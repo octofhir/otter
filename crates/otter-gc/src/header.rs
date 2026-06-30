@@ -19,9 +19,8 @@
 //! - `align_of::<GcHeader>() <= 8` so it fits at the start of a
 //!   cell-aligned allocation.
 //! - `flags` is `AtomicU8` so the marker and mutator can race on
-//!   mark transitions when incremental marking lands (Phase 2);
-//!   today the GC is STW so atomics serve as a forward-compatible
-//!   capability.
+//!   mark transitions once incremental marking is enabled; today the
+//!   GC is STW so atomics serve as a forward-compatible capability.
 //! - When the forwarded flag is set the first 8 bytes after the
 //!   header carry a forwarding offset (`u32`) — this is enforced by
 //!   [`crate::scavenger`] during evacuation, which in turn
@@ -30,8 +29,8 @@
 //!
 //! # See also
 //!
-//! - GC architecture plan §2.3 ("`GcHeader` reproduce in Phase 1")
-//!   and §5 (write barriers, mark transitions).
+//! - [`crate::barrier`] (write barriers) and [`crate::scavenger`]
+//!   (forwarding + mark transitions).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -61,11 +60,11 @@ const FLAG_SWEPT: u8 = 0b0010_0000;
 
 /// Set on an old/large parent once it has been recorded in the per-isolate
 /// remembered set after an old→young store. This is the dedup bit for the
-/// object-granular remembered set (JSC `CellState`): the barrier pushes a
-/// parent into the store buffer at most once between scavenges, and the
-/// scavenge that consumes the buffer clears the bit before re-tracing so a
-/// parent that still holds an old→young edge after evacuation is re-pushed.
-/// Outside the mark-color mask, so it survives [`GcHeader::clear_mark`].
+/// object-granular remembered set: the barrier pushes a parent into the store
+/// buffer at most once between scavenges, and the scavenge that consumes the
+/// buffer clears the bit before re-tracing so a parent that still holds an
+/// old→young edge after evacuation is re-pushed. Outside the mark-color mask,
+/// so it survives [`GcHeader::clear_mark`].
 const FLAG_REMEMBERED: u8 = 0b0100_0000;
 
 /// The remembered-set dedup bit within the [`GcHeader`] flag byte
@@ -155,7 +154,7 @@ impl GcHeader {
 
     /// Build a fresh young-generation header marked black, used by
     /// the black-allocation path while a marking cycle is in
-    /// progress (V8 standard since 2018).
+    /// progress (a freshly published object is never traced this cycle).
     #[inline]
     pub const fn new_young_black(type_tag: u8, size_bytes: u32) -> Self {
         Self {

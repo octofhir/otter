@@ -31,8 +31,7 @@
 //! A page's `survival_age` increments on every scavenge it
 //! survives. Once it reaches [`PROMOTE_AFTER_SURVIVALS`], the
 //! scavenger promotes survivors copied off that page into
-//! old-space rather than into to-space. V8 uses the same
-//! single-survival heuristic.
+//! old-space rather than into to-space.
 //!
 //! # Design
 //!
@@ -64,7 +63,9 @@ use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, Page, SpaceKind, align_up};
 use crate::space::{NewSpace, OldSpace};
 use crate::trace::TraceTable;
 
-/// Promote after this many surviving scavenges. V8 uses 1.
+/// Promote a survivor after this many scavenges it has lived through. One
+/// means a first-survival object is copied to to-space, then promoted on its
+/// next scavenge.
 pub const PROMOTE_AFTER_SURVIVALS: u32 = 1;
 
 /// Stats returned by [`scavenge`].
@@ -543,8 +544,8 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
 /// any young child.
 ///
 /// This replaces the card-table dirty-page header walk. The parents are
-/// held directly (object-granular, JSC/QuickJS model), so there is no
-/// O(objects/page) find-cost — `old_headers_walked` stays zero. The bit is
+/// held directly (object-granular), so there is no O(objects/page)
+/// find-cost — `old_headers_walked` stays zero. The bit is
 /// cleared before re-tracing so a parent that still points young after
 /// evacuation is re-pushed by [`remember_parent`] and survives to the next
 /// scavenge (the object-granular analog of re-dirtying a card).

@@ -502,8 +502,8 @@ pub struct ObjectBody {
     /// slots.
     ///
     /// Frozen ABI: string-keyed slot `i` lives at **forward** index `i`
-    /// (header-relative, no JSC-style bidirectional butterfly), reached
-    /// uniformly through this base whether the slab is inline or spilled. The
+    /// (header-relative, single growth direction — no split low/high regions),
+    /// reached uniformly through this base whether inline or spilled. The
     /// base is an **always-current** invariant — refreshed after every move,
     /// grow, shrink, or spill ([`Self::refresh_values_ptr`]) and verified at
     /// every slab access in debug ([`Self::values_ptr_is_current`]).
@@ -565,8 +565,8 @@ pub struct ObjectBody {
     exotic: Option<Box<ExoticSlots>>,
     /// In-body storage for the first [`INLINE_SLOT_CAP`] string-keyed slots, so
     /// a small object needs no separate slab allocation and keeps its hot slots
-    /// in the same cache line as the shape and `values_ptr` (the
-    /// allocation-locality merit every surveyed engine except QuickJS keeps).
+    /// in the same cache line as the shape and `values_ptr` — the
+    /// allocation-locality reason to keep a small inline region at all.
     /// Active while `slab_len <= INLINE_SLOT_CAP`; growth past the cap migrates
     /// every slot wholesale into `values` and leaves this array unused.
     /// `values_ptr` always points at whichever buffer is active, so the slot
@@ -3126,10 +3126,9 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) 
 /// - <https://tc39.es/ecma262/#sec-validateandapplypropertydescriptor>
 ///
 /// Field-presence-aware §10.1.6.3 OrdinaryDefineOwnProperty for
-/// string-keyed properties. Mirrors V8 / JSC's
-/// `PropertyDescriptor`-based `[[DefineOwnProperty]]`: missing fields
-/// preserve the existing value, missing-and-new defaults to spec
-/// defaults (§10.1.6.3 step 5).
+/// string-keyed properties. A `PropertyDescriptor`-based
+/// `[[DefineOwnProperty]]`: missing fields preserve the existing value,
+/// missing-and-new defaults to spec defaults (§10.1.6.3 step 5).
 pub fn define_own_property_partial(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,

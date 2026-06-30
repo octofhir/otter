@@ -69,8 +69,7 @@ pub fn empty() -> EmptyRoots {
 
 /// Growth-ratio major-GC trigger (used only when no hard cap is
 /// set). After a full GC the next trigger is `live × NUM / DEN`.
-/// `3/2` sits at the low end of the production band (V8 small-heap
-/// 1.3–2.0, Go 2.0) — appropriate for the small 256 MiB cage so a
+/// `3/2` is a tight ratio — appropriate for the small 256 MiB cage so a
 /// modest live set forces collection long before exhaustion.
 const MAJOR_GC_GROWTH_NUM: u64 = 3;
 const MAJOR_GC_GROWTH_DEN: u64 = 2;
@@ -750,7 +749,8 @@ impl GcHeap {
     ///
     /// The header gets `T::TYPE_TAG`; the value is moved into the
     /// payload area. When marking is active the new object starts
-    /// black (V8 black-allocation since 2018).
+    /// black (black-allocation — a freshly published object is not
+    /// traced this cycle).
     ///
     /// # Errors
     ///
@@ -1444,10 +1444,9 @@ impl GcHeap {
     /// e.g. handles popped & re-pushed mid-cycle) and drains to
     /// completion.
     ///
-    /// # See also
-    /// - V8 incremental marker — Dijkstra-style insertion barrier
-    ///   with black-on-allocation new-object policy
-    ///   (<https://v8.dev/blog/concurrent-marking>).
+    /// Uses a Dijkstra-style insertion barrier with a black-on-allocation
+    /// new-object policy so the mutator can run between mark steps without
+    /// losing a freshly published edge.
     pub fn start_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
         // Scavenge first so survivors are in old / to-space.
         self.collect_minor_internal(external_visit);

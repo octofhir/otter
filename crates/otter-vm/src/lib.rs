@@ -78,6 +78,7 @@ mod error_ops;
 mod eval_ops;
 mod executable;
 pub mod execution_context;
+pub mod field_repr;
 mod frame_ops;
 mod frame_state;
 mod function_kind;

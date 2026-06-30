@@ -58,6 +58,25 @@ const fn immediate(kind: u32) -> u32 {
     (kind << 3) | TAG_IMMEDIATE
 }
 
+// Frozen slot encoding: the optimizing tier bakes these tags into emitted
+// property loads/stores and the deopt frame-state record (which must know how
+// to reconstitute a full 8-byte Value from a 4-byte slot), so an accidental
+// edit is a compile error here, not a silent miscompile of every slot access.
+const _: () = assert!(TAG_BOXED == 0b010);
+const _: () = assert!(TAG_IMMEDIATE == 0b100);
+const _: () = assert!(TAG_FUNCTION_ID == 0b110);
+const _: () = assert!(TAG_MASK == 0b111);
+// A small int has bit 0 set; every other kind has it clear. The forwardable
+// GC kinds (cell ref 0b000, boxed number 0b010) have bit 2 clear, while the
+// non-pointer kinds (immediate, function id) have it set — so a single
+// `bit0 clear && bit2 clear && non-zero` test isolates the offsets the
+// collector relocates.
+const _: () = assert!(TAG_BOXED & 0b1 == 0 && TAG_BOXED & 0b100 == 0);
+const _: () = assert!(TAG_IMMEDIATE & 0b100 != 0);
+const _: () = assert!(TAG_FUNCTION_ID & 0b100 != 0);
+const _: () = assert!(FUNCTION_ID_LIMIT == 1 << 29);
+const _: () = assert!(SMI_MIN == -(1 << 30) && SMI_LIMIT == 1 << 30);
+
 /// A property value packed into 4 bytes. See the module docs for the layout.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]

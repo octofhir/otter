@@ -38,7 +38,8 @@ pub(super) fn ordinary_set_data_property(
     key: &str,
     value: Value,
 ) -> bool {
-    let barrier_value = value;
+    let mut obj = obj;
+    let compressed = super::compress_or_abort(heap, &mut obj, value);
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let slot_metas = super::slot_metas_for_shape_transition(heap, obj, existing_offset);
@@ -54,7 +55,7 @@ pub(super) fn ordinary_set_data_property(
             if !flags.writable() || is_accessor {
                 return false;
             }
-            body.set_data_value(i, value);
+            body.set_data_value(i, compressed);
             return true;
         }
 
@@ -70,11 +71,11 @@ pub(super) fn ordinary_set_data_property(
         }
         super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(append_index, SlotMeta::data_default(), value);
+        body.push_slot(append_index, SlotMeta::data_default(), compressed);
         true
     });
     if success {
-        heap.record_write(obj, &barrier_value);
+        super::record_slot_write(heap, obj, compressed);
     }
     success
 }
@@ -87,7 +88,8 @@ pub(super) fn ordinary_set_data_property_with_shape(
     next_shape: ShapeHandle,
     append_index: usize,
 ) -> bool {
-    let barrier_value = value;
+    let mut obj = obj;
+    let compressed = super::compress_or_abort(heap, &mut obj, value);
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let existing_attrs = existing_offset
         .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));
@@ -105,7 +107,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
             if !flags.writable() || is_accessor {
                 return false;
             }
-            body.set_data_value(i, value);
+            body.set_data_value(i, compressed);
             return true;
         }
 
@@ -113,11 +115,11 @@ pub(super) fn ordinary_set_data_property_with_shape(
             return false;
         }
         body.shape = next_shape;
-        body.push_slot(append_index, SlotMeta::data_default(), value);
+        body.push_slot(append_index, SlotMeta::data_default(), compressed);
         true
     });
     if success {
-        heap.record_write(obj, &barrier_value);
+        super::record_slot_write(heap, obj, compressed);
         heap.record_write(obj, &next_shape);
     }
     success

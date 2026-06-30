@@ -94,6 +94,8 @@ pub(crate) fn capture_store_property_transition(
     key: AtomizedPropertyKey<'_>,
     value: &Value,
 ) -> Option<StorePropertyTransition> {
+    let mut obj = obj;
+    let compressed = super::compress_or_abort(heap, &mut obj, *value);
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
     let existing_offset =
@@ -114,7 +116,7 @@ pub(crate) fn capture_store_property_transition(
         body.dictionary_shape_id = to_shape_id;
         super::dict_push_key(body, key.name().to_owned());
         body.shape = super::ShapeHandle::null();
-        body.push_slot(index, SlotMeta::data_default(), *value);
+        body.push_slot(index, SlotMeta::data_default(), compressed);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -124,7 +126,7 @@ pub(crate) fn capture_store_property_transition(
             slot,
         })
     })?;
-    heap.record_write(obj, value);
+    super::record_slot_write(heap, obj, compressed);
     Some(transition)
 }
 
@@ -135,6 +137,8 @@ pub(crate) fn capture_store_property_transition_with_shape(
     value: &Value,
     next_shape: ShapeHandle,
 ) -> Option<StorePropertyTransition> {
+    let mut obj = obj;
+    let compressed = super::compress_or_abort(heap, &mut obj, *value);
     let kind = transition_kind(obj, heap, key)?;
     let from_shape_id = super::shape_id(obj, heap);
     let (to_shape_id, to_shape_count) =
@@ -155,7 +159,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
             return None;
         }
         body.shape = next_shape;
-        body.push_slot(index, SlotMeta::data_default(), *value);
+        body.push_slot(index, SlotMeta::data_default(), compressed);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -165,7 +169,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
             slot,
         })
     })?;
-    heap.record_write(obj, value);
+    super::record_slot_write(heap, obj, compressed);
     heap.record_write(obj, &next_shape);
     Some(transition)
 }
@@ -182,6 +186,8 @@ pub(crate) fn replay_store_property_transition(
     transition: &StorePropertyTransition,
     value: &Value,
 ) -> Option<()> {
+    let mut obj = obj;
+    let compressed = super::compress_or_abort(heap, &mut obj, *value);
     if !transition_kind_matches(obj, heap, transition) {
         return None;
     }
@@ -223,13 +229,13 @@ pub(crate) fn replay_store_property_transition(
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
             body.shape = transition.to_shape;
         }
-        body.push_slot(offset, SlotMeta::data_default(), *value);
+        body.push_slot(offset, SlotMeta::data_default(), compressed);
         true
     });
     if !success {
         return None;
     }
-    heap.record_write(obj, value);
+    super::record_slot_write(heap, obj, compressed);
     if !transition.to_shape.is_null() {
         heap.record_write(obj, &transition.to_shape);
     }

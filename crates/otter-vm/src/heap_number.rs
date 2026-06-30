@@ -53,6 +53,21 @@ pub fn alloc_heap_number(
     heap.alloc(HeapNumberBody { bits })
 }
 
+/// Allocate a [`HeapNumber`], forwarding the caller's live roots through
+/// `external_visit` if this allocation triggers a collection that relocates
+/// them.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_heap_number_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    bits: u64,
+    external_visit: &mut otter_gc::raw::RootSlotVisitor<'_>,
+) -> Result<HeapNumber, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(HeapNumberBody { bits }, external_visit)
+}
+
 /// Read the boxed `Value` bits of `boxed`.
 #[must_use]
 pub fn read_heap_number(heap: &otter_gc::GcHeap, boxed: HeapNumber) -> u64 {

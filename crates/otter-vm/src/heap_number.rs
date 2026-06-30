@@ -9,12 +9,12 @@
 //!
 //! # Invariants
 //!
-//! - The boxed bits always decode to a [`crate::Value`] that is a number
-//!   (double or int32) and never a heap cell. A cell fits the 32-bit slot
-//!   inline as its compressed offset, so it is never boxed; the body
-//!   therefore holds no GC edge and traces to nothing.
-//! - The bits round-trip a `Value` exactly, so an out-of-range int32 keeps
-//!   its int32 representation instead of collapsing to a double.
+//! - The boxed bits always decode to a [`crate::Value`] that is never a heap
+//!   cell — a double, a wide int32, or an out-of-range function id, i.e. a
+//!   value that does not fit a 32-bit slot inline. The body therefore holds
+//!   no GC edge and traces to nothing.
+//! - The bits round-trip a `Value` exactly, so a wide int32 keeps its int32
+//!   representation instead of collapsing to a double.
 //!
 //! # See also
 //!

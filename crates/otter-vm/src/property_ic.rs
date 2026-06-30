@@ -7,7 +7,6 @@
 //! exceeds the PIC capacity.
 //!
 //! # Contents
-//! - [`StorePropertyIc`] — existing-own-slot and guarded store-
 //!   transition cache.
 //! - [`PropertyIcEntry`] — per-site cache state and miss policy.
 //! - [`PropertyIcStats`] — aggregate IC counters for diagnostics/tests.
@@ -31,11 +30,6 @@
 //! - [`crate::object`]
 //! - [`crate::property_dispatch`]
 
-use crate::object::{
-    self, AtomOwnPropertyHit, ShapeId, StorePropertyTransition, StorePropertyTransitionKind,
-};
-use crate::property_atom::AtomizedPropertyKey;
-use crate::{JsObject, Value};
 use otter_gc::raw::SlotVisitor;
 use smallvec::SmallVec;
 
@@ -281,7 +275,7 @@ impl<T> PropertyIcEntry<T> {
     }
 }
 
-impl PropertyIcEntry<StorePropertyIc> {
+impl PropertyIcEntry<crate::cache_ir::CacheStub> {
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         if let Self::Polymorphic { entries, .. } = self {
             for ic in entries {
@@ -291,142 +285,9 @@ impl PropertyIcEntry<StorePropertyIc> {
     }
 }
 
-/// Monomorphic `StoreProperty` cache for ordinary data-slot writes.
-#[derive(Debug, Clone)]
-pub(crate) enum StorePropertyIc {
-    /// Receiver already owns the writable data slot.
-    ExistingOwnDataStore {
-        /// Guarded slot metadata.
-        hit: AtomOwnPropertyHit,
-    },
-    /// Receiver can add one data slot with a `null` prototype.
-    OwnAddTransition {
-        /// Guarded hidden-class transition.
-        transition: StorePropertyTransition,
-    },
-    /// Receiver can add one data slot when its direct prototype still misses
-    /// the key and has no deeper chain.
-    DirectPrototypeMissingTransition {
-        /// Guarded hidden-class transition.
-        transition: StorePropertyTransition,
-    },
-    /// Receiver can add one data slot when its direct prototype still owns a
-    /// writable data property for this key.
-    DirectPrototypeWritableDataTransition {
-        /// Guarded hidden-class transition.
-        transition: StorePropertyTransition,
-    },
-}
-
-impl StorePropertyIc {
-    /// Create an IC from an atom-aware object lookup hit.
-    #[must_use]
-    pub(crate) const fn own_data(hit: AtomOwnPropertyHit) -> Self {
-        Self::ExistingOwnDataStore { hit }
-    }
-
-    /// Create an IC from a guarded store-property transition.
-    #[must_use]
-    pub(crate) fn transition(transition: StorePropertyTransition) -> Self {
-        match &transition.kind {
-            StorePropertyTransitionKind::OwnAdd => Self::OwnAddTransition { transition },
-            StorePropertyTransitionKind::DirectPrototypeMissing { .. } => {
-                Self::DirectPrototypeMissingTransition { transition }
-            }
-            StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => {
-                Self::DirectPrototypeWritableDataTransition { transition }
-            }
-        }
-    }
-
-    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        match self {
-            Self::ExistingOwnDataStore { .. } => {}
-            Self::OwnAddTransition { transition }
-            | Self::DirectPrototypeMissingTransition { transition }
-            | Self::DirectPrototypeWritableDataTransition { transition } => {
-                transition.trace_roots(visitor);
-            }
-        }
-    }
-
-    /// Own-data IC metadata when the receiver shape/key guard matches.
-    #[must_use]
-    pub(crate) fn own_data_hit(
-        &self,
-        shape_id: ShapeId,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<AtomOwnPropertyHit> {
-        let Self::ExistingOwnDataStore { hit } = self else {
-            return None;
-        };
-        (hit.shape_id == shape_id && hit.atom_id == key.atom().id()).then_some(*hit)
-    }
-
-    /// Add-transition metadata when the receiver shape/key guard matches.
-    #[must_use]
-    pub(crate) fn store_transition(
-        &self,
-        shape_id: ShapeId,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<&StorePropertyTransition> {
-        let transition = match self {
-            Self::OwnAddTransition { transition }
-            | Self::DirectPrototypeMissingTransition { transition }
-            | Self::DirectPrototypeWritableDataTransition { transition } => transition,
-            Self::ExistingOwnDataStore { .. } => return None,
-        };
-        (transition.from_shape_id == shape_id && transition.atom_id == key.atom().id())
-            .then_some(transition)
-    }
-
-    /// Replay this IC against an ordinary object receiver.
-    pub(crate) fn store(
-        &self,
-        obj: JsObject,
-        heap: &mut otter_gc::GcHeap,
-        key: AtomizedPropertyKey<'_>,
-        value: &Value,
-    ) -> Option<()> {
-        if !object::supports_fast_property_ic(obj, heap) {
-            return None;
-        }
-        let shape_id = object::shape_id(obj, heap);
-        if let Some(hit) = self.own_data_hit(shape_id, key) {
-            return object::store_own_data_slot_atom(obj, heap, key, hit, value);
-        }
-        if let Some(transition) = self.store_transition(shape_id, key) {
-            return object::replay_store_property_transition(obj, heap, key, transition, value);
-        }
-        None
-    }
-
-    /// Build an existing-own-data store IC candidate for the current receiver.
-    ///
-    /// Add-transition capture lives in the object shape-transition layer
-    /// because it performs the write while creating replay metadata.
-    #[must_use]
-    pub(crate) fn existing_own_data_install_candidate(
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<Self> {
-        if !object::supports_fast_property_ic(obj, heap) {
-            return None;
-        }
-        let atom_lookup = object::lookup_own_atom(obj, heap, key);
-        let (Some(hit), object::PropertyLookup::Data { flags, value: _ }) =
-            (atom_lookup.hit, atom_lookup.lookup)
-        else {
-            return None;
-        };
-        flags.writable().then_some(Self::own_data(hit))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{PropertyIcEntry, PropertyIcKind, PropertyIcStats, StorePropertyIc};
+    use super::{PropertyIcEntry, PropertyIcKind, PropertyIcStats};
     use crate::object::{self, PropertyDescriptor};
     use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
     use crate::{JsString, Value};
@@ -579,7 +440,7 @@ mod tests {
             &Value::boolean(false),
         )
         .expect("store transition");
-        let ic = StorePropertyIc::transition(transition);
+        let ic = crate::cache_ir::CacheStub::store_transition(transition);
         let second = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(second, &mut heap, Some(proto));
 
@@ -600,8 +461,6 @@ mod tests {
             PropertyDescriptor::data(Value::boolean(true), false, true, true),
         ));
 
-        assert!(
-            StorePropertyIc::existing_own_data_install_candidate(obj, &heap, key("x")).is_none()
-        );
+        assert!(crate::cache_ir::CacheStub::install_store_existing(obj, &heap, key("x")).is_none());
     }
 }

@@ -658,12 +658,17 @@ impl Interpreter {
         url_arc: std::sync::Arc<str>,
         init: crate::promise::JsPromiseHandle,
     ) -> Result<(), VmError> {
+        // The gate moves under the reaction-handler and capability
+        // allocations below; keep it rooted through them and read the
+        // current handle back before registering the reaction, so the
+        // reaction lands on the live gate rather than its vacated slot.
+        let init_value = Value::promise(init);
         let fulfilled_url = url_arc.clone();
         let on_fulfilled = crate::native_function::native_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             "AsyncModuleExecutionFulfilled",
             SmallVec::new(),
-            &mut |_visitor| {},
+            &mut |visitor| init_value.trace_value_slots(visitor),
             move |ncx, _args, _captures| {
                 let (interp, reaction_context) = ncx.interp_mut_and_context();
                 if let Some(reaction_context) = reaction_context {
@@ -678,7 +683,10 @@ impl Interpreter {
             &mut self.gc_heap,
             "AsyncModuleExecutionRejected",
             SmallVec::new(),
-            &mut |visitor| on_fulfilled.trace_value_slots(visitor),
+            &mut |visitor| {
+                on_fulfilled.trace_value_slots(visitor);
+                init_value.trace_value_slots(visitor);
+            },
             move |ncx, args, _captures| {
                 let reason = args.first().copied().unwrap_or_else(Value::undefined);
                 ncx.interp_mut()
@@ -688,7 +696,10 @@ impl Interpreter {
         )
         .map_err(VmError::from)?;
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
-            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected], &[])?;
+            .capability_runtime_rooted(self, &[&on_fulfilled, &on_rejected, &init_value], &[])?;
+        let init = init_value
+            .as_promise()
+            .expect("rooted async-module gate survives reaction allocation");
         let outcome = crate::JsPromise::perform_then_with_context(
             &init,
             &mut self.gc_heap,

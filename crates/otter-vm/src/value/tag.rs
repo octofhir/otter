@@ -2,12 +2,12 @@
 //!
 //! # Encoding
 //!
-//! Every `Value` is a single `u64` laid out exactly like JavaScriptCore's
-//! 64-bit `JSValue` (`JSCJSValue.h`), chosen so that **heap pointers are
-//! stored verbatim** and need no unmask before a dereference — the hot
-//! property/method path pays nothing to turn a `Value` into an object
-//! address. Doubles pay a single add/subtract at box/unbox time; that is
-//! the conscious trade (we are already competitive on float benches).
+//! Every `Value` is a single `u64` pointer-cheap NaN-box, chosen so that
+//! **heap pointers are stored verbatim** and need no unmask before a
+//! dereference — the hot property/method path pays nothing to turn a `Value`
+//! into an object address. Doubles pay a single add/subtract at box/unbox
+//! time; that is the conscious trade (we are already competitive on float
+//! benches).
 //!
 //! ```text
 //! Cell pointer : the full 48-bit address, top 16 bits zero.
@@ -44,7 +44,6 @@
 //!
 //! - ECMA-262 §6.1 ECMAScript Language Types
 //! - ECMA-262 §6.1.6.1 The Number Type (NaN canonicalisation)
-//! - JavaScriptCore `JSCJSValue.h` (the encoding mirrored here)
 
 /// High-bits tag marking a number (int32 or boxed double).
 pub const NUMBER_TAG: u64 = 0xfffe_0000_0000_0000;

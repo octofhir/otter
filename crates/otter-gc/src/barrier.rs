@@ -1,7 +1,7 @@
 //! Write barriers for the page heap.
 //!
-//! V8/JSC-shape: every heap pointer store goes through a
-//! barrier. Two duties stack on the same call site:
+//! Every heap pointer store goes through a barrier. Two duties
+//! stack on the same call site:
 //!
 //! 1. **Generational barrier** (load-bearing) — when an old-gen
 //!    object is updated to point at a young-gen object, record the

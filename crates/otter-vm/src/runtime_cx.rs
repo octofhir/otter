@@ -299,6 +299,28 @@ impl<'rt> NativeCtx<'rt> {
         self.alloc_object_with_roots(&[], &[])
     }
 
+    /// Park `value` on the interpreter's GC-traced scratch root stack and return
+    /// its index. Host helpers that hold a JS handle across a re-entrant call
+    /// (`run_callable_sync`, a nested allocation) must park it here, then read
+    /// the relocated handle back via [`Self::scratch_root`] before reusing it,
+    /// because a bare local is not a GC root and a moving scavenge during the
+    /// call would leave it pointing at the value's vacated slot.
+    pub fn push_scratch_root(&mut self, value: Value) -> usize {
+        self.cx.interp.json_root_push(value)
+    }
+
+    /// Read the (possibly relocated) value parked at `idx`.
+    #[must_use]
+    pub fn scratch_root(&self, idx: usize) -> Value {
+        self.cx.interp.json_root_get(idx)
+    }
+
+    /// Pop the scratch root stack back down to `idx` (the value
+    /// [`Self::push_scratch_root`] returned).
+    pub fn pop_scratch_root_to(&mut self, idx: usize) {
+        self.cx.interp.json_root_pop_to(idx);
+    }
+
     /// Allocate an ordinary object while keeping additional local values alive.
     pub fn alloc_object_with_roots(
         &mut self,

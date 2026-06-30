@@ -601,6 +601,10 @@ fn install_worker_poll_timer(
         .interp_mut_and_context()
         .1
         .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
+    // `run_callable_sync` enters JS (setInterval) which allocates; park the
+    // worker handle on the GC-traced scratch stack so the scavenge keeps it
+    // live, then read the relocated handle back before storing the timer token.
+    let wroot = ctx.push_scratch_root(worker_value);
     let (interp, _) = ctx.interp_mut_and_context();
     let token = interp
         .run_callable_sync(
@@ -610,6 +614,11 @@ fn install_worker_poll_timer(
             smallvec![poll, Value::number_f64(1.0)],
         )
         .map_err(vm_error_to_native)?;
+    worker = ctx
+        .scratch_root(wroot)
+        .as_object()
+        .expect("worker stays rooted across the timer install");
+    ctx.pop_scratch_root_to(wroot);
     object::set(&mut worker, ctx.heap_mut(), "__otterPoll", token);
     Ok(())
 }

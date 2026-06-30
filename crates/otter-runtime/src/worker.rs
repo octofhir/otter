@@ -233,7 +233,13 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
         let id = spawn_worker_record(&host, specifier)?;
         let mut worker = ctx.alloc_object()?;
-        let worker_value = Value::object(worker);
+        // The worker object is built up across many allocations (a listeners
+        // object plus five native methods), any of which can relocate the young
+        // `worker` body under a moving scavenge. `worker_value` is the rooted
+        // source of truth: it is resynced from `worker` before every allocation
+        // (so the alloc keeps it live) and `worker` is refreshed from it after,
+        // so no `set` ever writes through a vacated handle.
+        let mut worker_value = Value::object(worker);
         object::set(
             &mut worker,
             ctx.heap_mut(),
@@ -243,7 +249,11 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
         object::set(&mut worker, ctx.heap_mut(), "onmessage", Value::null());
         object::set(&mut worker, ctx.heap_mut(), "onerror", Value::null());
         object::set(&mut worker, ctx.heap_mut(), "onmessageerror", Value::null());
-        let listeners = ctx.alloc_object()?;
+        worker_value = Value::object(worker);
+        let listeners = ctx.alloc_object_with_roots(&[&worker_value], &[])?;
+        worker = worker_value
+            .as_object()
+            .expect("worker stays rooted across allocation");
         object::set(
             &mut worker,
             ctx.heap_mut(),
@@ -251,6 +261,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
             Value::object(listeners),
         );
 
+        worker_value = Value::object(worker);
         let post_host = host.clone();
         let post = ctx.native_value_with_captures(
             "postMessage",
@@ -287,8 +298,12 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
+        worker = worker_value
+            .as_object()
+            .expect("worker stays rooted across allocation");
         object::set(&mut worker, ctx.heap_mut(), "postMessage", post);
 
+        worker_value = Value::object(worker);
         let terminate_host = host.clone();
         let terminate = ctx.native_value_with_captures(
             "terminate",
@@ -308,8 +323,12 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
+        worker = worker_value
+            .as_object()
+            .expect("worker stays rooted across allocation");
         object::set(&mut worker, ctx.heap_mut(), "terminate", terminate);
 
+        worker_value = Value::object(worker);
         let dispatch = ctx.native_value_with_captures(
             "dispatchEvent",
             smallvec![],
@@ -330,7 +349,11 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::boolean(true))
             },
         )?;
+        worker = worker_value
+            .as_object()
+            .expect("worker stays rooted across allocation");
         object::set(&mut worker, ctx.heap_mut(), "dispatchEvent", dispatch);
+        worker_value = Value::object(worker);
         let add = ctx.native_value_with_captures(
             "addEventListener",
             smallvec![],
@@ -349,7 +372,11 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
+        worker = worker_value
+            .as_object()
+            .expect("worker stays rooted across allocation");
         object::set(&mut worker, ctx.heap_mut(), "addEventListener", add);
+        worker_value = Value::object(worker);
         let remove = ctx.native_value_with_captures(
             "removeEventListener",
             smallvec![],
@@ -366,7 +393,11 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
                 Ok(Value::undefined())
             },
         )?;
+        worker = worker_value
+            .as_object()
+            .expect("worker stays rooted across allocation");
         object::set(&mut worker, ctx.heap_mut(), "removeEventListener", remove);
+        worker_value = Value::object(worker);
 
         install_worker_poll_timer(ctx, host.clone(), worker)?;
         Ok(worker_value)

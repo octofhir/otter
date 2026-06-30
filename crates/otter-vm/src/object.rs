@@ -500,6 +500,13 @@ pub struct ObjectBody {
     /// offset, so every own data slot has the same inline path regardless of
     /// slot number. `null` means the object currently has no string-keyed
     /// slots.
+    ///
+    /// Frozen ABI (A2): string-keyed slot `i` lives at **forward** index `i`
+    /// (header-relative, no JSC-style bidirectional butterfly), reached
+    /// uniformly through this base whether the slab is inline or spilled. The
+    /// base is an **always-current** invariant — refreshed after every move,
+    /// grow, shrink, or spill ([`Self::refresh_values_ptr`]) and verified at
+    /// every slab access in debug ([`Self::values_ptr_is_current`]).
     values_ptr: *mut CompressedValue,
     /// Contiguous string-keyed own-property values, indexed by shape slot
     /// offset. A data slot stores its `[[Value]]` directly; an accessor slot
@@ -705,6 +712,10 @@ impl ObjectBody {
     /// Read the compressed word for string-keyed slot `i`.
     #[inline]
     fn slot_word(&self, i: usize) -> CompressedValue {
+        debug_assert!(
+            self.values_ptr_is_current(),
+            "stale values_ptr on slab read"
+        );
         if self.slab_is_inline() {
             self.inline_values[i]
         } else {
@@ -721,6 +732,10 @@ impl ObjectBody {
     /// Write a pre-compressed data value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: CompressedValue) {
+        debug_assert!(
+            self.values_ptr_is_current(),
+            "stale values_ptr on slab write"
+        );
         if self.slab_is_inline() {
             self.inline_values[i] = value;
         } else {
@@ -911,6 +926,15 @@ impl ObjectBody {
     /// at the active buffer — the in-body inline array for a small object, the
     /// out-of-line vector once spilled — so slot access and the JIT both index
     /// `values_ptr` uniformly. `null` only for a slotless object.
+    ///
+    /// This is the **sole** writer of the always-current `values_ptr` base
+    /// invariant (ABI A2): no code path may leave `values_ptr` aimed at a stale
+    /// buffer once the mutator can observe the body. Every mutation that grows,
+    /// shrinks, spills, or relocates the slab calls this; the relocating
+    /// scavenger calls it from `trace_slots_safe` after the body memcpy. A
+    /// future JIT bakes a single `values_ptr` load as the slab base for every
+    /// own-data slot, so a stale base is a silently-baked wild load — hence
+    /// [`Self::values_ptr_is_current`] verifies it at every slab access in debug.
     #[inline]
     fn refresh_values_ptr(&mut self) {
         self.values_ptr = if self.slab_len == 0 {
@@ -920,6 +944,26 @@ impl ObjectBody {
         } else {
             self.values.as_mut_ptr()
         };
+    }
+
+    /// Debug verifier for the always-current `values_ptr` base invariant
+    /// (ABI A2): the cached base must equal what [`Self::refresh_values_ptr`]
+    /// would recompute right now. Asserted at every slab access in debug
+    /// (compiled out in release) so any new relocation/grow/shrink path that
+    /// forgets to refresh fails deterministically under `OTTER_GC_STRESS`
+    /// instead of baking a wild JIT load. Reads never run mid-relocation (STW
+    /// pauses the mutator, and `trace_slots_safe` refreshes before yielding),
+    /// so a current pointer here is the steady-state contract, not a race.
+    #[inline]
+    fn values_ptr_is_current(&self) -> bool {
+        let expected: *const CompressedValue = if self.slab_len == 0 {
+            std::ptr::null()
+        } else if self.slab_is_inline() {
+            self.inline_values.as_ptr()
+        } else {
+            self.values.as_ptr()
+        };
+        self.values_ptr.cast_const() == expected
     }
 
     // --- Lazily-boxed exotic slots -----------------------------------------

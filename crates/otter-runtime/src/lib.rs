@@ -729,6 +729,19 @@ pub struct RuntimeExecutionStats {
     pub gc_cycles: u64,
     /// Most recent full-GC pause in milliseconds.
     pub gc_last_pause_ms: f32,
+    /// Minor (young-gen scavenge) cycles executed.
+    pub gc_minor_cycles: u64,
+    /// Cumulative minor-GC pause time, in nanoseconds.
+    pub gc_minor_pause_ns_total: u64,
+    /// Cumulative dirty cards scanned across all minor GCs (W1 input).
+    pub gc_minor_dirty_cards_scanned: u64,
+    /// Cumulative old-space headers strided during dirty-card walks
+    /// (W1 find-cost — driven to zero by the object-granular set).
+    pub gc_minor_old_headers_walked: u64,
+    /// Cumulative old/large parents re-traced for dirty cards (W2).
+    pub gc_minor_objects_retraced: u64,
+    /// Cumulative slots visited re-tracing dirty-card parents (W2).
+    pub gc_minor_slots_scanned: u64,
 }
 
 /// Deno-inspired, UX-first capability set.
@@ -2697,6 +2710,12 @@ impl Runtime {
             gc_live_bytes: gc.live_bytes,
             gc_cycles: gc.gc_cycles,
             gc_last_pause_ms: gc.last_gc_pause_ms,
+            gc_minor_cycles: gc.minor_gc_cycles,
+            gc_minor_pause_ns_total: gc.minor_pause_ns_total,
+            gc_minor_dirty_cards_scanned: gc.minor_dirty_cards_scanned,
+            gc_minor_old_headers_walked: gc.minor_old_headers_walked,
+            gc_minor_objects_retraced: gc.minor_objects_retraced,
+            gc_minor_slots_scanned: gc.minor_slots_scanned,
         }
     }
 

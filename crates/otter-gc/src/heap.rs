@@ -1267,7 +1267,8 @@ impl GcHeap {
         let weak_registry_slots = self.weak_finalization.handle_slots();
         // SAFETY: STW pause for the duration of the call;
         // every type tag in from-space is registered.
-        let stats = unsafe {
+        let scavenge_start = Instant::now();
+        let mut stats = unsafe {
             crate::scavenger::scavenge(
                 &mut self.new_space,
                 &mut self.old_space,
@@ -1279,9 +1280,11 @@ impl GcHeap {
                 &weak_registry_slots,
             )
         };
+        stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
         self.ephemerons.retain_non_null();
         self.weak_finalization.retain_non_null();
         self.stats.last_scavenge = stats;
+        self.gc_stats.record_minor(&stats);
         // Per-tag counters drift between scavenges (young
         // allocations counted at alloc-time but never
         // decremented when the scavenger reclaims them); the

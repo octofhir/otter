@@ -74,6 +74,25 @@ pub struct ScavengeStats {
     pub promoted_bytes: usize,
     /// Slot updates performed.
     pub slot_updates: usize,
+    /// Minor-GC pause time in nanoseconds. Populated by the heap
+    /// caller around the [`scavenge`] call, not by the scavenge
+    /// itself (the pause spans more than the inner work).
+    pub minor_pause_ns: u64,
+    /// Dirty cards scanned across all old/large pages this scavenge —
+    /// the W1 input. Becomes the remembered-set entry count once the
+    /// object-granular set replaces the card walk.
+    pub dirty_cards_scanned: usize,
+    /// Old-space object headers strided during the dirty-card walk —
+    /// the W1 find-cost (re-deriving which object owns a dirty card).
+    /// The object-granular remembered set drives this to zero.
+    pub old_headers_walked: usize,
+    /// Old/large parents re-traced to service dirty cards — the W2
+    /// whole-object re-trace count. Retained by the object-granular
+    /// set (the find-cost goes away, the re-trace stays).
+    pub objects_retraced: usize,
+    /// Slots visited while re-tracing dirty-card parents — the W2
+    /// magnitude (per-object slot fan-out of the re-trace).
+    pub slots_scanned: usize,
 }
 
 /// Internal scavenge context — raw-pointer state under STW.
@@ -83,6 +102,10 @@ struct ScavCtx {
     large_space: NonNull<LargeObjectSpace>,
     trace_table: NonNull<TraceTable>,
     stats: ScavengeStats,
+    /// True only while [`scan_old_dirty_cards`] is running, so
+    /// [`process_slot`] attributes the slots it visits to the W2
+    /// whole-object re-trace (and not to root / Cheney passes).
+    in_dirty_scan: bool,
 }
 
 impl ScavCtx {
@@ -151,6 +174,7 @@ pub unsafe fn scavenge(
         large_space: unsafe { NonNull::new_unchecked(large_space as *mut _) },
         trace_table: unsafe { NonNull::new_unchecked(trace_table as *const _ as *mut _) },
         stats: ScavengeStats::default(),
+        in_dirty_scan: false,
     };
 
     // 1) Explicit root slots.
@@ -217,6 +241,12 @@ pub unsafe fn scavenge(
 unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {
     // SAFETY: slot is dereferenceable per precondition.
     unsafe {
+        if ctx.in_dirty_scan {
+            // Every slot reached here while the dirty-card walk owns the
+            // visitor is a slot of an old parent being re-traced — the W2
+            // per-object fan-out.
+            ctx.stats.slots_scanned += 1;
+        }
         let raw = (*slot).0;
         if raw == 0 {
             return;
@@ -498,6 +528,7 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
 unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
     // SAFETY: per docstring.
     unsafe {
+        ctx.in_dirty_scan = true;
         // Large-object pages take generational write-barrier cards
         // too (their headers report old); each page holds exactly
         // one object, so any dirty card re-traces that object.
@@ -505,10 +536,11 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
         for idx in 0..large_count {
             let base = ctx.large_space().pages()[idx].base_ptr();
             let page_header = &mut *(base as *mut PageHeader);
-            let mut any_dirty = false;
-            page_header.for_each_dirty_card(|_, _| any_dirty = true);
+            let mut dirty_cards = 0usize;
+            page_header.for_each_dirty_card(|_, _| dirty_cards += 1);
             page_header.clear_cards();
-            if any_dirty {
+            ctx.stats.dirty_cards_scanned += dirty_cards;
+            if dirty_cards != 0 {
                 let header_ptr = base.add(PAGE_HEADER_SIZE) as *mut GcHeader;
                 // Skip swept corpses: a full-GC sweep drops dead old/large
                 // objects in place (freeing their payload buffers, e.g. a
@@ -516,6 +548,7 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
                 // such a corpse would read its freed — and possibly reused —
                 // backing as live GC slots (use-after-free).
                 if (*header_ptr).size_bytes() != 0 && !(*header_ptr).is_swept() {
+                    ctx.stats.objects_retraced += 1;
                     trace_one(ctx, header_ptr);
                 }
             }
@@ -531,6 +564,7 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
             let mut dirty: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
             page_header.for_each_dirty_card(|_, off| dirty.push(off));
             page_header.clear_cards();
+            ctx.stats.dirty_cards_scanned += dirty.len();
             if dirty.is_empty() {
                 continue;
             }
@@ -543,6 +577,9 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
                 if size == 0 {
                     break;
                 }
+                // W1 find-cost: every stride re-derives an object owner from
+                // a dirty card the barrier already knew at write time.
+                ctx.stats.old_headers_walked += 1;
                 let body_start = hoff;
                 let body_end = hoff + align_up(size, CELL_SIZE);
                 let overlaps = dirty
@@ -555,11 +592,13 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
                 // use-after-free that surfaced as "ab" string units appearing in
                 // a closure's upvalue `Gc` slot during dirty-card scan.
                 if overlaps && !(*header_ptr).is_swept() {
+                    ctx.stats.objects_retraced += 1;
                     trace_one(ctx, header_ptr);
                 }
                 hoff = body_end;
             }
         }
+        ctx.in_dirty_scan = false;
     }
 }
 

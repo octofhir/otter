@@ -87,6 +87,24 @@ pub struct GcStats {
     /// Number of full GC cycles executed since the heap was
     /// created.
     pub gc_cycles: u64,
+    /// Number of minor (young-gen scavenge) cycles executed since
+    /// the heap was created.
+    pub minor_gc_cycles: u64,
+    /// Cumulative minor-GC pause time, in nanoseconds.
+    pub minor_pause_ns_total: u64,
+    /// Cumulative dirty cards scanned across all minor GCs — the W1
+    /// input volume.
+    pub minor_dirty_cards_scanned: u64,
+    /// Cumulative old-space headers strided during dirty-card walks
+    /// — the W1 find-cost. The object-granular remembered set drives
+    /// the per-cycle contribution to zero.
+    pub minor_old_headers_walked: u64,
+    /// Cumulative old/large parents re-traced for dirty cards — the
+    /// W2 re-trace count.
+    pub minor_objects_retraced: u64,
+    /// Cumulative slots visited while re-tracing dirty-card parents
+    /// — the W2 magnitude.
+    pub minor_slots_scanned: u64,
 }
 
 impl Default for GcStats {
@@ -99,6 +117,12 @@ impl Default for GcStats {
             last_gc_pause_ms: 0.0,
             last_gc_reclaimed_bytes: 0,
             gc_cycles: 0,
+            minor_gc_cycles: 0,
+            minor_pause_ns_total: 0,
+            minor_dirty_cards_scanned: 0,
+            minor_old_headers_walked: 0,
+            minor_objects_retraced: 0,
+            minor_slots_scanned: 0,
         }
     }
 }
@@ -120,6 +144,12 @@ impl std::fmt::Debug for GcStats {
             .field("last_gc_pause_ms", &self.last_gc_pause_ms)
             .field("last_gc_reclaimed_bytes", &self.last_gc_reclaimed_bytes)
             .field("gc_cycles", &self.gc_cycles)
+            .field("minor_gc_cycles", &self.minor_gc_cycles)
+            .field("minor_pause_ns_total", &self.minor_pause_ns_total)
+            .field("minor_dirty_cards_scanned", &self.minor_dirty_cards_scanned)
+            .field("minor_old_headers_walked", &self.minor_old_headers_walked)
+            .field("minor_objects_retraced", &self.minor_objects_retraced)
+            .field("minor_slots_scanned", &self.minor_slots_scanned)
             .field("by_type_nonzero", &by_type)
             .finish()
     }
@@ -150,6 +180,28 @@ impl GcStats {
         row.alloc_bytes_total = row
             .alloc_bytes_total
             .wrapping_add(u64::try_from(size_bytes).unwrap_or(u64::MAX));
+    }
+
+    /// Fold one minor-GC scavenge result into the cumulative
+    /// minor-GC counters. Called once per scavenge from
+    /// [`crate::heap::GcHeap::collect_minor_with_roots`]; the
+    /// per-cycle [`crate::scavenger::ScavengeStats`] snapshot is
+    /// kept separately in `HeapStats::last_scavenge`.
+    pub fn record_minor(&mut self, s: &crate::scavenger::ScavengeStats) {
+        self.minor_gc_cycles = self.minor_gc_cycles.wrapping_add(1);
+        self.minor_pause_ns_total = self.minor_pause_ns_total.wrapping_add(s.minor_pause_ns);
+        self.minor_dirty_cards_scanned = self
+            .minor_dirty_cards_scanned
+            .wrapping_add(s.dirty_cards_scanned as u64);
+        self.minor_old_headers_walked = self
+            .minor_old_headers_walked
+            .wrapping_add(s.old_headers_walked as u64);
+        self.minor_objects_retraced = self
+            .minor_objects_retraced
+            .wrapping_add(s.objects_retraced as u64);
+        self.minor_slots_scanned = self
+            .minor_slots_scanned
+            .wrapping_add(s.slots_scanned as u64);
     }
 }
 

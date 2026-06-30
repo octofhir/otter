@@ -629,7 +629,10 @@ mod tests {
         // into the flat value array: each bootstrap accessor property now
         // allocates one GC-managed `AccessorCellBody` for its getter/setter
         // pair where it previously lived in a non-GC box.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1900;
+        // The 32-bit object slab boxes a property value that does not fit a
+        // 4-byte slot, so each double-valued builtin constant (Math.PI, the
+        // Number limits, …) allocates one HeapNumber during bootstrap.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1960;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

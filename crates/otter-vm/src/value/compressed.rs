@@ -11,6 +11,7 @@
 //! .....N000  cell ref   : the 8-aligned compressed offset, verbatim
 //! .....N010  boxed num  : (HeapNumber offset) | 0b010  (double / wide int)
 //! kkkkk100   immediate  : (kind << 3) | 0b100          undefined/null/...
+//! .....N110  function   : (id << 3)   | 0b110          closure-less function id
 //! ```
 //!
 //! A cell ref decodes with no header read, so reference-valued property loads
@@ -26,14 +27,19 @@
 //!   forwardable GC offsets are the `0b000` and `0b010` kinds.
 
 use super::Value;
-use crate::heap_number::{alloc_heap_number, read_heap_number};
+use crate::heap_number::{alloc_heap_number_with_roots, read_heap_number};
+use otter_gc::raw::RootSlotVisitor;
 
 /// Low-3-bit tag for a boxed-number slot.
 const TAG_BOXED: u32 = 0b010;
 /// Low-3-bit tag for an immediate slot.
 const TAG_IMMEDIATE: u32 = 0b100;
+/// Low-3-bit tag for an inline closure-less function-id slot.
+const TAG_FUNCTION_ID: u32 = 0b110;
 /// Mask isolating the low-3-bit slot tag.
 const TAG_MASK: u32 = 0b111;
+/// Largest function id that fits inline beside the 3-bit tag.
+const FUNCTION_ID_LIMIT: u32 = 1 << 29;
 
 /// Inclusive lower bound of the inline small-int range (`-2^30`).
 const SMI_MIN: i32 = -(1 << 30);
@@ -93,7 +99,10 @@ impl CompressedValue {
 }
 
 /// Pack `value` into a 4-byte slot, boxing a double or a wide int32 on the
-/// heap.
+/// heap. Boxing can collect, so `external_visit` must forward every live
+/// root the caller holds across this call (the receiver object in
+/// particular); non-boxed values never allocate and leave the roots
+/// untouched.
 ///
 /// # Errors
 ///
@@ -101,15 +110,12 @@ impl CompressedValue {
 pub fn compress(
     value: Value,
     heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<CompressedValue, otter_gc::OutOfMemory> {
     if let Some(i) = value.as_i32() {
         if (SMI_MIN..SMI_LIMIT).contains(&i) {
             return Ok(CompressedValue(((i as u32) << 1) | 1));
         }
-    }
-    if value.is_number() {
-        let boxed = alloc_heap_number(heap, value.to_bits())?;
-        return Ok(CompressedValue(boxed.offset() | TAG_BOXED));
     }
     if let Some(raw) = value.as_raw_gc() {
         debug_assert_eq!(raw.0 & TAG_MASK, 0, "cell offset must be 8-aligned");
@@ -123,9 +129,19 @@ pub fn compress(
         IMM_TRUE
     } else if value == Value::FALSE {
         IMM_FALSE
-    } else {
-        debug_assert!(value.is_hole(), "unexpected non-number immediate");
+    } else if value.is_hole() {
         IMM_HOLE
+    } else {
+        if let Some(id) = value.as_function_id() {
+            if id < FUNCTION_ID_LIMIT {
+                return Ok(CompressedValue((id << 3) | TAG_FUNCTION_ID));
+            }
+        }
+        // Doubles, wide int32s, and (vanishingly rare) out-of-range function
+        // ids do not fit a 4-byte slot, so box the full value bits and
+        // reference the box by its offset.
+        let boxed = alloc_heap_number_with_roots(heap, value.to_bits(), external_visit)?;
+        return Ok(CompressedValue(boxed.offset() | TAG_BOXED));
     };
     Ok(CompressedValue(immediate(kind)))
 }
@@ -145,6 +161,7 @@ pub fn decompress(slot: CompressedValue, heap: &otter_gc::GcHeap) -> Value {
             let boxed = unsafe { otter_gc::Gc::from_offset(v & !TAG_MASK) };
             Value::from_bits(read_heap_number(heap, boxed))
         }
+        TAG_FUNCTION_ID => Value::function_id(v >> 3),
         TAG_IMMEDIATE => match v >> 3 {
             IMM_NULL => Value::NULL,
             IMM_TRUE => Value::TRUE,
@@ -204,9 +221,12 @@ mod tests {
             Value::number_f64(f64::NAN),
             Value::object(obj),
             Value::string_gc(body),
+            Value::function_id(0),
+            Value::function_id(42),
+            Value::function_id(FUNCTION_ID_LIMIT - 1),
         ];
         for v in cases {
-            let c = compress(v, &mut heap).expect("compress");
+            let c = compress(v, &mut heap, &mut |_v| {}).expect("compress");
             let back = decompress(c, &heap);
             // Exact bit round-trip (covers NaN, ±0, and int32-vs-double repr).
             assert_eq!(v.to_bits(), back.to_bits(), "{v:?}");
@@ -224,19 +244,23 @@ mod tests {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
-        let cell = compress(Value::object(obj), &mut heap).expect("c");
+        let cell = compress(Value::object(obj), &mut heap, &mut |_v| {}).expect("c");
         assert!(cell.is_gc_offset());
         assert_eq!(cell.gc_offset(), obj.raw().0);
-        let boxed = compress(Value::number_f64(2.5), &mut heap).expect("c");
+        let boxed = compress(Value::number_f64(2.5), &mut heap, &mut |_v| {}).expect("c");
         assert!(boxed.is_gc_offset());
         // Re-pointing to a forwarded offset keeps the kind tag.
         let moved = boxed.with_gc_offset(boxed.gc_offset());
         assert_eq!(moved, boxed);
         assert!(
-            !compress(Value::number_i32(3), &mut heap)
+            !compress(Value::number_i32(3), &mut heap, &mut |_v| {})
                 .unwrap()
                 .is_gc_offset()
         );
-        assert!(!compress(Value::null(), &mut heap).unwrap().is_gc_offset());
+        assert!(
+            !compress(Value::null(), &mut heap, &mut |_v| {})
+                .unwrap()
+                .is_gc_offset()
+        );
     }
 }

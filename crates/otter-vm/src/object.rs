@@ -72,6 +72,7 @@ use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use crate::proxy::JsProxy;
 use crate::string::{JsString, to_utf16_vec};
 use crate::symbol::JsSymbol;
+use crate::value::compressed::{CompressedValue, compress, decompress};
 use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -334,23 +335,27 @@ impl SlotData {
         self,
         heap: &mut GcHeap,
         obj: &mut JsObject,
-    ) -> Result<(SlotMeta, Value), otter_gc::OutOfMemory> {
+    ) -> Result<(SlotMeta, CompressedValue), otter_gc::OutOfMemory> {
         match self.kind {
-            SlotKind::Data => Ok((
-                SlotMeta {
-                    flags: self.flags,
-                    is_accessor: false,
-                },
-                self.value,
-            )),
+            SlotKind::Data => {
+                let compressed = compress_rooted(heap, obj, self.value)?;
+                Ok((
+                    SlotMeta {
+                        flags: self.flags,
+                        is_accessor: false,
+                    },
+                    compressed,
+                ))
+            }
             SlotKind::Accessor(pair) => {
                 let cell = alloc_accessor_cell(heap, obj, pair.getter, pair.setter)?;
+                let compressed = compress_rooted(heap, obj, cell)?;
                 Ok((
                     SlotMeta {
                         flags: self.flags,
                         is_accessor: true,
                     },
-                    cell,
+                    compressed,
                 ))
             }
         }
@@ -495,13 +500,13 @@ pub struct ObjectBody {
     /// offset, so every own data slot has the same inline path regardless of
     /// slot number. `null` means the object currently has no string-keyed
     /// slots.
-    values_ptr: *mut Value,
+    values_ptr: *mut CompressedValue,
     /// Contiguous string-keyed own-property values, indexed by shape slot
     /// offset. A data slot stores its `[[Value]]` directly; an accessor slot
     /// stores a handle to its [`AccessorCellBody`]. Slot flags and data/accessor
     /// kind live in the shape for ordinary shaped objects, or in materialized
     /// metadata for dictionary/attribute-overridden objects.
-    values: Vec<Value>,
+    values: Vec<CompressedValue>,
     /// Fallback/dictionary identity used only when [`Self::shape`] is null.
     /// Fast shaped objects keep this as [`ShapeId::UNASSIGNED`] so allocation
     /// does not need per-object unique metadata; conversion to dictionary mode
@@ -640,15 +645,21 @@ const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 const _: () = assert!(std::mem::size_of::<ObjectBody>() == 72);
 
 impl ObjectBody {
-    /// Read the data value for string-keyed slot `i` from flat storage.
+    /// Read and decompress the data value for string-keyed slot `i`.
     #[inline]
-    fn data_value(&self, i: usize) -> Value {
+    fn data_value(&self, heap: &otter_gc::GcHeap, i: usize) -> Value {
+        decompress(self.values[i], heap)
+    }
+
+    /// Read the raw compressed slot `i` without decompressing.
+    #[inline]
+    fn data_slot(&self, i: usize) -> CompressedValue {
         self.values[i]
     }
 
-    /// Write the data value for string-keyed slot `i` into flat storage.
+    /// Write a pre-compressed data value into string-keyed slot `i`.
     #[inline]
-    fn set_data_value(&mut self, i: usize, value: Value) {
+    fn set_data_value(&mut self, i: usize, value: CompressedValue) {
         self.values[i] = value;
     }
 
@@ -659,7 +670,7 @@ impl ObjectBody {
     /// also pushes `meta` onto its per-slot metadata vector so it stays
     /// index-aligned with the value array. For an accessor slot `value` is the
     /// [`AccessorCellBody`] handle produced by [`SlotData::into_flat`].
-    fn push_slot(&mut self, index: usize, meta: SlotMeta, value: Value) {
+    fn push_slot(&mut self, index: usize, meta: SlotMeta, value: CompressedValue) {
         debug_assert_eq!(self.values.len(), index, "value slab append desynced");
         self.values.push(value);
         self.refresh_values_ptr();
@@ -685,7 +696,7 @@ impl ObjectBody {
         &mut self,
         i: usize,
         meta: SlotMeta,
-        value: Value,
+        value: CompressedValue,
         attr_shape: Option<ShapeHandle>,
     ) {
         self.set_data_value(i, value);
@@ -736,7 +747,7 @@ impl ObjectBody {
     fn slot_data(&self, heap: &otter_gc::GcHeap, i: usize) -> SlotData {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
         if is_accessor {
-            let (getter, setter) = read_accessor_cell(heap, self.data_value(i));
+            let (getter, setter) = read_accessor_cell(heap, self.data_value(heap, i));
             SlotData {
                 flags,
                 kind: SlotKind::accessor(getter, setter),
@@ -746,7 +757,7 @@ impl ObjectBody {
             SlotData {
                 flags,
                 kind: SlotKind::Data,
-                value: self.data_value(i),
+                value: self.data_value(heap, i),
             }
         }
     }
@@ -755,7 +766,7 @@ impl ObjectBody {
     fn slot_lookup_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyLookup {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
         if is_accessor {
-            let (getter, setter) = read_accessor_cell(heap, self.data_value(i));
+            let (getter, setter) = read_accessor_cell(heap, self.data_value(heap, i));
             return PropertyLookup::Accessor {
                 getter,
                 setter,
@@ -763,7 +774,7 @@ impl ObjectBody {
             };
         }
         PropertyLookup::Data {
-            value: self.data_value(i),
+            value: self.data_value(heap, i),
             flags,
         }
     }
@@ -772,7 +783,7 @@ impl ObjectBody {
     fn slot_descriptor_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyDescriptor {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
         if is_accessor {
-            let (getter, setter) = read_accessor_cell(heap, self.data_value(i));
+            let (getter, setter) = read_accessor_cell(heap, self.data_value(heap, i));
             return PropertyDescriptor {
                 flags,
                 kind: DescriptorKind::Accessor { getter, setter },
@@ -781,7 +792,7 @@ impl ObjectBody {
         PropertyDescriptor {
             flags,
             kind: DescriptorKind::Data {
-                value: self.data_value(i),
+                value: self.data_value(heap, i),
             },
         }
     }
@@ -1018,8 +1029,28 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // Trace cells in place so the moving scavenger rewrites the live slot,
         // not a copy; an accessor cell traces its own getter/setter through its
         // `Traceable` impl.
-        for value in self.values.iter() {
-            value.trace_value_slots(v);
+        for (i, slot) in self.values.iter().enumerate() {
+            if !slot.is_gc_offset() {
+                continue;
+            }
+            // The slab's mutable base; the collector rewrites slots in place, so
+            // route writes through the body's own `*mut` rather than a pointer
+            // derived from this shared borrow. `values_ptr` tracks `values` and
+            // never reallocates during a trace (no slot is pushed here).
+            // SAFETY: `i < values.len()`, so `values_ptr.add(i)` is in bounds.
+            let word = unsafe { self.values_ptr.add(i) };
+            if slot.0 & 0b111 == 0 {
+                // Cell ref: the compressed word is the bare 8-aligned offset, so
+                // it is itself a `RawGc` slot the collector rewrites in place.
+                v(word.cast::<RawGc>());
+            } else {
+                // Boxed number: forward the offset through a temporary, then
+                // re-apply the slot tag to the live word.
+                let mut tmp = RawGc(slot.gc_offset());
+                v(&mut tmp);
+                // SAFETY: `word` is the live slab slot with mut provenance.
+                unsafe { *word = slot.with_gc_offset(tmp.0) };
+            }
         }
         // Boxed exotic slots holding GC edges. Traced in place through the box
         // reference so the moving collector rewrites the live slots, not a copy.
@@ -1152,6 +1183,13 @@ pub(crate) fn alloc_object_with_shape_roots(
 /// Initialize a freshly allocated shaped object with the values for every
 /// hidden-class data slot, in shape order.
 pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, values: &[Value]) {
+    let mut obj = obj;
+    // Compress (boxing any double) before borrowing the body, rooting `obj`
+    // across each box allocation.
+    let compressed: Vec<CompressedValue> = values
+        .iter()
+        .map(|&value| compress_or_abort(heap, &mut obj, value))
+        .collect();
     let expected = heap.read_payload(obj, |body| body_property_count(heap, body));
     heap.with_payload(obj, |body| {
         debug_assert!(
@@ -1164,15 +1202,15 @@ pub(crate) fn initialize_shaped_data_slots(obj: JsObject, heap: &mut GcHeap, val
         );
         debug_assert_eq!(
             expected,
-            values.len(),
+            compressed.len(),
             "shape slot count and init value count diverged"
         );
-        for (index, value) in values.iter().copied().enumerate() {
+        for (index, &value) in compressed.iter().enumerate() {
             body.push_slot(index, SlotMeta::data_default(), value);
         }
     });
-    for value in values {
-        heap.record_write(obj, value);
+    for &value in &compressed {
+        record_slot_write(heap, obj, value);
     }
 }
 
@@ -1347,7 +1385,7 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
 }
 
 fn apply_mapped_arguments_partial_define(
-    obj: JsObject,
+    mut obj: JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
@@ -1375,6 +1413,7 @@ fn apply_mapped_arguments_partial_define(
     if descriptor.writable == Some(false) {
         if descriptor.value.is_none() {
             let current = read_upvalue(heap, cell);
+            let compressed = compress_or_abort(heap, &mut obj, current);
             if let Some(offset) = existing_offset {
                 let is_data_slot = heap.read_payload(obj, |body| {
                     (usize::from(offset) < body_property_count(heap, body))
@@ -1382,9 +1421,9 @@ fn apply_mapped_arguments_partial_define(
                 });
                 if is_data_slot {
                     heap.with_payload(obj, |body| {
-                        body.set_data_value(offset as usize, current);
+                        body.set_data_value(offset as usize, compressed);
                     });
-                    heap.record_write(obj, &current);
+                    record_slot_write(heap, obj, compressed);
                 }
             }
         }
@@ -1426,7 +1465,7 @@ pub(crate) fn data_value_at(obj: JsObject, heap: &otter_gc::GcHeap, slot: u16) -
     heap.read_payload(obj, |body| {
         let i = slot as usize;
         if i < body_property_count(heap, body) && !body.slot_attrs(heap, i).1 {
-            body.data_value(i)
+            body.data_value(heap, i)
         } else {
             Value::undefined()
         }
@@ -1582,7 +1621,7 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
         body_offset_of(heap, body, key).map(|offset| {
             let i = offset as usize;
             if !body.slot_attrs(heap, i).1 {
-                body.data_value(i)
+                body.data_value(heap, i)
             } else {
                 Value::undefined()
             }
@@ -1770,7 +1809,7 @@ pub(crate) fn load_own_data_slot_atom(
                 !body.slot_attrs(heap, offset).1,
                 "baked data slot resolved to an accessor"
             );
-            return Some(body.data_value(offset));
+            return Some(body.data_value(heap, offset));
         }
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
             return Some(read_upvalue(heap, cell));
@@ -1779,7 +1818,7 @@ pub(crate) fn load_own_data_slot_atom(
             return None;
         }
         if !body.slot_attrs(heap, offset).1 {
-            Some(body.data_value(offset))
+            Some(body.data_value(heap, offset))
         } else {
             None
         }
@@ -1797,6 +1836,8 @@ pub(crate) fn store_own_data_slot_atom(
     hit: AtomOwnPropertyHit,
     value: &Value,
 ) -> Option<()> {
+    let mut obj = obj;
+    let compressed = compress_or_abort(heap, &mut obj, *value);
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
     // Shaped receivers match on the interned shape handle (one offset compare,
     // no shape-body deref); dictionary mode falls back to the per-object shape
@@ -1839,7 +1880,7 @@ pub(crate) fn store_own_data_slot_atom(
         if !flags.writable() || is_accessor {
             return false;
         }
-        body.set_data_value(offset, *value);
+        body.set_data_value(offset, compressed);
         true
     });
     if !success {
@@ -1848,7 +1889,7 @@ pub(crate) fn store_own_data_slot_atom(
     if let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, *value);
     }
-    heap.record_write(obj, value);
+    record_slot_write(heap, obj, compressed);
     Some(())
 }
 
@@ -2516,10 +2557,55 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// flag: this path is only used by code that owns the object and
 /// is allowed to seed it (`Error.prototype.message`, etc.).
 ///
+/// Compress `value` for storage in `*obj`'s slab, rooting `obj` across the
+/// box allocation a double or wide int32 triggers. `obj` is updated in place
+/// if that collection relocates it, so callers must use the returned handle
+/// for any subsequent body access.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] from the box allocation.
+fn compress_rooted(
+    heap: &mut otter_gc::GcHeap,
+    obj: &mut JsObject,
+    value: Value,
+) -> Result<CompressedValue, otter_gc::OutOfMemory> {
+    let mut raw = obj.raw();
+    let compressed = compress(value, heap, &mut |visit: &mut dyn FnMut(*mut RawGc)| {
+        visit(&mut raw as *mut RawGc);
+    })?;
+    // SAFETY: `raw` started as `obj`'s offset and the collector only ever
+    // rewrites it to another live `ObjectBody` offset during the box alloc.
+    *obj = unsafe { raw.cast::<ObjectBody>() };
+    Ok(compressed)
+}
+
+/// Like [`compress_rooted`], but aborts on box-allocation OOM. Used by the
+/// infallible store helpers; a 16-byte box that cannot allocate means the
+/// heap is already exhausted.
+fn compress_or_abort(
+    heap: &mut otter_gc::GcHeap,
+    obj: &mut JsObject,
+    value: Value,
+) -> CompressedValue {
+    compress_rooted(heap, obj, value).expect("heap number box allocation")
+}
+
+/// Fire the generational write barrier for a compressed slot just stored into
+/// `obj`. A cell-ref or boxed-number slot establishes an `obj → cell` edge
+/// (the box for a boxed number); small ints and immediates carry no edge.
+fn record_slot_write(heap: &mut otter_gc::GcHeap, obj: JsObject, slot: CompressedValue) {
+    if slot.is_gc_offset() {
+        let cell = Value::from_object_gc(RawGc(slot.gc_offset()));
+        heap.record_write(obj, &cell);
+    }
+}
+
 /// Records the GC store when `value` carries a `Gc<…>` handle so the
 /// marker / scavenger see the new edge.
 pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
-    let barrier_value = value;
+    let mut obj = obj;
+    let compressed = compress_or_abort(heap, &mut obj, value);
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     if let Some(offset) = existing_offset {
         let i = offset as usize;
@@ -2535,9 +2621,9 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
             if is_accessor {
                 body.slots_mut()[i].is_accessor = false;
             }
-            body.set_data_value(i, value);
+            body.set_data_value(i, compressed);
         });
-        heap.record_write(obj, &barrier_value);
+        record_slot_write(heap, obj, compressed);
         return;
     }
     let index = heap.read_payload(obj, |body| body_property_count(heap, body));
@@ -2545,9 +2631,9 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
         body.dictionary_shape_id = next_shape_id();
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
-        body.push_slot(index, SlotMeta::data_default(), value);
+        body.push_slot(index, SlotMeta::data_default(), compressed);
     });
-    heap.record_write(obj, &barrier_value);
+    record_slot_write(heap, obj, compressed);
 }
 
 /// Construction-time data store for callers that already allocated the next
@@ -2563,7 +2649,8 @@ pub(crate) fn set_with_shape(
     next_shape: ShapeHandle,
     append_index: usize,
 ) {
-    let barrier_value = value;
+    let mut obj = obj;
+    let compressed = compress_or_abort(heap, &mut obj, value);
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     if let Some(offset) = existing_offset {
         let i = offset as usize;
@@ -2579,9 +2666,9 @@ pub(crate) fn set_with_shape(
             if is_accessor {
                 body.slots_mut()[i].is_accessor = false;
             }
-            body.set_data_value(i, value);
+            body.set_data_value(i, compressed);
         });
-        heap.record_write(obj, &barrier_value);
+        record_slot_write(heap, obj, compressed);
         return;
     }
     let index = append_index;
@@ -2591,9 +2678,9 @@ pub(crate) fn set_with_shape(
     );
     heap.with_payload(obj, |body| {
         body.shape = next_shape;
-        body.push_slot(index, SlotMeta::data_default(), value);
+        body.push_slot(index, SlotMeta::data_default(), compressed);
     });
-    heap.record_write(obj, &barrier_value);
+    record_slot_write(heap, obj, compressed);
     heap.record_write(obj, &next_shape);
     #[cfg(debug_assertions)]
     debug_assert_appended_shape_slot(obj, heap);
@@ -2951,7 +3038,7 @@ pub fn define_own_property_partial(
     });
     if success {
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
-        heap.record_write(obj, &stored);
+        record_slot_write(heap, obj, stored);
     }
     success
 }
@@ -3002,7 +3089,7 @@ pub(crate) fn define_own_property_partial_with_shape(
     });
     if success {
         apply_mapped_arguments_partial_define(obj, heap, key, descriptor, existing_offset);
-        heap.record_write(obj, &stored);
+        record_slot_write(heap, obj, stored);
         heap.record_write(obj, &next_shape);
         #[cfg(debug_assertions)]
         if existing_offset.is_none() {
@@ -3131,7 +3218,7 @@ pub fn define_own_property(
                 }
             }
         }
-        heap.record_write(obj, &stored);
+        record_slot_write(heap, obj, stored);
     }
     success
 }
@@ -3493,6 +3580,8 @@ pub(crate) fn freeze_with_shape(
 /// outlive the closure scope.
 pub struct Properties<'a> {
     body: &'a ObjectBody,
+    /// Heap used to decompress boxed-number slots during iteration.
+    heap: &'a otter_gc::GcHeap,
     /// `(key, flat slot index, flags, is_accessor)` in ordinary own-key order.
     /// Per-slot attributes are captured at build time (where the hidden class
     /// is reachable through the heap) so iteration needs no further shape walk
@@ -3509,7 +3598,7 @@ impl<'a> Properties<'a> {
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
         self.string_keys.iter().map(|(key, idx, _, is_accessor)| {
             let value = if !*is_accessor {
-                self.body.data_value(*idx)
+                self.body.data_value(self.heap, *idx)
             } else {
                 Value::undefined()
             };
@@ -3540,7 +3629,7 @@ impl<'a> Properties<'a> {
                     return None;
                 }
                 if !*is_accessor {
-                    Some((key.as_str(), self.body.data_value(*idx)))
+                    Some((key.as_str(), self.body.data_value(self.heap, *idx)))
                 } else {
                     None
                 }
@@ -3617,7 +3706,7 @@ impl<'a> Properties<'a> {
                 if values[index].is_none() {
                     seen += 1;
                 }
-                values[index] = Some(self.body.data_value(*idx));
+                values[index] = Some(self.body.data_value(self.heap, *idx));
             } else {
                 return None;
             }
@@ -3813,7 +3902,11 @@ pub fn with_properties<R>(
                 (key, idx, flags, is_accessor)
             })
             .collect();
-        f(Properties { body, string_keys })
+        f(Properties {
+            body,
+            heap,
+            string_keys,
+        })
     })
 }
 

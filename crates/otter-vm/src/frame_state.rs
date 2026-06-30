@@ -58,7 +58,23 @@ pub enum FrameRegisters {
         ptr: *mut Value,
         /// Window length (the callee's register count).
         len: u16,
+        /// Slot index of `ptr` in the flat register stack. Popping the frame
+        /// truncates the stack cursor back to here.
+        base_off: u32,
     },
+}
+
+impl FrameRegisters {
+    /// Slot index of a `Window` in the flat register stack, or `None` for an
+    /// inline-owned buffer.
+    #[inline]
+    #[must_use]
+    pub(crate) fn window_base(&self) -> Option<u32> {
+        match self {
+            FrameRegisters::Owned(_) => None,
+            FrameRegisters::Window { base_off, .. } => Some(*base_off),
+        }
+    }
 }
 
 impl FrameRegisters {
@@ -70,7 +86,7 @@ impl FrameRegisters {
             // SAFETY: a `Window` points at `len` live slots in the reserved flat
             // register stack, valid for the frame's life (the stack never
             // reallocates; the window is popped only when the frame ends).
-            FrameRegisters::Window { ptr, len } => unsafe {
+            FrameRegisters::Window { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr, *len as usize)
             },
         }
@@ -82,7 +98,7 @@ impl FrameRegisters {
         match self {
             FrameRegisters::Owned(v) => v,
             // SAFETY: see `as_slice`; `&mut self` gives exclusive access.
-            FrameRegisters::Window { ptr, len } => unsafe {
+            FrameRegisters::Window { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts_mut(*ptr, *len as usize)
             },
         }
@@ -543,6 +559,40 @@ impl Frame {
             function_id: function.id,
             pc: 0,
             registers: FrameRegisters::Owned(registers),
+            return_register,
+            upvalues,
+            this_value,
+            async_state: None,
+            cold: None,
+            generator_owner: None,
+        }
+    }
+
+    /// Same as [`Self::with_exec_return_upvalues_and_this`] but backs the
+    /// frame's registers with a `Window` into the interpreter's flat register
+    /// stack (`ptr`/`base_off` from [`crate::Interpreter::alloc_reg_window`])
+    /// instead of an inline-owned buffer. The window is pre-zeroed.
+    #[must_use]
+    pub(crate) fn with_exec_window(
+        function: &ExecutableFunction,
+        return_register: Option<u16>,
+        upvalues: UpvalueSpine,
+        this_value: Value,
+        ptr: *mut Value,
+        base_off: u32,
+    ) -> Self {
+        debug_assert!(
+            upvalues.len() >= function.own_upvalue_count as usize,
+            "frame upvalues must include the function's own cells"
+        );
+        Self {
+            function_id: function.id,
+            pc: 0,
+            registers: FrameRegisters::Window {
+                ptr,
+                len: function.register_count,
+                base_off,
+            },
             return_register,
             upvalues,
             this_value,

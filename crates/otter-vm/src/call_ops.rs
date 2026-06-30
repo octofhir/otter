@@ -571,14 +571,27 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let registers = self.draw_registers(function.register_count as usize);
-        let mut new_frame = Frame::with_exec_registers(
-            function,
-            return_register,
-            upvalues,
-            this_for_callee,
-            registers,
-        );
+        let windowed = !function.is_generator && async_state.is_none();
+        let mut new_frame = if windowed {
+            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(
+                function,
+                return_register,
+                upvalues,
+                this_for_callee,
+                ptr,
+                base_off,
+            )
+        } else {
+            let registers = self.draw_registers(function.register_count as usize);
+            Frame::with_exec_registers(
+                function,
+                return_register,
+                upvalues,
+                this_for_callee,
+                registers,
+            )
+        };
         new_frame.async_state = async_state;
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
@@ -2194,9 +2207,13 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let registers = self.draw_registers(function.register_count as usize);
-        let mut new_frame =
-            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
+        let mut new_frame = if function.is_generator {
+            let registers = self.draw_registers(function.register_count as usize);
+            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
+        } else {
+            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(function, None, upvalues, this_for_callee, ptr, base_off)
+        };
         // A closure frame records its instance so the named-function SELF
         // binding inside the body resolves to it (per-instance `.prototype`).
         // Only bodies that actually create a closure can read this back, so a
@@ -2477,9 +2494,13 @@ impl Interpreter {
             this_for_callee,
             &[effective_args],
         )?;
-        let registers = self.draw_registers(function.register_count as usize);
-        let mut new_frame =
-            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers);
+        let mut new_frame = if function.is_generator {
+            let registers = self.draw_registers(function.register_count as usize);
+            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
+        } else {
+            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(function, None, upvalues, this_for_callee, ptr, base_off)
+        };
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);

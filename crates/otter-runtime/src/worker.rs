@@ -239,7 +239,6 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
         // source of truth: it is resynced from `worker` before every allocation
         // (so the alloc keeps it live) and `worker` is refreshed from it after,
         // so no `set` ever writes through a vacated handle.
-        let mut worker_value = Value::object(worker);
         object::set(
             &mut worker,
             ctx.heap_mut(),
@@ -249,7 +248,7 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
         object::set(&mut worker, ctx.heap_mut(), "onmessage", Value::null());
         object::set(&mut worker, ctx.heap_mut(), "onerror", Value::null());
         object::set(&mut worker, ctx.heap_mut(), "onmessageerror", Value::null());
-        worker_value = Value::object(worker);
+        let mut worker_value = Value::object(worker);
         let listeners = ctx.alloc_object_with_roots(&[&worker_value], &[])?;
         worker = worker_value
             .as_object()
@@ -397,9 +396,9 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
             .as_object()
             .expect("worker stays rooted across allocation");
         object::set(&mut worker, ctx.heap_mut(), "removeEventListener", remove);
-        worker_value = Value::object(worker);
 
-        install_worker_poll_timer(ctx, host.clone(), worker)?;
+        install_worker_poll_timer(ctx, host.clone(), &mut worker)?;
+        worker_value = Value::object(worker);
         Ok(worker_value)
     });
     NativeCall::Dynamic(call)
@@ -545,9 +544,9 @@ fn worker_drain_call(host: Arc<WorkerHostState>) -> NativeCall {
 fn install_worker_poll_timer(
     ctx: &mut NativeCtx<'_>,
     host: Arc<WorkerHostState>,
-    mut worker: object::JsObject,
+    worker: &mut object::JsObject,
 ) -> Result<(), NativeError> {
-    let worker_value = Value::object(worker);
+    let worker_value = Value::object(*worker);
     let poll = ctx.native_value_with_captures(
         "__otter_worker_poll",
         smallvec![worker_value],
@@ -614,12 +613,12 @@ fn install_worker_poll_timer(
             smallvec![poll, Value::number_f64(1.0)],
         )
         .map_err(vm_error_to_native)?;
-    worker = ctx
+    *worker = ctx
         .scratch_root(wroot)
         .as_object()
         .expect("worker stays rooted across the timer install");
     ctx.pop_scratch_root_to(wroot);
-    object::set(&mut worker, ctx.heap_mut(), "__otterPoll", token);
+    object::set(worker, ctx.heap_mut(), "__otterPoll", token);
     Ok(())
 }
 

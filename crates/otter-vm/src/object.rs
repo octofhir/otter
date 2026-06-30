@@ -501,7 +501,7 @@ pub struct ObjectBody {
     /// slot number. `null` means the object currently has no string-keyed
     /// slots.
     ///
-    /// Frozen ABI (A2): string-keyed slot `i` lives at **forward** index `i`
+    /// Frozen ABI: string-keyed slot `i` lives at **forward** index `i`
     /// (header-relative, no JSC-style bidirectional butterfly), reached
     /// uniformly through this base whether the slab is inline or spilled. The
     /// base is an **always-current** invariant — refreshed after every move,
@@ -928,7 +928,7 @@ impl ObjectBody {
     /// `values_ptr` uniformly. `null` only for a slotless object.
     ///
     /// This is the **sole** writer of the always-current `values_ptr` base
-    /// invariant (ABI A2): no code path may leave `values_ptr` aimed at a stale
+    /// invariant: no code path may leave `values_ptr` aimed at a stale
     /// buffer once the mutator can observe the body. Every mutation that grows,
     /// shrinks, spills, or relocates the slab calls this; the relocating
     /// scavenger calls it from `trace_slots_safe` after the body memcpy. A
@@ -946,9 +946,9 @@ impl ObjectBody {
         };
     }
 
-    /// Debug verifier for the always-current `values_ptr` base invariant
-    /// (ABI A2): the cached base must equal what [`Self::refresh_values_ptr`]
-    /// would recompute right now. Asserted at every slab access in debug
+    /// Debug verifier for the always-current `values_ptr` base invariant:
+    /// the cached base must equal what [`Self::refresh_values_ptr`] would
+    /// recompute right now. Asserted at every slab access in debug
     /// (compiled out in release) so any new relocation/grow/shrink path that
     /// forgets to refresh fails deterministically under `OTTER_GC_STRESS`
     /// instead of baking a wild JIT load. Reads never run mid-relocation (STW

@@ -52,10 +52,8 @@
 //!
 //! # See also
 //!
-//! - GC architecture plan §2.3, §4.4 (handle survival across
-//!   moves), §5 (generational barrier feeding the remembered set).
-//! - `VM_GC_REDESIGN.md` — the object-granular remembered set that
-//!   replaced the card-table dirty-page header walk.
+//! - [`crate::barrier`] — the generational barrier that feeds the
+//!   object-granular remembered set this scavenger drains.
 
 use std::ptr::NonNull;
 
@@ -82,20 +80,17 @@ pub struct ScavengeStats {
     /// caller around the [`scavenge`] call, not by the scavenge
     /// itself (the pause spans more than the inner work).
     pub minor_pause_ns: u64,
-    /// Dirty cards scanned across all old/large pages this scavenge —
-    /// the W1 input. Becomes the remembered-set entry count once the
-    /// object-granular set replaces the card walk.
+    /// Remembered-set entries scanned this scavenge — the count of old/large
+    /// parents recorded by the barrier as holding an old→young edge.
     pub dirty_cards_scanned: usize,
-    /// Old-space object headers strided during the dirty-card walk —
-    /// the W1 find-cost (re-deriving which object owns a dirty card).
-    /// The object-granular remembered set drives this to zero.
+    /// Old-space object headers strided to re-derive which object owns an
+    /// edge. Holding the parent objects directly keeps this at zero; the
+    /// counter exists to prove no per-page header walk remains.
     pub old_headers_walked: usize,
-    /// Old/large parents re-traced to service dirty cards — the W2
-    /// whole-object re-trace count. Retained by the object-granular
-    /// set (the find-cost goes away, the re-trace stays).
+    /// Remembered parents re-traced whole to evacuate their young children.
     pub objects_retraced: usize,
-    /// Slots visited while re-tracing dirty-card parents — the W2
-    /// magnitude (per-object slot fan-out of the re-trace).
+    /// Slots visited while re-tracing remembered parents — the per-object
+    /// slot fan-out of the re-trace.
     pub slots_scanned: usize,
 }
 
@@ -106,8 +101,8 @@ struct ScavCtx {
     trace_table: NonNull<TraceTable>,
     stats: ScavengeStats,
     /// True only while [`scan_remembered_parents`] is running, so
-    /// [`process_slot`] attributes the slots it visits to the W2
-    /// whole-object re-trace (and not to root / Cheney passes).
+    /// [`process_slot`] attributes the slots it visits to the remembered-parent
+    /// re-trace (and not to root / Cheney passes).
     in_dirty_scan: bool,
     /// The live remembered-set store buffer (the heap's
     /// `remembered_parents`). Drained at the start of the scavenge into a
@@ -258,9 +253,8 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
     // SAFETY: slot is dereferenceable per precondition.
     unsafe {
         if ctx.in_dirty_scan {
-            // Every slot reached here while the dirty-card walk owns the
-            // visitor is a slot of an old parent being re-traced — the W2
-            // per-object fan-out.
+            // Every slot reached here while the remembered-parent scan owns the
+            // visitor is a slot of an old parent being re-traced.
             ctx.stats.slots_scanned += 1;
         }
         let raw = (*slot).0;

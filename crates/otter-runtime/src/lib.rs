@@ -733,14 +733,14 @@ pub struct RuntimeExecutionStats {
     pub gc_minor_cycles: u64,
     /// Cumulative minor-GC pause time, in nanoseconds.
     pub gc_minor_pause_ns_total: u64,
-    /// Cumulative dirty cards scanned across all minor GCs (W1 input).
+    /// Cumulative remembered-set entries scanned across all minor GCs.
     pub gc_minor_dirty_cards_scanned: u64,
-    /// Cumulative old-space headers strided during dirty-card walks
-    /// (W1 find-cost — driven to zero by the object-granular set).
+    /// Cumulative old-space headers strided to re-derive edge owners; zero
+    /// once the parents are held directly (proves no per-page header walk).
     pub gc_minor_old_headers_walked: u64,
-    /// Cumulative old/large parents re-traced for dirty cards (W2).
+    /// Cumulative remembered parents re-traced across all minor GCs.
     pub gc_minor_objects_retraced: u64,
-    /// Cumulative slots visited re-tracing dirty-card parents (W2).
+    /// Cumulative slots visited re-tracing remembered parents.
     pub gc_minor_slots_scanned: u64,
 }
 

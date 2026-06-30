@@ -35,14 +35,9 @@
 //!   by the number of distinct mutated old parents, not write count.
 //! - The card table (`mark_card` / `card_bitmap`) is **not** touched
 //!   by the live minor-GC path anymore. It remains in `page.rs` only
-//!   as the frozen-JIT barrier ABI surface (`JitGcBarrierLayout`);
-//!   the JIT is off this session and will be re-pointed at the
-//!   remembered-set insert sequence when it re-enables (ABI A9).
-//!
-//! # See also
-//!
-//! - GC architecture plan §5 (write barriers).
-//! - `VM_GC_REDESIGN.md` — the object-granular remembered set.
+//!   as the frozen-JIT barrier ABI surface (`JitGcBarrierLayout`); the
+//!   JIT is off and will be re-pointed at the remembered-set insert
+//!   sequence when it re-enables.
 
 use crate::compressed::{RawGc, cage_base};
 use crate::header::{GcHeader, MarkColor};

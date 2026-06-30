@@ -29,13 +29,14 @@ use crate::{
     ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue, PendingBindFunction,
     PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
-    bootstrap_collections, collections_prototype, date, descriptor_value, function_metadata, math,
+    bootstrap_collections, cache_ir, collections_prototype, date, descriptor_value,
+    function_metadata, math,
     native_function::VmIntrinsicFunction,
     number,
     operand_decode::{const_operand, register_operand},
     promise_dispatch,
     property_atom::AtomizedPropertyKey,
-    property_ic::{LoadPropertyIc, PropertyIcKind},
+    property_ic::PropertyIcKind,
     read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
     symbol_prototype, weak_refs, write_register,
@@ -2099,7 +2100,7 @@ impl Interpreter {
         }
         let mut hit_value: Option<Value> = None;
         for ic in self.load_property_ics[site].entries() {
-            if let Some(value) = ic.load(obj, &self.gc_heap, key) {
+            if let Some(value) = ic.run_load(obj, &self.gc_heap, key) {
                 hit_value = Some(value);
                 break;
             }
@@ -2116,7 +2117,7 @@ impl Interpreter {
                 .record_uncached_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
         }
         if !self.load_property_ics[site].is_megamorphic()
-            && let Some((ic, value)) = LoadPropertyIc::install_candidate(obj, &self.gc_heap, key)
+            && let Some((ic, value)) = cache_ir::CacheStub::install_load(obj, &self.gc_heap, key)
         {
             self.load_property_ics[site].install_with_stats(
                 &mut self.property_ic_stats,

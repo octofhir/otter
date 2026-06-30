@@ -69,6 +69,7 @@ pub mod bootstrap_regexp;
 pub mod bootstrap_typed_array;
 pub mod bootstrap_weak_refs;
 pub mod bound_function;
+pub mod cache_ir;
 pub mod class_constructor;
 pub mod dynamic_import;
 pub mod error_classes;
@@ -692,7 +693,7 @@ pub struct Interpreter {
     /// Monomorphic `LoadProperty` inline caches keyed by
     /// dense executable IC site id. These are interpreter-local
     /// hints and never affect bytecode dumps or JS-visible semantics.
-    load_property_ics: Vec<property_ic::PropertyIcEntry<property_ic::LoadPropertyIc>>,
+    load_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
     /// Monomorphic `StoreProperty` inline caches keyed by
     /// dense executable IC site id. These only cover ordinary own writable
     /// data slots; every miss falls back to full `[[Set]]` semantics.
@@ -3060,10 +3061,12 @@ impl Interpreter {
                     self.load_property_ics
                         .get(site)
                         .and_then(|e| match e.entries() {
-                            [property_ic::LoadPropertyIc::OwnData { hit }] => Some((
-                                hit.shape.offset(),
-                                u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
-                            )),
+                            [stub] => stub.own_data_hit().map(|hit| {
+                                (
+                                    hit.shape.offset(),
+                                    u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
+                                )
+                            }),
                             _ => None,
                         })
                 }

@@ -28,11 +28,11 @@ use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, SuperReadKey, Value,
     VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
-    binary, collections_prototype, descriptor_value, function_metadata,
+    binary, cache_ir, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, object,
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
-    property_ic::{HasPropertyIc, LoadPropertyIc, PropertyIcKind, StorePropertyIc},
+    property_ic::{HasPropertyIc, PropertyIcKind, StorePropertyIc},
     read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
     write_register,
 };
@@ -3211,7 +3211,7 @@ impl Interpreter {
         {
             let mut hit_value: Option<Value> = None;
             for ic in self.load_property_ics[site].entries() {
-                if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
+                if let Some(value) = ic.run_load(obj, &self.gc_heap, atomized_key) {
                     hit_value = Some(value);
                     break;
                 }
@@ -3240,7 +3240,7 @@ impl Interpreter {
             }
             if !self.load_property_ics[site].is_megamorphic()
                 && let Some((ic, value)) =
-                    LoadPropertyIc::install_candidate(obj, &self.gc_heap, atomized_key)
+                    cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
             {
                 self.load_property_ics[site].install_with_stats(
                     &mut self.property_ic_stats,
@@ -3299,7 +3299,7 @@ impl Interpreter {
         }
         let mut hit_value: Option<Value> = None;
         for ic in self.load_property_ics[site].entries() {
-            if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
+            if let Some(value) = ic.run_load(obj, &self.gc_heap, atomized_key) {
                 hit_value = Some(value);
                 break;
             }
@@ -3320,7 +3320,7 @@ impl Interpreter {
         }
         if !self.load_property_ics[site].is_megamorphic()
             && let Some((ic, value)) =
-                LoadPropertyIc::install_candidate(obj, &self.gc_heap, atomized_key)
+                cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
         {
             self.load_property_ics[site].install_with_stats(
                 &mut self.property_ic_stats,
@@ -3433,10 +3433,10 @@ impl Interpreter {
             return 0;
         }
         for ic in self.load_property_ics[site].entries() {
-            if let LoadPropertyIc::OwnData { hit } = ic
+            if let Some(hit) = ic.own_data_hit()
                 && hit.shape.offset() == recv_shape
                 && hit.atom_id == atomized_key.atom().id()
-                && object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, *hit).is_some()
+                && object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, hit).is_some()
             {
                 let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
                 return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
@@ -4065,7 +4065,7 @@ impl Interpreter {
             let entries = self.load_property_ics[site].entries();
             let mut hit_value: Option<Value> = None;
             for ic in entries {
-                if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
+                if let Some(value) = ic.run_load(obj, &self.gc_heap, atomized_key) {
                     hit_value = Some(value);
                     break;
                 }
@@ -4094,7 +4094,7 @@ impl Interpreter {
             }
             if !site_disabled
                 && let Some((ic, value)) =
-                    LoadPropertyIc::install_candidate(obj, &self.gc_heap, atomized_key)
+                    cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
             {
                 self.load_property_ics[site].install_with_stats(
                     &mut self.property_ic_stats,

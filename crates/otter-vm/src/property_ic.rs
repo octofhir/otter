@@ -7,7 +7,6 @@
 //! exceeds the PIC capacity.
 //!
 //! # Contents
-//! - [`LoadPropertyIc`] — own/direct-prototype data-slot load cache.
 //! - [`StorePropertyIc`] — existing-own-slot and guarded store-
 //!   transition cache.
 //! - [`HasPropertyIc`] — own/direct-prototype presence cache.
@@ -294,23 +293,6 @@ impl PropertyIcEntry<StorePropertyIc> {
     }
 }
 
-/// Monomorphic `LoadProperty` cache for ordinary data slots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoadPropertyIc {
-    /// Receiver owns the data slot.
-    OwnData {
-        /// Guarded receiver slot metadata.
-        hit: AtomOwnPropertyHit,
-    },
-    /// Receiver's direct prototype owns the data slot.
-    DirectPrototypeData {
-        /// Receiver shape observed before walking to `[[Prototype]]`.
-        receiver_shape_id: ShapeId,
-        /// Guarded direct-prototype slot metadata.
-        hit: AtomOwnPropertyHit,
-    },
-}
-
 /// Monomorphic `HasProperty` cache for ordinary data-property presence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HasPropertyIc {
@@ -434,113 +416,6 @@ impl HasPropertyIc {
         let (proto_hit, proto_lookup) = object::lookup_own_slot(proto, heap, &key_name);
         if let (Some(hit), object::PropertyLookup::Data { .. }) = (proto_hit, proto_lookup) {
             return Some(Self::direct_prototype_data(receiver_shape_id, key, hit));
-        }
-        None
-    }
-}
-
-impl LoadPropertyIc {
-    /// Create an own-data IC from an atom-aware object lookup hit.
-    #[must_use]
-    pub(crate) const fn own_data(hit: AtomOwnPropertyHit) -> Self {
-        Self::OwnData { hit }
-    }
-
-    /// Create a direct-prototype data IC.
-    #[must_use]
-    pub(crate) const fn direct_prototype_data(
-        receiver_shape_id: ShapeId,
-        hit: AtomOwnPropertyHit,
-    ) -> Self {
-        Self::DirectPrototypeData {
-            receiver_shape_id,
-            hit,
-        }
-    }
-
-    /// `true` when this own-data IC applies to the current receiver/key pair.
-    #[must_use]
-    pub(crate) fn matches_own_data(
-        self,
-        shape_id: ShapeId,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<AtomOwnPropertyHit> {
-        let Self::OwnData { hit } = self else {
-            return None;
-        };
-        (hit.shape_id == shape_id && hit.atom_id == key.atom().id()).then_some(hit)
-    }
-
-    /// Direct-prototype IC metadata when the receiver shape/key guard matches.
-    #[must_use]
-    pub(crate) fn direct_prototype_hit(
-        self,
-        receiver_shape_id: ShapeId,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<AtomOwnPropertyHit> {
-        let Self::DirectPrototypeData {
-            receiver_shape_id: cached_receiver_shape_id,
-            hit,
-        } = self
-        else {
-            return None;
-        };
-        (cached_receiver_shape_id == receiver_shape_id && hit.atom_id == key.atom().id())
-            .then_some(hit)
-    }
-
-    /// Replay this IC against an ordinary object receiver.
-    #[must_use]
-    pub(crate) fn load(
-        self,
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<Value> {
-        let receiver_shape_id = object::shape_id(obj, heap);
-        if let Some(hit) = self.matches_own_data(receiver_shape_id, key)
-            && let Some(value) = object::load_own_data_slot_atom(obj, heap, key, hit)
-        {
-            return Some(value);
-        }
-        if let Some(hit) = self.direct_prototype_hit(receiver_shape_id, key)
-            && let Some(proto) = object::prototype(obj, heap)
-            && object::supports_fast_property_ic(proto, heap)
-        {
-            return object::load_own_data_slot_atom(proto, heap, key, hit);
-        }
-        None
-    }
-
-    /// Build a load IC candidate for the current receiver/key pair.
-    #[must_use]
-    pub(crate) fn install_candidate(
-        obj: JsObject,
-        heap: &otter_gc::GcHeap,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<(Self, Value)> {
-        if !object::supports_fast_property_ic(obj, heap) {
-            return None;
-        }
-        let receiver_shape_id = object::shape_id(obj, heap);
-        let atom_lookup = object::lookup_own_atom(obj, heap, key);
-        if let (Some(hit), object::PropertyLookup::Data { value, flags: _ }) =
-            (atom_lookup.hit, atom_lookup.lookup)
-        {
-            return Some((Self::own_data(hit), value));
-        }
-        if atom_lookup.hit.is_some() {
-            return None;
-        }
-        let proto = object::prototype(obj, heap)?;
-        if !object::supports_fast_property_ic(proto, heap) {
-            return None;
-        }
-        let proto_lookup = object::lookup_own_atom(proto, heap, key);
-        if let (Some(hit), object::PropertyLookup::Data { value, flags: _ }) =
-            (proto_lookup.hit, proto_lookup.lookup)
-        {
-            return Some((Self::direct_prototype_data(receiver_shape_id, hit), value));
         }
         None
     }
@@ -681,10 +556,7 @@ impl StorePropertyIc {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        HasPropertyIc, LoadPropertyIc, PropertyIcEntry, PropertyIcKind, PropertyIcStats,
-        StorePropertyIc,
-    };
+    use super::{HasPropertyIc, PropertyIcEntry, PropertyIcKind, PropertyIcStats, StorePropertyIc};
     use crate::object::{self, PropertyDescriptor};
     use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
     use crate::{JsString, Value};
@@ -797,12 +669,12 @@ mod tests {
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
         let (ic, value) =
-            LoadPropertyIc::install_candidate(receiver, &heap, key("x")).expect("load ic");
+            crate::cache_ir::CacheStub::install_load(receiver, &heap, key("x")).expect("load ic");
         assert_eq!(value, Value::boolean(true));
 
         assert!(object::delete(proto, &mut heap, "y"));
 
-        assert_eq!(ic.load(receiver, &heap, key("x")), None);
+        assert_eq!(ic.run_load(receiver, &heap, key("x")), None);
     }
 
     #[test]

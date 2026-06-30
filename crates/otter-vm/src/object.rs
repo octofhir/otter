@@ -657,12 +657,29 @@ pub(crate) const OBJECT_BODY_VALUES_PTR_OFFSET: usize =
 /// prototype handle here to chase the prototype chain in machine code.
 pub(crate) const OBJECT_BODY_JIT_PROTO_OFFSET: usize = std::mem::offset_of!(ObjectBody, jit_proto);
 
-// The JIT bakes these offsets into emitted property loads; pin them.
+/// Byte offset of the in-body inline slab [`ObjectBody::inline_values`]. The
+/// JIT bakes the inline `New` store sequence (and an inline read for a small
+/// object whose `slab_len <= INLINE_SLOT_CAP`) against this offset.
+pub(crate) const OBJECT_BODY_INLINE_VALUES_OFFSET: usize =
+    std::mem::offset_of!(ObjectBody, inline_values);
+
+/// Byte offset of the [`ObjectBody::slab_len`] counter. The JIT reads it to
+/// branch inline-vs-overflow and to bounds-check an inline slot store.
+pub(crate) const OBJECT_BODY_SLAB_LEN_OFFSET: usize = std::mem::offset_of!(ObjectBody, slab_len);
+
+// The JIT bakes these offsets into emitted property loads, the inline `New`
+// store sequence, and the deopt frame-state record, so they are a frozen ABI:
+// pin every one to its EXACT value (not `>=` / `%`) so an accidental field
+// reorder is a compile error rather than a frozen JIT baking garbage. Update
+// these literals deliberately, in lockstep with the JIT, when the body changes.
 const _: () = assert!(OBJECT_BODY_SHAPE_OFFSET == 0);
-const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET >= 8);
+const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET == 8);
+const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET == 52);
+const _: () = assert!(OBJECT_BODY_INLINE_VALUES_OFFSET == 72);
+const _: () = assert!(OBJECT_BODY_SLAB_LEN_OFFSET == 80);
+// The shape guard word must sit at offset 0 (single-compare guard) and the
+// slab base must stay 8-aligned for the JIT's pointer load.
 const _: () = assert!(OBJECT_BODY_VALUES_PTR_OFFSET.is_multiple_of(8));
-const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET >= 8);
-const _: () = assert!(OBJECT_BODY_JIT_PROTO_OFFSET.is_multiple_of(4));
 
 // Pin the hot object footprint. Per-slot metadata lives out of line only for
 // dictionary-mode / attribute-overridden objects, while string-keyed values use

@@ -385,36 +385,44 @@ impl FrameSnapshot {
 
 /// Build the [`IcSiteState`] DTO from one stored
 /// [`crate::property_ic::PropertyIcEntry`] holding a
-/// [`crate::property_ic::LoadPropertyIc`].
+/// [`crate::cache_ir::CacheStub`].
 #[must_use]
 pub(crate) fn snapshot_load_state(
-    entry: &crate::property_ic::PropertyIcEntry<crate::property_ic::LoadPropertyIc>,
+    entry: &crate::property_ic::PropertyIcEntry<crate::cache_ir::CacheStub>,
 ) -> IcSiteState {
-    use crate::property_ic::{LoadPropertyIc, PropertyIcEntry};
+    use crate::property_ic::PropertyIcEntry;
     match entry {
         PropertyIcEntry::Empty => IcSiteState::Empty,
         PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
         PropertyIcEntry::Polymorphic { entries, misses } => {
             let mapped = entries
                 .iter()
-                .map(|ic| match ic {
-                    LoadPropertyIc::OwnData { hit } => IcEntrySnapshot {
-                        variant: IcEntryVariant::OwnData,
-                        receiver_shape_id: hit.shape_id.raw(),
-                        key: None,
-                        slot: Some(hit.slot),
-                        to_shape_id: None,
-                    },
-                    LoadPropertyIc::DirectPrototypeData {
-                        receiver_shape_id,
-                        hit,
-                    } => IcEntrySnapshot {
-                        variant: IcEntryVariant::DirectPrototypeData,
-                        receiver_shape_id: receiver_shape_id.raw(),
-                        key: None,
-                        slot: Some(hit.slot),
-                        to_shape_id: None,
-                    },
+                .map(|ic| {
+                    if let Some(hit) = ic.own_data_hit() {
+                        IcEntrySnapshot {
+                            variant: IcEntryVariant::OwnData,
+                            receiver_shape_id: hit.shape_id.raw(),
+                            key: None,
+                            slot: Some(hit.slot),
+                            to_shape_id: None,
+                        }
+                    } else if let Some((receiver_shape_id, hit)) = ic.direct_prototype_load() {
+                        IcEntrySnapshot {
+                            variant: IcEntryVariant::DirectPrototypeData,
+                            receiver_shape_id: receiver_shape_id.raw(),
+                            key: None,
+                            slot: Some(hit.slot),
+                            to_shape_id: None,
+                        }
+                    } else {
+                        IcEntrySnapshot {
+                            variant: IcEntryVariant::OwnData,
+                            receiver_shape_id: 0,
+                            key: None,
+                            slot: None,
+                            to_shape_id: None,
+                        }
+                    }
                 })
                 .collect();
             IcSiteState::Polymorphic {

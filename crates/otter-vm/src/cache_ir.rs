@@ -1,0 +1,237 @@
+//! One inline-cache representation shared by every property opcode.
+//!
+//! A cache stub is a short linear program — a sequence of [`CacheOp`] guards
+//! and loads over a small operand file, plus per-stub "data" (shape ids and
+//! resolved own-property hits) the ops reference by index rather than bake in.
+//! One [`CacheStub`] shape serves `LoadProperty`, `HasProperty`, and
+//! `StoreProperty`: the guard ops are identical and only the terminal op (and
+//! the executor entry point) differ. This is the contract a later optimizing
+//! JIT lowers, so the interpreter and the JIT never describe the same cache
+//! twice (the divergence class that produced the compiled-tier crash).
+//!
+//! # Contents
+//!
+//! - [`CacheOp`] — the guard/load opcodes.
+//! - [`CacheStub`] — an op sequence plus its referenced shape ids and hits.
+//! - executor entry points: [`CacheStub::run_load`], [`CacheStub::run_has`],
+//!   [`CacheStub::run_store`].
+//!
+//! # Invariants
+//!
+//! - Operand `0` is always the receiver; `1` is the receiver's prototype once a
+//!   [`CacheOp::LoadPrototype`] has run. No op reads an operand before it is
+//!   defined (guaranteed by the builders).
+//! - Shapes referenced by stub data are interned and immortal (rooted by the
+//!   transition tables, pinned in non-moving old space), so the stored
+//!   [`crate::object::ShapeId`]/hit metadata never dangles.
+
+use smallvec::SmallVec;
+
+use crate::object::{self, AtomOwnPropertyHit, ShapeId};
+use crate::property_atom::AtomizedPropertyKey;
+use crate::{JsObject, Value};
+
+/// Operand slot in a stub's tiny register file. `0` is the receiver; `1` is the
+/// receiver's prototype after [`CacheOp::LoadPrototype`].
+type OperandId = u8;
+
+/// A single guard or load in a cache stub. Data-bearing ops carry an index into
+/// the owning [`CacheStub`]'s `shape_ids` / `hits` tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheOp {
+    /// Guard that `operands[obj]`'s hidden-class id equals `shape_ids[shape]`.
+    GuardShapeId {
+        /// Operand whose shape is guarded.
+        obj: OperandId,
+        /// Index into the stub's `shape_ids`.
+        shape: u8,
+    },
+    /// Load `operands[obj]`'s `[[Prototype]]` into `operands[dst]`. Fails the
+    /// stub when there is no prototype or it is not fast-IC compatible.
+    LoadPrototype {
+        /// Operand to read the prototype of.
+        obj: OperandId,
+        /// Operand to write the prototype into.
+        dst: OperandId,
+    },
+    /// Terminal (load): produce the data value at `hits[hit]` on
+    /// `operands[obj]`, validating the slot's shape/atom/key guard.
+    LoadDataSlotResult {
+        /// Operand holding the object that owns the slot.
+        obj: OperandId,
+        /// Index into the stub's `hits`.
+        hit: u8,
+    },
+}
+
+/// A cache stub: a linear op program plus the data its ops reference.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CacheStub {
+    /// The guard/load program, run in order against operand `0` (the receiver).
+    ops: SmallVec<[CacheOp; 4]>,
+    /// Receiver / prototype shape ids guarded by [`CacheOp::GuardShapeId`].
+    shape_ids: SmallVec<[ShapeId; 1]>,
+    /// Atom-aware own-property hits consumed by load terminals.
+    hits: SmallVec<[AtomOwnPropertyHit; 1]>,
+}
+
+impl CacheStub {
+    /// Own-data load: receiver owns the slot.
+    #[must_use]
+    pub(crate) fn load_own_data(hit: AtomOwnPropertyHit) -> Self {
+        let mut ops = SmallVec::new();
+        ops.push(CacheOp::LoadDataSlotResult { obj: 0, hit: 0 });
+        Self {
+            ops,
+            hits: SmallVec::from_elem(hit, 1),
+            ..Self::default()
+        }
+    }
+
+    /// Direct-prototype data load: the receiver's prototype owns the slot. The
+    /// receiver shape is guarded before the prototype hop so a transitioned
+    /// receiver re-resolves.
+    #[must_use]
+    pub(crate) fn load_direct_prototype_data(
+        receiver_shape_id: ShapeId,
+        hit: AtomOwnPropertyHit,
+    ) -> Self {
+        let mut ops = SmallVec::new();
+        ops.push(CacheOp::GuardShapeId { obj: 0, shape: 0 });
+        ops.push(CacheOp::LoadPrototype { obj: 0, dst: 1 });
+        ops.push(CacheOp::LoadDataSlotResult { obj: 1, hit: 0 });
+        Self {
+            ops,
+            shape_ids: SmallVec::from_elem(receiver_shape_id, 1),
+            hits: SmallVec::from_elem(hit, 1),
+        }
+    }
+
+    /// Resolve operand `idx`, where `0` is the receiver and `1` is the
+    /// prototype once loaded.
+    #[inline]
+    fn operand(operands: &[Option<JsObject>; 2], idx: OperandId) -> Option<JsObject> {
+        operands.get(idx as usize).copied().flatten()
+    }
+
+    /// Run the shared guard prefix, resolving operands; returns the operand file
+    /// on success or `None` on any guard miss.
+    #[inline]
+    fn run_guards(&self, recv: JsObject, heap: &otter_gc::GcHeap) -> Option<[Option<JsObject>; 2]> {
+        let mut operands: [Option<JsObject>; 2] = [Some(recv), None];
+        for op in &self.ops {
+            match *op {
+                CacheOp::GuardShapeId { obj, shape } => {
+                    let obj = Self::operand(&operands, obj)?;
+                    if object::shape_id(obj, heap) != self.shape_ids[shape as usize] {
+                        return None;
+                    }
+                }
+                CacheOp::LoadPrototype { obj, dst } => {
+                    let obj = Self::operand(&operands, obj)?;
+                    let proto = object::prototype(obj, heap)?;
+                    if !object::supports_fast_property_ic(proto, heap) {
+                        return None;
+                    }
+                    operands[dst as usize] = Some(proto);
+                }
+                // Terminals are handled by the per-kind executors below.
+                CacheOp::LoadDataSlotResult { .. } => break,
+            }
+        }
+        Some(operands)
+    }
+
+    /// Execute as a `LoadProperty` cache. `None` on a miss.
+    #[must_use]
+    pub(crate) fn run_load(
+        &self,
+        recv: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<Value> {
+        // Fast path for the common monomorphic own-data stub: the receiver owns
+        // the slot, so skip the operand file and run the single load terminal
+        // directly (its own shape/atom guard validates the hit).
+        if let [CacheOp::LoadDataSlotResult { obj: 0, hit: 0 }] = self.ops.as_slice() {
+            return object::load_own_data_slot_atom(recv, heap, key, self.hits[0]);
+        }
+        let operands = self.run_guards(recv, heap)?;
+        let CacheOp::LoadDataSlotResult { obj, hit } = self.ops.last().copied()? else {
+            return None;
+        };
+        let obj = Self::operand(&operands, obj)?;
+        object::load_own_data_slot_atom(obj, heap, key, self.hits[hit as usize])
+    }
+
+    /// Build a `LoadProperty` stub for the current receiver/key pair, returning
+    /// the stub and the value it would have loaded. `None` when the access is
+    /// not IC-eligible.
+    #[must_use]
+    pub(crate) fn install_load(
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<(Self, Value)> {
+        if !object::supports_fast_property_ic(obj, heap) {
+            return None;
+        }
+        let receiver_shape_id = object::shape_id(obj, heap);
+        let atom_lookup = object::lookup_own_atom(obj, heap, key);
+        if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
+            (atom_lookup.hit, atom_lookup.lookup)
+        {
+            return Some((Self::load_own_data(hit), value));
+        }
+        if atom_lookup.hit.is_some() {
+            return None;
+        }
+        let proto = object::prototype(obj, heap)?;
+        if !object::supports_fast_property_ic(proto, heap) {
+            return None;
+        }
+        let proto_lookup = object::lookup_own_atom(proto, heap, key);
+        if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
+            (proto_lookup.hit, proto_lookup.lookup)
+        {
+            return Some((
+                Self::load_direct_prototype_data(receiver_shape_id, hit),
+                value,
+            ));
+        }
+        None
+    }
+
+    /// The own-data hit when this is a single-op own-data load stub. Lets the
+    /// compiled-call plan and devtools read the resolved slot without
+    /// re-deriving it.
+    #[must_use]
+    pub(crate) fn own_data_hit(&self) -> Option<AtomOwnPropertyHit> {
+        match (self.ops.as_slice(), self.hits.as_slice()) {
+            ([CacheOp::LoadDataSlotResult { obj: 0, hit: 0 }], [hit]) => Some(*hit),
+            _ => None,
+        }
+    }
+
+    /// The `(receiver shape id, prototype hit)` of a direct-prototype data load
+    /// stub, for devtools rendering.
+    #[must_use]
+    pub(crate) fn direct_prototype_load(&self) -> Option<(ShapeId, AtomOwnPropertyHit)> {
+        match (
+            self.ops.as_slice(),
+            self.shape_ids.as_slice(),
+            self.hits.as_slice(),
+        ) {
+            (
+                [
+                    CacheOp::GuardShapeId { obj: 0, shape: 0 },
+                    CacheOp::LoadPrototype { obj: 0, dst: 1 },
+                    CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
+                ],
+                [shape_id],
+                [hit],
+            ) => Some((*shape_id, *hit)),
+            _ => None,
+        }
+    }
+}

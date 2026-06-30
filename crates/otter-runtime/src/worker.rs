@@ -624,45 +624,81 @@ fn install_worker_poll_timer(
 
 fn dispatch_event_object(
     ctx: &mut NativeCtx<'_>,
-    worker: object::JsObject,
-    event: object::JsObject,
+    mut worker: object::JsObject,
+    mut event: object::JsObject,
 ) -> Result<(), NativeError> {
-    let ty = object::get(event, ctx.heap(), "type")
-        .and_then(|value| value.as_string(ctx.heap()))
-        .map(|s| s.to_lossy_string(ctx.heap()))
-        .unwrap_or_default();
-    let handler_key = format!("on{ty}");
-    let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
-    let listeners = worker_event_listeners(ctx, worker, &ty);
-    let exec = ctx
-        .interp_mut_and_context()
-        .1
-        .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
-    if handler.is_callable() {
-        let (interp, _) = ctx.interp_mut_and_context();
-        interp
-            .run_callable_sync(
+    let worker_root = ctx.push_scratch_root(Value::object(worker));
+    let event_root = ctx.push_scratch_root(Value::object(event));
+    let result = (|| {
+        let ty = object::get(event, ctx.heap(), "type")
+            .and_then(|value| value.as_string(ctx.heap()))
+            .map(|s| s.to_lossy_string(ctx.heap()))
+            .unwrap_or_default();
+        let handler_key = format!("on{ty}");
+        let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
+        let listeners = worker_event_listeners(ctx, worker, &ty);
+        let exec = ctx
+            .interp_mut_and_context()
+            .1
+            .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
+        if handler.is_callable() {
+            let handler_root = ctx.push_scratch_root(handler);
+            worker = ctx
+                .scratch_root(worker_root)
+                .as_object()
+                .expect("worker stays rooted across event dispatch");
+            event = ctx
+                .scratch_root(event_root)
+                .as_object()
+                .expect("event stays rooted across event dispatch");
+            let handler = ctx.scratch_root(handler_root);
+            let (interp, _) = ctx.interp_mut_and_context();
+            let call_result = interp.run_callable_sync(
                 &exec,
                 &handler,
                 Value::object(worker),
                 smallvec![Value::object(event)],
-            )
-            .map_err(vm_error_to_native)?;
-    }
-    for listener in listeners {
-        if listener.is_callable() {
-            let (interp, _) = ctx.interp_mut_and_context();
-            interp
-                .run_callable_sync(
+            );
+            worker = ctx
+                .scratch_root(worker_root)
+                .as_object()
+                .expect("worker stays rooted across event dispatch");
+            event = ctx
+                .scratch_root(event_root)
+                .as_object()
+                .expect("event stays rooted across event dispatch");
+            ctx.pop_scratch_root_to(handler_root);
+            call_result.map_err(vm_error_to_native)?;
+        }
+        let mut listener_roots = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            listener_roots.push(ctx.push_scratch_root(listener));
+        }
+        for listener_root in listener_roots {
+            let listener = ctx.scratch_root(listener_root);
+            if listener.is_callable() {
+                worker = ctx
+                    .scratch_root(worker_root)
+                    .as_object()
+                    .expect("worker stays rooted across event dispatch");
+                event = ctx
+                    .scratch_root(event_root)
+                    .as_object()
+                    .expect("event stays rooted across event dispatch");
+                let (interp, _) = ctx.interp_mut_and_context();
+                let call_result = interp.run_callable_sync(
                     &exec,
                     &listener,
                     Value::object(worker),
                     smallvec![Value::object(event)],
-                )
-                .map_err(vm_error_to_native)?;
+                );
+                call_result.map_err(vm_error_to_native)?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    ctx.pop_scratch_root_to(worker_root);
+    result
 }
 
 fn worker_listener_store(

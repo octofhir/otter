@@ -3,8 +3,9 @@
 //! Every GC-managed allocation in the cage starts with a
 //! [`GcHeader`]. The header is 8 bytes — a u8 type tag, an atomic
 //! u8 flag byte (mark color, young flag, forwarded flag, pinned
-//! flag), 2 reserved bytes, and a u32 size — chosen to fit in a
-//! single cache-line fetch alongside the object's first field.
+//! flag, swept flag, remembered flag), 2 reserved bytes, and a u32
+//! size — chosen to fit in a single cache-line fetch alongside the
+//! object's first field.
 //!
 //! # Contents
 //!
@@ -57,6 +58,21 @@ const FLAG_PINNED: u8 = 0b0001_0000;
 /// `clear_mark` (which only touches the color bits) so the drop is
 /// idempotent across GC cycles.
 const FLAG_SWEPT: u8 = 0b0010_0000;
+
+/// Set on an old/large parent once it has been recorded in the per-isolate
+/// remembered set after an old→young store. This is the dedup bit for the
+/// object-granular remembered set (JSC `CellState`): the barrier pushes a
+/// parent into the store buffer at most once between scavenges, and the
+/// scavenge that consumes the buffer clears the bit before re-tracing so a
+/// parent that still holds an old→young edge after evacuation is re-pushed.
+/// Outside the mark-color mask, so it survives [`GcHeader::clear_mark`].
+const FLAG_REMEMBERED: u8 = 0b0100_0000;
+
+/// The remembered-set dedup bit within the [`GcHeader`] flag byte
+/// ([`HEADER_FLAGS_BYTE_OFFSET`]). Exposed as a frozen constant so the future
+/// JIT can lower the generational barrier as `load parent.flags; test
+/// REMEMBERED_FLAG; if old ∧ young-child ∧ ¬remembered → cold-call push`.
+pub const REMEMBERED_FLAG: u8 = FLAG_REMEMBERED;
 
 /// Tri-color marker state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +243,28 @@ impl GcHeader {
     #[inline]
     pub fn set_swept(&self) {
         self.flags.fetch_or(FLAG_SWEPT, Ordering::Release);
+    }
+
+    /// True iff this old/large parent is currently recorded in the
+    /// remembered set (see [`FLAG_REMEMBERED`]). Drives the barrier's
+    /// dedup: a parent already in the set is not pushed again.
+    #[inline]
+    pub fn is_remembered(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & FLAG_REMEMBERED != 0
+    }
+
+    /// Record that this parent is now in the remembered set.
+    #[inline]
+    pub fn set_remembered(&self) {
+        self.flags.fetch_or(FLAG_REMEMBERED, Ordering::Release);
+    }
+
+    /// Clear the remembered bit. Called by the scavenge that consumes the
+    /// store buffer, before re-tracing, so a parent that still holds an
+    /// old→young edge after evacuation is re-pushed for the next scavenge.
+    #[inline]
+    pub fn clear_remembered(&self) {
+        self.flags.fetch_and(!FLAG_REMEMBERED, Ordering::Release);
     }
 
     /// Returns true iff the object is pinned (future compactor

@@ -148,6 +148,15 @@ pub struct GcHeap {
     large_space: LargeObjectSpace,
     trace_table: TraceTable,
     marking: MarkingState,
+    /// Object-granular remembered set: the per-isolate store buffer of
+    /// mutated **old/large parents** that hold an old→young edge. Fed by
+    /// the write barrier (deduped by `GcHeader` `FLAG_REMEMBERED`) and
+    /// consumed as additional roots by every minor scavenge, replacing the
+    /// card-table dirty-page header walk. Holds in-cage `RawGc` parent
+    /// offsets only; old/large objects do not move on a minor GC, so the
+    /// offsets stay valid across the scavenge that drains them. A full GC
+    /// prunes dead parents from it after sweep.
+    remembered_parents: Vec<RawGc>,
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
     /// LIFO stack of runtime-owned root sources. A stack — not a
@@ -265,6 +274,7 @@ impl GcHeap {
             large_space: LargeObjectSpace::new(),
             trace_table: TraceTable::new(),
             marking: MarkingState::new(),
+            remembered_parents: Vec::new(),
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
             extra_roots: Vec::new(),
@@ -1008,8 +1018,9 @@ impl GcHeap {
             // — the scavenger walks them directly.
             if placed_in_old {
                 let marking = &mut self.marking;
+                let remembered = &mut self.remembered_parents;
                 T::trace_slots(payload_ptr, &mut |slot| {
-                    crate::barrier::write_barrier(header_ptr, *slot, marking);
+                    crate::barrier::write_barrier(header_ptr, *slot, marking, remembered);
                 });
             }
         }
@@ -1165,12 +1176,13 @@ impl GcHeap {
             // frames, collection buffers); the barrier marks the card of
             // `header_ptr`, never of the slot.
             let marking = &mut self.marking;
+            let remembered = &mut self.remembered_parents;
             T::trace_slots(payload_ptr, &mut |slot| {
                 // SAFETY (inherited from the enclosing block): `slot`
                 // points into the just-written payload's reachable
                 // storage; `header_ptr` is the freshly initialised
                 // parent header.
-                crate::barrier::write_barrier(header_ptr, *slot, marking);
+                crate::barrier::write_barrier(header_ptr, *slot, marking, remembered);
             });
         }
         let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
@@ -1272,12 +1284,12 @@ impl GcHeap {
             crate::scavenger::scavenge(
                 &mut self.new_space,
                 &mut self.old_space,
-                &mut self.large_space,
                 &self.trace_table,
                 &[],
                 &mut combined,
                 &ephemeron_registry_slots,
                 &weak_registry_slots,
+                &mut self.remembered_parents,
             )
         };
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
@@ -1721,6 +1733,26 @@ impl GcHeap {
                 });
             }
         }
+        // Prune the remembered set to parents that survived this full GC.
+        // The embedded pre-mark scavenge (`start_incremental_mark_phase`)
+        // repopulated the buffer with the live old→young edges among
+        // survivors, but mark-sweep may then free some of those parents as
+        // unreachable. A dead parent left in the buffer would dangle once
+        // `reap_dead_pages` frees its page and the cage offset is reused, so
+        // drop every entry whose header did not survive the mark (and clear
+        // its now-meaningless remembered bit). Runs before the reap, while
+        // every header is still walkable.
+        self.remembered_parents.retain(|raw| {
+            // SAFETY: STW pause; `raw` is an in-cage old/large parent offset
+            // recorded by the barrier; its header is live until the reap below.
+            let header = unsafe { cage_base().add(raw.0 as usize) as *const GcHeader };
+            if unsafe { (*header).is_marked() } {
+                true
+            } else {
+                unsafe { (*header).clear_remembered() };
+                false
+            }
+        });
         // Reap pages whose live bytes is zero.
         let _ = self.old_space.reap_dead_pages();
         let _ = self.large_space.reap_dead_pages();
@@ -1783,7 +1815,12 @@ impl GcHeap {
         let parent_header = parent.as_header_ptr();
         // SAFETY: parent is non-null and live.
         unsafe {
-            crate::barrier::write_barrier(parent_header, child.raw(), &mut self.marking);
+            crate::barrier::write_barrier(
+                parent_header,
+                child.raw(),
+                &mut self.marking,
+                &mut self.remembered_parents,
+            );
         }
     }
 
@@ -1816,7 +1853,12 @@ impl GcHeap {
         let parent_header = parent.as_header_ptr();
         // SAFETY: parent is non-null and live.
         unsafe {
-            crate::barrier::write_barrier(parent_header, child, &mut self.marking);
+            crate::barrier::write_barrier(
+                parent_header,
+                child,
+                &mut self.marking,
+                &mut self.remembered_parents,
+            );
         }
     }
 

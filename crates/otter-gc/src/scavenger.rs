@@ -13,9 +13,11 @@
 //! # Algorithm
 //!
 //! 1. Walk root slots — evacuate any from-space target.
-//! 2. Walk every dirty card on every old-space page; trace each
-//!    object overlapping the card and evacuate young children.
-//!    Clear the card bits.
+//! 2. Re-trace the remembered parents — the old/large objects the
+//!    write barrier recorded as holding an old→young edge — and
+//!    evacuate their young children. The parents are held directly
+//!    (object-granular remembered set), so there is no dirty-page
+//!    header walk to re-derive owners.
 //! 3. Cheney scan: walk to-space pages and freshly-promoted
 //!    bytes in old-space pages; trace each newly-copied object
 //!    and evacuate children. Iterate until convergence.
@@ -51,15 +53,17 @@
 //! # See also
 //!
 //! - GC architecture plan §2.3, §4.4 (handle survival across
-//!   moves), §5 (generational barrier feeding card table).
+//!   moves), §5 (generational barrier feeding the remembered set).
+//! - `VM_GC_REDESIGN.md` — the object-granular remembered set that
+//!   replaced the card-table dirty-page header walk.
 
 use std::ptr::NonNull;
 
 use crate::compressed::{RawGc, cage_base};
 use crate::header::GcHeader;
 use crate::heap::RootSlotVisitor;
-use crate::page::{CARD_SIZE, CELL_SIZE, PAGE_HEADER_SIZE, Page, PageHeader, SpaceKind, align_up};
-use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
+use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, Page, SpaceKind, align_up};
+use crate::space::{NewSpace, OldSpace};
 use crate::trace::TraceTable;
 
 /// Promote after this many surviving scavenges. V8 uses 1.
@@ -99,13 +103,17 @@ pub struct ScavengeStats {
 struct ScavCtx {
     new_space: NonNull<NewSpace>,
     old_space: NonNull<OldSpace>,
-    large_space: NonNull<LargeObjectSpace>,
     trace_table: NonNull<TraceTable>,
     stats: ScavengeStats,
-    /// True only while [`scan_old_dirty_cards`] is running, so
+    /// True only while [`scan_remembered_parents`] is running, so
     /// [`process_slot`] attributes the slots it visits to the W2
     /// whole-object re-trace (and not to root / Cheney passes).
     in_dirty_scan: bool,
+    /// The live remembered-set store buffer (the heap's
+    /// `remembered_parents`). Drained at the start of the scavenge into a
+    /// local snapshot; [`remember_parent`] pushes fresh old→young parents
+    /// here so they survive to the next scavenge.
+    remembered: NonNull<Vec<RawGc>>,
 }
 
 impl ScavCtx {
@@ -116,9 +124,9 @@ impl ScavCtx {
     }
 
     #[inline]
-    fn large_space(&mut self) -> &mut LargeObjectSpace {
-        // SAFETY: STW pause + single-mutator invariant.
-        unsafe { self.large_space.as_mut() }
+    fn remembered(&mut self) -> &mut Vec<RawGc> {
+        // SAFETY: STW pause; the heap owns the buffer for the scavenge.
+        unsafe { self.remembered.as_mut() }
     }
 
     #[inline]
@@ -152,12 +160,12 @@ impl ScavCtx {
 pub unsafe fn scavenge(
     new_space: &mut NewSpace,
     old_space: &mut OldSpace,
-    large_space: &mut LargeObjectSpace,
     trace_table: &TraceTable,
     root_slots: &[*mut RawGc],
     external_visit: &mut RootSlotVisitor<'_>,
     ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
+    remembered_parents: &mut Vec<RawGc>,
 ) -> ScavengeStats {
     // Promotions can append survivors to old-space pages while processing
     // roots. Snapshot pre-scavenge watermarks so Cheney scans those newly
@@ -167,14 +175,20 @@ pub unsafe fn scavenge(
         .iter()
         .map(|p| p.header().bump_cursor)
         .collect();
+    // Snapshot the remembered parents recorded by the mutator since the last
+    // scavenge, then leave the live buffer empty so `remember_parent` can
+    // re-fill it with the parents that still hold an old→young edge after
+    // this scavenge — exactly the card model's "snapshot dirty cards, clear
+    // them, re-dirty survivors", but object-granular and find-cost-free.
+    let snapshot_remembered: Vec<RawGc> = std::mem::take(remembered_parents);
     let mut ctx = ScavCtx {
         // SAFETY: borrows are valid for the duration of this fn.
         new_space: unsafe { NonNull::new_unchecked(new_space as *mut _) },
         old_space: unsafe { NonNull::new_unchecked(old_space as *mut _) },
-        large_space: unsafe { NonNull::new_unchecked(large_space as *mut _) },
         trace_table: unsafe { NonNull::new_unchecked(trace_table as *const _ as *mut _) },
         stats: ScavengeStats::default(),
         in_dirty_scan: false,
+        remembered: unsafe { NonNull::new_unchecked(remembered_parents as *mut _) },
     };
 
     // 1) Explicit root slots.
@@ -190,10 +204,12 @@ pub unsafe fn scavenge(
         unsafe { process_slot(&mut *ctx_ptr, slot, None) };
     });
 
-    // 3) Walk dirty cards on old-space pages — every card may
-    // hold old→young pointers.
+    // 3) Re-trace the remembered parents — the old/large objects the
+    // barrier recorded as holding an old→young edge. Replaces the
+    // card-table dirty-page header walk: the parents are in hand, so there
+    // is no O(objects/page) find-cost.
     // SAFETY: STW + raw-pointer state.
-    unsafe { scan_old_dirty_cards(&mut ctx) };
+    unsafe { scan_remembered_parents(&mut ctx, &snapshot_remembered) };
 
     // 4) Cheney scan to-space (and freshly-promoted bytes in
     // old-space) until convergence.
@@ -257,7 +273,7 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
             return; // old / large objects do not move on scavenge.
         }
         if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
-            remember_parent_card_for_young_child(parent_header, header_ptr);
+            remember_parent(ctx, parent_header, header_ptr);
             return; // already evacuated during this scavenge.
         }
         let new_offset = evacuate(ctx, header_ptr);
@@ -265,28 +281,31 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
         ctx.stats.slot_updates += 1;
         // Generational invariant: evacuation itself can mint an
         // old->young edge — the parent may already be old/promoted
-        // while the child was copied to to-space. Without a dirty
-        // card the next scavenge never rescans that edge and the
-        // child dangles after it moves again. Mark the parent's
-        // card, not the slot's card: traced slots can live in
-        // malloc-owned side storage (Box/Vec/SmallVec) outside the
-        // cage, while dirty-card scanning re-traces the whole parent
-        // object.
+        // while the child was copied to to-space. Without remembering
+        // the parent the next scavenge never rescans that edge and the
+        // child dangles after it moves again. Record the parent object,
+        // not the slot: traced slots can live in malloc-owned side
+        // storage (Box/Vec/SmallVec) outside the cage, while re-tracing
+        // the whole parent reaches every slot through the refreshed
+        // slab base.
         let child_header = cage_base().add(new_offset as usize) as *const GcHeader;
-        remember_parent_card_for_young_child(parent_header, child_header);
+        remember_parent(ctx, parent_header, child_header);
     }
 }
 
-/// Re-dirty the card for an old/large parent that still points at a
-/// young child after slot processing. This covers both slots rewritten
-/// by this trace and slots already rewritten to NewTo by an earlier root
-/// pass in the same scavenge.
+/// Record an old/large parent that still points at a young child after
+/// slot processing into the remembered set, so the next scavenge re-traces
+/// it. Covers both slots rewritten by this trace and slots already
+/// rewritten to NewTo by an earlier root pass in the same scavenge.
+/// Deduped by `FLAG_REMEMBERED`: a parent is pushed at most once per
+/// scavenge.
 ///
 /// # Safety
 ///
 /// `parent_header`, when present, and `child_header` must be live heap
 /// object headers under the current STW scavenge.
-unsafe fn remember_parent_card_for_young_child(
+unsafe fn remember_parent(
+    ctx: &mut ScavCtx,
     parent_header: Option<*mut GcHeader>,
     child_header: *const GcHeader,
 ) {
@@ -299,10 +318,15 @@ unsafe fn remember_parent_card_for_young_child(
             return;
         };
         let parent_page = Page::header_of_mut(parent_header as *const u8);
-        if matches!(parent_page.space, SpaceKind::Old | SpaceKind::Large) {
-            let parent_addr = parent_header as usize;
-            let page_base = Page::page_base_of(parent_header as *const u8);
-            parent_page.mark_card(parent_addr - page_base as usize);
+        if matches!(parent_page.space, SpaceKind::Old | SpaceKind::Large)
+            && !(*parent_header).is_remembered()
+        {
+            (*parent_header).set_remembered();
+            // Parent is old/large and in-cage; old objects do not move on a
+            // minor GC, so this offset stays valid until the next scavenge
+            // drains it.
+            let offset = (parent_header as usize - cage_base() as usize) as u32;
+            ctx.remembered().push(RawGc(offset));
         }
     }
 }
@@ -518,84 +542,46 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
     }
 }
 
-/// Walk every dirty card on every old-space page. Each card is
-/// 512 B wide; objects whose body intersects a dirty card may
-/// hold old→young pointers and must be re-traced.
+/// Re-trace the remembered parents — the old/large objects the write
+/// barrier (and the prior scavenge's re-dirty path) recorded as holding an
+/// old→young edge. Each is a root for the young collection: re-tracing it
+/// in full reaches every slot through the refreshed slab base, evacuating
+/// any young child.
+///
+/// This replaces the card-table dirty-page header walk. The parents are
+/// held directly (object-granular, JSC/QuickJS model), so there is no
+/// O(objects/page) find-cost — `old_headers_walked` stays zero. The bit is
+/// cleared before re-tracing so a parent that still points young after
+/// evacuation is re-pushed by [`remember_parent`] and survives to the next
+/// scavenge (the object-granular analog of re-dirtying a card).
 ///
 /// # Safety
 ///
-/// STW pause + valid pages.
-unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
+/// STW pause + valid pages; `snapshot` holds in-cage old/large parent
+/// offsets recorded by the barrier since the last scavenge.
+unsafe fn scan_remembered_parents(ctx: &mut ScavCtx, snapshot: &[RawGc]) {
     // SAFETY: per docstring.
     unsafe {
         ctx.in_dirty_scan = true;
-        // Large-object pages take generational write-barrier cards
-        // too (their headers report old); each page holds exactly
-        // one object, so any dirty card re-traces that object.
-        let large_count = ctx.large_space().page_count();
-        for idx in 0..large_count {
-            let base = ctx.large_space().pages()[idx].base_ptr();
-            let page_header = &mut *(base as *mut PageHeader);
-            let mut dirty_cards = 0usize;
-            page_header.for_each_dirty_card(|_, _| dirty_cards += 1);
-            page_header.clear_cards();
-            ctx.stats.dirty_cards_scanned += dirty_cards;
-            if dirty_cards != 0 {
-                let header_ptr = base.add(PAGE_HEADER_SIZE) as *mut GcHeader;
-                // Skip swept corpses: a full-GC sweep drops dead old/large
-                // objects in place (freeing their payload buffers, e.g. a
-                // string `Vec<u16>`) but leaves the header walkable. Tracing
-                // such a corpse would read its freed — and possibly reused —
-                // backing as live GC slots (use-after-free).
-                if (*header_ptr).size_bytes() != 0 && !(*header_ptr).is_swept() {
-                    ctx.stats.objects_retraced += 1;
-                    trace_one(ctx, header_ptr);
-                }
-            }
+        // Clear the remembered bit on every snapshot parent up front so the
+        // re-dirty path during the trace below re-records (and re-sets the
+        // bit on) any parent that still holds an old→young edge.
+        for &parent in snapshot {
+            let header = cage_base().add(parent.0 as usize) as *mut GcHeader;
+            (*header).clear_remembered();
         }
-        let page_count = ctx.old_space().page_count();
-        for idx in 0..page_count {
-            let (base, bump_cursor) = {
-                let page = &ctx.old_space().pages()[idx];
-                (page.base_ptr(), page.header().bump_cursor)
-            };
-            let page_header = &mut *(base as *mut PageHeader);
-            // Snapshot dirty card offsets and clear bits.
-            let mut dirty: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
-            page_header.for_each_dirty_card(|_, off| dirty.push(off));
-            page_header.clear_cards();
-            ctx.stats.dirty_cards_scanned += dirty.len();
-            if dirty.is_empty() {
-                continue;
-            }
-            // Walk every header on the page; if the body
-            // intersects a dirty card, trace it.
-            let mut hoff = PAGE_HEADER_SIZE;
-            while hoff < bump_cursor {
-                let header_ptr = base.add(hoff) as *mut GcHeader;
-                let size = (*header_ptr).size_bytes() as usize;
-                if size == 0 {
-                    break;
-                }
-                // W1 find-cost: every stride re-derives an object owner from
-                // a dirty card the barrier already knew at write time.
-                ctx.stats.old_headers_walked += 1;
-                let body_start = hoff;
-                let body_end = hoff + align_up(size, CELL_SIZE);
-                let overlaps = dirty
-                    .iter()
-                    .any(|&card_off| body_start < card_off + CARD_SIZE && body_end > card_off);
-                // Skip swept corpses: a full-GC sweep drops dead old objects
-                // in place (freeing payload buffers like a string `Vec<u16>`)
-                // but leaves the header on the page for stride-walking. Tracing
-                // a corpse reads its freed/reused backing as live GC slots — the
-                // use-after-free that surfaced as "ab" string units appearing in
-                // a closure's upvalue `Gc` slot during dirty-card scan.
-                if overlaps && !(*header_ptr).is_swept() {
-                    ctx.stats.objects_retraced += 1;
-                    trace_one(ctx, header_ptr);
-                }
-                hoff = body_end;
+        for &parent in snapshot {
+            ctx.stats.dirty_cards_scanned += 1; // remembered-set entries scanned
+            let header = cage_base().add(parent.0 as usize) as *mut GcHeader;
+            // Skip swept corpses: a full-GC sweep drops dead old/large
+            // objects in place (freeing their payload buffers, e.g. a string
+            // `Vec<u16>`) but leaves the header walkable. Tracing such a
+            // corpse would read its freed — and possibly reused — backing as
+            // live GC slots (use-after-free). A full GC also prunes dead
+            // parents from the buffer, so this is belt-and-suspenders.
+            if (*header).size_bytes() != 0 && !(*header).is_swept() {
+                ctx.stats.objects_retraced += 1;
+                trace_one(ctx, header);
             }
         }
         ctx.in_dirty_scan = false;

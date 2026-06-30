@@ -1,18 +1,20 @@
-//! Card-table remembered set: an old → young pointer survives a
-//! scavenge via the dirty-card scan, even when no other root
-//! references the young object. The card returns to clean after
-//! the scavenge.
+//! Object-granular remembered set: an old → young pointer survives a
+//! scavenge because the write barrier records the **parent object** in
+//! the per-isolate store buffer, even when no other root references the
+//! young child. The parent's `FLAG_REMEMBERED` bit is set by the barrier
+//! and cleared by the scavenge that consumes the buffer; it is re-set
+//! while the edge stays old → young and clears once the child promotes.
 //!
-//! Also covers the malloc-owned-slot shape: a traced slot living
-//! behind a `Box` (outside the parent's heap cell) must still
-//! produce a dirty card on the **parent's** page. Computing the
-//! card from the slot address would fabricate a page header in
-//! malloc memory — a wild single-bit write — and the young child
-//! would be reaped because the real parent page stays clean.
+//! Also covers the malloc-owned-slot shape: a traced slot living behind a
+//! `Box` (outside the parent's heap cell) must still cause the parent to
+//! be remembered. The remembered entry is the parent object, never the
+//! slot, so off-page/exotic slots need no in-cage address — the scavenge
+//! re-traces the whole parent and reaches the boxed slot through the
+//! refreshed slab base.
 
 use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
-use otter_gc::{Gc, GcHeap, HandleScope, Page};
+use otter_gc::{Gc, GcHeap, HandleScope};
 
 struct Box1 {
     child: Gc<Box1>,
@@ -28,9 +30,8 @@ impl Traceable for Box1 {
     }
 }
 
-/// Parent whose traced slot lives in malloc memory (behind a
-/// `Box`), mirroring VM bodies like a parked frame's boxed
-/// register file.
+/// Parent whose traced slot lives in malloc memory (behind a `Box`),
+/// mirroring VM bodies like a parked frame's boxed register file.
 struct BoxedSlot {
     child: Box<Gc<Box1>>,
 }
@@ -46,7 +47,7 @@ impl Traceable for BoxedSlot {
 }
 
 #[test]
-fn old_to_young_pointer_survives_via_dirty_card() {
+fn old_to_young_pointer_survives_via_remembered_set() {
     let mut heap = GcHeap::new().expect("heap");
     heap.register_traceable::<Box1>();
 
@@ -78,22 +79,13 @@ fn old_to_young_pointer_survives_via_dirty_card() {
             // Fire the barrier.
             heap.write_barrier(promoted, child);
         }
-        // The page containing the slot must now have a dirty
-        // card.
-        unsafe {
-            let parent_header_ptr = promoted.as_header_ptr() as *const u8;
-            let page_header = Page::header_of(parent_header_ptr);
-            let page_base = Page::page_base_of(parent_header_ptr);
-            let parent_payload_addr =
-                parent_header_ptr as usize + std::mem::size_of::<otter_gc::GcHeader>();
-            let slot_byte_offset = parent_payload_addr - (page_base as usize);
-            assert!(
-                page_header.is_card_dirty(slot_byte_offset),
-                "card not dirty after barrier"
-            );
-        }
+        // The parent must now be recorded in the remembered set.
+        assert!(
+            unsafe { (*promoted.as_header_ptr()).is_remembered() },
+            "parent not remembered after barrier"
+        );
         // Scope still holds parent rooted; child is reachable
-        // ONLY through parent.child via the dirty card.
+        // ONLY through parent.child via the remembered set.
         let _ = local;
         // Hold parent via branded root so it survives scope close.
         // The intentional leak keeps the root live for the
@@ -119,25 +111,20 @@ fn old_to_young_pointer_survives_via_dirty_card() {
     };
     assert!(
         !child_after.is_null(),
-        "child reaped despite dirty-card remembered set"
+        "child reaped despite the remembered set"
     );
 
     // While the child stays YOUNG (evacuated to to-space, not yet
-    // promoted), the scavenge re-dirties the slot's card — dropping
-    // it would lose the old->young edge and dangle the child after
-    // its next move. Once the child promotes (second scavenge), the
-    // edge is old->old and the card stays clean.
+    // promoted), the scavenge re-records the parent — dropping it would
+    // lose the old->young edge and dangle the child after its next move.
+    // Once the child promotes (second scavenge), the edge is old->old and
+    // the parent is left un-remembered.
     unsafe {
-        let page_header = Page::header_of(parent_header as *const u8);
-        let page_base = Page::page_base_of(parent_header as *const u8);
-        let parent_payload_addr =
-            parent_header as usize + std::mem::size_of::<otter_gc::GcHeader>();
-        let slot_byte_offset = parent_payload_addr - (page_base as usize);
         let child_young = (*child_after.as_header_ptr()).is_young();
         assert_eq!(
-            page_header.is_card_dirty(slot_byte_offset),
+            (*parent_header).is_remembered(),
             child_young,
-            "card dirtiness must track the child's generation"
+            "remembered bit must track the child's generation"
         );
     }
     heap.collect_minor(otter_gc::EmptyRoots);
@@ -152,14 +139,9 @@ fn old_to_young_pointer_survives_via_dirty_card() {
             (*child_promoted.as_header_ptr()).is_old(),
             "child promotes on its second scavenge"
         );
-        let page_header = Page::header_of(parent_header as *const u8);
-        let page_base = Page::page_base_of(parent_header as *const u8);
-        let parent_payload_addr =
-            parent_header as usize + std::mem::size_of::<otter_gc::GcHeader>();
-        let slot_byte_offset = parent_payload_addr - (page_base as usize);
         assert!(
-            !page_header.is_card_dirty(slot_byte_offset),
-            "old->old edge keeps the card clean"
+            !(*parent_header).is_remembered(),
+            "old->old edge leaves the parent un-remembered"
         );
     }
 }
@@ -173,8 +155,8 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
     let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
     // Young child, then an old parent whose only reference to the
     // child sits behind a Box (malloc memory). `alloc_old`'s payload
-    // edge barrier must mark the card of the *parent header* — the
-    // slot address is useless for card math.
+    // edge barrier must remember the *parent object* — the slot lives
+    // off-cell and has no in-cage address to record.
     let child = heap.alloc(Box1 { child: Gc::null() }).unwrap();
     let child_local = scope.local(child);
     assert!(unsafe { (*child.as_header_ptr()).is_young() });
@@ -184,19 +166,13 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
         })
         .unwrap();
     assert!(unsafe { (*parent.as_header_ptr()).is_old() });
-    // The parent's page must carry the dirty card.
-    unsafe {
-        let parent_addr = parent.as_header_ptr() as *const u8;
-        let page_header = Page::header_of(parent_addr);
-        let page_base = Page::page_base_of(parent_addr);
-        let byte_offset = parent_addr as usize - page_base as usize;
-        assert!(
-            page_header.is_card_dirty(byte_offset),
-            "alloc_old edge barrier must dirty the parent's card for a boxed slot"
-        );
-    }
+    // The parent must be recorded in the remembered set.
+    assert!(
+        unsafe { (*parent.as_header_ptr()).is_remembered() },
+        "alloc_old edge barrier must remember the parent for a boxed slot"
+    );
     // Drop the direct root; the child stays reachable only through
-    // the old parent's boxed slot via the dirty card.
+    // the old parent's boxed slot via the remembered set.
     let _ = child_local;
     drop(scope);
     otter_gc::with_gc_session(&mut heap, |mut session| {
@@ -215,16 +191,10 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
         Box1::TYPE_TAG,
         "boxed-slot child header clobbered after scavenge"
     );
-    unsafe {
-        let parent_addr = parent.as_header_ptr() as *const u8;
-        let page_header = Page::header_of(parent_addr);
-        let page_base = Page::page_base_of(parent_addr);
-        let byte_offset = parent_addr as usize - page_base as usize;
-        assert!(
-            page_header.is_card_dirty(byte_offset),
-            "boxed-slot edge must re-dirty the parent card while the child remains young"
-        );
-    }
+    assert!(
+        unsafe { (*parent.as_header_ptr()).is_remembered() },
+        "boxed-slot edge must re-remember the parent while the child stays young"
+    );
 
     heap.collect_minor(otter_gc::EmptyRoots);
     let child_after_second = heap.read_payload(parent, |body| *body.child);
@@ -242,19 +212,15 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
             (*child_after_second.as_header_ptr()).is_old(),
             "child promotes on its second scavenge"
         );
-        let parent_addr = parent.as_header_ptr() as *const u8;
-        let page_header = Page::header_of(parent_addr);
-        let page_base = Page::page_base_of(parent_addr);
-        let byte_offset = parent_addr as usize - page_base as usize;
         assert!(
-            !page_header.is_card_dirty(byte_offset),
-            "old->old boxed-slot edge keeps the parent card clean"
+            !(*parent.as_header_ptr()).is_remembered(),
+            "old->old boxed-slot edge leaves the parent un-remembered"
         );
     }
 }
 
 #[test]
-fn old_slot_already_rewritten_to_to_space_redirties_parent_card() {
+fn old_slot_already_rewritten_to_to_space_re_remembers_parent() {
     let mut heap = GcHeap::new().expect("heap");
     heap.register_traceable::<Box1>();
 
@@ -288,9 +254,9 @@ fn old_slot_already_rewritten_to_to_space_redirties_parent_card() {
     }
 
     // Simulate an external root provider that visits an interior slot
-    // before dirty cards are scanned. The root phase rewrites
-    // parent.child to NewTo; the later card scan must still re-dirty
-    // the old parent while that child remains young.
+    // before the remembered parents are scanned. The root phase rewrites
+    // parent.child to NewTo; the later remembered-set scan must still
+    // re-record the old parent while that child remains young.
     let mut external = |visit: &mut dyn FnMut(*mut RawGc)| {
         visit(child_slot);
     };
@@ -307,13 +273,9 @@ fn old_slot_already_rewritten_to_to_space_redirties_parent_card() {
             (*child_after.as_header_ptr()).is_young(),
             "child should still be young after one scavenge"
         );
-        let parent_addr = parent.as_header_ptr() as *const u8;
-        let page_header = Page::header_of(parent_addr);
-        let page_base = Page::page_base_of(parent_addr);
-        let byte_offset = parent_addr as usize - page_base as usize;
         assert!(
-            page_header.is_card_dirty(byte_offset),
-            "old parent card must be re-dirtied when slot already points to NewTo"
+            (*parent.as_header_ptr()).is_remembered(),
+            "old parent must be re-remembered when slot already points to NewTo"
         );
     }
 
@@ -321,7 +283,7 @@ fn old_slot_already_rewritten_to_to_space_redirties_parent_card() {
     let child_after_second = heap.read_payload(parent, |body| body.child);
     assert!(
         !child_after_second.is_null(),
-        "child reaped after already-NewTo edge lost its remembered card"
+        "child reaped after already-NewTo edge lost its remembered parent"
     );
     unsafe {
         assert_eq!(

@@ -1902,6 +1902,12 @@ impl Value {
     #[allow(dead_code)]
     pub fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if is_cell_bits(self.0) {
+            debug_assert_eq!(
+                self.0 >> 32,
+                (otter_gc::cage_base() as u64) >> 32,
+                "trace_value_slots: cell bits {:#x} have a non-cage high word — a foreign 8-byte pointer (Arc/Box) is being traced as a Value",
+                self.0,
+            );
             let slot = &self.0 as *const u64 as *mut otter_gc::raw::RawGc;
             visitor(slot);
         }

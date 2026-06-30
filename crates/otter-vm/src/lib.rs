@@ -6162,6 +6162,41 @@ impl Interpreter {
         self.reg_stack.as_mut_ptr().cast::<u64>()
     }
 
+    /// Reserve a zero-filled `count`-slot window at the top of the flat register
+    /// stack, bumping `reg_top`. Returns the window's base pointer and its slot
+    /// index; the caller stores both in a [`FrameRegisters::Window`] and frees
+    /// the window by truncating `reg_top` back to the base on frame pop.
+    ///
+    /// The stack is pre-reserved and never reallocates (live `Window` frames
+    /// hold raw pointers into it), so an overflow throws a catchable stack
+    /// overflow instead of growing.
+    pub(crate) fn alloc_reg_window(&mut self, count: usize) -> Result<(*mut Value, u32), VmError> {
+        if self.reg_stack.capacity() == 0 {
+            self.reg_stack = vec![Value::undefined(); Self::REG_STACK_CAP];
+        }
+        let base = self.reg_top;
+        let end = base
+            .checked_add(count)
+            .filter(|&e| e <= Self::REG_STACK_CAP)
+            .ok_or(VmError::StackOverflow {
+                limit: Self::REG_STACK_CAP as u32,
+            })?;
+        let window = &mut self.reg_stack[base..end];
+        window.fill(Value::undefined());
+        let ptr = window.as_mut_ptr();
+        self.reg_top = end;
+        Ok((ptr, base as u32))
+    }
+
+    /// Truncate the flat register stack back to `base`, releasing every window
+    /// at or above it. Called when a `Window` frame leaves the stack (return,
+    /// unwind, or generator/async park).
+    #[inline]
+    pub(crate) fn free_reg_window(&mut self, base: u32) {
+        debug_assert!(base as usize <= self.reg_top, "reg window free above top");
+        self.reg_top = base as usize;
+    }
+
     /// Address of `reg_top` (the live extent of the flat register stack, in
     /// slots). Compiled code reads it from `JitCtx.reg_top_ptr` to reserve and
     /// release callee windows.
@@ -6216,9 +6251,13 @@ impl Interpreter {
 
     #[inline]
     pub(crate) fn reclaim_registers(&mut self, frame: &mut Frame) {
-        // Only an inline-owned, heap-spilled window goes back to the pool. A
-        // `Window` frame's registers live in the flat register stack and are
-        // released when its window is popped, not here.
+        // A `Window` frame's registers live in the flat register stack; release
+        // them by truncating the cursor back to the window base.
+        if let Some(base) = frame.registers.window_base() {
+            self.free_reg_window(base);
+            return;
+        }
+        // An inline-owned, heap-spilled buffer goes back to the pool.
         if let crate::frame_state::FrameRegisters::Owned(regs) = &mut frame.registers
             && regs.spilled()
             && self.reg_pool.len() < Self::REG_POOL_CAP
@@ -6899,7 +6938,12 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let previous = self.active_frame_stack;
         self.active_frame_stack = stack as *const HoltStack;
+        // A nested dispatch allocates its frames' register windows above the
+        // caller's flat-stack cursor; restore the cursor on exit so any window
+        // a non-locally-exited sub-frame left behind is released.
+        let saved_reg_top = self.reg_top;
         let result = self.dispatch_loop_tracked(context, stack);
+        self.reg_top = saved_reg_top;
         self.active_frame_stack = previous;
         result
     }

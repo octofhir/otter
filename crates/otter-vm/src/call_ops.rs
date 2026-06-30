@@ -653,14 +653,31 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
-        let registers = self.draw_registers(function.register_count as usize);
-        let mut frame = Frame::with_exec_registers(
-            function,
-            return_register,
-            upvalues,
-            this_for_callee,
-            registers,
-        );
+        // Ordinary calls back their registers with a window into the flat
+        // register stack (one indirection, no per-frame buffer). Generators and
+        // async functions leave the stack (lazy / parked off-stack), so they
+        // keep an inline-owned buffer that survives independent of the cursor.
+        let windowed = !function.is_generator && async_state.is_none();
+        let mut frame = if windowed {
+            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(
+                function,
+                return_register,
+                upvalues,
+                this_for_callee,
+                ptr,
+                base_off,
+            )
+        } else {
+            let registers = self.draw_registers(function.register_count as usize);
+            Frame::with_exec_registers(
+                function,
+                return_register,
+                upvalues,
+                this_for_callee,
+                registers,
+            )
+        };
         frame.async_state = async_state;
         let extras = args.bind_into(function, &mut frame)?;
         if !extras.is_empty() {

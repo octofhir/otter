@@ -45,6 +45,7 @@
 //! - [`docs/book/src/engine/architecture.md`](../../../../docs/book/src/engine/architecture.md)
 //!   — the value-model section.
 
+pub mod compressed;
 pub mod tag;
 
 use crate::array::{ArrayBody, JsArray};

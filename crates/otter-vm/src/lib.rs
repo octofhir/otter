@@ -6899,17 +6899,30 @@ impl Interpreter {
             None
         };
 
+        // Park the entry promise on the scratch root stack: once the
+        // async entry frame settles and is popped, nothing else roots
+        // the handle, so the microtask drain's allocations would leave
+        // a bare local pointing at the promise body's vacated slot.
+        let entry_promise_root = entry_promise.map(|p| self.json_root_push(Value::promise(p)));
+
         let dispatch_result = self.dispatch_loop(context, &mut stack);
         match dispatch_result {
             Ok(value) => {
-                if let Some(promise) = entry_promise {
+                if let Some(root_idx) = entry_promise_root {
                     // Drain microtasks until the entry promise
                     // settles. The settled value (or rejection)
                     // becomes the program's completion value.
                     if let Err(err) = self.drain_microtasks_with_default(Some(context.clone())) {
+                        self.json_root_pop_to(root_idx);
                         return Err((err.error, err.frames));
                     }
-                    match promise.state(&self.gc_heap) {
+                    let promise = self
+                        .json_root_get(root_idx)
+                        .as_promise()
+                        .expect("entry promise stays a promise across the drain");
+                    let state = promise.state(&self.gc_heap);
+                    self.json_root_pop_to(root_idx);
+                    match state {
                         crate::promise::PromiseState::Fulfilled(v) => return Ok(v),
                         crate::promise::PromiseState::Rejected(reason) => {
                             return Err((
@@ -6923,6 +6936,9 @@ impl Interpreter {
                 Ok(value)
             }
             Err(err) => {
+                if let Some(root_idx) = entry_promise_root {
+                    self.json_root_pop_to(root_idx);
+                }
                 let frames = self
                     .pending_uncaught_frames
                     .take()

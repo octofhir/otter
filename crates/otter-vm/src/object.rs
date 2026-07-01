@@ -64,6 +64,7 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 use std::any::Any;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bigint::BigIntValue;
@@ -507,7 +508,7 @@ pub struct ObjectBody {
     /// base is an **always-current** invariant — refreshed after every move,
     /// grow, shrink, or spill ([`Self::refresh_values_ptr`]) and verified at
     /// every slab access in debug ([`Self::values_ptr_is_current`]).
-    values_ptr: *mut CompressedValue,
+    values_ptr: Cell<*mut CompressedValue>,
     /// Contiguous string-keyed own-property values, indexed by shape slot
     /// offset. A data slot stores its `[[Value]]` directly; an accessor slot
     /// stores a handle to its [`AccessorCellBody`]. Slot flags and data/accessor
@@ -715,7 +716,11 @@ impl ObjectBody {
     fn slot_word(&self, i: usize) -> CompressedValue {
         debug_assert!(
             self.values_ptr_is_current(),
-            "stale values_ptr on slab read"
+            "stale values_ptr on slab read: body={:p} values_ptr={:p} expected={:p} slab_len={}",
+            self,
+            self.values_ptr.get(),
+            self.expected_values_ptr(),
+            self.slab_len,
         );
         if self.slab_is_inline() {
             self.inline_values[i]
@@ -816,6 +821,7 @@ impl ObjectBody {
         self.set_data_value(i, value);
         match attr_shape {
             Some(shape) => {
+                debug_assert_object_shape_handle(shape, "slot attribute shape install");
                 self.shape = shape;
                 // A previously overridden object keeps reading from its
                 // materialized metadata, so keep that entry current; a
@@ -937,14 +943,14 @@ impl ObjectBody {
     /// own-data slot, so a stale base is a silently-baked wild load — hence
     /// [`Self::values_ptr_is_current`] verifies it at every slab access in debug.
     #[inline]
-    fn refresh_values_ptr(&mut self) {
-        self.values_ptr = if self.slab_len == 0 {
+    fn refresh_values_ptr(&self) {
+        self.values_ptr.set(if self.slab_len == 0 {
             std::ptr::null_mut()
         } else if self.slab_is_inline() {
-            self.inline_values.as_mut_ptr()
+            self.inline_values.as_ptr().cast_mut()
         } else {
-            self.values.as_mut_ptr()
-        };
+            self.values.as_ptr().cast_mut()
+        });
     }
 
     /// Debug verifier for the always-current `values_ptr` base invariant:
@@ -957,14 +963,18 @@ impl ObjectBody {
     /// so a current pointer here is the steady-state contract, not a race.
     #[inline]
     fn values_ptr_is_current(&self) -> bool {
-        let expected: *const CompressedValue = if self.slab_len == 0 {
+        self.values_ptr.get().cast_const() == self.expected_values_ptr()
+    }
+
+    #[inline]
+    fn expected_values_ptr(&self) -> *const CompressedValue {
+        if self.slab_len == 0 {
             std::ptr::null()
         } else if self.slab_is_inline() {
             self.inline_values.as_ptr()
         } else {
             self.values.as_ptr()
-        };
-        self.values_ptr.cast_const() == expected
+        }
     }
 
     // --- Lazily-boxed exotic slots -----------------------------------------
@@ -1157,10 +1167,12 @@ impl otter_gc::SafeTraceable for ObjectBody {
     ///
     /// The GC-managed shape handle is traced directly; dictionary keys are
     /// owned Rust strings and need no GC tracing.
-    fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
+    fn trace_slots_safe(&mut self, v: &mut SlotVisitor<'_>) {
+        debug_assert_object_shape_handle(self.shape, "object trace entry");
         if !self.shape.is_null() {
-            let p = &self.shape as *const ShapeHandle as *mut RawGc;
+            let p = &mut self.shape as *mut ShapeHandle as *mut RawGc;
             v(p);
+            debug_assert_object_shape_handle(self.shape, "object trace shape slot");
         }
         // The ordinary-object / null prototype lives solely in the flat
         // `jit_proto` handle (null == `[[Prototype]]` null); the moving collector
@@ -1168,7 +1180,7 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // offset. Non-ordinary (Value / Proxy) prototypes live in the boxed
         // `proto_override` and are traced in the exotic block below.
         if !self.jit_proto.is_null() {
-            let p = &self.jit_proto as *const JsObject as *mut RawGc;
+            let p = &mut self.jit_proto as *mut JsObject as *mut RawGc;
             v(p);
         }
         // String-keyed property slots: the value slab holds each slot's data
@@ -1180,13 +1192,8 @@ impl otter_gc::SafeTraceable for ObjectBody {
         // `values_ptr` aimed at the pre-move inline array. Recompute it from the
         // post-move body so both the slot path and a baked JIT load read the live
         // base; the inline slab lives in the body and therefore moves with it.
-        // SAFETY: sole mutation of a non-slot field during trace; the collector
-        // owns the object and holds no aliasing reference across this write.
-        let base = unsafe {
-            let me = (self as *const Self).cast_mut();
-            (*me).refresh_values_ptr();
-            (*me).values_ptr
-        };
+        self.refresh_values_ptr();
+        let base = self.values_ptr.get();
         for i in 0..self.slab_len() {
             // SAFETY: `base` is the live slab base and `i < slab_len`.
             let word = unsafe { base.add(i) };
@@ -1209,40 +1216,40 @@ impl otter_gc::SafeTraceable for ObjectBody {
         }
         // Boxed exotic slots holding GC edges. Traced in place through the box
         // reference so the moving collector rewrites the live slots, not a copy.
-        if let Some(exotic) = self.exotic.as_ref() {
+        if let Some(exotic) = self.exotic.as_mut() {
             // Non-ordinary prototype (Value / Proxy), traced in place.
-            match &exotic.proto_override {
+            match &mut exotic.proto_override {
                 None | Some(ObjectPrototype::Null) | Some(ObjectPrototype::Object(_)) => {}
-                Some(ObjectPrototype::Value(value)) => value.trace_value_slots(v),
-                Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots(v),
+                Some(ObjectPrototype::Value(value)) => value.trace_value_slot_mut(v),
+                Some(ObjectPrototype::Proxy(proxy)) => proxy.trace_value_slots_mut(v),
             }
             // Symbol-keyed own properties (value inline in the slot).
-            for (_sym, slot) in exotic.symbol_props.iter() {
-                match &slot.kind {
-                    SlotKind::Data => slot.value.trace_value_slots(v),
+            for (_sym, slot) in exotic.symbol_props.iter_mut() {
+                match &mut slot.kind {
+                    SlotKind::Data => slot.value.trace_value_slot_mut(v),
                     SlotKind::Accessor(pair) => {
-                        if let Some(g) = &pair.getter {
-                            g.trace_value_slots(v);
+                        if let Some(g) = &mut pair.getter {
+                            g.trace_value_slot_mut(v);
                         }
-                        if let Some(s) = &pair.setter {
-                            s.trace_value_slots(v);
+                        if let Some(s) = &mut pair.setter {
+                            s.trace_value_slot_mut(v);
                         }
                     }
                 }
             }
-            if let Some(native) = &exotic.call_native {
-                native.trace_value_slots(v);
+            if let Some(native) = &mut exotic.call_native {
+                native.trace_value_slot_mut(v);
             }
-            if let Some(native) = &exotic.constructor_native {
-                native.trace_value_slots(v);
+            if let Some(native) = &mut exotic.constructor_native {
+                native.trace_value_slot_mut(v);
             }
             if let Some(data) = exotic
                 .host_data
-                .as_ref()
-                .and_then(|data| data.downcast_ref::<MappedArgumentsData>())
+                .as_mut()
+                .and_then(|data| data.downcast_mut::<MappedArgumentsData>())
             {
-                for entry in data.entries.iter() {
-                    let p = &entry.cell as *const UpvalueCell as *mut RawGc;
+                for entry in data.entries.iter_mut() {
+                    let p = &mut entry.cell as *mut UpvalueCell as *mut RawGc;
                     v(p);
                 }
             }
@@ -1266,10 +1273,16 @@ pub type JsObject = otter_gc::Gc<ObjectBody>;
 /// Maximum prototype-chain hops a property lookup will follow.
 pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 
+/// Register GC layouts that object allocation paths may publish without going
+/// through `GcHeap::alloc<T>`.
+pub(crate) fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
+    heap.register_traceable::<ObjectBody>();
+}
+
 fn empty_object_body() -> ObjectBody {
     ObjectBody {
         shape: ShapeHandle::null(),
-        values_ptr: std::ptr::null_mut(),
+        values_ptr: Cell::new(std::ptr::null_mut()),
         values: Vec::new(),
         inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
         slab_len: 0,
@@ -1283,9 +1296,27 @@ fn empty_object_body() -> ObjectBody {
 }
 
 fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
+    debug_assert_object_shape_handle(shape, "object allocation shape");
     let mut body = empty_object_body();
     body.shape = shape;
     body
+}
+
+fn debug_assert_object_shape_handle(shape: ShapeHandle, context: &str) {
+    if cfg!(debug_assertions) && !shape.is_null() {
+        // SAFETY: debug-only invariant check; a non-null shape handle stored in
+        // ObjectBody must always address a live ShapeBody cell.
+        unsafe {
+            debug_assert_eq!(
+                (*shape.as_header_ptr()).type_tag(),
+                shape_body::SHAPE_BODY_TYPE_TAG,
+                "ObjectBody shape points at non-shape cell during {context}: shape={:?} tag={:#x} swept={}",
+                shape,
+                (*shape.as_header_ptr()).type_tag(),
+                (*shape.as_header_ptr()).is_swept()
+            );
+        }
+    }
 }
 
 fn empty_dictionary_object_body() -> ObjectBody {
@@ -1380,6 +1411,7 @@ pub(crate) fn set_fresh_object_shape(obj: JsObject, heap: &mut GcHeap, shape: Sh
             !shape.is_null(),
             "fast constructor shape install requires a shaped target"
         );
+        debug_assert_object_shape_handle(shape, "fresh object shape install");
         body.shape = shape;
     });
 }
@@ -1429,7 +1461,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     heap.alloc_with_roots(
         ObjectBody {
             shape: ShapeHandle::null(),
-            values_ptr: std::ptr::null_mut(),
+            values_ptr: Cell::new(std::ptr::null_mut()),
             values: Vec::new(),
             inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
             slab_len: 0,
@@ -1457,7 +1489,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
     heap.alloc_with_roots(
         ObjectBody {
             shape,
-            values_ptr: std::ptr::null_mut(),
+            values_ptr: Cell::new(std::ptr::null_mut()),
             values: Vec::new(),
             inline_values: [CompressedValue::default(); INLINE_SLOT_CAP],
             slab_len: 0,
@@ -1651,6 +1683,7 @@ fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
 
 pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u16> {
     if !body.shape.is_null() {
+        debug_assert_object_shape_handle(body.shape, "property offset lookup");
         return shape_body::shape_offset_of_str(heap, body.shape, key)
             .and_then(|offset| u16::try_from(offset).ok());
     }

@@ -140,18 +140,18 @@ fn trace_generator_cold(
 }
 
 fn trace_async_generator_queue(
-    field: &VecDeque<AsyncGeneratorRequest>,
+    field: &mut VecDeque<AsyncGeneratorRequest>,
     visitor: &mut SlotVisitor<'_>,
 ) {
     for request in field {
-        match &request.resume {
+        match &mut request.resume {
             GeneratorResumeKind::Next(value)
             | GeneratorResumeKind::Return(value)
-            | GeneratorResumeKind::Throw(value) => value.trace_value_slots(visitor),
+            | GeneratorResumeKind::Throw(value) => value.trace_value_slot_mut(visitor),
         }
-        request.capability.promise.trace_value_slots(visitor);
-        request.capability.resolve.trace_value_slots(visitor);
-        request.capability.reject.trace_value_slots(visitor);
+        request.capability.promise.trace_value_slot_mut(visitor);
+        request.capability.resolve.trace_value_slot_mut(visitor);
+        request.capability.reject.trace_value_slot_mut(visitor);
     }
 }
 
@@ -231,6 +231,12 @@ impl JsGenerator {
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = &self.inner as *const otter_gc::Gc<GeneratorBody> as *mut RawGc;
+        visitor(p);
+    }
+
+    /// Trace this handle as a mutable root slot.
+    pub(crate) fn trace_value_slots_mut(&mut self, visitor: &mut SlotVisitor<'_>) {
+        let p = &mut self.inner as *mut otter_gc::Gc<GeneratorBody> as *mut RawGc;
         visitor(p);
     }
 

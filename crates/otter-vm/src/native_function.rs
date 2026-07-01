@@ -78,7 +78,7 @@ enum NativeOwnProperty {
 }
 
 impl crate::pelt::PeltField for NativeOwnProperty {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         if let Self::Overridden(desc) = self {
             <PropertyDescriptor as crate::pelt::PeltField>::pelt_trace(desc, visitor);
         }

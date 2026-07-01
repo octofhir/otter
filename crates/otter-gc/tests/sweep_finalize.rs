@@ -18,7 +18,7 @@ struct RegisteredFinalizerBody;
 impl SafeTraceable for RegisteredFinalizerBody {
     const TYPE_TAG: u8 = FINALIZER_REGISTERED_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+    fn trace_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 impl SafeFinalize for RegisteredFinalizerBody {
@@ -32,7 +32,7 @@ struct UnregisteredFinalizerBody;
 impl SafeTraceable for UnregisteredFinalizerBody {
     const TYPE_TAG: u8 = FINALIZER_UNREGISTERED_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+    fn trace_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 impl SafeFinalize for UnregisteredFinalizerBody {

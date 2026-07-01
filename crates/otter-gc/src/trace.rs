@@ -155,7 +155,7 @@ pub trait SafeTraceable: 'static {
     /// Must not allocate or retain the visitor (same contract
     /// as [`Traceable::trace_slots`], minus the pointer-validity
     /// precondition).
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>);
+    fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>);
 
     /// Safe counterpart to [`Traceable::trace_ephemeron_slots`].
     /// Most heap objects are not ephemeron tables and keep this
@@ -261,7 +261,7 @@ impl TraceTable {
         }
         let tag = T::TYPE_TAG as usize;
         if let Some(existing) = self.table[tag] {
-            debug_assert!(
+            assert!(
                 existing as *const () == trace_wrapper::<T> as *const (),
                 "trace tag {tag} already registered with a different fn",
             );

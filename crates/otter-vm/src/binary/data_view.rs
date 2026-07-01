@@ -52,15 +52,15 @@ pub struct DataViewBodyGc {
 impl otter_gc::SafeTraceable for DataViewBodyGc {
     const TYPE_TAG: u8 = DATA_VIEW_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
+    fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         // The backing `JsArrayBuffer` owns its own GC handles
         // (`LocalArrayBufferHandle` / `SharedArrayBufferHandle`);
         // forward the trace so its body survives the cycle.
         self.buffer.trace_value_slots(visitor);
-        if let Some(expando) = &self.expando
+        if let Some(expando) = &mut self.expando
             && !expando.is_null()
         {
-            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
     }

@@ -100,7 +100,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             const TYPE_TAG: u8 = #tag;
 
             fn trace_slots_safe(
-                &self,
+                &mut self,
                 visitor: &mut ::otter_gc::raw::SlotVisitor<'_>,
             ) {
                 #trace_body
@@ -252,7 +252,7 @@ fn field_calls(fields: &Fields) -> Result<Vec<proc_macro2::TokenStream>> {
                     continue;
                 }
                 let name = f.ident.as_ref().expect("named field has ident");
-                let access = quote! { &self.#name };
+                let access = quote! { &mut self.#name };
                 calls.push(emit_field_call(&access, attrs.via.as_ref()));
             }
         }
@@ -263,7 +263,7 @@ fn field_calls(fields: &Fields) -> Result<Vec<proc_macro2::TokenStream>> {
                     continue;
                 }
                 let idx = Index::from(i);
-                let access = quote! { &self.#idx };
+                let access = quote! { &mut self.#idx };
                 calls.push(emit_field_call(&access, attrs.via.as_ref()));
             }
         }

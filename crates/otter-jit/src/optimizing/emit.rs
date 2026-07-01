@@ -3596,6 +3596,9 @@ mod arm64 {
                     )?;
                     dynasm!(ops ; .arch aarch64 ; =>after_live_alloc);
                 }
+                // The argument register indices, packed one per 16-bit lane, are
+                // handed to every method-call stub in a single register.
+                let packed_args = crate::baseline::pack_method_arg_regs(arg_regs);
                 dynasm!(
                     ops
                     ; .arch aarch64
@@ -3605,11 +3608,7 @@ mod arm64 {
                 );
                 emit_load_u64(ops, 3, *site);
                 dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
-                for slot in 0..3 {
-                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
-                    let xn = 5 + slot as u32;
-                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
-                }
+                emit_load_u64(ops, 5, packed_args);
                 emit_load_u64(
                     ops,
                     16,
@@ -3631,11 +3630,7 @@ mod arm64 {
                 emit_load_u64(ops, 2, u64::from(*name));
                 emit_load_u64(ops, 3, *site);
                 dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
-                for slot in 0..3 {
-                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
-                    let xn = 5 + slot as u32;
-                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
-                }
+                emit_load_u64(ops, 5, packed_args);
                 emit_load_u64(
                     ops,
                     16,
@@ -3662,11 +3657,7 @@ mod arm64 {
                 // Pack call-site IC id (high 32) with the name index (low 32).
                 emit_load_u64(ops, 3, (*site << 32) | u64::from(*name));
                 dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
-                for slot in 0..3 {
-                    let arg = arg_regs.get(slot).copied().unwrap_or(0);
-                    let xn = 5 + slot as u32;
-                    dynasm!(ops ; .arch aarch64 ; movz X(xn), arg as u32);
-                }
+                emit_load_u64(ops, 5, packed_args);
                 emit_status_stub_call(
                     ops,
                     jit_call_method_stub_optimizing as *const () as usize,

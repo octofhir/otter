@@ -1,7 +1,7 @@
 //! Field-level helper trait powering [`otter_macros::Pelt`].
 //!
 //! The [`Pelt`](otter_macros::Pelt) derive expands to one
-//! `<FieldTy as PeltField>::pelt_trace(&self.field, visitor)` call per
+//! `<FieldTy as PeltField>::pelt_trace(&mut self.field, visitor)` call per
 //! traced field of a GC body. Each leaf field type implements
 //! [`PeltField`] once; the derive itself never inspects field shapes
 //! beyond looking for the `#[pelt(skip)]` attribute, which suppresses
@@ -48,13 +48,13 @@ use crate::Value;
 /// `Gc<…>` reference owned by `self`.
 pub trait PeltField {
     /// Visit every GC slot reachable through `self`.
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>);
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>);
 }
 
 impl PeltField for Value {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        self.trace_value_slots(visitor);
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.trace_value_slot_mut(visitor);
     }
 }
 
@@ -65,18 +65,18 @@ impl<T: ?Sized> PeltField for otter_gc::Gc<T> {
     /// in place. Null handles are skipped to match the hand-written
     /// guards (`if !handle.is_null() { … }`) the derive replaces.
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         if self.is_null() {
             return;
         }
-        let slot = self as *const otter_gc::Gc<T> as *mut RawGc;
+        let slot = self as *mut otter_gc::Gc<T> as *mut RawGc;
         visitor(slot);
     }
 }
 
 impl<T: PeltField> PeltField for Option<T> {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         if let Some(inner) = self {
             inner.pelt_trace(visitor);
         }
@@ -85,7 +85,7 @@ impl<T: PeltField> PeltField for Option<T> {
 
 impl<T: PeltField> PeltField for Vec<T> {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         for item in self {
             item.pelt_trace(visitor);
         }
@@ -94,7 +94,7 @@ impl<T: PeltField> PeltField for Vec<T> {
 
 impl<T: PeltField, const N: usize> PeltField for [T; N] {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         for item in self {
             item.pelt_trace(visitor);
         }
@@ -103,7 +103,7 @@ impl<T: PeltField, const N: usize> PeltField for [T; N] {
 
 impl<A: smallvec::Array<Item = T>, T: PeltField> PeltField for smallvec::SmallVec<A> {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         for item in self {
             item.pelt_trace(visitor);
         }
@@ -114,8 +114,8 @@ impl<K, V: PeltField, S> PeltField for std::collections::HashMap<K, V, S> {
     /// Walks values only — keys never carry GC slots in current
     /// bodies; if that changes the body owner adds a custom impl.
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in self.values() {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        for value in self.values_mut() {
             value.pelt_trace(visitor);
         }
     }
@@ -123,8 +123,8 @@ impl<K, V: PeltField, S> PeltField for std::collections::HashMap<K, V, S> {
 
 impl<K, V: PeltField, S> PeltField for indexmap::IndexMap<K, V, S> {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in self.values() {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        for value in self.values_mut() {
             value.pelt_trace(visitor);
         }
     }
@@ -132,7 +132,7 @@ impl<K, V: PeltField, S> PeltField for indexmap::IndexMap<K, V, S> {
 
 impl<A: PeltField, B: PeltField> PeltField for (A, B) {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.0.pelt_trace(visitor);
         self.1.pelt_trace(visitor);
     }
@@ -140,7 +140,7 @@ impl<A: PeltField, B: PeltField> PeltField for (A, B) {
 
 impl<A: PeltField, B: PeltField, C: PeltField> PeltField for (A, B, C) {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.0.pelt_trace(visitor);
         self.1.pelt_trace(visitor);
         self.2.pelt_trace(visitor);
@@ -154,12 +154,12 @@ impl<T: ?Sized> PeltField for std::sync::Arc<T> {
     /// value with GC slots inside an `Arc` must reach in through a
     /// hand-written impl rather than this no-op.
     #[inline]
-    fn pelt_trace(&self, _visitor: &mut SlotVisitor<'_>) {}
+    fn pelt_trace(&mut self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 impl<T: PeltField + ?Sized> PeltField for Box<T> {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         (**self).pelt_trace(visitor);
     }
 }
@@ -169,8 +169,8 @@ impl<T: PeltField> PeltField for RefCell<T> {
     /// the cell's inner storage — slot pointers handed to the
     /// visitor reach the live heap word.
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        self.borrow().pelt_trace(visitor);
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.borrow_mut().pelt_trace(visitor);
     }
 }
 
@@ -184,7 +184,7 @@ macro_rules! pelt_noop {
         $(
             impl PeltField for $t {
                 #[inline]
-                fn pelt_trace(&self, _visitor: &mut SlotVisitor<'_>) {}
+                fn pelt_trace(&mut self, _visitor: &mut SlotVisitor<'_>) {}
             }
         )*
     };
@@ -204,7 +204,7 @@ mod tests {
     use super::*;
     use otter_gc::raw::RawGc;
 
-    fn collect_slots<F: PeltField>(field: &F) -> Vec<*mut RawGc> {
+    fn collect_slots<F: PeltField>(field: &mut F) -> Vec<*mut RawGc> {
         let mut out: Vec<*mut RawGc> = Vec::new();
         {
             let mut push = |p: *mut RawGc| out.push(p);
@@ -215,26 +215,26 @@ mod tests {
 
     #[test]
     fn primitives_are_no_ops() {
-        assert!(collect_slots(&42u32).is_empty());
-        assert!(collect_slots(&true).is_empty());
-        assert!(collect_slots(&"hello".to_string()).is_empty());
+        assert!(collect_slots(&mut 42u32).is_empty());
+        assert!(collect_slots(&mut true).is_empty());
+        assert!(collect_slots(&mut "hello".to_string()).is_empty());
     }
 
     #[test]
     fn value_undefined_skips_visitor() {
-        let v = Value::UNDEFINED;
-        assert!(collect_slots(&v).is_empty());
+        let mut v = Value::UNDEFINED;
+        assert!(collect_slots(&mut v).is_empty());
     }
 
     #[test]
     fn option_some_value_visits_once() {
-        let v = Some(Value::undefined()); // immediate, no slot
-        assert!(collect_slots(&v).is_empty());
+        let mut v = Some(Value::undefined()); // immediate, no slot
+        assert!(collect_slots(&mut v).is_empty());
     }
 
     #[test]
     fn vec_iterates_in_order() {
-        let xs: Vec<Value> = vec![Value::UNDEFINED, Value::NULL, Value::TRUE];
-        assert!(collect_slots(&xs).is_empty());
+        let mut xs: Vec<Value> = vec![Value::UNDEFINED, Value::NULL, Value::TRUE];
+        assert!(collect_slots(&mut xs).is_empty());
     }
 }

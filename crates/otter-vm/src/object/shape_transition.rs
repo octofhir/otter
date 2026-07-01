@@ -36,6 +36,7 @@ use super::{
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use otter_gc::raw::{RawGc, SlotVisitor};
+use std::cell::Cell;
 
 /// Atom-aware hidden-class transition for adding one ordinary own data slot.
 #[derive(Debug, Clone)]
@@ -47,7 +48,7 @@ pub(crate) struct StorePropertyTransition {
     /// Child shape id reached by adding the property.
     pub(crate) to_shape_id: ShapeId,
     /// GC-managed child shape reached by adding the property.
-    pub(crate) to_shape: ShapeHandle,
+    pub(crate) to_shape: Cell<ShapeHandle>,
     /// Transition category and replay guard.
     pub(crate) kind: StorePropertyTransitionKind,
     /// Slot offset added by this transition.
@@ -56,8 +57,8 @@ pub(crate) struct StorePropertyTransition {
 
 impl StorePropertyTransition {
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        if !self.to_shape.is_null() {
-            let p = &self.to_shape as *const ShapeHandle as *mut RawGc;
+        if !self.to_shape.get().is_null() {
+            let p = self.to_shape.as_ptr() as *mut RawGc;
             visitor(p);
         }
     }
@@ -121,7 +122,7 @@ pub(crate) fn capture_store_property_transition(
             from_shape_id,
             atom_id: key.atom().id(),
             to_shape_id,
-            to_shape: ShapeHandle::null(),
+            to_shape: Cell::new(ShapeHandle::null()),
             kind,
             slot,
         })
@@ -164,7 +165,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
             from_shape_id,
             atom_id: key.atom().id(),
             to_shape_id,
-            to_shape: next_shape,
+            to_shape: Cell::new(next_shape),
             kind,
             slot,
         })
@@ -192,10 +193,11 @@ pub(crate) fn replay_store_property_transition(
         return None;
     }
     let current_shape_id = super::shape_id(obj, heap);
-    let to_shape_id = if transition.to_shape.is_null() {
+    let to_shape = transition.to_shape.get();
+    let to_shape_id = if to_shape.is_null() {
         None
     } else {
-        Some(heap.read_payload(transition.to_shape, super::shape_body::ShapeBody::id))
+        Some(heap.read_payload(to_shape, super::shape_body::ShapeBody::id))
     };
     let existing_offset =
         heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
@@ -221,13 +223,13 @@ pub(crate) fn replay_store_property_transition(
             current_count, offset,
             "replay count diverged from slot offset"
         );
-        if transition.to_shape.is_null() {
+        if to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
             super::dict_push_key(body, key.name().to_owned());
             body.shape = super::ShapeHandle::null();
         } else {
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
-            body.shape = transition.to_shape;
+            body.shape = to_shape;
         }
         body.push_slot(offset, SlotMeta::data_default(), compressed);
         true
@@ -236,8 +238,8 @@ pub(crate) fn replay_store_property_transition(
         return None;
     }
     super::record_slot_write(heap, obj, compressed);
-    if !transition.to_shape.is_null() {
-        heap.record_write(obj, &transition.to_shape);
+    if !to_shape.is_null() {
+        heap.record_write(obj, &to_shape);
     }
     Some(())
 }

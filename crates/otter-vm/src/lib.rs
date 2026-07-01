@@ -796,6 +796,11 @@ pub struct Interpreter {
     /// repeated call to the same callee skips the map probe entirely. Cleared
     /// whenever a new entry is inserted into `jit_code`.
     jit_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Active compiled→compiled callees whose emitted caller holds only raw
+    /// entry/safepoint pointers while the native stack is inside that callee.
+    /// The VM-local anchor keeps the executable mapping alive even if feedback
+    /// invalidates the installed body before control returns to the caller.
+    jit_direct_code_anchors: Vec<(usize, std::sync::Arc<dyn jit::JitFunctionCode>)>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
     /// Free-list of spilled register-window backing buffers. Every bytecode
@@ -1440,6 +1445,7 @@ impl Interpreter {
         let startup_timer = StartupPhaseTimer::from_env();
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
             .expect("GcHeap construction never fails on the default cage");
+        object::register_gc_traceables(&mut gc_heap);
         startup_timer.mark("vm_gc_heap");
         let well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
             .expect("well-known symbol descriptions + bodies fit within any positive cap");
@@ -1557,6 +1563,7 @@ impl Interpreter {
             jit_code: rustc_hash::FxHashMap::default(),
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
+            jit_direct_code_anchors: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
             holt_pool: Vec::new(),
@@ -2256,6 +2263,29 @@ impl Interpreter {
         })
     }
 
+    fn pin_jit_direct_code(
+        &mut self,
+        frame_index: usize,
+        code: std::sync::Arc<dyn jit::JitFunctionCode>,
+    ) {
+        self.jit_direct_code_anchors.push((frame_index, code));
+    }
+
+    fn release_jit_direct_code_at(&mut self, frame_index: usize) {
+        if let Some(pos) = self
+            .jit_direct_code_anchors
+            .iter()
+            .rposition(|(idx, _)| *idx == frame_index)
+        {
+            self.jit_direct_code_anchors.swap_remove(pos);
+        }
+    }
+
+    fn release_jit_direct_code_from(&mut self, frame_index: usize) {
+        self.jit_direct_code_anchors
+            .retain(|(idx, _)| *idx < frame_index);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_jit_direct_call_frame(
         &mut self,
@@ -2425,6 +2455,7 @@ impl Interpreter {
             arg_regs,
         ) {
             Ok(prepared) => {
+                self.pin_jit_direct_code(prepared.frame_index, code.clone());
                 self.jit_runtime_stats.direct_calls =
                     self.jit_runtime_stats.direct_calls.saturating_add(1);
                 Ok(Some(prepared))
@@ -2578,6 +2609,7 @@ impl Interpreter {
             arg_regs,
         ) {
             Ok(prepared) => {
+                self.pin_jit_direct_code(prepared.frame_index, code.clone());
                 self.jit_runtime_stats.direct_calls =
                     self.jit_runtime_stats.direct_calls.saturating_add(1);
                 Ok(Some(prepared))
@@ -2603,12 +2635,14 @@ impl Interpreter {
         value: Value,
     ) -> Result<(), VmError> {
         if stack.len() != callee_frame_index + 1 {
+            self.release_jit_direct_code_from(callee_frame_index);
             self.leave_sync_reentry();
             return Err(VmError::InvalidOperand);
         }
         if let Some(mut done) = stack.pop() {
             self.reclaim_registers(&mut done);
         }
+        self.release_jit_direct_code_at(callee_frame_index);
         let caller = stack
             .get_mut(caller_frame_index)
             .ok_or_else(|| VmError::InvalidOperand)?;
@@ -2675,9 +2709,11 @@ impl Interpreter {
         bail_pc: u32,
     ) -> Result<(), VmError> {
         if callee_frame_index >= stack.len() {
+            self.release_jit_direct_code_from(callee_frame_index);
             self.leave_sync_reentry();
             return Err(VmError::InvalidOperand);
         }
+        self.release_jit_direct_code_at(callee_frame_index);
         stack[callee_frame_index].pc = bail_pc;
         match self.dispatch_loop(context, stack) {
             Ok(value) => {
@@ -2708,6 +2744,7 @@ impl Interpreter {
         callee_frame_index: usize,
     ) {
         stack.truncate(callee_frame_index);
+        self.release_jit_direct_code_from(callee_frame_index);
         self.leave_sync_reentry();
     }
 

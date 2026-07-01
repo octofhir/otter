@@ -1096,7 +1096,7 @@ impl<'a> Builder<'a> {
                     self.def_register(dst, block, call, byte_pc);
                 }
                 Op::CallMethodValue => {
-                    const MAX_METHOD_ARGS: usize = 3;
+                    const MAX_METHOD_ARGS: usize = 4;
                     let dst = reg(&operands, 0)?;
                     let recv_reg = reg(&operands, 1)?;
                     let name = const_index(&operands, 2)?;

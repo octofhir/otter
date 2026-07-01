@@ -100,9 +100,9 @@ pub const LOCAL_ARRAY_BUFFER_BODY_DETACHED_OFFSET: usize =
 impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        if let Some(expando) = &self.expando {
-            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+    fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if let Some(expando) = &mut self.expando {
+            let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
         // No outgoing GC slots — `Vec<u8>` is plain data.
@@ -151,9 +151,9 @@ pub struct SharedArrayBufferBodyGc {
 impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
     const TYPE_TAG: u8 = SHARED_ARRAY_BUFFER_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        if let Some(expando) = &self.expando {
-            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+    fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if let Some(expando) = &mut self.expando {
+            let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
         // Bytes live behind an `Arc` outside the cage.

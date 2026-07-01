@@ -534,14 +534,14 @@ pub const TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET: usize =
 impl otter_gc::SafeTraceable for TypedArrayBodyGc {
     const TYPE_TAG: u8 = TYPED_ARRAY_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    fn trace_slots_safe(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         // Forward to the buffer's GC handle so the backing ArrayBuffer
         // body survives the cycle.
         self.buffer.trace_value_slots(visitor);
-        if let Some(expando) = &self.expando
+        if let Some(expando) = &mut self.expando
             && !expando.is_null()
         {
-            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            let p = expando as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
         if let Some(proto) = &self.custom_proto {

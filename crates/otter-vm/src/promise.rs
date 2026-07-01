@@ -62,9 +62,9 @@ impl PromiseState {
 }
 
 impl crate::pelt::PeltField for PromiseState {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         match self {
-            Self::Fulfilled(value) | Self::Rejected(value) => value.trace_value_slots(visitor),
+            Self::Fulfilled(value) | Self::Rejected(value) => value.trace_value_slot_mut(visitor),
             Self::Pending => {}
         }
     }
@@ -101,11 +101,11 @@ pub struct PromiseReaction {
 }
 
 impl crate::pelt::PeltField for PromiseReaction {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        self.capability.promise.trace_value_slots(visitor);
-        self.capability.resolve.trace_value_slots(visitor);
-        self.capability.reject.trace_value_slots(visitor);
-        self.handler.trace_value_slots(visitor);
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.capability.promise.trace_value_slot_mut(visitor);
+        self.capability.resolve.trace_value_slot_mut(visitor);
+        self.capability.reject.trace_value_slot_mut(visitor);
+        self.handler.trace_value_slots_mut(visitor);
     }
 }
 
@@ -149,18 +149,18 @@ pub enum PromiseReactionHandler {
 }
 
 impl PromiseReactionHandler {
-    fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+    fn trace_value_slots_mut(&mut self, visitor: &mut SlotVisitor<'_>) {
         match self {
-            Self::Call(Some(handler)) => handler.trace_value_slots(visitor),
+            Self::Call(Some(handler)) => handler.trace_value_slot_mut(visitor),
             Self::Call(None) => {}
             Self::AsyncResume { parked, .. } => {
-                let p = parked as *const crate::generator::ParkedFrame as *mut RawGc;
+                let p = parked as *mut crate::generator::ParkedFrame as *mut RawGc;
                 visitor(p);
             }
             Self::AsyncGenResume { parked, owner, .. } => {
-                let p = parked as *const crate::generator::ParkedFrame as *mut RawGc;
+                let p = parked as *mut crate::generator::ParkedFrame as *mut RawGc;
                 visitor(p);
-                owner.trace_value_slots(visitor);
+                owner.trace_value_slots_mut(visitor);
             }
         }
     }

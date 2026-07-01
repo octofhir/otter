@@ -3204,7 +3204,24 @@ impl Interpreter {
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let receiver = *read_register(&stack[frame_index], obj_reg)?;
+        let mut receiver = *read_register(&stack[frame_index], obj_reg)?;
+        if let Some(obj) = receiver.as_object() {
+            // Compiled code normally keeps heap values in the rooted frame
+            // window, but a runtime stub can observe a value that survived a
+            // recent scavenge before the compiled side has reloaded it. Repair
+            // forwarded handles at the bridge boundary before any typed payload
+            // read interprets the forwarding word as object fields.
+            unsafe {
+                let header = obj.as_header_ptr();
+                if !header.is_null() && (*header).is_forwarded() {
+                    let forwarded = otter_gc::Gc::from_offset(
+                        otter_gc::GcHeader::read_forwarding_offset(header),
+                    );
+                    receiver = Value::object(forwarded);
+                    write_register(&mut stack[frame_index], obj_reg, receiver)?;
+                }
+            }
+        }
         if let Some(obj) = receiver.as_object()
             && site < self.load_property_ics.len()
             && !self.load_property_ics[site].is_megamorphic()
@@ -3727,6 +3744,14 @@ impl Interpreter {
             Op::DefineOwnProperty => {
                 let operands = context.exec_operands(instr);
                 self.run_define_own_property_operands(context, stack, operands)
+            }
+            Op::LooseEqual | Op::LooseNotEqual => {
+                let (dst, lhs, rhs) = context
+                    .exec_register3(instr)
+                    .ok_or(VmError::InvalidOperand)?;
+                let negate = matches!(op, Op::LooseNotEqual);
+                let frame = &mut stack[frame_index];
+                self.run_loose_equal_regs(context, frame, dst, lhs, rhs, negate)
             }
             _ => Err(VmError::InvalidOperand),
         };

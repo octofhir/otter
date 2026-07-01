@@ -3701,7 +3701,9 @@ mod arm64 {
                 let Some(value) = instr.load_number else {
                     return Err(Unsupported::OperandShape("load-number constant"));
                 };
-                emit_load_u64(ops, 9, value.to_bits());
+                // Materialize the boxed `Value` (int32 or offset-double), not the
+                // raw f64 bits.
+                emit_load_u64(ops, 9, otter_vm::Value::number_f64(value).to_bits());
                 store_reg(ops, 9, dst)?;
             }
             Op::LoadLocal => {

@@ -1349,7 +1349,15 @@ mod arm64 {
                     store_loc(ops, loc, box_scratch);
                 }
                 Repr::Float64 => {
-                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_LOAD_SCRATCH), X(box_scratch));
+                    // Unbox: `emit_frame_materialize` stored the boxed double
+                    // (bits + encode offset), so subtract the offset before the
+                    // value re-enters its FP home.
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; movz X(MOVE_SCRATCH), DOUBLE_OFFSET_HI16, lsl #48
+                        ; sub X(box_scratch), X(box_scratch), X(MOVE_SCRATCH)
+                        ; fmov D(FP_LOAD_SCRATCH), X(box_scratch)
+                    );
                     store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
                 }
                 Repr::Bool => {

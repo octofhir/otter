@@ -1437,7 +1437,7 @@ fn refresh_jit_collection_method_ics(ctx: &mut JitCtx, vm: &Interpreter) {
 }
 
 #[cfg(target_arch = "aarch64")]
-mod arm64 {
+pub(crate) mod arm64 {
     #![allow(unused_parens)]
     use super::{
         ALLOC_CTX_CONTEXT_OFFSET, ALLOC_CTX_FRAME_INDEX_OFFSET, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET,
@@ -4744,7 +4744,16 @@ mod arm64 {
     /// status 0 (callee frame published in `ctx.direct_*`). Builds the callee
     /// `JitCtx` on the native stack, branches to the compiled entry, and runs
     /// the returned / bailed / threw finish helpers, landing at `done`.
-    fn emit_direct_call_tail(
+    ///
+    /// Both the baseline and the optimizing emitter enter compiled callees
+    /// through this one tail, so the callee `JitCtx` is constructed from a
+    /// single source: the isolate-boundary fields (`gc_heap`, safepoint table,
+    /// collection ICs, array-index protector) propagate from the caller ctx and
+    /// the per-call `direct_*` fields are copied verbatim. A second, hand-copied
+    /// tail in either tier would be free to drift on which fields it initializes
+    /// — the drift that left optimizing callees reading uninitialized safepoint
+    /// and heap slots — so there is deliberately only this one.
+    pub(crate) fn emit_direct_call_tail(
         ops: &mut Assembler,
         dst: u16,
         threw: DynamicLabel,

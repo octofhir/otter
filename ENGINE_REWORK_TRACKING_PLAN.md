@@ -1,34 +1,24 @@
 # Engine Rework Tracking Plan
 
-Fresh architecture/performance review tracking file for large structural work.
-This plan intentionally excludes the separate "make Octane a correctness gate"
-task. Keep steps large, independently shippable, and measured.
+Live roadmap for the JIT optimizing tier. Keep steps large, independently
+shippable, and measured. This plan intentionally excludes the separate
+"make Octane a correctness gate" task.
 
-## Baseline Measurements
+## Current baseline
 
-Measured on macOS arm64 with `target/release/otter`.
+Measured on macOS arm64 with `target/release/otter`, baseline JIT on
+(`OTTER_JIT=1`); min wall-clock via `node benchmarks/bench.mjs` (Node/Bun refs),
+correctness gate `node benchmarks/diff.mjs` 24/24 identical across
+`interp`/`jit`/`jit-osr`. The JIT value+slot ABI is fully ported to the JSC
+pointer-cheap encoding.
 
-- `node benchmarks/diff.mjs`: 21/21 identical across `interp`, `jit`, `jit-osr`.
-- Direct Richards loop, 500 `runRichards()` calls:
-  - Node v24.16.0: 53 ms.
-  - Bun v1.3.14: 66 ms.
-  - Otter JIT: 12077.7 ms.
-  - Otter interpreter: 11899.1 ms.
-- Otter JIT stats for direct Richards loop, 500 calls:
-  - `jitMethodGenericCalls=1626370`
-  - `jitDirectCalls=0`
-  - `reductionsExecuted=970109113`
-  - `gcAllocBytesTotal=1011980528`
-  - `gcCycles=62`
-- `OTTER_JIT_TRACE=1` on short Richards run shows optimizing-tier declines on
-  common real-workload opcodes including `LooseEqual`, `LooseNotEqual`, and
-  `StoreElement`.
-- `samply` profile on the 500-call Richards loop captured about 80k samples on
-  `otter-isolate`. Use the profile only for attribution because profiling
-  overhead increased wall time from about 12.1 s to about 27.3 s. `atos` resolved
-  hot frames to `dispatch_loop_inner`, `HoltStack` indexing,
-  `LoadPropertyIc::load`, `load_own_data_slot_atom`, and
-  `jit_runtime_call_method`.
+Slower than node (× = factor): richards 44×, tree-traversal 42×, poly-dispatch
+8.5×, nbody 7.7×, string-ops 7×, regex-heavy 6×, object-shapes 4×, map-set 3.5×,
+prop-access 3.4×, json 2.6×. Faster than node: loose-eq 0.61×, regex 0.57×,
+mandelbrot 0.73×, array-ops/control-flow 0.92×. The wall is method-heavy/poly
+workloads (richards/tree/poly): baseline JIT is interp-bound there, so the fix
+is the optimizing tier delivering un-inlined polymorphic `CallMethod` plus a real
+compiled-call ABI.
 
 ## Rules
 
@@ -41,7 +31,7 @@ Measured on macOS arm64 with `target/release/otter`.
 - Preserve exact-PC deopt, real register allocation, representation selection,
   speculative inlining, and precise GC/rooting invariants.
 - Verification for every landed slice must include:
-  - `node benchmarks/diff.mjs` remains 21/21.
+  - `node benchmarks/diff.mjs` remains 24/24.
   - Targeted Test262 for changed language semantics.
   - `OTTER_GC_STRESS=128 OTTER_JIT=1` on relevant workloads.
   - Real benchmark wall-clock against Node/Bun, with `OTTER_STATS=1`.
@@ -50,34 +40,17 @@ Measured on macOS arm64 with `target/release/otter`.
 
 Status: in progress — baseline polymorphic method inline landed.
 
-Landed: baseline JIT now bakes a most-frequent-first inline guard chain for
-polymorphic `Op::CallMethodValue` sites (up to four distinct receiver
-shapes) instead of collapsing to the per-call method bridge on the second
-shape. `MethodCallFeedback::Poly` carries the observed targets;
-`>4` distinct targets become `Megamorphic` and keep the bridge. A
-polymorphic thermometer (four sibling classes sharing one call site) drops
-from 3482 ms to 533 ms (the 23.97 M per-call method-bridge entries fall to
-zero); monomorphic OO benches are unchanged. Verified `node
-benchmarks/diff.mjs` 22/22 (new permanent gate `poly-dispatch.js`),
-adversarial edge cases (megamorphic / own-vs-prototype method / throwing
-method through the chain) identical across interp/jit/jit-osr, prototype
-method-reassignment invalidation correct, and `OTTER_GC_STRESS=128
-OTTER_JIT=1` checksums correct.
+Landed: baseline JIT bakes a most-frequent-first inline guard chain for
+polymorphic `Op::CallMethodValue` sites (up to four receiver shapes) instead of
+collapsing to the per-call method bridge; `MethodCallFeedback::Poly` carries the
+targets, `>4` becomes `Megamorphic` and keeps the bridge. Gated by
+`poly-dispatch.js` in `diff.mjs`.
 
-Remaining: megamorphic (`>4` shapes) still takes the full bridge; the
-optimizing tier still bridges polymorphic method sites; polymorphic
-property-load ICs and direct compiled-call entry for matched targets are not
-yet done.
+Remaining: megamorphic (`>4` shapes) still takes the full bridge; the optimizing
+tier still bridges polymorphic method sites; polymorphic property-load ICs and
+direct compiled-call entry for matched targets are not yet done.
 
 Goal: make real OO dispatch stop going through the generic method bridge.
-
-Measured problem:
-
-- Richards direct loop is about 228x slower than Node and about 183x slower
-  than Bun.
-- `jitMethodGenericCalls=1626370`, `jitDirectCalls=0`.
-- JIT and interpreter are effectively tied on Richards, so current tiering is
-  not paying for OO/polymorphic code.
 
 Root cause anchors:
 
@@ -102,11 +75,9 @@ Work:
 
 Verification:
 
-- Richards direct loop:
-  - `jitMethodGenericCalls` should drop materially.
-  - `jitDirectCalls` should rise from zero.
-  - Wall-clock should move by a large factor, not single-digit percent.
-- `node benchmarks/diff.mjs` remains 21/21.
+- Richards direct loop: `jitMethodGenericCalls` drops materially,
+  `jitDirectCalls` rises from zero, wall-clock moves by a large factor.
+- `node benchmarks/diff.mjs` remains 24/24.
 - Add targeted tests for polymorphic receiver shapes and prototype method
   replacement invalidation.
 - Run `OTTER_GC_STRESS=128 OTTER_JIT=1` on Richards and focused IC tests.
@@ -116,114 +87,33 @@ Verification:
 Status: in progress — `LooseEqual`/`LooseNotEqual` (`9e4bef3f`) and pointer
 `StoreProperty` + inline generational write barrier (`3cf18d0f`) landed.
 
-NEXT BLOCKER (surfaced by `3cf18d0f`): the optimizing tier does not lower an
-un-inlined POLYMORPHIC `CallMethod` correctly — enabling pointer stores let
-Richards' polymorphic-dispatch methods (`this.task.run()`) compile past the
-store and reach that path, which SIGSEGV'd (a `blr` to an unmapped target).
-Worked around for now by declining call-plus-memory-op bodies to the baseline
-(`reject_call_object_mix` now counts `CallMethod`), so Richards is correct again
-but its dispatch methods stay in the baseline. The real Richards/DeltaBlue wall
-win needs the optimizing tier to consume `inline_poly_methods` (baked
-most-frequent-first guard chain, like the baseline) OR a correct generic
-polymorphic `CallMethod` bridge with exact safepoint/deopt. That is the next
-slice. Anchors: `builder.rs` ~1073 (only consumes mono `inline_methods`), `emit.rs`
-~3105 (`CallMethod` bridge), `optimizing_call_method_safepoint_id`.
+Remaining: opt-tier polymorphic `CallMethod` via a synthetic-block guard chain
+(one guard/inline per candidate, miss → next, last miss → bridge/deopt, merge phi
+for the dst register — extend `cfg.succs/preds/block_of_pc` and `graph.blocks`
+mid-construction; anchors `optimizing/builder.rs` ~1073 mono `inline_methods`,
+`optimizing/emit.rs` ~3105 `CallMethod` bridge, `optimizing_call_method_safepoint_id`).
+Then `StoreElement` object-valued (array-ops, object-shapes), object/array
+literal allocation, and `New`/constructor inline — each a GC-careful
+alloc/safepoint slice, miscompile-sensitive (verify diff 24/24 + GC_STRESS=128 +
+per-shape correctness).
 
-PROFILE (2026-06-29, `OTTER_JIT=1 OTTER_STATS=1`): Richards otter 1.72s vs node
-0.16s (~11x). `reductionsExecuted=145.8M`, `bytecodeCalls=2.98M` (~48 interpreted
-reductions/call) — the task-method BODIES run in the interpreter, gated behind the
-polymorphic `this.task.run(packet)` site (4 task shapes: Idle/Device/Worker/Handler).
-The baseline already bridges that megamorphic call to the interpreter, so a
-correct opt-tier path that compiles the body wins regardless of the mono-focused
-cost model. Mono-inline-with-deopt is NOT viable (4 interleaved shapes → deopt
-thrash); it needs the FALL-THROUGH guard chain. Implementation reality: the
-optimizing builder is a Braun et al. on-demand-SSA builder whose blocks come from
-the bytecode CFG (`Cfg::discover`); `try_inline_method` splices into the CURRENT
-block with no new blocks. A poly chain needs SYNTHETIC blocks (one guard/inline
-per candidate, miss → next, last miss → bridge/deopt) plus a merge phi for the
-dst register — i.e. extending `cfg.succs/preds/block_of_pc` and `graph.blocks`
-mid-construction. That is the dedicated next slice; it is miscompile-sensitive
-(verify diff 24/24 + GC_STRESS=128 + per-shape correctness) and must not be
-rushed. Other benches' opt-tier declines surveyed: `FreshUpvalue` (nbody, json
-hot loops — alloc+safepoint+spine write), `StoreElement` object-valued
-(array-ops, object-shapes), `New`/`NewObject` constructors (json) — all
-medium-complexity alloc/safepoint adds, none a clean single-opcode win.
-
-DEEPER PROFILE (samply, atos-resolved): Richards self-time is dominated by
-`dispatch_loop_inner` (the interpreter big-switch, spread across handlers) plus
-`HoltStack::index`/`index_mut` (register reads) and `object::load_own_data_slot_atom`
-+ `string::eq_str` (NAME-based property access). So the method BODIES interpret —
-the JIT-"compiled" methods bail/decline, and most calls (jitDirectCalls 260K of
-2.98M bytecodeCalls) never enter compiled code. The fix is to get the bodies
-running compiled with inline property ICs.
-
-CRASH ANCHOR for route B (committed `3cf18d0f` masks it via reject): the
-optimizing-tier SIGSEGV is in fid 27 (a `*Task.run`-shaped method) when it
-fully compiles. Its op pattern (dumped): `LoadProperty`/`LoadElement`, `LooseEqual
-==null` + early `ReturnValue`, three pointer `StoreProperty`, then a TAIL 2-arg
-`CallMethodValue` (`this.scheduler.<m>(a,b)`, mono → inlined) + `ReturnValue`.
-Faithful micros of this shape do NOT crash, so the trigger is more specific —
-likely the inlined scheduler callee (which itself does linked-list work / another
-call) combined with the surrounding compile. Next iteration: bisect fid 27 by
-progressively enriching the repro's inlined callee (give it a pointer store + a
-nested method call + a branch) until it crashes, then root-cause the bad `blr`
-target in the inline/CallMethod emit. Reproduce by temporarily reverting the
-`reject_call_object_mix` CallMethod clause (back to `has_plain_call` only) — fid
-27 then compiles and crashes on entry (pc=0).
-
-Goal: make hot real-workload functions compile into the optimizing tier instead
-of falling back to baseline/interpreter.
-
-Measured problem:
-
-- `OTTER_JIT_TRACE=1` on Richards shows optimizing-tier declines on
-  `LooseEqual`, `LooseNotEqual`, and `StoreElement`.
-- Current accepted subset is strong for numeric loops but poor for OO benchmark
-  kernels.
-
-Progress / findings:
-
-- `LooseEqual`/`LooseNotEqual` now lower (nullish-literal identity test + numeric
-  speculative path with deopt). Isolated loose-eq hot loop: interp 1.20s -> jit
-  0.05s (24x). Richards loose-eq declines eliminated, but Richards wall is
-  unchanged because those functions now decline on the NEXT unsupported op.
-- The dominant remaining Richards blocker is `StoreProperty` of a POINTER value:
-  the scheduler stores object references into fields everywhere
-  (`this.list = currentTcb`, `this.link = link`, `this.currentTcb = new …`).
-  The optimizing tier only stores primitive (int32/f64/bool) slot values today —
-  a pointer store bails (builder.rs ~893). Lowering pointer `StoreProperty` (and
-  `New`) is the next slice; do it as a dedicated GC-careful slice, not a rushed
-  inline barrier.
-
-Confirmed scope notes (measured 2026-06-29):
-
-- Pointer *loads* already lower (LoadSlot of a tagged value needs no barrier).
-  A pointer *store* outside the hot OSR loop already deopts cleanly, so a
-  load-heavy method like the linked-list walk already opt-compiles. The decline
-  is specifically pointer stores that the function cannot deopt around:
-  CONSTRUCTORS (all-stores, loopless — `Node`, `TaskControlBlock`, `Packet`) and
-  field stores INSIDE a hot loop (`this.currentTcb = this.currentTcb.link`).
-- The complete barrier is `gc_heap.record_write(parent, value)` =
-  `write_barrier_raw` per GC edge. In Phase-1 the insertion (marking) barrier is
-  DORMANT (STW marker, `is_marking` always false while compiled code runs), so
-  only the GENERATIONAL card-mark is needed and it is allocation-free and never
-  moves GC — therefore NO safepoint/frame-state is required for it.
-- Inline card-mark recipe (dynasm `StoreSlot`, Tagged value): after the slot
-  store, (1) value pointer-tag test `(top16 - 0x7FFC) <= 3` else skip; (2) parent
-  young? `[parent_hdr+1] & FLAG_YOUNG(0b100)` set → skip; (3) child young?
-  `child_hdr = cage_base + low32(value)`, `[child_hdr+1] & FLAG_YOUNG` clear →
-  skip; (4) `page_base = parent_hdr & ~(PAGE_SIZE-1)` (256KiB); `byte_off =
-  parent_hdr - page_base`; `card = byte_off >> 9` (CARD_SIZE 512); set bit
-  `card&7` in byte `page_base + CARD_BITMAP_OFF + (card>>3)`. parent_hdr =
-  `cage_base + low32(parent_tagged)`; PageHeader sits at page_base
-  (`Page::page_base_of`). Bake into `JitFunctionView` from otter-vm:
-  `offset_of!(PageHeader, card_bitmap)`, `!(PAGE_SIZE-1)`, card-size shift, and
-  expose `FLAG_YOUNG` from otter-gc (otter-jit has no direct otter-gc dep). clif
-  does not lower StoreSlot → property-store functions already route to dynasm, so
-  only emit.rs + builder.rs + the view change are needed. Validate with a
-  pointer-store-in-loop gate + `OTTER_GC_STRESS=128` (old←young correctness) +
-  `node benchmarks/diff.mjs`. trybuild `native_ctx_is_not_send.stderr` may need
-  regen after the view field is added.
+Inline card-mark write-barrier recipe (dynasm `StoreSlot`, Tagged value; landed
+reference for future pointer-store slices): after the slot store, (1) value
+pointer-tag test `(top16 - 0x7FFC) <= 3` else skip; (2) parent young?
+`[parent_hdr+1] & FLAG_YOUNG(0b100)` set → skip; (3) child young?
+`child_hdr = cage_base + low32(value)`, `[child_hdr+1] & FLAG_YOUNG` clear → skip;
+(4) `page_base = parent_hdr & ~(PAGE_SIZE-1)` (256KiB); `byte_off = parent_hdr -
+page_base`; `card = byte_off >> 9` (CARD_SIZE 512); set bit `card&7` in byte
+`page_base + CARD_BITMAP_OFF + (card>>3)`. `parent_hdr = cage_base +
+low32(parent_tagged)`; PageHeader sits at page_base (`Page::page_base_of`). Bake
+into `JitFunctionView` from otter-vm: `offset_of!(PageHeader, card_bitmap)`,
+`!(PAGE_SIZE-1)`, card-size shift, and expose `FLAG_YOUNG` from otter-gc. In
+Phase-1 the insertion (marking) barrier is DORMANT (STW marker), so only the
+generational card-mark is needed — allocation-free, never moves GC, no
+safepoint/frame-state required. clif does not lower StoreSlot (property-store
+functions route to dynasm), so only emit.rs + builder.rs + the view change are
+needed. trybuild `native_ctx_is_not_send.stderr` may need regen after the view
+field is added.
 
 Root cause anchors:
 
@@ -237,8 +127,8 @@ Root cause anchors:
 
 Work:
 
-- Add real lowering for `LooseEqual` and `LooseNotEqual` with speculative
-  primitive/object paths and exact deopt.
+- Add opt-tier polymorphic `CallMethod` lowering via the synthetic-block guard
+  chain with exact safepoint/deopt.
 - Add `StoreElement` coverage for dense arrays and common object-valued element
   cases.
 - Add object/array literal allocation paths only with correct safepoints and
@@ -251,11 +141,11 @@ Work:
 
 Verification:
 
-- `OTTER_JIT_TRACE=1` should show Richards/DeltaBlue hot functions compiling
-  instead of baseline fallback for the targeted opcode classes.
+- `OTTER_JIT_TRACE=1` shows Richards/DeltaBlue hot functions compiling instead
+  of baseline fallback for the targeted opcode classes.
 - Targeted Test262 for equality semantics, element access, object/array
   literals, and constructor behavior.
-- `node benchmarks/diff.mjs` remains 21/21.
+- `node benchmarks/diff.mjs` remains 24/24.
 - Compare wall-clock on Richards and DeltaBlue once correctness is available.
 
 ## Step 3: Real Compiled-Call ABI, Register Maps, And Exact Safepoints
@@ -299,7 +189,7 @@ Verification:
 - `OTTER_GC_STRESS=128 OTTER_JIT=1` over call-heavy and allocation-heavy cases.
 - Targeted deopt tests: guard miss after side effects, exception across compiled
   call, GC during allocating compiled op, recursive compiled calls.
-- `node benchmarks/diff.mjs` remains 21/21.
+- `node benchmarks/diff.mjs` remains 24/24.
 
 ## Step 4: Make GC Remembered-Set Behavior Measurable, Then Reduce Root Work
 
@@ -310,7 +200,7 @@ broad root scanning during minor collections.
 
 Measured problem:
 
-- Richards direct loop allocates about 1.01 GB and triggers 62 minor GCs.
+- The Richards direct loop allocates ~1 GB and triggers dozens of minor GCs.
 - Current minor GC combines handle stack, global handles, caller roots,
   extra roots, and frame roots each cycle.
 - Dirty-card infrastructure exists, but root scanning is still broad.
@@ -344,7 +234,7 @@ Verification:
 - Allocation-heavy real workloads and synthetic allocation loops with before/after
   pause totals.
 - No increase in use-after-move failures under stress.
-- `node benchmarks/diff.mjs` remains 21/21.
+- `node benchmarks/diff.mjs` remains 24/24.
 
 ## Step 5: Standardized Benchmark Telemetry And Profile Discipline
 
@@ -385,4 +275,3 @@ Verification:
   timing.
 - Profile notes include whether samples were symbolicated directly or resolved
   with `atos`.
-

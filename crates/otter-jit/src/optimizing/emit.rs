@@ -1310,7 +1310,30 @@ mod arm64 {
         point: &DeoptPoint,
         box_scratch: u32,
     ) -> Result<(), Unsupported> {
-        emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |_| true)
+        emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |_, _| true)
+    }
+
+    /// Materialize only the live pointer (`Tagged`) values of `point` into
+    /// `[x19]`. A GC point (an allocating op or a call that can scavenge) roots
+    /// the caller's live pointers through the wholesale window scan, so only
+    /// tagged slots must be refreshed to their current value there; a live
+    /// non-pointer (`Int32` / `Float64` / `Bool`) that crosses the call already
+    /// survives unboxed in its spill/callee-saved home, and its stale `[x19]`
+    /// slot is GC-safe (a non-pointer is never traced, and a stale pointer left
+    /// in the slot is still rooted by that very slot, so it is relocated in place
+    /// and never dangles). The full frame — non-pointers included — is
+    /// reconstructed from homes only at the cold deopt/bail exit. Mirrors the
+    /// Maglev safepoint, which records only tagged registers/slots.
+    fn emit_frame_materialize_tagged(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        box_scratch: u32,
+    ) -> Result<(), Unsupported> {
+        emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |_, value| {
+            graph.node(value).repr == Repr::Tagged
+        })
     }
 
     /// Box and store into the interpreter window `[x19]` exactly the live
@@ -1329,10 +1352,10 @@ mod arm64 {
         alloc: &Allocation,
         point: &DeoptPoint,
         box_scratch: u32,
-        keep: impl Fn(u16) -> bool,
+        keep: impl Fn(u16, NodeId) -> bool,
     ) -> Result<(), Unsupported> {
         for &(regn, value) in &point.registers {
-            if !keep(regn) {
+            if !keep(regn, value) {
                 continue;
             }
             let node = graph.node(value);
@@ -1398,6 +1421,36 @@ mod arm64 {
                     store_loc(ops, loc, box_scratch);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Reload only the live pointer (`Tagged`) values of `point` from `[x19]`
+    /// into their homes after a call/allocation. Pairs with
+    /// [`emit_frame_materialize_tagged`]: a moving GC may have relocated a
+    /// pointer, and the wholesale window scan rewrote the tagged `[x19]` slot to
+    /// the new address, so the pointer must be reloaded from there. A non-pointer
+    /// value is untouched by the collector and survived the call unboxed in its
+    /// spill/callee-saved home, so it is left in place rather than round-tripped
+    /// through the tagged window.
+    fn emit_frame_reload_tagged(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        skip_reg: Option<u16>,
+        box_scratch: u32,
+    ) -> Result<(), Unsupported> {
+        for &(regn, value) in &point.registers {
+            if Some(regn) == skip_reg || graph.node(value).repr != Repr::Tagged {
+                continue;
+            }
+            let Some(&loc) = alloc.location.get(&value) else {
+                continue;
+            };
+            let off = u32::from(regn) * 8;
+            dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+            store_loc(ops, loc, box_scratch);
         }
         Ok(())
     }
@@ -3235,7 +3288,7 @@ mod arm64 {
                 if inputs.len() > 4 {
                     return Err(Unsupported::OperandShape("object literal property count"));
                 }
-                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
                 // Box each property value into x4..x7 before setting the leading
                 // ABI argument registers (x0..x3), so boxing's scratch use cannot
                 // clobber them.
@@ -3259,7 +3312,7 @@ mod arm64 {
                     ; b.eq =>threw
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
-                emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
@@ -3295,7 +3348,7 @@ mod arm64 {
                     // The recursion reads only the args and the self callee from
                     // `[x19]`; write just those on the hot path and defer the rest
                     // of the live set to the cold bail exit below.
-                    let crosses = |r: u16| r == *callee_reg || arg_regs.contains(&r);
+                    let crosses = |r: u16, _v: NodeId| r == *callee_reg || arg_regs.contains(&r);
                     emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, crosses)?;
                     emit_self_recursive_call(
                         ops,
@@ -3327,8 +3380,8 @@ mod arm64 {
                     // Cold: a guard-miss or reg-stack overflow bails to the
                     // interpreter, so complete `[x19]` with the registers the hot
                     // path skipped before stamping the resume PC.
-                    emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |r| {
-                        !crosses(r)
+                    emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |r, v| {
+                        !crosses(r, v)
                     })?;
                     emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
                     dynasm!(ops

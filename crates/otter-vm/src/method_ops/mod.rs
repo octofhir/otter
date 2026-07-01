@@ -401,6 +401,28 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
+        // Method-resolution inline cache. An ordinary object's method is a data
+        // slot on its own object or its prototype, so the receiver shape keys
+        // the resolved method exactly like a `LoadProperty`. On a hit (or a
+        // freshly installed monomorphic candidate) the per-call string `[[Get]]`
+        // walk — `has_plain_builtin_method` + `ordinary_get_value` + atom
+        // comparison up the chain — is skipped entirely. A non-cacheable
+        // shape (accessor method, deep prototype, absent) returns `None` and
+        // falls through to the full resolution below. Only an `ObjectBody`
+        // receiver reaches here (`as_object` is `None` for arrays / Map / Set),
+        // so this runs ahead of the array/collection prototype probes without
+        // stealing their dispatch — and skips the method-name string resolution
+        // those probes need for the common ordinary-method call.
+        if let Some(obj) = recv_value.as_object()
+            && method_site != usize::MAX
+            && let Some(atomized_key) =
+                context.property_atom_for_function(stack[top_idx].function_id, name_idx)
+            && let Some(method) = self.resolve_method_ic(obj, atomized_key, method_site)
+            && self.is_callable_runtime(&method)
+        {
+            stack[top_idx].advance_pc(caller_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         let name = context
             .string_constant_str_for_function(stack[top_idx].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -430,26 +452,6 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
-        // Method-resolution inline cache. An ordinary object's method is a data
-        // slot on its own object or its prototype, so the receiver shape keys
-        // the resolved method exactly like a `LoadProperty`. On a hit (or a
-        // freshly installed monomorphic candidate) the per-call string `[[Get]]`
-        // walk — `has_plain_builtin_method` + `ordinary_get_value` + atom
-        // comparison up the chain — is skipped entirely. A non-cacheable
-        // shape (accessor method, deep prototype, absent) returns `None` and
-        // falls through to the full resolution below.
-        if let Some(obj) = recv_value.as_object()
-            && let Some(atomized_key) =
-                context.property_atom_for_function(stack[top_idx].function_id, name_idx)
-            && let Some(site) =
-                context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-            && let Some(method) = self.resolve_method_ic(obj, atomized_key, site)
-            && self.is_callable_runtime(&method)
-        {
-            stack[top_idx].advance_pc(caller_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?

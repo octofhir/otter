@@ -1072,9 +1072,12 @@ mod arm64 {
             ; b =>exit
         );
 
+        let arr_exotic_byte = view.ta_layout.array_exotic_byte;
         dynasm!(ops
             ; .arch aarch64
             ; =>array_path
+            ; ldr x3, [x0, arr_exotic_byte]
+            ; cbnz x3, =>exit                 // exotic sidecar → not ordinary dense
             ; ldr x3, [x0, arr_len_byte]
             ; cmp x5, x3
             ; b.hs =>exit

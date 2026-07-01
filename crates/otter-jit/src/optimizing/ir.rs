@@ -269,6 +269,29 @@ pub enum NodeKind {
         /// Expected bytecode function id.
         method_fid: u32,
     },
+    /// Polymorphic-dispatch predicate: `true` when `recv` still resolves `name`
+    /// to the specific bytecode method whose body is inlined on the matching arm
+    /// of a polymorphic `CallMethodValue` guard chain. Unlike
+    /// [`NodeKind::CheckMethodIdentity`] (which deoptimizes on a miss), this
+    /// produces a [`Repr::Bool`] a [`Terminator::Branch`] consumes to fall
+    /// through to the next candidate shape; the chain's final miss takes the
+    /// method bridge, so no single shape is speculated. Mirrors JSC
+    /// `ByteCodeParser::handleInlining`'s per-target `SwitchCell` and V8 Maglev's
+    /// polymorphic call dispatch.
+    MethodIdentityMatches {
+        /// Receiver object/value.
+        recv: NodeId,
+        /// Receiver shape-handle compressed offset.
+        recv_shape: u32,
+        /// Prototype shape-handle compressed offset.
+        proto_shape: u32,
+        /// Byte offset of the method slot in the prototype value slab.
+        method_value_byte: u32,
+        /// Whether the method slot is an own property on the receiver.
+        method_on_receiver: bool,
+        /// Expected bytecode function id.
+        method_fid: u32,
+    },
     /// Speculative "operand is an ordinary object of the baked shape" guard.
     /// Carries the receiver and the receiver shape's compressed `Gc` offset. A
     /// non-object, or a different shape (or dictionary mode), deoptimizes.
@@ -437,6 +460,7 @@ impl NodeKind {
             }
             NodeKind::CheckFunctionIdentity { callee, .. } => vec![*callee],
             NodeKind::CheckMethodIdentity { recv, .. } => vec![*recv],
+            NodeKind::MethodIdentityMatches { recv, .. } => vec![*recv],
             NodeKind::ArrayPop { recv } => vec![*recv],
             NodeKind::ArrayPush { recv, value, .. } => vec![*recv, *value],
         }
@@ -511,6 +535,7 @@ impl NodeKind {
             }
             NodeKind::CheckFunctionIdentity { callee, .. } => fix(callee),
             NodeKind::CheckMethodIdentity { recv, .. } => fix(recv),
+            NodeKind::MethodIdentityMatches { recv, .. } => fix(recv),
             NodeKind::ArrayPop { recv } => fix(recv),
             NodeKind::ArrayPush { recv, value, .. } => {
                 fix(recv);
@@ -547,6 +572,7 @@ impl NodeKind {
             | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
             NodeKind::Int32Compare(_, _, _)
             | NodeKind::Float64Compare(_, _, _)
+            | NodeKind::MethodIdentityMatches { .. }
             | NodeKind::TaggedIsNull { .. } => Repr::Bool,
             // Register-carried values are tagged at block boundaries; a phi
             // therefore lives in tagged form (lowering boxes typed inputs).

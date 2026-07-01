@@ -2909,6 +2909,112 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::MethodIdentityMatches {
+                recv,
+                recv_shape,
+                proto_shape,
+                method_value_byte,
+                method_on_receiver,
+                method_fid,
+            } => {
+                // Same receiver-shape + prototype-method-identity probe as
+                // `CheckMethodIdentity`, but a mismatch falls through to `miss`
+                // (result `false`) instead of deoptimizing, so a polymorphic
+                // dispatch chain can try the next candidate shape. The result is
+                // the boolean a `Branch` consumes.
+                let recv_loc = require_loc(alloc, *recv)?;
+                debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                let miss = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                let fid_immediate = ops.new_dynamic_label();
+                let fid_compare = ops.new_dynamic_label();
+                load_loc(ops, box_scratch, recv_loc);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; movz x1, NUMBER_TAG_HI16, lsl #48
+                    ; orr x1, x1, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+                    ; tst X(box_scratch), x1
+                    ; b.ne =>miss
+                    ; mov w2, W(box_scratch)
+                );
+                emit_load_u64(ops, 3, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x3, x3, x2
+                    ; ldrb w4, [x3]
+                    ; cmp w4, OBJECT_BODY_TYPE_TAG
+                    ; b.ne =>miss
+                    ; ldr w4, [x3, view.object_shape_byte]
+                    ; movz w5, recv_shape & 0xffff
+                    ; movk w5, (recv_shape >> 16) & 0xffff, lsl #16
+                    ; cmp w4, w5
+                    ; b.ne =>miss
+                );
+                if !*method_on_receiver {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr w2, [x3, view.jit_proto_byte]
+                        ; cbz w2, =>miss
+                    );
+                    emit_load_u64(ops, 3, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x3, x3, x2
+                        ; ldrb w4, [x3]
+                        ; cmp w4, OBJECT_BODY_TYPE_TAG
+                        ; b.ne =>miss
+                        ; ldr w4, [x3, view.object_shape_byte]
+                        ; movz w5, proto_shape & 0xffff
+                        ; movk w5, (proto_shape >> 16) & 0xffff, lsl #16
+                        ; cmp w4, w5
+                        ; b.ne =>miss
+                    );
+                }
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x3, [x3, view.object_values_ptr_byte]
+                    ; cbz x3, =>miss
+                    ; ldr w17, [x3, *method_value_byte]  // 4-byte compressed slot
+                );
+                emit_decompress_slot(ops, miss);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x4, x17
+                    ; movz x1, NUMBER_TAG_HI16, lsl #48
+                    ; tst x4, x1
+                    ; b.ne =>miss                        // a number is not a method
+                    ; and x0, x4, #0xffff
+                    ; cmp x0, #(FUNCTION_ID_TAG as u32)
+                    ; b.eq =>fid_immediate
+                    ; mov w2, w4                         // otherwise a cell: low32 = gc offset
+                );
+                emit_load_u64(ops, 3, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x3, x3, x2
+                    ; ldrb w0, [x3]
+                    ; cmp w0, JS_CLOSURE_BODY_TYPE_TAG
+                    ; b.ne =>miss
+                    ; ldr w4, [x3, view.closure_fid_byte]
+                    ; b =>fid_compare
+                    ; =>fid_immediate
+                    ; lsr x4, x4, #16                    // function id in bits [16, 48)
+                    ; =>fid_compare
+                    ; movz w5, method_fid & 0xffff
+                    ; movk w5, (method_fid >> 16) & 0xffff, lsl #16
+                    ; cmp w4, w5
+                    ; b.ne =>miss
+                    ; movz W(box_scratch), #1
+                    ; b =>done
+                    ; =>miss
+                    ; movz W(box_scratch), #0
+                    ; =>done
+                );
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::LoadSlot(obj, value_byte) => {
                 // Read the slot at the baked byte offset within the shape-guarded
                 // receiver's value slab. No guard (CheckShape established it).

@@ -40,8 +40,8 @@ use otter_vm::JitFunctionView;
 
 use super::Unsupported;
 use super::abi::{
-    HOLE_BITS, NULL_BITS, REGS_OFFSET, STATUS_RETURNED, STATUS_THREW, TAG_INT32, TAG_PTR_OBJECT,
-    UNDEFINED_BITS, clif_type,
+    DOUBLE_ENCODE_OFFSET, HOLE_BITS, NOT_CELL_MASK, NULL_BITS, NUMBER_TAG, REGS_OFFSET,
+    STATUS_RETURNED, STATUS_THREW, UNDEFINED_BITS, clif_type,
 };
 use super::deopt::{Flags, box_tagged, emit_bail};
 use crate::optimizing::deopt::DeoptPoint;
@@ -477,10 +477,13 @@ impl<'a, 'f> Lower<'a, 'f> {
                 nullish,
             } => {
                 let v = self.val(*value)?;
-                // `null` = base|1, `undefined` = base|0; OR-in bit 0 so a nullish
-                // (`== null`) test collapses both onto the `null` immediate.
+                // `undefined` is `null | UNDEFINED_TAG`; clearing that bit for a
+                // nullish (`== null`) test collapses both onto the `null` immediate,
+                // and no other value maps there.
                 let v = if *nullish {
-                    self.b.ins().bor_imm(v, 1)
+                    self.b
+                        .ins()
+                        .band_imm(v, !(otter_vm::value::tag::UNDEFINED_TAG as i64))
                 } else {
                     v
                 };
@@ -514,10 +517,12 @@ impl<'a, 'f> Lower<'a, 'f> {
         match orepr {
             Repr::Int32 => Ok(v),
             Repr::Tagged => {
-                let top16 = self.b.ins().ushr_imm(v, 48);
-                let is_int = self.b.ins().icmp_imm(IntCC::Equal, top16, TAG_INT32 as i64);
-                // Deopt when not int32-tagged.
-                let not_int = self.b.ins().icmp_imm(IntCC::Equal, is_int, 0);
+                // int32 iff every NUMBER_TAG bit is set; deopt otherwise.
+                let masked = self.b.ins().band_imm(v, NUMBER_TAG as i64);
+                let not_int = self
+                    .b
+                    .ins()
+                    .icmp_imm(IntCC::NotEqual, masked, NUMBER_TAG as i64);
                 self.guard(nid, not_int)?;
                 Ok(self.b.ins().ireduce(types::I32, v))
             }
@@ -537,23 +542,20 @@ impl<'a, 'f> Lower<'a, 'f> {
             Repr::Float64 => Ok(v),
             Repr::Int32 => Ok(self.b.ins().fcvt_from_sint(types::F64, v)),
             Repr::Tagged => {
-                let top16 = self.b.ins().ushr_imm(v, 48);
-                let is_int = self.b.ins().icmp_imm(IntCC::Equal, top16, TAG_INT32 as i64);
-                // A special / pointer tag (0x7FFA..=0x7FFF) is a non-number: deopt.
-                let ge = self
+                let masked = self.b.ins().band_imm(v, NUMBER_TAG as i64);
+                let is_int = self
                     .b
                     .ins()
-                    .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, top16, 0x7FFA);
-                let le = self
-                    .b
-                    .ins()
-                    .icmp_imm(IntCC::UnsignedLessThanOrEqual, top16, 0x7FFF);
-                let bad = self.b.ins().band(ge, le);
+                    .icmp_imm(IntCC::Equal, masked, NUMBER_TAG as i64);
+                // A cell or non-number immediate carries no NUMBER_TAG bit: deopt.
+                let bad = self.b.ins().icmp_imm(IntCC::Equal, masked, 0);
                 self.guard(nid, bad)?;
-                // int32: widen the signed low-32 payload; double: bits verbatim.
+                // int32: widen the signed low-32 payload; double: subtract the
+                // encode offset, then reinterpret the bits as f64.
                 let as_i32 = self.b.ins().ireduce(types::I32, v);
                 let from_int = self.b.ins().fcvt_from_sint(types::F64, as_i32);
-                let from_bits = self.b.ins().bitcast(types::F64, self.flags.plain, v);
+                let unboxed = self.b.ins().iadd_imm(v, -(DOUBLE_ENCODE_OFFSET as i64));
+                let from_bits = self.b.ins().bitcast(types::F64, self.flags.plain, unboxed);
                 Ok(self.b.ins().select(is_int, from_int, from_bits))
             }
             Repr::Bool => Err(Unsupported::Unlowered("clif: check-number operand bool")),
@@ -675,13 +677,11 @@ impl<'a, 'f> Lower<'a, 'f> {
     /// `(gc_ptr: i64, type_tag: i8)`. The builder is left on the success path.
     fn recv_body(&mut self, nid: NodeId, recv: NodeId) -> Result<(Value, Value), Unsupported> {
         let v = self.val(recv)?;
-        let top16 = self.b.ins().ushr_imm(v, 48);
-        let is_obj = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::Equal, top16, TAG_PTR_OBJECT as i64);
-        let not_obj = self.b.ins().icmp_imm(IntCC::Equal, is_obj, 0);
-        self.guard(nid, not_obj)?;
+        // A heap cell carries no NOT_CELL_MASK bit; deopt on a number or
+        // immediate. The caller's type-tag check disambiguates the cell class.
+        let masked = self.b.ins().band_imm(v, NOT_CELL_MASK as i64);
+        let not_cell = self.b.ins().icmp_imm(IntCC::NotEqual, masked, 0);
+        self.guard(nid, not_cell)?;
         // Decompress: GcHeader ptr = cage_base + low32(value).
         let low = self.b.ins().ireduce(types::I32, v);
         let off = self.b.ins().uextend(types::I64, low);

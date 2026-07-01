@@ -655,7 +655,8 @@ pub(crate) const OBJECT_BODY_SHAPE_OFFSET: usize = std::mem::offset_of!(ObjectBo
 
 /// Byte offset of the string-keyed value slab pointer within an [`ObjectBody`]
 /// payload. The JIT reads this pointer after its shape guard and then indexes
-/// the contiguous slab by `slot * size_of::<Value>()`.
+/// the contiguous slab by `slot * size_of::<CompressedValue>()` (4 bytes),
+/// decompressing each 4-byte slot into a full `Value`.
 pub(crate) const OBJECT_BODY_VALUES_PTR_OFFSET: usize =
     std::mem::offset_of!(ObjectBody, values_ptr);
 

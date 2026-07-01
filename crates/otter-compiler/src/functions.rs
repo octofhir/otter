@@ -146,30 +146,29 @@ pub(crate) fn compile_function_full(
     // constructor's name must resolve to the §15.7.14 class-scope
     // binding, not to a re-made closure of itself.
     let fn_self_immutable = std::mem::take(&mut parent.fn_self_immutable_hint);
-    let self_make_idx =
-        if is_method
-            || no_self_name
-            || !self_name_referenced
-            || parent.lookup_in_current_scope(name).is_some()
-        {
-            None
-        } else {
-            let self_storage = parent.declare_binding(name, false, span)?;
-            if fn_self_immutable {
-                parent.top_mut().mark_fn_self_name(name);
-            }
-            let const_idx = parent.intern_function_id(function_id);
-            let tmp = parent.alloc_scratch();
-            let idx = parent.code.len();
-            parent.emit(
-                Op::MakeFunction,
-                [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
-                span,
-            );
-            parent.emit_store_storage(tmp, self_storage, span);
-            parent.mark_initialized(name);
-            Some((idx, tmp, const_idx))
-        };
+    let self_make_idx = if is_method
+        || no_self_name
+        || !self_name_referenced
+        || parent.lookup_in_current_scope(name).is_some()
+    {
+        None
+    } else {
+        let self_storage = parent.declare_binding(name, false, span)?;
+        if fn_self_immutable {
+            parent.top_mut().mark_fn_self_name(name);
+        }
+        let const_idx = parent.intern_function_id(function_id);
+        let tmp = parent.alloc_scratch();
+        let idx = parent.code.len();
+        parent.emit(
+            Op::MakeFunction,
+            [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
+            span,
+        );
+        parent.emit_store_storage(tmp, self_storage, span);
+        parent.mark_initialized(name);
+        Some((idx, tmp, const_idx))
+    };
     // §10.2.11 step 22 — bind `arguments` BEFORE
     // IteratorBindingInitialization (step 24), so a parameter
     // default expression like `x = arguments[0]` resolves the

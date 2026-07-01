@@ -302,8 +302,7 @@ mod tests {
     use crate::baseline::BAIL_PC_OFFSET;
     use crate::optimizing::{build_graph, deopt};
 
-    const TAG_INT32: u64 = 0x7FF9;
-    const TAG_NAN: u64 = 0x7FF8;
+    use otter_vm::value::tag as value_tag;
 
     fn r(n: u16) -> Operand {
         Operand::Register(n)
@@ -312,13 +311,18 @@ mod tests {
         Operand::Imm32(n)
     }
     fn boxi(v: i32) -> u64 {
-        (TAG_INT32 << 48) | (v as u32 as u64)
+        value_tag::NUMBER_TAG | (v as u32 as u64)
     }
     fn unboxi(v: u64) -> i32 {
         v as u32 as i32
     }
     fn boxf(v: f64) -> u64 {
-        v.to_bits()
+        let bits = if v.is_nan() {
+            value_tag::CANONICAL_NAN
+        } else {
+            v.to_bits()
+        };
+        value_tag::box_double(bits)
     }
 
     #[repr(C)]
@@ -515,9 +519,12 @@ mod tests {
 
     #[test]
     fn nan_box_canonical_constant_matches_dynasm() {
-        // The boxed-NaN canonical pattern the float boxing path emits must equal
-        // the dynasm tier's `TAG_NAN << 48`, so cross-backend stored bits agree.
-        assert_eq!((TAG_NAN << 48), 0x7FF8_0000_0000_0000);
+        // Boxing any NaN canonicalizes to `CANONICAL_NAN`, then the encode offset
+        // is applied, so both backends store identical bits for a NaN result.
+        assert_eq!(
+            boxf(f64::NAN),
+            value_tag::box_double(value_tag::CANONICAL_NAN)
+        );
     }
 
     /// Report Cranelift compile time per function (the risk CRANELIFT_TIER2.md §9

@@ -3435,7 +3435,8 @@ impl Interpreter {
                 && hit.atom_id == atomized_key.atom().id()
                 && object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, hit).is_some()
             {
-                let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+                let value_byte = u32::from(hit.slot)
+                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
                 return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
             }
         }
@@ -3960,7 +3961,8 @@ impl Interpreter {
             if let Some(hit) = ic.store_own_data_hit()
                 && hit.shape.offset() == recv_shape
             {
-                let value_byte = u32::from(hit.slot) * std::mem::size_of::<Value>() as u32;
+                let value_byte = u32::from(hit.slot)
+                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
                 return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
             }
         }

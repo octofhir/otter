@@ -26,34 +26,30 @@
 use cranelift_codegen::ir::{Type, types};
 
 use crate::optimizing::ir::Repr;
+use otter_vm::value::tag as value_tag;
 
-/// NaN-box tag for a 32-bit signed integer immediate (`value/tag.rs`).
-pub(super) const TAG_INT32: u64 = crate::baseline::TAG_INT32;
-/// NaN-box tag for special immediates (undefined/null/hole/boolean).
-pub(super) const TAG_SPECIAL: u64 = crate::baseline::TAG_SPECIAL;
-/// NaN-box tag for object-class heap pointers (`value/tag.rs`). The low 32 bits
-/// are a `Gc` offset added to the cage base to decompress the pointer.
-pub(super) const TAG_PTR_OBJECT: u64 = crate::baseline::TAG_PTR_OBJECT;
-/// NaN-box high-16 for the canonical quiet NaN double. A non-int double result
-/// whose own bits land in the tagged range is canonicalised to this so it stays
-/// a valid `Number(NaN)` and never aliases a tag.
-pub(super) const TAG_NAN: u64 = 0x7FF8;
-/// `SPECIAL` payload for `false`.
-pub(super) const SPECIAL_FALSE: u64 = crate::baseline::SPECIAL_FALSE as u64;
-/// `SPECIAL` payload for `true`.
-pub(super) const SPECIAL_TRUE: u64 = crate::baseline::SPECIAL_TRUE as u64;
+/// Number tag: an int32 carries every one of these bits, a boxed double at least
+/// one; a cell or non-number immediate carries none.
+pub(super) const NUMBER_TAG: u64 = value_tag::NUMBER_TAG;
+/// Added to a purified double's bits when boxing, subtracted when unboxing.
+pub(super) const DOUBLE_ENCODE_OFFSET: u64 = value_tag::DOUBLE_ENCODE_OFFSET;
+/// `(v & NOT_CELL_MASK) == 0` (and non-zero) identifies a heap-cell pointer.
+pub(super) const NOT_CELL_MASK: u64 = value_tag::NOT_CELL_MASK;
+/// Canonical quiet-NaN bits; a boxed `NaN` purifies from these before the double
+/// offset is applied, so all NaNs compare bit-equal and none aliases an immediate.
+pub(super) const CANONICAL_NAN: u64 = value_tag::CANONICAL_NAN;
 
-/// Boxed `undefined` bit pattern (`TAG_SPECIAL << 48`).
-pub(super) const UNDEFINED_BITS: u64 = TAG_SPECIAL << 48;
+/// Boxed `undefined` bit pattern.
+pub(super) const UNDEFINED_BITS: u64 = value_tag::VALUE_UNDEFINED;
 /// Boxed `null` bit pattern.
-pub(super) const NULL_BITS: u64 = (TAG_SPECIAL << 48) | crate::baseline::SPECIAL_NULL;
+pub(super) const NULL_BITS: u64 = value_tag::VALUE_NULL;
 /// Boxed `false` bit pattern.
-pub(super) const FALSE_BITS: u64 = (TAG_SPECIAL << 48) | SPECIAL_FALSE;
+pub(super) const FALSE_BITS: u64 = value_tag::VALUE_FALSE;
 /// Boxed `true` bit pattern.
-pub(super) const TRUE_BITS: u64 = (TAG_SPECIAL << 48) | SPECIAL_TRUE;
+pub(super) const TRUE_BITS: u64 = value_tag::VALUE_TRUE;
 /// Boxed array/`this` hole sentinel bit pattern (a dense-array element slot that
 /// is a hole misses the inline fast path and deopts).
-pub(super) const HOLE_BITS: u64 = (TAG_SPECIAL << 48) | crate::baseline::SPECIAL_HOLE;
+pub(super) const HOLE_BITS: u64 = value_tag::VALUE_HOLE;
 
 /// `JitRet.status` for a normal return (`Returned(value)`).
 pub(super) const STATUS_RETURNED: i64 = crate::baseline::STATUS_RETURNED as i64;

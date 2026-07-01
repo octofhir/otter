@@ -5394,12 +5394,12 @@ impl Interpreter {
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
             let entries_len = self.store_property_ics[site].entry_count();
+            // The stub program is `&self`; only `gc_heap` is mutated by a store.
+            // `store_property_ics` and `gc_heap` are disjoint fields, so the
+            // entries slice and the `&mut gc_heap` a store writes through can be
+            // held at once — no per-store clone of the whole stub is needed.
             let mut store_hit = false;
-            for idx in 0..entries_len {
-                // Reborrow each iteration: `store` needs `&mut self.gc_heap`
-                // which conflicts with holding a long-lived borrow on the
-                // entries slice.
-                let ic = self.store_property_ics[site].entries()[idx].clone();
+            for ic in self.store_property_ics[site].entries() {
                 if ic
                     .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()

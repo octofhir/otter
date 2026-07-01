@@ -50,6 +50,60 @@ Remaining: megamorphic (`>4` shapes) still takes the full bridge; the optimizing
 tier still bridges polymorphic method sites; polymorphic property-load ICs and
 direct compiled-call entry for matched targets are not yet done.
 
+### Profiling-confirmed blocker chain (2026-07-01)
+
+A `sample` profile of the richards direct loop (`otter-isolate` thread) plus
+`OTTER_JIT_TRACE=1` decline reasons pinned exactly why the optimizing tier does
+not cover richards' hot method bodies, in order:
+
+1. **`Unlowered("guard without deopt frame state")` — FIXED (`c5c35191`).** The
+   value-ABI port made `LoadSlot`/`StoreSlot` deopt-capable (compress/decompress
+   guard) but `deopt::can_deopt` did not list them, so every slot-touching body
+   aborted. Added them; fids 26/32 now compile in the optimizing tier.
+2. **`Opcode(StoreProperty)` / `Opcode(LoadProperty)` — the current wall (7×/1× on
+   richards).** `Interpreter::bake_property_feedback` (`lib.rs:3056`) only bakes
+   `property_feedback: Some((shape,slot))` when the IC site has **exactly one**
+   entry (`[stub]`). Richards' `this.<field> = …` stores see several sibling task
+   shapes, so the site is polymorphic → feedback `None` → `builder.rs` (LoadProperty
+   ~842, StoreProperty ~895) declines. Mono-speculating one shape would deopt-storm
+   a balanced poly site, so the fix is a real polymorphic IC, not first-shape
+   speculation.
+
+### Next slice — polymorphic property IC (Maglev `PolymorphicAccessInfo` shape)
+
+Lower a poly property site as an **inline shape-guard chain in machine code** with
+a deopt fallback — mirroring the existing inline collection-method IC
+(`emit.rs::emit_opt_live_collection_leaf_method_guarded_call`), NOT synthetic SSA
+blocks (no phi surgery: a load writes its one frame register on the matching arm; a
+store has no result):
+
+- `jit.rs`: add `property_feedback_poly: SmallVec<[(u32,u32); 4]>` to the view
+  instruction (empty for mono/non-property). Init at the ~3 construction sites
+  (`executable.rs:260`, `lib.rs:11160`, `lib.rs:16089`) + the synthetic ones in
+  `optimizing/builder.rs`.
+- `lib.rs::bake_property_feedback`: when the site has 2..=4 own-data-hit entries,
+  collect each `(shape.offset(), slot*sizeof(CompressedValue))` into the poly list
+  (keep the single-entry mono path as-is).
+- `optimizing/ir.rs`: add `LoadSlotPoly(obj, Box<[(u32,u32)]>)` and
+  `StoreSlotPoly(obj, Box<[(u32,u32)]>, value)`; wire `inputs()`/`repr()`
+  (`LoadSlotPoly` → Tagged; `StoreSlotPoly` → no result) and add both to
+  `deopt::can_deopt` (they bail before any write, like the mono forms).
+- `optimizing/builder.rs`: at LoadProperty/StoreProperty, when mono
+  `property_feedback` is absent but `property_feedback_poly` is non-empty and
+  `cage_base != 0`, emit the poly node instead of declining.
+- `optimizing/emit.rs`: lower the poly node — for each candidate: decompress the
+  receiver (`cage_base + low32`), read `object_shape_byte`, compare to the
+  candidate shape; on match run the existing mono `LoadSlot`/`StoreSlot` body
+  (decompress/compress + slab access + card-mark for a Tagged store) and branch to
+  `done`; on miss fall to the next candidate; the final miss takes the node's deopt
+  exit. `clif/mod.rs` declines the poly node (property stores already route to
+  dynasm).
+- Verify: `diff.mjs` 24/24, `OTTER_GC_STRESS=128` on richards/tree/object-shapes,
+  `OTTER_JIT=1 just test262` property suites failing-set == JIT-off, then the
+  richards `StoreProperty` declines should fall and the hot task bodies compile.
+  After this, the residual richards walls are `Opcode(New)` (constructor inline)
+  and the poly `CallMethod` bridge (Step 2).
+
 Goal: make real OO dispatch stop going through the generic method bridge.
 
 Root cause anchors:

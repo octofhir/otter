@@ -69,6 +69,33 @@ pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph
 /// sealed `LoadSlot`s at baked offsets), not a runtime stub. Gating on it would
 /// reject exactly the fully-inlined method bodies this tier exists to optimize.
 fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
+    // A polymorphic method inline replaces the `CallMethod` bridge with an inline
+    // dispatch chain, so it no longer trips the call-plus-mem-op reject below. But
+    // when the enclosing loop also indexes an array, the optimizing tier's element
+    // access bridges through the materialize-frame stub and the whole loop runs
+    // slower than the baseline's tuned IC sequence — the same cost model that
+    // motivates the reject. Keep such bodies on the baseline until the optimizing
+    // tier's element access is competitive; a poly dispatch over object fields
+    // (no array op) still compiles.
+    let has_poly_method_inline = graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.kind, NodeKind::MethodIdentityMatches { .. }));
+    if has_poly_method_inline {
+        let has_array_op = graph.nodes.iter().any(|node| {
+            matches!(
+                node.kind,
+                NodeKind::LoadElement(_, _)
+                    | NodeKind::StoreElement(_, _, _)
+                    | NodeKind::LoadArrayLength(_)
+            )
+        });
+        if has_array_op {
+            return Err(Unsupported::Unlowered(
+                "polymorphic method inline plus array access",
+            ));
+        }
+    }
     let has_plain_call = graph
         .nodes
         .iter()
@@ -703,8 +730,14 @@ impl<'a> Builder<'a> {
     }
 
     /// Translate one block's instructions into nodes and a terminator.
-    fn fill_block(&mut self, block: BlockId) -> Result<(), Unsupported> {
-        let (start, end) = self.cfg.ranges[block as usize];
+    fn fill_block(&mut self, cfg_block: BlockId) -> Result<(), Unsupported> {
+        let (start, end) = self.cfg.ranges[cfg_block as usize];
+        // `cfg_block` indexes the CFG (successor lookups at the block's exit);
+        // `block` is where nodes and the terminator are placed. A polymorphic
+        // method inline splits this bytecode block, redirecting `block` to the
+        // merge block of its guard chain so the instructions after the call build
+        // into the merge (whose successors are `cfg_block`'s, rewired there).
+        let mut block = cfg_block;
         for i in start..end {
             // Capture the instruction's fields up front so the `&self.view`
             // borrow ends before the `&mut self.graph` mutations below.
@@ -1128,11 +1161,22 @@ impl<'a> Builder<'a> {
                             self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                             return Ok(());
                         }
-                        if let Some(result) =
-                            self.try_inline_method(block, byte_pc, recv, &method, argc, &args)?
+                        if let Some(result) = self
+                            .try_inline_method(block, byte_pc, recv, &method, argc, &args, None)?
                         {
                             self.def_register(dst, block, result, byte_pc);
                             continue;
+                        }
+                    } else if let Some(arms) = self.view.inline_poly_methods.get(&byte_pc).cloned()
+                    {
+                        if let Some((result, merge)) = self
+                            .try_inline_poly_method(block, byte_pc, recv, &arms, argc, &args, dst)?
+                        {
+                            block = merge;
+                            self.def_register(dst, block, result, byte_pc);
+                            continue;
+                        } else if self.block_is_in_loop(block) {
+                            return Err(Unsupported::Opcode(op));
                         }
                     } else if self.block_is_in_loop(block) {
                         return Err(Unsupported::Opcode(op));
@@ -1357,7 +1401,7 @@ impl<'a> Builder<'a> {
                     let cond = reg(&operands, 1)?;
                     let target = u32::try_from(branch_target(byte_pc, rel)).unwrap();
                     let tgt_block = self.cfg.block_of_pc[&target];
-                    let succs = &self.cfg.succs[block as usize];
+                    let succs = &self.cfg.succs[cfg_block as usize];
                     if succs.len() < 2 {
                         return Err(Unsupported::OperandShape(
                             "conditional branch without fallthrough",
@@ -1423,10 +1467,16 @@ impl<'a> Builder<'a> {
         // A block whose last instruction was not a terminator falls through to
         // its single successor.
         if self.graph.blocks[block as usize].term.is_none() {
-            let next = *self.cfg.succs[block as usize]
+            let next = *self.cfg.succs[cfg_block as usize]
                 .first()
                 .ok_or(Unsupported::OperandShape("fallthrough without successor"))?;
             self.set_term(block, Terminator::Jump(next));
+        }
+        // A polymorphic inline redirected building into a synthetic merge block;
+        // mark it filled so `seal_ready` can seal the CFG successors that now take
+        // their control (and loop back-edge values) from it.
+        if block != cfg_block {
+            self.graph.blocks[block as usize].filled = true;
         }
         Ok(())
     }
@@ -1937,6 +1987,165 @@ impl<'a> Builder<'a> {
         Ok(returned)
     }
 
+    /// Inline a *polymorphic* `Op::CallMethodValue` site as a synthetic-block
+    /// guard chain: one guard per candidate receiver shape branches to an inlined
+    /// copy of that shape's method body, falling through to the next candidate on
+    /// a miss; a receiver matching none deoptimizes at the final arm's own
+    /// identity guard (V8 Maglev `CheckMaps` eager deopt / JSC `handleInlining`
+    /// per-target dispatch). All arms merge their result through a phi in a fresh
+    /// merge block, which becomes the continuation for the rest of the enclosing
+    /// bytecode block.
+    ///
+    /// Returns `(phi, merge)` — the destination value and the block the caller
+    /// continues building into — or `None` (bridge the site) when the feedback is
+    /// absent/degenerate or any arm body is not inlinable. On `None` nothing is
+    /// committed: the arm bodies are built first (touching only the node/block
+    /// arenas, never the SSA register maps), so a decline rolls back with two
+    /// truncations and no stale state.
+    #[allow(clippy::too_many_arguments)]
+    fn try_inline_poly_method(
+        &mut self,
+        block: BlockId,
+        call_pc: u32,
+        recv: NodeId,
+        arms: &[JitInlineMethod],
+        argc: usize,
+        args: &[NodeId],
+        dst: u16,
+    ) -> Result<Option<(NodeId, BlockId)>, Unsupported> {
+        const MAX_POLY_ARMS: usize = 4;
+        if self.view.cage_base == 0 || arms.len() < 2 || arms.len() > MAX_POLY_ARMS {
+            return Ok(None);
+        }
+        // A statically undefined / hole receiver has no shape to dispatch on.
+        if matches!(
+            self.graph.node(recv).kind,
+            NodeKind::ConstUndefined | NodeKind::LoadHole
+        ) {
+            return Ok(None);
+        }
+        let n = arms.len();
+        let nodes0 = self.graph.nodes.len();
+        let blocks0 = self.graph.blocks.len();
+
+        // Inline every arm body into a fresh arm block first. This only appends to
+        // the node/block arenas (arm bodies use a local register map, never the
+        // builder's `current_def`), so a decline is a clean rollback.
+        let mut arm_blocks: Vec<BlockId> = Vec::with_capacity(n);
+        let mut arm_results: Vec<NodeId> = Vec::with_capacity(n);
+        for (i, arm) in arms.iter().enumerate() {
+            let a = self.graph.blocks.len() as BlockId;
+            self.graph.blocks.push(super::ir::Block::new(call_pc));
+            // Every arm but the last was proven by its guard's
+            // `MethodIdentityMatches`, so it inlines with the receiver passed
+            // straight through; the last arm keeps its `CheckMethodIdentity` as
+            // the chain's final-miss deopt.
+            let guarded_this = if i + 1 < n { Some(recv) } else { None };
+            match self.try_inline_method(a, call_pc, recv, arm, argc, args, guarded_this)? {
+                Some(result) => {
+                    arm_blocks.push(a);
+                    arm_results.push(result);
+                }
+                None => {
+                    self.graph.nodes.truncate(nodes0);
+                    self.graph.blocks.truncate(blocks0);
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Merge block and the guard blocks (one per non-final candidate).
+        let merge = self.graph.blocks.len() as BlockId;
+        self.graph.blocks.push(super::ir::Block::new(call_pc));
+        let mut guards: Vec<BlockId> = Vec::with_capacity(n - 1);
+        for _ in 0..n - 1 {
+            let g = self.graph.blocks.len() as BlockId;
+            self.graph.blocks.push(super::ir::Block::new(call_pc));
+            guards.push(g);
+        }
+
+        // Guard `i` tests candidate `i` and branches to its arm or to the next
+        // candidate; the last guard's miss falls to the final arm, whose own
+        // `CheckMethodIdentity` (emitted by `try_inline_method`) deopts if the
+        // receiver matches no candidate shape.
+        for i in 0..n - 1 {
+            let arm = &arms[i];
+            let matches = self.graph.add_node(
+                NodeKind::MethodIdentityMatches {
+                    recv,
+                    recv_shape: arm.recv_shape,
+                    proto_shape: arm.proto_shape,
+                    method_value_byte: arm.method_value_byte,
+                    method_on_receiver: arm.method_on_receiver,
+                    method_fid: arm.method_fid,
+                },
+                guards[i],
+                call_pc,
+            );
+            self.push_body(guards[i], matches);
+            let on_false = if i + 1 < n - 1 {
+                guards[i + 1]
+            } else {
+                arm_blocks[n - 1]
+            };
+            self.set_term(
+                guards[i],
+                Terminator::Branch {
+                    cond: matches,
+                    on_true: arm_blocks[i],
+                    on_false,
+                },
+            );
+        }
+
+        // Wire predecessors and the per-arm merge edge.
+        self.graph.blocks[guards[0] as usize].preds.push(block);
+        for i in 1..n - 1 {
+            self.graph.blocks[guards[i] as usize]
+                .preds
+                .push(guards[i - 1]);
+        }
+        for i in 0..n {
+            let pred = if i < n - 1 { guards[i] } else { guards[n - 2] };
+            self.graph.blocks[arm_blocks[i] as usize].preds.push(pred);
+            self.set_term(arm_blocks[i], Terminator::Jump(merge));
+            self.graph.blocks[merge as usize].preds.push(arm_blocks[i]);
+        }
+
+        // The original block now enters the guard chain, and its CFG successors
+        // take control from the merge block instead (so their phi operands read
+        // the post-call environment).
+        self.set_term(block, Terminator::Jump(guards[0]));
+        for succ in self.cfg.succs[block as usize].clone() {
+            for p in &mut self.graph.blocks[succ as usize].preds {
+                if *p == block {
+                    *p = merge;
+                }
+            }
+        }
+
+        // Merge the per-arm results into the destination phi.
+        let phi = self.new_phi(dst, merge);
+        self.graph.nodes[phi as usize].kind = NodeKind::Phi(arm_results);
+
+        // Every synthetic block's predecessors are now final. Mark the guard and
+        // arm blocks filled (fully built) so `seal_ready` treats them as complete
+        // predecessors; the merge block is filled once the caller finishes
+        // building the rest of the bytecode block into it (see `fill_block`).
+        for &g in &guards {
+            self.seal_block(g);
+            self.graph.blocks[g as usize].filled = true;
+        }
+        for &a in &arm_blocks {
+            self.seal_block(a);
+            self.graph.blocks[a as usize].filled = true;
+        }
+        self.seal_block(merge);
+
+        Ok(Some((phi, merge)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn try_inline_method(
         &mut self,
         block: BlockId,
@@ -1945,6 +2154,7 @@ impl<'a> Builder<'a> {
         method: &JitInlineMethod,
         argc: usize,
         args: &[NodeId],
+        guarded_this: Option<NodeId>,
     ) -> Result<Option<NodeId>, Unsupported> {
         const MAX_INLINE_METHOD_REGS: u16 = 64;
         const MAX_INLINE_METHOD_INSTRS: usize = 64;
@@ -1966,19 +2176,29 @@ impl<'a> Builder<'a> {
             }};
         }
 
-        let checked = self.graph.add_node(
-            NodeKind::CheckMethodIdentity {
-                recv,
-                recv_shape: method.recv_shape,
-                proto_shape: method.proto_shape,
-                method_value_byte: method.method_value_byte,
-                method_on_receiver: method.method_on_receiver,
-                method_fid: method.method_fid,
-            },
-            block,
-            call_pc,
-        );
-        self.push_body(block, checked);
+        // `this` is the guarded receiver. A monomorphic site guards it here with a
+        // deopt-on-miss `CheckMethodIdentity`; a polymorphic arm was already
+        // proven by the chain's `MethodIdentityMatches` branch, so it passes the
+        // receiver straight through and skips the redundant identity probe.
+        let this = match guarded_this {
+            Some(recv) => recv,
+            None => {
+                let checked = self.graph.add_node(
+                    NodeKind::CheckMethodIdentity {
+                        recv,
+                        recv_shape: method.recv_shape,
+                        proto_shape: method.proto_shape,
+                        method_value_byte: method.method_value_byte,
+                        method_on_receiver: method.method_on_receiver,
+                        method_fid: method.method_fid,
+                    },
+                    block,
+                    call_pc,
+                );
+                self.push_body(block, checked);
+                checked
+            }
+        };
 
         let mut regs: Vec<Option<NodeId>> = vec![None; method.register_count as usize];
         for (slot, &arg) in args.iter().enumerate() {
@@ -2008,7 +2228,7 @@ impl<'a> Builder<'a> {
             match op {
                 Op::LoadThis => {
                     let dst = reg(operands, 0)?;
-                    write(&mut regs, dst, checked)?;
+                    write(&mut regs, dst, this)?;
                 }
                 Op::LoadInt32 => {
                     let dst = reg(operands, 0)?;

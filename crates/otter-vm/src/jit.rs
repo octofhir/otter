@@ -85,6 +85,25 @@ pub struct JitFunctionView {
     /// OBJECT_BODY_VALUES_PTR_OFFSET`). The emitter reads this pointer after a
     /// shape guard and applies the cached slot-byte offset inside the slab.
     pub object_values_ptr_byte: u32,
+    /// Byte offset from a decompressed object pointer to its in-body inline slab
+    /// (`HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`). A small object
+    /// (`slab_len <= `[`object_inline_slot_cap`](Self::object_inline_slot_cap))
+    /// keeps its slots here, in the body itself. The emitter addresses the slab
+    /// as `header + object_inline_values_byte` for such an object instead of
+    /// loading the cached `values_ptr`: the cached pointer aims into the body and
+    /// so is only valid until the moving collector relocates the object, whereas
+    /// the header is recomputed from the (rooted) receiver every access and never
+    /// dangles.
+    pub object_inline_values_byte: u32,
+    /// Byte offset from a decompressed object pointer to the `u16`
+    /// [`slab_len`](crate::object) counter (`HEADER_SIZE +
+    /// OBJECT_BODY_SLAB_LEN_OFFSET`). The emitter reads it to pick the inline vs
+    /// out-of-line slab base.
+    pub object_slab_len_byte: u32,
+    /// Inline slab capacity (`INLINE_SLOT_CAP`): a body with this many
+    /// string-keyed slots or fewer holds them inline; a larger one spills to the
+    /// out-of-line `values` vector whose base is a stable heap allocation.
+    pub object_inline_slot_cap: u32,
     /// Static GC layout for the inline generational write barrier emitted on a
     /// pointer-valued `StoreProperty`. Isolate-independent `#[repr(C)]` / `const`
     /// values; the card-mark is gated on [`cage_base`](Self::cage_base) being
@@ -542,6 +561,16 @@ pub struct JitInstrView {
     /// polymorphic / megamorphic / prototype / dictionary sites. Baked by
     /// `Interpreter::bake_property_feedback`.
     pub property_feedback: Option<(u32, u32)>,
+    /// Polymorphic own-data property feedback for a `LoadProperty` /
+    /// `StoreProperty` site the interpreter saw with several receiver shapes that
+    /// each own the named slot: one `(shape_offset, slot_byte)` case per observed
+    /// shape (2..=[`MAX_POLY_PROPERTY_CASES`]). The optimizing tier lowers this to
+    /// an inline structure-guard chain — try each case's shape, take its slot on a
+    /// match, deopt on the final miss — mirroring a JSC `MultiGetByOffset` /
+    /// `MultiPutByOffset`. Empty for monomorphic sites (which use
+    /// [`property_feedback`] instead) and for megamorphic / prototype / dictionary
+    /// sites. Baked by `Interpreter::bake_property_feedback`.
+    pub property_feedback_poly: Vec<(u32, u32)>,
     /// For a `NewObject` that begins an object literal (`{ k: v, … }` with
     /// constant string keys), the plan to allocate it directly in its final
     /// hidden class instead of running per-property shape transitions. `None`

@@ -214,6 +214,11 @@ impl ExecutableFunction {
                 + crate::object::OBJECT_BODY_SHAPE_OFFSET as u32,
             object_values_ptr_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_VALUES_PTR_OFFSET as u32,
+            object_inline_values_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_INLINE_VALUES_OFFSET as u32,
+            object_slab_len_byte: otter_gc::header::HEADER_SIZE as u32
+                + crate::object::OBJECT_BODY_SLAB_LEN_OFFSET as u32,
+            object_inline_slot_cap: crate::object::INLINE_SLOT_CAP as u32,
             gc_barrier: crate::jit::JitGcBarrierLayout {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
@@ -261,6 +266,7 @@ impl ExecutableFunction {
                     // Baked by `Interpreter::bake_property_feedback` from the
                     // live per-site property IC; the raw snapshot carries none.
                     property_feedback: None,
+                    property_feedback_poly: Vec::new(),
                     object_literal: None,
                 })
                 .collect(),

@@ -2842,7 +2842,6 @@ mod arm64 {
                 if let Some(loc) = dst {
                     debug_assert_eq!(box_scratch, BOX_SCRATCH);
                     let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
-                    let values_ptr_byte = view.object_values_ptr_byte;
                     let slot_byte = *value_byte;
                     load_loc(ops, box_scratch, oloc);
                     dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
@@ -2850,7 +2849,10 @@ mod arm64 {
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x16, x16, X(box_scratch)     // header ptr
-                        ; ldr x16, [x16, values_ptr_byte]  // slab base
+                    );
+                    crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
+                    dynasm!(ops
+                        ; .arch aarch64
                         ; ldr w17, [x16, slot_byte]        // 4-byte compressed slot
                     );
                     emit_decompress_slot(ops, exit);
@@ -2995,7 +2997,6 @@ mod arm64 {
                 let vloc = require_loc(alloc, *value)?;
                 let vrepr = graph.node(*value).kind.repr();
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
-                let values_ptr_byte = view.object_values_ptr_byte;
                 let slot_byte = *value_byte;
                 // Box the value into x17. Float boxing uses the FP load scratch +
                 // x16; int32 boxing inserts the tag with `movk` (the producer
@@ -3029,13 +3030,162 @@ mod arm64 {
                 dynasm!(ops
                     ; .arch aarch64
                     ; add x16, x16, X(box_scratch)     // header ptr
-                    ; ldr x16, [x16, values_ptr_byte]  // slab base
+                );
+                crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
+                dynasm!(ops
+                    ; .arch aarch64
                     ; fmov x17, d7                      // restore compressed slot
                     ; str w17, [x16, slot_byte]         // 4-byte slot write
                 );
                 if matches!(vrepr, Repr::Tagged) {
                     emit_generational_card_mark(ops, view, oloc, vloc)?;
                 }
+                Ok(())
+            }
+            NodeKind::LoadSlotPoly(obj, cases) => {
+                // Inline structure-guard chain (a JSC `MultiGetByOffset`): read the
+                // receiver shape once, then compare it to each baked case's shape;
+                // the first match loads that case's slot and writes the result, and
+                // the final miss deopts at the load's exact PC. Arms 0..n-1 branch
+                // to the next case on a miss; the last arm's miss is the deopt.
+                debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                let oloc = require_loc(alloc, *obj)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let done = ops.new_dynamic_label();
+                let shape_byte = view.object_shape_byte;
+                // Receiver → header, and read the shape id, once. `d6` parks the
+                // header pointer across the compare chain.
+                load_loc(ops, box_scratch, oloc);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; tst X(box_scratch), #value_tag::NUMBER_TAG
+                    ; b.ne =>exit
+                    ; tst X(box_scratch), #value_tag::OTHER_TAG
+                    ; b.ne =>exit
+                    ; mov W(MOVE_SCRATCH), W(box_scratch)
+                );
+                emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, X(box_scratch)
+                    ; ldrb w17, [x16]
+                    ; cmp w17, OBJECT_BODY_TYPE_TAG
+                    ; b.ne =>exit
+                    ; ldr w17, [x16, shape_byte]   // w17 = receiver shape id
+                    ; fmov d6, x16                 // park header ptr
+                );
+                for (i, (shape, slot_byte)) in cases.iter().enumerate() {
+                    let is_last = i + 1 == cases.len();
+                    let miss = if is_last {
+                        exit
+                    } else {
+                        ops.new_dynamic_label()
+                    };
+                    emit_load_u64(ops, MOVE_SCRATCH, u64::from(*shape));
+                    dynasm!(ops ; .arch aarch64 ; cmp w17, W(MOVE_SCRATCH) ; b.ne =>miss);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; fmov x16, d6                     // header ptr
+                    );
+                    crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr w17, [x16, *slot_byte]       // 4-byte compressed slot
+                    );
+                    emit_decompress_slot(ops, exit);
+                    if let Some(loc) = dst {
+                        store_loc(ops, loc, box_scratch);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; b =>done);
+                    if !is_last {
+                        dynasm!(ops ; .arch aarch64 ; =>miss);
+                    }
+                }
+                dynasm!(ops ; .arch aarch64 ; =>done);
+                Ok(())
+            }
+            NodeKind::StoreSlotPoly(obj, cases, value) => {
+                // Inline structure-guard chain (a JSC `MultiPutByOffset`): box and
+                // compress the value once, read the receiver shape once, then store
+                // into the first matching case's slot; the final miss deopts before
+                // any write, so re-executing the store on the interpreter is
+                // correct. A tagged value carries the inline generational card-mark.
+                debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                let oloc = require_loc(alloc, *obj)?;
+                let vloc = require_loc(alloc, *value)?;
+                let vrepr = graph.node(*value).kind.repr();
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let done = ops.new_dynamic_label();
+                let shape_byte = view.object_shape_byte;
+                // Box the value into x17, then compress to a 4-byte slot parked in
+                // d7. A value that does not fit the compressed form deopts.
+                match vrepr {
+                    Repr::Float64 => {
+                        box_into_gp(ops, box_scratch, Repr::Float64, vloc, MOVE_SCRATCH)
+                    }
+                    Repr::Int32 => {
+                        load_loc(ops, box_scratch, vloc);
+                        dynasm!(ops ; .arch aarch64 ; movk x17, NUMBER_TAG_HI16, lsl #48);
+                    }
+                    Repr::Tagged => {
+                        load_loc(ops, box_scratch, vloc);
+                    }
+                    _ => {
+                        return Err(Unsupported::Unlowered(
+                            "store-slot-poly value not int32/f64/tagged",
+                        ));
+                    }
+                }
+                emit_compress_slot(ops, exit);
+                dynasm!(ops ; .arch aarch64 ; fmov d7, x17);
+                // Receiver → header + shape id, once; park header in d6.
+                load_loc(ops, box_scratch, oloc);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; tst X(box_scratch), #value_tag::NUMBER_TAG
+                    ; b.ne =>exit
+                    ; tst X(box_scratch), #value_tag::OTHER_TAG
+                    ; b.ne =>exit
+                    ; mov W(MOVE_SCRATCH), W(box_scratch)
+                );
+                emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, X(box_scratch)
+                    ; ldrb w17, [x16]
+                    ; cmp w17, OBJECT_BODY_TYPE_TAG
+                    ; b.ne =>exit
+                    ; ldr w17, [x16, shape_byte]   // w17 = receiver shape id
+                    ; fmov d6, x16                 // park header ptr
+                );
+                for (i, (shape, slot_byte)) in cases.iter().enumerate() {
+                    let is_last = i + 1 == cases.len();
+                    let miss = if is_last {
+                        exit
+                    } else {
+                        ops.new_dynamic_label()
+                    };
+                    emit_load_u64(ops, MOVE_SCRATCH, u64::from(*shape));
+                    dynasm!(ops ; .arch aarch64 ; cmp w17, W(MOVE_SCRATCH) ; b.ne =>miss);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; fmov x16, d6                     // header ptr
+                    );
+                    crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; fmov x17, d7                     // compressed slot
+                        ; str w17, [x16, *slot_byte]       // 4-byte slot write
+                    );
+                    if matches!(vrepr, Repr::Tagged) {
+                        emit_generational_card_mark(ops, view, oloc, vloc)?;
+                    }
+                    dynasm!(ops ; .arch aarch64 ; b =>done);
+                    if !is_last {
+                        dynasm!(ops ; .arch aarch64 ; =>miss);
+                    }
+                }
+                dynasm!(ops ; .arch aarch64 ; =>done);
                 Ok(())
             }
             NodeKind::AllocObjectLiteral {
@@ -3689,6 +3839,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                property_feedback_poly: Vec::new(),
                 object_literal: None,
                 arith_feedback: *fb,
             })
@@ -3706,6 +3857,9 @@ mod tests {
             ta_layout: Default::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            object_inline_values_byte: 80,
+            object_slab_len_byte: 88,
+            object_inline_slot_cap: 2,
             gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,

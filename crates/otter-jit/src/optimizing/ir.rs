@@ -285,6 +285,20 @@ pub enum NodeKind {
     /// (int32 / f64 / bool), so the stored `Value` is never a `Gc` pointer and no
     /// generational write barrier is needed. A side effect — produces no result.
     StoreSlot(NodeId, u32, NodeId),
+    /// Polymorphic own-data slot load (a JSC `MultiGetByOffset`). Input is the
+    /// receiver; the boxed list carries one `(shape_offset, slot_byte)` case per
+    /// observed receiver shape. Lowered as an inline structure-guard chain: each
+    /// case compares the receiver shape and, on a match, loads the slot at its
+    /// offset and writes the destination; the final miss deoptimizes at the load's
+    /// exact PC. Result [`Repr::Tagged`].
+    LoadSlotPoly(NodeId, Box<[(u32, u32)]>),
+    /// Polymorphic own-data slot store (a JSC `MultiPutByOffset`). Inputs are
+    /// `(receiver, value)`; the boxed list carries one `(shape_offset, slot_byte)`
+    /// case per observed receiver shape. Lowered as an inline structure-guard
+    /// chain that stores the value at the matching case's offset (with the
+    /// generational card-mark for a tagged value); the final miss deoptimizes at
+    /// the store's exact PC before any write. Side effect — produces no result.
+    StoreSlotPoly(NodeId, Box<[(u32, u32)]>, NodeId),
     /// Speculative dense-array / typed-array computed element read. Inputs are
     /// `(receiver, index)`, where `index` is already unboxed int32. A miss
     /// deoptimizes at the load's exact PC so the interpreter owns the full
@@ -400,6 +414,8 @@ impl NodeKind {
             | NodeKind::Int32Shr(a, b)
             | NodeKind::Int32UshrToFloat64(a, b) => vec![*a, *b],
             NodeKind::StoreElement(a, b, c) => vec![*a, *b, *c],
+            NodeKind::LoadSlotPoly(a, _) => vec![*a],
+            NodeKind::StoreSlotPoly(a, _, b) => vec![*a, *b],
             NodeKind::Phi(ops) => ops.clone(),
             NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
@@ -470,6 +486,11 @@ impl NodeKind {
                 fix(a);
                 fix(b);
                 fix(c);
+            }
+            NodeKind::LoadSlotPoly(a, _) => fix(a),
+            NodeKind::StoreSlotPoly(a, _, b) => {
+                fix(a);
+                fix(b);
             }
             NodeKind::Phi(ops) => ops.iter_mut().for_each(fix),
             NodeKind::LoadThis
@@ -544,6 +565,8 @@ impl NodeKind {
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
             | NodeKind::StoreSlot(_, _, _)
+            | NodeKind::LoadSlotPoly(_, _)
+            | NodeKind::StoreSlotPoly(_, _, _)
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::InlineUpvalue { .. }

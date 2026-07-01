@@ -349,6 +349,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                property_feedback_poly: Vec::new(),
                 object_literal: None,
                 arith_feedback: *fb,
             })
@@ -366,6 +367,9 @@ mod tests {
             ta_layout: Default::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            object_inline_values_byte: 80,
+            object_slab_len_byte: 88,
+            object_inline_slot_cap: 2,
             gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,

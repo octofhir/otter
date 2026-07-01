@@ -426,6 +426,14 @@ pub(crate) enum CallTargetFeedback {
 /// reoptimization evictions a single site can trigger as its target set grows.
 pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 4;
 
+/// Largest number of receiver shapes the optimizing tier bakes into an inline
+/// polymorphic property-access guard chain (a JSC `MultiGetByOffset` /
+/// `MultiPutByOffset`). Above this a site is treated as megamorphic and keeps
+/// the interpreter IC path — the guard chain would cost more than the generic
+/// lookup, and each extra baked shape is another reoptimization eviction as the
+/// site's shape set grows.
+pub(crate) const MAX_POLY_PROPERTY_CASES: usize = 4;
+
 /// One observed `(receiver shape, resolved method)` target at a polymorphic
 /// method-call site. Same layout data the baseline bakes for a monomorphic
 /// inline guard ([`MethodCallFeedback::Mono`]), plus a `hits` counter so the
@@ -3054,48 +3062,59 @@ impl Interpreter {
     /// (polymorphic, megamorphic, prototype, dictionary) stays `None` and lowers
     /// through the property bridge.
     fn bake_property_feedback(&self, view: &mut jit::JitFunctionView) {
+        // Byte size of one compressed slot — a `hit.slot` index scales by this to
+        // the value's byte offset inside the object's value slab.
+        const SLOT_BYTES: u32 =
+            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
         for instr in &mut view.instructions {
             let Some(site) = instr.property_ic_site else {
                 continue;
             };
-            instr.property_feedback = match instr.op {
-                otter_bytecode::Op::LoadProperty => {
-                    self.load_property_ics
-                        .get(site)
-                        .and_then(|e| match e.entries() {
-                            [stub] => stub.own_data_hit().map(|hit| {
-                                (
-                                    hit.shape.offset(),
-                                    u32::from(hit.slot)
-                                        * std::mem::size_of::<
-                                            crate::value::compressed::CompressedValue,
-                                        >() as u32,
-                                )
-                            }),
-                            _ => None,
+            // Collect every entry's own-data `(shape_offset, slot_byte)` case, or
+            // `None` if any entry is not an own-data hit (a prototype / accessor /
+            // transition stub the guard chain cannot represent) — in which case the
+            // whole site is left uncached for the tier.
+            let cases: Option<Vec<(u32, u32)>> = match instr.op {
+                otter_bytecode::Op::LoadProperty => self.load_property_ics.get(site).map(|e| {
+                    e.entries()
+                        .iter()
+                        .map(|stub| {
+                            stub.own_data_hit()
+                                .map(|hit| (hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
                         })
-                }
-                otter_bytecode::Op::StoreProperty => {
-                    self.store_property_ics
-                        .get(site)
-                        .and_then(|e| match e.entries() {
-                            [stub] if stub.store_own_data_hit().is_some() => {
-                                stub.store_own_data_hit().map(|hit| {
-                                    (
-                                        hit.shape.offset(),
-                                        u32::from(hit.slot)
-                                            * std::mem::size_of::<
-                                                crate::value::compressed::CompressedValue,
-                                            >()
-                                                as u32,
-                                    )
-                                })
-                            }
-                            _ => None,
+                        .collect::<Option<Vec<_>>>()
+                }),
+                otter_bytecode::Op::StoreProperty => self.store_property_ics.get(site).map(|e| {
+                    e.entries()
+                        .iter()
+                        .map(|stub| {
+                            stub.store_own_data_hit()
+                                .map(|hit| (hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
                         })
-                }
+                        .collect::<Option<Vec<_>>>()
+                }),
                 _ => None,
-            };
+            }
+            .flatten();
+
+            // One own-data shape → the monomorphic guard the tier already lowers.
+            // 2..=cap own-data shapes → the polymorphic guard chain. Beyond the cap
+            // (or a non-own-data mix) both stay empty and the site keeps the
+            // interpreter IC.
+            match cases.as_deref() {
+                Some([one]) => {
+                    instr.property_feedback = Some(*one);
+                    instr.property_feedback_poly = Vec::new();
+                }
+                Some(many) if (2..=MAX_POLY_PROPERTY_CASES).contains(&many.len()) => {
+                    instr.property_feedback = None;
+                    instr.property_feedback_poly = many.to_vec();
+                }
+                _ => {
+                    instr.property_feedback = None;
+                    instr.property_feedback_poly = Vec::new();
+                }
+            }
         }
     }
 
@@ -11159,6 +11178,7 @@ mod tests {
             load_number: None,
             arith_feedback: 0,
             property_feedback: None,
+            property_feedback_poly: Vec::new(),
             object_literal: None,
         }
     }
@@ -16069,6 +16089,9 @@ mod tests {
             ta_layout: jit::JitTypedArrayLayout::default(),
             object_shape_byte: 0,
             object_values_ptr_byte: 0,
+            object_inline_values_byte: 0,
+            object_slab_len_byte: 0,
+            object_inline_slot_cap: 0,
             gc_barrier: jit::JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
             closure_fid_byte: 0,
@@ -16088,6 +16111,7 @@ mod tests {
                     load_number: None,
                     arith_feedback: 0,
                     property_feedback: None,
+                    property_feedback_poly: Vec::new(),
                     object_literal: None,
                 })
                 .collect(),

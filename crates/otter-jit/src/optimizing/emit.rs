@@ -287,19 +287,16 @@ mod arm64 {
         COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
         COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET,
         COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
-        COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
-        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-        DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
-        FUNCTION_ID_TAG, GC_HEAP_OFFSET, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG,
-        NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
-        SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED,
-        STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
-        UPVALUES_PTR_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
-        VM_OFFSET, jit_abort_direct_call_stub, jit_alloc_object_literal_stub,
-        jit_array_push_optimizing_stub, jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
-        jit_call_method_stub_optimizing, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, value_tag,
+        COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DOUBLE_OFFSET_HI16, FRAME_INDEX_OFFSET,
+        FUNCTION_ID_TAG, GC_HEAP_OFFSET, JS_CLOSURE_BODY_TYPE_TAG, NUMBER_TAG_HI16,
+        OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET,
+        SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_OFFSET,
+        jit_alloc_object_literal_stub, jit_array_push_optimizing_stub, jit_backedge_poll_stub,
+        jit_call_collection_method_ic_stub, jit_call_method_stub_optimizing,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        value_tag,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{
@@ -1725,88 +1722,20 @@ mod arm64 {
         Ok(true)
     }
 
+    /// Enter a prepared direct-call callee through the single shared tail in the
+    /// baseline emitter (see `baseline::arm64::emit_direct_call_tail`). The
+    /// optimizing tier deliberately keeps no copy of this sequence: the callee
+    /// `JitCtx` — including the isolate-boundary `gc_heap` / safepoint /
+    /// collection-IC / array-index-protector fields — is built from one source,
+    /// so an optimizing callee can never enter compiled code with those slots
+    /// left as stack garbage.
     fn emit_direct_call_tail(
         ops: &mut Assembler,
         dst_reg: u16,
         threw: DynamicLabel,
         done: DynamicLabel,
     ) {
-        let direct_returned = ops.new_dynamic_label();
-        let direct_bailed = ops.new_dynamic_label();
-        let direct_threw = ops.new_dynamic_label();
-        dynasm!(ops
-            ; .arch aarch64
-            ; sub sp, sp, JIT_CTX_STACK_SIZE
-            ; ldr x9, [x20, DIRECT_REGS_OFFSET]
-            ; str x9, [sp]
-            ; ldr x9, [x20, DIRECT_SELF_OFFSET]
-            ; str x9, [sp, #8]
-            ; ldr x9, [x20, DIRECT_THIS_OFFSET]
-            ; str x9, [sp, #16]
-            ; str wzr, [sp, BAIL_PC_OFFSET]
-            ; ldr x9, [x20, VM_OFFSET]
-            ; str x9, [sp, VM_OFFSET]
-            ; ldr x9, [x20, STACK_OFFSET]
-            ; str x9, [sp, STACK_OFFSET]
-            ; ldr x9, [x20, CONTEXT_OFFSET]
-            ; str x9, [sp, CONTEXT_OFFSET]
-            ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
-            ; str x9, [sp, FRAME_INDEX_OFFSET]
-            ; ldr x9, [x20, ERROR_SLOT_OFFSET]
-            ; str x9, [sp, ERROR_SLOT_OFFSET]
-            ; ldr x9, [x20, DIRECT_UPVALUES_OFFSET]
-            ; str x9, [sp, UPVALUES_PTR_OFFSET]
-            ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
-            ; str x9, [sp, REG_STACK_BASE_OFFSET]
-            ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
-            ; str x9, [sp, REG_TOP_PTR_OFFSET]
-            ; mov x0, sp
-            ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
-            ; blr x16
-            ; cmp x1, STATUS_RETURNED as u32
-            ; b.eq =>direct_returned
-            ; cmp x1, STATUS_BAILED as u32
-            ; b.eq =>direct_bailed
-            ; b =>direct_threw
-            ; =>direct_returned
-            ; mov x3, x0
-            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
-            ; add sp, sp, JIT_CTX_STACK_SIZE
-            ; mov x0, x20
-            ; movz x1, dst_reg as u32
-        );
-        emit_status_stub_call(
-            ops,
-            jit_finish_direct_call_returned_stub as *const () as usize,
-            threw,
-        );
-        dynasm!(ops ; .arch aarch64 ; b =>done);
-
-        dynasm!(ops
-            ; .arch aarch64
-            ; =>direct_bailed
-            ; ldr w3, [sp, BAIL_PC_OFFSET]
-            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
-            ; add sp, sp, JIT_CTX_STACK_SIZE
-            ; mov x0, x20
-            ; movz x1, dst_reg as u32
-        );
-        emit_status_stub_call(
-            ops,
-            jit_finish_direct_call_bailed_stub as *const () as usize,
-            threw,
-        );
-        dynasm!(ops ; .arch aarch64 ; b =>done);
-
-        dynasm!(ops
-            ; .arch aarch64
-            ; =>direct_threw
-            ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
-            ; add sp, sp, JIT_CTX_STACK_SIZE
-            ; mov x0, x20
-        );
-        emit_status_stub_call(ops, jit_abort_direct_call_stub as *const () as usize, threw);
-        dynasm!(ops ; .arch aarch64 ; b =>threw);
+        crate::baseline::arm64::emit_direct_call_tail(ops, dst_reg, threw, done);
     }
 
     /// Emit the function prologue (copied from the baseline) then reserve the

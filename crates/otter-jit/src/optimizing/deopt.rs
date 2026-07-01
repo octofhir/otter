@@ -365,6 +365,13 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::CheckShape(_, _)
             | NodeKind::CheckFunctionIdentity { .. }
             | NodeKind::CheckMethodIdentity { .. }
+            // Slot access speculates on the JSC-compressed representation: a load
+            // decompresses the 4-byte slot and a store compresses the value into
+            // it, and both bail to a deopt exit when the value is not one that
+            // fits (a boxed double / wide int / function id). Both bail before any
+            // write, so re-executing the property op after the deopt is correct.
+            | NodeKind::LoadSlot(_, _)
+            | NodeKind::StoreSlot(_, _, _)
             | NodeKind::LoadUpvalue(_)
             | NodeKind::InlineUpvalue { .. }
             | NodeKind::Call { .. }

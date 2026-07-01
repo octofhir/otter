@@ -41,7 +41,10 @@ pub(super) struct Flags {
     pub plain: MemFlagsData,
 }
 
-use super::abi::{BAIL_PC_OFFSET, FALSE_BITS, STATUS_BAILED, TAG_INT32, TAG_NAN, TRUE_BITS};
+use super::abi::{
+    BAIL_PC_OFFSET, CANONICAL_NAN, DOUBLE_ENCODE_OFFSET, FALSE_BITS, NUMBER_TAG, STATUS_BAILED,
+    TRUE_BITS,
+};
 use crate::optimizing::deopt::DeoptPoint;
 use crate::optimizing::ir::{Graph, Repr};
 
@@ -57,7 +60,7 @@ pub(super) fn box_tagged(b: &mut FunctionBuilder, flags: Flags, v: Value, repr: 
         Repr::Tagged => v,
         Repr::Int32 => {
             let widened = b.ins().uextend(types::I64, v);
-            let tag = b.ins().iconst(types::I64, (TAG_INT32 << 48) as i64);
+            let tag = b.ins().iconst(types::I64, NUMBER_TAG as i64);
             b.ins().bor(widened, tag)
         }
         Repr::Bool => {
@@ -70,8 +73,12 @@ pub(super) fn box_tagged(b: &mut FunctionBuilder, flags: Flags, v: Value, repr: 
             let bits = b.ins().bitcast(types::I64, flags.plain, v);
             // `Unordered(v, v)` is true iff `v` is NaN.
             let is_nan = b.ins().fcmp(FloatCC::Unordered, v, v);
-            let canonical = b.ins().iconst(types::I64, (TAG_NAN << 48) as i64);
-            b.ins().select(is_nan, canonical, bits)
+            let canonical = b.ins().iconst(types::I64, CANONICAL_NAN as i64);
+            let raw = b.ins().select(is_nan, canonical, bits);
+            // Purify into the number space: every boxed double is its bits plus
+            // the encode offset, so its tag is disjoint from the immediates.
+            let offset = b.ins().iconst(types::I64, DOUBLE_ENCODE_OFFSET as i64);
+            b.ins().iadd(raw, offset)
         }
     }
 }

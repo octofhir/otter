@@ -268,6 +268,7 @@ pub(super) fn emit(
 
 #[cfg(target_arch = "aarch64")]
 mod arm64 {
+    #![allow(unused_parens)]
     use super::super::builder::graph_allows_frameless_self_call;
     use super::{
         Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, Float64UnaryOp, GP_REGS, Graph,
@@ -280,7 +281,7 @@ mod arm64 {
         ALLOC_CTX_FRAME_SLOTS_OFFSET, ALLOC_CTX_RESERVED0_OFFSET, ALLOC_CTX_RESERVED1_OFFSET,
         ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
         ALLOC_CTX_STACK_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET,
-        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET,
+        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BAIL_PC_OFFSET, CANONICAL_NAN_HI16,
         COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET,
         COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET,
         COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
@@ -288,17 +289,17 @@ mod arm64 {
         COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
         COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-        DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, GC_HEAP_OFFSET,
-        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET,
-        REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, SPECIAL_FALSE,
-        SPECIAL_HOLE, SPECIAL_NULL, SPECIAL_TRUE, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED,
-        STATUS_THREW, TAG_FUNCTION_ID, TAG_INT32, TAG_PTR_FUNCTION, TAG_PTR_OBJECT, TAG_SPECIAL,
-        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VM_OFFSET,
-        jit_abort_direct_call_stub, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
-        jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
+        DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        FUNCTION_ID_TAG, GC_HEAP_OFFSET, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG,
+        NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
+        SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET,
+        UPVALUES_PTR_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+        VM_OFFSET, jit_abort_direct_call_stub, jit_alloc_object_literal_stub,
+        jit_array_push_optimizing_stub, jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
         jit_call_method_stub_optimizing, jit_finish_direct_call_bailed_stub,
         jit_finish_direct_call_returned_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, value_tag,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{
@@ -342,8 +343,6 @@ mod arm64 {
     const FP_LOAD_SCRATCH: u32 = 6;
     /// FP scratch register for the second arithmetic operand (`d7`).
     const FP_ARITH_SCRATCH: u32 = 7;
-    /// NaN-box high-16 for the canonical quiet NaN double (`value/tag.rs`).
-    const TAG_NAN: u64 = 0x7FF8;
 
     /// Frame byte offset of spill slot `s` within the JIT spill area (`[sp]`).
     fn spill_off(s: u32) -> u32 {
@@ -441,8 +440,9 @@ mod arm64 {
     }
 
     /// Box the f64 in `src_d` into x-register `dst_x` as a tagged `Value`.
-    /// Non-NaN doubles are their own boxed representation; NaN is canonicalized
-    /// so it never aliases the NaN-box tag range.
+    /// NaN is canonicalized first, then the encode offset is added so the bits
+    /// land in the number space and never alias an immediate. Uses the move
+    /// scratch (`x16`); `dst_x` must be an allocatable home, not the scratch.
     fn emit_box_double(ops: &mut Assembler, src_d: u32, dst_x: u32) {
         let ready = ops.new_dynamic_label();
         dynasm!(ops
@@ -450,8 +450,10 @@ mod arm64 {
             ; fmov X(dst_x), D(src_d)
             ; fcmp D(src_d), D(src_d)
             ; b.vc =>ready
-            ; movz X(dst_x), TAG_NAN as u32, lsl #48
+            ; movz X(dst_x), CANONICAL_NAN_HI16, lsl #48
             ; =>ready
+            ; movz X(MOVE_SCRATCH), DOUBLE_OFFSET_HI16, lsl #48
+            ; add X(dst_x), X(dst_x), X(MOVE_SCRATCH)
         );
     }
 
@@ -529,11 +531,160 @@ mod arm64 {
     fn box_into_gp(ops: &mut Assembler, gp_dst: u32, repr: Repr, loc: Location, tag_scratch: u32) {
         if repr == Repr::Float64 {
             load_fp_loc(ops, FP_LOAD_SCRATCH, loc);
-            dynasm!(ops ; .arch aarch64 ; fmov X(gp_dst), D(FP_LOAD_SCRATCH));
+            // The producer already canonicalized any NaN; apply the encode offset
+            // so the boxed bits land in the number space.
+            dynasm!(ops
+                ; .arch aarch64
+                ; fmov X(gp_dst), D(FP_LOAD_SCRATCH)
+                ; movz X(tag_scratch), DOUBLE_OFFSET_HI16, lsl #48
+                ; add X(gp_dst), X(gp_dst), X(tag_scratch)
+            );
         } else {
             load_loc(ops, gp_dst, loc);
             box_value(ops, gp_dst, repr, tag_scratch);
         }
+    }
+
+    /// Decompress a 4-byte object property slot (zero-extended in `x17`) into a
+    /// full tagged `Value`, in place in `x17`. Small-int / cell-ref / immediate /
+    /// function-id decode inline; a `TAG_BOXED` slot (a heap-boxed number) side
+    /// exits to `deopt`, where the interpreter reads the box. Fixed registers
+    /// (the `#imm` forms need literal registers): `x17` slot in/out, `x16` scratch.
+    fn emit_decompress_slot(ops: &mut Assembler, deopt: DynamicLabel) {
+        use otter_vm::value::compressed as cslot;
+        debug_assert_eq!(cslot::TAG_MASK, 0b111);
+        debug_assert_eq!(
+            (
+                cslot::IMM_NULL,
+                cslot::IMM_TRUE,
+                cslot::IMM_FALSE,
+                cslot::IMM_HOLE
+            ),
+            (1, 2, 3, 4)
+        );
+        let l_smi = ops.new_dynamic_label();
+        let l_cell = ops.new_dynamic_label();
+        let l_imm = ops.new_dynamic_label();
+        let l_fid = ops.new_dynamic_label();
+        let l_undef = ops.new_dynamic_label();
+        let l_null = ops.new_dynamic_label();
+        let l_true = ops.new_dynamic_label();
+        let l_false = ops.new_dynamic_label();
+        let l_hole = ops.new_dynamic_label();
+        let l_done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; tbnz w17, #0, =>l_smi                     // bit0 set → small int
+            ; and w16, w17, #0x7                        // low-3-bit slot tag
+            ; cbz w16, =>l_cell                         // 000 → cell ref
+            ; cmp w16, #0x4                             // 100 → immediate
+            ; b.eq =>l_imm
+            ; cmp w16, #0x6                             // 110 → function id
+            ; b.eq =>l_fid
+            ; b =>deopt                                 // 010 → boxed number
+            ; =>l_cell
+            ; cbz x17, =>l_undef                        // empty slot → undefined
+            ; b =>l_done                                // cell ref = zero-extended offset
+            ; =>l_smi
+            ; asr w17, w17, #1
+            ; mov w17, w17
+            ; movz x16, NUMBER_TAG_HI16, lsl #48
+            ; orr x17, x17, x16
+            ; b =>l_done
+            ; =>l_fid
+            ; lsr w17, w17, #3
+            ; lsl x17, x17, #16
+            ; movz x16, FUNCTION_ID_TAG as u32
+            ; orr x17, x17, x16
+            ; b =>l_done
+            ; =>l_imm
+            ; lsr w16, w17, #3
+            ; cmp w16, #1
+            ; b.eq =>l_null
+            ; cmp w16, #2
+            ; b.eq =>l_true
+            ; cmp w16, #3
+            ; b.eq =>l_false
+            ; cmp w16, #4
+            ; b.eq =>l_hole
+            ; =>l_undef
+            ; movz x17, VALUE_UNDEFINED as u32
+            ; b =>l_done
+            ; =>l_null
+            ; movz x17, VALUE_NULL as u32
+            ; b =>l_done
+            ; =>l_true
+            ; movz x17, VALUE_TRUE as u32
+            ; b =>l_done
+            ; =>l_false
+            ; movz x17, VALUE_FALSE as u32
+            ; b =>l_done
+            ; =>l_hole
+            ; movz x17, VALUE_HOLE as u32
+            ; =>l_done
+        );
+    }
+
+    /// Compress the full tagged `Value` in `x17` into a 4-byte object slot in
+    /// `w17`, in place. A small int, cell ref, or immediate encodes inline; a
+    /// wide int, double, or function id (a boxed-number slot allocates) side
+    /// exits to `deopt`. Fixed registers: `x17` value in / slot out, `x16` scratch.
+    fn emit_compress_slot(ops: &mut Assembler, deopt: DynamicLabel) {
+        let not_int = ops.new_dynamic_label();
+        let check_imm = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        let imm_undef = ops.new_dynamic_label();
+        let imm_null = ops.new_dynamic_label();
+        let imm_true = ops.new_dynamic_label();
+        let imm_false = ops.new_dynamic_label();
+        let imm_hole = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; and x16, x17, #value_tag::NUMBER_TAG
+            ; eor x16, x16, #value_tag::NUMBER_TAG
+            ; cbnz x16, =>not_int                       // not an int32
+            // int32: keep only a small int in [-2^30, 2^30); wider ints box.
+            ; movz w16, #0x4000, lsl #16                // 2^30
+            ; add w16, w17, w16
+            ; tbnz w16, #31, =>deopt                    // out of small-int range
+            ; lsl w17, w17, #1
+            ; orr w17, w17, #1                          // (i << 1) | 1
+            ; b =>done
+            ; =>not_int
+            ; and x16, x17, #value_tag::NUMBER_TAG
+            ; cbnz x16, =>deopt                         // a double boxes on the heap
+            ; tst x17, #value_tag::OTHER_TAG
+            ; b.ne =>check_imm                          // immediate or function id
+            // Cell: the low-32 8-aligned offset (low-3 tag 000) is the slot.
+            ; b =>done
+            ; =>check_imm
+            ; cmp x17, #(VALUE_UNDEFINED as u32)
+            ; b.eq =>imm_undef
+            ; cmp x17, #(VALUE_NULL as u32)
+            ; b.eq =>imm_null
+            ; cmp x17, #(VALUE_TRUE as u32)
+            ; b.eq =>imm_true
+            ; cmp x17, #(VALUE_FALSE as u32)
+            ; b.eq =>imm_false
+            ; cmp x17, #(VALUE_HOLE as u32)
+            ; b.eq =>imm_hole
+            ; b =>deopt                                 // function id → interpreter
+            ; =>imm_undef
+            ; movz w17, #0x4                            // (0 << 3) | 0b100
+            ; b =>done
+            ; =>imm_null
+            ; movz w17, #0xc                            // (1 << 3) | 0b100
+            ; b =>done
+            ; =>imm_true
+            ; movz w17, #0x14                           // (2 << 3) | 0b100
+            ; b =>done
+            ; =>imm_false
+            ; movz w17, #0x1c                           // (3 << 3) | 0b100
+            ; b =>done
+            ; =>imm_hole
+            ; movz w17, #0x24                           // (4 << 3) | 0b100
+            ; =>done
+        );
     }
 
     /// Emit the inline generational write barrier for a pointer-valued slot
@@ -572,17 +723,15 @@ mod arm64 {
         let bitmap_off = view.gc_barrier.card_bitmap_byte as u64;
         let done = ops.new_dynamic_label();
 
-        // (1) Child pointer-tag test: a heap pointer NaN-boxes with top16 in
-        // [TAG_PTR_OBJECT(0x7FFC), TAG_PTR_OTHER(0x7FFF)]. `top16 - 0x7FFC <= 3`
-        // (unsigned) is true only for those four tags. x16 = top16.
+        // (1) Child cell test: a heap cell carries neither a `NUMBER_TAG` bit
+        // nor `OTHER_TAG`; a number or immediate child needs no barrier.
         load_loc(ops, MOVE_SCRATCH, child_loc);
         dynasm!(ops
             ; .arch aarch64
-            ; lsr x16, x16, #48
-            ; movz w17, #0x7FFC
-            ; sub w16, w16, w17
-            ; cmp w16, #3
-            ; b.hi =>done
+            ; tst x16, #value_tag::NUMBER_TAG
+            ; b.ne =>done
+            ; tst x16, #value_tag::OTHER_TAG
+            ; b.ne =>done
         );
 
         // (2) Child young? child_hdr = cage_base + low32(child). An old child
@@ -654,16 +803,16 @@ mod arm64 {
     ) -> bool {
         match kind {
             NodeKind::ConstUndefined => {
-                emit_load_u64(ops, gp_dst, TAG_SPECIAL << 48);
+                emit_load_u64(ops, gp_dst, VALUE_UNDEFINED);
                 true
             }
             NodeKind::ConstNull => {
-                emit_load_u64(ops, gp_dst, (TAG_SPECIAL << 48) | SPECIAL_NULL);
+                emit_load_u64(ops, gp_dst, VALUE_NULL);
                 true
             }
             NodeKind::ConstBool(value) => {
-                let special = if *value { SPECIAL_TRUE } else { SPECIAL_FALSE };
-                emit_load_u64(ops, gp_dst, (TAG_SPECIAL << 48) | u64::from(special));
+                let special_bits = if *value { VALUE_TRUE } else { VALUE_FALSE };
+                emit_load_u64(ops, gp_dst, special_bits);
                 true
             }
             NodeKind::ConstInt32(value) => {
@@ -672,7 +821,12 @@ mod arm64 {
                 true
             }
             NodeKind::ConstF64(value) => {
-                emit_load_u64(ops, gp_dst, value.to_bits());
+                let bits = if value.is_nan() {
+                    value_tag::CANONICAL_NAN
+                } else {
+                    value.to_bits()
+                };
+                emit_load_u64(ops, gp_dst, value_tag::box_double(bits));
                 true
             }
             NodeKind::SelfClosure => {
@@ -755,10 +909,10 @@ mod arm64 {
             let phi_home = require_loc(alloc, phi)?;
             let input_home = require_loc(alloc, input)?;
             if input_repr == Repr::Float64 {
-                // The FP-resident input had no GP parallel move; read its FP home
-                // and store the verbatim (boxed) bits into the phi's GP home.
+                // The FP-resident input had no GP parallel move; read its FP home,
+                // box the double (offset applied), and store into the phi's GP home.
                 load_fp_loc(ops, FP_LOAD_SCRATCH, input_home);
-                dynasm!(ops ; .arch aarch64 ; fmov X(BOX_SCRATCH), D(FP_LOAD_SCRATCH));
+                emit_box_double(ops, FP_LOAD_SCRATCH, BOX_SCRATCH);
                 store_loc(ops, phi_home, BOX_SCRATCH);
             } else {
                 // Int32 / Bool: the raw bits are already in the phi home (GP
@@ -781,21 +935,19 @@ mod arm64 {
                 // OR in the int32 tag.
                 dynasm!(ops
                     ; .arch aarch64
-                    ; movz X(scratch_x), TAG_INT32 as u32, lsl #48
+                    ; movz X(scratch_x), NUMBER_TAG_HI16, lsl #48
                     ; orr X(xr), X(xr), X(scratch_x)
                 );
             }
             Repr::Bool => {
-                // 0/1 predicate → SPECIAL false(3)/true(4): add the false base
-                // (through `scratch_x`, since a dynamic-register immediate add is
-                // not expressible in this assembler), then OR the special tag —
-                // reusing the same scratch sequentially so only one is needed.
+                // 0/1 predicate → the `VALUE_FALSE` / `VALUE_TRUE` immediate
+                // word: add the false base (through `scratch_x`, since a
+                // dynamic-register immediate add is not expressible here). The W
+                // write zeroes bits 63:32, so the result is the full value word.
                 dynasm!(ops
                     ; .arch aarch64
-                    ; movz W(scratch_x), SPECIAL_FALSE
+                    ; movz W(scratch_x), VALUE_FALSE as u32
                     ; add W(xr), W(xr), W(scratch_x)
-                    ; movz X(scratch_x), TAG_SPECIAL as u32, lsl #48
-                    ; orr X(xr), X(xr), X(scratch_x)
                 );
             }
             Repr::Tagged => {}
@@ -830,10 +982,10 @@ mod arm64 {
         load_loc(ops, 0, recv_loc);
         dynasm!(ops
             ; .arch aarch64
-            ; lsr x3, x0, #48
-            ; movz x4, TAG_PTR_OBJECT as u32
-            ; cmp x3, x4
-            ; b.ne =>exit
+            ; movz x4, NUMBER_TAG_HI16, lsl #48
+            ; orr x4, x4, #value_tag::OTHER_TAG   // NOT_CELL_MASK
+            ; tst x0, x4
+            ; b.ne =>exit                         // not a heap cell
             ; mov w0, w0
         );
         emit_load_u64(ops, 1, view.cage_base as u64);
@@ -901,7 +1053,7 @@ mod arm64 {
         let arr_len_byte = view.ta_layout.array_elements_byte + len_word;
         let bytes_ptr_byte = view.ta_layout.buf_bytes_byte + ptr_word;
         let bytes_len_byte = view.ta_layout.buf_bytes_byte + len_word;
-        let hole_bits = (TAG_SPECIAL << 48) | SPECIAL_HOLE;
+        let hole_bits = VALUE_HOLE;
         let array_path = ops.new_dynamic_label();
         let ta_path = ops.new_dynamic_label();
         let f64_path = ops.new_dynamic_label();
@@ -992,7 +1144,7 @@ mod arm64 {
             ; b.hi =>exit
             ; add x4, x6, x4
             ; ldr w6, [x4]
-            ; movz x7, TAG_INT32 as u32, lsl #48
+            ; movz x7, NUMBER_TAG_HI16, lsl #48
             ; orr x6, x6, x7
         );
         if let Some(loc) = dst {
@@ -1090,7 +1242,7 @@ mod arm64 {
                 load_loc(ops, 6, value_loc);
                 dynasm!(ops
                     ; .arch aarch64
-                    ; movz x7, TAG_INT32 as u32, lsl #48
+                    ; movz x7, NUMBER_TAG_HI16, lsl #48
                     ; orr x6, x6, x7
                     ; str x6, [x4]
                     ; b =>done
@@ -1200,7 +1352,7 @@ mod arm64 {
                 Repr::Bool => {
                     let is_true = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
-                    emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_TRUE as u64);
+                    emit_load_u64(ops, MOVE_SCRATCH, VALUE_TRUE);
                     dynasm!(ops
                         ; .arch aarch64
                         ; cmp X(box_scratch), X(MOVE_SCRATCH)
@@ -1323,9 +1475,9 @@ mod arm64 {
         load_frame_reg(ops, 9, recv_reg)?;
         dynasm!(ops
             ; .arch aarch64
-            ; lsr x10, x9, #48
-            ; movz x11, TAG_PTR_OBJECT as u32
-            ; cmp x10, x11
+            ; movz x11, NUMBER_TAG_HI16, lsl #48
+            ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+            ; tst x9, x11
             ; b.ne =>miss
             ; mov w12, w9
         );
@@ -1357,9 +1509,9 @@ mod arm64 {
             ; cbz x15, =>miss
             ; ldr w12, [x17, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET]
             ; ldr x9, [x15, x12]
-            ; lsr x10, x9, #48
-            ; movz x11, TAG_PTR_FUNCTION as u32
-            ; cmp x10, x11
+            ; movz x11, NUMBER_TAG_HI16, lsl #48
+            ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+            ; tst x9, x11
             ; b.ne =>miss
             ; mov w12, w9
         );
@@ -1382,7 +1534,7 @@ mod arm64 {
         if let Some(key) = key {
             load_frame_reg(ops, 3, key)?;
         } else {
-            emit_load_u64(ops, 3, TAG_SPECIAL << 48);
+            emit_load_u64(ops, 3, VALUE_UNDEFINED);
         }
         emit_load_u64(
             ops,
@@ -1423,7 +1575,7 @@ mod arm64 {
         let object_values_ptr_byte = view.object_values_ptr_byte;
         let native_static_fn_byte = view.native_static_fn_byte;
         let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
-        let undefined_bits = TAG_SPECIAL << 48;
+        let undefined_bits = VALUE_UNDEFINED;
 
         dynasm!(ops
             ; .arch aarch64
@@ -1452,9 +1604,9 @@ mod arm64 {
         load_frame_reg(ops, 9, recv_reg)?;
         dynasm!(ops
             ; .arch aarch64
-            ; lsr x10, x9, #48
-            ; movz x11, TAG_PTR_OBJECT as u32
-            ; cmp x10, x11
+            ; movz x11, NUMBER_TAG_HI16, lsl #48
+            ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+            ; tst x9, x11
             ; b.ne =>miss
             ; mov w12, w9
         );
@@ -1486,9 +1638,9 @@ mod arm64 {
             ; cbz x15, =>miss
             ; ldr w12, [x17, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET]
             ; ldr x9, [x15, x12]
-            ; lsr x10, x9, #48
-            ; movz x11, TAG_PTR_FUNCTION as u32
-            ; cmp x10, x11
+            ; movz x11, NUMBER_TAG_HI16, lsl #48
+            ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+            ; tst x9, x11
             ; b.ne =>miss
             ; mov w12, w9
         );
@@ -1730,13 +1882,11 @@ mod arm64 {
         match repr {
             Repr::Tagged => store_loc(ops, home, BOX_SCRATCH),
             Repr::Int32 => {
-                debug_assert_eq!(TAG_INT32, 0x7FF9);
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x16, X(BOX_SCRATCH), #48
-                    ; sub x16, x16, #0xFF9
-                    ; subs x16, x16, #7, lsl #12
-                    ; b.ne =>fail
+                    ; and x16, X(BOX_SCRATCH), #value_tag::NUMBER_TAG
+                    ; eor x16, x16, #value_tag::NUMBER_TAG
+                    ; cbnz x16, =>fail
                     ; mov W(BOX_SCRATCH), W(BOX_SCRATCH)
                 );
                 store_loc(ops, home, BOX_SCRATCH);
@@ -1746,13 +1896,13 @@ mod arm64 {
                 let done = ops.new_dynamic_label();
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x16, X(BOX_SCRATCH), #48
-                    ; sub x16, x16, #0xFF9
-                    ; subs x16, x16, #7, lsl #12
-                    ; b.eq =>int32_path
-                    ; cmp x16, #6
-                    ; b.ls =>fail
-                    ; fmov D(FP_LOAD_SCRATCH), X(BOX_SCRATCH)
+                    ; and x16, X(BOX_SCRATCH), #value_tag::NUMBER_TAG
+                    ; cbz x16, =>fail
+                    ; eor x16, x16, #value_tag::NUMBER_TAG
+                    ; cbz x16, =>int32_path
+                    ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
+                    ; sub x16, X(BOX_SCRATCH), x16
+                    ; fmov D(FP_LOAD_SCRATCH), x16
                     ; b =>done
                     ; =>int32_path
                     ; scvtf D(FP_LOAD_SCRATCH), W(BOX_SCRATCH)
@@ -1763,11 +1913,7 @@ mod arm64 {
             Repr::Bool => {
                 let is_true = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                emit_load_u64(
-                    ops,
-                    MOVE_SCRATCH,
-                    (TAG_SPECIAL << 48) | SPECIAL_FALSE as u64,
-                );
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_FALSE);
                 dynasm!(ops
                     ; .arch aarch64
                     ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
@@ -1776,7 +1922,7 @@ mod arm64 {
                     ; b =>done
                     ; =>is_true
                 );
-                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_TRUE as u64);
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_TRUE);
                 dynasm!(ops
                     ; .arch aarch64
                     ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
@@ -1976,11 +2122,7 @@ mod arm64 {
                     if graph.node(*cond).repr == Repr::Bool {
                         dynasm!(&mut ops ; .arch aarch64 ; cbz W(BOX_SCRATCH), =>false_setup);
                     } else {
-                        emit_load_u64(
-                            &mut ops,
-                            MOVE_SCRATCH,
-                            (TAG_SPECIAL << 48) | SPECIAL_FALSE as u64,
-                        );
+                        emit_load_u64(&mut ops, MOVE_SCRATCH, VALUE_FALSE);
                         dynasm!(&mut ops
                             ; .arch aarch64
                             ; cmp X(BOX_SCRATCH), X(MOVE_SCRATCH)
@@ -2138,10 +2280,10 @@ mod arm64 {
         load_loc(ops, 0, recv_loc);
         dynasm!(ops
             ; .arch aarch64
-            ; lsr x3, x0, #48
-            ; movz x4, TAG_PTR_OBJECT as u32
-            ; cmp x3, x4
-            ; b.ne =>exit
+            ; movz x4, NUMBER_TAG_HI16, lsl #48
+            ; orr x4, x4, #value_tag::OTHER_TAG   // NOT_CELL_MASK
+            ; tst x0, x4
+            ; b.ne =>exit                         // not a heap cell
             ; mov w0, w0
         );
         emit_load_u64(ops, 1, view.cage_base as u64);
@@ -2170,10 +2312,15 @@ mod arm64 {
             ; b.ne =>exit
             ; ldr x4, [x4, object_values_ptr_byte]
             ; cbz x4, =>exit
-            ; ldr x5, [x4, method_value_byte]
-            ; lsr x6, x5, #48
-            ; movz x7, TAG_PTR_FUNCTION as u32
-            ; cmp x6, x7
+            ; ldr w17, [x4, method_value_byte]   // 4-byte compressed slot
+        );
+        emit_decompress_slot(ops, exit);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x5, x17
+            ; movz x7, NUMBER_TAG_HI16, lsl #48
+            ; orr x7, x7, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+            ; tst x5, x7
             ; b.ne =>exit
             ; mov w6, w5
             ; add x6, x1, x6                  // x6 = method fn body ptr
@@ -2215,22 +2362,21 @@ mod arm64 {
             NodeKind::Param(_) | NodeKind::Phi(_) => Ok(()),
             NodeKind::ConstUndefined => {
                 if let Some(loc) = dst {
-                    emit_load_u64(ops, box_scratch, TAG_SPECIAL << 48);
+                    emit_load_u64(ops, box_scratch, VALUE_UNDEFINED);
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())
             }
             NodeKind::ConstNull => {
                 if let Some(loc) = dst {
-                    emit_load_u64(ops, box_scratch, (TAG_SPECIAL << 48) | SPECIAL_NULL);
+                    emit_load_u64(ops, box_scratch, VALUE_NULL);
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())
             }
             NodeKind::ConstBool(b) => {
                 if let Some(loc) = dst {
-                    let special = if *b { SPECIAL_TRUE } else { SPECIAL_FALSE };
-                    let bits = (TAG_SPECIAL << 48) | u64::from(special);
+                    let bits = if *b { VALUE_TRUE } else { VALUE_FALSE };
                     emit_load_u64(ops, box_scratch, bits);
                     store_loc(ops, loc, box_scratch);
                 }
@@ -2270,18 +2416,14 @@ mod arm64 {
                 }
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 load_loc(ops, box_scratch, oloc);
-                // Guard top16(value) == TAG_INT32 (0x7FF9) using only the move
-                // scratch (x16): two immediate subtracts form 0x7FF9 = 0x7000 +
-                // 0xFF9 (each ≤ 0xFFF), avoiding a third reserved register so the
-                // value stays in box_scratch and the allocatable file (x9..x15) is
-                // never clobbered.
-                debug_assert_eq!(TAG_INT32, 0x7FF9);
+                // int32 iff every `NUMBER_TAG` bit is set. The two logical
+                // immediates need no extra register, so the value stays in
+                // box_scratch and the allocatable file (x9..x15) is untouched.
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x16, X(box_scratch), #48
-                    ; sub x16, x16, #0xFF9
-                    ; subs x16, x16, #7, lsl #12
-                    ; b.ne =>exit
+                    ; and x16, X(box_scratch), #value_tag::NUMBER_TAG
+                    ; eor x16, x16, #value_tag::NUMBER_TAG
+                    ; cbnz x16, =>exit
                 );
                 if let Some(loc) = dst {
                     // The guarded low32 is the unboxed int value; mask off the tag.
@@ -2431,24 +2573,20 @@ mod arm64 {
                 }
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 load_loc(ops, box_scratch, oloc);
-                debug_assert_eq!(TAG_INT32, 0x7FF9);
                 let int32_path = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                // x16 = top16(value) - TAG_INT32 (= 0x7000 + 0xFF9). Z set ⇒ the
-                // value is int32-tagged. Then `(tag - 0x7FF9) ∈ [1, 6]` ⇒ a
-                // special / pointer tag (0x7FFA..=0x7FFF) ⇒ non-number ⇒ deopt;
-                // every other prefix (the whole double range, including the
-                // canonical NaN at 0x7FF8 and the negative half ≥ 0x8000) passes.
+                // `value & NUMBER_TAG`: zero ⇒ a cell or non-number immediate
+                // (deopt); == NUMBER_TAG ⇒ int32 (widen the low-32 payload);
+                // otherwise a boxed double (subtract the encode offset).
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x16, X(box_scratch), #48
-                    ; sub x16, x16, #0xFF9
-                    ; subs x16, x16, #7, lsl #12
-                    ; b.eq =>int32_path
-                    ; cmp x16, #6
-                    ; b.ls =>exit
-                    // Double: the operand bits are the f64 verbatim.
-                    ; fmov D(FP_LOAD_SCRATCH), X(box_scratch)
+                    ; and x16, X(box_scratch), #value_tag::NUMBER_TAG
+                    ; cbz x16, =>exit
+                    ; eor x16, x16, #value_tag::NUMBER_TAG
+                    ; cbz x16, =>int32_path
+                    ; movz x16, DOUBLE_OFFSET_HI16, lsl #48
+                    ; sub x16, X(box_scratch), x16
+                    ; fmov D(FP_LOAD_SCRATCH), x16
                     ; b =>done
                     ; =>int32_path
                     // Int32: widen the signed low-32 payload to f64.
@@ -2555,15 +2693,18 @@ mod arm64 {
             } => {
                 let vloc = require_loc(alloc, *value)?;
                 load_loc(ops, box_scratch, vloc);
-                // `null` = base|1, `undefined` = base|0 (base = TAG_SPECIAL<<48).
-                // For a nullish (`== null`) test, set bit 0 so both collapse onto
-                // the `null` immediate; no other value maps there.
-                if *nullish {
-                    emit_load_u64(ops, MOVE_SCRATCH, 1);
-                    dynasm!(ops ; .arch aarch64 ; orr X(box_scratch), X(box_scratch), X(MOVE_SCRATCH));
-                }
-                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_NULL);
+                let flags_ready = ops.new_dynamic_label();
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_NULL);
                 dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH));
+                if *nullish {
+                    // A loose null test also matches `undefined`. On a `null` hit
+                    // the flags already read equal; otherwise re-test against
+                    // `undefined` so the flags read equal iff nullish.
+                    dynasm!(ops ; .arch aarch64 ; b.eq =>flags_ready);
+                    emit_load_u64(ops, MOVE_SCRATCH, VALUE_UNDEFINED);
+                    dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH));
+                }
+                dynasm!(ops ; .arch aarch64 ; =>flags_ready);
                 if let Some(loc) = dst {
                     if *negate {
                         dynasm!(ops ; .arch aarch64 ; cset W(box_scratch), ne);
@@ -2582,12 +2723,14 @@ mod arm64 {
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 debug_assert_eq!(box_scratch, BOX_SCRATCH);
                 load_loc(ops, box_scratch, oloc);
-                debug_assert_eq!(TAG_PTR_OBJECT, 0x7FFC);
+                // A heap cell carries neither a `NUMBER_TAG` bit nor `OTHER_TAG`;
+                // a number or immediate receiver deopts. The GC type-tag check
+                // below disambiguates an ordinary object from another cell class.
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x16, X(box_scratch), #48
-                    ; sub x16, x16, #0xFFC
-                    ; subs x16, x16, #7, lsl #12
+                    ; tst X(box_scratch), #value_tag::NUMBER_TAG
+                    ; b.ne =>exit
+                    ; tst X(box_scratch), #value_tag::OTHER_TAG
                     ; b.ne =>exit
                 );
                 if let Some(loc) = dst {
@@ -2620,14 +2763,13 @@ mod arm64 {
                 load_loc(ops, box_scratch, callee_loc);
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x0, X(box_scratch), #48
-                    ; movz x1, TAG_FUNCTION_ID as u32
-                    ; cmp x0, x1
+                    ; movz x1, NUMBER_TAG_HI16, lsl #48
+                    ; tst X(box_scratch), x1
+                    ; b.ne =>exit                       // a number is not callable
+                    ; and x0, X(box_scratch), #0xffff
+                    ; cmp x0, #(FUNCTION_ID_TAG as u32)
                     ; b.eq =>fid_immediate
-                    ; movz x1, TAG_PTR_FUNCTION as u32
-                    ; cmp x0, x1
-                    ; b.ne =>exit
-                    ; mov w2, W(box_scratch)
+                    ; mov w2, W(box_scratch)            // otherwise a cell: low32 = gc offset
                 );
                 emit_load_u64(ops, 3, view.cage_base as u64);
                 dynasm!(ops
@@ -2639,7 +2781,7 @@ mod arm64 {
                     ; ldr w4, [x3, view.closure_fid_byte]
                     ; b =>fid_compare
                     ; =>fid_immediate
-                    ; mov w4, W(box_scratch)
+                    ; lsr x4, X(box_scratch), #16        // function id in bits [16, 48)
                     ; =>fid_compare
                     ; movz w5, function_id & 0xffff
                     ; movk w5, (function_id >> 16) & 0xffff, lsl #16
@@ -2668,9 +2810,9 @@ mod arm64 {
                 let fid_compare = ops.new_dynamic_label();
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x0, X(box_scratch), #48
-                    ; movz x1, TAG_PTR_OBJECT as u32
-                    ; cmp x0, x1
+                    ; movz x1, NUMBER_TAG_HI16, lsl #48
+                    ; orr x1, x1, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+                    ; tst X(box_scratch), x1
                     ; b.ne =>exit
                     ; mov w2, W(box_scratch)
                 );
@@ -2711,15 +2853,19 @@ mod arm64 {
                     ; .arch aarch64
                     ; ldr x3, [x3, view.object_values_ptr_byte]
                     ; cbz x3, =>exit
-                    ; ldr x4, [x3, *method_value_byte]
-                    ; lsr x0, x4, #48
-                    ; movz x1, TAG_FUNCTION_ID as u32
-                    ; cmp x0, x1
+                    ; ldr w17, [x3, *method_value_byte]  // 4-byte compressed slot
+                );
+                emit_decompress_slot(ops, exit);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; mov x4, x17
+                    ; movz x1, NUMBER_TAG_HI16, lsl #48
+                    ; tst x4, x1
+                    ; b.ne =>exit                       // a number is not a method
+                    ; and x0, x4, #0xffff
+                    ; cmp x0, #(FUNCTION_ID_TAG as u32)
                     ; b.eq =>fid_immediate
-                    ; movz x1, TAG_PTR_FUNCTION as u32
-                    ; cmp x0, x1
-                    ; b.ne =>exit
-                    ; mov w2, w4
+                    ; mov w2, w4                        // otherwise a cell: low32 = gc offset
                 );
                 emit_load_u64(ops, 3, view.cage_base as u64);
                 dynasm!(ops
@@ -2731,7 +2877,7 @@ mod arm64 {
                     ; ldr w4, [x3, view.closure_fid_byte]
                     ; b =>fid_compare
                     ; =>fid_immediate
-                    ; mov w4, w4
+                    ; lsr x4, x4, #16                   // function id in bits [16, 48)
                     ; =>fid_compare
                     ; movz w5, method_fid & 0xffff
                     ; movk w5, (method_fid >> 16) & 0xffff, lsl #16
@@ -2754,6 +2900,8 @@ mod arm64 {
                 }
                 let oloc = require_loc(alloc, *obj)?;
                 if let Some(loc) = dst {
+                    debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                    let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                     let values_ptr_byte = view.object_values_ptr_byte;
                     let slot_byte = *value_byte;
                     load_loc(ops, box_scratch, oloc);
@@ -2761,10 +2909,11 @@ mod arm64 {
                     emit_load_u64(ops, box_scratch, view.cage_base as u64);
                     dynasm!(ops
                         ; .arch aarch64
-                        ; add x16, x16, X(box_scratch)
-                        ; ldr X(box_scratch), [x16, values_ptr_byte]
-                        ; ldr X(box_scratch), [X(box_scratch), slot_byte]
+                        ; add x16, x16, X(box_scratch)     // header ptr
+                        ; ldr x16, [x16, values_ptr_byte]  // slab base
+                        ; ldr w17, [x16, slot_byte]        // 4-byte compressed slot
                     );
+                    emit_decompress_slot(ops, exit);
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())
@@ -2827,7 +2976,7 @@ mod arm64 {
                     store_loc(ops, loc, 6);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>empty);
-                emit_load_u64(ops, 6, TAG_SPECIAL << 48);
+                emit_load_u64(ops, 6, VALUE_UNDEFINED);
                 if let Some(loc) = dst {
                     store_loc(ops, loc, 6);
                 }
@@ -2905,28 +3054,19 @@ mod arm64 {
                 let oloc = require_loc(alloc, *obj)?;
                 let vloc = require_loc(alloc, *value)?;
                 let vrepr = graph.node(*value).kind.repr();
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 let values_ptr_byte = view.object_values_ptr_byte;
                 let slot_byte = *value_byte;
-                // Slab base pointer → x16.
-                load_loc(ops, box_scratch, oloc);
-                dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
-                emit_load_u64(ops, box_scratch, view.cage_base as u64);
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; add x16, x16, X(box_scratch)
-                    ; ldr x16, [x16, values_ptr_byte]
-                );
-                // Boxed value → x17 (box_scratch). Float boxing uses the FP load
-                // scratch and never touches x16; int32 boxing inserts the tag with
-                // `movk` (the producer zeroed bits 63:32), needing no scratch. A
-                // `Tagged` value is already boxed in its location.
+                // Box the value into x17. Float boxing uses the FP load scratch +
+                // x16; int32 boxing inserts the tag with `movk` (the producer
+                // zeroed bits 63:32); a `Tagged` value is already boxed.
                 match vrepr {
                     Repr::Float64 => {
                         box_into_gp(ops, box_scratch, Repr::Float64, vloc, MOVE_SCRATCH)
                     }
                     Repr::Int32 => {
                         load_loc(ops, box_scratch, vloc);
-                        dynasm!(ops ; .arch aarch64 ; movk x17, TAG_INT32 as u32, lsl #48);
+                        dynasm!(ops ; .arch aarch64 ; movk x17, NUMBER_TAG_HI16, lsl #48);
                     }
                     Repr::Tagged => {
                         load_loc(ops, box_scratch, vloc);
@@ -2937,7 +3077,22 @@ mod arm64 {
                         ));
                     }
                 }
-                dynasm!(ops ; .arch aarch64 ; str x17, [x16, slot_byte]);
+                // Compress to a 4-byte slot (a double / wide int / function id
+                // deopts — it would allocate a heap box). Park the slot in d7
+                // while the slab base is recomputed, since the compress and the
+                // base computation both use x16.
+                emit_compress_slot(ops, exit);
+                dynasm!(ops ; .arch aarch64 ; fmov d7, x17);
+                load_loc(ops, box_scratch, oloc);
+                dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
+                emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; add x16, x16, X(box_scratch)     // header ptr
+                    ; ldr x16, [x16, values_ptr_byte]  // slab base
+                    ; fmov x17, d7                      // restore compressed slot
+                    ; str w17, [x16, slot_byte]         // 4-byte slot write
+                );
                 if matches!(vrepr, Repr::Tagged) {
                     emit_generational_card_mark(ops, view, oloc, vloc)?;
                 }
@@ -3249,7 +3404,7 @@ mod arm64 {
                 // super) deopts to the interpreter.
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x20, THIS_VALUE_OFFSET]);
-                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_HOLE);
                 dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
                 if let Some(loc) = dst {
                     store_loc(ops, loc, box_scratch);
@@ -3258,7 +3413,7 @@ mod arm64 {
             }
             NodeKind::LoadHole => {
                 if let Some(loc) = dst {
-                    emit_load_u64(ops, box_scratch, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                    emit_load_u64(ops, box_scratch, VALUE_HOLE);
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())
@@ -3285,7 +3440,7 @@ mod arm64 {
                     ; add x16, x16, x17
                     ; ldr X(box_scratch), [x16, UPVALUE_VALUE_OFFSET]
                 );
-                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_HOLE);
                 dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
                 if let Some(loc) = dst {
                     store_loc(ops, loc, box_scratch);
@@ -3311,9 +3466,9 @@ mod arm64 {
                 // `TAG_PTR_FUNCTION`; a bare function-id immediate has no spine.
                 dynasm!(ops
                     ; .arch aarch64
-                    ; lsr x0, X(box_scratch), #48
-                    ; movz x1, TAG_PTR_FUNCTION as u32
-                    ; cmp x0, x1
+                    ; movz x1, NUMBER_TAG_HI16, lsl #48
+                    ; orr x1, x1, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+                    ; tst X(box_scratch), x1
                     ; b.ne =>exit
                     ; mov w2, W(box_scratch)
                 );
@@ -3334,7 +3489,7 @@ mod arm64 {
                     ; add x16, x16, x17
                     ; ldr X(box_scratch), [x16, UPVALUE_VALUE_OFFSET]
                 );
-                emit_load_u64(ops, MOVE_SCRATCH, (TAG_SPECIAL << 48) | SPECIAL_HOLE);
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_HOLE);
                 dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
                 if let Some(loc) = dst {
                     store_loc(ops, loc, box_scratch);
@@ -3361,7 +3516,7 @@ mod arm64 {
         let bailed = ops.new_dynamic_label();
         let fill = ops.new_dynamic_label();
         let fill_done = ops.new_dynamic_label();
-        let undef_bits = TAG_SPECIAL << 48;
+        let undef_bits = VALUE_UNDEFINED;
 
         let callee_off = u32::from(callee_reg) * 8;
         dynasm!(ops
@@ -3550,7 +3705,7 @@ mod tests {
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32},
     };
 
-    const TAG_INT32: u64 = 0x7FF9;
+    use otter_vm::value::tag as value_tag;
 
     fn r(n: u16) -> Operand {
         Operand::Register(n)
@@ -3559,7 +3714,10 @@ mod tests {
         Operand::Imm32(n)
     }
     fn boxi(v: i32) -> u64 {
-        (TAG_INT32 << 48) | (v as u32 as u64)
+        value_tag::NUMBER_TAG | (v as u32 as u64)
+    }
+    fn unboxf(v: u64) -> f64 {
+        f64::from_bits(value_tag::unbox_double(v))
     }
     fn unboxi(v: u64) -> i32 {
         v as u32 as i32
@@ -3723,12 +3881,12 @@ mod tests {
         // A non-int32 param fails the CheckInt32 guard and bails to the
         // interpreter (status 1), which owns the spec-correct semantics.
         let v = loop_return_param();
-        let double_bits = 3.5_f64.to_bits(); // a real double, not NaN-boxed int32
+        let double_bits = value_tag::box_double(3.5_f64.to_bits()); // boxed real double
         let (status, _value) = run(&v, &[double_bits]);
         assert_eq!(status, 1, "non-int32 param deopts to the interpreter");
     }
 
-    const SPECIAL_UNDEFINED: u64 = 0x7FFA << 48;
+    const SPECIAL_UNDEFINED: u64 = value_tag::VALUE_UNDEFINED;
 
     /// `f(a){ return a / 2 }` — a float site (`Div` always lowers float): the
     /// param is `CheckNumber`-unboxed, the int32 const `2` is widened, and the
@@ -3750,16 +3908,19 @@ mod tests {
         // a = 5 (boxed int32): CheckNumber widens via scvtf, 5/2 = 2.5.
         let (status, value) = run(&divide_by_two(), &[boxi(5)]);
         assert_eq!(status, 0, "returns, no bail");
-        assert_eq!(f64::from_bits(value), 2.5);
+        assert_eq!(unboxf(value), 2.5);
     }
 
     #[test]
     fn float_divide_double_param_verbatim() {
         // a = 7.0 (real double, bits verbatim): CheckNumber takes the double
         // path, 7.0/2 = 3.5.
-        let (status, value) = run(&divide_by_two(), &[7.0_f64.to_bits()]);
+        let (status, value) = run(
+            &divide_by_two(),
+            &[value_tag::box_double(7.0_f64.to_bits())],
+        );
         assert_eq!(status, 0);
-        assert_eq!(f64::from_bits(value), 3.5);
+        assert_eq!(unboxf(value), 3.5);
     }
 
     #[test]
@@ -3785,7 +3946,7 @@ mod tests {
     fn ushr_int32_result_widens_to_double() {
         let (status, value) = run(&ushr_zero(), &[boxi(-1)]);
         assert_eq!(status, 0, "returns, no bail");
-        assert_eq!(f64::from_bits(value), 4_294_967_295.0);
+        assert_eq!(unboxf(value), 4_294_967_295.0);
     }
 
     fn bit_or_zero() -> JitFunctionView {
@@ -3813,7 +3974,7 @@ mod tests {
             (f64::NAN, 0),
             (f64::INFINITY, 0),
         ] {
-            let (status, value) = run(&bit_or_zero(), &[input.to_bits()]);
+            let (status, value) = run(&bit_or_zero(), &[value_tag::box_double(input.to_bits())]);
             assert_eq!(status, 0, "{input:?} returns, no bail");
             assert_eq!(unboxi(value), expected, "ToInt32({input:?})");
         }
@@ -3862,9 +4023,9 @@ mod tests {
         v.instructions[4].load_number = Some(1.5);
         let (status, value) = run(&v, &[boxi(4)]);
         assert_eq!(status, 0, "returns, no bail");
-        assert_eq!(f64::from_bits(value), 6.0, "4 * 1.5");
+        assert_eq!(unboxf(value), 6.0, "4 * 1.5");
         let (s2, v2) = run(&v, &[boxi(100)]);
         assert_eq!(s2, 0);
-        assert_eq!(f64::from_bits(v2), 150.0, "100 * 1.5");
+        assert_eq!(unboxf(v2), 150.0, "100 * 1.5");
     }
 }

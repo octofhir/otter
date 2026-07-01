@@ -30,14 +30,15 @@ use super::Value;
 use crate::heap_number::{alloc_heap_number_with_roots, read_heap_number};
 use otter_gc::raw::RootSlotVisitor;
 
-/// Low-3-bit tag for a boxed-number slot.
-const TAG_BOXED: u32 = 0b010;
+/// Low-3-bit tag for a boxed-number slot. `pub(crate)` so the JIT bakes the
+/// exact slot layout into its inline decompress / compress.
+pub const TAG_BOXED: u32 = 0b010;
 /// Low-3-bit tag for an immediate slot.
-const TAG_IMMEDIATE: u32 = 0b100;
+pub const TAG_IMMEDIATE: u32 = 0b100;
 /// Low-3-bit tag for an inline closure-less function-id slot.
-const TAG_FUNCTION_ID: u32 = 0b110;
+pub const TAG_FUNCTION_ID: u32 = 0b110;
 /// Mask isolating the low-3-bit slot tag.
-const TAG_MASK: u32 = 0b111;
+pub const TAG_MASK: u32 = 0b111;
 /// Largest function id that fits inline beside the 3-bit tag.
 const FUNCTION_ID_LIMIT: u32 = 1 << 29;
 
@@ -46,12 +47,18 @@ const SMI_MIN: i32 = -(1 << 30);
 /// Exclusive upper bound of the inline small-int range (`2^30`).
 const SMI_LIMIT: i32 = 1 << 30;
 
-// Immediate kinds, packed as `(kind << 3) | TAG_IMMEDIATE`.
-const IMM_UNDEFINED: u32 = 0;
-const IMM_NULL: u32 = 1;
-const IMM_TRUE: u32 = 2;
-const IMM_FALSE: u32 = 3;
-const IMM_HOLE: u32 = 4;
+// Immediate kinds, packed as `(kind << 3) | TAG_IMMEDIATE`. `pub` so the JIT's
+// inline immediate-slot decompress bakes the same kind values.
+/// `undefined` immediate kind.
+pub const IMM_UNDEFINED: u32 = 0;
+/// `null` immediate kind.
+pub const IMM_NULL: u32 = 1;
+/// `true` immediate kind.
+pub const IMM_TRUE: u32 = 2;
+/// `false` immediate kind.
+pub const IMM_FALSE: u32 = 3;
+/// Internal array/`this` hole immediate kind.
+pub const IMM_HOLE: u32 = 4;
 
 #[inline]
 const fn immediate(kind: u32) -> u32 {
@@ -131,10 +138,10 @@ pub fn compress(
     heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<CompressedValue, otter_gc::OutOfMemory> {
-    if let Some(i) = value.as_i32() {
-        if (SMI_MIN..SMI_LIMIT).contains(&i) {
-            return Ok(CompressedValue(((i as u32) << 1) | 1));
-        }
+    if let Some(i) = value.as_i32()
+        && (SMI_MIN..SMI_LIMIT).contains(&i)
+    {
+        return Ok(CompressedValue(((i as u32) << 1) | 1));
     }
     if let Some(raw) = value.as_raw_gc() {
         debug_assert_eq!(raw.0 & TAG_MASK, 0, "cell offset must be 8-aligned");
@@ -151,10 +158,10 @@ pub fn compress(
     } else if value.is_hole() {
         IMM_HOLE
     } else {
-        if let Some(id) = value.as_function_id() {
-            if id < FUNCTION_ID_LIMIT {
-                return Ok(CompressedValue((id << 3) | TAG_FUNCTION_ID));
-            }
+        if let Some(id) = value.as_function_id()
+            && id < FUNCTION_ID_LIMIT
+        {
+            return Ok(CompressedValue((id << 3) | TAG_FUNCTION_ID));
         }
         // Doubles, wide int32s, and (vanishingly rare) out-of-range function
         // ids do not fit a 4-byte slot, so box the full value bits and

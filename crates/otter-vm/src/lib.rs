@@ -3066,7 +3066,10 @@ impl Interpreter {
                             [stub] => stub.own_data_hit().map(|hit| {
                                 (
                                     hit.shape.offset(),
-                                    u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
+                                    u32::from(hit.slot)
+                                        * std::mem::size_of::<
+                                            crate::value::compressed::CompressedValue,
+                                        >() as u32,
                                 )
                             }),
                             _ => None,
@@ -3080,7 +3083,11 @@ impl Interpreter {
                                 stub.store_own_data_hit().map(|hit| {
                                     (
                                         hit.shape.offset(),
-                                        u32::from(hit.slot) * std::mem::size_of::<Value>() as u32,
+                                        u32::from(hit.slot)
+                                            * std::mem::size_of::<
+                                                crate::value::compressed::CompressedValue,
+                                            >()
+                                                as u32,
                                     )
                                 })
                             }
@@ -3451,7 +3458,8 @@ impl Interpreter {
             return Some(MethodSite {
                 recv_shape,
                 proto_shape: self.shape_root(),
-                method_value_byte: slot * std::mem::size_of::<Value>() as u32,
+                method_value_byte: slot
+                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32,
                 method_on_receiver: true,
             });
         }
@@ -3464,7 +3472,8 @@ impl Interpreter {
             .map(|slot| MethodSite {
                 recv_shape,
                 proto_shape,
-                method_value_byte: slot * std::mem::size_of::<Value>() as u32,
+                method_value_byte: slot
+                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32,
                 method_on_receiver: false,
             })
     }
@@ -3606,7 +3615,7 @@ impl Interpreter {
                         let mut targets = observed.clone();
                         // Most-frequent target first: the common receiver shape
                         // then hits the shortest guard chain.
-                        targets.sort_by(|a, b| b.hits.cmp(&a.hits));
+                        targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
                         Some(PolySnapshot { byte_pc, targets })
                     }
                     MethodCallFeedback::Megamorphic => None,
@@ -3679,7 +3688,8 @@ impl Interpreter {
             };
             let key = context.property_atom(name_idx)?;
             let slot = self.shape_offset_of(target.recv_shape, key.name())?;
-            let value_byte = slot * std::mem::size_of::<Value>() as u32;
+            let value_byte =
+                slot * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
             prop_offsets.insert(instr.byte_pc, value_byte);
         }
         Some(jit::JitInlineMethod {

@@ -146,15 +146,16 @@ mod toolchain_tests {
 
     #[test]
     fn emits_and_runs_tagged_fib() {
-        // Tagged NaN-box fib: TAG_INT32 = 0x7FF9 in top 16 bits, payload in low
-        // 32 (value/tag.rs). int32 guard + checked arith + rebox; self-recursive.
+        // Tagged fib over the JSC value encoding: an int32 carries NUMBER_TAG
+        // (0xfffe in the top 16 bits) with the payload in the low 32. int32
+        // guard + checked arith + rebox; self-recursive.
         let code = assemble(|ops| {
             let entry = ops.offset();
             dynasm!(ops
                 ; .arch aarch64
                 ; ->fibt:
                 ; lsr x9, x0, #48
-                ; movz x10, #0x7ff9
+                ; movz x10, #0xfffe
                 ; cmp x9, x10
                 ; b.ne >slow
                 ; cmp w0, #2
@@ -162,7 +163,7 @@ mod toolchain_tests {
                 ; stp x29, x30, [sp, #-48]!
                 ; stp x19, x20, [sp, #16]
                 ; stp x21, x22, [sp, #32]
-                ; movz x21, #0x7ff9, lsl #48
+                ; movz x21, #0xfffe, lsl #48
                 ; mov w19, w0
                 ; sub w0, w19, #1
                 ; orr x0, x0, x21
@@ -184,7 +185,7 @@ mod toolchain_tests {
             );
             entry
         });
-        let box_i32 = |v: i32| -> u64 { (0x7FF9u64 << 48) | (v as u32 as u64) };
+        let box_i32 = |v: i32| -> u64 { (0xfffeu64 << 48) | (v as u32 as u64) };
         let unbox = |v: u64| -> i32 { v as u32 as i32 };
         // SAFETY: emitted `extern "C" fn(u64) -> u64`; `code` outlives the call.
         let f: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };

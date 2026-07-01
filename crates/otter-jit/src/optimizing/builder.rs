@@ -2196,6 +2196,7 @@ impl<'a> Builder<'a> {
     /// Lower a relational / equality site, mirroring [`Self::arith_binop`]'s
     /// representation choice: an int32-only site compares unboxed int32s, an
     /// otherwise-numeric site compares `f64`s, anything else bails.
+    #[allow(clippy::too_many_arguments)]
     fn compare(
         &mut self,
         block: BlockId,

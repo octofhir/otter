@@ -25,6 +25,7 @@
 //! - Architecture plan §4.1 (hidden classes).
 
 use rustc_hash::FxHashMap;
+use std::cell::Cell;
 
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
@@ -56,10 +57,10 @@ struct TransitionKey {
 
 /// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
-    root: ShapeHandle,
+    root: Cell<ShapeHandle>,
     next_string_id: u32,
-    interned_keys: FxHashMap<String, JsStringHandle>,
-    transitions: FxHashMap<TransitionKey, ShapeHandle>,
+    interned_keys: FxHashMap<String, Cell<JsStringHandle>>,
+    transitions: FxHashMap<TransitionKey, Cell<ShapeHandle>>,
     offset_cache: FxHashMap<ShapeId, FxHashMap<JsStringId, u32>>,
     observer: Option<Box<dyn ShapeTransitionObserver>>,
 }
@@ -83,7 +84,7 @@ impl ShapeRuntime {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let root = alloc_root_shape_body_with_roots(heap, &mut roots)?;
         Ok(Self {
-            root,
+            root: Cell::new(root),
             next_string_id: 1,
             interned_keys: FxHashMap::default(),
             transitions: FxHashMap::default(),
@@ -109,13 +110,13 @@ impl ShapeRuntime {
     ) -> impl Iterator<Item = (ShapeId, ShapeHandle)> + '_ {
         self.transitions
             .iter()
-            .map(|(key, child)| (key.parent, *child))
+            .map(|(key, child)| (key.parent, child.get()))
     }
 
     /// Empty hidden-class root.
     #[must_use]
-    pub(crate) const fn root(&self) -> ShapeHandle {
-        self.root
+    pub(crate) fn root(&self) -> ShapeHandle {
+        self.root.get()
     }
 
     /// Remove every side-table entry before heap teardown.
@@ -123,21 +124,21 @@ impl ShapeRuntime {
         self.interned_keys.clear();
         self.transitions.clear();
         self.offset_cache.clear();
-        self.root = ShapeHandle::null();
+        self.root.set(ShapeHandle::null());
     }
 
     /// Yield every GC handle stored in side tables as a mutable root slot.
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        if !self.root.is_null() {
-            let p = &self.root as *const ShapeHandle as *mut RawGc;
+        if !self.root.get().is_null() {
+            let p = self.root.as_ptr() as *mut RawGc;
             visitor(p);
         }
         for key in self.interned_keys.values() {
-            let p = key as *const JsStringHandle as *mut RawGc;
+            let p = key.as_ptr() as *mut RawGc;
             visitor(p);
         }
         for shape in self.transitions.values() {
-            let p = shape as *const ShapeHandle as *mut RawGc;
+            let p = shape.as_ptr() as *mut RawGc;
             visitor(p);
         }
     }
@@ -150,7 +151,7 @@ impl ShapeRuntime {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
         if let Some(existing) = self.interned_keys.get(key) {
-            return Ok(*existing);
+            return Ok(existing.get());
         }
         let units: Vec<u16> = key.encode_utf16().collect();
         let id = JsStringId::new(self.next_string_id);
@@ -160,7 +161,7 @@ impl ShapeRuntime {
         };
         let handle = alloc_flat_string_body_with_roots(heap, id, &units, &mut visit_roots)?;
         self.next_string_id = self.next_string_id.saturating_add(1);
-        self.interned_keys.insert(key.to_owned(), handle);
+        self.interned_keys.insert(key.to_owned(), Cell::new(handle));
         Ok(handle)
     }
 
@@ -183,7 +184,7 @@ impl ShapeRuntime {
         flags: PropertyFlags,
         is_accessor: bool,
     ) -> Option<ShapeHandle> {
-        let key_handle = *self.interned_keys.get(key)?;
+        let key_handle = self.interned_keys.get(key)?.get();
         let parent_id = heap.read_payload(parent, ShapeBody::id);
         let key_id = heap.read_payload(key_handle, JsStringBody::id);
         let transition_key = TransitionKey {
@@ -192,7 +193,7 @@ impl ShapeRuntime {
             flags,
             is_accessor,
         };
-        let child = *self.transitions.get(&transition_key)?;
+        let child = self.transitions.get(&transition_key)?.get();
         self.notify_observer(heap, parent_id, child, key, true);
         Some(child)
     }
@@ -222,7 +223,7 @@ impl ShapeRuntime {
             is_accessor,
         };
         if let Some(existing) = self.transitions.get(&transition_key) {
-            let child = *existing;
+            let child = existing.get();
             self.notify_observer(heap, parent_id, child, key, true);
             return Ok(child);
         }
@@ -239,7 +240,7 @@ impl ShapeRuntime {
             is_accessor,
             &mut visit_child_roots,
         )?;
-        self.transitions.insert(transition_key, child);
+        self.transitions.insert(transition_key, Cell::new(child));
         self.notify_observer(heap, parent_id, child, key, false);
         Ok(child)
     }
@@ -275,7 +276,7 @@ impl ShapeRuntime {
         let key_id = self
             .interned_keys
             .get(key)
-            .map(|handle| heap.read_payload(*handle, JsStringBody::id))?;
+            .map(|handle| heap.read_payload(handle.get(), JsStringBody::id))?;
         let shape_id = heap.read_payload(shape, ShapeBody::id);
         if let Some(cache) = self.offset_cache.get(&shape_id) {
             return cache.get(&key_id).copied();

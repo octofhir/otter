@@ -2980,7 +2980,6 @@ if (process.argv[3] !== "from-cli") fail();
             &CapabilitySet::default(),
             &startup_timer,
             None,
-            None,
         )
         .await
         .unwrap();
@@ -3027,7 +3026,6 @@ if (process.argv[3] !== "from-cli") fail();
             false,
             &CapabilitySet::default(),
             &startup_timer,
-            None,
             None,
         )
         .await

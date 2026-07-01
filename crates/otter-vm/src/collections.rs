@@ -241,15 +241,15 @@ struct MapEntry {
 }
 
 impl crate::pelt::PeltField for MapEntry {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(key_hash) = &self.key_hash {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        if let Some(key_hash) = &mut self.key_hash {
             <MapKey as crate::pelt::PeltField>::pelt_trace(key_hash, visitor);
         }
-        if let Some(key) = &self.key {
-            key.trace_value_slots(visitor);
+        if let Some(key) = &mut self.key {
+            key.trace_value_slot_mut(visitor);
         }
-        if let Some(value) = &self.value {
-            value.trace_value_slots(visitor);
+        if let Some(value) = &mut self.value {
+            value.trace_value_slot_mut(visitor);
         }
     }
 }
@@ -631,12 +631,12 @@ struct SetEntry {
 }
 
 impl crate::pelt::PeltField for SetEntry {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(key_hash) = &self.key_hash {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        if let Some(key_hash) = &mut self.key_hash {
             <MapKey as crate::pelt::PeltField>::pelt_trace(key_hash, visitor);
         }
-        if let Some(value) = &self.value {
-            value.trace_value_slots(visitor);
+        if let Some(value) = &mut self.value {
+            value.trace_value_slot_mut(visitor);
         }
     }
 }
@@ -1411,9 +1411,9 @@ fn weak_collection_key(
 }
 
 impl crate::pelt::PeltField for MapKey {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         if let MapKey::ObjectValue(value) = self {
-            value.trace_value_slots(visitor);
+            value.trace_value_slot_mut(visitor);
         }
     }
 }

@@ -42,7 +42,7 @@ pub(crate) enum BoundFunctionMetadataProperty {
 }
 
 impl crate::pelt::PeltField for BoundFunctionMetadataProperty {
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         if let Self::Overridden(desc) = self {
             desc.pelt_trace(visitor);
         }

@@ -87,11 +87,11 @@ pub struct FinalizerCell {
 
 impl crate::pelt::PeltField for FinalizerCell {
     #[inline]
-    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         // `target` + `unregister_token` are weak per §27.7.4.
         let _ = self.target;
         let _ = self.unregister_token;
-        self.held_value.trace_value_slots(visitor);
+        self.held_value.trace_value_slot_mut(visitor);
     }
 }
 

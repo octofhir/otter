@@ -90,6 +90,16 @@ impl ShapeBody {
         own_flags: PropertyFlags,
         own_is_accessor: bool,
     ) -> Self {
+        debug_assert!(
+            parent.is_null() || parent.offset().is_multiple_of(8),
+            "misaligned shape parent at child creation: parent={:?}",
+            parent
+        );
+        debug_assert!(
+            key.is_null() || key.offset().is_multiple_of(8),
+            "misaligned shape key at child creation: key={:?}",
+            key
+        );
         Self {
             id: next_shape_id(),
             parent,
@@ -153,13 +163,13 @@ impl ShapeBody {
 impl otter_gc::SafeTraceable for ShapeBody {
     const TYPE_TAG: u8 = SHAPE_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
+    fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         if !self.parent.is_null() {
-            let p = &self.parent as *const ShapeHandle as *mut RawGc;
+            let p = &mut self.parent as *mut ShapeHandle as *mut RawGc;
             visitor(p);
         }
         if !self.transition_key.is_null() {
-            let p = &self.transition_key as *const JsStringHandle as *mut RawGc;
+            let p = &mut self.transition_key as *mut JsStringHandle as *mut RawGc;
             visitor(p);
         }
     }
@@ -212,6 +222,20 @@ pub(crate) fn shape_offset_of_key(
     key: JsStringHandle,
 ) -> Option<u32> {
     while !shape.is_null() {
+        debug_assert_eq!(
+            unsafe { (*shape.as_header_ptr()).type_tag() },
+            SHAPE_BODY_TYPE_TAG,
+            "shape handle does not point at ShapeBody: shape={:?} swept={}",
+            shape,
+            unsafe { (*shape.as_header_ptr()).is_swept() }
+        );
+        debug_assert_eq!(
+            unsafe { (*shape.as_header_ptr()).size_bytes() },
+            (std::mem::size_of::<otter_gc::GcHeader>() + std::mem::size_of::<ShapeBody>()) as u32,
+            "shape handle points at wrong-sized cell: shape={:?} swept={}",
+            shape,
+            unsafe { (*shape.as_header_ptr()).is_swept() }
+        );
         let (parent, transition_key, own_offset) = heap.read_payload(shape, |body| {
             (body.parent(), body.transition_key(), body.own_offset())
         });
@@ -235,6 +259,14 @@ pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &s
         let (parent, transition_key, own_offset) = heap.read_payload(shape, |body| {
             (body.parent(), body.transition_key(), body.own_offset())
         });
+        debug_assert!(
+            transition_key.is_null() || transition_key.offset().is_multiple_of(8),
+            "misaligned shape transition key: shape={:?} swept={} parent={:?} key={:?}",
+            shape,
+            unsafe { (*shape.as_header_ptr()).is_swept() },
+            parent,
+            transition_key
+        );
         if !transition_key.is_null() && eq_str(heap, transition_key, key) {
             return Some(own_offset);
         }

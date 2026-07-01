@@ -497,23 +497,27 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         }
         let size = (*header).size_bytes() as usize;
         let aligned = align_up(size, CELL_SIZE);
-
         let promote = {
             let page_header = Page::header_of(header as *const u8);
             page_header.survival_age >= PROMOTE_AFTER_SURVIVALS
         };
 
-        let new_offset = if promote {
-            ctx.old_space()
-                .alloc(aligned)
-                .expect("old-space alloc during scavenge")
+        let (new_offset, promoted) = if promote {
+            (
+                ctx.old_space()
+                    .alloc(aligned)
+                    .expect("old-space alloc during scavenge"),
+                true,
+            )
         } else {
             match ctx.new_space().alloc_in_to(aligned) {
-                Some(off) => off,
-                None => ctx
-                    .old_space()
-                    .alloc(aligned)
-                    .expect("old-space alloc during scavenge fallback"),
+                Some(off) => (off, false),
+                None => (
+                    ctx.old_space()
+                        .alloc(aligned)
+                        .expect("old-space alloc during scavenge fallback"),
+                    true,
+                ),
             }
         };
 
@@ -523,7 +527,7 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
 
         // Promote / re-flag the destination header.
         let dest_header = dest_ptr as *mut GcHeader;
-        if promote {
+        if promoted {
             (*dest_header).promote_to_old();
             ctx.stats.promoted_bytes += size;
         } else {
@@ -691,5 +695,118 @@ unsafe fn trace_one(ctx: &mut ScavCtx, header: *mut GcHeader) {
             process_slot(&mut *ctx_ptr, slot, Some(header));
         };
         (*table_ptr).trace(header, &mut visitor);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compressed::{Cage, RawGc};
+    use crate::header::{GcHeader, HEADER_SIZE};
+    use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, PAGE_SIZE, Page, SpaceKind, align_up};
+    use crate::space::{NewSpace, OldSpace};
+    use crate::trace::{SlotVisitor, TraceTable, Traceable};
+
+    #[derive(Debug)]
+    struct SelfRelativeSlot {
+        cached_slot: *mut RawGc,
+        child: RawGc,
+    }
+
+    impl Traceable for SelfRelativeSlot {
+        const TYPE_TAG: u8 = 0xD1;
+
+        unsafe fn trace_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>) {
+            unsafe {
+                let child_slot = std::ptr::addr_of_mut!((*this).child);
+                (*this).cached_slot = child_slot;
+                if !(*child_slot).is_null() {
+                    visitor(child_slot);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn old_space_fallback_promotes_and_traces_moved_body() {
+        Cage::ensure_default().expect("cage");
+
+        let mut new_space = NewSpace::new(1).expect("new space");
+        let mut old_space = OldSpace::new();
+        let mut trace_table = TraceTable::new();
+        trace_table.register::<SelfRelativeSlot>();
+        let mut remembered = Vec::new();
+
+        let total = HEADER_SIZE + std::mem::size_of::<SelfRelativeSlot>();
+        let aligned = align_up(total, CELL_SIZE);
+        let offset = new_space.alloc(aligned).expect("from-space allocation");
+
+        let header = unsafe { cage_base().add(offset as usize) as *mut GcHeader };
+        let payload = unsafe {
+            cage_base()
+                .add(offset as usize + HEADER_SIZE)
+                .cast::<SelfRelativeSlot>()
+        };
+        unsafe {
+            std::ptr::write(
+                header,
+                GcHeader::new_young(SelfRelativeSlot::TYPE_TAG, aligned as u32),
+            );
+            std::ptr::write(
+                payload,
+                SelfRelativeSlot {
+                    cached_slot: std::ptr::null_mut(),
+                    child: RawGc::NULL,
+                },
+            );
+            (*payload).cached_slot = std::ptr::addr_of_mut!((*payload).child);
+        }
+
+        let to_payload_capacity = align_up(PAGE_SIZE - PAGE_HEADER_SIZE, CELL_SIZE);
+        assert!(
+            new_space.to_pages()[0]
+                .bump_alloc(to_payload_capacity)
+                .is_some(),
+            "test must leave to-space without evacuation room"
+        );
+
+        let mut root = RawGc(offset);
+        let stats = unsafe {
+            scavenge(
+                &mut new_space,
+                &mut old_space,
+                &trace_table,
+                &[&mut root as *mut RawGc],
+                &mut |_| {},
+                &[],
+                &[],
+                &mut remembered,
+            )
+        };
+
+        assert_eq!(stats.promoted_bytes, total);
+        assert_eq!(stats.copied_bytes, 0);
+
+        let moved_header = unsafe { cage_base().add(root.0 as usize).cast::<GcHeader>() };
+        assert_eq!(
+            unsafe { Page::header_of(moved_header.cast()).space },
+            SpaceKind::Old
+        );
+        assert!(
+            unsafe { (*moved_header).is_old() },
+            "old-space fallback destination must not keep a young header"
+        );
+
+        let moved_payload = unsafe {
+            cage_base()
+                .add(root.0 as usize + HEADER_SIZE)
+                .cast::<SelfRelativeSlot>()
+        };
+        let expected_slot = unsafe { std::ptr::addr_of_mut!((*moved_payload).child) };
+        assert_eq!(
+            unsafe { (*moved_payload).cached_slot },
+            expected_slot,
+            "relocation trace must refresh self-relative payload pointers"
+        );
     }
 }

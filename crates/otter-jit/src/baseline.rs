@@ -107,6 +107,34 @@ pub(crate) const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
 /// to the call stub). Functions called with more args fall back.
 const MAX_INLINE_ARGS: usize = 4;
 
+/// Largest argument count a `CallMethodValue` site passes inline. The emitter
+/// packs the argument *register indices* one per 16-bit lane of a single word,
+/// so a full method-call stub needs only one register for all of them (leaving
+/// room in the C ABI's eight argument registers); raising this past 4 needs a
+/// second packed word.
+pub(crate) const MAX_METHOD_ARGS: usize = 4;
+
+/// Pack up to [`MAX_METHOD_ARGS`] argument register indices into one word (one
+/// per 16-bit lane), the form the method-call stubs receive.
+pub(crate) fn pack_method_arg_regs(arg_regs: &[u16]) -> u64 {
+    let mut packed = 0u64;
+    for (slot, &areg) in arg_regs.iter().take(MAX_METHOD_ARGS).enumerate() {
+        packed |= u64::from(areg) << (16 * slot);
+    }
+    packed
+}
+
+/// Unpack the [`MAX_METHOD_ARGS`] argument register indices a method-call stub
+/// received (one per 16-bit lane).
+fn unpack_method_arg_regs(packed: u64) -> [u16; MAX_METHOD_ARGS] {
+    [
+        (packed & 0xffff) as u16,
+        ((packed >> 16) & 0xffff) as u16,
+        ((packed >> 32) & 0xffff) as u16,
+        ((packed >> 48) & 0xffff) as u16,
+    ]
+}
+
 /// Re-entry context handed to compiled code. The machine code reads `regs`
 /// (offset 0) and `self_closure` (offset 8) directly by offset — keep those two
 /// first. The full struct is machine-constructible: nested direct calls copy
@@ -377,9 +405,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     name_idx: u64,
     site: u64,
     argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
+    packed_args: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -387,7 +413,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
     let call_byte_pc = ctx.bail_pc;
-    let all = [a0 as u16, a1 as u16, a2 as u16];
+    let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_prepare_direct_method_call(
         context,
@@ -1067,9 +1093,7 @@ pub(crate) extern "C" fn jit_call_method_stub(
     recv: u64,
     name_and_site: u64,
     argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
+    packed_args: u64,
 ) -> u64 {
     jit_call_method_stub_impl(
         ctx,
@@ -1077,9 +1101,7 @@ pub(crate) extern "C" fn jit_call_method_stub(
         recv,
         name_and_site,
         argc,
-        a0,
-        a1,
-        a2,
+        packed_args,
         JitRuntimeMethodStubSource::Baseline,
     )
 }
@@ -1093,9 +1115,7 @@ pub(crate) extern "C" fn jit_call_method_stub_optimizing(
     recv: u64,
     name_and_site: u64,
     argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
+    packed_args: u64,
 ) -> u64 {
     jit_call_method_stub_impl(
         ctx,
@@ -1103,9 +1123,7 @@ pub(crate) extern "C" fn jit_call_method_stub_optimizing(
         recv,
         name_and_site,
         argc,
-        a0,
-        a1,
-        a2,
+        packed_args,
         JitRuntimeMethodStubSource::Optimizing,
     )
 }
@@ -1117,9 +1135,7 @@ fn jit_call_method_stub_impl(
     recv: u64,
     name_and_site: u64,
     argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
+    packed_args: u64,
     source: JitRuntimeMethodStubSource,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
@@ -1130,7 +1146,7 @@ fn jit_call_method_stub_impl(
     let call_byte_pc = ctx.bail_pc;
     let name_idx = (name_and_site & 0xffff_ffff) as u32;
     let site = (name_and_site >> 32) as usize;
-    let all = [a0 as u16, a1 as u16, a2 as u16];
+    let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_runtime_call_method(
         context,
@@ -1165,15 +1181,13 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
     recv: u64,
     site: u64,
     argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
+    packed_args: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
-    let all = [a0 as u16, a1 as u16, a2 as u16];
+    let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_runtime_try_collection_method_ic(
         stack,
@@ -1460,21 +1474,21 @@ pub(crate) mod arm64 {
         DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
         DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
         FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG,
-        MAX_INLINE_ARGS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET,
-        REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE,
-        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW,
-        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell,
-        alloc_value_stub_trampoline_pair, jit_abort_direct_call_stub, jit_backedge_poll_stub,
-        jit_call_collection_method_ic_stub, jit_call_method_stub, jit_delegate_op_stub,
-        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_inline_closure_upvalues_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
-        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        reg_offset, value_tag,
+        MAX_INLINE_ARGS, MAX_METHOD_ARGS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Op, Operand,
+        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET,
+        SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
+        VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell, alloc_value_stub_trampoline_pair,
+        jit_abort_direct_call_stub, jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
+        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
+        jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
+        jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub,
+        leaf_no_alloc_stub2_trampoline_pair, pack_method_arg_regs, reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -3196,6 +3210,8 @@ pub(crate) mod arm64 {
                 | Op::FreshUpvalue
                 | Op::LoadBuiltinError
                 | Op::Neg
+                | Op::LooseEqual
+                | Op::LooseNotEqual
                 | Op::DefineOwnProperty => {
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                     emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
@@ -5755,7 +5771,6 @@ pub(crate) mod arm64 {
         live_alloc_safepoint: Option<SafepointId>,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
-        const MAX_METHOD_ARGS: usize = 3;
         let dst = reg(operands, 0)?;
         let recv = reg(operands, 1)?;
         let name = const_index(operands, 2)?;
@@ -5763,6 +5778,13 @@ pub(crate) mod arm64 {
         if argc > MAX_METHOD_ARGS {
             return Err(Unsupported::ArgCount(argc));
         }
+        // The argument register indices, packed one per 16-bit lane, are handed
+        // to every method-call stub in a single register.
+        let mut method_arg_regs: Vec<u16> = Vec::with_capacity(argc);
+        for slot in 0..argc {
+            method_arg_regs.push(reg(operands, 4 + slot)?);
+        }
+        let packed_args = pack_method_arg_regs(&method_arg_regs);
 
         let fallback = ops.new_dynamic_label();
         let after_leaf = ops.new_dynamic_label();
@@ -5825,15 +5847,7 @@ pub(crate) mod arm64 {
         );
         emit_load_u64(ops, 3, site);
         dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-        for slot in 0..MAX_METHOD_ARGS {
-            let areg = if slot < argc {
-                reg(operands, 4 + slot)?
-            } else {
-                0
-            };
-            let xn = 5 + slot as u32;
-            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
-        }
+        emit_load_u64(ops, 5, packed_args);
         emit_load_u64(
             ops,
             16,
@@ -5862,15 +5876,7 @@ pub(crate) mod arm64 {
         emit_load_u64(ops, 2, u64::from(name));
         emit_load_u64(ops, 3, site);
         dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-        for slot in 0..MAX_METHOD_ARGS {
-            let areg = if slot < argc {
-                reg(operands, 4 + slot)?
-            } else {
-                0
-            };
-            let xn = 5 + slot as u32;
-            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
-        }
+        emit_load_u64(ops, 5, packed_args);
         emit_load_u64(
             ops,
             16,
@@ -5901,15 +5907,7 @@ pub(crate) mod arm64 {
         // 32) so the bridge stays within its 8 argument registers.
         emit_load_u64(ops, 3, (site << 32) | u64::from(name));
         dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-        for slot in 0..MAX_METHOD_ARGS {
-            let areg = if slot < argc {
-                reg(operands, 4 + slot)?
-            } else {
-                0
-            };
-            let xn = 5 + slot as u32;
-            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
-        }
+        emit_load_u64(ops, 5, packed_args);
         emit_call_stub(ops, jit_call_method_stub as *const () as usize, threw);
         dynasm!(ops ; .arch aarch64 ; =>done);
         Ok(())

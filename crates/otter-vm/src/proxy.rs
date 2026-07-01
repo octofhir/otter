@@ -204,8 +204,8 @@ impl JsProxy {
     }
 
     /// Trace the embedded GC handle slot.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        let p = &self.handle as *const ProxyHandle as *mut otter_gc::raw::RawGc;
+    pub(crate) fn trace_value_slots_mut(&mut self, visitor: &mut SlotVisitor<'_>) {
+        let p = &mut self.handle as *mut ProxyHandle as *mut otter_gc::raw::RawGc;
         visitor(p);
     }
 }

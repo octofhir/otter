@@ -162,25 +162,25 @@ impl JsStringBody {
 impl otter_gc::SafeTraceable for JsStringBody {
     const TYPE_TAG: u8 = JS_STRING_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        match &self.repr {
+    fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        match &mut self.repr {
             JsStringBodyRepr::InlineFlat(_)
             | JsStringBodyRepr::Flat(_)
             | JsStringBodyRepr::InlineLatin1(_)
             | JsStringBodyRepr::Latin1(_) => {}
             JsStringBodyRepr::Cons { left, right, .. } => {
                 if !left.is_null() {
-                    let p = left as *const JsStringHandle as *mut RawGc;
+                    let p = left as *mut JsStringHandle as *mut RawGc;
                     visitor(p);
                 }
                 if !right.is_null() {
-                    let p = right as *const JsStringHandle as *mut RawGc;
+                    let p = right as *mut JsStringHandle as *mut RawGc;
                     visitor(p);
                 }
             }
             JsStringBodyRepr::Sliced { parent, .. } => {
                 if !parent.is_null() {
-                    let p = parent as *const JsStringHandle as *mut RawGc;
+                    let p = parent as *mut JsStringHandle as *mut RawGc;
                     visitor(p);
                 }
             }

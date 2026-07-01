@@ -113,6 +113,41 @@ Decision points to lock after research:
       published per-op descriptor (they share the live-value analysis); one
       `FrameStateId` per safepoint/guard (already present) drives both.
 
+## Item 3 — opt-tier polymorphic CallMethod inline (the richards/tree/poly wall)
+
+Item-2 mechanisms are essentially complete (callee-saved residency + exact-PC
+deopt already present; S0/S1/S2 added tagged-only safepoints). The bench wall is
+item 3: `reject_call_object_mix` (builder.rs:113) declines any un-inlined
+`CallMethod`+mem-op body, and the builder declines a poly method-in-loop
+(builder.rs:1137) → richards/tree/poly hot bodies never reach the tier.
+
+Key enabler: the feedback already exists.
+`JitFunctionView::inline_poly_methods: FxHashMap<u32, Vec<JitInlineMethod>>`
+(jit.rs:160) is baked by the baseline (`bake_inline_callees`) — most-frequent-
+first, ≥2 entries, each a full `JitInlineMethod` (own recv_shape + proto/method
+identity + tiny body). The optimizing tier currently ignores it. So item-3 =
+builder + emit consumption, no new VM feedback.
+
+Build steps:
+1. `ir.rs`: a guard node that BRANCHES on receiver shape+method identity match
+   (not deopt) — reuse the `CheckMethodIdentity` predicate as a branch condition,
+   or add `GuardMethodIdentity{...} -> bool` feeding a `Branch` terminator.
+2. `builder.rs` at CallMethodValue (replace the 1137 decline): when
+   `inline_poly_methods.get(&byte_pc)` is Some, build a guard chain — for each
+   entry create a synthetic guard block + arm block; guard branches to its arm
+   (inline the entry's body via the existing `try_inline_method` machinery) or to
+   the next guard; the final miss falls to a `CallMethod` bridge arm (or deopt).
+   All arms jump to a merge block with a phi for `dst`. Extend
+   `cfg.succs/preds/block_of_pc` + `graph.blocks` mid-construction, phi-merge dst.
+   Mirror JSC `handleInlining` SwitchCell / V8 Maglev poly-call dispatch.
+3. `emit.rs`/`clif`: lower the branch-guard (shape byte compare + method-identity
+   compare, inline — no bridge) and the merge phi (regalloc already handles phis).
+4. Drop the `reject_call_object_mix` CallMethod clause once poly bodies compile
+   (they no longer leave an un-inlined CallMethod on the hot path).
+5. Verify: diff 24/24; GC128 on richards/tree/poly-dispatch; targeted Test262
+   (class/method/proto); `OTTER_JIT_TRACE` shows richards hot bodies compiling;
+   bench delta richards/tree/poly-dispatch vs node.
+
 ## Verification harness per slice
 
 - `node benchmarks/diff.mjs` == 24/24.

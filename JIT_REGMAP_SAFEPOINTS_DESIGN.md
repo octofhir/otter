@@ -80,12 +80,26 @@ Decision points to lock after research:
 
 ## Slice plan (each: diff.mjs 24/24 + GC_STRESS=128 + jit/vm tests + fmt/clippy)
 
-- [ ] S0. Plumbing (no behavior change): add native spill-area base + count to
-      `RuntimeStubAllocContext`; teach `validate_alloc_safepoint_frame_roots` +
-      the root publisher to accept + trace `SpillSlot` (read `[spill_base +
-      idx*8]` as `&mut Value`). Keep every safepoint `frame_slot_window` for now
-      → publisher still only sees FrameSlot, SpillSlot path is dead-but-tested via
-      a unit test. Verify: no runtime change, tests green.
+- [x] S1-lite (landed `d8191d97`). Frameless self-call: defer the non-arg live
+      set's `[x19]` materialization to the cold bail exit; added the filtered
+      `emit_frame_materialize_where` helper S2+ reuses. Correct (24/24, GC128,
+      jit69/vm652) but **bench-marginal** — the frameless path already pins
+      call-crossing values to callee-saved/spill homes, so its live-across set is
+      tiny (fib: just `n`). **Finding: item-2's real payoff is at the allocating-
+      stub full-materialize sites, and much of it is gated behind item 3** (the
+      richards/tree/poly hot bodies are rejected → do not compile yet, so no
+      precise safepoint touches them until poly `CallMethod` inline lands).
+
+- [x] S0 (landed). `RuntimeStubAllocContext` gains `spill_slots: *mut u64` +
+      `spill_slot_count: u16` (+ `with_spill_area` / `has_spill_slots`);
+      `validate_alloc_safepoint_frame_roots` + `AllocSafepointFrameRoots::
+      visit_extra_roots` accept + trace `SpillSlot` (read `[spill_slots+idx*8]`
+      as `&mut Value` — moving GC rewrites in place); MachineRegister still
+      rejected (S3 spills first). Emitter zeroes the two new fields at all 3
+      ctx-build sites (opt collection-alloc + 2 baseline) → SpillSlot path dead in
+      production, exercised by `spill_slot_safepoint_root_is_traced_and_validated`.
+      Struct 64→72B (`abi_records_stay_small` bumped). Zero behavior change:
+      diff 24/24, GC128 clean, jit69/vm653, clippy clean.
 - [ ] S1. Precise safepoint construction for **one** op class (`Call`): build the
       record from the live Tagged set at their homes instead of `frame_slot_window`;
       thread the spill base into the alloc/reentry ctx at the `Call` lowering;

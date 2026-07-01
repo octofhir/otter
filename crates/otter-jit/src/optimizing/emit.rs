@@ -1310,7 +1310,31 @@ mod arm64 {
         point: &DeoptPoint,
         box_scratch: u32,
     ) -> Result<(), Unsupported> {
+        emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |_| true)
+    }
+
+    /// Box and store into the interpreter window `[x19]` exactly the live
+    /// registers of `point` for which `keep(regn)` holds. A frameless
+    /// self-recursive call splits its frame state: the register subset the
+    /// recursion reads from `[x19]` (args + callee) is written on the hot path,
+    /// and the complement — values live across the call but only read when the
+    /// function bails to the interpreter — is written on the cold bail exit, so
+    /// the fast recursion pays no box for a value it merely holds live. The
+    /// frameless subset allocates nothing, so no GC observes `[x19]` between the
+    /// two writes; the reconstructed frame is identical on every path that reads
+    /// it (a guard-miss bail, a stack overflow, or a later op's frame state).
+    fn emit_frame_materialize_where(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        box_scratch: u32,
+        keep: impl Fn(u16) -> bool,
+    ) -> Result<(), Unsupported> {
         for &(regn, value) in &point.registers {
+            if !keep(regn) {
+                continue;
+            }
             let node = graph.node(value);
             if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
                 let loc = require_loc(alloc, value)?;
@@ -3261,12 +3285,16 @@ mod arm64 {
                 if arg_regs.len() > 4 {
                     return Err(Unsupported::OperandShape("call arg count"));
                 }
-                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
                 if matches!(
                     inputs.first().map(|callee| &graph.node(*callee).kind),
                     Some(NodeKind::SelfClosure)
                 ) && graph_allows_frameless_self_call(graph)
                 {
+                    // The recursion reads only the args and the self callee from
+                    // `[x19]`; write just those on the hot path and defer the rest
+                    // of the live set to the cold bail exit below.
+                    let crosses = |r: u16| r == *callee_reg || arg_regs.contains(&r);
+                    emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, crosses)?;
                     emit_self_recursive_call(
                         ops,
                         graph.register_count,
@@ -3294,6 +3322,12 @@ mod arm64 {
                         ; b =>after
                         ; =>bail
                     );
+                    // Cold: a guard-miss or reg-stack overflow bails to the
+                    // interpreter, so complete `[x19]` with the registers the hot
+                    // path skipped before stamping the resume PC.
+                    emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |r| {
+                        !crosses(r)
+                    })?;
                     emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
                     dynasm!(ops
                         ; .arch aarch64
@@ -3304,6 +3338,7 @@ mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; =>after);
                     return Ok(());
                 }
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov x0, x20

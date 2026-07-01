@@ -196,8 +196,16 @@ pub struct RuntimeStubAllocContext {
     pub frame_slots: *mut u64,
     /// Number of tagged frame slots starting at [`Self::frame_slots`].
     pub frame_slot_count: u16,
+    /// Number of native spill slots starting at [`Self::spill_slots`].
+    pub spill_slot_count: u16,
     /// Reserved for future safepoint/deopt metadata width.
-    pub reserved1: u16,
+    pub reserved1: u32,
+    /// Absolute base of the compiled frame's native spill/save area as raw
+    /// `Value` bits (the `[sp]`-relative area a register-map safepoint saves
+    /// call-crossing values into). A [`TaggedLocation::spill_slot`] root at index
+    /// `i` names `spill_slots[i]`. Null when the call site publishes no native
+    /// spill roots (every safepoint location is a frame slot).
+    pub spill_slots: *mut u64,
 }
 
 impl RuntimeStubAllocContext {
@@ -223,14 +231,32 @@ impl RuntimeStubAllocContext {
             frame_index,
             frame_slots,
             frame_slot_count,
+            spill_slot_count: 0,
             reserved1: 0,
+            spill_slots: std::ptr::null_mut(),
         }
+    }
+
+    /// Attach a native spill/save-area root window to this packet. The base must
+    /// point at `count` live, writable `Value` ABI slots that stay pinned while a
+    /// GC may trace and update them.
+    #[must_use]
+    pub const fn with_spill_area(mut self, spill_slots: *mut u64, count: u16) -> Self {
+        self.spill_slots = spill_slots;
+        self.spill_slot_count = count;
+        self
     }
 
     /// Whether this packet names a concrete frame-slot root window.
     #[must_use]
     pub const fn has_frame_slots(self) -> bool {
         !self.frame_slots.is_null() && self.frame_slot_count != 0
+    }
+
+    /// Whether this packet names a concrete native spill/save-area root window.
+    #[must_use]
+    pub const fn has_spill_slots(self) -> bool {
+        !self.spill_slots.is_null() && self.spill_slot_count != 0
     }
 
     /// Whether this packet names a concrete safepoint-record table.
@@ -728,7 +754,7 @@ mod tests {
     #[test]
     fn abi_records_stay_small() {
         assert!(std::mem::size_of::<NativeFrameHeader>() <= 40);
-        assert!(std::mem::size_of::<RuntimeStubAllocContext>() <= 64);
+        assert!(std::mem::size_of::<RuntimeStubAllocContext>() <= 72);
         assert!(std::mem::size_of::<RuntimeStubResult>() <= 24);
         assert_eq!(std::mem::size_of::<RuntimeStubResultPair>(), 16);
         assert!(std::mem::size_of::<TaggedLocation>() <= 4);
@@ -764,6 +790,12 @@ mod tests {
         assert_eq!(ctx.frame_index, 7);
         assert!(ctx.has_frame_slots());
         assert!(ctx.has_safepoint_records());
+        // A fresh packet publishes no native spill window until a register-map
+        // safepoint attaches one.
+        assert!(!ctx.has_spill_slots());
+        let mut spill = [0_u64; 1];
+        let with_spill = ctx.with_spill_area(spill.as_mut_ptr(), 1);
+        assert!(with_spill.has_spill_slots());
     }
 
     #[test]

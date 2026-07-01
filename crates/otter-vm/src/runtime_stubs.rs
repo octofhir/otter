@@ -169,6 +169,16 @@ pub enum AllocSafepointRootError {
         /// Slot count supplied by the context packet.
         frame_slot_count: u16,
     },
+    /// A safepoint names a native spill-slot root but the packet exposes no
+    /// spill/save-area window.
+    MissingSpillSlots,
+    /// A spill-slot root points outside the context packet's spill window.
+    SpillSlotOutOfBounds {
+        /// Safepoint spill-slot index.
+        index: u16,
+        /// Spill-slot count supplied by the context packet.
+        spill_slot_count: u16,
+    },
 }
 
 /// Resolve an allocating-stub safepoint id through the context packet table.
@@ -224,6 +234,17 @@ pub fn validate_alloc_safepoint_frame_roots(
                     });
                 }
             }
+            TaggedLocationKind::SpillSlot => {
+                if !ctx.has_spill_slots() {
+                    return Err(AllocSafepointRootError::MissingSpillSlots);
+                }
+                if location.index >= ctx.spill_slot_count {
+                    return Err(AllocSafepointRootError::SpillSlotOutOfBounds {
+                        index: location.index,
+                        spill_slot_count: ctx.spill_slot_count,
+                    });
+                }
+            }
             kind => {
                 return Err(AllocSafepointRootError::UnsupportedLocation {
                     kind,
@@ -273,13 +294,26 @@ impl<'a> AllocSafepointFrameRoots<'a> {
 impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         for location in &self.safepoint.tagged_locations {
-            debug_assert_eq!(location.kind, TaggedLocationKind::FrameSlot);
-            debug_assert!(location.index < self.ctx.frame_slot_count);
-            // SAFETY: construction validates non-null frame slots, rejects
-            // out-of-bounds locations, and requires callers to keep the
-            // writable frame window alive while this root source is registered.
-            let value =
-                unsafe { &mut *(self.ctx.frame_slots.add(location.index as usize) as *mut Value) };
+            // SAFETY: construction validated every location's storage class and
+            // bounds and requires callers to keep the writable frame and spill
+            // windows alive while this root source is registered. A moving
+            // collector both traces and rewrites the pointer in place through the
+            // `&mut Value`, so a call-crossing pointer saved in the native spill
+            // area is updated exactly like one held in the interpreter window.
+            let base = match location.kind {
+                TaggedLocationKind::FrameSlot => {
+                    debug_assert!(location.index < self.ctx.frame_slot_count);
+                    self.ctx.frame_slots
+                }
+                TaggedLocationKind::SpillSlot => {
+                    debug_assert!(location.index < self.ctx.spill_slot_count);
+                    self.ctx.spill_slots
+                }
+                // A machine-register root class is rejected at validation; the
+                // register-map safepoint saves the value to a spill slot first.
+                TaggedLocationKind::MachineRegister => unreachable!("validated away"),
+            };
+            let value = unsafe { &mut *(base.add(location.index as usize) as *mut Value) };
             value.trace_value_slot_mut(visitor);
         }
     }
@@ -1565,6 +1599,67 @@ mod tests {
             )
             .expect("entry");
         assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+    }
+
+    #[test]
+    fn spill_slot_safepoint_root_is_traced_and_validated() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let obj = young_object_value(&mut heap);
+        // Frame window holds a non-pointer; the tagged pointer lives only in the
+        // native spill/save area, named by a spill-slot safepoint location.
+        let mut frame = [n(3).to_abi_bits()];
+        let mut spill = [obj.to_abi_bits()];
+        let record = SafepointRecord {
+            id: 1,
+            frame_state: NO_FRAME_STATE,
+            tagged_locations: vec![TaggedLocation::spill_slot(0)],
+        };
+        let ctx = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &record as *const SafepointRecord,
+            1,
+            0,
+            frame.as_mut_ptr(),
+            frame.len() as u16,
+        )
+        .with_spill_area(spill.as_mut_ptr(), spill.len() as u16);
+
+        validate_alloc_safepoint_frame_roots(&ctx, &record).expect("spill root validates");
+        let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &record) }.expect("publisher");
+        let mut visited = 0usize;
+        roots.visit_extra_roots(&mut |_p| visited += 1);
+        assert_eq!(visited, 1, "the spill-slot pointer is traced exactly once");
+
+        // A spill-slot location without a published spill window is rejected, and
+        // a machine-register location remains unsupported (spilled first).
+        let no_spill = RuntimeStubAllocContext::new(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &record as *const SafepointRecord,
+            1,
+            0,
+            frame.as_mut_ptr(),
+            frame.len() as u16,
+        );
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&no_spill, &record),
+            Err(AllocSafepointRootError::MissingSpillSlots)
+        );
+        let reg_record = SafepointRecord {
+            id: 1,
+            frame_state: NO_FRAME_STATE,
+            tagged_locations: vec![TaggedLocation::machine_register(0)],
+        };
+        assert_eq!(
+            validate_alloc_safepoint_frame_roots(&ctx, &reg_record),
+            Err(AllocSafepointRootError::UnsupportedLocation {
+                kind: TaggedLocationKind::MachineRegister,
+                index: 0,
+            })
+        );
     }
 
     #[test]

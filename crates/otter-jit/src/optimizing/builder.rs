@@ -716,6 +716,7 @@ impl<'a> Builder<'a> {
             let load_number = instr.load_number;
             let load_array_length = instr.load_array_length;
             let property_feedback = instr.property_feedback;
+            let property_feedback_poly = instr.property_feedback_poly.clone();
             let property_ic_site = instr.property_ic_site;
             let object_literal = instr.object_literal.clone();
             let operands = instr.operands.clone();
@@ -862,9 +863,35 @@ impl<'a> Builder<'a> {
                     }
                     // Inline slot access decompresses object pointers against the
                     // baked GC cage base; without it the layout offsets are absent.
-                    let Some((shape, slot_byte)) =
-                        property_feedback.filter(|_| self.view.cage_base != 0)
-                    else {
+                    if self.view.cage_base == 0 {
+                        self.deopt_or_decline(
+                            block,
+                            byte_pc,
+                            Unsupported::Opcode(Op::LoadProperty),
+                        )?;
+                        return Ok(());
+                    }
+                    let obj = self.read_variable(obj_reg, block);
+                    let load = if let Some((shape, slot_byte)) = property_feedback {
+                        // Monomorphic: a single shape guard then the slot load.
+                        let checked =
+                            self.graph
+                                .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
+                        self.push_body(block, checked);
+                        self.graph
+                            .add_node(NodeKind::LoadSlot(checked, slot_byte), block, byte_pc)
+                    } else if !property_feedback_poly.is_empty() {
+                        // Polymorphic: an inline structure-guard chain over the
+                        // baked `(shape, slot)` cases, deopt on the final miss.
+                        self.graph.add_node(
+                            NodeKind::LoadSlotPoly(
+                                obj,
+                                property_feedback_poly.clone().into_boxed_slice(),
+                            ),
+                            block,
+                            byte_pc,
+                        )
+                    } else {
                         self.deopt_or_decline(
                             block,
                             byte_pc,
@@ -872,14 +899,6 @@ impl<'a> Builder<'a> {
                         )?;
                         return Ok(());
                     };
-                    let obj = self.read_variable(obj_reg, block);
-                    let checked =
-                        self.graph
-                            .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
-                    self.push_body(block, checked);
-                    let load =
-                        self.graph
-                            .add_node(NodeKind::LoadSlot(checked, slot_byte), block, byte_pc);
                     self.graph.set_frame_dst(load, dst);
                     self.push_body(block, load);
                     self.def_register(dst, block, load, byte_pc);
@@ -895,16 +914,16 @@ impl<'a> Builder<'a> {
                 Op::StoreProperty => {
                     let obj_reg = reg(&operands, 0)?;
                     let src_reg = reg(&operands, 2)?;
-                    let Some((shape, slot_byte)) =
-                        property_feedback.filter(|_| self.view.cage_base != 0)
-                    else {
+                    if self.view.cage_base == 0
+                        || (property_feedback.is_none() && property_feedback_poly.is_empty())
+                    {
                         self.deopt_or_decline(
                             block,
                             byte_pc,
                             Unsupported::Opcode(Op::StoreProperty),
                         )?;
                         return Ok(());
-                    };
+                    }
                     let value = self.read_variable(src_reg, block);
                     if !matches!(
                         self.graph.node(value).kind.repr(),
@@ -918,16 +937,32 @@ impl<'a> Builder<'a> {
                         return Ok(());
                     }
                     let obj = self.read_variable(obj_reg, block);
-                    let checked =
-                        self.graph
-                            .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
-                    self.push_body(block, checked);
-                    let store = self.graph.add_node(
-                        NodeKind::StoreSlot(checked, slot_byte, value),
-                        block,
-                        byte_pc,
-                    );
-                    self.push_body(block, store);
+                    if let Some((shape, slot_byte)) = property_feedback {
+                        // Monomorphic: a single shape guard then the slot store.
+                        let checked =
+                            self.graph
+                                .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
+                        self.push_body(block, checked);
+                        let store = self.graph.add_node(
+                            NodeKind::StoreSlot(checked, slot_byte, value),
+                            block,
+                            byte_pc,
+                        );
+                        self.push_body(block, store);
+                    } else {
+                        // Polymorphic: an inline structure-guard chain over the
+                        // baked `(shape, slot)` cases, deopt on the final miss.
+                        let store = self.graph.add_node(
+                            NodeKind::StoreSlotPoly(
+                                obj,
+                                property_feedback_poly.clone().into_boxed_slice(),
+                                value,
+                            ),
+                            block,
+                            byte_pc,
+                        );
+                        self.push_body(block, store);
+                    }
                 }
                 // `LoadElement dst, recv, idx` — inline only dense Array and
                 // Float64Array / Int32Array fast paths. Every miss deoptimizes at
@@ -2480,6 +2515,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                property_feedback_poly: Vec::new(),
                 object_literal: None,
                 arith_feedback: *fb,
             })
@@ -2497,6 +2533,9 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            object_inline_values_byte: 80,
+            object_slab_len_byte: 88,
+            object_inline_slot_cap: 2,
             gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,
@@ -2560,6 +2599,7 @@ mod tests {
                         load_array_length: false,
                         load_number: None,
                         property_feedback: None,
+                        property_feedback_poly: Vec::new(),
                         object_literal: None,
                         arith_feedback: ARITH_INT32,
                     },
@@ -2573,6 +2613,7 @@ mod tests {
                         load_array_length: false,
                         load_number: None,
                         property_feedback: None,
+                        property_feedback_poly: Vec::new(),
                         object_literal: None,
                         arith_feedback: 0,
                     },
@@ -2613,6 +2654,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     property_feedback: None,
+                    property_feedback_poly: Vec::new(),
                     object_literal: None,
                     arith_feedback: 0,
                 },
@@ -2626,6 +2668,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     property_feedback: None,
+                    property_feedback_poly: Vec::new(),
                     object_literal: None,
                     arith_feedback: 0,
                 },
@@ -2639,6 +2682,7 @@ mod tests {
                     load_array_length: false,
                     load_number: None,
                     property_feedback: None,
+                    property_feedback_poly: Vec::new(),
                     object_literal: None,
                     arith_feedback: 0,
                 },
@@ -2712,6 +2756,7 @@ mod tests {
             load_array_length: false,
             load_number: None,
             property_feedback: None,
+            property_feedback_poly: Vec::new(),
             object_literal: None,
             arith_feedback: fb,
         }

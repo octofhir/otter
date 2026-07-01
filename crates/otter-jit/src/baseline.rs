@@ -2930,7 +2930,6 @@ pub(crate) mod arm64 {
                         let obj_off = reg_offset(obj)?;
                         let dst_off = reg_offset(dst)?;
                         let shape_byte = view.object_shape_byte;
-                        let values_ptr_byte = view.object_values_ptr_byte;
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr x9, [x19, obj_off]   // receiver Value
@@ -2970,11 +2969,12 @@ pub(crate) mod arm64 {
                                 ; =>next
                             );
                         }
+                        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_load);
+                        // Slab base from the fresh header (inline) or stable
+                        // out-of-line `values_ptr` — never the cached body pointer.
+                        emit_slab_base(&mut ops, view, 13, 14);
                         dynasm!(ops
                             ; .arch aarch64
-                            ; b =>miss
-                            ; =>do_load
-                            ; ldr x13, [x13, values_ptr_byte] // value slab base
                             ; cbz x13, =>miss
                             ; ldr w9, [x13, x17]       // 4-byte compressed slot
                         );
@@ -3046,7 +3046,6 @@ pub(crate) mod arm64 {
                         let obj_off = reg_offset(obj)?;
                         let src_off = reg_offset(src)?;
                         let shape_byte = view.object_shape_byte;
-                        let values_ptr_byte = view.object_values_ptr_byte;
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr x9, [x19, obj_off]   // receiver Value
@@ -3090,7 +3089,12 @@ pub(crate) mod arm64 {
                             ; b =>miss
                             ; =>do_store
                             ; ldr x9, [x19, src_off]   // value to store
-                            ; ldr x13, [x13, values_ptr_byte] // value slab base
+                        );
+                        // Slab base from the fresh header (inline) or stable
+                        // out-of-line `values_ptr` — never the cached body pointer.
+                        emit_slab_base(&mut ops, view, 13, 14);
+                        dynasm!(ops
+                            ; .arch aarch64
                             ; cbz x13, =>miss
                             ; movz x11, NUMBER_TAG_HI16, lsl #48
                             ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
@@ -3290,6 +3294,67 @@ pub(crate) mod arm64 {
             ; blr x16
             ; cbnz x0, =>threw
         );
+    }
+
+    /// Compute the value-slab base for a shape-matched receiver into `reg`, which
+    /// holds the decompressed `GcHeader` pointer on entry (`scratch` is
+    /// clobbered). A small object (`slab_len <= INLINE_SLOT_CAP`) carries its slab
+    /// inline in the body, so the base is `header + object_inline_values_byte`,
+    /// derived fresh from the receiver's header every access. This deliberately
+    /// never reads the cached `values_ptr`: that pointer aims into the body and
+    /// dangles the instant the moving collector relocates the object — a stale
+    /// base the collector only re-caches lazily, so a compiled load/store that
+    /// trusted it wrote through a freed slab. A spilled object's slab is a stable
+    /// out-of-line allocation, so its base is loaded from `values_ptr`.
+    pub(crate) fn emit_slab_base(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        reg: u32,
+        scratch: u32,
+    ) {
+        // Frozen ABI (a `dynasm` immediate must be a compile-time constant): the
+        // inline slab capacity and the header-relative offset of the in-body
+        // inline slab. Pinned to `INLINE_SLOT_CAP` and
+        // `HEADER_SIZE + OBJECT_BODY_INLINE_VALUES_OFFSET`, `debug_assert`ed
+        // against the values otter-vm baked from the live `#[repr(C)]` layout so a
+        // field reorder trips in tests rather than baking a wild offset.
+        const INLINE_SLOT_CAP: u32 = 2;
+        const INLINE_VALUES_BYTE: u32 = 80;
+        debug_assert_eq!(INLINE_SLOT_CAP, view.object_inline_slot_cap);
+        debug_assert_eq!(INLINE_VALUES_BYTE, view.object_inline_values_byte);
+        let slab_len_off = view.object_slab_len_byte;
+        let values_ptr_off = view.object_values_ptr_byte;
+        let spilled = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        // A `dynasm` `cmp` / `add` immediate is only accepted with a static
+        // register operand, so emit the fixed-register form for each register
+        // pair the two emitters call this with (baseline x13/x14, optimizing
+        // x16/x17).
+        match (reg, scratch) {
+            (13, 14) => dynasm!(ops
+                ; .arch aarch64
+                ; ldrh w14, [x13, slab_len_off]
+                ; cmp w14, INLINE_SLOT_CAP
+                ; b.hi =>spilled
+                ; add x13, x13, INLINE_VALUES_BYTE
+                ; b =>done
+                ; =>spilled
+                ; ldr x13, [x13, values_ptr_off]
+                ; =>done
+            ),
+            (16, 17) => dynasm!(ops
+                ; .arch aarch64
+                ; ldrh w17, [x16, slab_len_off]
+                ; cmp w17, INLINE_SLOT_CAP
+                ; b.hi =>spilled
+                ; add x16, x16, INLINE_VALUES_BYTE
+                ; b =>done
+                ; =>spilled
+                ; ldr x16, [x16, values_ptr_off]
+                ; =>done
+            ),
+            _ => unreachable!("emit_slab_base register pair"),
+        }
     }
 
     fn emit_backedge_interrupt_check(ops: &mut Assembler, threw: DynamicLabel) {
@@ -6581,6 +6646,7 @@ mod tests {
                 load_array_length: false,
                 load_number: None,
                 property_feedback: None,
+                property_feedback_poly: Vec::new(),
                 object_literal: None,
                 arith_feedback: 0,
             })
@@ -6598,6 +6664,9 @@ mod tests {
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
+            object_inline_values_byte: 80,
+            object_slab_len_byte: 88,
+            object_inline_slot_cap: 2,
             gc_barrier: Default::default(),
             jit_proto_byte: 12,
             closure_fid_byte: 8,

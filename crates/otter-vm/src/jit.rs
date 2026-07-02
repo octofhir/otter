@@ -115,6 +115,12 @@ pub struct JitFunctionView {
     /// `[recv_ptr + jit_proto_byte]` to chase the receiver's prototype chain
     /// in machine code without a resolve bridge.
     pub jit_proto_byte: u32,
+    /// `GcHeader::type_tag` for heap-number boxes referenced by compressed
+    /// object slots.
+    pub heap_number_type_tag: u8,
+    /// Byte offset from a decompressed heap-number pointer to its raw boxed
+    /// `Value` bits (`HEADER_SIZE + offset_of!(HeapNumberBody, bits)`).
+    pub heap_number_bits_byte: u32,
     /// Byte offset from a decompressed closure pointer to its `function_id`
     /// (`HEADER_SIZE + offset_of!(JsClosureBody, function_id)`). The
     /// method-inline guard reads `[closure_ptr + closure_fid_byte]` to compare

@@ -229,6 +229,9 @@ impl ExecutableFunction {
             },
             jit_proto_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_JIT_PROTO_OFFSET as u32,
+            heap_number_type_tag: crate::heap_number::HEAP_NUMBER_TYPE_TAG,
+            heap_number_bits_byte: otter_gc::header::HEADER_SIZE as u32
+                + std::mem::offset_of!(crate::heap_number::HeapNumberBody, bits) as u32,
             closure_fid_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::closure::JsClosureBody, function_id) as u32,
             closure_upvalues_ptr_byte: closure_upvalues_ptr_byte(),

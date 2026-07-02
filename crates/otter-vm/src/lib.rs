@@ -3181,13 +3181,17 @@ impl Interpreter {
         self.bake_array_methods(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         if trace {
+            let function_name = context
+                .function(fid)
+                .map(|function| function.name.as_str())
+                .unwrap_or("<unknown>");
             let method_feedback = self
                 .jit_method_site_feedback
                 .iter()
                 .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
                 .count();
             eprintln!(
-                "[otter-jit] view fid {fid}: call_feedback={} method_feedback={} inline_callees={} inline_methods={}",
+                "[otter-jit] view fid {fid} {function_name}: call_feedback={} method_feedback={} inline_callees={} inline_methods={}",
                 self.jit_call_site_feedback
                     .iter()
                     .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
@@ -3259,10 +3263,10 @@ impl Interpreter {
             .record(lhs, rhs);
     }
 
-    /// Copy the warmup operand-type feedback recorded for `fid`'s arithmetic /
-    /// relational sites into the compile snapshot, keyed by each instruction's
-    /// byte-PC. Sites the interpreter never observed stay `0` (unknown), which
-    /// the optimizing tier lowers generically.
+    /// Copy the warmup value-representation feedback recorded for `fid`'s
+    /// numeric-specialized sites into the compile snapshot, keyed by each
+    /// instruction's byte-PC. Sites the interpreter never observed stay `0`
+    /// (unknown), which the optimizing tier lowers generically.
     fn bake_arith_feedback(&self, view: &mut jit::JitFunctionView, fid: u32) {
         if self.jit_arith_feedback.is_empty() && self.jit_arith_widen_float.is_empty() {
             return;
@@ -8165,9 +8169,6 @@ impl Interpreter {
                 }
                 Op::StoreElement => {
                     let operands = context.exec_operands(instr);
-                    if self.drive_store_element(stack, context, operands)? {
-                        continue;
-                    }
                     let recv_reg = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
@@ -8177,6 +8178,13 @@ impl Interpreter {
                     let src_reg = context
                         .exec_register(instr, 2)
                         .ok_or_else(|| VmError::InvalidOperand)?;
+                    if self.jit_hook.is_some() {
+                        let value = *read_register(&stack[top_idx], src_reg)?;
+                        self.note_arith(value, value);
+                    }
+                    if self.drive_store_element(stack, context, operands)? {
+                        continue;
+                    }
                     self.run_store_element_regs(
                         context,
                         &mut *stack,

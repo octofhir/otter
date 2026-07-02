@@ -508,6 +508,22 @@ pub(crate) struct MethodSite {
     method_on_receiver: bool,
 }
 
+#[derive(Clone)]
+enum JitDirectMethodHit {
+    Own(crate::object::AtomOwnPropertyHit),
+    DirectPrototype {
+        receiver_shape_id: crate::object::ShapeId,
+        prototype_hit: crate::object::AtomOwnPropertyHit,
+    },
+}
+
+#[derive(Clone)]
+struct JitDirectMethodCache {
+    hit: JitDirectMethodHit,
+    function_id: u32,
+    code: std::sync::Arc<dyn jit::JitFunctionCode>,
+}
+
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
 /// (foundation plan §"Interpreter requirements").
@@ -801,6 +817,10 @@ pub struct Interpreter {
     /// The VM-local anchor keeps the executable mapping alive even if feedback
     /// invalidates the installed body before control returns to the caller.
     jit_direct_code_anchors: Vec<(usize, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Per-method-call-site compiled direct-call cache. Each entry is guarded by
+    /// the same shape/slot metadata as the load IC and re-reads the method value
+    /// before entry, so overwriting a method slot falls back to full resolution.
+    jit_direct_method_cache: Vec<Option<JitDirectMethodCache>>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
     /// Free-list of spilled register-window backing buffers. Every bytecode
@@ -1564,6 +1584,7 @@ impl Interpreter {
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_direct_code_anchors: Vec::new(),
+            jit_direct_method_cache: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
             holt_pool: Vec::new(),
@@ -2017,6 +2038,7 @@ impl Interpreter {
     fn invalidate_jit_function(&mut self, fid: u32) {
         self.jit_code.remove(&fid);
         self.jit_code_cache = None;
+        self.clear_jit_direct_method_cache();
         self.jit_osr_code
             .retain(|(entry_fid, _), _| *entry_fid != fid);
         self.jit_osr_disabled
@@ -2112,6 +2134,7 @@ impl Interpreter {
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
             self.jit_code.insert(fid, compiled.clone());
             self.jit_code_cache = None;
+            self.clear_jit_direct_method_cache();
             compiled
         };
         // The function-entry path never runs OSR-only code (compiled with
@@ -2263,6 +2286,12 @@ impl Interpreter {
         })
     }
 
+    fn clear_jit_direct_method_cache(&mut self) {
+        for slot in &mut self.jit_direct_method_cache {
+            *slot = None;
+        }
+    }
+
     fn pin_jit_direct_code(
         &mut self,
         frame_index: usize,
@@ -2304,6 +2333,24 @@ impl Interpreter {
         callee_reg: Option<u16>,
         arg_regs: &[u16],
     ) -> Result<jit::JitPreparedDirectCall, VmError> {
+        let bind_count = usize::from(plan.param_count).min(arg_regs.len());
+        {
+            let caller = stack
+                .get(frame_index)
+                .ok_or_else(|| VmError::InvalidOperand)?;
+            for &src in arg_regs.iter().take(bind_count) {
+                caller
+                    .registers
+                    .get(src as usize)
+                    .ok_or_else(|| VmError::InvalidOperand)?;
+            }
+            if let Some(reg) = callee_reg {
+                caller
+                    .registers
+                    .get(reg as usize)
+                    .ok_or_else(|| VmError::InvalidOperand)?;
+            }
+        };
         let upvalues = if function.own_upvalue_count == 0 {
             parent_upvalues
         } else {
@@ -2318,12 +2365,8 @@ impl Interpreter {
             this_for_callee,
             registers,
         ));
-
-        let bind_count = usize::from(plan.param_count).min(arg_regs.len());
         let callee_now = {
-            let caller = stack
-                .get(frame_index)
-                .ok_or_else(|| VmError::InvalidOperand)?;
+            let caller = &stack[frame_index];
             for (dst_slot, &src) in callee_frame
                 .frame_mut()
                 .registers
@@ -2331,20 +2374,9 @@ impl Interpreter {
                 .zip(arg_regs.iter())
                 .take(bind_count)
             {
-                *dst_slot = *caller
-                    .registers
-                    .get(src as usize)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
+                *dst_slot = caller.registers[src as usize];
             }
-            match callee_reg {
-                Some(reg) => Some(
-                    *caller
-                        .registers
-                        .get(reg as usize)
-                        .ok_or_else(|| VmError::InvalidOperand)?,
-                ),
-                None => None,
-            }
+            callee_reg.map(|reg| caller.registers[reg as usize])
         };
         let self_closure = if function.makes_function
             && let Some(closure) = callee_now.and_then(|v| v.as_closure(&self.gc_heap))
@@ -2498,6 +2530,137 @@ impl Interpreter {
         })
     }
 
+    fn cached_direct_method_value(
+        &self,
+        recv: crate::object::JsObject,
+        hit: &JitDirectMethodHit,
+    ) -> Option<Value> {
+        match *hit {
+            JitDirectMethodHit::Own(slot) => {
+                object::load_plain_shaped_own_data_slot_hit(recv, &self.gc_heap, slot)
+            }
+            JitDirectMethodHit::DirectPrototype {
+                receiver_shape_id,
+                prototype_hit,
+            } => {
+                if object::shape_id(recv, &self.gc_heap) != receiver_shape_id {
+                    return None;
+                }
+                let proto = object::prototype(recv, &self.gc_heap)?;
+                object::load_plain_shaped_own_data_slot_hit(proto, &self.gc_heap, prototype_hit)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_prepare_cached_direct_method_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        frame_index: usize,
+        recv: Value,
+        obj: crate::object::JsObject,
+        site: usize,
+        arg_regs: &[u16],
+    ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        let Some(cache) = self
+            .jit_direct_method_cache
+            .get(site)
+            .and_then(Option::as_ref)
+        else {
+            return Ok(None);
+        };
+        let expected = Value::function(cache.function_id);
+        if self.cached_direct_method_value(obj, &cache.hit) != Some(expected) {
+            if let Some(slot) = self.jit_direct_method_cache.get_mut(site) {
+                *slot = None;
+            }
+            return Ok(None);
+        }
+        let Some(function) = context.exec_function(cache.function_id) else {
+            return Ok(None);
+        };
+        let code = cache.code.clone();
+        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+            return Ok(None);
+        };
+
+        self.enter_sync_reentry()?;
+        match self.prepare_jit_direct_call_frame(
+            context,
+            stack,
+            frame_index,
+            function,
+            Frame::empty_upvalues(),
+            recv,
+            plan,
+            None,
+            arg_regs,
+        ) {
+            Ok(prepared) => {
+                self.pin_jit_direct_code(prepared.frame_index, code);
+                self.jit_runtime_stats.direct_calls =
+                    self.jit_runtime_stats.direct_calls.saturating_add(1);
+                Ok(Some(prepared))
+            }
+            Err(err) => {
+                self.leave_sync_reentry();
+                Err(err)
+            }
+        }
+    }
+
+    fn install_jit_direct_method_cache(
+        &mut self,
+        site: usize,
+        obj: crate::object::JsObject,
+        key: crate::property_atom::AtomizedPropertyKey<'_>,
+        method: Value,
+        function_id: u32,
+        code: std::sync::Arc<dyn jit::JitFunctionCode>,
+    ) {
+        if method != Value::function(function_id) {
+            return;
+        }
+        let Some(entry) = self.load_property_ics.get(site) else {
+            return;
+        };
+        let mut cached_hit = None;
+        for stub in entry.entries() {
+            if let Some(hit) = stub.own_data_hit()
+                && object::load_own_data_slot_atom(obj, &self.gc_heap, key, hit) == Some(method)
+                && object::load_plain_shaped_own_data_slot_hit(obj, &self.gc_heap, hit)
+                    == Some(method)
+            {
+                cached_hit = Some(JitDirectMethodHit::Own(hit));
+                break;
+            }
+            if let Some((receiver_shape_id, prototype_hit)) = stub.direct_prototype_load()
+                && object::shape_id(obj, &self.gc_heap) == receiver_shape_id
+                && let Some(proto) = object::prototype(obj, &self.gc_heap)
+                && object::load_own_data_slot_atom(proto, &self.gc_heap, key, prototype_hit)
+                    == Some(method)
+                && object::load_plain_shaped_own_data_slot_hit(proto, &self.gc_heap, prototype_hit)
+                    == Some(method)
+            {
+                cached_hit = Some(JitDirectMethodHit::DirectPrototype {
+                    receiver_shape_id,
+                    prototype_hit,
+                });
+                break;
+            }
+        }
+        if let Some(hit) = cached_hit
+            && let Some(slot) = self.jit_direct_method_cache.get_mut(site)
+        {
+            *slot = Some(JitDirectMethodCache {
+                hit,
+                function_id,
+                code,
+            });
+        }
+    }
+
     /// Prepare an eligible compiled **method** callee (`recv.name(args…)`) for
     /// direct machine-code entry, the `CallMethodValue` analogue of
     /// [`Self::jit_prepare_direct_call`].
@@ -2545,6 +2708,17 @@ impl Interpreter {
         let Some(obj) = recv.as_object() else {
             return Ok(None);
         };
+        if let Some(prepared) = self.try_prepare_cached_direct_method_call(
+            context,
+            stack,
+            frame_index,
+            recv,
+            obj,
+            site,
+            arg_regs,
+        )? {
+            return Ok(Some(prepared));
+        }
         let Some(key) =
             context.property_atom_for_function(stack[frame_index].function_id, name_idx)
         else {
@@ -2595,6 +2769,7 @@ impl Interpreter {
         let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
+        self.install_jit_direct_method_cache(site, obj, key, method, function_id, code.clone());
 
         self.enter_sync_reentry()?;
         match self.prepare_jit_direct_call_frame(
@@ -2743,9 +2918,18 @@ impl Interpreter {
         stack: &mut jit::JitFrameStack,
         callee_frame_index: usize,
     ) {
-        stack.truncate(callee_frame_index);
+        self.truncate_frame_stack_reclaiming(stack, callee_frame_index);
         self.release_jit_direct_code_from(callee_frame_index);
         self.leave_sync_reentry();
+    }
+
+    #[inline]
+    fn truncate_frame_stack_reclaiming(&mut self, stack: &mut jit::JitFrameStack, len: usize) {
+        while stack.len() > len {
+            if let Some(mut frame) = stack.pop() {
+                self.reclaim_registers(&mut frame);
+            }
+        }
     }
 
     /// Attempt the fast compiled→compiled call. Returns `Ok(Some(value))` when
@@ -2875,7 +3059,7 @@ impl Interpreter {
             // frames) still appended; drop back to the caller before propagating
             // so the stack is left exactly as found.
             jit::JitExecOutcome::Threw(err) => {
-                stack.truncate(idx);
+                self.truncate_frame_stack_reclaiming(stack, idx);
                 Err(err)
             }
             // `new_frame` carries `return_register = None`, so resuming the
@@ -3544,6 +3728,7 @@ impl Interpreter {
     fn evict_compiled_for_reopt(&mut self, fid: u32) {
         self.jit_code.remove(&fid);
         self.jit_code_cache = None;
+        self.clear_jit_direct_method_cache();
         self.jit_osr_code.retain(|&(f, _), _| f != fid);
         self.jit_osr_disabled.retain(|&(f, _)| f != fid);
         self.jit_osr_counts.retain(|&(f, _), _| f != fid);
@@ -4129,6 +4314,9 @@ impl Interpreter {
         if self.jit_collection_method_ics.len() < site_count {
             self.jit_collection_method_ics
                 .resize(site_count, jit::JitCollectionMethodIcSlot::EMPTY);
+        }
+        if self.jit_direct_method_cache.len() < site_count {
+            self.jit_direct_method_cache.resize(site_count, None);
         }
     }
 
@@ -6356,8 +6544,11 @@ impl Interpreter {
     /// pool drops the stack instead.
     #[inline]
     pub(crate) fn return_stack(&mut self, mut stack: HoltStack) {
+        while let Some(mut frame) = stack.pop() {
+            self.frame_release_cold(&mut frame);
+            self.reclaim_registers(&mut frame);
+        }
         if self.holt_pool.len() < Self::HOLT_POOL_CAP {
-            stack.clear();
             self.holt_pool.push(stack);
         }
     }

@@ -352,16 +352,18 @@ fn reverse_postorder(graph: &Graph) -> Vec<BlockId> {
 }
 
 /// Whether a node can deoptimize and therefore needs a captured frame state: a
-/// speculation guard (`CheckInt32` / `CheckNumber`) or an arithmetic node that
-/// deopts on int32 overflow (`Int32Add` / `Int32Sub` / `Int32Mul`). An overflow
-/// resumes the interpreter at the arithmetic instruction's byte-PC, so it needs
-/// the same live-register frame state as a guard does. Float arithmetic is total
-/// (IEEE) and never deopts, so the `Float64*` nodes are absent here.
+/// speculation guard (`CheckInt32` / `CheckNumber` / `CheckBool`) or an
+/// arithmetic node that deopts on int32 overflow (`Int32Add` / `Int32Sub` /
+/// `Int32Mul`). An overflow resumes the interpreter at the arithmetic
+/// instruction's byte-PC, so it needs the same live-register frame state as a
+/// guard does. Float arithmetic is total (IEEE) and never deopts, so the
+/// `Float64*` nodes are absent here.
 fn can_deopt(kind: &NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::CheckInt32(_)
             | NodeKind::CheckNumber(_)
+            | NodeKind::CheckBool(_)
             | NodeKind::CheckShape(_, _)
             | NodeKind::CheckFunctionIdentity { .. }
             | NodeKind::CheckMethodIdentity { .. }

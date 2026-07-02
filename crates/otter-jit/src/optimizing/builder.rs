@@ -132,13 +132,13 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
                 | NodeKind::LoadArrayLength(_)
         )
     });
-    // Reject the bridge-churn mixes the cost model loses on: a plain `Call`
+    // Reject the bridge-churn mix the cost model loses on: a plain `Call`
     // alongside any other bridging op (a memory op or an un-inlined method
-    // call), or an un-inlined `CallMethod` alongside a memory op. Either way the
-    // baseline's tuned IC sequence wins, and — for the method-call case — keeps
-    // these bodies off the un-inlined-poly-method optimizing path.
-    let reject =
-        (has_plain_call && (has_mem_op || has_method_call)) || (has_method_call && has_mem_op);
+    // call). Method calls with baked memory ops are allowed through; richards
+    // hot method bodies use that shape, and the method-call cache keeps the
+    // remaining bridge predictable enough for the typed slot/arithmetic body to
+    // pay for itself.
+    let reject = has_plain_call && (has_mem_op || has_method_call);
     if reject {
         return Err(Unsupported::Unlowered("call plus object fast path"));
     }
@@ -170,6 +170,7 @@ pub(super) fn graph_allows_frameless_self_call(graph: &Graph) -> bool {
                     | NodeKind::ConstNull
                     | NodeKind::ConstBool(_)
                     | NodeKind::SelfClosure
+                    | NodeKind::CheckBool(_)
                     | NodeKind::ConstInt32(_)
                     | NodeKind::CheckInt32(_)
                     | NodeKind::Int32Add(_, _)
@@ -1409,16 +1410,20 @@ impl<'a> Builder<'a> {
                     }
                     // succs == [target, fallthrough] (built in CFG discovery).
                     let fallthrough = succs[1];
-                    let cond_node = self.read_variable(cond, block);
-                    // Only an unboxed `Bool` condition (a comparison result) is
-                    // compiled. A `Tagged` condition is a value tested for JS
-                    // truthiness (`if (x)`, `while (obj)`, a `&&`/`||` result
-                    // merged through a phi) — full ToBoolean is outside this tier,
-                    // so bail rather than mis-evaluate it.
+                    let mut cond_node = self.read_variable(cond, block);
+                    // Branches consume an unboxed predicate. A known boxed
+                    // boolean (constant or boolean-only phi) can be consumed as
+                    // tagged and tested against `false`; an unknown tagged value
+                    // gets a boolean guard that deopts on every non-boolean so
+                    // the interpreter still owns full ToBoolean semantics.
                     if self.graph.node(cond_node).kind.repr() != Repr::Bool
                         && !self.is_boxed_bool(cond_node, &mut FxHashSet::default())
                     {
-                        return Err(Unsupported::OperandShape("non-boolean branch condition"));
+                        let check =
+                            self.graph
+                                .add_node(NodeKind::CheckBool(cond_node), block, byte_pc);
+                        self.push_body(block, check);
+                        cond_node = check;
                     }
                     let (on_true, on_false) = if matches!(op, Op::JumpIfTrue) {
                         (tgt_block, fallthrough)
@@ -2961,6 +2966,34 @@ mod tests {
         assert_eq!(
             count_kind(&g, |k| matches!(k, NodeKind::CheckMethodIdentity { .. })),
             0
+        );
+    }
+
+    #[test]
+    fn tagged_method_branch_inserts_bool_guard() {
+        let mut v = view(
+            1,
+            4,
+            &[
+                (
+                    Op::CallMethodValue,
+                    vec![r(1), r(0), Operand::ConstIndex(0), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::JumpIfFalse, vec![imm(rel(1, 4)), r(1)], 0),
+                (Op::LoadInt32, vec![r(2), imm(1)], 0),
+                (Op::ReturnValue, vec![r(2)], 0),
+                (Op::LoadInt32, vec![r(3), imm(0)], 0),
+                (Op::ReturnValue, vec![r(3)], 0),
+            ],
+        );
+        v.instructions[0].property_ic_site = Some(7);
+
+        let g = build_full(&v).expect("method-result branch builds");
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckBool(_))), 1);
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CallMethod { .. })),
+            1
         );
     }
 

@@ -149,6 +149,10 @@ pub enum NodeKind {
     /// double; a real double is unboxed verbatim; a non-number input
     /// deoptimizes.
     CheckNumber(NodeId),
+    /// Speculative "operand is a boxed boolean" guard; result repr [`Repr::Bool`].
+    /// A boxed `false` becomes `0`, boxed `true` becomes `1`, and any other
+    /// value deoptimizes so the interpreter owns full JavaScript truthiness.
+    CheckBool(NodeId),
     /// Widen an unboxed `int32` to `f64` (arm64 `scvtf`). Used to bring an
     /// int32-typed operand into a `Float64` arithmetic site without a guard.
     Int32ToFloat64(NodeId),
@@ -409,6 +413,7 @@ impl NodeKind {
         match self {
             NodeKind::CheckInt32(a)
             | NodeKind::CheckNumber(a)
+            | NodeKind::CheckBool(a)
             | NodeKind::Int32ToFloat64(a)
             | NodeKind::Float64ToInt32(a)
             | NodeKind::TaggedIsNull { value: a, .. }
@@ -478,6 +483,7 @@ impl NodeKind {
         match self {
             NodeKind::CheckInt32(a)
             | NodeKind::CheckNumber(a)
+            | NodeKind::CheckBool(a)
             | NodeKind::Int32ToFloat64(a)
             | NodeKind::Float64ToInt32(a)
             | NodeKind::TaggedIsNull { value: a, .. }
@@ -572,6 +578,7 @@ impl NodeKind {
             | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
             NodeKind::Int32Compare(_, _, _)
             | NodeKind::Float64Compare(_, _, _)
+            | NodeKind::CheckBool(_)
             | NodeKind::MethodIdentityMatches { .. }
             | NodeKind::TaggedIsNull { .. } => Repr::Bool,
             // Register-carried values are tagged at block boundaries; a phi

@@ -2617,6 +2617,53 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::CheckBool(operand) => {
+                // Guard a boxed operand is exactly `false` or `true`, producing
+                // the unboxed 0/1 predicate. This is not general ToBoolean:
+                // any non-boolean deopts so the interpreter runs the full
+                // truthiness semantics at the branch bytecode.
+                let oloc = require_loc(alloc, *operand)?;
+                match graph.node(*operand).repr {
+                    Repr::Bool => {
+                        if let Some(loc) = dst {
+                            load_loc(ops, box_scratch, oloc);
+                            store_loc(ops, loc, box_scratch);
+                        }
+                        return Ok(());
+                    }
+                    Repr::Tagged => {}
+                    Repr::Int32 | Repr::Float64 => {
+                        let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>exit);
+                        return Ok(());
+                    }
+                }
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let is_true = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                load_loc(ops, box_scratch, oloc);
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_FALSE);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp X(box_scratch), X(MOVE_SCRATCH)
+                    ; b.ne =>is_true
+                    ; movz W(box_scratch), #0
+                    ; b =>done
+                    ; =>is_true
+                );
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_TRUE);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp X(box_scratch), X(MOVE_SCRATCH)
+                    ; b.ne =>exit
+                    ; movz W(box_scratch), #1
+                    ; =>done
+                );
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::Int32ToFloat64(operand) => {
                 // Widen an already-unboxed int32 (low 32 bits of its GP home) to
                 // f64. No guard: the input's int32-ness was established upstream.
@@ -3854,6 +3901,14 @@ mod arm64 {
             ; b.eq =>bailed
             ; cmp x1, STATUS_RETURNED as u32
             ; b.eq =>returned
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+        );
+        emit_load_u64(ops, 9, u64::from(rc));
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub x13, x13, x9
+            ; str x13, [x12]
             ; b =>threw
             ; =>returned
             ; ldr x12, [x20, REG_TOP_PTR_OFFSET]

@@ -4713,6 +4713,14 @@ pub(crate) mod arm64 {
             ; add sp, sp, JIT_CTX_STACK_SIZE
             ; cmp x1, STATUS_RETURNED as u32
             ; b.eq =>returned
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+        );
+        emit_load_u64(ops, 9, u64::from(rc));
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub x13, x13, x9
+            ; str x13, [x12]
             ; b =>threw
         );
         // Returned: pop the window, store the value into `dst`.

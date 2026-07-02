@@ -173,6 +173,11 @@ pub enum NodeKind {
     Float64Mul(NodeId, NodeId),
     /// `f64 / f64`.
     Float64Div(NodeId, NodeId),
+    /// `f64 % f64` (JavaScript remainder — truncated, sign of the dividend).
+    /// arm64 has no float-remainder instruction, so this lowers to a leaf `fmod`
+    /// libcall; the emitter treats it as a call site (live values keep callee-saved
+    /// homes across it). Result [`Repr::Float64`].
+    Float64Rem(NodeId, NodeId),
     /// `f64 <cmp> f64`. Result [`Repr::Bool`]. IEEE ordered comparison
     /// (a `NaN` operand yields `false` for every relation, matching JS).
     Float64Compare(CmpOp, NodeId, NodeId),
@@ -187,6 +192,33 @@ pub enum NodeKind {
     /// writes the traced cached value into the destination frame slot. Result
     /// [`Repr::Tagged`].
     LoadString,
+    /// Read a free global identifier through the VM global-lexical / global-object
+    /// lookup, throwing a `ReferenceError` when unbound. The helper decodes the
+    /// destination register and name-constant index from the bytecode instruction
+    /// and writes the resolved value into the destination frame slot. The read may
+    /// invoke a global accessor (allocating), so the node is treated as a GC-safe
+    /// call site: live values are materialized into the frame before entry and
+    /// reloaded after. Result [`Repr::Tagged`].
+    LoadGlobalOrThrow,
+    /// Store a property through the full runtime `[[Set]]` path for a site with no
+    /// inline-cacheable shape feedback (a shape-transition add, an accessor, or a
+    /// polymorphic miss). The helper re-decodes the receiver / name / value / IC
+    /// site from the bytecode and owns the transition + write barriers. A call
+    /// site (may allocate to grow the value slab): live values are materialized
+    /// into the frame before entry and reloaded after. Produces no value.
+    StorePropertyGeneric,
+    /// Write `value` to a free global identifier (§9.1.1.4 SetMutableBinding:
+    /// global declarative record first, then the object record). The helper
+    /// re-decodes the value register, name-constant index, and strict flag from
+    /// the bytecode instruction; the stored value is materialized into its frame
+    /// slot beforehand so the runtime reads it there. A const reassignment / TDZ
+    /// / strict-unbound write throws. Treated as a GC-safe call site (the
+    /// object-record fallback may allocate). Produces no value.
+    StoreGlobalBinding {
+        /// The value being stored (kept live so it is materialized into the
+        /// instruction's value frame slot before the runtime read).
+        value: NodeId,
+    },
     /// Nullish identity check against the boxed `null` (and, when `nullish`,
     /// `undefined`) immediate. With `nullish=false` this is strict `value ===
     /// null` (`negate=true` → `!== null`). With `nullish=true` it matches `null`
@@ -263,12 +295,23 @@ pub enum NodeKind {
         recv_reg: u16,
         /// Property atom index.
         name: u32,
-        /// Monomorphic call IC site index.
-        site: u64,
+        /// Monomorphic call IC site index, when bytecode feedback has one.
+        site: Option<u64>,
+        /// VM-baked primitive method-name hint.
+        method_hint: otter_vm::jit::JitMethodHint,
         /// Bytecode argument registers, in call order.
         arg_regs: Vec<u16>,
         /// Argument values.
         args: Vec<NodeId>,
+    },
+    /// String-only `+` site lowered through the VM's rooted concat allocation
+    /// stub. A stub miss deoptimizes so the interpreter owns non-string
+    /// coercion ordering.
+    StringConcat {
+        /// Left operand.
+        lhs: NodeId,
+        /// Right operand.
+        rhs: NodeId,
     },
     /// Guard that `recv.name` still resolves to the monomorphic bytecode method
     /// whose body was inlined at a `CallMethodValue` site. Result is the tagged
@@ -463,6 +506,7 @@ impl NodeKind {
             | NodeKind::Float64Sub(a, b)
             | NodeKind::Float64Mul(a, b)
             | NodeKind::Float64Div(a, b)
+            | NodeKind::Float64Rem(a, b)
             | NodeKind::Float64Compare(_, a, b)
             | NodeKind::StoreSlot(a, _, b)
             | NodeKind::LoadElement(a, b)
@@ -486,6 +530,8 @@ impl NodeKind {
             | NodeKind::LoadUpvalue(_)
             | NodeKind::NewArray
             | NodeKind::LoadString
+            | NodeKind::LoadGlobalOrThrow
+            | NodeKind::StorePropertyGeneric
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
             NodeKind::Call { inputs, .. } => inputs.clone(),
@@ -496,6 +542,8 @@ impl NodeKind {
                 inputs.extend(args.iter().copied());
                 inputs
             }
+            NodeKind::StringConcat { lhs, rhs } => vec![*lhs, *rhs],
+            NodeKind::StoreGlobalBinding { value } => vec![*value],
             NodeKind::CheckFunctionIdentity { callee, .. } => vec![*callee],
             NodeKind::CheckMethodIdentity { recv, .. } => vec![*recv],
             NodeKind::MethodIdentityMatches { recv, .. } => vec![*recv],
@@ -535,6 +583,7 @@ impl NodeKind {
             | NodeKind::Float64Sub(a, b)
             | NodeKind::Float64Mul(a, b)
             | NodeKind::Float64Div(a, b)
+            | NodeKind::Float64Rem(a, b)
             | NodeKind::Float64Compare(_, a, b)
             | NodeKind::StoreSlot(a, _, b)
             | NodeKind::LoadElement(a, b)
@@ -563,6 +612,8 @@ impl NodeKind {
             | NodeKind::LoadUpvalue(_)
             | NodeKind::NewArray
             | NodeKind::LoadString
+            | NodeKind::LoadGlobalOrThrow
+            | NodeKind::StorePropertyGeneric
             | NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
             | NodeKind::ConstF64(_)
@@ -576,6 +627,11 @@ impl NodeKind {
                 fix(recv);
                 args.iter_mut().for_each(fix);
             }
+            NodeKind::StringConcat { lhs, rhs } => {
+                fix(lhs);
+                fix(rhs);
+            }
+            NodeKind::StoreGlobalBinding { value } => fix(value),
             NodeKind::CheckFunctionIdentity { callee, .. } => fix(callee),
             NodeKind::CheckMethodIdentity { recv, .. } => fix(recv),
             NodeKind::MethodIdentityMatches { recv, .. } => fix(recv),
@@ -612,6 +668,7 @@ impl NodeKind {
             | NodeKind::Float64Sub(_, _)
             | NodeKind::Float64Mul(_, _)
             | NodeKind::Float64Div(_, _)
+            | NodeKind::Float64Rem(_, _)
             | NodeKind::Float64Unary(_, _)
             | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
             NodeKind::Int32Compare(_, _, _)
@@ -630,9 +687,13 @@ impl NodeKind {
             | NodeKind::LoadUpvalue(_)
             | NodeKind::NewArray
             | NodeKind::LoadString
+            | NodeKind::LoadGlobalOrThrow
+            | NodeKind::StorePropertyGeneric
             | NodeKind::Call { .. }
             | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }
+            | NodeKind::StringConcat { .. }
+            | NodeKind::StoreGlobalBinding { .. }
             | NodeKind::CheckFunctionIdentity { .. }
             | NodeKind::CheckMethodIdentity { .. }
             | NodeKind::CheckShape(_, _)

@@ -1535,6 +1535,22 @@ impl Interpreter {
         if !number::prototype::is_to_string_builtin(value, &self.gc_heap) {
             return Ok(None);
         }
+        if let Some(recv) = recv_value.as_number() {
+            let radix_is_decimal = match args.first().copied() {
+                None => true,
+                Some(arg) if arg.is_undefined() => true,
+                Some(arg) => arg.as_number().is_some_and(|n| n.as_f64() == 10.0),
+            };
+            let f = recv.as_f64();
+            if radix_is_decimal
+                && f >= 0.0
+                && f < Self::SMALL_INT_STRING_CACHE as f64
+                && f.fract() == 0.0
+                && let Some(s) = self.small_int_string(f as i32)?
+            {
+                return Ok(Some(Value::string(s)));
+            }
+        }
         Ok(number::prototype::fast_primitive_to_string(
             recv_value,
             args,

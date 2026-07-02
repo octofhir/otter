@@ -3807,6 +3807,49 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for a `StoreProperty` site with no inline-cacheable shape
+    /// feedback (a shape-transition add, an accessor, or a polymorphic miss).
+    /// Decodes the receiver register, name-constant index, value register, and IC
+    /// site from the bytecode at `byte_pc`, then runs the full runtime store
+    /// ([`Self::jit_runtime_store_property`], which owns the transition / accessor
+    /// / `[[Set]]` ladder and its write barriers). Lets a constructor body that
+    /// grows objects field by field compile instead of declining. Frame PC is
+    /// saved/restored so a later guard bail re-runs the compiled frame from PC 0.
+    ///
+    /// # Errors
+    /// Propagates a throwing setter / read-only `TypeError` and `InvalidOperand`.
+    pub fn jit_runtime_store_property_at_pc(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
+        if instr.op() != Op::StoreProperty {
+            return Err(VmError::InvalidOperand);
+        }
+        let obj_reg = context
+            .exec_register(instr, 0)
+            .ok_or(VmError::InvalidOperand)?;
+        let name_idx = context
+            .exec_const_index(instr, 1)
+            .ok_or(VmError::InvalidOperand)?;
+        let src = context
+            .exec_register(instr, 2)
+            .ok_or(VmError::InvalidOperand)?;
+        let site = instr.property_ic_site().ok_or(VmError::InvalidOperand)?;
+        let saved_pc = stack[frame_index].pc;
+        let result =
+            self.jit_runtime_store_property(context, stack, frame_index, obj_reg, name_idx, src, site);
+        stack[frame_index].pc = saved_pc;
+        result.map(|_| ())
+    }
+
     /// JIT bridge for `LoadString` from compiled code. The constant cache is
     /// VM-owned and traced, so compiled code asks the VM to materialize the
     /// literal instead of embedding a GC pointer that a moving collection could
@@ -3838,6 +3881,88 @@ impl Interpreter {
         let saved_pc = stack[frame_index].pc;
         let value = self.load_string_constant_value(context, idx)?;
         let result = write_register(&mut stack[frame_index], dst, value);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// JIT bridge for `LoadGlobalOrThrow` from compiled code, decoding the
+    /// destination register and name-constant index from the bytecode instruction
+    /// at `byte_pc` (rather than from register operands, so the optimizing tier
+    /// never has to model the baseline register window). Delegates to the full
+    /// interpreter global read, which resolves a free identifier through the
+    /// global declarative record and then the global object, throwing a
+    /// `ReferenceError` when unbound. Frame PC is saved/restored so a later guard
+    /// bail re-runs the compiled frame from PC 0.
+    ///
+    /// # Errors
+    /// Propagates the `ReferenceError` for an unbound identifier (and any throwing
+    /// global accessor) plus `InvalidOperand`.
+    pub fn jit_runtime_load_global_at_pc(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
+        if instr.op() != Op::LoadGlobalOrThrow {
+            return Err(VmError::InvalidOperand);
+        }
+        let dst = context
+            .exec_register(instr, 0)
+            .ok_or(VmError::InvalidOperand)?;
+        let name_idx = context
+            .exec_const_index(instr, 1)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = stack[frame_index].pc;
+        let frame = &mut stack[frame_index];
+        let result =
+            self.run_load_global_or_throw_reg_for_function(context, frame, fid, dst, name_idx);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
+    /// JIT bridge for `StoreGlobalBinding` from compiled code, decoding the value
+    /// register, name-constant index, and strict flag from the bytecode
+    /// instruction at `byte_pc`. Delegates to the interpreter global write
+    /// ([`Self::run_store_global_binding_reg`]): the §9.1.1.4 SetMutableBinding
+    /// path (global declarative record first, then the object record). Frame PC is
+    /// saved/restored so a later guard bail re-runs the compiled frame from PC 0.
+    ///
+    /// # Errors
+    /// Propagates a const-reassignment / TDZ / strict-unbound `TypeError` /
+    /// `ReferenceError`, plus `InvalidOperand`.
+    pub fn jit_runtime_store_global_at_pc(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_property_stub();
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
+        if instr.op() != Op::StoreGlobalBinding {
+            return Err(VmError::InvalidOperand);
+        }
+        let value_reg = context
+            .exec_register(instr, 0)
+            .ok_or(VmError::InvalidOperand)?;
+        let name_idx = context
+            .exec_const_index(instr, 1)
+            .ok_or(VmError::InvalidOperand)?;
+        let strict = context.exec_imm32(instr, 2).unwrap_or(0) != 0;
+        let saved_pc = stack[frame_index].pc;
+        let frame = &mut stack[frame_index];
+        let result = self.run_store_global_binding_reg(context, frame, value_reg, name_idx, strict);
         stack[frame_index].pc = saved_pc;
         result
     }

@@ -75,6 +75,8 @@ pub struct JitFunctionView {
     /// `StoreElement` for monomorphic `Float64Array` / `Int32Array` receivers
     /// only when [`cage_base`](Self::cage_base) is non-zero (baked).
     pub ta_layout: JitTypedArrayLayout,
+    /// Static heap-layout offsets for inline primitive string `.length`.
+    pub string_layout: JitStringLayout,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
     /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
@@ -181,6 +183,10 @@ pub struct JitFunctionView {
     /// fast path (length bump + element move) under a guard, with the runtime
     /// method bridge as the miss fallback.
     pub array_methods: rustc_hash::FxHashMap<u32, JitArrayMethod>,
+    /// Primitive builtin method guard metadata keyed by the caller's
+    /// `Op::CallMethodValue` byte-PC. Each entry validates the realm prototype
+    /// shape and method slot before a primitive-specific leaf stub runs.
+    pub primitive_method_guards: rustc_hash::FxHashMap<u32, JitPrimitiveMethodGuard>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
     /// `SafepointId`. Baseline v1 uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
@@ -270,6 +276,23 @@ pub struct JitArrayMethod {
     pub builtin_fn_addr: usize,
     /// Which builtin this site resolved to.
     pub kind: JitArrayMethodKind,
+}
+
+/// JIT-readable guard for primitive prototype builtin calls.
+///
+/// Holds only stable compressed offsets, shape handles, and a native entry
+/// address. Generated code still reloads the prototype slot from the heap and
+/// validates the native function identity before using any primitive leaf stub.
+#[derive(Debug, Clone, Copy)]
+pub struct JitPrimitiveMethodGuard {
+    /// Compressed offset of the realm primitive prototype object.
+    pub proto_offset: u32,
+    /// Expected prototype shape handle compressed offset.
+    pub proto_shape: u32,
+    /// Byte offset inside the prototype object's value slab for the method.
+    pub method_value_byte: u32,
+    /// Raw static native builtin function address expected in the method slot.
+    pub builtin_fn_addr: usize,
 }
 
 /// Empty [`JitCollectionMethodIcSlot::state`].
@@ -414,6 +437,11 @@ pub struct JitDirectCallPlan {
 ///
 /// The frame has already been published onto the active [`JitFrameStack`], so
 /// its value slots are visible to precise GC tracing. Emitted code uses this to
+/// Receiver shapes cached per direct-method call site, and the number of flat
+/// inline-link ways the optimizing tier walks. Shared with the VM so the flat
+/// table stride and the emitted walk agree.
+pub const JIT_DIRECT_METHOD_WAYS: usize = 4;
+
 /// construct the callee `JitCtx` and branch to `entry_addr` without the generic
 /// call bridge.
 #[repr(C)]
@@ -493,6 +521,15 @@ pub struct JitTypedArrayLayout {
     pub array_exotic_byte: u32,
 }
 
+/// Ready-to-use byte offsets and tags for inline primitive string fast paths.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct JitStringLayout {
+    /// `GcHeader::type_tag` of a `JsStringBody` (guarded at byte 0).
+    pub string_type_tag: u8,
+    /// Offset to `JsStringBody.len`, the UTF-16 code-unit length.
+    pub string_len_byte: u32,
+}
+
 /// Static GC layout the optimizing tier needs to emit an inline generational
 /// write barrier for a pointer-valued `StoreProperty`. All `#[repr(C)]` /
 /// `const` values, isolate-independent, so baked once from the executable
@@ -543,6 +580,8 @@ pub struct JitInstrView {
     /// `"length"`. The emitter uses it to try the Array exotic length fast
     /// path before falling back to ordinary property semantics.
     pub load_array_length: bool,
+    /// Compact VM-baked identity for common primitive method names.
+    pub method_hint: JitMethodHint,
     /// Resolved `f64` value of a `LoadNumber` instruction, whose operand is a
     /// number-constant-pool index rather than an inline immediate. Baked at
     /// view build so the optimizing tier can materialize the constant as a
@@ -591,6 +630,19 @@ pub struct JitInstrView {
     /// for every other `NewObject` and every non-`NewObject` op. Baked by
     /// `Interpreter::bake_object_literals`.
     pub object_literal: Option<ObjectLiteralPlan>,
+}
+
+/// Common method names the external JIT can specialize without reading VM
+/// constant pools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JitMethodHint {
+    /// No recognized method name.
+    #[default]
+    None,
+    /// `String.prototype.charCodeAt`.
+    StringCharCodeAt,
+    /// `Number.prototype.toString`.
+    NumberToString,
 }
 
 /// Plan for lowering an object literal (`NewObject` + a source-order run of

@@ -39,8 +39,8 @@ use otter_bytecode::{Op, Operand};
 pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
     ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext, SafepointRecord, Value,
-    VmError,
+    JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext, RuntimeStubResult,
+    RuntimeStubResultPair, RuntimeStubStatus, SafepointRecord, Value, VmError,
     runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
 };
 
@@ -209,6 +209,10 @@ pub struct JitCtx {
     collection_method_ics: *const otter_vm::JitCollectionMethodIcSlot,
     /// Number of live collection method IC slots.
     collection_method_ic_count: u32,
+    /// Base of the VM-published flat direct-method inline-link table (indexed by
+    /// IC site). The optimizing tier reads a slot to build the callee window and
+    /// branch to a compiled method with no Rust bridge.
+    direct_method_inline: *const otter_vm::JitDirectMethodInline,
     /// Opaque heap pointer for native leaf runtime stubs.
     gc_heap: *const std::ffi::c_void,
     /// Base of the active compiled function's safepoint records.
@@ -255,6 +259,30 @@ pub(crate) const COLLECTION_METHOD_IC_COUNT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, collection_method_ic_count) as u32;
 pub(crate) const COLLECTION_METHOD_IC_SLOT_SIZE: u32 =
     std::mem::size_of::<otter_vm::JitCollectionMethodIcSlot>() as u32;
+/// Byte offset of [`JitCtx::direct_method_inline`] (the direct-method link table
+/// base) and the flat slot layout the optimizing tier reads.
+pub(crate) const DIRECT_METHOD_INLINE_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_method_inline) as u32;
+pub(crate) const DIRECT_METHOD_INLINE_SLOT_SIZE: u32 =
+    std::mem::size_of::<otter_vm::JitDirectMethodInline>() as u32;
+pub(crate) const DMI_ENTRY_ADDR_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, entry_addr) as u32;
+pub(crate) const DMI_REGISTER_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, register_count) as u32;
+pub(crate) const DMI_RECV_SHAPE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, recv_shape_offset) as u32;
+pub(crate) const DMI_PROTO_SHAPE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, proto_shape_offset) as u32;
+pub(crate) const DMI_METHOD_ON_RECEIVER_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_on_receiver) as u32;
+pub(crate) const DMI_METHOD_VALUE_BYTE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_value_byte) as u32;
+pub(crate) const DMI_METHOD_FID_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_fid) as u32;
+pub(crate) const DMI_SELF_CLOSURE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, self_closure_bits) as u32;
+pub(crate) const DMI_UPVALUES_PTR_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, upvalues_ptr) as u32;
 pub(crate) const COLLECTION_METHOD_IC_STATE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, state) as u32;
 pub(crate) const COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET: u32 =
@@ -1078,6 +1106,24 @@ pub(crate) extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u
     }
 }
 
+/// Bridge stub: run a full `StoreProperty` (transition / accessor / polymorphic)
+/// for a site the optimizing tier could not inline, decoding operands at
+/// `byte_pc`. Returns `0` on success, `1` when the store threw.
+pub(crate) extern "C" fn jit_store_property_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_store_property_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: materialize a string literal for `LoadString` from compiled
 /// code. The VM decodes the constant index at `byte_pc` and serves it from the
 /// traced per-context constant cache.
@@ -1088,6 +1134,63 @@ pub(crate) extern "C" fn jit_load_string_stub(ctx: *mut JitCtx, byte_pc: u64) ->
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
     match vm.jit_runtime_load_string(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Bridge stub: perform a `LoadGlobalOrThrow` from optimizing-tier code. The VM
+/// decodes the destination register and name-constant index from the bytecode at
+/// `byte_pc` and writes the resolved global into the interpreter frame slot,
+/// matching the `LoadString` / `NewArray` bridges (no baseline register-window
+/// assumptions). Returns `0` on success, `1` when the read threw (unbound
+/// identifier / throwing accessor; error parked in `ctx`).
+pub(crate) extern "C" fn jit_load_global_stub_optimizing(
+    ctx: *mut JitCtx,
+    byte_pc: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_load_global_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Leaf math helper for the optimizing tier's `Float64Rem` (`a % b`). arm64 has
+/// no float-remainder instruction; Rust's `f64` remainder is the truncated
+/// remainder with the sign of the dividend — exactly JavaScript `%` (including
+/// the `NaN` / `±Infinity` / zero-divisor edge cases). Allocates nothing and
+/// makes no reentry into the VM, so it needs no `JitCtx`.
+pub(crate) extern "C" fn otter_jit_fmod(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+/// Bridge stub: perform a `StoreGlobalBinding` from optimizing-tier code. The VM
+/// decodes the value register, name-constant index, and strict flag from the
+/// bytecode at `byte_pc`, reads the stored value from the interpreter frame slot
+/// (materialized by the caller), and performs the global write. Returns `0` on
+/// success, `1` when the write threw (const / TDZ / strict-unbound; error parked
+/// in `ctx`).
+pub(crate) extern "C" fn jit_store_global_stub_optimizing(
+    ctx: *mut JitCtx,
+    byte_pc: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_store_global_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1146,6 +1249,98 @@ pub(crate) extern "C" fn jit_call_method_stub_optimizing(
     )
 }
 
+/// Fast primitive `String.prototype.charCodeAt` bridge returning a value pair.
+///
+/// Return status: `Ok` = hit and `value_bits` carries the result, `Throw` =
+/// throw parked in ctx, `Miss` = continue to the generic method bridge.
+pub(crate) extern "C" fn jit_string_char_code_at_leaf_stub(
+    ctx: *mut JitCtx,
+    recv_bits: u64,
+    arg_bits: u64,
+) -> RuntimeStubResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let recv = Value::from_bits(recv_bits);
+    let arg = Value::from_bits(arg_bits);
+    match vm.jit_runtime_try_string_char_code_at_value(recv, arg) {
+        Ok(Some(value)) => {
+            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
+        }
+        Ok(None) => RuntimeStubResultPair::from_result(RuntimeStubResult::miss()),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            RuntimeStubResultPair::from_result(RuntimeStubResult {
+                status: RuntimeStubStatus::Throw,
+                value_bits: 0,
+                payload: 0,
+            })
+        }
+    }
+}
+
+/// Primitive `String.prototype.charCodeAt` bridge used after generated code
+/// has already validated the prototype builtin identity.
+pub(crate) extern "C" fn jit_string_char_code_at_guarded_leaf_stub(
+    ctx: *mut JitCtx,
+    recv_bits: u64,
+    arg_bits: u64,
+) -> RuntimeStubResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let recv = Value::from_bits(recv_bits);
+    let arg = Value::from_bits(arg_bits);
+    match vm.jit_runtime_string_char_code_at_value_guarded(recv, arg) {
+        Ok(Some(value)) => {
+            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
+        }
+        Ok(None) => RuntimeStubResultPair::from_result(RuntimeStubResult::miss()),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            RuntimeStubResultPair::from_result(RuntimeStubResult {
+                status: RuntimeStubStatus::Throw,
+                value_bits: 0,
+                payload: 0,
+            })
+        }
+    }
+}
+
+/// Fast primitive `Number.prototype.toString` bridge for optimizing code.
+///
+/// Return status: `0` = hit and `dst` written, `1` = throw parked in ctx,
+/// `2` = miss, continue to the generic method bridge.
+pub(crate) extern "C" fn jit_number_to_string_fast_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    recv_bits: u64,
+    arg_bits: u64,
+    has_arg: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let recv = Value::from_bits(recv_bits);
+    let arg = Value::from_bits(arg_bits);
+    match vm.jit_runtime_try_number_to_string(
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        recv,
+        arg,
+        has_arg != 0,
+    ) {
+        Ok(true) => 0,
+        Ok(false) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn jit_call_method_stub_impl(
     ctx: *mut JitCtx,
@@ -1163,7 +1358,8 @@ fn jit_call_method_stub_impl(
     let context = unsafe { &*ctx.context };
     let call_byte_pc = ctx.bail_pc;
     let name_idx = (name_and_site & 0xffff_ffff) as u32;
-    let site = (name_and_site >> 32) as usize;
+    let raw_site = (name_and_site >> 32) as u32;
+    let site = (raw_site != otter_vm::JIT_METHOD_CALL_NO_SITE).then_some(raw_site as usize);
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_runtime_call_method(
@@ -1413,6 +1609,7 @@ pub(crate) unsafe fn enter_compiled(
             unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
         let collection_method_ics = unsafe { (*vm).jit_collection_method_ics_ptr() };
         let collection_method_ic_count = unsafe { (*vm).jit_collection_method_ics_len() };
+        let direct_method_inline = unsafe { (*vm).jit_direct_method_inline_ptr() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let mut error = None;
         let mut ctx = JitCtx {
@@ -1439,6 +1636,7 @@ pub(crate) unsafe fn enter_compiled(
             array_index_accessor_protector_ptr,
             collection_method_ics,
             collection_method_ic_count,
+            direct_method_inline,
             gc_heap,
             safepoint_records,
             safepoint_count,
@@ -1470,6 +1668,10 @@ fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
 fn refresh_jit_collection_method_ics(ctx: &mut JitCtx, vm: &Interpreter) {
     ctx.collection_method_ics = vm.jit_collection_method_ics_ptr();
     ctx.collection_method_ic_count = vm.jit_collection_method_ics_len();
+    // The direct-method inline table can reallocate too; refresh its base with the
+    // collection ICs at every reentry so a bridge that grew it leaves the compiled
+    // caller a valid pointer.
+    ctx.direct_method_inline = vm.jit_direct_method_inline_ptr();
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1488,7 +1690,8 @@ pub(crate) mod arm64 {
         COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET,
         COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
         COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
-        DIRECT_FRAME_INDEX_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SAFEPOINT_COUNT_OFFSET,
+        DIRECT_FRAME_INDEX_OFFSET, DIRECT_METHOD_INLINE_OFFSET, DIRECT_REGS_OFFSET,
+        DIRECT_SAFEPOINT_COUNT_OFFSET,
         DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
         DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
         FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG,
@@ -4910,6 +5113,10 @@ pub(crate) mod arm64 {
             ; str x9, [sp, COLLECTION_METHOD_ICS_OFFSET]
             ; ldr w9, [x20, COLLECTION_METHOD_IC_COUNT_OFFSET]
             ; str w9, [sp, COLLECTION_METHOD_IC_COUNT_OFFSET]
+            // Propagate the direct-method inline-link table base so a direct
+            // callee can itself take the bridge-free method-call fast path.
+            ; ldr x9, [x20, DIRECT_METHOD_INLINE_OFFSET]
+            ; str x9, [sp, DIRECT_METHOD_INLINE_OFFSET]
             ; ldr x9, [x20, GC_HEAP_OFFSET]
             ; str x9, [sp, GC_HEAP_OFFSET]
             ; ldr x9, [x20, DIRECT_SAFEPOINT_RECORDS_OFFSET]
@@ -5166,11 +5373,16 @@ pub(crate) mod arm64 {
             ; b.ne =>miss
             ; ldr x15, [x15, object_values_ptr_byte]
             ; cbz x15, =>miss
-            ; ldr x9, [x15, method_value_byte]
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
-            ; tst x9, x11
+            // The value slab holds 4-byte compressed slots, so the method value is
+            // a 32-bit load (the byte offset is `slot * 4` and need not be
+            // 8-aligned). The method is expected to be a cell (a native function
+            // object): its low-3 tag is `000` and its zero-extended offset is the
+            // bare cage offset. Any non-cell (smi / immediate / function id / boxed
+            // number) or the empty slot misses to the runtime method bridge.
+            ; ldr w9, [x15, method_value_byte]
+            ; ands w11, w9, #0x7
             ; b.ne =>miss
+            ; cbz w9, =>miss
             ; mov w12, w9
         );
         emit_load_u64(ops, 13, cage_base);
@@ -5542,11 +5754,16 @@ pub(crate) mod arm64 {
             ; b.ne =>miss
             ; ldr x15, [x15, object_values_ptr_byte]
             ; cbz x15, =>miss
-            ; ldr x9, [x15, method_value_byte]
-            ; movz x11, NUMBER_TAG_HI16, lsl #48
-            ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
-            ; tst x9, x11
+            // The value slab holds 4-byte compressed slots, so the method value is
+            // a 32-bit load (the byte offset is `slot * 4` and need not be
+            // 8-aligned). The method is expected to be a cell (a native function
+            // object): its low-3 tag is `000` and its zero-extended offset is the
+            // bare cage offset. Any non-cell (smi / immediate / function id / boxed
+            // number) or the empty slot misses to the runtime method bridge.
+            ; ldr w9, [x15, method_value_byte]
+            ; ands w11, w9, #0x7
             ; b.ne =>miss
+            ; cbz w9, =>miss
             ; mov w12, w9
         );
         emit_load_u64(ops, 13, view.cage_base as u64);
@@ -6682,6 +6899,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                method_hint: otter_vm::jit::JitMethodHint::None,
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
@@ -6701,6 +6919,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
+            string_layout: otter_vm::JitStringLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
             object_inline_values_byte: 80,
@@ -6721,6 +6940,7 @@ mod tests {
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),
+            primitive_method_guards: Default::default(),
             safepoints: Default::default(),
         }
     }
@@ -6781,6 +7001,7 @@ mod tests {
             array_index_accessor_protector_ptr: &array_index_accessor_protector,
             collection_method_ics: std::ptr::null(),
             collection_method_ic_count: 0,
+            direct_method_inline: std::ptr::null(),
             gc_heap: std::ptr::null(),
             safepoint_records: std::ptr::null(),
             safepoint_count: 0,

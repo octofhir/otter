@@ -122,6 +122,21 @@ pub fn compile(
     // OSR entries reuse the same register→value environment reconstruction as the
     // deopt frame states, captured at each loop header instead of each guard.
     let osr_entries = deopt::capture_osr_entries(&graph, &bcl);
+    // Soundness gate for a bail out of an OSR-narrowed region. A
+    // `Terminator::Deopt` (an unsupported opcode in the straight-line tail after a
+    // hot loop) resumes the interpreter at that byte-PC. The interpreter then runs
+    // forward reading register values that instructions *between* the OSR entry and
+    // the bail were supposed to have produced — but the emitted region only writes
+    // the interpreter frame at the bail itself, from the captured live set, and
+    // that set cannot include a value whose producer the OSR narrowing left out.
+    // Emitting the bail anyway leaves those slots stale (observed as a resumed
+    // interpreter reading a garbage / `null` operand). Until the region tracks
+    // every such value, decline the whole compile to the baseline — which still
+    // JITs the loop through its own tier — rather than emit an unsound bail. No
+    // benchmark exercises this path, so the coverage cost is nil today.
+    if !block_deopts.is_empty() {
+        return Err(Unsupported::Unlowered("osr region bails to interpreter tail"));
+    }
     let code = emit::emit(
         view,
         &graph,

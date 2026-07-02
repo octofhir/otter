@@ -267,6 +267,16 @@ impl ExecutionContext {
             {
                 instr.load_array_length = true;
             }
+            if instr.op == otter_bytecode::Op::CallMethodValue
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(2)
+                && let Some(name) = self.string_constant_str_for_function(function_id, idx)
+            {
+                instr.method_hint = match name {
+                    "charCodeAt" => crate::jit::JitMethodHint::StringCharCodeAt,
+                    "toString" => crate::jit::JitMethodHint::NumberToString,
+                    _ => crate::jit::JitMethodHint::None,
+                };
+            }
             if instr.op == otter_bytecode::Op::LoadNumber
                 && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
                 && let Some(bits) = self.number_constant_bits(idx)
@@ -627,6 +637,52 @@ mod tests {
 
         assert!(view.instructions[0].load_array_length);
         assert!(!view.instructions[1].load_array_length);
+    }
+
+    #[test]
+    fn jit_view_marks_primitive_method_hints() {
+        let context = ExecutionContext::from_module(module_with(
+            vec![
+                instr(
+                    0,
+                    Op::CallMethodValue,
+                    [
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::ConstIndex(0),
+                        Operand::ConstIndex(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                instr(
+                    1,
+                    Op::CallMethodValue,
+                    [
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::ConstIndex(2),
+                        Operand::ConstIndex(0),
+                    ],
+                ),
+            ],
+            vec![
+                string_constant("charCodeAt"),
+                string_constant("unused"),
+                string_constant("value"),
+            ],
+            4,
+        ));
+
+        let view = context.jit_function_view(0).expect("function exists");
+
+        assert_eq!(
+            view.instructions[0].method_hint,
+            crate::jit::JitMethodHint::StringCharCodeAt
+        );
+        assert_eq!(
+            view.instructions[1].method_hint,
+            crate::jit::JitMethodHint::None
+        );
     }
 
     #[test]

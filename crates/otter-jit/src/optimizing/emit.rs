@@ -64,6 +64,7 @@ use super::liveness::Liveness;
 use super::regalloc::{Allocation, EdgeMoves, Location};
 use crate::CompiledCode;
 use otter_bytecode::Op;
+use otter_vm::jit_feedback::ARITH_STRING;
 use otter_vm::{JitFunctionView, NO_FRAME_STATE, SafepointId, SafepointRecord};
 
 /// Caller-saved (volatile) GP registers in the allocator pool: abstract
@@ -201,10 +202,11 @@ fn optimizing_safepoint_records(view: &JitFunctionView) -> Box<[SafepointRecord]
         .map_or(1, |id| id.saturating_add(1))
         .max(1);
     for instr in &view.instructions {
-        if !matches!(
+        let needs_safepoint = matches!(
             instr.op,
             Op::CallMethodValue | Op::NewArray | Op::LoadString
-        ) {
+        ) || (instr.op == Op::Add && instr.arith_feedback == ARITH_STRING);
+        if !needs_safepoint {
             continue;
         }
         if instr.op == Op::CallMethodValue
@@ -254,6 +256,39 @@ fn optimizing_call_method_safepoint_id(
     None
 }
 
+fn optimizing_string_concat_safepoint_id(
+    view: &JitFunctionView,
+    byte_pc: u32,
+) -> Option<SafepointId> {
+    let mut next_safepoint = view
+        .safepoints
+        .values()
+        .map(|record| record.id)
+        .max()
+        .map_or(1, |id| id.saturating_add(1))
+        .max(1);
+    for instr in &view.instructions {
+        let needs_safepoint = matches!(
+            instr.op,
+            Op::CallMethodValue | Op::NewArray | Op::LoadString
+        ) || (instr.op == Op::Add && instr.arith_feedback == ARITH_STRING);
+        if !needs_safepoint {
+            continue;
+        }
+        if instr.op == Op::CallMethodValue
+            && view.collection_alloc_methods.contains_key(&instr.byte_pc)
+        {
+            continue;
+        }
+        let safepoint = next_safepoint;
+        next_safepoint = next_safepoint.saturating_add(1);
+        if instr.op == Op::Add && instr.byte_pc == byte_pc {
+            return Some(safepoint);
+        }
+    }
+    None
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(super) use arm64::emit;
 
@@ -293,22 +328,33 @@ mod arm64 {
         COLLECTION_METHOD_IC_PROTO_OFFSET, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET,
         COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET, COLLECTION_METHOD_IC_SLOT_SIZE,
         COLLECTION_METHOD_IC_STATE_OFFSET, COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET,
-        DOUBLE_OFFSET_HI16, FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET,
+        DIRECT_METHOD_INLINE_OFFSET, DIRECT_METHOD_INLINE_SLOT_SIZE, DMI_ENTRY_ADDR_OFFSET,
+        DMI_METHOD_FID_OFFSET, DMI_METHOD_ON_RECEIVER_OFFSET, DMI_METHOD_VALUE_BYTE_OFFSET,
+        DMI_PROTO_SHAPE_OFFSET, DMI_RECV_SHAPE_OFFSET, DMI_REGISTER_COUNT_OFFSET,
+        DMI_SELF_CLOSURE_OFFSET, DMI_UPVALUES_PTR_OFFSET, DOUBLE_OFFSET_HI16, FRAME_INDEX_OFFSET,
+        FUNCTION_ID_TAG, GC_HEAP_OFFSET,
         JS_CLOSURE_BODY_TYPE_TAG, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET,
         REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE,
         UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
         VALUE_UNDEFINED, VM_OFFSET, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
         jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
-        jit_call_method_stub_optimizing, jit_load_string_stub, jit_new_array_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
-        value_tag,
+        jit_call_method_stub_optimizing, jit_load_global_stub_optimizing, jit_load_string_stub,
+        jit_new_array_stub,
+        jit_number_to_string_fast_stub, jit_prepare_direct_call_stub, otter_jit_fmod,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_global_stub_optimizing,
+        jit_store_property_stub_optimizing,
+        jit_string_char_code_at_guarded_leaf_stub, jit_string_char_code_at_leaf_stub, value_tag,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{
-        Interpreter, JitFunctionView, STUB_COLLECTION_SET_ADD_ALLOC, SafepointId,
+        Interpreter, JitFunctionView, STUB_COLLECTION_SET_ADD_ALLOC, STUB_STRING_CONCAT_ALLOC,
+        SafepointId,
         jit::{JIT_COLLECTION_METHOD_IC_COLLECTION, JIT_COLLECTION_METHOD_IC_NO_STUB},
-        runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
+        runtime_stubs::{
+            alloc_value_stub_by_id, alloc_value_stub_trampoline_pair,
+            leaf_no_alloc_stub2_trampoline_pair,
+        },
     };
     use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -924,9 +970,13 @@ mod arm64 {
             if input_repr == Repr::Tagged {
                 continue; // already boxed.
             }
-            // A typed phi input that is itself dead (no home) cannot have been
-            // moved in; the phi would then have no value — abort to the baseline.
-            let phi_home = require_loc(alloc, phi)?;
+            // A dead phi (no allocation home, because it has no use anywhere) is
+            // never read, so its typed input needs no boxing. The parallel-move
+            // resolver likewise skips it; leaving it here would spuriously demand a
+            // home and abort the compile.
+            let Some(&phi_home) = alloc.location.get(&phi) else {
+                continue;
+            };
             let input_home = require_loc(alloc, input)?;
             if input_repr == Repr::Float64 {
                 // The FP-resident input had no GP parallel move; read its FP home,
@@ -1016,9 +1066,10 @@ mod arm64 {
         );
     }
 
-    /// Lower speculative Array `.length` to an int32 result, deoptimizing on
-    /// non-Array receiver or lengths outside the int32 fast path.
-    fn emit_array_length_load(
+    /// Lower speculative `.length` for Arrays and primitive Strings to an int32
+    /// result, deoptimizing on other receivers or lengths outside the int32
+    /// fast path.
+    fn emit_length_load(
         ops: &mut Assembler,
         view: &JitFunctionView,
         recv_loc: Location,
@@ -1027,12 +1078,22 @@ mod arm64 {
     ) {
         emit_recv_body(ops, view, recv_loc, exit);
         let array_tag = u32::from(view.ta_layout.array_type_tag);
-        let length_byte = view.ta_layout.array_length_byte;
+        let array_length_byte = view.ta_layout.array_length_byte;
+        let string_tag = u32::from(view.string_layout.string_type_tag);
+        let string_len_byte = view.string_layout.string_len_byte;
+        let load_string = ops.new_dynamic_label();
+        let loaded = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
             ; cmp w2, array_tag
+            ; b.ne =>load_string
+            ; ldr x3, [x0, array_length_byte]
+            ; b =>loaded
+            ; =>load_string
+            ; cmp w2, string_tag
             ; b.ne =>exit
-            ; ldr x3, [x0, length_byte]
+            ; ldr w3, [x0, string_len_byte]
+            ; =>loaded
         );
         emit_load_u64(ops, 4, i32::MAX as u64);
         dynasm!(ops
@@ -1356,6 +1417,20 @@ mod arm64 {
     ) -> Result<(), Unsupported> {
         emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |_, value| {
             graph.node(value).repr == Repr::Tagged
+        })
+    }
+
+    fn emit_frame_materialize_method_fast(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        point: &DeoptPoint,
+        recv_reg: u16,
+        arg_regs: &[u16],
+        box_scratch: u32,
+    ) -> Result<(), Unsupported> {
+        emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |reg, value| {
+            graph.node(value).repr == Repr::Tagged || reg == recv_reg || arg_regs.contains(&reg)
         })
     }
 
@@ -2379,6 +2454,60 @@ mod arm64 {
         );
     }
 
+    fn emit_primitive_method_guard(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        guard: &otter_vm::JitPrimitiveMethodGuard,
+        exit: DynamicLabel,
+    ) {
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let native_static_fn_byte = view.native_static_fn_byte;
+        let native_function_type_tag = u32::from(view.collection_layout.native_function_type_tag);
+        let method_value_byte = guard.method_value_byte;
+
+        emit_load_u64(ops, 1, view.cage_base as u64);
+        emit_load_u64(ops, 4, u64::from(guard.proto_offset));
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x4, x1, x4                  // x4 = primitive prototype body ptr
+            ; ldrb w5, [x4]
+            ; cmp w5, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>exit
+            ; ldr w5, [x4, object_shape_byte]
+        );
+        emit_load_u64(ops, 6, u64::from(guard.proto_shape));
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp w5, w6
+            ; b.ne =>exit
+            ; ldr x4, [x4, object_values_ptr_byte]
+            ; cbz x4, =>exit
+            ; ldr w17, [x4, method_value_byte]   // 4-byte compressed slot
+        );
+        emit_decompress_slot(ops, view, exit);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x5, x17
+            ; movz x7, NUMBER_TAG_HI16, lsl #48
+            ; orr x7, x7, #value_tag::OTHER_TAG  // NOT_CELL_MASK
+            ; tst x5, x7
+            ; b.ne =>exit
+            ; mov w6, w5
+            ; add x6, x1, x6                  // x6 = method fn body ptr
+            ; ldrb w7, [x6]
+            ; cmp w7, native_function_type_tag
+            ; b.ne =>exit
+            ; ldr x7, [x6, native_static_fn_byte]
+        );
+        emit_load_u64(ops, 5, guard.builtin_fn_addr as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x7, x5
+            ; b.ne =>exit
+        );
+    }
+
     /// Lower one SSA body node. A node's result goes to its home; a node with no
     /// home is dead and emits only the guards that can deopt.
     #[allow(clippy::too_many_arguments)]
@@ -2747,6 +2876,28 @@ mod arm64 {
                     _ => unreachable!(),
                 }
                 store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                Ok(())
+            }
+            NodeKind::Float64Rem(a, b) => {
+                // JS `a % b` — no arm64 float-remainder instruction, so call the
+                // leaf `fmod` helper (AAPCS64: args `d0`/`d1`, result `d0`). The
+                // node is a regalloc call site, so every other live value already
+                // holds a callee-saved home the call preserves. The operands are
+                // staged through the reserved FP scratch (`d6`/`d7`) first so a
+                // home that happens to be `d0`/`d1` cannot be clobbered mid-setup.
+                let Some(loc) = dst else { return Ok(()) };
+                let aloc = require_loc(alloc, *a)?;
+                let bloc = require_loc(alloc, *b)?;
+                load_fp_loc(ops, FP_LOAD_SCRATCH, aloc);
+                load_fp_loc(ops, FP_ARITH_SCRATCH, bloc);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; fmov d0, D(FP_LOAD_SCRATCH)
+                    ; fmov d1, D(FP_ARITH_SCRATCH)
+                );
+                emit_load_u64(ops, 16, otter_jit_fmod as *const () as u64);
+                dynasm!(ops ; .arch aarch64 ; blr x16);
+                store_fp_loc(ops, loc, 0);
                 Ok(())
             }
             NodeKind::Float64Unary(uop, a) => {
@@ -3211,7 +3362,7 @@ mod arm64 {
             NodeKind::LoadArrayLength(obj) => {
                 let oloc = require_loc(alloc, *obj)?;
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
-                emit_array_length_load(ops, view, oloc, dst, exit);
+                emit_length_load(ops, view, oloc, dst, exit);
                 Ok(())
             }
             NodeKind::LoadElement(recv, idx) => {
@@ -3327,6 +3478,75 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::StringConcat { lhs, rhs } => {
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "string concat without safepoint state",
+                ))?;
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("string concat without frame dst"))?;
+                let lhs_loc = require_loc(alloc, *lhs)?;
+                let rhs_loc = require_loc(alloc, *rhs)?;
+                let lhs_repr = graph.node(*lhs).kind.repr();
+                let rhs_repr = graph.node(*rhs).kind.repr();
+                let safepoint = super::optimizing_string_concat_safepoint_id(view, node.byte_pc)
+                    .ok_or(Unsupported::Unlowered("string concat without safepoint id"))?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let Some(stub_addr) = alloc_value_stub_by_id(STUB_STRING_CONCAT_ALLOC.id)
+                    .and_then(|stub| stub.entry_addr())
+                else {
+                    return Err(Unsupported::Unlowered("string concat stub unavailable"));
+                };
+                emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; sub sp, sp, ALLOC_CTX_STACK_SIZE
+                    ; ldr x9, [x20, VM_OFFSET]
+                    ; str x9, [sp, ALLOC_CTX_VM_OFFSET]
+                    ; ldr x9, [x20, STACK_OFFSET]
+                    ; str x9, [sp, ALLOC_CTX_STACK_OFFSET]
+                    ; ldr x9, [x20, CONTEXT_OFFSET]
+                    ; str x9, [sp, ALLOC_CTX_CONTEXT_OFFSET]
+                    ; ldr x9, [x20, SAFEPOINT_RECORDS_OFFSET]
+                    ; str x9, [sp, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET]
+                    ; ldr w9, [x20, SAFEPOINT_COUNT_OFFSET]
+                    ; str w9, [sp, ALLOC_CTX_SAFEPOINT_COUNT_OFFSET]
+                    ; str wzr, [sp, ALLOC_CTX_RESERVED0_OFFSET]
+                    ; ldr x9, [x20, FRAME_INDEX_OFFSET]
+                    ; str x9, [sp, ALLOC_CTX_FRAME_INDEX_OFFSET]
+                    ; str x19, [sp, ALLOC_CTX_FRAME_SLOTS_OFFSET]
+                    ; movz w9, view.register_count as u32
+                    ; strh w9, [sp, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET]
+                    ; movz w9, #0
+                    ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
+                    ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+                    ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+                    ; mov x0, sp
+                );
+                emit_load_u64(ops, 1, u64::from(safepoint));
+                box_into_gp(ops, 2, lhs_repr, lhs_loc, box_scratch);
+                box_into_gp(ops, 3, rhs_repr, rhs_loc, box_scratch);
+                emit_load_u64(ops, 4, VALUE_UNDEFINED);
+                emit_load_u64(ops, 16, stub_addr as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; and x1, x1, #0xff
+                    ; mov x5, x1
+                    ; add sp, sp, ALLOC_CTX_STACK_SIZE
+                    ; cbnz x5, =>exit
+                );
+                let dst_off = u32::from(dst_reg) * 8;
+                dynasm!(ops ; .arch aarch64 ; str x0, [x19, dst_off]);
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                {
+                    store_loc(ops, loc, 0);
+                }
+                emit_frame_reload_tagged(ops, graph, alloc, resume, Some(dst_reg), box_scratch)?;
+                Ok(())
+            }
             NodeKind::NewArray => {
                 let point = frames
                     .get(&nid)
@@ -3334,6 +3554,9 @@ mod arm64 {
                 let dst_reg = node
                     .frame_dst
                     .ok_or(Unsupported::Unlowered("new array without frame dst"))?;
+                // Full materialize: the bridge re-reads the element source registers
+                // from the frame slots, so unboxed int32 / f64 elements must be
+                // boxed into their slots, not just the tagged (GC-root) subset.
                 emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                 emit_load_u64(ops, 1, u64::from(node.byte_pc));
@@ -3383,6 +3606,78 @@ mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
                     store_loc(ops, loc, box_scratch);
                 }
+                Ok(())
+            }
+            NodeKind::LoadGlobalOrThrow => {
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "load global without safepoint state",
+                ))?;
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("load global without frame dst"))?;
+                emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                emit_load_u64(ops, 1, u64::from(node.byte_pc));
+                emit_load_u64(ops, 16, jit_load_global_stub_optimizing as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
+            NodeKind::StorePropertyGeneric => {
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "store property without safepoint state",
+                ))?;
+                // Full materialize: the bridge re-reads the receiver and value
+                // registers from the frame slots, so a value stored from an unboxed
+                // int32 / f64 home must be boxed into its slot, not just the tagged
+                // (GC-root) subset. No result register.
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                emit_load_u64(ops, 1, u64::from(node.byte_pc));
+                emit_load_u64(ops, 16, jit_store_property_stub_optimizing as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
+                Ok(())
+            }
+            NodeKind::StoreGlobalBinding { value: _ } => {
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "store global without safepoint state",
+                ))?;
+                // Full materialize: the runtime helper reads the stored value from
+                // its frame slot, so an int32 / f64 value must be boxed into the
+                // slot, not just the tagged (GC-root) subset a safepoint needs.
+                emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                emit_load_u64(ops, 1, u64::from(node.byte_pc));
+                emit_load_u64(ops, 16, jit_store_global_stub_optimizing as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 Ok(())
             }
             NodeKind::StoreSlot(obj, value_byte, value) => {
@@ -3801,19 +4096,24 @@ mod arm64 {
                 Ok(())
             }
             NodeKind::CallMethod {
+                recv,
                 recv_reg,
                 name,
                 site,
+                method_hint,
                 arg_regs,
-                ..
+                args,
             } => {
                 let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
                     "method call without safepoint state",
                 ))?;
+                let full_path = ops.new_dynamic_label();
                 let fallback = ops.new_dynamic_label();
                 let after_live_leaf = ops.new_dynamic_label();
                 let after_live_alloc = ops.new_dynamic_label();
+                let fast_done = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
+                let after = ops.new_dynamic_label();
                 let dst_reg = node
                     .frame_dst
                     .ok_or(Unsupported::Unlowered("method call without frame dst"))?;
@@ -3821,84 +4121,187 @@ mod arm64 {
                     return Err(Unsupported::OperandShape("method call arg count"));
                 }
 
-                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
-                emit_opt_live_collection_leaf_method_guarded_call(
-                    ops,
-                    view,
-                    dst_reg,
-                    *recv_reg,
-                    *site,
-                    arg_regs,
-                    after_live_leaf,
-                    done,
-                )?;
-                dynasm!(ops ; .arch aarch64 ; =>after_live_leaf);
-                if let Some(safepoint) =
-                    super::optimizing_call_method_safepoint_id(view, node.byte_pc)
+                // The argument register indices, packed one per 16-bit lane, are
+                // handed to every method-call stub in a single register.
+                let packed_args = crate::baseline::pack_method_arg_regs(arg_regs);
+                if *method_hint == otter_vm::jit::JitMethodHint::StringCharCodeAt
+                    && arg_regs.len() == 1
                 {
-                    emit_opt_live_collection_alloc_method_guarded_call(
+                    let primitive_guard = view.primitive_method_guards.get(&node.byte_pc);
+                    if let Some(guard) = primitive_guard
+                        && view.cage_base != 0
+                    {
+                        emit_primitive_method_guard(ops, view, guard, full_path);
+                    }
+                    let recv_loc = require_loc(alloc, *recv)?;
+                    let arg = args
+                        .first()
+                        .copied()
+                        .ok_or(Unsupported::OperandShape("method call arg count"))?;
+                    let arg_loc = require_loc(alloc, arg)?;
+                    let recv_repr = graph.node(*recv).kind.repr();
+                    let arg_repr = graph.node(arg).kind.repr();
+                    dynasm!(
+                        ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                    );
+                    box_into_gp(ops, 1, recv_repr, recv_loc, box_scratch);
+                    box_into_gp(ops, 2, arg_repr, arg_loc, box_scratch);
+                    emit_load_u64(
+                        ops,
+                        16,
+                        if primitive_guard.is_some() && view.cage_base != 0 {
+                            jit_string_char_code_at_guarded_leaf_stub as *const () as u64
+                        } else {
+                            jit_string_char_code_at_leaf_stub as *const () as u64
+                        },
+                    );
+                    dynasm!(
+                        ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; and x1, x1, #0xff
+                        ; cbz x1, >leaf_hit
+                        ; cmp x1, #2
+                        ; b.eq =>threw
+                        ; b =>full_path
+                        ; leaf_hit:
+                    );
+                    if value_is_used_after(graph, call_resume_frames, nid)
+                        && let Some(loc) = dst
+                    {
+                        store_loc(ops, loc, 0);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; b =>after);
+                }
+                if *method_hint == otter_vm::jit::JitMethodHint::NumberToString
+                    && arg_regs.len() <= 1
+                {
+                    emit_frame_materialize_method_fast(
+                        ops,
+                        graph,
+                        alloc,
+                        point,
+                        *recv_reg,
+                        arg_regs,
+                        box_scratch,
+                    )?;
+                    let recv_off = u32::from(*recv_reg) * 8;
+                    let has_arg = !arg_regs.is_empty();
+                    dynasm!(
+                        ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst_reg as u32
+                        ; ldr x2, [x19, recv_off]
+                    );
+                    if let Some(&arg_reg) = arg_regs.first() {
+                        let arg_off = u32::from(arg_reg) * 8;
+                        dynasm!(ops ; .arch aarch64 ; ldr x3, [x19, arg_off]);
+                    } else {
+                        emit_load_u64(ops, 3, VALUE_UNDEFINED);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; movz x4, has_arg as u32);
+                    emit_load_u64(ops, 16, jit_number_to_string_fast_stub as *const () as u64);
+                    dynasm!(
+                        ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>full_path
+                        ; b =>fast_done
+                    );
+                }
+                dynasm!(ops ; .arch aarch64 ; =>full_path);
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                if let Some(site) = *site {
+                    // Bridge-free direct compiled method call: on a receiver-shape +
+                    // method-identity hit, build the callee window and branch to its
+                    // compiled entry inline. A miss (empty link, mismatch, overflow)
+                    // falls to the collection / prepare / generic path below.
+                    let inline_miss = ops.new_dynamic_label();
+                    emit_direct_method_call_inline(
+                        ops, view, dst_reg, *recv_reg, arg_regs, site, inline_miss, threw, done,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; =>inline_miss);
+                    emit_opt_live_collection_leaf_method_guarded_call(
                         ops,
                         view,
                         dst_reg,
                         *recv_reg,
-                        *site,
+                        site,
                         arg_regs,
-                        safepoint,
-                        after_live_alloc,
+                        after_live_leaf,
                         done,
                     )?;
-                    dynasm!(ops ; .arch aarch64 ; =>after_live_alloc);
-                }
-                // The argument register indices, packed one per 16-bit lane, are
-                // handed to every method-call stub in a single register.
-                let packed_args = crate::baseline::pack_method_arg_regs(arg_regs);
-                dynasm!(
-                    ops
-                    ; .arch aarch64
-                    ; mov x0, x20
-                    ; movz x1, dst_reg as u32
-                    ; movz x2, *recv_reg as u32
-                );
-                emit_load_u64(ops, 3, *site);
-                dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
-                emit_load_u64(ops, 5, packed_args);
-                emit_load_u64(
-                    ops,
-                    16,
-                    jit_call_collection_method_ic_stub as *const () as u64,
-                );
-                dynasm!(
-                    ops
-                    ; .arch aarch64
-                    ; blr x16
-                    ; cmp x0, #1
-                    ; b.eq =>threw
-                    ; cbz x0, =>done
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; mov x0, x20
-                    ; movz x1, *recv_reg as u32
-                );
-                emit_load_u64(ops, 2, u64::from(*name));
-                emit_load_u64(ops, 3, *site);
-                dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
-                emit_load_u64(ops, 5, packed_args);
-                emit_load_u64(
-                    ops,
-                    16,
-                    jit_prepare_direct_method_call_stub as *const () as u64,
-                );
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; blr x16
-                    ; cmp x0, #1
-                    ; b.eq =>threw
-                    ; cmp x0, #2
-                    ; b.eq =>fallback
-                );
+                    dynasm!(ops ; .arch aarch64 ; =>after_live_leaf);
+                    if let Some(safepoint) =
+                        super::optimizing_call_method_safepoint_id(view, node.byte_pc)
+                    {
+                        emit_opt_live_collection_alloc_method_guarded_call(
+                            ops,
+                            view,
+                            dst_reg,
+                            *recv_reg,
+                            site,
+                            arg_regs,
+                            safepoint,
+                            after_live_alloc,
+                            done,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; =>after_live_alloc);
+                    }
+                    dynasm!(
+                        ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst_reg as u32
+                        ; movz x2, *recv_reg as u32
+                    );
+                    emit_load_u64(ops, 3, site);
+                    dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
+                    emit_load_u64(ops, 5, packed_args);
+                    emit_load_u64(
+                        ops,
+                        16,
+                        jit_call_collection_method_ic_stub as *const () as u64,
+                    );
+                    dynasm!(
+                        ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cbz x0, =>done
+                    );
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, *recv_reg as u32
+                    );
+                    emit_load_u64(ops, 2, u64::from(*name));
+                    emit_load_u64(ops, 3, site);
+                    dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
+                    emit_load_u64(ops, 5, packed_args);
+                    emit_load_u64(
+                        ops,
+                        16,
+                        jit_prepare_direct_method_call_stub as *const () as u64,
+                    );
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>fallback
+                    );
 
-                emit_direct_call_tail(ops, dst_reg, threw, done);
+                    emit_direct_call_tail(ops, dst_reg, threw, done);
+                }
 
                 dynasm!(ops
                     ; .arch aarch64
@@ -3908,7 +4311,8 @@ mod arm64 {
                     ; movz x2, *recv_reg as u32
                 );
                 // Pack call-site IC id (high 32) with the name index (low 32).
-                emit_load_u64(ops, 3, (*site << 32) | u64::from(*name));
+                let raw_site = site.unwrap_or(u64::from(otter_vm::JIT_METHOD_CALL_NO_SITE));
+                emit_load_u64(ops, 3, (raw_site << 32) | u64::from(*name));
                 dynasm!(ops ; .arch aarch64 ; movz x4, arg_regs.len() as u32);
                 emit_load_u64(ops, 5, packed_args);
                 emit_status_stub_call(
@@ -3927,6 +4331,17 @@ mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
                     store_loc(ops, loc, box_scratch);
                 }
+                dynasm!(ops ; .arch aarch64 ; b =>after ; =>fast_done);
+                emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                dynasm!(ops ; .arch aarch64 ; =>after);
                 Ok(())
             }
             NodeKind::LoadThis => {
@@ -4146,6 +4561,261 @@ mod arm64 {
         Ok(())
     }
 
+    /// Emit a bridge-free direct compiled method call for `recv.name(args…)`.
+    /// The VM publishes up to `JIT_DIRECT_METHOD_WAYS` receiver shapes per site in
+    /// a flat inline-link table; this walks those ways to find the one matching the
+    /// receiver's shape (so a polymorphic site — e.g. richards `task.run()` across
+    /// task classes — is handled inline), verifies the method identity, then builds
+    /// the callee window on the flat register stack and branches straight to its
+    /// compiled entry with no Rust `jit_prepare_direct_method_call`. Any miss (no
+    /// matching way, identity mismatch, window overflow) falls to `fallback`; a
+    /// success lands at the shared `done` after storing the result.
+    ///
+    /// `x19` = caller window, `x20` = `JitCtx`; both preserved by saving/restoring
+    /// the four callee-specific `JitCtx` fields.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_direct_method_call_inline(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        dst_reg: u16,
+        recv_reg: u16,
+        arg_regs: &[u16],
+        site: u64,
+        fallback: DynamicLabel,
+        threw: DynamicLabel,
+        done: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        if view.cage_base == 0 {
+            dynasm!(ops ; .arch aarch64 ; b =>fallback);
+            return Ok(());
+        }
+        let cage = view.cage_base as u64;
+        let ways = otter_vm::jit::JIT_DIRECT_METHOD_WAYS as u64;
+        let returned = ops.new_dynamic_label();
+        let bailed = ops.new_dynamic_label();
+        let fill = ops.new_dynamic_label();
+        let fill_done = ops.new_dynamic_label();
+        let skip_proto = ops.new_dynamic_label();
+        let fid_immediate = ops.new_dynamic_label();
+        let fid_compare = ops.new_dynamic_label();
+        let found = ops.new_dynamic_label();
+        let overflow = ops.new_dynamic_label();
+        let recv_off = u32::from(recv_reg) * 8;
+        let object_shape_byte = view.object_shape_byte;
+        let object_values_ptr_byte = view.object_values_ptr_byte;
+        let jit_proto_byte = view.jit_proto_byte;
+        let closure_fid_byte = view.closure_fid_byte;
+        let slot_size = u64::from(DIRECT_METHOD_INLINE_SLOT_SIZE);
+        let dst_off = u32::from(dst_reg) * 8;
+
+        // Load the receiver once: object header (x13) and shape (w14).
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x11, [x19, recv_off]
+            ; movz x12, NUMBER_TAG_HI16, lsl #48
+            ; orr x12, x12, #value_tag::OTHER_TAG
+            ; tst x11, x12
+            ; b.ne =>fallback
+            ; mov w12, w11
+        );
+        emit_load_u64(ops, 13, cage);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w15, [x13]
+            ; cmp w15, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>fallback
+            ; ldr w14, [x13, object_shape_byte]        // w14 = receiver shape (kept)
+        );
+        // Walk the ways: x9 = &table[site * ways]; each empty way holds shape 0,
+        // which never matches a live receiver shape, so a plain compare suffices.
+        dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, DIRECT_METHOD_INLINE_OFFSET]);
+        emit_load_u64(ops, 10, site.saturating_mul(ways).saturating_mul(slot_size));
+        dynasm!(ops ; .arch aarch64 ; add x9, x9, x10);
+        for way in 0..ways {
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr w15, [x9, DMI_RECV_SHAPE_OFFSET]
+                ; cmp w14, w15
+                ; b.eq =>found
+            );
+            if way + 1 < ways {
+                emit_load_u64(ops, 10, slot_size);
+                dynasm!(ops ; .arch aarch64 ; add x9, x9, x10);
+            }
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>fallback ; =>found);
+
+        // Matched way in x9, receiver header in x13. Verify method identity (the
+        // prototype-method / own-method slot still resolves the cached function).
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr w12, [x9, DMI_METHOD_ON_RECEIVER_OFFSET]
+            ; cbnz w12, =>skip_proto
+            ; ldr w12, [x13, jit_proto_byte]
+            ; cbz w12, =>fallback
+        );
+        emit_load_u64(ops, 13, cage);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x12
+            ; ldrb w15, [x13]
+            ; cmp w15, OBJECT_BODY_TYPE_TAG
+            ; b.ne =>fallback
+            ; ldr w15, [x13, object_shape_byte]
+            ; ldr w12, [x9, DMI_PROTO_SHAPE_OFFSET]
+            ; cmp w15, w12
+            ; b.ne =>fallback
+            ; =>skip_proto
+            ; ldr x13, [x13, object_values_ptr_byte]
+            ; cbz x13, =>fallback
+            ; ldr w12, [x9, DMI_METHOD_VALUE_BYTE_OFFSET]
+            ; ldr w17, [x13, x12]                       // compressed method slot
+            ; mov x4, x17
+            ; movz x1, NUMBER_TAG_HI16, lsl #48
+            ; tst x4, x1
+            ; b.ne =>fallback
+            ; and x0, x4, #0xffff
+            ; cmp x0, #(FUNCTION_ID_TAG as u32)
+            ; b.eq =>fid_immediate
+            ; mov w2, w4
+        );
+        emit_load_u64(ops, 13, cage);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x2
+            ; ldrb w0, [x13]
+            ; cmp w0, JS_CLOSURE_BODY_TYPE_TAG
+            ; b.ne =>fallback
+            ; ldr w4, [x13, closure_fid_byte]
+            ; b =>fid_compare
+            ; =>fid_immediate
+            ; lsr x4, x4, #16
+            ; =>fid_compare
+            ; ldr w5, [x9, DMI_METHOD_FID_OFFSET]
+            ; cmp w4, w5
+            ; b.ne =>fallback
+        );
+
+        // Identity confirmed. Stash the callee link fields (entry, self, upvalues,
+        // register count) for the whole call — the window build clobbers `x9`.
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x10, [x9, DMI_ENTRY_ADDR_OFFSET]
+            ; ldr x11, [x9, DMI_SELF_CLOSURE_OFFSET]
+            ; ldr x12, [x9, DMI_UPVALUES_PTR_OFFSET]
+            ; ldr w2, [x9, DMI_REGISTER_COUNT_OFFSET]
+            ; stp x10, x11, [sp, #-32]!                 // [sp]=entry, [sp+8]=self
+            ; stp x12, x2, [sp, #16]                    // [sp+16]=upv, [sp+24]=rc
+        );
+
+        // Build the callee window on the flat register stack (rc in x13).
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x13, [sp, #24]                        // rc
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x11, [x12]                            // old top
+            ; ldr x10, [x20, REG_STACK_BASE_OFFSET]
+            ; add x14, x10, x11, lsl #3                 // new window base (kept)
+            ; add x15, x11, x13                         // new top
+        );
+        emit_load_u64(ops, 9, Interpreter::jit_reg_stack_cap() as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x15, x9
+            ; b.hi =>overflow
+            ; str x15, [x12]
+        );
+        emit_load_u64(ops, 10, VALUE_UNDEFINED);
+        dynasm!(ops
+            ; .arch aarch64
+            ; movz x9, 0
+            ; =>fill
+            ; cmp x9, x13
+            ; b.hs =>fill_done
+            ; str x10, [x14, x9, lsl #3]
+            ; add x9, x9, #1
+            ; b =>fill
+            ; =>fill_done
+        );
+        for (slot, &areg) in arg_regs.iter().enumerate() {
+            let off = u32::from(areg) * 8;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x9, [x19, off]
+                ; str x9, [x14, slot as u32 * 8]
+            );
+        }
+
+        // Swap the callee JitCtx fields (from the stash), call, restore.
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x10, [sp]                             // callee entry
+            ; ldr x11, [sp, #8]                         // callee self closure
+            ; ldr x12, [sp, #16]                        // callee upvalue spine
+            ; ldr x13, [x19, recv_off]                  // this = receiver
+            ; ldr x4, [x20]
+            ; ldr x5, [x20, #8]
+            ; ldr x6, [x20, THIS_VALUE_OFFSET]
+            ; ldr x7, [x20, UPVALUES_PTR_OFFSET]
+            ; stp x4, x5, [sp, #-32]!
+            ; stp x6, x7, [sp, #16]
+            ; str x14, [x20]
+            ; str x11, [x20, #8]
+            ; str x13, [x20, THIS_VALUE_OFFSET]
+            ; str x12, [x20, UPVALUES_PTR_OFFSET]
+            ; str wzr, [x20, BAIL_PC_OFFSET]
+            ; mov x0, x20
+            ; blr x10
+            ; ldp x6, x7, [sp, #16]
+            ; ldp x4, x5, [sp], #32
+            ; str x4, [x20]
+            ; str x5, [x20, #8]
+            ; str x6, [x20, THIS_VALUE_OFFSET]
+            ; str x7, [x20, UPVALUES_PTR_OFFSET]
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.eq =>bailed
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>returned
+            // threw: pop window (top -= rc from stash), drop stash, propagate.
+            ; ldr x9, [sp, #24]
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+            ; sub x13, x13, x9
+            ; str x13, [x12]
+            ; add sp, sp, #32
+            ; b =>threw
+            ; =>returned
+            ; ldr x9, [sp, #24]
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+            ; sub x13, x13, x9
+            ; str x13, [x12]
+            ; add sp, sp, #32
+            ; str x0, [x19, dst_off]
+            ; b =>done
+            ; =>bailed
+            ; ldr x2, [sp, #24]                         // rc for the bail stub
+            ; ldr w1, [x20, BAIL_PC_OFFSET]
+            ; add sp, sp, #32
+            ; mov x0, x20
+        );
+        emit_load_u64(ops, 16, jit_self_call_bail_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x1, STATUS_THREW as u32
+            ; b.eq =>threw
+            ; str x0, [x19, dst_off]
+            ; b =>done
+            // Window overflow after the way stash was pushed: drop it, then bail.
+            ; =>overflow
+            ; add sp, sp, #32
+            ; b =>fallback
+        );
+        Ok(())
+    }
+
     /// The deopt-exit label for a deopt-capable node, creating it on first use.
     /// Errors when the node has no captured frame state (it must, by the deopt
     /// capture contract; a missing one would be a wild bail).
@@ -4285,6 +4955,7 @@ mod tests {
                 operands: ops.clone(),
                 make_self: matches!(op, Op::MakeFunction),
                 load_array_length: false,
+                method_hint: otter_vm::jit::JitMethodHint::None,
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
@@ -4304,6 +4975,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: Default::default(),
+            string_layout: Default::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
             object_inline_values_byte: 80,
@@ -4324,6 +4996,7 @@ mod tests {
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),
+            primitive_method_guards: Default::default(),
             safepoints: Default::default(),
         }
     }
@@ -4419,6 +5092,38 @@ mod tests {
         let (s2, v2) = run(&v, &[boxi(1000)]);
         assert_eq!(s2, 0);
         assert_eq!(unboxi(v2), 1000);
+    }
+
+    /// `f(n){ let acc=0; let i=0; while(i<n){ if(i>=5) acc++; i++; } return acc }`.
+    fn conditional_branch_accumulator() -> JitFunctionView {
+        view(
+            1,
+            7,
+            &[
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::LoadInt32, vec![r(2), imm(0)], 0),
+                (Op::LoadInt32, vec![r(3), imm(5)], 0),
+                (Op::LessThan, vec![r(4), r(2), r(0)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(5), r(4)], 0),
+                (Op::GreaterEq, vec![r(5), r(2), r(3)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(1), r(5)], 0),
+                (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
+                (Op::Increment, vec![r(2), r(2), imm(1)], ARITH_INT32),
+                (Op::Jump, vec![imm(-7)], 0),
+                (Op::ReturnValue, vec![r(1)], 0),
+            ],
+        )
+    }
+
+    #[test]
+    fn conditional_branch_accumulates_through_join() {
+        let v = conditional_branch_accumulator();
+        let (status, value) = run(&v, &[boxi(10)]);
+        assert_eq!(status, 0, "returns, no bail");
+        assert_eq!(unboxi(value), 5);
+        let (s2, v2) = run(&v, &[boxi(100)]);
+        assert_eq!(s2, 0);
+        assert_eq!(unboxi(v2), 95);
     }
 
     #[test]

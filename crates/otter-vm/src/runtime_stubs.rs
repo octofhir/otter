@@ -1120,10 +1120,18 @@ fn string_concat_alloc_inner(
         if lhs.as_string(&interp.gc_heap).is_none() && rhs.as_string(&interp.gc_heap).is_none() {
             return RuntimeStubResult::miss();
         }
-        let Ok(lhs_string) = interp.js_string_for_concat(lhs) else {
+        let Ok(lhs_string) = (if let Some(string) = lhs.as_string(&interp.gc_heap) {
+            Ok(string)
+        } else {
+            interp.js_string_for_concat(lhs)
+        }) else {
             return RuntimeStubResult::miss();
         };
-        let Ok(rhs_string) = interp.js_string_for_concat(rhs) else {
+        let Ok(rhs_string) = (if let Some(string) = rhs.as_string(&interp.gc_heap) {
+            Ok(string)
+        } else {
+            interp.js_string_for_concat(rhs)
+        }) else {
             return RuntimeStubResult::miss();
         };
         match crate::string::JsString::concat(lhs_string, rhs_string, &mut interp.gc_heap) {

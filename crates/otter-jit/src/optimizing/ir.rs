@@ -200,6 +200,16 @@ pub enum NodeKind {
     /// call site: live values are materialized into the frame before entry and
     /// reloaded after. Result [`Repr::Tagged`].
     LoadGlobalOrThrow,
+    /// Read a property through the full runtime `[[Get]]` path for a site with no
+    /// inline-cacheable shape feedback (a cold site never warmed at compile time,
+    /// or a polymorphic / megamorphic miss). The helper re-decodes the destination
+    /// register, receiver register, name-constant index, and IC site from the
+    /// bytecode, runs the load-property IC ladder (own-data, then the full
+    /// `[[Get]]`), and writes the result into the destination frame slot. The read
+    /// may walk a prototype chain or invoke an accessor (allocating), so the node
+    /// is a GC-safe call site: live values are materialized into the frame before
+    /// entry and reloaded after. Result [`Repr::Tagged`].
+    LoadPropertyGeneric,
     /// Store a property through the full runtime `[[Set]]` path for a site with no
     /// inline-cacheable shape feedback (a shape-transition add, an accessor, or a
     /// polymorphic miss). The helper re-decodes the receiver / name / value / IC
@@ -531,6 +541,7 @@ impl NodeKind {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
@@ -613,6 +624,7 @@ impl NodeKind {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
@@ -688,6 +700,7 @@ impl NodeKind {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::Call { .. }
             | NodeKind::AllocObjectLiteral { .. }

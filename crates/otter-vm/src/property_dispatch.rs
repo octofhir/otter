@@ -3850,6 +3850,47 @@ impl Interpreter {
         result.map(|_| ())
     }
 
+    /// JIT bridge for a `LoadProperty` from optimizing-tier code that could not be
+    /// inline-cached at compile time (a cold site, or a polymorphic / megamorphic
+    /// miss). Decodes the destination register, receiver register, name-constant
+    /// index, and IC site from the bytecode instruction at `byte_pc`, then runs the
+    /// full load-property IC ladder ([`Self::jit_runtime_load_property`]): the
+    /// own-data fast path, then the general `[[Get]]` (prototype walk / accessor).
+    /// The resolved value is written into the destination frame slot. Frame PC is
+    /// saved/restored by the delegate so a later guard bail re-runs the compiled
+    /// frame from PC 0.
+    ///
+    /// # Errors
+    /// Propagates a throwing accessor and `InvalidOperand`.
+    pub fn jit_runtime_load_property_at_pc(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
+        if instr.op() != Op::LoadProperty {
+            return Err(VmError::InvalidOperand);
+        }
+        let dst = context
+            .exec_register(instr, 0)
+            .ok_or(VmError::InvalidOperand)?;
+        let obj_reg = context
+            .exec_register(instr, 1)
+            .ok_or(VmError::InvalidOperand)?;
+        let name_idx = context
+            .exec_const_index(instr, 2)
+            .ok_or(VmError::InvalidOperand)?;
+        let site = instr.property_ic_site().ok_or(VmError::InvalidOperand)?;
+        self.jit_runtime_load_property(context, stack, frame_index, fid, dst, obj_reg, name_idx, site)
+            .map(|_| ())
+    }
+
     /// JIT bridge for `LoadString` from compiled code. The constant cache is
     /// VM-owned and traced, so compiled code asks the VM to materialize the
     /// literal instead of embedding a GC pointer that a moving collection could

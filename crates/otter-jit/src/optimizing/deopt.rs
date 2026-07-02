@@ -67,6 +67,7 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
     match op {
         Op::LoadInt32
         | Op::LoadNumber
+        | Op::LoadString
         | Op::LoadTrue
         | Op::LoadFalse
         | Op::LoadUndefined
@@ -395,6 +396,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }
             | NodeKind::NewArray
+            | NodeKind::LoadString
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::ArrayPop { .. }
@@ -404,6 +406,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
             | NodeKind::Int32Mul(_, _)
+            | NodeKind::Int32Rem(_, _)
     )
 }
 

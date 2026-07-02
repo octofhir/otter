@@ -22,10 +22,12 @@
 //!   function only when every opcode is supported), so the def/use model here is
 //!   exhaustive for any function that reaches it.
 //! - Conservative is safe: a register wrongly kept live merely restores an extra
-//!   value at deopt; a register wrongly dropped is a correctness bug. The
-//!   dataflow therefore over-approximates on any opcode it does not model
-//!   (none today) by treating it as using nothing and defining nothing — which
-//!   would surface as a builder `Unsupported` long before here.
+//!   value at deopt; a register wrongly dropped is a correctness bug. An opcode
+//!   outside the optimizing subset is not "never seen here" — inside an OSR region
+//!   it becomes a deopt terminator the interpreter resumes at, re-reading the
+//!   instruction's operands. The default therefore over-approximates by treating
+//!   every register operand of an unmodeled opcode as a use (and no def), so its
+//!   live source operands survive to the deopt frame state.
 //!
 //! # See also
 //! - [`super::liveness`] — SSA-value liveness (a different problem: values, not
@@ -68,6 +70,7 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
         Op::LoadInt32
         | Op::LoadNumber
         | Op::LoadString
+        | Op::LoadGlobalOrThrow
         | Op::LoadTrue
         | Op::LoadFalse
         | Op::LoadUndefined
@@ -235,11 +238,33 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
                 }
             }
         }
+        // `StoreGlobalBinding value, nameIdx, strict` / `InitGlobalLex value,
+        // nameIdx` read the value register (operand 0); the name/strict operands
+        // are not registers. The value must stay live so the deopt / bridge frame
+        // materialization writes it into the instruction's value slot.
+        Op::StoreGlobalBinding | Op::InitGlobalLex => {
+            if let Some(s) = reg(operands, 0) {
+                uses.push(s);
+            }
+        }
         // No register effects.
         Op::Jump | Op::ReturnUndefined => {}
-        // Any opcode outside the subset would have failed the builder; model it
-        // as no-effect (conservative — never drops a live register).
-        _ => {}
+        // Any opcode outside the optimizing subset is compiled as a deopt
+        // terminator when it sits inside an OSR region: the interpreter resumes at
+        // that exact instruction and re-reads its source operands. So every
+        // register operand must be kept live at the deopt point — treat them all
+        // as uses (conservative: an extra live register only restores one more
+        // value; a dropped one is a correctness bug — the interpreter would read a
+        // stale frame slot). Register operands passed by inline immediate index
+        // (e.g. `LoadLocal`/`StoreLocal`) belong to modeled opcodes above, so the
+        // `Register`-operand scan here is sufficient for the unmodeled tail.
+        _ => {
+            for operand in operands {
+                if let Operand::Register(r) = operand {
+                    uses.push(*r);
+                }
+            }
+        }
     }
     RegEffects { defs, uses }
 }
@@ -395,8 +420,12 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::Call { .. }
             | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }
+            | NodeKind::StringConcat { .. }
             | NodeKind::NewArray
             | NodeKind::LoadString
+            | NodeKind::LoadGlobalOrThrow
+            | NodeKind::StorePropertyGeneric
+            | NodeKind::StoreGlobalBinding { .. }
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::ArrayPop { .. }
@@ -573,6 +602,7 @@ pub fn capture_call_resume_states(
                 node.kind,
                 NodeKind::Call { .. }
                     | NodeKind::CallMethod { .. }
+                    | NodeKind::StringConcat { .. }
                     | NodeKind::AllocObjectLiteral { .. }
                     | NodeKind::ArrayPush { .. }
             ) {
@@ -850,6 +880,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                method_hint: otter_vm::jit::JitMethodHint::None,
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
@@ -869,6 +900,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
+            string_layout: otter_vm::JitStringLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
             object_inline_values_byte: 80,
@@ -889,6 +921,7 @@ mod tests {
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),
+            primitive_method_guards: Default::default(),
             safepoints: Default::default(),
         }
     }

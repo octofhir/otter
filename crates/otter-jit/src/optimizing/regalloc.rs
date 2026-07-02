@@ -307,7 +307,13 @@ pub fn allocate(
                 n.kind,
                 super::ir::NodeKind::Call { .. }
                     | super::ir::NodeKind::CallMethod { .. }
+                    | super::ir::NodeKind::StringConcat { .. }
                     | super::ir::NodeKind::ArrayPush { .. }
+                    | super::ir::NodeKind::StorePropertyGeneric
+                    // `Float64Rem` lowers to a leaf `fmod` libcall that clobbers
+                    // the caller-saved register pool, so values live across it must
+                    // hold callee-saved homes just like a real call.
+                    | super::ir::NodeKind::Float64Rem(_, _)
             )
         })
         .filter_map(|(id, _)| numbering.pos_of.get(&(id as NodeId)).copied())
@@ -547,9 +553,18 @@ fn build_intervals(
             iv.add_range(block_start, block_end - 1);
             iv.add_use(block_end - 1);
         }
-        // Phi heads define at block entry; shorten their leading range.
+        // Phi heads define at block entry; shorten their leading range. Only a
+        // phi that is actually live — already given an interval by the live-out
+        // seeding or a real use above — needs this. A phi with no interval here is
+        // dead (no use, not live-out of its block); minting one via `set_from`
+        // would hand it a spurious degenerate range and a register home, and the
+        // edge resolver would then emit a move into that home. When the dead phi's
+        // home aliases a live value (linear scan is free to reuse it — the dead
+        // phi never interferes), that move clobbers the live value on the edge.
         for &phi in &block.phis {
-            interval_for(&mut intervals, graph, phi).set_from(numbering.def_pos(phi));
+            if let Some(iv) = intervals.get_mut(&phi) {
+                iv.set_from(numbering.def_pos(phi));
+            }
         }
     }
 
@@ -1073,6 +1088,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                method_hint: otter_vm::jit::JitMethodHint::None,
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
@@ -1092,6 +1108,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
+            string_layout: otter_vm::JitStringLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
             object_inline_values_byte: 80,
@@ -1112,6 +1129,7 @@ mod tests {
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),
+            primitive_method_guards: Default::default(),
             safepoints: Default::default(),
         }
     }

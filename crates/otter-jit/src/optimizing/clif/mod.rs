@@ -347,6 +347,7 @@ mod tests {
                 operands: ops.clone(),
                 make_self: false,
                 load_array_length: false,
+                method_hint: otter_vm::jit::JitMethodHint::None,
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
@@ -366,6 +367,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: Default::default(),
+            string_layout: Default::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
             object_inline_values_byte: 80,
@@ -386,6 +388,7 @@ mod tests {
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),
+            primitive_method_guards: Default::default(),
             safepoints: Default::default(),
         }
     }

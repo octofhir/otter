@@ -30,12 +30,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::jit_feedback::ArithFeedback;
+use otter_vm::jit_feedback::{ARITH_STRING, ArithFeedback};
 use otter_vm::{JitArrayMethodKind, JitFunctionView, JitInlineCallee, JitInlineMethod};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::Unsupported;
 use super::ir::{BlockId, CmpOp, Float64UnaryOp, Graph, NodeId, NodeKind, Repr, Terminator};
+use super::{Unsupported, deopt};
 
 /// Build a typed SSA graph for `view`, or report why the function is outside the
 /// optimizing subset. When `osr_pc` is set, build only the region reachable from
@@ -217,6 +217,13 @@ fn imm32(operands: &[Operand], i: usize) -> Result<i32, Unsupported> {
     match operands.get(i) {
         Some(Operand::Imm32(v)) => Ok(*v),
         _ => Err(Unsupported::OperandShape("expected imm32")),
+    }
+}
+
+fn local_slot(operands: &[Operand], i: usize) -> Option<u16> {
+    match operands.get(i) {
+        Some(Operand::Imm32(v)) => u16::try_from(*v).ok(),
+        _ => None,
     }
 }
 
@@ -750,6 +757,7 @@ impl<'a> Builder<'a> {
             let make_self = instr.make_self;
             let load_number = instr.load_number;
             let load_array_length = instr.load_array_length;
+            let method_hint = instr.method_hint;
             let property_feedback = instr.property_feedback;
             let property_feedback_poly = instr.property_feedback_poly.clone();
             let property_proto_feedback = instr.property_proto_feedback;
@@ -886,10 +894,36 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
                 }
+                // `LoadGlobalOrThrow dst, nameIdx` — read a free global identifier
+                // through the VM lookup (global lexical cell, then global object),
+                // throwing when unbound. Lowered as a GC-safe bridge: the runtime
+                // helper re-decodes the operands from the bytecode, so the node
+                // carries only its destination register for liveness / reload.
+                Op::LoadGlobalOrThrow => {
+                    let dst = reg(&operands, 0)?;
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::LoadGlobalOrThrow, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
                 // `LoadProperty dst, obj, name` — lower baked IC feedback into
                 // inline slot access. Own-data sites become receiver shape
                 // guards; simple direct-prototype data sites become receiver and
                 // prototype guards; unsupported sites bail to the interpreter.
+                // `StoreGlobalBinding value, nameIdx, strict` — write a free global
+                // identifier's binding. The runtime helper re-decodes the operands
+                // and performs the §9.1.1.4 SetMutableBinding lookup; the value is
+                // kept as an input so it is materialized into its frame slot first.
+                Op::StoreGlobalBinding => {
+                    let value_reg = reg(&operands, 0)?;
+                    let value = self.read_variable(value_reg, block);
+                    let node = self
+                        .graph
+                        .add_node(NodeKind::StoreGlobalBinding { value }, block, byte_pc);
+                    self.push_body(block, node);
+                }
                 Op::LoadProperty => {
                     let dst = reg(&operands, 0)?;
                     let obj_reg = reg(&operands, 1)?;
@@ -977,9 +1011,20 @@ impl<'a> Builder<'a> {
                 Op::StoreProperty => {
                     let obj_reg = reg(&operands, 0)?;
                     let src_reg = reg(&operands, 2)?;
-                    if self.view.cage_base == 0
-                        || (property_feedback.is_none() && property_feedback_poly.is_empty())
-                    {
+                    // No inline-cacheable shape feedback (a shape-transition add, an
+                    // accessor, or a polymorphic miss): run the full runtime store
+                    // through the bridge so a constructor body that grows objects
+                    // still compiles instead of declining the whole function. The
+                    // receiver and value stay live (modeled in `reg_effects`) so the
+                    // call safepoint materializes them for the bridge to re-decode.
+                    if property_feedback.is_none() && property_feedback_poly.is_empty() {
+                        let node =
+                            self.graph
+                                .add_node(NodeKind::StorePropertyGeneric, block, byte_pc);
+                        self.push_body(block, node);
+                        continue;
+                    }
+                    if self.view.cage_base == 0 {
                         self.deopt_or_decline(
                             block,
                             byte_pc,
@@ -1146,10 +1191,6 @@ impl<'a> Builder<'a> {
                     if argc > MAX_METHOD_ARGS {
                         return Err(Unsupported::OperandShape("method call arg count"));
                     }
-                    let Some(site) = property_ic_site else {
-                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
-                        return Ok(());
-                    };
                     let recv = self.read_variable(recv_reg, block);
                     let mut args = Vec::with_capacity(argc);
                     let mut arg_regs = Vec::with_capacity(argc);
@@ -1210,25 +1251,20 @@ impl<'a> Builder<'a> {
                             continue;
                         }
                     } else if let Some(arms) = self.view.inline_poly_methods.get(&byte_pc).cloned()
-                    {
-                        if let Some((result, merge)) = self
+                        && let Some((result, merge)) = self
                             .try_inline_poly_method(block, byte_pc, recv, &arms, argc, &args, dst)?
-                        {
-                            block = merge;
-                            self.def_register(dst, block, result, byte_pc);
-                            continue;
-                        } else if self.block_is_in_loop(block) {
-                            return Err(Unsupported::Opcode(op));
-                        }
-                    } else if self.block_is_in_loop(block) {
-                        return Err(Unsupported::Opcode(op));
+                    {
+                        block = merge;
+                        self.def_register(dst, block, result, byte_pc);
+                        continue;
                     }
                     let call = self.graph.add_node(
                         NodeKind::CallMethod {
                             recv,
                             recv_reg,
                             name,
-                            site: site as u64,
+                            site: property_ic_site.map(|site| site as u64),
+                            method_hint,
                             arg_regs,
                             args,
                         },
@@ -1315,13 +1351,26 @@ impl<'a> Builder<'a> {
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
-                    let node = match self.arith_binop(block, op, lhs, rhs, feedback, byte_pc) {
-                        Ok(node) => node,
-                        Err(reason @ Unsupported::TypeFeedback(_)) => {
-                            self.deopt_or_decline(block, byte_pc, reason)?;
-                            return Ok(());
+                    let node = if op == Op::Add && feedback == ARITH_STRING {
+                        let lhs_node = self.read_variable(lhs, block);
+                        let rhs_node = self.read_variable(rhs, block);
+                        self.graph.add_node(
+                            NodeKind::StringConcat {
+                                lhs: lhs_node,
+                                rhs: rhs_node,
+                            },
+                            block,
+                            byte_pc,
+                        )
+                    } else {
+                        match self.arith_binop(block, op, lhs, rhs, feedback, byte_pc) {
+                            Ok(node) => node,
+                            Err(reason @ Unsupported::TypeFeedback(_)) => {
+                                self.deopt_or_decline(block, byte_pc, reason)?;
+                                return Ok(());
+                            }
+                            Err(reason) => return Err(reason),
                         }
-                        Err(reason) => return Err(reason),
                     };
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
@@ -2490,7 +2539,7 @@ impl<'a> Builder<'a> {
             Op::Sub => NodeKind::Float64Sub(l, r),
             Op::Mul => NodeKind::Float64Mul(l, r),
             Op::Div => NodeKind::Float64Div(l, r),
-            Op::Rem => return Err(Unsupported::Opcode(Op::Rem)),
+            Op::Rem => NodeKind::Float64Rem(l, r),
             _ => unreachable!("arith_binop on non-arithmetic op"),
         };
         Ok(self.graph.add_node(kind, block, byte_pc))
@@ -2699,6 +2748,89 @@ impl<'a> Builder<'a> {
         self.graph.blocks[block as usize].term = Some(term);
     }
 
+    fn loop_header_live_registers(
+        &self,
+        bytecode_live: &FxHashMap<u32, FxHashSet<u16>>,
+    ) -> FxHashSet<u16> {
+        let mut regs = FxHashSet::default();
+        for block in &self.graph.blocks {
+            if self.back_edge_pc(block).is_none() {
+                continue;
+            }
+            if let Some(live) = bytecode_live.get(&block.start_pc) {
+                regs.extend(live.iter().copied());
+            }
+        }
+        regs
+    }
+
+    fn active_loop_local_registers(&self) -> FxHashSet<u16> {
+        if !self.view.inline_callees.is_empty()
+            || !self.view.inline_methods.is_empty()
+            || !self.view.inline_poly_methods.is_empty()
+        {
+            return FxHashSet::default();
+        }
+
+        let mut loop_ranges = Vec::new();
+        for block in &self.graph.blocks {
+            for &pred in &block.preds {
+                if pred as usize >= self.cfg.ranges.len() {
+                    continue;
+                }
+                let pred_block = &self.graph.blocks[pred as usize];
+                if pred_block.start_pc <= block.start_pc {
+                    continue;
+                }
+                let (_, pred_end) = self.cfg.ranges[pred as usize];
+                let Some(last) = pred_end
+                    .checked_sub(1)
+                    .and_then(|idx| self.view.instructions.get(idx))
+                else {
+                    continue;
+                };
+                loop_ranges.push((block.start_pc, last.byte_pc));
+            }
+        }
+
+        let mut regs = FxHashSet::default();
+        for instr in &self.view.instructions {
+            if !loop_ranges
+                .iter()
+                .any(|&(start, end)| start <= instr.byte_pc && instr.byte_pc <= end)
+            {
+                continue;
+            }
+            match instr.op {
+                Op::LoadLocal => {
+                    if let Some(src) = local_slot(&instr.operands, 1) {
+                        regs.insert(src);
+                    }
+                }
+                Op::StoreLocal => {
+                    if let Some(dst) = local_slot(&instr.operands, 1) {
+                        regs.insert(dst);
+                    }
+                }
+                _ => {}
+            }
+        }
+        regs
+    }
+
+    fn materialize_deopt_env(&mut self, block: BlockId, byte_pc: u32) {
+        let mut regs = FxHashSet::default();
+        let live = deopt::bytecode_liveness(self.view);
+        if let Some(live) = live.get(&byte_pc) {
+            regs.extend(live.iter().copied());
+        }
+        regs.extend(self.loop_header_live_registers(&live));
+        regs.extend(self.active_loop_local_registers());
+        for reg in regs {
+            let _ = self.read_variable(reg, block);
+        }
+    }
+
     fn back_edge_pc(&self, header: &super::ir::Block) -> Option<u32> {
         header
             .preds
@@ -2757,6 +2889,7 @@ impl<'a> Builder<'a> {
         if !self.can_deopt_at(byte_pc) {
             return Err(reason);
         }
+        self.materialize_deopt_env(block, byte_pc);
         self.set_term(block, Terminator::Deopt(byte_pc));
         Ok(())
     }
@@ -2764,6 +2897,7 @@ impl<'a> Builder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::deopt;
     use super::*;
     use otter_vm::jit_feedback::{ARITH_FLOAT64, ARITH_INT32};
 
@@ -2793,6 +2927,7 @@ mod tests {
                 operands: operands.clone(),
                 make_self: false,
                 load_array_length: false,
+                method_hint: otter_vm::jit::JitMethodHint::None,
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
@@ -2812,6 +2947,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: otter_vm::JitTypedArrayLayout::default(),
+            string_layout: otter_vm::JitStringLayout::default(),
             object_shape_byte: 8,
             object_values_ptr_byte: 16,
             object_inline_values_byte: 80,
@@ -2832,6 +2968,7 @@ mod tests {
             collection_leaf_methods: Default::default(),
             collection_alloc_methods: Default::default(),
             array_methods: Default::default(),
+            primitive_method_guards: Default::default(),
             safepoints: Default::default(),
         }
     }
@@ -2880,6 +3017,7 @@ mod tests {
                         operands: vec![r(2), r(0), r(1)],
                         make_self: false,
                         load_array_length: false,
+                        method_hint: otter_vm::jit::JitMethodHint::None,
                         load_number: None,
                         property_feedback: None,
                         property_feedback_poly: Vec::new(),
@@ -2895,6 +3033,7 @@ mod tests {
                         operands: vec![r(2)],
                         make_self: false,
                         load_array_length: false,
+                        method_hint: otter_vm::jit::JitMethodHint::None,
                         load_number: None,
                         property_feedback: None,
                         property_feedback_poly: Vec::new(),
@@ -2937,6 +3076,7 @@ mod tests {
                     operands: vec![r(0)],
                     make_self: false,
                     load_array_length: false,
+                    method_hint: otter_vm::jit::JitMethodHint::None,
                     load_number: None,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
@@ -2952,6 +3092,7 @@ mod tests {
                     operands: vec![r(1), r(0), Operand::ConstIndex(0)],
                     make_self: false,
                     load_array_length: false,
+                    method_hint: otter_vm::jit::JitMethodHint::None,
                     load_number: None,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
@@ -2967,6 +3108,7 @@ mod tests {
                     operands: vec![r(1)],
                     make_self: false,
                     load_array_length: false,
+                    method_hint: otter_vm::jit::JitMethodHint::None,
                     load_number: None,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
@@ -3033,6 +3175,28 @@ mod tests {
     }
 
     #[test]
+    fn no_site_method_call_lowers_to_runtime_method_call() {
+        let v = view(
+            1,
+            3,
+            &[
+                (
+                    Op::CallMethodValue,
+                    vec![r(1), r(0), Operand::ConstIndex(0), Operand::ConstIndex(0)],
+                    0,
+                ),
+                (Op::ReturnValue, vec![r(1)], 0),
+            ],
+        );
+
+        let g = build_full(&v).expect("no-site generic method call builds");
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::CallMethod { site: None, .. })),
+            1
+        );
+    }
+
+    #[test]
     fn tagged_method_branch_inserts_bool_guard() {
         let mut v = view(
             1,
@@ -3070,6 +3234,7 @@ mod tests {
             operands,
             make_self,
             load_array_length: false,
+            method_hint: otter_vm::jit::JitMethodHint::None,
             load_number: None,
             property_feedback: None,
             property_feedback_poly: Vec::new(),
@@ -3217,7 +3382,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_inline_method_inside_loop_declines() {
+    fn missing_inline_method_inside_loop_lowers_to_runtime_method_call() {
         let mut v = view(
             1,
             5,
@@ -3237,9 +3402,10 @@ mod tests {
         );
         v.instructions[3].property_ic_site = Some(7);
 
+        let g = build_full(&v).expect("loop method call builds");
         assert_eq!(
-            build_full(&v).unwrap_err(),
-            Unsupported::Opcode(Op::CallMethodValue)
+            count_kind(&g, |k| matches!(k, NodeKind::CallMethod { .. })),
+            1
         );
     }
 
@@ -3294,6 +3460,25 @@ mod tests {
         // Only the tagged parameter needs a guard; the int32 const does not.
         assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::CheckInt32(_))), 1);
         assert!(matches!(g.blocks[0].term, Some(Terminator::Return(_))));
+    }
+
+    #[test]
+    fn string_add_lowers_to_concat_stub_node() {
+        let g = build_full(&view(
+            2,
+            3,
+            &[
+                (Op::Add, vec![r(2), r(0), r(1)], ARITH_STRING),
+                (Op::ReturnValue, vec![r(2)], 0),
+            ],
+        ))
+        .expect("string add builds");
+
+        assert_eq!(
+            count_kind(&g, |k| matches!(k, NodeKind::StringConcat { .. })),
+            1
+        );
+        assert_eq!(count_kind(&g, |k| matches!(k, NodeKind::Int32Add(..))), 0);
     }
 
     #[test]
@@ -3483,6 +3668,48 @@ mod tests {
             .find(|b| b.start_pc == 8 * STRIDE)
             .expect("epilogue block");
         assert!(matches!(epilogue.term, Some(Terminator::Deopt(pc)) if pc == 8 * STRIDE));
+    }
+
+    #[test]
+    fn epilogue_deopt_materializes_loop_carried_diamond_phi() {
+        let v = view(
+            0,
+            6,
+            &[
+                (Op::LoadInt32, vec![r(0), imm(0)], 0),
+                (Op::LoadInt32, vec![r(1), imm(0)], 0),
+                (Op::LoadInt32, vec![r(2), imm(10)], 0),
+                (Op::LessThan, vec![r(3), r(1), r(2)], ARITH_INT32),
+                (Op::JumpIfFalse, vec![imm(rel(4, 10)), r(3)], 0),
+                (Op::LoadTrue, vec![r(4)], 0),
+                (Op::JumpIfFalse, vec![imm(rel(6, 8)), r(4)], 0),
+                (Op::Increment, vec![r(0), r(0), imm(1)], ARITH_INT32),
+                (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
+                (Op::Jump, vec![imm(rel(9, 3))], 0),
+                (Op::LoadGlobalThis, vec![r(5)], 0),
+                (Op::ReturnValue, vec![r(0)], 0),
+            ],
+        );
+        let g = build_full(&v).expect("epilogue deopt graph builds");
+        let bcl = deopt::bytecode_liveness(&v);
+        let deopts = deopt::capture_deopt_terminators(&g, &bcl);
+        let epilogue = g
+            .blocks
+            .iter()
+            .position(|b| b.start_pc == 10 * STRIDE)
+            .expect("epilogue block") as BlockId;
+        let point = deopts.get(&epilogue).expect("epilogue deopt state");
+        let (_, acc) = point
+            .registers
+            .iter()
+            .find(|&&(reg, _)| reg == 0)
+            .copied()
+            .expect("acc is live at epilogue deopt");
+        assert!(
+            matches!(g.node(acc).kind, NodeKind::Phi(ref inputs) if inputs.len() == 2),
+            "epilogue deopt must restore the loop-carried acc phi, got {:?}",
+            g.node(acc).kind
+        );
     }
 
     #[test]

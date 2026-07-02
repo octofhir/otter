@@ -189,8 +189,8 @@ pub use jit::{
     JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLayout,
     JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError, JitCompileRequest,
     JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode,
-    JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView, JitReentryPtrs,
-    JitTypedArrayLayout,
+    JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView, JitPrimitiveMethodGuard,
+    JitReentryPtrs, JitStringLayout, JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -380,6 +380,9 @@ pub enum JitRuntimeMethodStubSource {
     Optimizing,
 }
 
+/// Packed method-call bridge site marker for calls without bytecode IC metadata.
+pub const JIT_METHOD_CALL_NO_SITE: u32 = u32::MAX;
+
 /// Snapshot of VM-published collection method IC mirror slots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCollectionMethodIcStats {
@@ -522,6 +525,58 @@ struct JitDirectMethodCache {
     hit: JitDirectMethodHit,
     function_id: u32,
     code: std::sync::Arc<dyn jit::JitFunctionCode>,
+    /// Inline-link fields for this shape, mirrored into the flat per-way table the
+    /// optimizing tier walks to take the bridge-free call.
+    inline: JitDirectMethodInline,
+}
+
+/// Maximum receiver shapes cached per direct-method call site before it is left
+/// to the generic path. A polymorphic site (e.g. richards `task.run()` across
+/// four task classes) keeps every observed shape so each call hits the cache
+/// instead of re-resolving the method every time.
+const MAX_DIRECT_METHOD_WAYS: usize = jit::JIT_DIRECT_METHOD_WAYS;
+
+/// Inline-readable direct-method-call link, mirroring the collection-method IC:
+/// the optimizing tier guards the receiver shape, then builds the callee window
+/// and branches to `entry_addr` with no bridge.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct JitDirectMethodInline {
+    /// Compiled callee entry address (non-OSR body). `0` marks an empty/invalid
+    /// slot: the inline guard bails to the bridge.
+    pub entry_addr: usize,
+    /// Callee register-window length.
+    pub register_count: u32,
+    /// Receiver shape compressed offset the inline guard compares against (own
+    /// method → receiver's shape; prototype method → receiver's shape).
+    pub recv_shape_offset: u32,
+    /// Prototype shape compressed offset for a prototype-method identity walk.
+    pub proto_shape_offset: u32,
+    /// `1` when the method slot is an own property on the receiver.
+    pub method_on_receiver: u32,
+    /// Byte offset of the method slot in the (proto or receiver) value slab.
+    pub method_value_byte: u32,
+    /// Expected method function id the identity walk compares against.
+    pub method_fid: u32,
+    /// Boxed SELF closure bits for the callee context.
+    pub self_closure_bits: u64,
+    /// Callee upvalue-spine base pointer, or 0 when it captures nothing.
+    pub upvalues_ptr: usize,
+}
+
+impl JitDirectMethodInline {
+    /// An empty slot: `entry_addr == 0` so the inline guard falls to the bridge.
+    pub const EMPTY: Self = Self {
+        entry_addr: 0,
+        register_count: 0,
+        recv_shape_offset: 0,
+        proto_shape_offset: 0,
+        method_on_receiver: 0,
+        method_value_byte: 0,
+        method_fid: 0,
+        self_closure_bits: 0,
+        upvalues_ptr: 0,
+    };
 }
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
@@ -812,6 +867,14 @@ pub struct Interpreter {
     /// repeated call to the same callee skips the map probe entirely. Cleared
     /// whenever a new entry is inserted into `jit_code`.
     jit_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Function ids whose installed body compiled `osr_only` (unsupported opcodes
+    /// emitted as bails), so the function-entry path can never run it — only a
+    /// loop OSR enters at a supported header. Once compiled, a body's `osr_only`
+    /// status is fixed, so caching it here lets the hot entry path short-circuit
+    /// to the interpreter with one set probe, skipping the `jit_code` map lookup,
+    /// the `Arc` clone (an atomic refcount round-trip), and the `osr_only()`
+    /// virtual call on every invocation of an interpreter-resident method body.
+    jit_entry_osr_only: rustc_hash::FxHashSet<u32>,
     /// Active compiled→compiled callees whose emitted caller holds only raw
     /// entry/safepoint pointers while the native stack is inside that callee.
     /// The VM-local anchor keeps the executable mapping alive even if feedback
@@ -820,7 +883,13 @@ pub struct Interpreter {
     /// Per-method-call-site compiled direct-call cache. Each entry is guarded by
     /// the same shape/slot metadata as the load IC and re-reads the method value
     /// before entry, so overwriting a method slot falls back to full resolution.
-    jit_direct_method_cache: Vec<Option<JitDirectMethodCache>>,
+    jit_direct_method_cache: Vec<Vec<JitDirectMethodCache>>,
+    /// Flat, `#[repr(C)]` inline-readable mirror of the direct-method cache,
+    /// indexed by IC site. The optimizing tier reads a slot directly from compiled
+    /// code (base pointer in `JitCtx`) to build the callee window and branch with
+    /// no Rust bridge; `entry_addr == 0` marks an empty/invalid slot. Kept in sync
+    /// with `jit_direct_method_cache` (populated together, cleared together).
+    jit_direct_method_inline_slots: Vec<JitDirectMethodInline>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
     /// Free-list of spilled register-window backing buffers. Every bytecode
@@ -1583,8 +1652,10 @@ impl Interpreter {
             jit_code: rustc_hash::FxHashMap::default(),
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
+            jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_direct_code_anchors: Vec::new(),
             jit_direct_method_cache: Vec::new(),
+            jit_direct_method_inline_slots: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
             holt_pool: Vec::new(),
@@ -2066,6 +2137,7 @@ impl Interpreter {
     /// sees the latest compile policy / feedback snapshot.
     fn invalidate_jit_function(&mut self, fid: u32) {
         self.jit_code.remove(&fid);
+        self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
         self.clear_jit_direct_method_cache();
         self.jit_osr_code
@@ -2149,6 +2221,11 @@ impl Interpreter {
         {
             return Some(code.clone());
         }
+        // A body already known to be `osr_only` can never run at function entry;
+        // short-circuit before the map probe + `Arc` clone below.
+        if self.jit_entry_osr_only.contains(&fid) {
+            return None;
+        }
         let code = if let Some(slot) = self.jit_code.get(&fid) {
             slot.clone()
         } else {
@@ -2174,6 +2251,12 @@ impl Interpreter {
         let code = code.filter(|c| !c.osr_only());
         if let Some(c) = &code {
             self.jit_code_cache = Some((fid, c.clone()));
+        } else {
+            // Reached only past the tier-up threshold (a below-threshold fid
+            // returns early above), so `jit_code[fid]` is installed and its
+            // `None`/`osr_only` verdict is final: record it so the entry path
+            // stops re-probing it.
+            self.jit_entry_osr_only.insert(fid);
         }
         code
     }
@@ -2318,8 +2401,11 @@ impl Interpreter {
     }
 
     fn clear_jit_direct_method_cache(&mut self) {
-        for slot in &mut self.jit_direct_method_cache {
-            *slot = None;
+        for set in &mut self.jit_direct_method_cache {
+            set.clear();
+        }
+        for slot in &mut self.jit_direct_method_inline_slots {
+            *slot = JitDirectMethodInline::EMPTY;
         }
     }
 
@@ -2594,24 +2680,28 @@ impl Interpreter {
         site: usize,
         arg_regs: &[u16],
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
-        let Some(cache) = self
-            .jit_direct_method_cache
-            .get(site)
-            .and_then(Option::as_ref)
-        else {
+        // Polymorphic cache: find the entry whose cached receiver shape still
+        // resolves the same method. A miss just falls to the generic path — the
+        // other cached shapes stay, so a site that alternates shapes does not
+        // thrash and re-resolve every call.
+        let Some(set) = self.jit_direct_method_cache.get(site) else {
             return Ok(None);
         };
-        let expected = Value::function(cache.function_id);
-        if self.cached_direct_method_value(obj, &cache.hit) != Some(expected) {
-            if let Some(slot) = self.jit_direct_method_cache.get_mut(site) {
-                *slot = None;
+        let mut resolved = None;
+        for cache in set {
+            if self.cached_direct_method_value(obj, &cache.hit)
+                == Some(Value::function(cache.function_id))
+            {
+                resolved = Some((cache.function_id, cache.code.clone()));
+                break;
             }
-            return Ok(None);
         }
-        let Some(function) = context.exec_function(cache.function_id) else {
+        let Some((function_id, code)) = resolved else {
             return Ok(None);
         };
-        let code = cache.code.clone();
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(None);
+        };
         let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
@@ -2649,6 +2739,9 @@ impl Interpreter {
         method: Value,
         function_id: u32,
         code: std::sync::Arc<dyn jit::JitFunctionCode>,
+        entry_addr: usize,
+        register_count: u32,
+        upvalues_ptr: usize,
     ) {
         if method != Value::function(function_id) {
             return;
@@ -2681,14 +2774,81 @@ impl Interpreter {
                 break;
             }
         }
-        if let Some(hit) = cached_hit
-            && let Some(slot) = self.jit_direct_method_cache.get_mut(site)
-        {
-            *slot = Some(JitDirectMethodCache {
-                hit,
-                function_id,
-                code,
-            });
+        if let Some(hit) = cached_hit {
+            // Derive the inline-link fields from the already-resolved hit (no
+            // second shape walk): the receiver-shape guard, the prototype-shape
+            // guard and method-slot byte offset for the identity walk, plus the
+            // callee entry / window / SELF / upvalue-spine the emitted call needs.
+            let cv = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+            let inline = match &hit {
+                JitDirectMethodHit::Own(h) => JitDirectMethodInline {
+                    entry_addr,
+                    register_count,
+                    recv_shape_offset: h.shape.offset(),
+                    proto_shape_offset: 0,
+                    method_on_receiver: 1,
+                    method_value_byte: u32::from(h.slot) * cv,
+                    method_fid: function_id,
+                    self_closure_bits: Value::function(function_id).to_bits(),
+                    upvalues_ptr,
+                },
+                JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
+                    JitDirectMethodInline {
+                        entry_addr,
+                        register_count,
+                        recv_shape_offset: object::shape(obj, &self.gc_heap).offset(),
+                        proto_shape_offset: prototype_hit.shape.offset(),
+                        method_on_receiver: 0,
+                        method_value_byte: u32::from(prototype_hit.slot) * cv,
+                        method_fid: function_id,
+                        self_closure_bits: Value::function(function_id).to_bits(),
+                        upvalues_ptr,
+                    }
+                }
+            };
+            let new_shape = match &hit {
+                JitDirectMethodHit::Own(h) => h.shape_id,
+                JitDirectMethodHit::DirectPrototype {
+                    receiver_shape_id, ..
+                } => *receiver_shape_id,
+            };
+            if let Some(set) = self.jit_direct_method_cache.get_mut(site) {
+                let entry = JitDirectMethodCache {
+                    hit,
+                    function_id,
+                    code,
+                    inline,
+                };
+                // Replace a same-receiver-shape entry (method reassigned) in place;
+                // otherwise append while the site stays within the way budget.
+                let pos = set.iter().position(|c| {
+                    let s = match &c.hit {
+                        JitDirectMethodHit::Own(h) => h.shape_id,
+                        JitDirectMethodHit::DirectPrototype {
+                            receiver_shape_id, ..
+                        } => *receiver_shape_id,
+                    };
+                    s == new_shape
+                });
+                match pos {
+                    Some(i) => set[i] = entry,
+                    None if set.len() < MAX_DIRECT_METHOD_WAYS => set.push(entry),
+                    None => {}
+                }
+                // Mirror every cached way into the flat table the JIT walks.
+                let base = site * MAX_DIRECT_METHOD_WAYS;
+                for way in 0..MAX_DIRECT_METHOD_WAYS {
+                    let value = self
+                        .jit_direct_method_cache
+                        .get(site)
+                        .and_then(|s| s.get(way))
+                        .map(|c| c.inline)
+                        .unwrap_or(JitDirectMethodInline::EMPTY);
+                    if let Some(flat) = self.jit_direct_method_inline_slots.get_mut(base + way) {
+                        *flat = value;
+                    }
+                }
+            }
         }
     }
 
@@ -2800,7 +2960,24 @@ impl Interpreter {
         let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
-        self.install_jit_direct_method_cache(site, obj, key, method, function_id, code.clone());
+        // The method closure's upvalue spine (constant for a shared prototype
+        // method) for the inline direct-call link the install derives.
+        let upvalues_ptr = if parent_upvalues.is_empty() {
+            0
+        } else {
+            parent_upvalues.as_ptr() as usize
+        };
+        self.install_jit_direct_method_cache(
+            site,
+            obj,
+            key,
+            method,
+            function_id,
+            code.clone(),
+            plan.entry_addr,
+            u32::from(plan.register_count),
+            upvalues_ptr,
+        );
 
         self.enter_sync_reentry()?;
         match self.prepare_jit_direct_call_frame(
@@ -3203,6 +3380,7 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_function_view(fid)?;
         Self::bake_typed_array_layout(&mut view);
+        Self::bake_string_layout(&mut view);
         self.bake_arith_feedback(&mut view, fid);
         self.bake_property_feedback(&mut view);
         self.bake_object_literals(&mut view, context);
@@ -3210,6 +3388,7 @@ impl Interpreter {
         self.bake_collection_leaf_methods(&mut view);
         self.bake_collection_alloc_methods(&mut view);
         self.bake_array_methods(&mut view);
+        self.bake_primitive_method_guards(&mut view);
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         if trace {
             let function_name = context
@@ -3276,6 +3455,19 @@ impl Interpreter {
             array_length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
             array_exotic_byte: header
                 + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+        };
+        view.cage_base = otter_gc::cage_base() as usize;
+    }
+
+    /// Bake the static heap-layout offsets for inline primitive string fast
+    /// paths. String bodies are GC cells addressed through the same cage base as
+    /// object/array bodies, so this only enables when the compile snapshot has a
+    /// cage base.
+    fn bake_string_layout(view: &mut jit::JitFunctionView) {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        view.string_layout = jit::JitStringLayout {
+            string_type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
+            string_len_byte: header + std::mem::offset_of!(crate::string::JsStringBody, len) as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }
@@ -3791,6 +3983,7 @@ impl Interpreter {
     /// through its `Arc` until the frame returns.
     fn evict_compiled_for_reopt(&mut self, fid: u32) {
         self.jit_code.remove(&fid);
+        self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
         self.clear_jit_direct_method_cache();
         self.jit_osr_code.retain(|&(f, _), _| f != fid);
@@ -4030,6 +4223,18 @@ impl Interpreter {
             if let Some(feedback) = self.jit_array_method_feedback(site) {
                 view.array_methods.insert(instr.byte_pc, feedback);
             }
+        }
+    }
+
+    fn bake_primitive_method_guards(&self, view: &mut jit::JitFunctionView) {
+        for instr in &view.instructions {
+            if instr.op != Op::CallMethodValue {
+                continue;
+            }
+            let Some(feedback) = self.jit_primitive_method_guard(instr.method_hint) else {
+                continue;
+            };
+            view.primitive_method_guards.insert(instr.byte_pc, feedback);
         }
     }
 
@@ -4380,7 +4585,13 @@ impl Interpreter {
                 .resize(site_count, jit::JitCollectionMethodIcSlot::EMPTY);
         }
         if self.jit_direct_method_cache.len() < site_count {
-            self.jit_direct_method_cache.resize(site_count, None);
+            self.jit_direct_method_cache.resize_with(site_count, Vec::new);
+        }
+        if self.jit_direct_method_inline_slots.len() < site_count * MAX_DIRECT_METHOD_WAYS {
+            self.jit_direct_method_inline_slots.resize(
+                site_count * MAX_DIRECT_METHOD_WAYS,
+                JitDirectMethodInline::EMPTY,
+            );
         }
     }
 
@@ -5683,6 +5894,11 @@ impl Interpreter {
         if function.is_strict || function.is_arrow {
             return Ok(this_value);
         }
+        // The dominant sloppy-method case is an object receiver (`recv.m()`),
+        // which is its own `this` — return it before the primitive-wrapper ladder.
+        if this_value.as_object().is_some() {
+            return Ok(this_value);
+        }
         match this_value {
             v if v.is_undefined() || v.is_null() => Ok(Value::object(self.global_this)),
             other => self.box_sloppy_this_primitive_runtime_rooted(other, slice_roots),
@@ -5697,6 +5913,9 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         if function.is_strict || function.is_arrow {
+            return Ok(this_value);
+        }
+        if this_value.as_object().is_some() {
             return Ok(this_value);
         }
         if this_value.is_undefined() || this_value.is_null() {
@@ -6558,6 +6777,19 @@ impl Interpreter {
     /// Number of slots starting at [`Self::jit_collection_method_ics_ptr`].
     pub fn jit_collection_method_ics_len(&self) -> u32 {
         self.jit_collection_method_ics.len() as u32
+    }
+
+    /// Base of the flat direct-method inline-link table. The optimizing tier reads
+    /// a slot by IC site to build the callee window and branch with no bridge; the
+    /// pointer is refreshed into `JitCtx` on every entry/reentry because the table
+    /// can grow (reallocate).
+    pub fn jit_direct_method_inline_ptr(&self) -> *const JitDirectMethodInline {
+        self.jit_direct_method_inline_slots.as_ptr()
+    }
+
+    /// Number of slots starting at [`Self::jit_direct_method_inline_ptr`].
+    pub fn jit_direct_method_inline_len(&self) -> u32 {
+        self.jit_direct_method_inline_slots.len() as u32
     }
 
     /// Capacity of the flat JIT register stack in slots — the overflow bound
@@ -11471,6 +11703,7 @@ mod tests {
             operands,
             make_self: false,
             load_array_length: false,
+            method_hint: jit::JitMethodHint::None,
             load_number: None,
             arith_feedback: 0,
             property_feedback: None,
@@ -12631,6 +12864,7 @@ mod tests {
             .expect("string result")
             .to_lossy_string(interp.gc_heap());
         assert_eq!(result, "42");
+        assert!(interp.small_int_string_cache[42].is_some());
     }
 
     #[test]
@@ -16384,6 +16618,7 @@ mod tests {
             is_async_generator: false,
             cage_base: 0,
             ta_layout: jit::JitTypedArrayLayout::default(),
+            string_layout: jit::JitStringLayout::default(),
             object_shape_byte: 0,
             object_values_ptr_byte: 0,
             object_inline_values_byte: 0,
@@ -16407,6 +16642,7 @@ mod tests {
                     operands: Vec::new(),
                     make_self: false,
                     load_array_length: false,
+                    method_hint: jit::JitMethodHint::None,
                     load_number: None,
                     arith_feedback: 0,
                     property_feedback: None,
@@ -16421,6 +16657,7 @@ mod tests {
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),
+            primitive_method_guards: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         };
         interp.bake_arith_feedback(&mut view, 5);

@@ -38,7 +38,7 @@ impl Interpreter {
         recv_reg: u16,
         name_idx: u32,
         call_byte_pc: u32,
-        site: usize,
+        site: Option<usize>,
         arg_regs: &[u16],
         source: crate::JitRuntimeMethodStubSource,
     ) -> Result<(), VmError> {
@@ -54,36 +54,42 @@ impl Interpreter {
         }
         // Cached dense-array builtin: a guard hit dispatches without resolving
         // the method name, hashing the prototype slot, or string-matching.
-        if let Some(result) = self.try_array_method_call_ic(context, site, recv, args.as_slice()) {
-            let value = result?;
-            self.record_jit_method_array_fast_hit();
-            write_register(&mut stack[frame_index], dst, value)?;
-            return Ok(());
-        }
-        if let Some(result) = self.try_collection_method_call_ic(site, recv, args.as_slice()) {
-            let value = result?;
-            self.record_jit_method_collection_ic_hit();
-            write_register(&mut stack[frame_index], dst, value)?;
-            return Ok(());
+        if let Some(site) = site {
+            if let Some(result) =
+                self.try_array_method_call_ic(context, site, recv, args.as_slice())
+            {
+                let value = result?;
+                self.record_jit_method_array_fast_hit();
+                write_register(&mut stack[frame_index], dst, value)?;
+                return Ok(());
+            }
+            if let Some(result) = self.try_collection_method_call_ic(site, recv, args.as_slice()) {
+                let value = result?;
+                self.record_jit_method_collection_ic_hit();
+                write_register(&mut stack[frame_index], dst, value)?;
+                return Ok(());
+            }
         }
         let name = context
             .string_constant_str_for_function(stack[frame_index].function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(result) =
-            self.try_fast_array_proto_method(context, site, recv, name, args.as_slice())
-        {
-            let value = result?;
-            self.record_jit_method_array_fast_hit();
-            write_register(&mut stack[frame_index], dst, value)?;
-            return Ok(());
-        }
-        if let Some(result) =
-            self.try_fast_collection_proto_method(site, recv, name, args.as_slice())
-        {
-            let value = result?;
-            self.record_jit_method_fast_collection_hit();
-            write_register(&mut stack[frame_index], dst, value)?;
-            return Ok(());
+        if let Some(site) = site {
+            if let Some(result) =
+                self.try_fast_array_proto_method(context, site, recv, name, args.as_slice())
+            {
+                let value = result?;
+                self.record_jit_method_array_fast_hit();
+                write_register(&mut stack[frame_index], dst, value)?;
+                return Ok(());
+            }
+            if let Some(result) =
+                self.try_fast_collection_proto_method(site, recv, name, args.as_slice())
+            {
+                let value = result?;
+                self.record_jit_method_fast_collection_hit();
+                write_register(&mut stack[frame_index], dst, value)?;
+                return Ok(());
+            }
         }
         if name == "charCodeAt"
             && recv.is_string()
@@ -124,6 +130,85 @@ impl Interpreter {
         stack[frame_index].pc = saved_pc;
         write_register(&mut stack[frame_index], dst, result)?;
         Ok(())
+    }
+
+    /// Fast non-allocating primitive `String.prototype.charCodeAt` bridge.
+    ///
+    /// Returns `Ok(true)` only when the receiver is a primitive string, the
+    /// prototype still exposes the canonical builtin, and the argument shape is
+    /// handled by the primitive fast path. Every miss falls back to the full
+    /// method-call bridge so user overrides and coercions keep interpreter
+    /// semantics.
+    pub fn jit_runtime_try_string_char_code_at(
+        &mut self,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        recv: Value,
+        arg: Value,
+    ) -> Result<bool, VmError> {
+        let Some(result) = self.try_fast_primitive_string_char_code_at(recv, &[arg])? else {
+            return Ok(false);
+        };
+        self.record_jit_method_string_fast_hit();
+        write_register(&mut stack[frame_index], dst, result)?;
+        Ok(true)
+    }
+
+    /// Fast non-allocating primitive `String.prototype.charCodeAt` bridge that
+    /// returns the value directly to compiled code.
+    pub fn jit_runtime_try_string_char_code_at_value(
+        &mut self,
+        recv: Value,
+        arg: Value,
+    ) -> Result<Option<Value>, VmError> {
+        let Some(result) = self.try_fast_primitive_string_char_code_at(recv, &[arg])? else {
+            return Ok(None);
+        };
+        self.record_jit_method_string_fast_hit();
+        Ok(Some(result))
+    }
+
+    /// Primitive `String.prototype.charCodeAt` bridge for code that has already
+    /// validated the prototype builtin identity in generated guards.
+    pub fn jit_runtime_string_char_code_at_value_guarded(
+        &mut self,
+        recv: Value,
+        arg: Value,
+    ) -> Result<Option<Value>, VmError> {
+        let result =
+            crate::string::prototype::fast_primitive_char_code_at(recv, &[arg], &mut self.gc_heap);
+        if result.is_some() {
+            self.record_jit_method_string_fast_hit();
+        }
+        Ok(result)
+    }
+
+    /// Fast primitive `Number.prototype.toString` bridge.
+    ///
+    /// The result may allocate, so callers must have already materialized the
+    /// interpreter frame as the GC root source. Misses preserve full method-call
+    /// semantics by falling back to the generic bridge.
+    pub fn jit_runtime_try_number_to_string(
+        &mut self,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        recv: Value,
+        arg: Value,
+        has_arg: bool,
+    ) -> Result<bool, VmError> {
+        let result = if has_arg {
+            self.try_fast_primitive_number_to_string(recv, &[arg])?
+        } else {
+            self.try_fast_primitive_number_to_string(recv, &[])?
+        };
+        let Some(result) = result else {
+            return Ok(false);
+        };
+        self.record_jit_method_number_fast_hit();
+        write_register(&mut stack[frame_index], dst, result)?;
+        Ok(true)
     }
 
     /// JIT bridge for the leaf/no-allocation Map/Set method path.
@@ -259,6 +344,46 @@ impl Interpreter {
             method_value_byte: compressed_slot_byte(ic.proto_slot),
             builtin_fn_addr,
             kind,
+        })
+    }
+
+    pub(crate) fn jit_primitive_method_guard(
+        &self,
+        hint: crate::jit::JitMethodHint,
+    ) -> Option<crate::jit::JitPrimitiveMethodGuard> {
+        let (proto, name) = match hint {
+            crate::jit::JitMethodHint::StringCharCodeAt => {
+                (self.realm_intrinsics.string_prototype?, "charCodeAt")
+            }
+            crate::jit::JitMethodHint::None | crate::jit::JitMethodHint::NumberToString => {
+                return None;
+            }
+        };
+        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+        let hit = hit?;
+        let method = match lookup {
+            crate::object::PropertyLookup::Data { value, .. } => value,
+            crate::object::PropertyLookup::Accessor { .. }
+            | crate::object::PropertyLookup::Absent => return None,
+        };
+        match hint {
+            crate::jit::JitMethodHint::StringCharCodeAt => {
+                if !crate::string::prototype::is_char_code_at_builtin(method, &self.gc_heap) {
+                    return None;
+                }
+            }
+            crate::jit::JitMethodHint::None | crate::jit::JitMethodHint::NumberToString => {
+                return None;
+            }
+        }
+        let builtin_fn_addr = method
+            .as_native_function()
+            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
+        Some(crate::jit::JitPrimitiveMethodGuard {
+            proto_offset: proto.offset(),
+            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
+            method_value_byte: compressed_slot_byte(hit.slot),
+            builtin_fn_addr,
         })
     }
 

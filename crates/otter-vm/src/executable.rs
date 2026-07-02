@@ -208,6 +208,7 @@ impl ExecutableFunction {
             // all-zero default is never read because the emitter gates inline
             // element access on `cage_base != 0`.
             ta_layout: crate::jit::JitTypedArrayLayout::default(),
+            string_layout: crate::jit::JitStringLayout::default(),
             // `#[repr(C)]` constant: offset from the decompressed object
             // pointer to its shape handle, for the WhiskerIC load-cell guard.
             object_shape_byte: otter_gc::header::HEADER_SIZE as u32
@@ -260,6 +261,7 @@ impl ExecutableFunction {
                     // can inspect constant strings without exposing them to the
                     // external JIT crate.
                     load_array_length: false,
+                    method_hint: crate::jit::JitMethodHint::None,
                     // Resolved by `ExecutionContext::jit_function_view`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
@@ -283,6 +285,7 @@ impl ExecutableFunction {
             collection_leaf_methods: rustc_hash::FxHashMap::default(),
             collection_alloc_methods: rustc_hash::FxHashMap::default(),
             array_methods: rustc_hash::FxHashMap::default(),
+            primitive_method_guards: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
     }

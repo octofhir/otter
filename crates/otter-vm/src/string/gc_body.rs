@@ -44,7 +44,7 @@ pub const JS_STRING_BODY_TYPE_TAG: u8 = 0x20;
 /// Maximum depth of an unflattened cons rope. Concatenations that
 /// would exceed this trigger an eager flatten before the new `Cons`
 /// node is built.
-pub const MAX_ROPE_DEPTH: u8 = 64;
+pub const MAX_ROPE_DEPTH: u8 = 254;
 /// UTF-16 code units stored directly inside a flat string body.
 pub const INLINE_FLAT_CAP: usize = 12;
 /// Latin-1 bytes stored directly inside a Latin-1 string body.

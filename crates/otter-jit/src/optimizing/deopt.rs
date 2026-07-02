@@ -78,6 +78,16 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
                 defs.push(d);
             }
         }
+        Op::NewArray => {
+            if let Some(d) = reg(operands, 0) {
+                defs.push(d);
+            }
+            for slot in 2..operands.len() {
+                if let Some(s) = reg(operands, slot) {
+                    uses.push(s);
+                }
+            }
+        }
         // `LoadLocal dst, srcIdx` reads register `srcIdx`, writes `dst`.
         Op::LoadLocal => {
             if let Some(d) = reg(operands, 0) {
@@ -384,6 +394,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::Call { .. }
             | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }
+            | NodeKind::NewArray
             | NodeKind::LoadElement(_, _)
             | NodeKind::StoreElement(_, _, _)
             | NodeKind::ArrayPop { .. }

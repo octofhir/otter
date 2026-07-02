@@ -1063,7 +1063,7 @@ pub(crate) extern "C" fn jit_array_push_optimizing_stub(
 /// Bridge stub: allocate an array literal for `NewArray` from compiled code.
 /// The VM decodes the variable source-register list at `byte_pc` and uses the
 /// stack-rooted array allocator, matching interpreter GC semantics.
-extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+pub(crate) extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
@@ -5054,7 +5054,12 @@ pub(crate) mod arm64 {
             ; b.ne =>miss
             ; ldr x15, [x15, object_values_ptr_byte]
             ; cbz x15, =>miss
-            ; ldr x9, [x15, method_value_byte]
+            ; ldr w17, [x15, method_value_byte]
+        );
+        emit_decompress_slot(ops, miss);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x9, x17
             ; movz x11, NUMBER_TAG_HI16, lsl #48
             ; orr x11, x11, #value_tag::OTHER_TAG  // NOT_CELL_MASK
             ; tst x9, x11

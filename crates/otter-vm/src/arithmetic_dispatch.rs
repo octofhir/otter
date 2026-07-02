@@ -236,6 +236,9 @@ impl Interpreter {
         negate: bool,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        if self.jit_hook.is_some() {
+            self.note_arith(lhs, rhs);
+        }
         let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
         frame.advance_pc(self.current_byte_len)?;

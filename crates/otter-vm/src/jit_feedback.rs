@@ -1,16 +1,16 @@
-//! Runtime type-feedback cells consumed by the optimizing JIT tier.
+//! Runtime value-representation feedback consumed by the optimizing JIT tier.
 //!
-//! The interpreter records the observed operand representation at each binary
-//! arithmetic / relational site while a hot function is still warming up
-//! (before it tiers up to compiled code). The optimizing tier reads these cells
-//! to pick a node representation — `Int32`, `Float64`, or fully generic
-//! `Tagged` — and to insert the matching speculation guard. Once a function is
-//! compiled the interpreter arms no longer run for it, so steady-state
-//! execution records nothing: the cost is bounded to the warm-up window.
+//! The interpreter records observed operand/value representations at numeric
+//! bytecode sites while a hot function is still warming up (before it tiers up
+//! to compiled code). The optimizing tier reads these cells to pick a node
+//! representation — `Int32`, `Float64`, or fully generic `Tagged` — and to
+//! insert the matching speculation guard. Once a function is compiled the
+//! interpreter arms no longer run for it, so steady-state execution records
+//! nothing: the cost is bounded to the warm-up window.
 //!
 //! # Contents
-//! - [`ArithFeedback`] — an OR-accumulated operand-representation bitset for one
-//!   binary arithmetic / relational site, keyed in the interpreter by
+//! - [`ArithFeedback`] — an OR-accumulated representation bitset for one
+//!   numeric-specialized bytecode site, keyed in the interpreter by
 //!   `(function_id, byte_pc)`.
 //!
 //! # Invariants
@@ -49,8 +49,8 @@ pub const ARITH_OTHER: u8 = 1 << 4;
 /// speculated as a pure numeric operation.
 const NON_NUMERIC: u8 = ARITH_STRING | ARITH_BIGINT | ARITH_OTHER;
 
-/// OR-accumulated operand-representation feedback for one binary arithmetic or
-/// relational bytecode site.
+/// OR-accumulated representation feedback for one numeric-specialized bytecode
+/// site.
 ///
 /// The interpreter folds both operands of every observed execution into the
 /// same cell, so the bitset summarises *every representation ever seen at the

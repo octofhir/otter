@@ -1025,10 +1025,11 @@ impl<'a> Builder<'a> {
                     self.push_body(block, load);
                     self.def_register(dst, block, load, byte_pc);
                 }
-                // `StoreElement recv, idx, src` — inline typed-array element
-                // stores for primitive numeric values. Every miss deoptimizes at
-                // this exact PC, letting the interpreter perform full `[[Set]]`
-                // semantics, including coercion cases this tier does not lower.
+                // `StoreElement recv, idx, src` — inline dense-array and
+                // typed-array element stores for primitive numeric values. The
+                // RHS representation comes from warmup feedback recorded at the
+                // store site; a miss deoptimizes before writing so the
+                // interpreter owns full `[[Set]]` semantics.
                 Op::StoreElement => {
                     let recv_reg = reg(&operands, 0)?;
                     let idx_reg = reg(&operands, 1)?;
@@ -1046,13 +1047,24 @@ impl<'a> Builder<'a> {
                         }
                     };
                     let value = self.read_variable(src_reg, block);
-                    if !matches!(
-                        self.graph.node(value).kind.repr(),
-                        Repr::Int32 | Repr::Float64
-                    ) {
-                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
-                        return Ok(());
-                    }
+                    let value = match self.graph.node(value).kind.repr() {
+                        Repr::Int32 | Repr::Float64 => value,
+                        Repr::Tagged | Repr::Bool => {
+                            let fb = ArithFeedback::from_bits(feedback);
+                            if fb.is_int32_only() {
+                                self.int32_operand(block, src_reg, feedback, byte_pc)?
+                            } else if fb.is_numeric_only() {
+                                self.float_operand(block, src_reg, byte_pc)
+                            } else {
+                                self.deopt_or_decline(
+                                    block,
+                                    byte_pc,
+                                    Unsupported::TypeFeedback(feedback),
+                                )?;
+                                return Ok(());
+                            }
+                        }
+                    };
                     let store = self.graph.add_node(
                         NodeKind::StoreElement(recv, idx, value),
                         block,
@@ -2696,6 +2708,18 @@ impl<'a> Builder<'a> {
         byte_pc: u32,
         reason: Unsupported,
     ) -> Result<(), Unsupported> {
+        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+            let op = self
+                .view
+                .instructions
+                .iter()
+                .find(|instr| instr.byte_pc == byte_pc)
+                .map(|instr| instr.op);
+            eprintln!(
+                "[otter-jit] optimizing site fid {} pc {byte_pc} op {op:?}: {reason:?}",
+                self.view.function_id
+            );
+        }
         if self.block_is_in_loop(block) {
             return Err(reason);
         }

@@ -3807,6 +3807,41 @@ impl Interpreter {
         result
     }
 
+    /// JIT bridge for `LoadString` from compiled code. The constant cache is
+    /// VM-owned and traced, so compiled code asks the VM to materialize the
+    /// literal instead of embedding a GC pointer that a moving collection could
+    /// make stale.
+    ///
+    /// # Errors
+    /// Propagates invalid operands and allocation failures.
+    pub fn jit_runtime_load_string(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        byte_pc: u32,
+    ) -> Result<(), VmError> {
+        let fid = stack[frame_index].function_id;
+        let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let instr = func
+            .instr_at_byte_pc(byte_pc)
+            .ok_or(VmError::InvalidOperand)?;
+        if instr.op() != Op::LoadString {
+            return Err(VmError::InvalidOperand);
+        }
+        let dst = context
+            .exec_register(instr, 0)
+            .ok_or(VmError::InvalidOperand)?;
+        let idx = context
+            .exec_const_index(instr, 1)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = stack[frame_index].pc;
+        let value = self.load_string_constant_value(context, idx)?;
+        let result = write_register(&mut stack[frame_index], dst, value);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// JIT bridge for a computed `StoreElement` (`recv[idx] = src`) from compiled
     /// code. Mirrors the interpreter dispatch: the typed-array / dense-array fast
     /// path ([`Self::drive_store_element`]) first, then the general

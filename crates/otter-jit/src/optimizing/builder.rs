@@ -879,6 +879,13 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
                 }
+                Op::LoadString => {
+                    let dst = reg(&operands, 0)?;
+                    let node = self.graph.add_node(NodeKind::LoadString, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
                 // `LoadProperty dst, obj, name` — lower baked IC feedback into
                 // inline slot access. Own-data sites become receiver shape
                 // guards; simple direct-prototype data sites become receiver and
@@ -1305,7 +1312,7 @@ impl<'a> Builder<'a> {
                     let node = self.read_variable(src, block);
                     self.def_register(dst, block, node, byte_pc);
                 }
-                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let (dst, lhs, rhs) =
                         (reg(&operands, 0)?, reg(&operands, 1)?, reg(&operands, 2)?);
                     let node = match self.arith_binop(block, op, lhs, rhs, feedback, byte_pc) {
@@ -1538,6 +1545,7 @@ impl<'a> Builder<'a> {
             Op::Add => NodeKind::Int32Add(l, r),
             Op::Sub => NodeKind::Int32Sub(l, r),
             Op::Mul => NodeKind::Int32Mul(l, r),
+            Op::Rem => NodeKind::Int32Rem(l, r),
             _ => unreachable!("int32_binop on non-arithmetic op"),
         };
         Ok(self.graph.add_node(kind, block, byte_pc))
@@ -2482,6 +2490,7 @@ impl<'a> Builder<'a> {
             Op::Sub => NodeKind::Float64Sub(l, r),
             Op::Mul => NodeKind::Float64Mul(l, r),
             Op::Div => NodeKind::Float64Div(l, r),
+            Op::Rem => return Err(Unsupported::Opcode(Op::Rem)),
             _ => unreachable!("arith_binop on non-arithmetic op"),
         };
         Ok(self.graph.add_node(kind, block, byte_pc))
@@ -3432,17 +3441,18 @@ mod tests {
 
     #[test]
     fn bails_on_unsupported_opcode() {
-        // `Rem` (`%`) is outside the arithmetic subset and bails the function.
+        // Unary numeric negation is outside the optimizing subset and bails the
+        // function.
         let err = build_full(&view(
             2,
             4,
             &[
-                (Op::Rem, vec![r(2), r(0), r(1)], ARITH_INT32),
+                (Op::Neg, vec![r(2), r(0)], ARITH_INT32),
                 (Op::ReturnValue, vec![r(2)], 0),
             ],
         ))
         .unwrap_err();
-        assert_eq!(err, Unsupported::Opcode(Op::Rem));
+        assert_eq!(err, Unsupported::Opcode(Op::Neg));
     }
 
     #[test]
@@ -3477,10 +3487,10 @@ mod tests {
 
     #[test]
     fn osr_target_skips_unsupported_earlier_loop() {
-        // A setup loop contains an unsupported `%`, then execution reaches a
-        // later simple hot loop. Whole-function compilation must decline the
-        // setup loop, but an OSR-target compile rooted at the later header should
-        // build only the region reachable from that header.
+        // A setup loop contains an unsupported unary negation, then execution
+        // reaches a later simple hot loop. Whole-function compilation must
+        // decline the setup loop, but an OSR-target compile rooted at the later
+        // header should build only the region reachable from that header.
         let v = view(
             1,
             8,
@@ -3488,7 +3498,7 @@ mod tests {
                 (Op::LoadInt32, vec![r(1), imm(0)], 0),
                 (Op::LessThan, vec![r(2), r(1), r(0)], ARITH_INT32),
                 (Op::JumpIfFalse, vec![imm(rel(2, 6)), r(2)], 0),
-                (Op::Rem, vec![r(3), r(1), r(0)], ARITH_INT32),
+                (Op::Neg, vec![r(3), r(1)], ARITH_INT32),
                 (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
                 (Op::Jump, vec![imm(rel(5, 1))], 0),
                 (Op::LoadInt32, vec![r(4), imm(0)], 0),
@@ -3502,7 +3512,7 @@ mod tests {
         );
         assert_eq!(
             build_full(&v).unwrap_err(),
-            Unsupported::Opcode(Op::Rem),
+            Unsupported::Opcode(Op::Neg),
             "whole-function compile still rejects the setup loop"
         );
 
@@ -3537,7 +3547,7 @@ mod tests {
                 (Op::LoadInt32, vec![r(5), imm(1)], 0),
                 (Op::LessThan, vec![r(2), r(1), r(0)], ARITH_INT32),
                 (Op::JumpIfFalse, vec![imm(rel(3, 7)), r(2)], 0),
-                (Op::Rem, vec![r(3), r(1), r(5)], ARITH_INT32),
+                (Op::Neg, vec![r(3), r(1)], ARITH_INT32),
                 (Op::Increment, vec![r(1), r(1), imm(1)], ARITH_INT32),
                 (Op::Jump, vec![imm(rel(6, 2))], 0),
                 (Op::ReturnValue, vec![r(1)], 0),
@@ -3546,7 +3556,7 @@ mod tests {
 
         assert_eq!(
             build(&v, Some(2 * STRIDE)).unwrap_err(),
-            Unsupported::Opcode(Op::Rem)
+            Unsupported::Opcode(Op::Neg)
         );
     }
 

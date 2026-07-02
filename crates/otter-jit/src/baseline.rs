@@ -1078,6 +1078,24 @@ pub(crate) extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u
     }
 }
 
+/// Bridge stub: materialize a string literal for `LoadString` from compiled
+/// code. The VM decodes the constant index at `byte_pc` and serves it from the
+/// traced per-context constant cache.
+pub(crate) extern "C" fn jit_load_string_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_load_string(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
 /// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
 /// Returns `0` on success, `1` when the call threw (error parked in `ctx`).

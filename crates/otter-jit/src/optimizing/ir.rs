@@ -142,6 +142,9 @@ pub enum NodeKind {
     Int32Sub(NodeId, NodeId),
     /// `int32 * int32`, deopt on overflow.
     Int32Mul(NodeId, NodeId),
+    /// `int32 % int32`, deopt on zero divisor and the `INT_MIN % -1` negative
+    /// zero case.
+    Int32Rem(NodeId, NodeId),
     /// `int32 <cmp> int32`. Result [`Repr::Bool`].
     Int32Compare(CmpOp, NodeId, NodeId),
     /// Speculative "operand is a number" guard; result repr [`Repr::Float64`]
@@ -179,6 +182,11 @@ pub enum NodeKind {
     /// result to the instruction's destination frame slot. Result
     /// [`Repr::Tagged`].
     NewArray,
+    /// Materialize a string literal through the VM-owned constant cache. The
+    /// helper decodes the constant index from the bytecode instruction and
+    /// writes the traced cached value into the destination frame slot. Result
+    /// [`Repr::Tagged`].
+    LoadString,
     /// Nullish identity check against the boxed `null` (and, when `nullish`,
     /// `undefined`) immediate. With `nullish=false` this is strict `value ===
     /// null` (`negate=true` → `!== null`). With `nullish=true` it matches `null`
@@ -449,6 +457,7 @@ impl NodeKind {
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
             | NodeKind::Int32Mul(a, b)
+            | NodeKind::Int32Rem(a, b)
             | NodeKind::Int32Compare(_, a, b)
             | NodeKind::Float64Add(a, b)
             | NodeKind::Float64Sub(a, b)
@@ -476,6 +485,7 @@ impl NodeKind {
             | NodeKind::SelfClosure
             | NodeKind::LoadUpvalue(_)
             | NodeKind::NewArray
+            | NodeKind::LoadString
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
             NodeKind::Call { inputs, .. } => inputs.clone(),
@@ -519,6 +529,7 @@ impl NodeKind {
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
             | NodeKind::Int32Mul(a, b)
+            | NodeKind::Int32Rem(a, b)
             | NodeKind::Int32Compare(_, a, b)
             | NodeKind::Float64Add(a, b)
             | NodeKind::Float64Sub(a, b)
@@ -551,6 +562,7 @@ impl NodeKind {
             | NodeKind::LoadHole
             | NodeKind::LoadUpvalue(_)
             | NodeKind::NewArray
+            | NodeKind::LoadString
             | NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
             | NodeKind::ConstF64(_)
@@ -586,6 +598,7 @@ impl NodeKind {
             | NodeKind::Int32Add(_, _)
             | NodeKind::Int32Sub(_, _)
             | NodeKind::Int32Mul(_, _)
+            | NodeKind::Int32Rem(_, _)
             | NodeKind::Int32BitOr(_, _)
             | NodeKind::Int32BitAnd(_, _)
             | NodeKind::Int32BitXor(_, _)
@@ -616,6 +629,7 @@ impl NodeKind {
             | NodeKind::Phi(_)
             | NodeKind::LoadUpvalue(_)
             | NodeKind::NewArray
+            | NodeKind::LoadString
             | NodeKind::Call { .. }
             | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }

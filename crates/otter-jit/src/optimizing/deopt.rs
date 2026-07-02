@@ -373,6 +373,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             // fits (a boxed double / wide int / function id). Both bail before any
             // write, so re-executing the property op after the deopt is correct.
             | NodeKind::LoadSlot(_, _)
+            | NodeKind::LoadProtoSlot { .. }
             | NodeKind::StoreSlot(_, _, _)
             // A polymorphic slot access deopts on the final structure miss (no
             // baked case matched the receiver shape), before any write.
@@ -838,6 +839,7 @@ mod tests {
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
+                property_proto_feedback: None,
                 object_literal: None,
                 arith_feedback: *fb,
             })

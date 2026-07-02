@@ -267,6 +267,7 @@ impl ExecutableFunction {
                     // live per-site property IC; the raw snapshot carries none.
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
+                    property_proto_feedback: None,
                     object_literal: None,
                 })
                 .collect(),

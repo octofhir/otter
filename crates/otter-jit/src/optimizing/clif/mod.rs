@@ -350,6 +350,7 @@ mod tests {
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
+                property_proto_feedback: None,
                 object_literal: None,
                 arith_feedback: *fb,
             })

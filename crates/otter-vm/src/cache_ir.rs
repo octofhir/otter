@@ -30,7 +30,7 @@ use smallvec::SmallVec;
 use otter_gc::raw::SlotVisitor;
 
 use crate::object::{
-    self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeId, StorePropertyTransition,
+    self, AtomOwnPropertyHit, OwnPropertySlotHit, ShapeHandle, ShapeId, StorePropertyTransition,
 };
 use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, JsString, Value};
@@ -111,6 +111,10 @@ pub(crate) struct CacheStub {
     ops: SmallVec<[CacheOp; 4]>,
     /// Receiver / prototype shape ids guarded by [`CacheOp::GuardShapeId`].
     shape_ids: SmallVec<[ShapeId; 1]>,
+    /// Receiver shapes for direct-prototype load stubs. The interpreter guards
+    /// by [`ShapeId`], while the JIT needs the immortal shape handle's
+    /// compressed offset for an inline shape compare.
+    receiver_shapes: SmallVec<[ShapeHandle; 1]>,
     /// Atom-aware own-property hits consumed by load terminals.
     hits: SmallVec<[AtomOwnPropertyHit; 1]>,
     /// Slot hits consumed by `has` terminals.
@@ -143,6 +147,7 @@ impl CacheStub {
     #[must_use]
     pub(crate) fn load_direct_prototype_data(
         receiver_shape_id: ShapeId,
+        receiver_shape: ShapeHandle,
         hit: AtomOwnPropertyHit,
     ) -> Self {
         let mut ops = SmallVec::new();
@@ -152,6 +157,7 @@ impl CacheStub {
         Self {
             ops,
             shape_ids: SmallVec::from_elem(receiver_shape_id, 1),
+            receiver_shapes: SmallVec::from_elem(receiver_shape, 1),
             hits: SmallVec::from_elem(hit, 1),
             ..Self::default()
         }
@@ -320,6 +326,7 @@ impl CacheStub {
             return None;
         }
         let receiver_shape_id = object::shape_id(obj, heap);
+        let receiver_shape = object::shape(obj, heap);
         let atom_lookup = object::lookup_own_atom(obj, heap, key);
         if let (Some(hit), object::PropertyLookup::Data { value, .. }) =
             (atom_lookup.hit, atom_lookup.lookup)
@@ -338,7 +345,7 @@ impl CacheStub {
             (proto_lookup.hit, proto_lookup.lookup)
         {
             return Some((
-                Self::load_direct_prototype_data(receiver_shape_id, hit),
+                Self::load_direct_prototype_data(receiver_shape_id, receiver_shape, hit),
                 value,
             ));
         }
@@ -374,6 +381,28 @@ impl CacheStub {
                 [shape_id],
                 [hit],
             ) => Some((*shape_id, *hit)),
+            _ => None,
+        }
+    }
+
+    /// The `(receiver shape, prototype hit)` of a direct-prototype data load
+    /// stub, for JIT lowering.
+    #[must_use]
+    pub(crate) fn direct_prototype_load_jit(&self) -> Option<(ShapeHandle, AtomOwnPropertyHit)> {
+        match (
+            self.ops.as_slice(),
+            self.receiver_shapes.as_slice(),
+            self.hits.as_slice(),
+        ) {
+            (
+                [
+                    CacheOp::GuardShapeId { obj: 0, shape: 0 },
+                    CacheOp::LoadPrototype { obj: 0, dst: 1 },
+                    CacheOp::LoadDataSlotResult { obj: 1, hit: 0 },
+                ],
+                [shape],
+                [hit],
+            ) => Some((*shape, *hit)),
             _ => None,
         }
     }
@@ -566,6 +595,12 @@ impl CacheStubSnapshot {
     #[must_use]
     pub(crate) fn direct_prototype_load(&self) -> Option<(ShapeId, AtomOwnPropertyHit)> {
         self.stub.direct_prototype_load()
+    }
+
+    /// Direct-prototype data load as JIT-readable shape handles.
+    #[must_use]
+    pub(crate) fn direct_prototype_load_jit(&self) -> Option<(ShapeHandle, AtomOwnPropertyHit)> {
+        self.stub.direct_prototype_load_jit()
     }
 
     /// Existing-own-data store hit.

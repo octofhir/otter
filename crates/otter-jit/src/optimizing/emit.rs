@@ -3092,6 +3092,82 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::LoadProtoSlot {
+                recv,
+                recv_shape,
+                proto_shape,
+                slot_byte,
+            } => {
+                // Direct-prototype data load: guard the receiver shape, follow the
+                // flattened prototype mirror, guard the prototype shape, then read
+                // the baked prototype value slot. Any miss deopts before the load's
+                // value is observed.
+                if *slot_byte > 32760 {
+                    return Err(Unsupported::Unlowered(
+                        "prototype property slot offset out of ldr range",
+                    ));
+                }
+                let recv_loc = require_loc(alloc, *recv)?;
+                if let Some(loc) = dst {
+                    debug_assert_eq!(box_scratch, BOX_SCRATCH);
+                    let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                    let shape_byte = view.object_shape_byte;
+                    let proto_byte = view.jit_proto_byte;
+                    load_loc(ops, box_scratch, recv_loc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; tst X(box_scratch), #value_tag::NUMBER_TAG
+                        ; b.ne =>exit
+                        ; tst X(box_scratch), #value_tag::OTHER_TAG
+                        ; b.ne =>exit
+                        ; mov W(MOVE_SCRATCH), W(box_scratch)
+                    );
+                    emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x16, x16, X(box_scratch)     // receiver header
+                        ; ldrb w17, [x16]
+                        ; cmp w17, OBJECT_BODY_TYPE_TAG
+                        ; b.ne =>exit
+                        ; ldr w17, [x16, shape_byte]
+                        ; fmov d6, x16
+                    );
+                    emit_load_u64(ops, MOVE_SCRATCH, u64::from(*recv_shape));
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp w17, W(MOVE_SCRATCH)
+                        ; b.ne =>exit
+                        ; fmov x16, d6
+                        ; ldr w17, [x16, proto_byte]       // compressed prototype
+                        ; cbz w17, =>exit
+                    );
+                    emit_load_u64(ops, MOVE_SCRATCH, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x16, x17, X(MOVE_SCRATCH)    // prototype header
+                        ; ldrb w17, [x16]
+                        ; cmp w17, OBJECT_BODY_TYPE_TAG
+                        ; b.ne =>exit
+                        ; ldr w17, [x16, shape_byte]
+                        ; fmov d6, x16
+                    );
+                    emit_load_u64(ops, MOVE_SCRATCH, u64::from(*proto_shape));
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp w17, W(MOVE_SCRATCH)
+                        ; b.ne =>exit
+                        ; fmov x16, d6
+                    );
+                    crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr w17, [x16, *slot_byte]       // 4-byte compressed slot
+                    );
+                    emit_decompress_slot(ops, exit);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::LoadArrayLength(obj) => {
                 let oloc = require_loc(alloc, *obj)?;
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
@@ -4082,6 +4158,7 @@ mod tests {
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
+                property_proto_feedback: None,
                 object_literal: None,
                 arith_feedback: *fb,
             })

@@ -6685,6 +6685,8 @@ mod tests {
             object_inline_slot_cap: 2,
             gc_barrier: Default::default(),
             jit_proto_byte: 12,
+            heap_number_type_tag: 0x30,
+            heap_number_bits_byte: 8,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,
             collection_layout: Default::default(),

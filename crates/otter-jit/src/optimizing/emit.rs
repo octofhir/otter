@@ -544,12 +544,13 @@ mod arm64 {
 
     /// Decompress a 4-byte object property slot (zero-extended in `x17`) into a
     /// full tagged `Value`, in place in `x17`. Small-int / cell-ref / immediate /
-    /// function-id decode inline; a `TAG_BOXED` slot (a heap-boxed number) side
-    /// exits to `deopt`, where the interpreter reads the box. Fixed registers
-    /// (the `#imm` forms need literal registers): `x17` slot in/out, `x16` scratch.
-    fn emit_decompress_slot(ops: &mut Assembler, deopt: DynamicLabel) {
+    /// function-id decode inline; a `TAG_BOXED` slot reads the heap-number box's
+    /// raw value bits. Fixed registers (the `#imm` forms need literal
+    /// registers): `x17` slot in/out, `x16` scratch.
+    fn emit_decompress_slot(ops: &mut Assembler, view: &JitFunctionView, deopt: DynamicLabel) {
         use otter_vm::value::compressed as cslot;
         debug_assert_eq!(cslot::TAG_MASK, 0b111);
+        debug_assert_eq!(cslot::TAG_BOXED, 0b010);
         debug_assert_eq!(
             (
                 cslot::IMM_NULL,
@@ -561,6 +562,7 @@ mod arm64 {
         );
         let l_smi = ops.new_dynamic_label();
         let l_cell = ops.new_dynamic_label();
+        let l_boxed = ops.new_dynamic_label();
         let l_imm = ops.new_dynamic_label();
         let l_fid = ops.new_dynamic_label();
         let l_undef = ops.new_dynamic_label();
@@ -578,10 +580,25 @@ mod arm64 {
             ; b.eq =>l_imm
             ; cmp w16, #0x6                             // 110 → function id
             ; b.eq =>l_fid
-            ; b =>deopt                                 // 010 → boxed number
+            ; cmp w16, #0x2                             // 010 → boxed number
+            ; b.eq =>l_boxed
+            ; b =>deopt
             ; =>l_cell
             ; cbz x17, =>l_undef                        // empty slot → undefined
             ; b =>l_done                                // cell ref = zero-extended offset
+            ; =>l_boxed
+            ; and w17, w17, #0xfffffff8
+            ; mov w17, w17
+        );
+        emit_load_u64(ops, 16, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x16, x16, x17
+            ; ldrb w17, [x16]
+            ; cmp w17, u32::from(view.heap_number_type_tag)
+            ; b.ne =>deopt
+            ; ldr x17, [x16, view.heap_number_bits_byte]
+            ; b =>l_done
             ; =>l_smi
             ; asr w17, w17, #1
             ; mov w17, w17
@@ -2333,7 +2350,7 @@ mod arm64 {
             ; cbz x4, =>exit
             ; ldr w17, [x4, method_value_byte]   // 4-byte compressed slot
         );
-        emit_decompress_slot(ops, exit);
+        emit_decompress_slot(ops, view, exit);
         dynasm!(ops
             ; .arch aarch64
             ; mov x5, x17
@@ -2921,7 +2938,7 @@ mod arm64 {
                     ; cbz x3, =>exit
                     ; ldr w17, [x3, *method_value_byte]  // 4-byte compressed slot
                 );
-                emit_decompress_slot(ops, exit);
+                emit_decompress_slot(ops, view, exit);
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov x4, x17
@@ -3023,7 +3040,7 @@ mod arm64 {
                     ; cbz x3, =>miss
                     ; ldr w17, [x3, *method_value_byte]  // 4-byte compressed slot
                 );
-                emit_decompress_slot(ops, miss);
+                emit_decompress_slot(ops, view, miss);
                 dynasm!(ops
                     ; .arch aarch64
                     ; mov x4, x17
@@ -3087,7 +3104,7 @@ mod arm64 {
                         ; .arch aarch64
                         ; ldr w17, [x16, slot_byte]        // 4-byte compressed slot
                     );
-                    emit_decompress_slot(ops, exit);
+                    emit_decompress_slot(ops, view, exit);
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())
@@ -3163,7 +3180,7 @@ mod arm64 {
                         ; .arch aarch64
                         ; ldr w17, [x16, *slot_byte]       // 4-byte compressed slot
                     );
-                    emit_decompress_slot(ops, exit);
+                    emit_decompress_slot(ops, view, exit);
                     store_loc(ops, loc, box_scratch);
                 }
                 Ok(())
@@ -3306,6 +3323,38 @@ mod arm64 {
                 let vrepr = graph.node(*value).kind.repr();
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 let slot_byte = *value_byte;
+                if matches!(vrepr, Repr::Float64) {
+                    box_into_gp(ops, box_scratch, Repr::Float64, vloc, MOVE_SCRATCH);
+                    dynasm!(ops ; .arch aarch64 ; fmov d7, x17);
+                    load_loc(ops, box_scratch, oloc);
+                    dynasm!(ops ; .arch aarch64 ; mov W(MOVE_SCRATCH), W(box_scratch));
+                    emit_load_u64(ops, box_scratch, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x16, x16, X(box_scratch)     // receiver header
+                    );
+                    crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr w17, [x16, slot_byte]        // existing compressed slot
+                        ; and w16, w17, #0x7
+                        ; cmp w16, #0x2                    // boxed number
+                        ; b.ne =>exit
+                        ; and w17, w17, #0xfffffff8
+                        ; mov w17, w17
+                    );
+                    emit_load_u64(ops, 16, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x16, x16, x17                // heap-number header
+                        ; ldrb w17, [x16]
+                        ; cmp w17, u32::from(view.heap_number_type_tag)
+                        ; b.ne =>exit
+                        ; fmov x17, d7
+                        ; str x17, [x16, view.heap_number_bits_byte]
+                    );
+                    return Ok(());
+                }
                 // Box the value into x17. Float boxing uses the FP load scratch +
                 // x16; int32 boxing inserts the tag with `movk` (the producer
                 // zeroed bits 63:32); a `Tagged` value is already boxed.
@@ -3400,7 +3449,7 @@ mod arm64 {
                         ; .arch aarch64
                         ; ldr w17, [x16, *slot_byte]       // 4-byte compressed slot
                     );
-                    emit_decompress_slot(ops, exit);
+                    emit_decompress_slot(ops, view, exit);
                     if let Some(loc) = dst {
                         store_loc(ops, loc, box_scratch);
                     }
@@ -4181,6 +4230,8 @@ mod tests {
             object_inline_slot_cap: 2,
             gc_barrier: Default::default(),
             jit_proto_byte: 12,
+            heap_number_type_tag: 0x30,
+            heap_number_bits_byte: 8,
             closure_fid_byte: 8,
             closure_upvalues_ptr_byte: 16,
             collection_layout: Default::default(),

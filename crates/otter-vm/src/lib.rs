@@ -1772,6 +1772,32 @@ impl Interpreter {
     /// normally; `Ok(Some(popped))` when the JIT ran and the callee returned,
     /// where `popped` mirrors [`Self::return_running_finally`] (`Some(v)` means
     /// the return unwound the dispatch entry and the loop should yield `v`).
+    fn trace_jit_bail(
+        context: &ExecutionContext,
+        fid: u32,
+        kind: &str,
+        osr_pc: Option<u32>,
+        pc: u32,
+    ) {
+        if std::env::var_os("OTTER_JIT_TRACE").is_none() {
+            return;
+        }
+        let function_name = context
+            .function(fid)
+            .map(|function| function.name.as_str())
+            .unwrap_or("<unknown>");
+        let instr = context
+            .exec_function(fid)
+            .and_then(|function| function.instr_at_byte_pc(pc));
+        let op = instr.map(|instr| instr.op());
+        let operands = instr
+            .map(|instr| format!("{:?}", context.exec_operands(instr)))
+            .unwrap_or_else(|| "[]".to_string());
+        eprintln!(
+            "[otter-jit] {kind} bail fid {fid} {function_name} osr={osr_pc:?} pc {pc} op {op:?} operands {operands}"
+        );
+    }
+
     fn maybe_dispatch_jit(
         &mut self,
         stack: &mut HoltStack,
@@ -1783,8 +1809,10 @@ impl Interpreter {
         };
         match self.run_compiled_frame(stack, context, top_idx, &code) {
             jit::JitExecOutcome::Bailed(pc) => {
+                let fid = stack[top_idx].function_id;
+                Self::trace_jit_bail(context, fid, "entry", None, pc);
                 stack[top_idx].pc = pc;
-                self.reoptimize_arith_overflow_bail(context, stack[top_idx].function_id, pc);
+                self.reoptimize_arith_overflow_bail(context, fid, pc);
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => {
@@ -1951,6 +1979,7 @@ impl Interpreter {
                 // loop, continue through cold epilogue/outer-loop code, and bail
                 // there; that should not permanently suppress the header on the
                 // next hot iteration.
+                Self::trace_jit_bail(context, fid, "osr", Some(osr_pc), pc);
                 stack[top_idx].pc = pc;
                 if self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     return Ok(None);
@@ -2069,8 +2098,10 @@ impl Interpreter {
         };
         match self.run_compiled_frame(stack, context, top_idx, &code) {
             jit::JitExecOutcome::Bailed(pc) => {
+                let fid = stack[top_idx].function_id;
+                Self::trace_jit_bail(context, fid, "sync-entry", None, pc);
                 stack[top_idx].pc = pc;
-                self.reoptimize_arith_overflow_bail(context, stack[top_idx].function_id, pc);
+                self.reoptimize_arith_overflow_bail(context, fid, pc);
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => Ok(Some(value)),
@@ -16360,6 +16391,8 @@ mod tests {
             object_inline_slot_cap: 0,
             gc_barrier: jit::JitGcBarrierLayout::default(),
             jit_proto_byte: 0,
+            heap_number_type_tag: 0,
+            heap_number_bits_byte: 0,
             closure_fid_byte: 0,
             closure_upvalues_ptr_byte: 0,
             collection_layout: jit::JitCollectionLayout::default(),

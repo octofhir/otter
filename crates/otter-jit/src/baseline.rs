@@ -1124,6 +1124,25 @@ pub(crate) extern "C" fn jit_store_property_stub_optimizing(ctx: *mut JitCtx, by
     }
 }
 
+/// Bridge stub: run a full `LoadProperty` (cold / polymorphic / megamorphic
+/// miss, prototype walk, accessor) for a site the optimizing tier could not
+/// inline, decoding operands at `byte_pc`. The VM writes the result into the
+/// destination frame slot. Returns `0` on success, `1` when the load threw.
+pub(crate) extern "C" fn jit_load_property_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_runtime_load_property_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Bridge stub: materialize a string literal for `LoadString` from compiled
 /// code. The VM decodes the constant index at `byte_pc` and serves it from the
 /// traced per-context constant cache.

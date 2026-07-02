@@ -988,13 +988,35 @@ impl<'a> Builder<'a> {
                             block,
                             byte_pc,
                         )
-                    } else {
+                    } else if self.is_osr_target() {
+                        // An OSR-entry compile already speculates numeric on
+                        // arithmetic with empty feedback (`allow_empty_feedback_for_osr`);
+                        // a no-feedback property load has no shape to warm those
+                        // sites, so declining here keeps the whole function on the
+                        // interpreter until it tiers up from its function entry with
+                        // real feedback, rather than compiling a body whose loads
+                        // feed unguarded OSR speculation.
                         self.deopt_or_decline(
                             block,
                             byte_pc,
                             Unsupported::Opcode(Op::LoadProperty),
                         )?;
                         return Ok(());
+                    } else {
+                        // No inline-cacheable shape feedback (a site cold at
+                        // compile time, or a polymorphic / megamorphic miss): run
+                        // the full runtime load through the bridge so a caller body
+                        // that reads such a site still compiles instead of
+                        // declining the whole function. The receiver stays live
+                        // (materialized by the call safepoint) for the bridge to
+                        // re-decode; the result reloads into `dst`.
+                        let node = self
+                            .graph
+                            .add_node(NodeKind::LoadPropertyGeneric, block, byte_pc);
+                        self.graph.set_frame_dst(node, dst);
+                        self.push_body(block, node);
+                        self.def_register(dst, block, node, byte_pc);
+                        continue;
                     };
                     self.graph.set_frame_dst(load, dst);
                     self.push_body(block, load);

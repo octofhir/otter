@@ -424,6 +424,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::StoreGlobalBinding { .. }
             | NodeKind::LoadElement(_, _)

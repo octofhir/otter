@@ -339,7 +339,8 @@ mod arm64 {
         UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
         VALUE_UNDEFINED, VM_OFFSET, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
         jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
-        jit_call_method_stub_optimizing, jit_load_global_stub_optimizing, jit_load_string_stub,
+        jit_call_method_stub_optimizing, jit_load_global_stub_optimizing,
+        jit_load_property_stub_optimizing, jit_load_string_stub,
         jit_new_array_stub,
         jit_number_to_string_fast_stub, jit_prepare_direct_call_stub, otter_jit_fmod,
         jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_global_stub_optimizing,
@@ -3627,6 +3628,42 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
+            NodeKind::LoadPropertyGeneric => {
+                let point = frames.get(&nid).ok_or(Unsupported::Unlowered(
+                    "load property without safepoint state",
+                ))?;
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("load property without frame dst"))?;
+                // Full materialize: the bridge re-reads the receiver register from
+                // the frame slot, so a receiver whose home is an unboxed slot must
+                // be boxed there, not only the tagged (GC-root) subset. The full
+                // reload after the call restores every live value (including an
+                // unboxed int32 / f64 held in a caller-saved home clobbered by the
+                // bridge) from its frame slot, so no value has to survive the call
+                // in a register.
+                emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                emit_load_u64(ops, 1, u64::from(node.byte_pc));
+                emit_load_u64(ops, 16, jit_load_property_stub_optimizing as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.registers.iter().any(|&(r, _)| r == dst_reg)

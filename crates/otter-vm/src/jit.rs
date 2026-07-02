@@ -571,6 +571,14 @@ pub struct JitInstrView {
     /// [`property_feedback`] instead) and for megamorphic / prototype / dictionary
     /// sites. Baked by `Interpreter::bake_property_feedback`.
     pub property_feedback_poly: Vec<(u32, u32)>,
+    /// Monomorphic direct-prototype data-property feedback for a `LoadProperty`
+    /// site: `Some((receiver_shape_offset, prototype_shape_offset, slot_byte))`
+    /// when the receiver shape and its direct prototype were observed resolving
+    /// the named data property from the prototype's slot. The optimizing tier
+    /// lowers this to receiver/prototype shape guards plus an inline prototype
+    /// slot load. `None` for non-load ops and for own-data, polymorphic,
+    /// dictionary, accessor, and deeper-prototype sites.
+    pub property_proto_feedback: Option<(u32, u32, u32)>,
     /// For a `NewObject` that begins an object literal (`{ k: v, … }` with
     /// constant string keys), the plan to allocate it directly in its final
     /// hidden class instead of running per-property shape transitions. `None`

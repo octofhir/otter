@@ -3280,12 +3280,11 @@ impl Interpreter {
         }
     }
 
-    /// Copy each monomorphic own-data property IC into the compile snapshot as
-    /// `(shape_offset, slot_byte)`, so the optimizing tier can lower a
-    /// `LoadProperty` / `StoreProperty` to a shape guard plus an inline slot
-    /// access. Only a single-entry own-data site qualifies; everything else
-    /// (polymorphic, megamorphic, prototype, dictionary) stays `None` and lowers
-    /// through the property bridge.
+    /// Copy JIT-readable property IC cases into the compile snapshot. Own-data
+    /// loads/stores bake as receiver-shape slot accesses; a single direct
+    /// prototype data load bakes as receiver/prototype shape guards plus the
+    /// prototype slot. Megamorphic, accessor, dictionary, mixed, and deeper
+    /// prototype sites stay empty and lower through the property bridge.
     fn bake_property_feedback(&self, view: &mut jit::JitFunctionView) {
         // Byte size of one compressed slot — a `hit.slot` index scales by this to
         // the value's byte offset inside the object's value slab.
@@ -3330,15 +3329,45 @@ impl Interpreter {
                 Some([one]) => {
                     instr.property_feedback = Some(*one);
                     instr.property_feedback_poly = Vec::new();
+                    instr.property_proto_feedback = None;
                 }
                 Some(many) if (2..=MAX_POLY_PROPERTY_CASES).contains(&many.len()) => {
                     instr.property_feedback = None;
                     instr.property_feedback_poly = many.to_vec();
+                    instr.property_proto_feedback = None;
                 }
                 _ => {
                     instr.property_feedback = None;
                     instr.property_feedback_poly = Vec::new();
+                    instr.property_proto_feedback = None;
                 }
+            }
+
+            if !matches!(instr.op, otter_bytecode::Op::LoadProperty)
+                || instr.property_feedback.is_some()
+                || !instr.property_feedback_poly.is_empty()
+            {
+                continue;
+            }
+
+            let proto_cases = self.load_property_ics.get(site).map(|e| {
+                e.entries()
+                    .iter()
+                    .map(|stub| {
+                        stub.direct_prototype_load_jit().map(|(recv_shape, hit)| {
+                            (
+                                recv_shape.offset(),
+                                hit.shape.offset(),
+                                u32::from(hit.slot) * SLOT_BYTES,
+                            )
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()
+            });
+            if let Some(Some(proto_cases)) = proto_cases
+                && let [one] = proto_cases.as_slice()
+            {
+                instr.property_proto_feedback = Some(*one);
             }
         }
     }
@@ -11415,6 +11444,7 @@ mod tests {
             arith_feedback: 0,
             property_feedback: None,
             property_feedback_poly: Vec::new(),
+            property_proto_feedback: None,
             object_literal: None,
         }
     }
@@ -16348,6 +16378,7 @@ mod tests {
                     arith_feedback: 0,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
+                    property_proto_feedback: None,
                     object_literal: None,
                 })
                 .collect(),

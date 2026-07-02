@@ -150,9 +150,9 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
 /// materializing and reloading the interpreter frame.
 ///
 /// The subset is exactly the non-allocating ops. Beyond the typed-arithmetic
-/// and constant nodes, it admits the primitive slot accesses
-/// (`CheckShape` / `LoadSlot` / `StoreSlot`): a body restricted to these reads
-/// and writes already-allocated objects' primitive fields, so it allocates
+/// and constant nodes, it admits the primitive slot accesses (`CheckShape` /
+/// `LoadSlot` / `LoadProtoSlot` / `StoreSlot`): a body restricted to these
+/// reads and writes already-allocated objects' primitive fields, so it allocates
 /// nothing. No GC can move the tagged receivers held live across the recursive
 /// call, and a primitive `StoreSlot` needs no generational write barrier —
 /// which is what makes the frameless self-call (no spill / reload around the
@@ -186,6 +186,7 @@ pub(super) fn graph_allows_frameless_self_call(graph: &Graph) -> bool {
                     | NodeKind::Int32Compare(_, _, _)
                     | NodeKind::CheckShape(_, _)
                     | NodeKind::LoadSlot(_, _)
+                    | NodeKind::LoadProtoSlot { .. }
                     | NodeKind::StoreSlot(_, _, _)
                     | NodeKind::Call { .. }
             )
@@ -751,6 +752,7 @@ impl<'a> Builder<'a> {
             let load_array_length = instr.load_array_length;
             let property_feedback = instr.property_feedback;
             let property_feedback_poly = instr.property_feedback_poly.clone();
+            let property_proto_feedback = instr.property_proto_feedback;
             let property_ic_site = instr.property_ic_site;
             let object_literal = instr.object_literal.clone();
             let operands = instr.operands.clone();
@@ -870,10 +872,10 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
                 }
-                // `LoadProperty dst, obj, name` — lower a monomorphic own-data
-                // site to a `CheckShape` guard plus an inline `LoadSlot`. A site
-                // without baked own-data feedback (polymorphic / prototype /
-                // dictionary / never observed) bails the function.
+                // `LoadProperty dst, obj, name` — lower baked IC feedback into
+                // inline slot access. Own-data sites become receiver shape
+                // guards; simple direct-prototype data sites become receiver and
+                // prototype guards; unsupported sites bail to the interpreter.
                 Op::LoadProperty => {
                     let dst = reg(&operands, 0)?;
                     let obj_reg = reg(&operands, 1)?;
@@ -914,6 +916,19 @@ impl<'a> Builder<'a> {
                         self.push_body(block, checked);
                         self.graph
                             .add_node(NodeKind::LoadSlot(checked, slot_byte), block, byte_pc)
+                    } else if let Some((recv_shape, proto_shape, slot_byte)) =
+                        property_proto_feedback
+                    {
+                        self.graph.add_node(
+                            NodeKind::LoadProtoSlot {
+                                recv: obj,
+                                recv_shape,
+                                proto_shape,
+                                slot_byte,
+                            },
+                            block,
+                            byte_pc,
+                        )
                     } else if !property_feedback_poly.is_empty() {
                         // Polymorphic: an inline structure-guard chain over the
                         // baked `(shape, slot)` cases, deopt on the final miss.
@@ -2765,6 +2780,7 @@ mod tests {
                 load_number: None,
                 property_feedback: None,
                 property_feedback_poly: Vec::new(),
+                property_proto_feedback: None,
                 object_literal: None,
                 arith_feedback: *fb,
             })
@@ -2849,6 +2865,7 @@ mod tests {
                         load_number: None,
                         property_feedback: None,
                         property_feedback_poly: Vec::new(),
+                        property_proto_feedback: None,
                         object_literal: None,
                         arith_feedback: ARITH_INT32,
                     },
@@ -2863,6 +2880,7 @@ mod tests {
                         load_number: None,
                         property_feedback: None,
                         property_feedback_poly: Vec::new(),
+                        property_proto_feedback: None,
                         object_literal: None,
                         arith_feedback: 0,
                     },
@@ -2904,6 +2922,7 @@ mod tests {
                     load_number: None,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
+                    property_proto_feedback: None,
                     object_literal: None,
                     arith_feedback: 0,
                 },
@@ -2918,6 +2937,7 @@ mod tests {
                     load_number: None,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
+                    property_proto_feedback: None,
                     object_literal: None,
                     arith_feedback: 0,
                 },
@@ -2932,6 +2952,7 @@ mod tests {
                     load_number: None,
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
+                    property_proto_feedback: None,
                     object_literal: None,
                     arith_feedback: 0,
                 },
@@ -3034,6 +3055,7 @@ mod tests {
             load_number: None,
             property_feedback: None,
             property_feedback_poly: Vec::new(),
+            property_proto_feedback: None,
             object_literal: None,
             arith_feedback: fb,
         }

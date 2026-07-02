@@ -307,6 +307,21 @@ pub enum NodeKind {
     /// Pure (no deopt, no allocation); the preceding `CheckShape` established the
     /// receiver shape. Result [`Repr::Tagged`].
     LoadSlot(NodeId, u32),
+    /// Direct-prototype data-property load. Input is the receiver; the baked
+    /// metadata carries receiver shape, prototype shape, and the prototype slot
+    /// byte offset. Lowered as object/prototype guards followed by an inline
+    /// prototype slab load; any miss deoptimizes at the load's exact PC. Result
+    /// [`Repr::Tagged`].
+    LoadProtoSlot {
+        /// Receiver object/value.
+        recv: NodeId,
+        /// Expected receiver shape-handle compressed offset.
+        recv_shape: u32,
+        /// Expected direct-prototype shape-handle compressed offset.
+        proto_shape: u32,
+        /// Byte offset of the property slot in the prototype value slab.
+        slot_byte: u32,
+    },
     /// Store a value into a fixed byte offset within a shape-guarded receiver's
     /// value slab. Inputs `(receiver, value)`; the value is always a primitive
     /// (int32 / f64 / bool), so the stored `Value` is never a `Gc` pointer and no
@@ -419,6 +434,7 @@ impl NodeKind {
             | NodeKind::TaggedIsNull { value: a, .. }
             | NodeKind::CheckShape(a, _)
             | NodeKind::LoadSlot(a, _)
+            | NodeKind::LoadProtoSlot { recv: a, .. }
             | NodeKind::InlineUpvalue { closure: a, .. }
             | NodeKind::Float64Unary(_, a)
             | NodeKind::LoadArrayLength(a) => {
@@ -489,6 +505,7 @@ impl NodeKind {
             | NodeKind::TaggedIsNull { value: a, .. }
             | NodeKind::CheckShape(a, _)
             | NodeKind::LoadSlot(a, _)
+            | NodeKind::LoadProtoSlot { recv: a, .. }
             | NodeKind::InlineUpvalue { closure: a, .. }
             | NodeKind::Float64Unary(_, a)
             | NodeKind::LoadArrayLength(a) => fix(a),
@@ -597,6 +614,7 @@ impl NodeKind {
             | NodeKind::CheckMethodIdentity { .. }
             | NodeKind::CheckShape(_, _)
             | NodeKind::LoadSlot(_, _)
+            | NodeKind::LoadProtoSlot { .. }
             | NodeKind::StoreSlot(_, _, _)
             | NodeKind::LoadSlotPoly(_, _)
             | NodeKind::StoreSlotPoly(_, _, _)

@@ -173,6 +173,12 @@ pub enum NodeKind {
     /// `f64 <cmp> f64`. Result [`Repr::Bool`]. IEEE ordered comparison
     /// (a `NaN` operand yields `false` for every relation, matching JS).
     Float64Compare(CmpOp, NodeId, NodeId),
+    /// Allocate an array literal by materializing the frame and delegating to the
+    /// VM's rooted `NewArray` path for the bytecode instruction. The runtime
+    /// helper decodes the source registers from the bytecode and writes the
+    /// result to the instruction's destination frame slot. Result
+    /// [`Repr::Tagged`].
+    NewArray,
     /// Nullish identity check against the boxed `null` (and, when `nullish`,
     /// `undefined`) immediate. With `nullish=false` this is strict `value ===
     /// null` (`negate=true` → `!== null`). With `nullish=true` it matches `null`
@@ -469,6 +475,7 @@ impl NodeKind {
             | NodeKind::ConstNull
             | NodeKind::SelfClosure
             | NodeKind::LoadUpvalue(_)
+            | NodeKind::NewArray
             | NodeKind::LoadThis
             | NodeKind::LoadHole => Vec::new(),
             NodeKind::Call { inputs, .. } => inputs.clone(),
@@ -543,6 +550,7 @@ impl NodeKind {
             NodeKind::LoadThis
             | NodeKind::LoadHole
             | NodeKind::LoadUpvalue(_)
+            | NodeKind::NewArray
             | NodeKind::Param(_)
             | NodeKind::ConstInt32(_)
             | NodeKind::ConstF64(_)
@@ -607,6 +615,7 @@ impl NodeKind {
             | NodeKind::SelfClosure
             | NodeKind::Phi(_)
             | NodeKind::LoadUpvalue(_)
+            | NodeKind::NewArray
             | NodeKind::Call { .. }
             | NodeKind::AllocObjectLiteral { .. }
             | NodeKind::CallMethod { .. }

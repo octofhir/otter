@@ -872,6 +872,13 @@ impl<'a> Builder<'a> {
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
                 }
+                Op::NewArray => {
+                    let dst = reg(&operands, 0)?;
+                    let node = self.graph.add_node(NodeKind::NewArray, block, byte_pc);
+                    self.graph.set_frame_dst(node, dst);
+                    self.push_body(block, node);
+                    self.def_register(dst, block, node, byte_pc);
+                }
                 // `LoadProperty dst, obj, name` — lower baked IC feedback into
                 // inline slot access. Own-data sites become receiver shape
                 // guards; simple direct-prototype data sites become receiver and

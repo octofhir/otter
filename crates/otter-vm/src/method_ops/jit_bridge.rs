@@ -12,6 +12,10 @@ use crate::holt_stack::HoltStack;
 use crate::native_abi::RuntimeStubId;
 use crate::{ExecutionContext, Interpreter, Value, VmError, read_register, write_register};
 
+fn compressed_slot_byte(slot: u16) -> u32 {
+    u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
+}
+
 impl Interpreter {
     /// JIT bridge for `CallMethodValue` (`recv.name(args…)`) from compiled code.
     ///
@@ -252,7 +256,7 @@ impl Interpreter {
         Some(crate::jit::JitArrayMethod {
             proto_offset: proto.offset(),
             proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
+            method_value_byte: compressed_slot_byte(ic.proto_slot),
             builtin_fn_addr,
             kind,
         })

@@ -201,10 +201,12 @@ fn optimizing_safepoint_records(view: &JitFunctionView) -> Box<[SafepointRecord]
         .map_or(1, |id| id.saturating_add(1))
         .max(1);
     for instr in &view.instructions {
-        if instr.op != Op::CallMethodValue {
+        if !matches!(instr.op, Op::CallMethodValue | Op::NewArray) {
             continue;
         }
-        if view.collection_alloc_methods.contains_key(&instr.byte_pc) {
+        if instr.op == Op::CallMethodValue
+            && view.collection_alloc_methods.contains_key(&instr.byte_pc)
+        {
             continue;
         }
         let safepoint = next_safepoint;
@@ -295,7 +297,7 @@ mod arm64 {
         UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
         VALUE_UNDEFINED, VM_OFFSET, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
         jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
-        jit_call_method_stub_optimizing, jit_prepare_direct_call_stub,
+        jit_call_method_stub_optimizing, jit_new_array_stub, jit_prepare_direct_call_stub,
         jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, value_tag,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -3294,6 +3296,35 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                {
+                    let off = u32::from(dst_reg) * 8;
+                    dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
+            NodeKind::NewArray => {
+                let point = frames
+                    .get(&nid)
+                    .ok_or(Unsupported::Unlowered("new array without safepoint state"))?;
+                let dst_reg = node
+                    .frame_dst
+                    .ok_or(Unsupported::Unlowered("new array without frame dst"))?;
+                emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
+                dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                emit_load_u64(ops, 1, u64::from(node.byte_pc));
+                emit_load_u64(ops, 16, jit_new_array_stub as *const () as u64);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; blr x16
+                    ; cmp x0, #1
+                    ; b.eq =>threw
+                );
+                let resume = call_resume_frames.get(&nid).unwrap_or(point);
+                emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.registers.iter().any(|&(r, _)| r == dst_reg)

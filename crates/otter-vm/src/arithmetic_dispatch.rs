@@ -212,7 +212,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_equal_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
@@ -220,6 +220,14 @@ impl Interpreter {
         negate: bool,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        // Record operand-type feedback like the relational path: a `===` / `!==`
+        // between two numbers is numeric equality, so the optimizing tier can
+        // speculate an int32 / float compare (the operand guards deopt a
+        // mismatched type). Without this a strict-equality site stays unfed and
+        // declines at tier-up.
+        if self.jit_hook.is_some() {
+            self.note_arith(lhs, rhs);
+        }
         let eq = abstract_ops::is_strictly_equal(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
         frame.advance_pc(self.current_byte_len)?;

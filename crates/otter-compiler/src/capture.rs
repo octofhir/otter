@@ -12,11 +12,12 @@
 //!   arrow / module body.
 //!
 //! # Invariants
-//! - The pre-pass is conservative: it ignores shadowing inside
-//!   nested functions, so a nested `let n` that shadows the outer
-//!   `n` may still mark the outer `n` as captured. That is harmless
-//!   (one extra cell allocated) and lets us skip per-scope shadow
-//!   tracking inside this analyzer.
+//! - Shadowing is respected: a nested function that binds its own
+//!   parameter or local of the same spelling as an outer name does
+//!   not mark that outer name as captured (its reference resolves
+//!   locally). The inner-reference walk tracks a stack of each
+//!   nested function's own names and records a reference only when no
+//!   enclosing nested function binds its name.
 //! - We never recurse across module / file boundaries — each
 //!   function body is its own analysis unit.
 
@@ -378,12 +379,40 @@ impl<'a> Visit<'a> for OwnNameCollector {
     }
 }
 
-/// Walks a function body and collects every identifier name
-/// referenced from inside any nested function (transitively).
+/// Own names (params, `arguments` for non-arrows, and top-level locals /
+/// nested declaration names) of one nested function — the bindings that
+/// shadow any equally-named outer variable within it. Excludes anything
+/// declared inside a further-nested function (that has its own scope).
+fn nested_function_own_names(
+    params: Option<&FormalParameters<'_>>,
+    body: Option<&FunctionBody<'_>>,
+    is_arrow: bool,
+) -> HashSet<String> {
+    let mut own = OwnNameCollector::default();
+    if let Some(p) = params {
+        own.visit_formal_parameters(p);
+    }
+    if !is_arrow {
+        own.names.insert("arguments".to_string());
+    }
+    if let Some(b) = body {
+        own.visit_function_body(b);
+    }
+    own.names
+}
+
+/// Walks a function body and collects the free variables of every nested
+/// function (transitively): identifier names referenced from inside a
+/// nested function that the nested function (or an intervening one) does
+/// not itself bind. A nested function whose own parameter / local shadows
+/// an outer name of the same spelling therefore does not mark that outer
+/// name as captured.
 #[derive(Default)]
 struct InnerRefCollector {
     refs: HashSet<String>,
     nested_depth: u32,
+    /// Own-name sets of the nested functions currently on the walk stack.
+    bound: Vec<HashSet<String>>,
 }
 
 /// Collects every identifier reference in a function body at any
@@ -402,20 +431,32 @@ impl<'a> Visit<'a> for AnyRefCollector {
 
 impl<'a> Visit<'a> for InnerRefCollector {
     fn visit_function(&mut self, it: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        let own = nested_function_own_names(Some(&it.params), it.body.as_deref(), false);
+        self.bound.push(own);
         self.nested_depth = self.nested_depth.saturating_add(1);
         walk::walk_function(self, it, flags);
         self.nested_depth = self.nested_depth.saturating_sub(1);
+        self.bound.pop();
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
+        let own = nested_function_own_names(Some(&it.params), Some(&it.body), true);
+        self.bound.push(own);
         self.nested_depth = self.nested_depth.saturating_add(1);
         walk::walk_arrow_function_expression(self, it);
         self.nested_depth = self.nested_depth.saturating_sub(1);
+        self.bound.pop();
     }
 
     fn visit_identifier_reference(&mut self, it: &oxc_ast::ast::IdentifierReference<'a>) {
+        // A reference is a capture of an *outer* binding only when no nested
+        // function on the walk stack binds the same name (a shadowing param
+        // or local resolves the reference locally, not to the outer scope).
         if self.nested_depth > 0 {
-            self.refs.insert(it.name.as_str().to_string());
+            let name = it.name.as_str();
+            if !self.bound.iter().any(|scope| scope.contains(name)) {
+                self.refs.insert(name.to_string());
+            }
         }
     }
 

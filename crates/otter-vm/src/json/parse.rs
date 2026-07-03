@@ -466,7 +466,7 @@ fn read_step(
                 );
             }
             // Otherwise read the first key.
-            let key = read_object_key(cursor, gc_heap)?;
+            let key = read_object_key(cursor, gc_heap, stack.as_slice(), external_visit)?;
             if let Some(Builder::Object { pending_key, .. }) = stack.last_mut() {
                 *pending_key = Some(key);
             }
@@ -504,7 +504,12 @@ fn read_step(
             }
             read_step(cursor, stack, gc_heap, external_visit, object_proto)
         }
-        b'"' => Ok(Value::string(read_string(cursor, gc_heap)?)),
+        b'"' => Ok(Value::string(read_string(
+            cursor,
+            gc_heap,
+            stack.as_slice(),
+            external_visit,
+        )?)),
         b't' => {
             consume_keyword(cursor, b"true")?;
             Ok(Value::boolean(true))
@@ -593,7 +598,7 @@ fn continue_container(
                     if matches!(cursor.peek(), Some(b'}')) {
                         return Err(ParseError::at(cursor.pos, "trailing comma"));
                     }
-                    let key = read_object_key(cursor, gc_heap)?;
+                    let key = read_object_key(cursor, gc_heap, stack.as_slice(), external_visit)?;
                     if let Some(Builder::Object { pending_key, .. }) = stack.last_mut() {
                         *pending_key = Some(key);
                     }
@@ -674,16 +679,53 @@ fn finish_builder(
             };
             let mut obj = crate::object::alloc_object_with_roots(gc_heap, &mut roots)
                 .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
-            for (k, v) in entries {
-                crate::object::set(&mut obj, gc_heap, &k, v);
+            // Filling each property transitions the hidden class and can grow the
+            // value slab — an allocation that may collect. The object being
+            // filled, the values not yet installed, and the enclosing builder
+            // stack live only in Rust locals, so root them in place for the
+            // duration (the object's `Gc` handle is `repr(transparent)` over its
+            // compressed offset, so the collector rewrites `obj` through the slot
+            // it is traced by — the same in-place rooting the interpreter frame
+            // registers use across an allocating opcode).
+            struct ObjectBuildRoots {
+                obj: *mut crate::object::JsObject,
+                entries: *const Vec<(String, Value)>,
+                stack: *const [Builder],
+            }
+            impl otter_gc::ExtraRootSource for ObjectBuildRoots {
+                fn visit_extra_roots(
+                    &self,
+                    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+                ) {
+                    // SAFETY: the source outlives its registration (popped below),
+                    // and only the STW collector reads it, while the mutator is
+                    // paused inside an allocation.
+                    unsafe {
+                        visitor(self.obj.cast::<otter_gc::raw::RawGc>());
+                        for (_, value) in &*self.entries {
+                            value.trace_value_slots(visitor);
+                        }
+                        trace_builder_stack(&*self.stack, visitor);
+                    }
+                }
+            }
+            let build_roots = ObjectBuildRoots {
+                obj: &mut obj,
+                entries: &entries,
+                stack,
+            };
+            let depth = gc_heap.push_extra_roots(otter_gc::ExtraRoots::new(&build_roots));
+            for (k, v) in &entries {
+                crate::object::set(&mut obj, gc_heap, k, *v);
             }
             // Install the realm `%Object.prototype%` at construction time when the
             // caller supplied it, after the own keys are defined so an own
-            // `"__proto__"` data property is preserved (§25.5.1). This replaces a
-            // separate post-parse tree walk over the whole result.
+            // `"__proto__"` data property is preserved (§25.5.1). Kept inside the
+            // root scope: setting the prototype can transition the shape too.
             if let Some(proto) = object_proto {
                 crate::object::set_prototype_value(obj, gc_heap, Some(proto));
             }
+            gc_heap.pop_extra_roots_to(depth - 1);
             Ok(Value::object(obj))
         }
     }
@@ -719,6 +761,8 @@ fn consume_keyword(cursor: &mut Cursor<'_>, keyword: &[u8]) -> Result<(), ParseE
 fn read_object_key(
     cursor: &mut Cursor<'_>,
     heap: &mut otter_gc::GcHeap,
+    stack: &[Builder],
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<String, ParseError> {
     if cursor.peek() != Some(b'"') {
         return Err(ParseError::at(
@@ -741,7 +785,7 @@ fn read_object_key(
     }
     // Escape / control / unterminated: defer to the full string reader,
     // which decodes escapes (and reports the precise error) identically.
-    let s = read_string(cursor, heap)?;
+    let s = read_string(cursor, heap, stack, external_visit)?;
     Ok(s.to_lossy_string(heap))
 }
 
@@ -832,6 +876,8 @@ fn read_number(cursor: &mut Cursor<'_>) -> Result<NumberValue, ParseError> {
 fn read_string(
     cursor: &mut Cursor<'_>,
     heap: &mut otter_gc::GcHeap,
+    stack: &[Builder],
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsString, ParseError> {
     debug_assert_eq!(cursor.peek(), Some(b'"'));
     cursor.pos += 1;
@@ -846,18 +892,27 @@ fn read_string(
     if b == b'"' {
         let slice = &cursor.bytes[start..cursor.pos];
         cursor.pos += 1;
+        // The string body allocation can collect, so the in-progress builder
+        // stack (partially built arrays / objects whose parsed children live
+        // only in Rust-side `Vec`s until the container closes) must be exposed
+        // as roots, or a moving GC leaves the finished container with dangling
+        // element / property pointers.
+        let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            external_visit(visitor);
+            trace_builder_stack(stack, visitor);
+        };
         // Escape-free common case. An all-ASCII span is valid UTF-8 by
         // construction and maps one byte per Latin-1 code unit, so build the
         // body straight from the bytes — skipping both the `from_utf8`
         // validation here and the redundant ASCII re-scan inside `from_str`.
         // A span carrying high bytes still needs UTF-8 validation first.
         if slice.is_ascii() {
-            return JsString::from_latin1(slice, heap)
+            return JsString::from_latin1_with_roots(slice, heap, &mut roots)
                 .map_err(|_| ParseError::at(start, "out of memory while interning string"));
         }
         let text = std::str::from_utf8(slice)
             .map_err(|_| ParseError::at(start, "invalid utf-8 in string"))?;
-        return JsString::from_str(text, heap)
+        return JsString::from_str_with_roots(text, heap, &mut roots)
             .map_err(|_| ParseError::at(start, "out of memory while interning string"));
     }
     if b < 0x20 {
@@ -866,13 +921,15 @@ fn read_string(
     debug_assert_eq!(b, b'\\');
     // Slow path: fall back to a WTF-16 builder seeded with the
     // already-consumed prefix.
-    read_string_with_escapes(cursor, start, heap)
+    read_string_with_escapes(cursor, start, heap, stack, external_visit)
 }
 
 fn read_string_with_escapes(
     cursor: &mut Cursor<'_>,
     plain_start: usize,
     heap: &mut otter_gc::GcHeap,
+    stack: &[Builder],
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsString, ParseError> {
     // Lift the plain prefix into a UTF-16 buffer. Bytes between
     // `plain_start` and `cursor.pos` are guaranteed ASCII (we'd
@@ -887,9 +944,13 @@ fn read_string_with_escapes(
         match b {
             b'"' => {
                 cursor.pos += 1;
-                return JsString::from_utf16_units(&buf, heap).map_err(|_| {
-                    ParseError::at(plain_start, "out of memory while interning string")
-                });
+                let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    external_visit(visitor);
+                    trace_builder_stack(stack, visitor);
+                };
+                return JsString::from_utf16_units_with_roots(&buf, heap, &mut roots).map_err(
+                    |_| ParseError::at(plain_start, "out of memory while interning string"),
+                );
             }
             b'\\' => {
                 cursor.pos += 1;

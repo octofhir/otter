@@ -349,17 +349,74 @@ pub fn bytecode_liveness(view: &JitFunctionView) -> FxHashMap<u32, FxHashSet<u16
         .collect()
 }
 
-/// One guard's deopt frame state: the bytecode PC to resume the interpreter at,
-/// and the SSA value to box and store into each live interpreter register before
-/// resuming. Built by [`capture_frame_states`].
+/// One interpreter frame in a deopt state: which function, the byte-PC to resume
+/// it at, the SSA value to box into each live register, and (for an inlined
+/// callee frame) the parent register that receives this frame's return value.
+///
+/// A non-inlined guard produces a single frame (the compiled function itself).
+/// A guard inside an inlined callee produces a stack: the outermost frame is the
+/// compiled function resuming *after* the inlined call, and each inner frame is a
+/// callee resuming mid-execution at its own PC, its `return_reg` naming the
+/// parent register the interpreter writes when that callee returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeoptFrame {
+    /// Function id this frame executes. The outermost frame is the compiled
+    /// function; inner frames are inlined callees.
+    pub function_id: u32,
+    /// Bytecode byte-PC the interpreter resumes this frame at.
+    pub byte_pc: u32,
+    /// `(register, value)` pairs for every register live at `byte_pc` in this
+    /// frame, ascending by register. The deopt exit materializes each value
+    /// (boxed to its tagged representation) into that frame's register slot.
+    pub registers: Vec<(u16, NodeId)>,
+    /// For an inlined callee frame, the register in the *parent* frame that
+    /// receives this frame's return value when it completes. `None` for the
+    /// outermost (compiled-function) frame.
+    pub return_reg: Option<u16>,
+}
+
+/// One guard's deopt frame state: the interpreter frame stack to reconstruct
+/// before resuming. Outermost (compiled function) first, innermost (deepest
+/// inlined callee, where the guard actually is) last. Built by
+/// [`capture_frame_states`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeoptPoint {
-    /// Bytecode byte-PC the interpreter resumes at when this guard fails.
-    pub byte_pc: u32,
-    /// `(register, value)` pairs for every register live at `byte_pc`, ascending
-    /// by register. The deopt exit materializes each value (boxed to its tagged
-    /// representation) into the frame slot for that register.
-    pub registers: Vec<(u16, NodeId)>,
+    /// Frames from outermost (compiled fn) to innermost (deopting callee).
+    pub frames: Vec<DeoptFrame>,
+}
+
+impl DeoptPoint {
+    /// A single-frame (non-inlined) deopt state for the compiled function `fid`.
+    pub fn single(fid: u32, byte_pc: u32, registers: Vec<(u16, NodeId)>) -> Self {
+        DeoptPoint {
+            frames: vec![DeoptFrame {
+                function_id: fid,
+                byte_pc,
+                registers,
+                return_reg: None,
+            }],
+        }
+    }
+
+    /// The compiled function's own frame (outermost), materialized into the live
+    /// frame window (`[x19]`).
+    #[must_use]
+    pub fn top(&self) -> &DeoptFrame {
+        &self.frames[0]
+    }
+
+    /// The innermost frame's resume byte-PC — where the interpreter re-enters.
+    #[must_use]
+    pub fn resume_pc(&self) -> u32 {
+        self.frames.last().map_or(0, |f| f.byte_pc)
+    }
+
+    /// Every SSA value referenced by any frame's live registers.
+    pub fn values(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.frames
+            .iter()
+            .flat_map(|f| f.registers.iter().map(|&(_, v)| v))
+    }
 }
 
 /// Reverse-postorder block ordering of `graph` (iterative DFS from the entry).
@@ -529,10 +586,9 @@ pub fn capture_frame_states(
                         }
                     }
                 }
-                points.entry(nid).or_insert(DeoptPoint {
-                    byte_pc: pc,
-                    registers,
-                });
+                points
+                    .entry(nid)
+                    .or_insert(DeoptPoint::single(graph.function_id, pc, registers));
             }
         }
         // Apply the remaining rebinds to form the block-exit environment that
@@ -628,10 +684,9 @@ pub fn capture_call_resume_states(
                         }
                     }
                 }
-                points.entry(nid).or_insert(DeoptPoint {
-                    byte_pc: pc,
-                    registers,
-                });
+                points
+                    .entry(nid)
+                    .or_insert(DeoptPoint::single(graph.function_id, pc, registers));
             }
         }
         while wi < writes.len() {
@@ -658,21 +713,13 @@ pub fn capture_call_resume_states(
 pub fn merge_frame_state_uses<'a>(
     maps: impl IntoIterator<Item = &'a FxHashMap<NodeId, DeoptPoint>>,
 ) -> FxHashMap<NodeId, DeoptPoint> {
+    // The input maps key disjoint node kinds (guard nodes vs call-resume nodes),
+    // so a node appears in at most one map with its full frame stack — a union
+    // by node preserves every frame's live values.
     let mut merged = FxHashMap::default();
     for map in maps {
         for (&node, point) in map {
-            let entry = merged.entry(node).or_insert_with(|| point.clone());
-            for &(reg, value) in &point.registers {
-                if !entry
-                    .registers
-                    .iter()
-                    .any(|&(existing_reg, existing_value)| {
-                        existing_reg == reg && existing_value == value
-                    })
-                {
-                    entry.registers.push((reg, value));
-                }
-            }
+            merged.entry(node).or_insert_with(|| point.clone());
         }
     }
     merged
@@ -829,13 +876,7 @@ pub fn capture_deopt_terminators(
                     }
                 }
             }
-            out.insert(
-                b,
-                DeoptPoint {
-                    byte_pc: *pc,
-                    registers,
-                },
-            );
+            out.insert(b, DeoptPoint::single(graph.function_id, *pc, registers));
         }
         exit_env[b as usize] = Some(env);
     }
@@ -850,7 +891,7 @@ pub fn capture_deopt_terminators(
 pub fn deopt_value_uses(frames: &FxHashMap<NodeId, DeoptPoint>) -> FxHashMap<NodeId, Vec<NodeId>> {
     frames
         .iter()
-        .map(|(&nid, point)| (nid, point.registers.iter().map(|&(_, v)| v).collect()))
+        .map(|(&nid, point)| (nid, point.values().collect()))
         .collect()
 }
 
@@ -1030,10 +1071,10 @@ mod tests {
             .map(|(id, _)| id as NodeId)
             .expect("header comparison has an int32 guard");
         let point = &points[&header_guard];
-        assert_eq!(point.byte_pc, 2 * STRIDE);
+        assert_eq!(point.resume_pc(), 2 * STRIDE);
 
         let regs: std::collections::HashMap<u16, NodeId> =
-            point.registers.iter().copied().collect();
+            point.top().registers.iter().copied().collect();
         // r0 = n restores the parameter; r1 = i and r2 = acc restore header phis.
         assert!(
             matches!(g.node(regs[&0]).kind, NodeKind::Param(0)),

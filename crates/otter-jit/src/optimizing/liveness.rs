@@ -126,7 +126,7 @@ pub fn analyze(
             }
         }
         if let Some(dp) = block_deopts.get(&(b as BlockId)) {
-            for &(_, v) in &dp.registers {
+            for v in dp.values() {
                 if !d.contains(&v) {
                     u.insert(v);
                 }

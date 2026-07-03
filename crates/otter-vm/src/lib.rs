@@ -641,6 +641,14 @@ pub struct Interpreter {
     /// overwhelmingly common unpolluted heap, keeping appends cheap.
     array_index_accessor_protector: bool,
     interrupt: InterruptFlag,
+    /// Countdown of remaining compiled back-edges before the next cooperative
+    /// budget checkpoint. Compiled code decrements this inline at every
+    /// back-edge and re-enters [`Self::jit_backedge_poll`] only when it reaches
+    /// zero (or the interrupt flag is set, polled inline every back-edge), which
+    /// batches the reduction accounting the checkpoint would otherwise record one
+    /// unit at a time per iteration. Reset to [`JIT_BACKEDGE_POLL_BATCH`] by the
+    /// checkpoint.
+    jit_backedge_fuel: u64,
     /// Byte length of the instruction currently being dispatched. Set
     /// by `dispatch_loop_inner` right after each fetch and consumed by
     /// every `frame.advance_pc(self.current_byte_len)?` call along
@@ -1606,6 +1614,7 @@ impl Interpreter {
             json_root_stack: Vec::new(),
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
+            jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             current_byte_len: 1,
             current_function_id: 0,
             current_byte_pc: 0,
@@ -1829,6 +1838,13 @@ impl Interpreter {
     /// that genuinely hot functions tier up early, high enough that one-shot
     /// calls never pay compile latency.
     const JIT_TIER_UP_THRESHOLD: u32 = 50;
+
+    /// Number of compiled back-edges the fuel counter allows between cooperative
+    /// budget checkpoints. Large enough to amortize the VM re-entry across a hot
+    /// loop, small enough that a runtime budget is enforced within a bounded
+    /// number of iterations. The interrupt flag is polled inline every back-edge,
+    /// so cancellation latency is unaffected by this batch size.
+    const JIT_BACKEDGE_POLL_BATCH: u64 = 4096;
 
     /// Back-edge count at which a hot loop tiers up via OSR. Higher than the
     /// call-count threshold: a loop iterating this many times amortizes the
@@ -4396,11 +4412,32 @@ impl Interpreter {
     /// hot loop has OSR'd into native code.
     pub fn jit_backedge_poll(&mut self) -> Result<(), VmError> {
         self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_BACKEDGE_POLL);
-        self.runtime_budget_stats.record_reductions(1);
-        if self.interrupt_handle().is_set() {
+        // The interrupt flag is polled inline at every back-edge, so reaching
+        // this re-entry with the flag set means a cancellation is pending.
+        if self.interrupt.is_set() {
             return Err(VmError::Interrupted);
         }
+        // Compiled code decremented the fuel counter inline for each back-edge
+        // since the last checkpoint and re-entered when it hit zero. Account for
+        // that whole batch of reductions in one step and re-arm the counter, then
+        // run the (possibly early-returning) budget checkpoint.
+        self.runtime_budget_stats
+            .record_reductions(Self::JIT_BACKEDGE_POLL_BATCH);
+        self.jit_backedge_fuel = Self::JIT_BACKEDGE_POLL_BATCH;
         self.enforce_runtime_budget_checkpoint()
+    }
+
+    /// Address of the inline back-edge fuel counter, handed to compiled code so
+    /// it can decrement the countdown without a VM re-entry.
+    pub fn jit_backedge_fuel_ptr(&mut self) -> *mut u64 {
+        &mut self.jit_backedge_fuel
+    }
+
+    /// Address of the cooperative interrupt flag's backing byte, polled inline at
+    /// each back-edge.
+    #[must_use]
+    pub fn jit_interrupt_flag_ptr(&self) -> *const u8 {
+        self.interrupt.as_ptr()
     }
 
     pub(crate) fn record_jit_runtime_property_stub(&mut self) {

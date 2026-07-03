@@ -219,6 +219,13 @@ pub struct JitCtx {
     safepoint_records: *const SafepointRecord,
     /// Number of records starting at [`Self::safepoint_records`].
     safepoint_count: u32,
+    /// Address of the cooperative interrupt flag's backing byte. Compiled code
+    /// polls this inline at every back-edge and re-enters only when it is set.
+    interrupt_flag: *const u8,
+    /// Address of the VM's back-edge fuel counter. Compiled code decrements it
+    /// inline per back-edge and re-enters the poll stub when it reaches zero,
+    /// batching the budget checkpoint across the whole run of iterations.
+    backedge_fuel: *mut u64,
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
@@ -240,6 +247,10 @@ pub(crate) const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as 
 #[allow(dead_code)]
 pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
 pub(crate) const VM_OFFSET: u32 = std::mem::offset_of!(JitCtx, vm) as u32;
+/// Byte offset of [`JitCtx::interrupt_flag`] — the inline back-edge interrupt poll.
+pub(crate) const INTERRUPT_FLAG_OFFSET: u32 = std::mem::offset_of!(JitCtx, interrupt_flag) as u32;
+/// Byte offset of [`JitCtx::backedge_fuel`] — the inline back-edge fuel counter.
+pub(crate) const BACKEDGE_FUEL_OFFSET: u32 = std::mem::offset_of!(JitCtx, backedge_fuel) as u32;
 pub(crate) const STACK_OFFSET: u32 = std::mem::offset_of!(JitCtx, stack) as u32;
 pub(crate) const CONTEXT_OFFSET: u32 = std::mem::offset_of!(JitCtx, context) as u32;
 pub(crate) const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
@@ -1630,6 +1641,8 @@ pub(crate) unsafe fn enter_compiled(
         let collection_method_ic_count = unsafe { (*vm).jit_collection_method_ics_len() };
         let direct_method_inline = unsafe { (*vm).jit_direct_method_inline_ptr() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
+        let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
+        let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
         let mut error = None;
         let mut ctx = JitCtx {
             regs,
@@ -1659,6 +1672,8 @@ pub(crate) unsafe fn enter_compiled(
             gc_heap,
             safepoint_records,
             safepoint_count,
+            interrupt_flag,
+            backedge_fuel,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
@@ -1702,7 +1717,7 @@ pub(crate) mod arm64 {
         ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
         ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_OFFSET,
         ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
-        BAIL_PC_OFFSET, BaselineCode, CANONICAL_NAN_HI16,
+        BACKEDGE_FUEL_OFFSET, BAIL_PC_OFFSET, BaselineCode, CANONICAL_NAN_HI16, INTERRUPT_FLAG_OFFSET,
         COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET,
         COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET,
         COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
@@ -3630,8 +3645,27 @@ pub(crate) mod arm64 {
     }
 
     fn emit_backedge_interrupt_check(ops: &mut Assembler, threw: DynamicLabel) {
-        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+        let slow = ops.new_dynamic_label();
+        let cont = ops.new_dynamic_label();
+        // Inline cooperative poll: read the interrupt byte and decrement the fuel
+        // counter, re-entering the poll stub only when the interrupt is set or the
+        // counter reaches zero. x9/x10 are transient scratch (no value is live
+        // across a block boundary in the baseline register-window model).
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x20, INTERRUPT_FLAG_OFFSET]
+            ; ldrb w9, [x9]
+            ; cbnz w9, =>slow
+            ; ldr x9, [x20, BACKEDGE_FUEL_OFFSET]
+            ; ldr x10, [x9]
+            ; subs x10, x10, #1
+            ; str x10, [x9]
+            ; b.gt =>cont
+            ; =>slow
+            ; mov x0, x20
+        );
         emit_call_stub(ops, jit_backedge_poll_stub as *const () as usize, threw);
+        dynasm!(ops ; .arch aarch64 ; =>cont);
     }
 
     /// Largest callee register window the inliner accepts. Bounds the per-site
@@ -7007,6 +7041,11 @@ mod tests {
         let code = compile(view).expect("compiles");
         let mut error = None;
         let array_index_accessor_protector = false;
+        // Probe storage for the inline back-edge poll: an unset interrupt byte
+        // and a fuel counter high enough that these small test loops never reach
+        // the (null-`vm`) re-entry stub.
+        let interrupt_probe: u8 = 0;
+        let mut backedge_fuel_probe: u64 = 1 << 30;
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
             self_closure: 0,
@@ -7035,6 +7074,8 @@ mod tests {
             gc_heap: std::ptr::null(),
             safepoint_records: std::ptr::null(),
             safepoint_count: 0,
+            interrupt_flag: &interrupt_probe,
+            backedge_fuel: &mut backedge_fuel_probe,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.code.entry_ptr()) };

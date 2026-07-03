@@ -322,8 +322,10 @@ mod arm64 {
         ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
         ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_OFFSET,
         ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
-        BAIL_PC_OFFSET, CANONICAL_NAN_HI16, COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET,
+        BACKEDGE_FUEL_OFFSET, BAIL_PC_OFFSET, CANONICAL_NAN_HI16,
+        COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET,
         COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET, COLLECTION_METHOD_IC_COUNT_OFFSET,
+        INTERRUPT_FLAG_OFFSET,
         COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET,
         COLLECTION_METHOD_IC_PROTO_OFFSET, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET,
         COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET, COLLECTION_METHOD_IC_SLOT_SIZE,
@@ -428,6 +430,25 @@ mod arm64 {
     }
 
     fn emit_backedge_poll(ops: &mut Assembler, threw: DynamicLabel, save_base: u32) {
+        let slow = ops.new_dynamic_label();
+        let cont = ops.new_dynamic_label();
+        // Inline cooperative poll: read the interrupt byte, then decrement the
+        // fuel counter. Only a set interrupt or an exhausted counter re-enters
+        // the stub. Uses caller-saved scratch x0/x1, which are never allocator
+        // homes (those are x9..x15 / x21..x28), so the common case touches no
+        // live value and skips the caller-saved spill below entirely.
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x0, [x20, INTERRUPT_FLAG_OFFSET]
+            ; ldrb w0, [x0]
+            ; cbnz w0, =>slow
+            ; ldr x0, [x20, BACKEDGE_FUEL_OFFSET]
+            ; ldr x1, [x0]
+            ; subs x1, x1, #1
+            ; str x1, [x0]
+            ; b.gt =>cont
+            ; =>slow
+        );
         // The poll stub follows the C ABI and preserves the callee-saved
         // allocator registers (`x21..x28`, `d8..d15`), so only the caller-saved
         // pool needs a round-trip here.
@@ -456,6 +477,7 @@ mod arm64 {
             let off = save_base + i * 8;
             dynasm!(ops ; .arch aarch64 ; ldr X(reg), [sp, off]);
         }
+        dynasm!(ops ; .arch aarch64 ; =>cont);
     }
 
     /// Probe the `Vec<T>` field layout by value identity, returning the byte
@@ -5148,6 +5170,15 @@ mod tests {
         let mut ctx = vec![0u64; 64];
         ctx[0] = regs.as_mut_ptr() as u64;
         ctx[1] = boxi(0);
+        // The inline back-edge poll reads these two ctx pointers; point them at
+        // an unset interrupt byte and a fuel counter high enough that the test
+        // loops never re-enter the (absent) poll stub.
+        let interrupt_probe: u8 = 0;
+        let mut backedge_fuel_probe: u64 = 1 << 30;
+        ctx[crate::baseline::INTERRUPT_FLAG_OFFSET as usize / 8] =
+            std::ptr::addr_of!(interrupt_probe) as u64;
+        ctx[crate::baseline::BACKEDGE_FUEL_OFFSET as usize / 8] =
+            std::ptr::addr_of_mut!(backedge_fuel_probe) as u64;
         // SAFETY: `entry` was emitted with the shared `extern "C" fn(*mut JitCtx)
         // -> JitRet` ABI; `ctx` is a JitCtx-shaped buffer whose offset-0 regs
         // pointer is a valid 64-slot window; `code` outlives the call.

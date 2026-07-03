@@ -85,6 +85,16 @@ impl InterruptFlag {
         self.0.load(Ordering::Acquire)
     }
 
+    /// Raw address of the backing `AtomicBool`, stable for this flag's life (the
+    /// `Arc` keeps it alive). Compiled code polls this byte inline at each
+    /// back-edge instead of re-entering the VM; a plain byte load is sufficient
+    /// for a cooperative poll (a set flag missed by a stale read is caught on the
+    /// next back-edge).
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr().cast::<u8>()
+    }
+
     /// Reset the flag.
     pub fn reset(&self) {
         self.0.store(false, Ordering::Release);

@@ -387,6 +387,14 @@ struct Builder<'a> {
     /// literal's key `LoadString`s are skipped and each `DefineDataProperty`
     /// captures its value SSA instead of running.
     active_literal: Option<ActiveLiteral>,
+    /// Per-block cache of already-proven receiver shape guards, keyed by
+    /// `(receiver SSA, compressed shape)` and mapping to the `CheckShape` node
+    /// that proved it. A second same-shape access to the same SSA receiver reuses
+    /// the earlier guard instead of re-checking. Reset at each block boundary
+    /// (the guard only dominates within its straight-line block) and cleared
+    /// after any instruction that re-enters the VM, allocates, or could
+    /// transition an object's shape.
+    checked_shapes: FxHashMap<(NodeId, u32), NodeId>,
 }
 
 /// In-flight state for folding one object literal in the builder.
@@ -458,7 +466,84 @@ impl<'a> Builder<'a> {
             current_def: vec![FxHashMap::default(); reg_count],
             incomplete_phis: FxHashMap::default(),
             active_literal: None,
+            checked_shapes: FxHashMap::default(),
         })
+    }
+
+    /// Emit (or reuse) a receiver shape guard. Within a straight-line block the
+    /// same `(receiver SSA, shape)` is invariant, so a repeated access — the
+    /// common `o.x`, `o.y`, `o.z` cluster — shares one `CheckShape` instead of
+    /// re-proving it. The cache is reset per block and cleared after any
+    /// shape-mutating or VM-re-entering instruction, so a reused guard always
+    /// still dominates and still holds.
+    fn guarded_receiver(
+        &mut self,
+        obj: NodeId,
+        shape: u32,
+        block: BlockId,
+        byte_pc: u32,
+    ) -> NodeId {
+        if let Some(&checked) = self.checked_shapes.get(&(obj, shape)) {
+            return checked;
+        }
+        let checked = self
+            .graph
+            .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
+        self.push_body(block, checked);
+        self.checked_shapes.insert((obj, shape), checked);
+        checked
+    }
+
+    /// Whether a node emitted while lowering an instruction leaves every cached
+    /// receiver shape guard valid. Only pure, single-block, non-allocating,
+    /// non-reshaping nodes qualify; anything that re-enters the VM, allocates
+    /// (a safepoint), calls user code, or transitions a shape invalidates the
+    /// whole cache. Conservative: an unlisted kind clears the cache.
+    fn node_preserves_shape_cache(kind: &NodeKind) -> bool {
+        matches!(
+            kind,
+            NodeKind::CheckShape(_, _)
+                | NodeKind::CheckInt32(_)
+                | NodeKind::CheckNumber(_)
+                | NodeKind::CheckBool(_)
+                | NodeKind::CheckFunctionIdentity { .. }
+                | NodeKind::CheckMethodIdentity { .. }
+                | NodeKind::LoadSlot(_, _)
+                | NodeKind::LoadProtoSlot { .. }
+                | NodeKind::LoadSlotPoly(_, _)
+                | NodeKind::StoreSlot(_, _, _)
+                | NodeKind::StoreSlotPoly(_, _, _)
+                | NodeKind::LoadElement(_, _)
+                | NodeKind::StoreElement(_, _, _)
+                | NodeKind::LoadArrayLength(_)
+                | NodeKind::ArrayPop { .. }
+                | NodeKind::Param(_)
+                | NodeKind::Phi(_)
+                | NodeKind::ConstInt32(_)
+                | NodeKind::ConstF64(_)
+                | NodeKind::ConstBool(_)
+                | NodeKind::ConstUndefined
+                | NodeKind::ConstNull
+                | NodeKind::SelfClosure
+                | NodeKind::LoadThis
+                | NodeKind::LoadHole
+                | NodeKind::LoadUpvalue(_)
+                | NodeKind::InlineUpvalue { .. }
+                | NodeKind::Int32Add(_, _)
+                | NodeKind::Int32Sub(_, _)
+                | NodeKind::Int32Mul(_, _)
+                | NodeKind::Int32Rem(_, _)
+                | NodeKind::Int32Compare(_, _, _)
+                | NodeKind::Int32ToFloat64(_)
+                | NodeKind::Float64ToInt32(_)
+                | NodeKind::Float64Add(_, _)
+                | NodeKind::Float64Sub(_, _)
+                | NodeKind::Float64Mul(_, _)
+                | NodeKind::Float64Div(_, _)
+                | NodeKind::Float64Rem(_, _)
+                | NodeKind::Float64Compare(_, _, _)
+                | NodeKind::Float64Unary(_, _)
+        )
     }
 
     fn run(&mut self) -> Result<(), Unsupported> {
@@ -747,7 +832,22 @@ impl<'a> Builder<'a> {
         // merge block of its guard chain so the instructions after the call build
         // into the merge (whose successors are `cfg_block`'s, rewired there).
         let mut block = cfg_block;
+        // Shape guards proven earlier in the program do not dominate this block's
+        // entry (predecessors may take other paths), so start with an empty cache.
+        self.checked_shapes.clear();
+        // Nodes emitted so far; the receiver-guard cache is invalidated whenever
+        // the previous instruction added a node that could re-enter the VM,
+        // allocate, or transition a shape (checked at the top of each iteration so
+        // the object-literal / active-define early `continue`s are covered too).
+        let mut nodes_before = self.graph.nodes.len();
         for i in start..end {
+            if self.graph.nodes[nodes_before..]
+                .iter()
+                .any(|n| !Self::node_preserves_shape_cache(&n.kind))
+            {
+                self.checked_shapes.clear();
+            }
+            nodes_before = self.graph.nodes.len();
             // Capture the instruction's fields up front so the `&self.view`
             // borrow ends before the `&mut self.graph` mutations below.
             let instr = &self.view.instructions[i];
@@ -957,11 +1057,10 @@ impl<'a> Builder<'a> {
                     }
                     let obj = self.read_variable(obj_reg, block);
                     let load = if let Some((shape, slot_byte)) = property_feedback {
-                        // Monomorphic: a single shape guard then the slot load.
-                        let checked =
-                            self.graph
-                                .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
-                        self.push_body(block, checked);
+                        // Monomorphic: a single shape guard then the slot load. The
+                        // guard is shared with an earlier same-shape access to this
+                        // receiver in the block.
+                        let checked = self.guarded_receiver(obj, shape, block, byte_pc);
                         self.graph
                             .add_node(NodeKind::LoadSlot(checked, slot_byte), block, byte_pc)
                     } else if let Some((recv_shape, proto_shape, slot_byte)) =
@@ -1068,11 +1167,11 @@ impl<'a> Builder<'a> {
                     }
                     let obj = self.read_variable(obj_reg, block);
                     if let Some((shape, slot_byte)) = property_feedback {
-                        // Monomorphic: a single shape guard then the slot store.
-                        let checked =
-                            self.graph
-                                .add_node(NodeKind::CheckShape(obj, shape), block, byte_pc);
-                        self.push_body(block, checked);
+                        // Monomorphic: a single shape guard then the slot store. The
+                        // guard is shared with an earlier same-shape access to this
+                        // receiver in the block; a slot store writes a value and
+                        // never transitions the shape, so the cache stays valid.
+                        let checked = self.guarded_receiver(obj, shape, block, byte_pc);
                         let store = self.graph.add_node(
                             NodeKind::StoreSlot(checked, slot_byte, value),
                             block,

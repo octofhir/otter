@@ -353,6 +353,7 @@ mod tests {
                 property_feedback_poly: Vec::new(),
                 property_proto_feedback: None,
                 object_literal: None,
+                element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                 arith_feedback: *fb,
             })
             .collect();

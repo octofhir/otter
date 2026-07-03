@@ -314,6 +314,9 @@ pub fn allocate(
                     // the caller-saved register pool, so values live across it must
                     // hold callee-saved homes just like a real call.
                     | super::ir::NodeKind::Float64Rem(_, _)
+                    // `Float64UnaryCall` (`Math.sin` / `Math.log` / …) is a leaf
+                    // libm call with the same caller-saved clobber contract.
+                    | super::ir::NodeKind::Float64UnaryCall(_, _)
             )
         })
         .filter_map(|(id, _)| numbering.pos_of.get(&(id as NodeId)).copied())
@@ -1094,6 +1097,7 @@ mod tests {
                 property_feedback_poly: Vec::new(),
                 property_proto_feedback: None,
                 object_literal: None,
+                element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                 arith_feedback: *fb,
             })
             .collect();

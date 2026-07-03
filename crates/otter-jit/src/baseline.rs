@@ -1205,6 +1205,43 @@ pub(crate) extern "C" fn otter_jit_fmod(a: f64, b: f64) -> f64 {
     a % b
 }
 
+/// Leaf libm helpers for the optimizing tier's transcendental `Math.*` unaries
+/// ([`crate::optimizing::ir::Float64MathCall`]). Each forwards to the exact
+/// `f64` method the interpreter's `Math` uses (`crates/otter-vm/src/math`), so a
+/// compiled `Math.sin(x)` is bit-identical to the interpreted result. Each
+/// allocates nothing and makes no VM reentry, so it needs no `JitCtx`.
+macro_rules! otter_jit_math_leaf {
+    ($($name:ident => $method:ident),* $(,)?) => {
+        $(
+            #[doc = concat!("Leaf `f64::", stringify!($method), "` for the optimizing tier.")]
+            pub(crate) extern "C" fn $name(x: f64) -> f64 {
+                x.$method()
+            }
+        )*
+    };
+}
+otter_jit_math_leaf! {
+    otter_jit_sin => sin,
+    otter_jit_cos => cos,
+    otter_jit_tan => tan,
+    otter_jit_asin => asin,
+    otter_jit_acos => acos,
+    otter_jit_atan => atan,
+    otter_jit_sinh => sinh,
+    otter_jit_cosh => cosh,
+    otter_jit_tanh => tanh,
+    otter_jit_asinh => asinh,
+    otter_jit_acosh => acosh,
+    otter_jit_atanh => atanh,
+    otter_jit_exp => exp,
+    otter_jit_expm1 => exp_m1,
+    otter_jit_log => ln,
+    otter_jit_log2 => log2,
+    otter_jit_log10 => log10,
+    otter_jit_log1p => ln_1p,
+    otter_jit_cbrt => cbrt,
+}
+
 /// Bridge stub: perform a `StoreGlobalBinding` from optimizing-tier code. The VM
 /// decodes the value register, name-constant index, and strict flag from the
 /// bytecode at `byte_pc`, reads the stored value from the interpreter frame slot
@@ -6969,6 +7006,7 @@ mod tests {
                 property_feedback_poly: Vec::new(),
                 property_proto_feedback: None,
                 object_literal: None,
+                element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                 arith_feedback: 0,
             })
             .collect();

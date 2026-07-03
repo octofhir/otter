@@ -630,6 +630,32 @@ pub struct JitInstrView {
     /// for every other `NewObject` and every non-`NewObject` op. Baked by
     /// `Interpreter::bake_object_literals`.
     pub object_literal: Option<ObjectLiteralPlan>,
+    /// Baked element-load specialization for a `LoadElement` site the interpreter
+    /// observed loading exclusively from one unboxable typed-array kind
+    /// (`Float64Array` / `Int32Array`). The optimizing tier lowers such a site to
+    /// a kind-guarded load that leaves the element in a register in its native
+    /// representation (an FP register for `Float64`, a raw int for `Int32`),
+    /// skipping the box on load and the matching unbox in the numeric consumer.
+    /// [`JitElementLoadKind::Any`] (the default) keeps the generic boxed load.
+    /// Baked by `Interpreter::bake_element_load_kind`.
+    pub element_load_kind: JitElementLoadKind,
+}
+
+/// Native representation an observed `LoadElement` site can produce unboxed.
+///
+/// Recorded during warmup: a site that only ever reads from a `Float64Array`
+/// bakes `Float64`, one that only reads from an `Int32Array` bakes `Int32`, and
+/// a site that sees any other receiver (dense array, mixed typed-array kinds,
+/// object) stays `Any` and keeps the boxed load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JitElementLoadKind {
+    /// Generic boxed element load (no specialization).
+    #[default]
+    Any,
+    /// The site only observed `Float64Array` receivers.
+    Float64,
+    /// The site only observed `Int32Array` receivers.
+    Int32,
 }
 
 /// Common method names the external JIT can specialize without reading VM

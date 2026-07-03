@@ -34,7 +34,16 @@ use otter_vm::jit_feedback::{ARITH_STRING, ArithFeedback};
 use otter_vm::{JitArrayMethodKind, JitFunctionView, JitInlineCallee, JitInlineMethod};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::ir::{BlockId, CmpOp, Float64UnaryOp, Graph, NodeId, NodeKind, Repr, Terminator};
+use super::ir::{
+    BlockId, CmpOp, ElementLoadKind, Float64MathCall, Float64UnaryOp, Graph, NodeId, NodeKind,
+    Repr, Terminator,
+};
+
+/// How a `Math.*` unary lowers: a single float instruction, or a leaf libm call.
+enum MathLowering {
+    Unary(Float64UnaryOp),
+    Call(Float64MathCall),
+}
 use super::{Unsupported, deopt};
 
 /// Build a typed SSA graph for `view`, or report why the function is outside the
@@ -86,6 +95,7 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
             matches!(
                 node.kind,
                 NodeKind::LoadElement(_, _)
+                    | NodeKind::LoadElementUnboxed(_, _, _)
                     | NodeKind::StoreElement(_, _, _)
                     | NodeKind::LoadArrayLength(_)
             )
@@ -128,6 +138,7 @@ fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
             node.kind,
             NodeKind::StoreSlot(_, _, _)
                 | NodeKind::LoadElement(_, _)
+                | NodeKind::LoadElementUnboxed(_, _, _)
                 | NodeKind::StoreElement(_, _, _)
                 | NodeKind::LoadArrayLength(_)
         )
@@ -514,6 +525,7 @@ impl<'a> Builder<'a> {
                 | NodeKind::StoreSlot(_, _, _)
                 | NodeKind::StoreSlotPoly(_, _, _)
                 | NodeKind::LoadElement(_, _)
+                | NodeKind::LoadElementUnboxed(_, _, _)
                 | NodeKind::StoreElement(_, _, _)
                 | NodeKind::LoadArrayLength(_)
                 | NodeKind::ArrayPop { .. }
@@ -543,6 +555,7 @@ impl<'a> Builder<'a> {
                 | NodeKind::Float64Rem(_, _)
                 | NodeKind::Float64Compare(_, _, _)
                 | NodeKind::Float64Unary(_, _)
+                | NodeKind::Float64UnaryCall(_, _)
         )
     }
 
@@ -1213,9 +1226,25 @@ impl<'a> Builder<'a> {
                             return Ok(());
                         }
                     };
-                    let load =
-                        self.graph
-                            .add_node(NodeKind::LoadElement(recv, idx), block, byte_pc);
+                    // A site the interpreter only ever saw loading from one
+                    // unboxable typed-array kind lowers to a native-representation
+                    // load (no box on load, no unbox in the numeric consumer); any
+                    // other kind deopts at the guard. Everything else keeps the
+                    // generic boxed load.
+                    let load_kind = match instr.element_load_kind {
+                        otter_vm::jit::JitElementLoadKind::Float64 => {
+                            Some(NodeKind::LoadElementUnboxed(recv, idx, ElementLoadKind::Float64))
+                        }
+                        otter_vm::jit::JitElementLoadKind::Int32 => {
+                            Some(NodeKind::LoadElementUnboxed(recv, idx, ElementLoadKind::Int32))
+                        }
+                        otter_vm::jit::JitElementLoadKind::Any => None,
+                    };
+                    let load = self.graph.add_node(
+                        load_kind.unwrap_or(NodeKind::LoadElement(recv, idx)),
+                        block,
+                        byte_pc,
+                    );
                     self.graph.set_frame_dst(load, dst);
                     self.push_body(block, load);
                     self.def_register(dst, block, load, byte_pc);
@@ -1501,29 +1530,55 @@ impl<'a> Builder<'a> {
                 // instruction. Other methods (ties-to-+Inf `round`, multi-arg
                 // `min`/`max`/`pow`, transcendentals needing libm) decline.
                 Op::MathCall => {
+                    use otter_bytecode::method_id::MathMethod as M;
                     let dst = reg(&operands, 0)?;
                     let method_id = const_index(&operands, 1)?;
                     let argc = const_index(&operands, 2)? as usize;
-                    let uop = match otter_bytecode::method_id::MathMethod::from_u32(method_id) {
-                        Some(otter_bytecode::method_id::MathMethod::Sqrt) => Float64UnaryOp::Sqrt,
-                        Some(otter_bytecode::method_id::MathMethod::Abs) => Float64UnaryOp::Abs,
-                        Some(otter_bytecode::method_id::MathMethod::Floor) => Float64UnaryOp::Floor,
-                        Some(otter_bytecode::method_id::MathMethod::Ceil) => Float64UnaryOp::Ceil,
-                        Some(otter_bytecode::method_id::MathMethod::Trunc) => Float64UnaryOp::Trunc,
+                    if argc != 1 {
+                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
+                        return Ok(());
+                    }
+                    // A single-instruction `Math.*` lowers to `Float64Unary`; a
+                    // transcendental with no exact hardware op lowers to a leaf
+                    // libm call (`Float64UnaryCall`) matching the interpreter's
+                    // `f64` method bit-for-bit. Anything else declines.
+                    let kind = match M::from_u32(method_id) {
+                        Some(M::Sqrt) => MathLowering::Unary(Float64UnaryOp::Sqrt),
+                        Some(M::Abs) => MathLowering::Unary(Float64UnaryOp::Abs),
+                        Some(M::Floor) => MathLowering::Unary(Float64UnaryOp::Floor),
+                        Some(M::Ceil) => MathLowering::Unary(Float64UnaryOp::Ceil),
+                        Some(M::Trunc) => MathLowering::Unary(Float64UnaryOp::Trunc),
+                        Some(M::Sin) => MathLowering::Call(Float64MathCall::Sin),
+                        Some(M::Cos) => MathLowering::Call(Float64MathCall::Cos),
+                        Some(M::Tan) => MathLowering::Call(Float64MathCall::Tan),
+                        Some(M::Asin) => MathLowering::Call(Float64MathCall::Asin),
+                        Some(M::Acos) => MathLowering::Call(Float64MathCall::Acos),
+                        Some(M::Atan) => MathLowering::Call(Float64MathCall::Atan),
+                        Some(M::Sinh) => MathLowering::Call(Float64MathCall::Sinh),
+                        Some(M::Cosh) => MathLowering::Call(Float64MathCall::Cosh),
+                        Some(M::Tanh) => MathLowering::Call(Float64MathCall::Tanh),
+                        Some(M::Asinh) => MathLowering::Call(Float64MathCall::Asinh),
+                        Some(M::Acosh) => MathLowering::Call(Float64MathCall::Acosh),
+                        Some(M::Atanh) => MathLowering::Call(Float64MathCall::Atanh),
+                        Some(M::Exp) => MathLowering::Call(Float64MathCall::Exp),
+                        Some(M::Expm1) => MathLowering::Call(Float64MathCall::Expm1),
+                        Some(M::Log) => MathLowering::Call(Float64MathCall::Log),
+                        Some(M::Log2) => MathLowering::Call(Float64MathCall::Log2),
+                        Some(M::Log10) => MathLowering::Call(Float64MathCall::Log10),
+                        Some(M::Log1p) => MathLowering::Call(Float64MathCall::Log1p),
+                        Some(M::Cbrt) => MathLowering::Call(Float64MathCall::Cbrt),
                         _ => {
                             self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
                             return Ok(());
                         }
                     };
-                    if argc != 1 {
-                        self.deopt_or_decline(block, byte_pc, Unsupported::Opcode(op))?;
-                        return Ok(());
-                    }
                     let arg = self.read_variable(reg(&operands, 3)?, block);
                     let f = self.float_node_operand(block, arg, byte_pc);
-                    let node = self
-                        .graph
-                        .add_node(NodeKind::Float64Unary(uop, f), block, byte_pc);
+                    let node_kind = match kind {
+                        MathLowering::Unary(uop) => NodeKind::Float64Unary(uop, f),
+                        MathLowering::Call(call) => NodeKind::Float64UnaryCall(call, f),
+                    };
+                    let node = self.graph.add_node(node_kind, block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -3054,6 +3109,7 @@ mod tests {
                 property_feedback_poly: Vec::new(),
                 property_proto_feedback: None,
                 object_literal: None,
+                element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                 arith_feedback: *fb,
             })
             .collect();
@@ -3144,6 +3200,7 @@ mod tests {
                         property_feedback_poly: Vec::new(),
                         property_proto_feedback: None,
                         object_literal: None,
+                        element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                         arith_feedback: ARITH_INT32,
                     },
                     otter_vm::JitInstrView {
@@ -3160,6 +3217,7 @@ mod tests {
                         property_feedback_poly: Vec::new(),
                         property_proto_feedback: None,
                         object_literal: None,
+                        element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                         arith_feedback: 0,
                     },
                 ],
@@ -3203,6 +3261,7 @@ mod tests {
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
+                    element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                     arith_feedback: 0,
                 },
                 otter_vm::JitInstrView {
@@ -3219,6 +3278,7 @@ mod tests {
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
+                    element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                     arith_feedback: 0,
                 },
                 otter_vm::JitInstrView {
@@ -3235,6 +3295,7 @@ mod tests {
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
+                    element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                     arith_feedback: 0,
                 },
             ],
@@ -3361,6 +3422,7 @@ mod tests {
             property_feedback_poly: Vec::new(),
             property_proto_feedback: None,
             object_literal: None,
+            element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
             arith_feedback: fb,
         }
     }

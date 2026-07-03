@@ -274,6 +274,9 @@ impl ExecutableFunction {
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
+                    // Baked by `Interpreter::bake_element_load_kind` from the
+                    // live per-site warmup feedback; the raw snapshot carries none.
+                    element_load_kind: crate::jit::JitElementLoadKind::Any,
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

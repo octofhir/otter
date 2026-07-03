@@ -59,7 +59,10 @@
 
 use super::Unsupported;
 use super::deopt::{DeoptPoint, OsrEntry};
-use super::ir::{BlockId, CmpOp, Float64UnaryOp, Graph, NodeId, NodeKind, Repr, Terminator};
+use super::ir::{
+    BlockId, CmpOp, ElementLoadKind, Float64MathCall, Float64UnaryOp, Graph, NodeId, NodeKind,
+    Repr, Terminator,
+};
 use super::liveness::Liveness;
 use super::regalloc::{Allocation, EdgeMoves, Location};
 use crate::CompiledCode;
@@ -311,9 +314,9 @@ mod arm64 {
     #![allow(unused_parens)]
     use super::super::builder::graph_allows_frameless_self_call;
     use super::{
-        Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, Float64UnaryOp, GP_REGS, Graph,
-        Liveness, Location, NodeId, NodeKind, OptimizedCode, OsrEntry, Repr, Terminator,
-        Unsupported,
+        Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, ElementLoadKind, Float64MathCall,
+        Float64UnaryOp, GP_REGS, Graph, Liveness, Location, NodeId, NodeKind, OptimizedCode,
+        OsrEntry, Repr, Terminator, Unsupported,
     };
     use crate::CompiledCode;
     use crate::baseline::{
@@ -1282,6 +1285,133 @@ mod arm64 {
             store_loc(ops, loc, 6);
         }
         dynasm!(ops ; .arch aarch64 ; =>done);
+    }
+
+    /// The leaf libm helper a transcendental `Math.*` unary calls. Each matches
+    /// the interpreter's `f64` method (`crates/otter-vm/src/math`) so the
+    /// compiled result is bit-identical.
+    fn math_call_fn(call: Float64MathCall) -> extern "C" fn(f64) -> f64 {
+        use crate::baseline;
+        match call {
+            Float64MathCall::Sin => baseline::otter_jit_sin,
+            Float64MathCall::Cos => baseline::otter_jit_cos,
+            Float64MathCall::Tan => baseline::otter_jit_tan,
+            Float64MathCall::Asin => baseline::otter_jit_asin,
+            Float64MathCall::Acos => baseline::otter_jit_acos,
+            Float64MathCall::Atan => baseline::otter_jit_atan,
+            Float64MathCall::Sinh => baseline::otter_jit_sinh,
+            Float64MathCall::Cosh => baseline::otter_jit_cosh,
+            Float64MathCall::Tanh => baseline::otter_jit_tanh,
+            Float64MathCall::Asinh => baseline::otter_jit_asinh,
+            Float64MathCall::Acosh => baseline::otter_jit_acosh,
+            Float64MathCall::Atanh => baseline::otter_jit_atanh,
+            Float64MathCall::Exp => baseline::otter_jit_exp,
+            Float64MathCall::Expm1 => baseline::otter_jit_expm1,
+            Float64MathCall::Log => baseline::otter_jit_log,
+            Float64MathCall::Log2 => baseline::otter_jit_log2,
+            Float64MathCall::Log10 => baseline::otter_jit_log10,
+            Float64MathCall::Log1p => baseline::otter_jit_log1p,
+            Float64MathCall::Cbrt => baseline::otter_jit_cbrt,
+        }
+    }
+
+    /// Lower a typed-array element read specialized to one unboxable kind
+    /// ([`NodeKind::LoadElementUnboxed`]). The site only ever observed a single
+    /// `Float64Array` / `Int32Array` receiver at warmup, so this guards that
+    /// exact kind and leaves the element in its native representation — an FP
+    /// register for `Float64`, a raw int in `w6` for `Int32` — with no box.
+    /// Every miss (not a typed array, length-tracking, out of bounds, detached /
+    /// non-local buffer, wrong kind) deopts at the load's exact PC before the
+    /// result is defined, so the interpreter re-runs the full `[[Get]]`.
+    fn emit_element_load_unboxed(
+        ops: &mut Assembler,
+        view: &JitFunctionView,
+        recv_loc: Location,
+        idx_loc: Location,
+        dst: Option<Location>,
+        kind: ElementLoadKind,
+        exit: DynamicLabel,
+    ) {
+        let ta_tag = u32::from(view.ta_layout.ta_type_tag);
+        let local_buf_type_tag = u32::from(view.ta_layout.local_buffer_type_tag);
+        let buffer_local_tag = view.ta_layout.buffer_local_tag;
+        let ta_kind_byte = view.ta_layout.ta_kind_byte;
+        let ta_byte_offset_byte = view.ta_layout.ta_byte_offset_byte;
+        let ta_length_byte = view.ta_layout.ta_length_byte;
+        let ta_length_tracking_byte = view.ta_layout.ta_length_tracking_byte;
+        let buffer_disc_byte = view.ta_layout.buffer_disc_byte;
+        let buffer_handle_byte = view.ta_layout.buffer_handle_byte;
+        let (ptr_word, len_word) = vec_layout_offsets();
+        let bytes_ptr_byte = view.ta_layout.buf_bytes_byte + ptr_word;
+        let bytes_len_byte = view.ta_layout.buf_bytes_byte + len_word;
+        let expected_kind = match kind {
+            ElementLoadKind::Float64 => view.ta_layout.kind_float64,
+            ElementLoadKind::Int32 => view.ta_layout.kind_int32,
+        };
+
+        // Shared prologue: decompress the receiver, guard it is a typed array of
+        // the expected kind over a non-length-tracking local buffer, and stage
+        // the element base (`x6`), byte length (`x7`) and byte offset (`x3`).
+        emit_recv_body(ops, view, recv_loc, exit);
+        load_loc(ops, 5, idx_loc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov w5, w5
+            ; cmp w2, ta_tag
+            ; b.ne =>exit
+            ; ldrb w3, [x0, ta_length_tracking_byte]
+            ; cbnz w3, =>exit
+            ; ldr x3, [x0, ta_length_byte]
+            ; cmp x5, x3
+            ; b.hs =>exit
+            ; ldr w3, [x0, buffer_disc_byte]
+            ; movz w4, buffer_local_tag
+            ; cmp w3, w4
+            ; b.ne =>exit
+            ; ldr w3, [x0, buffer_handle_byte]
+            ; add x3, x1, x3
+            ; ldrb w4, [x3]
+            ; cmp w4, local_buf_type_tag
+            ; b.ne =>exit
+            ; ldr x6, [x3, bytes_ptr_byte]
+            ; ldr x7, [x3, bytes_len_byte]
+            ; ldr x3, [x0, ta_byte_offset_byte]
+            ; ldr w4, [x0, ta_kind_byte]
+            ; cmp w4, expected_kind
+            ; b.ne =>exit
+        );
+        match kind {
+            ElementLoadKind::Float64 => {
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsl x4, x5, #3
+                    ; add x4, x4, x3
+                    ; add x0, x4, #8
+                    ; cmp x0, x7
+                    ; b.hi =>exit
+                    ; add x4, x6, x4
+                    ; ldr D(FP_LOAD_SCRATCH), [x4]
+                );
+                if let Some(loc) = dst {
+                    store_fp_loc(ops, loc, FP_LOAD_SCRATCH);
+                }
+            }
+            ElementLoadKind::Int32 => {
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; lsl x4, x5, #2
+                    ; add x4, x4, x3
+                    ; add x0, x4, #4
+                    ; cmp x0, x7
+                    ; b.hi =>exit
+                    ; add x4, x6, x4
+                    ; ldr w6, [x4]
+                );
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, 6);
+                }
+            }
+        }
     }
 
     /// Lower speculative dense-array / typed-array `recv[idx] = value` fast
@@ -2947,6 +3077,21 @@ mod arm64 {
                 store_fp_loc(ops, loc, 0);
                 Ok(())
             }
+            NodeKind::Float64UnaryCall(call, a) => {
+                // Leaf libm call (`Math.sin` / `Math.log` / …). AAPCS64 arg /
+                // result in `d0`; the node is a regalloc call site, so every
+                // other live value already holds a callee-saved home the call
+                // preserves. The operand is staged through the reserved FP
+                // scratch first so an operand home in `d0` cannot be clobbered.
+                let Some(loc) = dst else { return Ok(()) };
+                let aloc = require_loc(alloc, *a)?;
+                load_fp_loc(ops, FP_LOAD_SCRATCH, aloc);
+                dynasm!(ops ; .arch aarch64 ; fmov d0, D(FP_LOAD_SCRATCH));
+                emit_load_u64(ops, 16, math_call_fn(*call) as *const () as u64);
+                dynasm!(ops ; .arch aarch64 ; blr x16);
+                store_fp_loc(ops, loc, 0);
+                Ok(())
+            }
             NodeKind::Float64Unary(uop, a) => {
                 // Single exact float instruction; total, so a dead result is a
                 // no-op. The operand is already an unboxed `f64`.
@@ -3417,6 +3562,13 @@ mod arm64 {
                 let idx_loc = require_loc(alloc, *idx)?;
                 let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
                 emit_element_load(ops, view, recv_loc, idx_loc, dst, exit);
+                Ok(())
+            }
+            NodeKind::LoadElementUnboxed(recv, idx, kind) => {
+                let recv_loc = require_loc(alloc, *recv)?;
+                let idx_loc = require_loc(alloc, *idx)?;
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                emit_element_load_unboxed(ops, view, recv_loc, idx_loc, dst, *kind, exit);
                 Ok(())
             }
             NodeKind::StoreElement(recv, idx, value) => {
@@ -5090,6 +5242,7 @@ mod tests {
                 property_feedback_poly: Vec::new(),
                 property_proto_feedback: None,
                 object_literal: None,
+                element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
                 arith_feedback: *fb,
             })
             .collect();

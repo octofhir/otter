@@ -832,6 +832,14 @@ pub struct Interpreter {
     /// unboxed `Int32` / `Float64` lowering and insert the matching guard. Only
     /// mutated when a JIT hook is installed.
     jit_arith_feedback: rustc_hash::FxHashMap<(u32, u32), jit_feedback::ArithFeedback>,
+    /// Observed unboxable typed-array kind at each `LoadElement` site, keyed
+    /// `(function_id, byte_pc)`. A site that only ever reads from one of
+    /// `Float64Array` / `Int32Array` records that kind; any other receiver
+    /// (dense array, mixed typed-array kinds, object) demotes it to
+    /// [`jit::JitElementLoadKind::Any`]. Baked into
+    /// `JitInstrView::element_load_kind` so the optimizing tier can lower the
+    /// site to a kind-guarded native-representation load (no box/unbox).
+    jit_element_load_kind: rustc_hash::FxHashMap<(u32, u32), jit::JitElementLoadKind>,
     /// Arithmetic bytecode sites that already overflow-deoptimized once and
     /// should be recompiled through the optimizing tier's float path. Keyed by
     /// `(function_id, byte_pc)`. This is compile policy, not observed operand
@@ -1650,6 +1658,7 @@ impl Interpreter {
             jit_call_site_feedback: rustc_hash::FxHashMap::default(),
             jit_method_site_feedback: rustc_hash::FxHashMap::default(),
             jit_arith_feedback: rustc_hash::FxHashMap::default(),
+            jit_element_load_kind: rustc_hash::FxHashMap::default(),
             jit_arith_widen_float: rustc_hash::FxHashSet::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
@@ -3398,6 +3407,7 @@ impl Interpreter {
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         self.bake_arith_feedback(&mut view, fid);
+        self.bake_element_load_kind(&mut view, fid);
         self.bake_property_feedback(&mut view);
         self.bake_object_literals(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid);
@@ -3500,6 +3510,55 @@ impl Interpreter {
             .entry((self.current_function_id, self.current_byte_pc))
             .or_default()
             .record(lhs, rhs);
+    }
+
+    /// Record the receiver kind observed at the current `LoadElement` site so a
+    /// site that reads only from a single unboxable typed-array kind
+    /// (`Float64Array` / `Int32Array`) can lower to a native-representation load.
+    /// Any other receiver demotes the site to
+    /// [`jit::JitElementLoadKind::Any`] (generic boxed load), and that demotion
+    /// is sticky — a mixed site never re-specializes.
+    pub(crate) fn note_element_load(&mut self, recv: Value) {
+        let key = (self.current_function_id, self.current_byte_pc);
+        let observed = match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
+            Some(crate::binary::TypedArrayKind::Float64) => jit::JitElementLoadKind::Float64,
+            Some(crate::binary::TypedArrayKind::Int32) => jit::JitElementLoadKind::Int32,
+            Some(_) => jit::JitElementLoadKind::Any,
+            None => {
+                // A non-typed-array receiver only matters if the site had already
+                // specialized: demote it so the tier keeps the generic load.
+                if let Some(slot) = self.jit_element_load_kind.get_mut(&key) {
+                    *slot = jit::JitElementLoadKind::Any;
+                }
+                return;
+            }
+        };
+        self.jit_element_load_kind
+            .entry(key)
+            .and_modify(|slot| {
+                if *slot != observed {
+                    *slot = jit::JitElementLoadKind::Any;
+                }
+            })
+            .or_insert(observed);
+    }
+
+    /// Copy the warmup element-load kind feedback recorded for `fid`'s
+    /// `LoadElement` sites into the compile snapshot, keyed by byte-PC. Sites the
+    /// interpreter never observed (or observed with mixed receivers) stay
+    /// [`jit::JitElementLoadKind::Any`], which lowers as the generic boxed load.
+    fn bake_element_load_kind(&self, view: &mut jit::JitFunctionView, fid: u32) {
+        if self.jit_element_load_kind.is_empty() {
+            return;
+        }
+        for instr in &mut view.instructions {
+            if instr.op != Op::LoadElement {
+                continue;
+            }
+            if let Some(kind) = self.jit_element_load_kind.get(&(fid, instr.byte_pc)) {
+                instr.element_load_kind = *kind;
+            }
+        }
     }
 
     /// Copy the warmup value-representation feedback recorded for `fid`'s
@@ -8374,6 +8433,12 @@ impl Interpreter {
                 }
                 Op::LoadElement => {
                     let operands = context.exec_operands(instr);
+                    if let Some(recv_reg) = context.exec_register(instr, 1)
+                        && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
+                    {
+                        let recv = *recv;
+                        self.note_element_load(recv);
+                    }
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }
@@ -11747,6 +11812,7 @@ mod tests {
             property_feedback_poly: Vec::new(),
             property_proto_feedback: None,
             object_literal: None,
+            element_load_kind: jit::JitElementLoadKind::Any,
         }
     }
 
@@ -16686,6 +16752,7 @@ mod tests {
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
+                    element_load_kind: jit::JitElementLoadKind::Any,
                 })
                 .collect(),
             inline_callees: rustc_hash::FxHashMap::default(),

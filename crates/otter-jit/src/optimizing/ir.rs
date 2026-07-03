@@ -57,6 +57,20 @@ pub enum Repr {
     Bool,
 }
 
+/// Native representation a specialized typed-array element load produces.
+///
+/// Chosen from warmup feedback ([`crate::JitFunctionView`]'s per-instruction
+/// `element_load_kind`): a site that only read from one unboxable typed-array
+/// kind lowers to a [`NodeKind::LoadElementUnboxed`] that keeps the element in
+/// this representation, skipping the box-on-load / unbox-in-consumer round trip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ElementLoadKind {
+    /// `Float64Array` element → [`Repr::Float64`] in an FP register.
+    Float64,
+    /// `Int32Array` element → [`Repr::Int32`] in a GP register.
+    Int32,
+}
+
 /// Relational / equality comparison kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CmpOp {
@@ -107,6 +121,53 @@ pub enum Float64UnaryOp {
     Ceil,
     /// `Math.trunc` → `frintz` (round toward zero).
     Trunc,
+}
+
+/// A `Math.*` unary with no single-instruction form, lowered to a leaf libm
+/// call from the optimizing tier ([`NodeKind::Float64UnaryCall`]). Each maps to
+/// the exact `f64` method the interpreter's `Math` uses, so the compiled result
+/// is bit-identical. The call clobbers the caller-saved register pool, so the
+/// node is a regalloc call site (values live across it hold callee-saved homes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Float64MathCall {
+    /// `Math.sin` → `f64::sin`.
+    Sin,
+    /// `Math.cos` → `f64::cos`.
+    Cos,
+    /// `Math.tan` → `f64::tan`.
+    Tan,
+    /// `Math.asin` → `f64::asin`.
+    Asin,
+    /// `Math.acos` → `f64::acos`.
+    Acos,
+    /// `Math.atan` → `f64::atan`.
+    Atan,
+    /// `Math.sinh` → `f64::sinh`.
+    Sinh,
+    /// `Math.cosh` → `f64::cosh`.
+    Cosh,
+    /// `Math.tanh` → `f64::tanh`.
+    Tanh,
+    /// `Math.asinh` → `f64::asinh`.
+    Asinh,
+    /// `Math.acosh` → `f64::acosh`.
+    Acosh,
+    /// `Math.atanh` → `f64::atanh`.
+    Atanh,
+    /// `Math.exp` → `f64::exp`.
+    Exp,
+    /// `Math.expm1` → `f64::exp_m1`.
+    Expm1,
+    /// `Math.log` → `f64::ln`.
+    Log,
+    /// `Math.log2` → `f64::log2`.
+    Log2,
+    /// `Math.log10` → `f64::log10`.
+    Log10,
+    /// `Math.log1p` → `f64::ln_1p`.
+    Log1p,
+    /// `Math.cbrt` → `f64::cbrt`.
+    Cbrt,
 }
 
 /// A typed SSA operation.
@@ -413,6 +474,16 @@ pub enum NodeKind {
     /// deoptimizes at the load's exact PC so the interpreter owns the full
     /// `[[Get]]` semantics. Result [`Repr::Tagged`].
     LoadElement(NodeId, NodeId),
+    /// Speculative typed-array element read specialized to a single unboxable
+    /// kind observed at warmup. Inputs are `(receiver, index)`, `index` already
+    /// unboxed int32. The kind-guarded load leaves the element in its native
+    /// representation — an FP register for [`ElementLoadKind::Float64`], a raw
+    /// int for [`ElementLoadKind::Int32`] — so a numeric consumer reads it
+    /// without an unbox. Any receiver that is not the expected typed-array kind
+    /// deopts at the load's exact PC before the result is defined, so
+    /// re-executing the load in the interpreter is correct. Result repr matches
+    /// the kind.
+    LoadElementUnboxed(NodeId, NodeId, ElementLoadKind),
     /// Speculative typed-array computed element write. Inputs are `(receiver,
     /// index, value)`, where `index` is already unboxed int32 and `value` is a
     /// primitive numeric value. A miss deoptimizes at the store's exact PC so the
@@ -428,6 +499,12 @@ pub enum NodeKind {
     /// so no deopt of its own; the operand's widening guard owns non-number
     /// inputs. Result [`Repr::Float64`].
     Float64Unary(Float64UnaryOp, NodeId),
+    /// A `Math.*` unary lowered to a leaf libm call (`Op::MathCall` with one
+    /// argument already widened to `f64`, e.g. `Math.sin`). Total per IEEE —
+    /// `NaN` / `±Inf` propagate exactly as the interpreter's matching `f64`
+    /// method, so no deopt of its own. Result [`Repr::Float64`]. The call
+    /// clobbers caller-saved registers, so this is a regalloc call site.
+    Float64UnaryCall(Float64MathCall, NodeId),
     /// Allocate an object literal (`NewObject` + a source-order run of
     /// `DefineDataProperty` with constant string keys) directly in its final
     /// hidden class. `shape_offset` is the compressed `Gc` offset of the shape
@@ -504,6 +581,7 @@ impl NodeKind {
             | NodeKind::LoadProtoSlot { recv: a, .. }
             | NodeKind::InlineUpvalue { closure: a, .. }
             | NodeKind::Float64Unary(_, a)
+            | NodeKind::Float64UnaryCall(_, a)
             | NodeKind::LoadArrayLength(a) => {
                 vec![*a]
             }
@@ -520,6 +598,7 @@ impl NodeKind {
             | NodeKind::Float64Compare(_, a, b)
             | NodeKind::StoreSlot(a, _, b)
             | NodeKind::LoadElement(a, b)
+            | NodeKind::LoadElementUnboxed(a, b, _)
             | NodeKind::Int32BitOr(a, b)
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
@@ -584,6 +663,7 @@ impl NodeKind {
             | NodeKind::LoadProtoSlot { recv: a, .. }
             | NodeKind::InlineUpvalue { closure: a, .. }
             | NodeKind::Float64Unary(_, a)
+            | NodeKind::Float64UnaryCall(_, a)
             | NodeKind::LoadArrayLength(a) => fix(a),
             NodeKind::Int32Add(a, b)
             | NodeKind::Int32Sub(a, b)
@@ -598,6 +678,7 @@ impl NodeKind {
             | NodeKind::Float64Compare(_, a, b)
             | NodeKind::StoreSlot(a, _, b)
             | NodeKind::LoadElement(a, b)
+            | NodeKind::LoadElementUnboxed(a, b, _)
             | NodeKind::Int32BitOr(a, b)
             | NodeKind::Int32BitAnd(a, b)
             | NodeKind::Int32BitXor(a, b)
@@ -682,7 +763,12 @@ impl NodeKind {
             | NodeKind::Float64Div(_, _)
             | NodeKind::Float64Rem(_, _)
             | NodeKind::Float64Unary(_, _)
+            | NodeKind::Float64UnaryCall(_, _)
             | NodeKind::Int32UshrToFloat64(_, _) => Repr::Float64,
+            NodeKind::LoadElementUnboxed(_, _, kind) => match kind {
+                ElementLoadKind::Float64 => Repr::Float64,
+                ElementLoadKind::Int32 => Repr::Int32,
+            },
             NodeKind::Int32Compare(_, _, _)
             | NodeKind::Float64Compare(_, _, _)
             | NodeKind::CheckBool(_)

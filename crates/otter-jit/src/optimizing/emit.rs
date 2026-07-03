@@ -489,6 +489,30 @@ mod arm64 {
         })
     }
 
+    /// Byte offset of the capacity word within `Vec`'s three machine words —
+    /// the word that is neither the data pointer nor the length. Used by the
+    /// inline dense-array append to check for spare capacity before the store.
+    fn vec_cap_offset() -> u32 {
+        static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            let mut v: Vec<u8> = Vec::with_capacity(4);
+            v.push(0xA5);
+            let ptr = v.as_ptr() as usize;
+            let len = v.len();
+            assert_eq!(std::mem::size_of::<Vec<u8>>(), 24);
+            // SAFETY: read the three machine words by value; only compared to the
+            // known pointer / length, never dereferenced. The remaining word is
+            // the capacity.
+            let words: [usize; 3] = unsafe { std::mem::transmute_copy(&v) };
+            for (i, &w) in words.iter().enumerate() {
+                if w != ptr && w != len {
+                    return (i * 8) as u32;
+                }
+            }
+            panic!("Vec capacity word not found");
+        })
+    }
+
     /// Box the f64 in `src_d` into x-register `dst_x` as a tagged `Value`.
     /// NaN is canonicalized first, then the encode offset is added so the bits
     /// land in the number space and never alias an immediate. Uses the move
@@ -3430,13 +3454,12 @@ mod arm64 {
                 value,
                 recv_reg,
             } => {
-                // Dense `push(value)`: guard, then route the append through a
-                // safepointed runtime stub that handles growth and the
-                // generational barrier in Rust. The guard deopts on every
-                // non-fast case before any frame change; the live frame is
-                // materialized for the call safepoint, the value is passed boxed
-                // by value (its source register may be reused), and the new length
-                // is written back to the frame and reloaded.
+                // Dense `push(value)`: guard, then append in place when the packed
+                // backing store has spare capacity — write the boxed value at the
+                // free slot, bump the backing length and the JS length, and record
+                // the generational card. Growth (capacity full), a sparse length,
+                // or an out-of-int32 length falls to the safepointed runtime stub,
+                // which handles reallocation and the barrier in Rust.
                 let point = frames
                     .get(&nid)
                     .ok_or(Unsupported::Unlowered("array push without safepoint state"))?;
@@ -3451,7 +3474,53 @@ mod arm64 {
                     .array_methods
                     .get(&node.byte_pc)
                     .ok_or(Unsupported::Unlowered("array push without feedback"))?;
+                let (ptr_word, len_word) = vec_layout_offsets();
+                let arr_ptr_byte = view.ta_layout.array_elements_byte + ptr_word;
+                let arr_len_byte = view.ta_layout.array_elements_byte + len_word;
+                let arr_cap_byte = view.ta_layout.array_elements_byte + vec_cap_offset();
+                let array_length_byte = view.ta_layout.array_length_byte;
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                // The guard leaves the array body pointer in x0. The fast path uses
+                // only the caller-saved scratch x3..x9 (allocator homes live in
+                // x9..x15 / x21..x28) plus the reserved x16/x17/d6/d7 the barrier
+                // clobbers, so no live SSA value is disturbed.
                 emit_opt_array_dense_proto_guard(ops, view, &am, recv_loc, exit);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x3, [x0, arr_len_byte]        // backing length
+                    ; ldr x4, [x0, array_length_byte]   // JS length
+                    ; cmp x3, x4
+                    ; b.ne =>slow                        // sparse / detached length
+                    ; lsr x4, x3, #31
+                    ; cbnz x4, =>slow                    // length past int32 → stub owns it
+                    ; ldr x5, [x0, arr_cap_byte]         // backing capacity
+                    ; cmp x3, x5
+                    ; b.hs =>slow                        // no spare capacity → grow via stub
+                    ; ldr x6, [x0, arr_ptr_byte]         // backing data
+                    ; lsl x7, x3, #3
+                    ; add x6, x6, x7                     // &elem[len]
+                );
+                box_into_gp(ops, 8, value_repr, value_loc, box_scratch);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; str x8, [x6]                       // elem[len] = value
+                    ; add x3, x3, #1                     // new length
+                    ; str x3, [x0, arr_len_byte]
+                    ; str x3, [x0, array_length_byte]
+                );
+                if value_is_used_after(graph, call_resume_frames, nid)
+                    && let Some(loc) = dst
+                {
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; movz x9, NUMBER_TAG_HI16, lsl #48
+                        ; orr x9, x3, x9
+                    );
+                    store_loc(ops, loc, 9);
+                }
+                emit_generational_card_mark(ops, view, recv_loc, value_loc)?;
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
                 emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
                 box_into_gp(ops, 3, value_repr, value_loc, box_scratch);
                 dynasm!(ops
@@ -3477,6 +3546,7 @@ mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
                     store_loc(ops, loc, box_scratch);
                 }
+                dynasm!(ops ; .arch aarch64 ; =>done);
                 Ok(())
             }
             NodeKind::StringConcat { lhs, rhs } => {

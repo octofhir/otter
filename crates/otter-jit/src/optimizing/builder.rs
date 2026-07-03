@@ -934,6 +934,38 @@ impl<'a> Builder<'a> {
                     .last()
                     .map(|p| p.define_pc)
                     .ok_or(Unsupported::Unlowered("object literal without properties"))?;
+                // Folding defers every property store to a single
+                // `AllocObjectLiteral` at the final define, holding each captured
+                // property value as an SSA value until then. The optimizing tier's
+                // GC safepoints root the interpreter frame-slot window, not the
+                // machine homes those SSA values occupy, and the folded value is
+                // never written back to its frame slot — so a garbage-collecting op
+                // between the `NewObject` and the final define moves the captured
+                // object and leaves the pending store dangling. Decline the fold
+                // (the whole function drops to the baseline, which stores each
+                // property into the already-rooted object as it goes) whenever a
+                // property value spans such an op. A key `LoadString` is folded
+                // away and never allocates, so it does not count.
+                let key_pcs: FxHashSet<u32> = plan.key_pcs.iter().copied().collect();
+                let spans_gc_op = self.view.instructions.iter().any(|i| {
+                    i.byte_pc > byte_pc
+                        && i.byte_pc <= last_define_pc
+                        && !key_pcs.contains(&i.byte_pc)
+                        && matches!(
+                            i.op,
+                            Op::Call
+                                | Op::CallMethodValue
+                                | Op::New
+                                | Op::NewArray
+                                | Op::NewObject
+                                | Op::LoadString
+                        )
+                });
+                if spans_gc_op {
+                    return Err(Unsupported::Unlowered(
+                        "object literal value spans a garbage-collecting op",
+                    ));
+                }
                 let define_slot = plan
                     .defines
                     .iter()

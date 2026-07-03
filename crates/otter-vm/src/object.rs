@@ -2054,19 +2054,28 @@ pub(crate) fn store_own_data_slot_atom(
 ) -> Option<()> {
     let mut obj = obj;
     let compressed = compress_or_abort(heap, &mut obj, *value);
-    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
-    // Shaped receivers match on the interned shape handle (one offset compare,
-    // no shape-body deref); dictionary mode falls back to the per-object shape
-    // id plus a name compare. See `load_own_data_slot_atom`.
-    let shape_ok = heap.read_payload(obj, |body| {
-        if !body.shape.is_null() {
+    // Every pre-write guard reads the same immutable body under `&heap` (to walk
+    // the hidden class) — no mutation runs between them — so a single payload
+    // snapshot computes them all instead of re-indexing the slot table four
+    // times. Shaped receivers match on the interned shape handle (one offset
+    // compare, no shape-body deref); dictionary mode falls back to the per-object
+    // shape id plus a name compare. See `load_own_data_slot_atom`. The per-slot
+    // attributes are read under the same shape the write below revalidates, so
+    // `with_payload` (which cannot reborrow the heap to walk the hidden class)
+    // sees a consistent `(writable, is_accessor)` pair.
+    let (mapped_cell, shape_ok, key_matches, slot_attrs) = heap.read_payload(obj, |body| {
+        let offset = hit.slot as usize;
+        let mapped_cell = mapped_argument_cell(body, key.name());
+        let shape_ok = if !body.shape.is_null() {
             body.shape == hit.shape
         } else {
             body_shape_id(heap, body) == hit.shape_id
-        }
-    });
-    let key_matches = heap.read_payload(obj, |body| {
-        !body.shape.is_null() || body_key_matches(heap, body, hit.slot as usize, key.name())
+        };
+        let key_matches =
+            !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
+        let slot_attrs =
+            (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset));
+        (mapped_cell, shape_ok, key_matches, slot_attrs)
     });
     debug_assert!(
         !shape_ok
@@ -2078,13 +2087,6 @@ pub(crate) fn store_own_data_slot_atom(
             )),
         "shape-id store hit resolved to a slot whose key differs from the request"
     );
-    // The per-slot attributes are read under the same shape that the guards
-    // below revalidate, so `with_payload` (which cannot reborrow the heap to
-    // walk the hidden class) sees a consistent `(writable, is_accessor)` pair.
-    let slot_attrs = heap.read_payload(obj, |body| {
-        let offset = hit.slot as usize;
-        (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset))
-    });
     let success = heap.with_payload(obj, |body| {
         let offset = hit.slot as usize;
         if !shape_ok || key.atom().id() != hit.atom_id || !key_matches {

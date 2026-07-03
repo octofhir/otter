@@ -442,7 +442,7 @@ impl<'a> Builder<'a> {
         };
         // Materialize one block per CFG range (the graph starts with just the
         // entry block).
-        let mut graph = Graph::new(view.param_count, view.register_count, entry);
+        let mut graph = Graph::new(view.function_id, view.param_count, view.register_count, entry);
         graph.blocks.clear();
         for &(start, _) in &cfg.ranges {
             let pc = view.instructions[start].byte_pc;
@@ -3883,6 +3883,7 @@ mod tests {
             .expect("epilogue block") as BlockId;
         let point = deopts.get(&epilogue).expect("epilogue deopt state");
         let (_, acc) = point
+            .top()
             .registers
             .iter()
             .find(|&&(reg, _)| reg == 0)

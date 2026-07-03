@@ -923,11 +923,14 @@ pub struct Graph {
     /// holds at a guard, which `frame_dst` alone cannot express for aliased
     /// registers.
     pub reg_writes: rustc_hash::FxHashMap<BlockId, Vec<(u32, u16, NodeId)>>,
+    /// Function id of the compiled function this graph represents. Deopt frame
+    /// states name it as the outermost interpreter frame to resume.
+    pub function_id: u32,
 }
 
 impl Graph {
     /// Construct an empty graph with a single (entry) block at byte-PC 0.
-    pub(super) fn new(param_count: u16, register_count: u16, entry: BlockId) -> Self {
+    pub(super) fn new(function_id: u32, param_count: u16, register_count: u16, entry: BlockId) -> Self {
         Self {
             nodes: Vec::new(),
             blocks: vec![Block::new(0)],
@@ -936,6 +939,7 @@ impl Graph {
             register_count,
             phi_reg: rustc_hash::FxHashMap::default(),
             reg_writes: rustc_hash::FxHashMap::default(),
+            function_id,
         }
     }
 

@@ -99,7 +99,7 @@ pub(super) fn emit_bail(
     graph: &Graph,
     values: &[Option<Value>],
 ) -> Result<(), super::Unsupported> {
-    for &(regn, value) in &point.registers {
+    for &(regn, value) in &point.top().registers {
         let v = values[value as usize].ok_or(super::Unsupported::Unlowered(
             "clif: deopt value without home",
         ))?;
@@ -107,7 +107,7 @@ pub(super) fn emit_bail(
         let off = i32::from(regn) * 8;
         b.ins().store(flags.trusted, boxed, regs_base, off);
     }
-    let pc = b.ins().iconst(types::I32, i64::from(point.byte_pc));
+    let pc = b.ins().iconst(types::I32, i64::from(point.resume_pc()));
     b.ins().store(flags.trusted, pc, ctx_ptr, BAIL_PC_OFFSET);
     // The bail value is ignored by `enter_compiled` on `STATUS_BAILED` (it reads
     // `ctx.bail_pc`); return a zero placeholder in the value slot.

@@ -1629,7 +1629,7 @@ mod arm64 {
         box_scratch: u32,
         keep: impl Fn(u16, NodeId) -> bool,
     ) -> Result<(), Unsupported> {
-        for &(regn, value) in &point.registers {
+        for &(regn, value) in &point.top().registers {
             if !keep(regn, value) {
                 continue;
             }
@@ -1652,7 +1652,7 @@ mod arm64 {
         skip_reg: Option<u16>,
         box_scratch: u32,
     ) -> Result<(), Unsupported> {
-        for &(regn, value) in &point.registers {
+        for &(regn, value) in &point.top().registers {
             if Some(regn) == skip_reg {
                 continue;
             }
@@ -1716,7 +1716,7 @@ mod arm64 {
         skip_reg: Option<u16>,
         box_scratch: u32,
     ) -> Result<(), Unsupported> {
-        for &(regn, value) in &point.registers {
+        for &(regn, value) in &point.top().registers {
             if Some(regn) == skip_reg || graph.node(value).repr != Repr::Tagged {
                 continue;
             }
@@ -1754,7 +1754,7 @@ mod arm64 {
         }
         frames
             .values()
-            .any(|point| point.registers.iter().any(|&(_, v)| v == value))
+            .any(|point| point.values().any(|v| v == value))
     }
 
     fn emit_status_stub_call(ops: &mut Assembler, addr: usize, threw: DynamicLabel) {
@@ -3714,7 +3714,7 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3816,7 +3816,7 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3845,7 +3845,7 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3874,7 +3874,7 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3910,7 +3910,7 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4250,7 +4250,7 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4318,7 +4318,7 @@ mod arm64 {
                     emit_frame_materialize_where(ops, graph, alloc, point, box_scratch, |r, v| {
                         !crosses(r, v)
                     })?;
-                    emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
+                    emit_load_u64(ops, box_scratch, u64::from(point.resume_pc()));
                     dynasm!(ops
                         ; .arch aarch64
                         ; str W(box_scratch), [x20, BAIL_PC_OFFSET]
@@ -4355,7 +4355,7 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4366,7 +4366,7 @@ mod arm64 {
                     ; b =>after
                     ; =>bail
                 );
-                emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
+                emit_load_u64(ops, box_scratch, u64::from(point.resume_pc()));
                 dynasm!(ops
                     ; .arch aarch64
                     ; str W(box_scratch), [x20, BAIL_PC_OFFSET]
@@ -4606,7 +4606,7 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4616,7 +4616,7 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -5162,7 +5162,7 @@ mod arm64 {
         box_scratch: u32,
         callee_saved: &[CalleeSavedReg],
     ) -> Result<(), Unsupported> {
-        for &(regn, value) in &point.registers {
+        for &(regn, value) in &point.top().registers {
             let node = graph.node(value);
             if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
                 let loc = require_loc(alloc, value)?;
@@ -5171,7 +5171,7 @@ mod arm64 {
             let off = u32::from(regn) * 8;
             dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [x19, off]);
         }
-        emit_load_u64(ops, box_scratch, u64::from(point.byte_pc));
+        emit_load_u64(ops, box_scratch, u64::from(point.resume_pc()));
         dynasm!(ops ; .arch aarch64 ; str W(box_scratch), [x20, BAIL_PC_OFFSET]);
         dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_BAILED as u32);
         emit_epilogue(ops, spill_bytes, callee_saved);

@@ -524,10 +524,28 @@ enum JitDirectMethodHit {
 struct JitDirectMethodCache {
     hit: JitDirectMethodHit,
     function_id: u32,
+    /// The resolved method value the receiver slot must still hold for this cached
+    /// way to apply. Held as exact bits (a plain function or a closure singleton on
+    /// a shared prototype) and only ever bit-compared against the freshly loaded
+    /// slot value — never dereferenced — so a moved/stale entry simply misses and
+    /// re-resolves rather than reading a dangling pointer.
+    method_value: Value,
     code: std::sync::Arc<dyn jit::JitFunctionCode>,
     /// Inline-link fields for this shape, mirrored into the flat per-way table the
     /// optimizing tier walks to take the bridge-free call.
     inline: JitDirectMethodInline,
+}
+
+impl JitDirectMethodCache {
+    /// The receiver shape id this cached way keys on.
+    fn cached_shape_id(&self) -> crate::object::ShapeId {
+        match &self.hit {
+            JitDirectMethodHit::Own(h) => h.shape_id,
+            JitDirectMethodHit::DirectPrototype {
+                receiver_shape_id, ..
+            } => *receiver_shape_id,
+        }
+    }
 }
 
 /// Maximum receiver shapes cached per direct-method call site before it is left
@@ -2164,7 +2182,7 @@ impl Interpreter {
         self.jit_code.remove(&fid);
         self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
-        self.clear_jit_direct_method_cache();
+        self.clear_jit_direct_method_cache_for_fid(fid);
         self.jit_osr_code
             .retain(|(entry_fid, _), _| *entry_fid != fid);
         self.jit_osr_disabled
@@ -2267,7 +2285,7 @@ impl Interpreter {
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
             self.jit_code.insert(fid, compiled.clone());
             self.jit_code_cache = None;
-            self.clear_jit_direct_method_cache();
+            self.clear_jit_direct_method_cache_for_fid(fid);
             compiled
         };
         // The function-entry path never runs OSR-only code (compiled with
@@ -2425,12 +2443,30 @@ impl Interpreter {
         })
     }
 
-    fn clear_jit_direct_method_cache(&mut self) {
-        for set in &mut self.jit_direct_method_cache {
-            set.clear();
-        }
-        for slot in &mut self.jit_direct_method_inline_slots {
-            *slot = JitDirectMethodInline::EMPTY;
+    /// Drop only the cached direct-method ways whose callee is `fid`, and re-mirror
+    /// the flat table for the sites they occupied. A recompile/invalidation of one
+    /// function only invalidates the entries that point at *its* code (stale entry
+    /// address); wiping the whole cache instead makes a call site with churning
+    /// receiver feedback re-resolve and re-install every call (the cache is cleared
+    /// out from under it before it can be hit).
+    fn clear_jit_direct_method_cache_for_fid(&mut self, fid: u32) {
+        for site_idx in 0..self.jit_direct_method_cache.len() {
+            let set = &mut self.jit_direct_method_cache[site_idx];
+            let before = set.len();
+            set.retain(|c| c.function_id != fid);
+            if set.len() == before {
+                continue;
+            }
+            let base = site_idx * MAX_DIRECT_METHOD_WAYS;
+            for way in 0..MAX_DIRECT_METHOD_WAYS {
+                let value = self.jit_direct_method_cache[site_idx]
+                    .get(way)
+                    .map(|c| c.inline)
+                    .unwrap_or(JitDirectMethodInline::EMPTY);
+                if let Some(flat) = self.jit_direct_method_inline_slots.get_mut(base + way) {
+                    *flat = value;
+                }
+            }
         }
     }
 
@@ -2714,16 +2750,32 @@ impl Interpreter {
         };
         let mut resolved = None;
         for cache in set {
-            if self.cached_direct_method_value(obj, &cache.hit)
-                == Some(Value::function(cache.function_id))
-            {
-                resolved = Some((cache.function_id, cache.code.clone()));
+            if self.cached_direct_method_value(obj, &cache.hit) == Some(cache.method_value) {
+                resolved = Some((cache.method_value, cache.function_id, cache.code.clone()));
                 break;
             }
         }
-        let Some((function_id, code)) = resolved else {
+        let Some((method_value, function_id, code)) = resolved else {
             return Ok(None);
         };
+        // Derive the callee's upvalue spine and `this` from the resolved method
+        // value. A plain-function method carries no upvalues; a closure method
+        // (the common shape for a prototype method that captures module state)
+        // supplies its captured spine here — the reason this fast path exists is
+        // to skip the slow path's IC walk and method-site feedback, not to
+        // restrict itself to upvalue-free methods.
+        let Ok((target_fid, parent_upvalues, this0, new_target, derived_this, eval_env)) =
+            Self::bytecode_call_target_parts(method_value, recv, &self.gc_heap)
+        else {
+            return Ok(None);
+        };
+        if target_fid != function_id
+            || new_target.is_some()
+            || derived_this.is_some()
+            || eval_env.is_some()
+        {
+            return Ok(None);
+        }
         let Some(function) = context.exec_function(function_id) else {
             return Ok(None);
         };
@@ -2737,8 +2789,8 @@ impl Interpreter {
             stack,
             frame_index,
             function,
-            Frame::empty_upvalues(),
-            recv,
+            parent_upvalues,
+            this0,
             plan,
             None,
             arg_regs,
@@ -2768,12 +2820,51 @@ impl Interpreter {
         register_count: u32,
         upvalues_ptr: usize,
     ) {
-        if method != Value::function(function_id) {
+        // Accept the plain-function method value or a closure singleton that
+        // resolves to the same callee. A closure method is cached (and served) by
+        // the Rust fast path via `method_value` identity; only a bare, upvalue-free
+        // function is additionally eligible for the asm flat-table link below.
+        let method_is_plain_function = method == Value::function(function_id);
+        // A closure method only caches at a monomorphic site. A polymorphic receiver
+        // family (one `arr[i].run()` site over sibling classes) exposes no single
+        // stable own/direct-prototype stub to cache, so the shape-walk loop below
+        // would find nothing and re-run every call for no benefit — reject it up
+        // front (as cheaply as the pre-cache path did) and leave it on the uniform
+        // slow path. Plain-function methods keep their existing mono/poly caching.
+        if !method_is_plain_function
+            && self.load_property_ics.get(site).map(|e| e.entry_count()) != Some(1)
+        {
+            return;
+        }
+        let method_fid = method
+            .as_function()
+            .or_else(|| method.as_closure(&self.gc_heap).map(|c| c.function_id()));
+        if method_fid != Some(function_id) {
+            return;
+        }
+        // A saturated site whose receiver shape is not already one of the cached
+        // ways is megamorphic: installing cannot help (the way budget is full and a
+        // new shape would be dropped), so skip the receiver/prototype shape walk
+        // below and leave those calls on the uniform slow path. Without this a
+        // megamorphic site pays the full resolve loop on every call.
+        let recv_shape_id = object::shape_id(obj, &self.gc_heap);
+        if let Some(set) = self.jit_direct_method_cache.get(site)
+            && set.len() >= MAX_DIRECT_METHOD_WAYS
+            && !set.iter().any(|c| c.cached_shape_id() == recv_shape_id)
+        {
             return;
         }
         let Some(entry) = self.load_property_ics.get(site) else {
             return;
         };
+        // A megamorphic load IC (the receiver family exceeds the IC's shape
+        // budget — e.g. one `arr[i].run()` site driven with both a 4-shape and a
+        // 6-shape array) exposes no monomorphic own/direct-prototype stub to cache
+        // from, so the shape-walk loop below would find nothing on every call.
+        // Bail to the uniform slow path, matching the pre-cache behaviour.
+        if entry.is_megamorphic() {
+            return;
+        }
         let mut cached_hit = None;
         for stub in entry.entries() {
             if let Some(hit) = stub.own_data_hit()
@@ -2805,29 +2896,37 @@ impl Interpreter {
             // guard and method-slot byte offset for the identity walk, plus the
             // callee entry / window / SELF / upvalue-spine the emitted call needs.
             let cv = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-            let inline = match &hit {
-                JitDirectMethodHit::Own(h) => JitDirectMethodInline {
-                    entry_addr,
-                    register_count,
-                    recv_shape_offset: h.shape.offset(),
-                    proto_shape_offset: 0,
-                    method_on_receiver: 1,
-                    method_value_byte: u32::from(h.slot) * cv,
-                    method_fid: function_id,
-                    self_closure_bits: Value::function(function_id).to_bits(),
-                    upvalues_ptr,
-                },
-                JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
-                    JitDirectMethodInline {
+            // The asm flat-table link bakes a raw `upvalues_ptr` and plain-function
+            // SELF bits, so it is only sound for an upvalue-free function method. A
+            // closure method leaves the flat slot EMPTY (the asm guard bails to the
+            // Rust stub, which serves it from the cache with the live spine).
+            let inline = if !method_is_plain_function {
+                JitDirectMethodInline::EMPTY
+            } else {
+                match &hit {
+                    JitDirectMethodHit::Own(h) => JitDirectMethodInline {
                         entry_addr,
                         register_count,
-                        recv_shape_offset: object::shape(obj, &self.gc_heap).offset(),
-                        proto_shape_offset: prototype_hit.shape.offset(),
-                        method_on_receiver: 0,
-                        method_value_byte: u32::from(prototype_hit.slot) * cv,
+                        recv_shape_offset: h.shape.offset(),
+                        proto_shape_offset: 0,
+                        method_on_receiver: 1,
+                        method_value_byte: u32::from(h.slot) * cv,
                         method_fid: function_id,
                         self_closure_bits: Value::function(function_id).to_bits(),
                         upvalues_ptr,
+                    },
+                    JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
+                        JitDirectMethodInline {
+                            entry_addr,
+                            register_count,
+                            recv_shape_offset: object::shape(obj, &self.gc_heap).offset(),
+                            proto_shape_offset: prototype_hit.shape.offset(),
+                            method_on_receiver: 0,
+                            method_value_byte: u32::from(prototype_hit.slot) * cv,
+                            method_fid: function_id,
+                            self_closure_bits: Value::function(function_id).to_bits(),
+                            upvalues_ptr,
+                        }
                     }
                 }
             };
@@ -2841,6 +2940,7 @@ impl Interpreter {
                 let entry = JitDirectMethodCache {
                     hit,
                     function_id,
+                    method_value: method,
                     code,
                     inline,
                 };
@@ -4060,7 +4160,7 @@ impl Interpreter {
         self.jit_code.remove(&fid);
         self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
-        self.clear_jit_direct_method_cache();
+        self.clear_jit_direct_method_cache_for_fid(fid);
         self.jit_osr_code.retain(|&(f, _), _| f != fid);
         self.jit_osr_disabled.retain(|&(f, _)| f != fid);
         self.jit_osr_counts.retain(|&(f, _), _| f != fid);

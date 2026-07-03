@@ -31,7 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use otter_bytecode::{Op, Operand};
 use otter_vm::jit_feedback::{ARITH_STRING, ArithFeedback};
-use otter_vm::{JitArrayMethodKind, JitFunctionView, JitInlineCallee, JitInlineMethod};
+use otter_vm::{
+    JitArrayMethodKind, JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::ir::{
@@ -53,7 +55,7 @@ pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph
     if view.instructions.is_empty() {
         return Err(Unsupported::Empty);
     }
-    let cfg = Cfg::discover(view)?;
+    let cfg = Cfg::discover(&view.instructions)?;
     let mut builder = Builder::new(view, cfg, osr_pc)?;
     builder.run()?;
     reject_call_object_mix(&builder.graph)?;
@@ -267,8 +269,7 @@ struct Cfg {
 }
 
 impl Cfg {
-    fn discover(view: &JitFunctionView) -> Result<Self, Unsupported> {
-        let instrs = &view.instructions;
+    fn discover(instrs: &[JitInstrView]) -> Result<Self, Unsupported> {
         // Byte-PC → instruction index, for resolving branch targets and the
         // fallthrough successor.
         let mut index_of_pc: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1397,6 +1398,17 @@ impl<'a> Builder<'a> {
                         if let Some(result) = self
                             .try_inline_method(block, byte_pc, recv, &method, argc, &args, None)?
                         {
+                            self.def_register(dst, block, result, byte_pc);
+                            continue;
+                        }
+                        // The linear replay declines a branchy body; a pure
+                        // (side-effect-free) one splices its whole control-flow
+                        // graph in instead, continuing the caller in the merge
+                        // block the callee's returns feed.
+                        if let Some((result, cont)) = self.try_inline_method_cfg(
+                            cfg_block, block, byte_pc, recv, &method, argc, &args,
+                        )? {
+                            block = cont;
                             self.def_register(dst, block, result, byte_pc);
                             continue;
                         }
@@ -2677,6 +2689,505 @@ impl<'a> Builder<'a> {
             self.graph.blocks[block as usize].body.truncate(start_body);
         }
         Ok(returned)
+    }
+
+    /// Whether a callee opcode is admissible in a *side-effect-free* CFG-splice
+    /// inline: reads, typed arithmetic, comparisons, and intra-body branches, but
+    /// nothing that writes memory, allocates, or re-enters user code. A method
+    /// built entirely from these can be re-executed from its call site with no
+    /// observable effect, which is what makes the re-run-the-call deopt of an
+    /// inlined guard correct (see [`Self::try_inline_method_cfg`]).
+    fn inline_cfg_op_is_pure(op: Op) -> bool {
+        matches!(
+            op,
+            Op::LoadThis
+                | Op::LoadInt32
+                | Op::LoadNumber
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::LoadUndefined
+                | Op::LoadHole
+                | Op::LoadLocal
+                | Op::StoreLocal
+                | Op::LoadUpvalue
+                | Op::ToPrimitive
+                | Op::ToNumeric
+                | Op::LoadProperty
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
+                | Op::Increment
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual
+                | Op::LooseEqual
+                | Op::LooseNotEqual
+                | Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
+        )
+    }
+
+    /// Inline a *branchy, side-effect-free* monomorphic method by splicing the
+    /// callee's control-flow graph into the caller at the call site.
+    ///
+    /// The linear replay ([`Self::try_inline_method`]) handles only straight-line
+    /// method bodies — a method with an `if` or a short-circuit (`||` / `&&`)
+    /// declines there. This builds the callee's basic blocks as fresh caller
+    /// blocks and translates each with the builder's on-demand SSA machinery, so
+    /// internal merges get real phis. Callee registers are offset above the
+    /// caller's register file: they are named only inside the spliced blocks and
+    /// never appear in a deopt frame state (which is keyed on the caller's live
+    /// bytecode registers at the call PC), so a guard inside the body deopts by
+    /// re-running the whole call at `call_pc` with the caller's frame — exactly
+    /// what the existing single-frame machinery already captures.
+    ///
+    /// Restricted to **pure** callees (see [`Self::inline_cfg_op_is_pure`]):
+    /// re-running the call is only observably-equivalent when the body has no
+    /// side effect. A branchy method that mutates before a guard needs a
+    /// mid-callee resume frame (a nested deopt state) and is left to the bridge.
+    /// The callee CFG must also be a forward DAG (no internal loop), so the
+    /// spliced blocks seal in topological order.
+    ///
+    /// Returns `(result, continuation)` — the call's destination value and the
+    /// merge block the caller continues building into — or `None` (bridge the
+    /// call). On `None` every arena touched is rolled back to a clean state.
+    #[allow(clippy::too_many_arguments)]
+    fn try_inline_method_cfg(
+        &mut self,
+        cfg_block: BlockId,
+        block: BlockId,
+        call_pc: u32,
+        recv: NodeId,
+        method: &JitInlineMethod,
+        argc: usize,
+        args: &[NodeId],
+    ) -> Result<Option<(NodeId, BlockId)>, Unsupported> {
+        const MAX_INLINE_METHOD_REGS: u16 = 64;
+        const MAX_INLINE_METHOD_INSTRS: usize = 64;
+        // Splice only at a real CFG block: the successor rewiring below reads
+        // `self.cfg.succs[block]`, which a synthetic merge block (produced by an
+        // earlier splice in this same bytecode block) does not have.
+        if block != cfg_block
+            || self.view.cage_base == 0
+            || argc != usize::from(method.param_count)
+            || method.register_count == 0
+            || method.register_count > MAX_INLINE_METHOD_REGS
+            || method.instructions.len() < 2
+            || method.instructions.len() > MAX_INLINE_METHOD_INSTRS
+            || !method.instructions.iter().all(|i| Self::inline_cfg_op_is_pure(i.op))
+        {
+            return Ok(None);
+        }
+        // The callee registers occupy `[base, base + register_count)` above the
+        // caller's file; keep that window inside the `u16` register index space.
+        let base = self.current_def.len();
+        if base + usize::from(method.register_count) > usize::from(u16::MAX) {
+            return Ok(None);
+        }
+        let base = base as u16;
+
+        let ccfg = match Cfg::discover(&method.instructions) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+        // Forward DAG only. Blocks are in start-PC order, so a back edge is a
+        // predecessor whose block index is not strictly smaller.
+        for (b, preds) in ccfg.preds.iter().enumerate() {
+            if preds.iter().any(|&p| p as usize >= b) {
+                return Ok(None);
+            }
+        }
+
+        let nodes0 = self.graph.nodes.len();
+        let blocks0 = self.graph.blocks.len();
+        let cdef0 = self.current_def.len();
+        let cont = blocks0 + ccfg.ranges.len();
+        macro_rules! bail_cfg {
+            () => {{
+                self.graph.nodes.truncate(nodes0);
+                self.graph.blocks.truncate(blocks0);
+                self.current_def.truncate(cdef0);
+                self.graph.phi_reg.retain(|&k, _| (k as usize) < nodes0);
+                self.incomplete_phis.retain(|&b, _| (b as usize) < blocks0);
+                return Ok(None);
+            }};
+        }
+
+        // One caller-graph block per callee block, then the continuation merge.
+        for &(start, _) in &ccfg.ranges {
+            let pc = method.instructions[start].byte_pc;
+            self.graph.blocks.push(super::ir::Block::new(pc));
+        }
+        self.graph.blocks.push(super::ir::Block::new(call_pc));
+        self.current_def
+            .resize(base as usize + usize::from(method.register_count), Default::default());
+        let off = |r: u16| -> u16 { base + r };
+        let gblock = |cb: BlockId| -> BlockId { blocks0 as BlockId + cb };
+
+        // Callee-block predecessors (offset), the entry fed by the caller block.
+        for (cb, preds) in ccfg.preds.iter().enumerate() {
+            let mapped: Vec<BlockId> = preds.iter().map(|&p| gblock(p)).collect();
+            self.graph.blocks[gblock(cb as BlockId) as usize].preds = mapped;
+        }
+        self.graph.blocks[gblock(0) as usize].preds = vec![block];
+
+        // Seed the callee entry: parameter registers take the call arguments,
+        // every other register starts `undefined` (matching an uninitialized
+        // interpreter slot) so no cross-block read ever falls through to the
+        // caller's register file.
+        let entry_g = gblock(0);
+        let ident = self.graph.add_node(
+            NodeKind::CheckMethodIdentity {
+                recv,
+                recv_shape: method.recv_shape,
+                proto_shape: method.proto_shape,
+                method_value_byte: method.method_value_byte,
+                method_on_receiver: method.method_on_receiver,
+                method_fid: method.method_fid,
+            },
+            entry_g,
+            call_pc,
+        );
+        self.push_body(entry_g, ident);
+        for r in 0..method.register_count {
+            let node = if (r as usize) < argc {
+                args[r as usize]
+            } else {
+                let u = self.graph.add_node(NodeKind::ConstUndefined, entry_g, call_pc);
+                self.push_body(entry_g, u);
+                u
+            };
+            self.write_variable(off(r), entry_g, node);
+        }
+
+        // A captured binding of the inlined method resolves through the method's
+        // own closure, which lives in the (identity-guarded) method slot: the
+        // receiver's prototype slab for a prototype method, or the receiver's own
+        // slab for an own-property method. Materialize it once in the entry block
+        // so every `LoadUpvalue` in the body reads the method closure's spine.
+        let method_closure = if method.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
+            let node = if method.method_on_receiver {
+                let checked = self.graph.add_node(
+                    NodeKind::CheckShape(recv, method.recv_shape),
+                    entry_g,
+                    call_pc,
+                );
+                self.push_body(entry_g, checked);
+                self.graph.add_node(
+                    NodeKind::LoadSlot(checked, method.method_value_byte),
+                    entry_g,
+                    call_pc,
+                )
+            } else {
+                self.graph.add_node(
+                    NodeKind::LoadProtoSlot {
+                        recv,
+                        recv_shape: method.recv_shape,
+                        proto_shape: method.proto_shape,
+                        slot_byte: method.method_value_byte,
+                    },
+                    entry_g,
+                    call_pc,
+                )
+            };
+            self.push_body(entry_g, node);
+            Some(node)
+        } else {
+            None
+        };
+
+        // Fill each callee block in topological (index) order. A block's
+        // predecessors always have a lower index (forward DAG), so they are
+        // already filled and sealed — the on-demand SSA reader resolves cross-
+        // block values into real phis with no incomplete-phi backlog.
+        let mut returns: Vec<NodeId> = Vec::new();
+        for cb in 0..ccfg.ranges.len() {
+            let g = gblock(cb as BlockId);
+            self.graph.blocks[g as usize].sealed = true;
+            let (start, end) = ccfg.ranges[cb];
+            for instr in &method.instructions[start..end] {
+                let op = instr.op;
+                let operands = instr.operands.as_slice();
+                match op {
+                    Op::LoadThis => {
+                        let dst = reg(operands, 0)?;
+                        self.write_variable(off(dst), g, recv);
+                    }
+                    Op::LoadInt32 => {
+                        let dst = reg(operands, 0)?;
+                        let value = imm32(operands, 1)?;
+                        let node = self.graph.add_node(NodeKind::ConstInt32(value), g, call_pc);
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LoadNumber => {
+                        let dst = reg(operands, 0)?;
+                        let Some(value) = instr.load_number else {
+                            bail_cfg!();
+                        };
+                        let node = self.graph.add_node(NodeKind::ConstF64(value), g, call_pc);
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LoadTrue | Op::LoadFalse => {
+                        let dst = reg(operands, 0)?;
+                        let node = self.graph.add_node(
+                            NodeKind::ConstBool(matches!(op, Op::LoadTrue)),
+                            g,
+                            call_pc,
+                        );
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LoadUndefined | Op::LoadHole => {
+                        let dst = reg(operands, 0)?;
+                        let kind = if matches!(op, Op::LoadUndefined) {
+                            NodeKind::ConstUndefined
+                        } else {
+                            NodeKind::LoadHole
+                        };
+                        let node = self.graph.add_node(kind, g, call_pc);
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LoadLocal | Op::StoreLocal => {
+                        // `LoadLocal dst, srcIdx` and `StoreLocal src, dstIdx`
+                        // both copy one register to another; the index operand is
+                        // an inline immediate, the other operand a register.
+                        let reg_operand = reg(operands, 0)?;
+                        let imm_operand = u16::try_from(imm32(operands, 1)?)
+                            .map_err(|_| Unsupported::OperandShape("inline local index"))?;
+                        let (src, dst) = if matches!(op, Op::LoadLocal) {
+                            (imm_operand, reg_operand)
+                        } else {
+                            (reg_operand, imm_operand)
+                        };
+                        let node = self.read_variable(off(src), g);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LoadUpvalue => {
+                        let dst = reg(operands, 0)?;
+                        let idx = imm32(operands, 1)?;
+                        let Some(closure) = method_closure else {
+                            bail_cfg!();
+                        };
+                        if idx < 0 {
+                            bail_cfg!();
+                        }
+                        let node = self.graph.add_node(
+                            NodeKind::InlineUpvalue {
+                                closure,
+                                index: idx as u32,
+                            },
+                            g,
+                            call_pc,
+                        );
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::ToPrimitive | Op::ToNumeric => {
+                        let dst = reg(operands, 0)?;
+                        let src = reg(operands, 1)?;
+                        let node = self.read_variable(off(src), g);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LoadProperty => {
+                        let dst = reg(operands, 0)?;
+                        let obj_reg = reg(operands, 1)?;
+                        let obj = self.read_variable(off(obj_reg), g);
+                        let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
+                            bail_cfg!();
+                        };
+                        let checked = self.graph.add_node(
+                            NodeKind::CheckShape(obj, method.recv_shape),
+                            g,
+                            call_pc,
+                        );
+                        self.push_body(g, checked);
+                        let load =
+                            self.graph
+                                .add_node(NodeKind::LoadSlot(checked, slot_byte), g, call_pc);
+                        self.push_body(g, load);
+                        self.write_variable(off(dst), g, load);
+                    }
+                    Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                        let dst = reg(operands, 0)?;
+                        let lhs = self.read_variable(off(reg(operands, 1)?), g);
+                        let rhs = self.read_variable(off(reg(operands, 2)?), g);
+                        let node = match self
+                            .arith_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
+                        {
+                            Ok(node) => node,
+                            Err(_) => bail_cfg!(),
+                        };
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr
+                    | Op::Ushr => {
+                        let dst = reg(operands, 0)?;
+                        let lhs = self.read_variable(off(reg(operands, 1)?), g);
+                        let rhs = self.read_variable(off(reg(operands, 2)?), g);
+                        let node = match self
+                            .bitwise_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
+                        {
+                            Ok(node) => node,
+                            Err(_) => bail_cfg!(),
+                        };
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::Increment => {
+                        let dst = reg(operands, 0)?;
+                        let src = self.read_variable(off(reg(operands, 1)?), g);
+                        let delta = match operands.get(2) {
+                            Some(Operand::Imm32(v)) => *v,
+                            None => 1,
+                            _ => return Err(Unsupported::OperandShape("increment delta")),
+                        };
+                        let step = self.graph.add_node(NodeKind::ConstInt32(delta), g, call_pc);
+                        self.push_body(g, step);
+                        let node =
+                            match self.arith_node_binop(g, Op::Add, src, step, instr.arith_feedback, call_pc) {
+                                Ok(node) => node,
+                                Err(_) => bail_cfg!(),
+                            };
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
+                    | Op::Equal
+                    | Op::NotEqual
+                    | Op::LooseEqual
+                    | Op::LooseNotEqual => {
+                        let dst = reg(operands, 0)?;
+                        let (cmp, loose) = match op {
+                            Op::LooseEqual => (CmpOp::Eq, true),
+                            Op::LooseNotEqual => (CmpOp::Ne, true),
+                            other => (CmpOp::from_op(other).expect("comparison opcode"), false),
+                        };
+                        let node = match self.compare(
+                            g,
+                            cmp,
+                            off(reg(operands, 1)?),
+                            off(reg(operands, 2)?),
+                            instr.arith_feedback,
+                            loose,
+                            call_pc,
+                        ) {
+                            Ok(node) => node,
+                            Err(_) => bail_cfg!(),
+                        };
+                        self.push_body(g, node);
+                        self.write_variable(off(dst), g, node);
+                    }
+                    Op::Jump => {
+                        let tgt = gblock(ccfg.succs[cb][0]);
+                        self.set_term(g, Terminator::Jump(tgt));
+                    }
+                    Op::JumpIfTrue | Op::JumpIfFalse => {
+                        let cond = reg(operands, 1)?;
+                        let succs = &ccfg.succs[cb];
+                        if succs.len() < 2 {
+                            bail_cfg!();
+                        }
+                        let tgt_block = gblock(succs[0]);
+                        let fallthrough = gblock(succs[1]);
+                        let mut cond_node = self.read_variable(off(cond), g);
+                        if self.graph.node(cond_node).kind.repr() != Repr::Bool
+                            && !self.is_boxed_bool(cond_node, &mut FxHashSet::default())
+                        {
+                            let check =
+                                self.graph.add_node(NodeKind::CheckBool(cond_node), g, call_pc);
+                            self.push_body(g, check);
+                            cond_node = check;
+                        }
+                        let (on_true, on_false) = if matches!(op, Op::JumpIfTrue) {
+                            (tgt_block, fallthrough)
+                        } else {
+                            (fallthrough, tgt_block)
+                        };
+                        self.set_term(
+                            g,
+                            Terminator::Branch {
+                                cond: cond_node,
+                                on_true,
+                                on_false,
+                            },
+                        );
+                    }
+                    Op::Return | Op::ReturnValue => {
+                        let src = reg(operands, 0)?;
+                        let value = self.read_variable(off(src), g);
+                        returns.push(value);
+                        self.graph.blocks[cont].preds.push(g);
+                        self.set_term(g, Terminator::Jump(cont as BlockId));
+                    }
+                    Op::ReturnUndefined => {
+                        let node = self.graph.add_node(NodeKind::ConstUndefined, g, call_pc);
+                        self.push_body(g, node);
+                        returns.push(node);
+                        self.graph.blocks[cont].preds.push(g);
+                        self.set_term(g, Terminator::Jump(cont as BlockId));
+                    }
+                    _ => bail_cfg!(),
+                }
+            }
+            // A block whose last instruction was not a terminator falls through.
+            if self.graph.blocks[g as usize].term.is_none() {
+                let Some(&next) = ccfg.succs[cb].first() else {
+                    bail_cfg!();
+                };
+                self.set_term(g, Terminator::Jump(gblock(next)));
+            }
+            self.graph.blocks[g as usize].filled = true;
+        }
+
+        if returns.is_empty() {
+            bail_cfg!();
+        }
+
+        // The caller now enters the callee, and its CFG successors take control
+        // from the continuation instead (so their phi operands read the post-call
+        // environment).
+        self.set_term(block, Terminator::Jump(entry_g));
+        for succ in self.cfg.succs[cfg_block as usize].clone() {
+            for p in &mut self.graph.blocks[succ as usize].preds {
+                if *p == block {
+                    *p = cont as BlockId;
+                }
+            }
+        }
+
+        // Merge the returns into the destination phi; a single return collapses
+        // to its value via trivial-phi removal.
+        let phi = self.new_phi(0, cont as BlockId);
+        self.graph.nodes[phi as usize].kind = NodeKind::Phi(returns);
+        self.graph.phi_reg.remove(&phi);
+        let result = self.try_remove_trivial_phi(phi);
+        self.seal_block(cont as BlockId);
+
+        // A fresh continuation does not inherit the pre-call block's proven
+        // receiver-shape guards (control reaches it from several return paths).
+        self.checked_shapes.clear();
+        Ok(Some((result, cont as BlockId)))
     }
 
     /// Lower an `Add` / `Sub` / `Mul` / `Div` site to a typed arithmetic node,

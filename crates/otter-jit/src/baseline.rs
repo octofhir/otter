@@ -2557,6 +2557,18 @@ pub(crate) mod arm64 {
                     emit_load_u64(&mut ops, 9, boxed);
                     store_reg(&mut ops, 9, dst)?;
                 }
+                Op::LoadNumber => {
+                    let dst = reg(ops_ref, 0)?;
+                    let Some(value) = instr.load_number else {
+                        return Err(Unsupported::OperandShape("load-number constant"));
+                    };
+                    // Materialize the boxed `Value` (int32 or offset-double) inline
+                    // instead of re-running the constant load through the delegate
+                    // bridge: a float literal in a numeric loop otherwise pays a VM
+                    // round-trip on every execution.
+                    emit_load_u64(&mut ops, 9, otter_vm::Value::number_f64(value).to_bits());
+                    store_reg(&mut ops, 9, dst)?;
+                }
                 Op::LoadLocal => {
                     let dst = reg(ops_ref, 0)?;
                     let idx = local_index(ops_ref, 1)?;
@@ -3444,7 +3456,6 @@ pub(crate) mod arm64 {
                 // frame.
                 Op::MakeClosure
                 | Op::LoadString
-                | Op::LoadNumber
                 | Op::MathCall
                 | Op::DefineDataProperty
                 | Op::FreshUpvalue

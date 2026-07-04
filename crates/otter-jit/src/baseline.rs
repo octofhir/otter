@@ -1338,8 +1338,8 @@ pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
     let k = frame_count as usize;
     let mut frames: Vec<otter_vm::jit::JitResumeFrame> = Vec::with_capacity(k);
     for j in 0..k {
-        let base = j * 6;
-        // SAFETY: emitted code wrote `frame_count` 6-u64 descriptors at `descs_ptr`.
+        let base = j * 7;
+        // SAFETY: emitted code wrote `frame_count` 7-u64 descriptors at `descs_ptr`.
         let fid = unsafe { *descs_ptr.add(base) } as u32;
         let pc = unsafe { *descs_ptr.add(base + 1) } as u32;
         let ret = unsafe { *descs_ptr.add(base + 2) } as u16;
@@ -1347,6 +1347,7 @@ pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
         let this_bits = unsafe { *descs_ptr.add(base + 4) };
         // Field 5 is the register window's byte offset from the descriptor base.
         let regs_off = unsafe { *descs_ptr.add(base + 5) } as usize;
+        let closure_bits = unsafe { *descs_ptr.add(base + 6) };
         // SAFETY: the emitted deopt exit placed the windows after the descriptor
         // array in the same stack allocation `descs_ptr` addresses.
         let regs_ptr = unsafe { (descs_ptr as *const u8).add(regs_off) as *const u64 };
@@ -1360,6 +1361,7 @@ pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
             callee_pc: pc,
             return_register: ret,
             this: Value::from_bits(this_bits),
+            closure: Value::from_bits(closure_bits),
             registers,
         });
     }

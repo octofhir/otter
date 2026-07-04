@@ -955,6 +955,10 @@ pub struct InlineResumeFrame {
     /// This frame's register-window length; the reconstructed frame gets this
     /// many slots (live ones from [`Self::registers`], the rest `undefined`).
     pub callee_register_count: u16,
+    /// The method's own closure SSA, present iff the body reads an upvalue. The
+    /// resumed frame draws its upvalue spine from this closure; absent bodies
+    /// resume with an empty spine.
+    pub closure: Option<NodeId>,
     /// Live registers at `callee_pc`: `(register, SSA value)`, boxed into the
     /// reconstructed frame's register slots.
     pub registers: Vec<(u16, NodeId)>,

@@ -736,6 +736,9 @@ pub struct JitResumeFrame {
     pub return_register: u16,
     /// Value bound as this frame's `this`.
     pub this: crate::Value,
+    /// The method's closure, or `undefined` when the body reads no upvalue. The
+    /// resumed frame draws its upvalue spine from this closure's captured cells.
+    pub closure: crate::Value,
     /// Full register window (unwritten slots `undefined`, live slots boxed).
     pub registers: Vec<crate::Value>,
 }

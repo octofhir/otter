@@ -3103,6 +3103,20 @@ impl<'a> Builder<'a> {
             trace_inline!("decline: non-GBM body reads an upvalue (resume needs empty spine)");
             return Ok(None);
         }
+        // A resume guard boxes the callee's live registers from their SSA homes
+        // into the reconstructed interpreter frame. Under an OSR compile every
+        // register the loop does not itself define is Param-seeded from the OSR
+        // entry frame — but an inlined callee's registers live *above* the
+        // caller's window, so those Param reads address frame slots the OSR entry
+        // never populated, and the resumed callee reads garbage. Re-running the
+        // whole call (a GBM body) is unaffected; only the mid-callee resume is
+        // unsound here, so decline resume-mode inlining under OSR and keep the
+        // bridged call. (Function-entry compiles seed unwritten registers with a
+        // real `undefined`, so their resume frames are sound.)
+        if resume_mode && self.is_osr_target() {
+            trace_inline!("decline: resume-mode inline under OSR (offset regs are Param-seeded)");
+            return Ok(None);
+        }
         // The callee registers occupy `[base, base + register_count)` above the
         // caller's file; keep that window inside the `u16` register index space.
         let base = self.current_def.len();

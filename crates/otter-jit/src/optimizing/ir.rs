@@ -926,6 +926,38 @@ pub struct Graph {
     /// Function id of the compiled function this graph represents. Deopt frame
     /// states name it as the outermost interpreter frame to resume.
     pub function_id: u32,
+    /// Deopt metadata for guards inside a spliced non-GBM callee body: node id →
+    /// the callee frame to resume mid-execution when that guard fails. When
+    /// present the caller stays compiled and only the callee frame deoptimizes
+    /// (see [`InlineResume`]); absent for ordinary (single-frame) guards.
+    pub inline_resume: rustc_hash::FxHashMap<NodeId, InlineResume>,
+}
+
+/// The callee interpreter frame to reconstruct when a guard inside a spliced
+/// method body fails. The caller stays compiled: the failing callee frame is
+/// resumed mid-execution in the interpreter, run to completion, and its return
+/// value stored into the inlined call's destination.
+#[derive(Clone, Debug)]
+pub struct InlineResume {
+    /// Inlined callee function id.
+    pub callee_fid: u32,
+    /// Callee byte-PC to resume the interpreter at (the failing guard's PC).
+    pub callee_pc: u32,
+    /// Receiver value bound as the resumed callee frame's `this`.
+    pub recv: NodeId,
+    /// Caller register that receives the callee's completion value (the inlined
+    /// call's destination).
+    pub dst_reg: u16,
+    /// SSA value defining the inlined call's result in the continuation block;
+    /// the slow path stores the resumed value into its allocated location so the
+    /// continuation reads it identically to the fast (return-phi) path.
+    pub result: NodeId,
+    /// Continuation block the caller resumes compiled execution in after the
+    /// callee completes.
+    pub cont: BlockId,
+    /// Callee live registers at `callee_pc`: `(callee register, SSA value)`,
+    /// boxed into the reconstructed frame's register slots.
+    pub registers: Vec<(u16, NodeId)>,
 }
 
 impl Graph {
@@ -940,6 +972,7 @@ impl Graph {
             phi_reg: rustc_hash::FxHashMap::default(),
             reg_writes: rustc_hash::FxHashMap::default(),
             function_id,
+            inline_resume: rustc_hash::FxHashMap::default(),
         }
     }
 

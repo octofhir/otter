@@ -271,9 +271,13 @@ fn reg_effects(op: Op, operands: &[Operand]) -> RegEffects {
 
 /// Byte-PC successors of the instruction at index `i` (fallthrough + branch
 /// target), as instruction byte-PCs.
-fn successors(view: &JitFunctionView, i: usize, index_of_pc: &FxHashMap<u32, usize>) -> Vec<u32> {
-    let instr = &view.instructions[i];
-    let next_pc = view.instructions.get(i + 1).map(|n| n.byte_pc);
+fn successors(
+    instrs: &[otter_vm::JitInstrView],
+    i: usize,
+    index_of_pc: &FxHashMap<u32, usize>,
+) -> Vec<u32> {
+    let instr = &instrs[i];
+    let next_pc = instrs.get(i + 1).map(|n| n.byte_pc);
     let branch = |slot: usize| -> Option<u32> {
         match instr.operands.get(slot) {
             Some(Operand::Imm32(rel)) => {
@@ -298,16 +302,24 @@ fn successors(view: &JitFunctionView, i: usize, index_of_pc: &FxHashMap<u32, usi
 /// at a guard serving byte-PC `P` restores exactly `live_before[P]`.
 #[must_use]
 pub fn bytecode_liveness(view: &JitFunctionView) -> FxHashMap<u32, FxHashSet<u16>> {
-    let index_of_pc: FxHashMap<u32, usize> = view
-        .instructions
+    bytecode_liveness_instrs(&view.instructions)
+}
+
+/// [`bytecode_liveness`] over a bare instruction slice — used to compute a
+/// spliced callee's register liveness (an inlined method carries only its
+/// instructions, not a full view) for the callee's deopt frame state.
+#[must_use]
+pub fn bytecode_liveness_instrs(
+    instrs: &[otter_vm::JitInstrView],
+) -> FxHashMap<u32, FxHashSet<u16>> {
+    let index_of_pc: FxHashMap<u32, usize> = instrs
         .iter()
         .enumerate()
         .map(|(i, instr)| (instr.byte_pc, i))
         .collect();
 
-    let n = view.instructions.len();
-    let effects: Vec<RegEffects> = view
-        .instructions
+    let n = instrs.len();
+    let effects: Vec<RegEffects> = instrs
         .iter()
         .map(|instr| reg_effects(instr.op, &instr.operands))
         .collect();
@@ -322,7 +334,7 @@ pub fn bytecode_liveness(view: &JitFunctionView) -> FxHashMap<u32, FxHashSet<u16
         for i in (0..n).rev() {
             // live_after = union of successors' live_before.
             let mut after: FxHashSet<u16> = FxHashSet::default();
-            for s in successors(view, i, &index_of_pc) {
+            for s in successors(instrs, i, &index_of_pc) {
                 if let Some(&si) = index_of_pc.get(&s) {
                     after.extend(live_before[si].iter().copied());
                 }
@@ -342,7 +354,7 @@ pub fn bytecode_liveness(view: &JitFunctionView) -> FxHashMap<u32, FxHashSet<u16
         }
     }
 
-    view.instructions
+    instrs
         .iter()
         .enumerate()
         .map(|(i, instr)| (instr.byte_pc, std::mem::take(&mut live_before[i])))
@@ -586,9 +598,32 @@ pub fn capture_frame_states(
                         }
                     }
                 }
-                points
-                    .entry(nid)
-                    .or_insert(DeoptPoint::single(graph.function_id, pc, registers));
+                // A guard inside a spliced non-GBM callee body resumes only the
+                // callee frame (the caller stays compiled): stack the caller
+                // frame at the call PC under a reconstructed callee frame at the
+                // guard's own PC, so the deopt exit resumes the callee mid-
+                // execution instead of re-running the whole call.
+                let point = if let Some(resume) = graph.inline_resume.get(&nid) {
+                    DeoptPoint {
+                        frames: vec![
+                            DeoptFrame {
+                                function_id: graph.function_id,
+                                byte_pc: pc,
+                                registers,
+                                return_reg: None,
+                            },
+                            DeoptFrame {
+                                function_id: resume.callee_fid,
+                                byte_pc: resume.callee_pc,
+                                registers: resume.registers.clone(),
+                                return_reg: Some(resume.dst_reg),
+                            },
+                        ],
+                    }
+                } else {
+                    DeoptPoint::single(graph.function_id, pc, registers)
+                };
+                points.entry(nid).or_insert(point);
             }
         }
         // Apply the remaining rebinds to form the block-exit environment that

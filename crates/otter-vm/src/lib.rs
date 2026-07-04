@@ -3055,7 +3055,10 @@ impl Interpreter {
                 .get(frame_index)
                 .ok_or_else(|| VmError::InvalidOperand)?
                 .function_id;
-            if let Some(site) = self.method_site_for_receiver(context, caller_fid, name_idx, recv) {
+            if !self.method_site_feedback_saturated(caller_fid, call_byte_pc)
+                && let Some(site) =
+                    self.method_site_for_receiver(context, caller_fid, name_idx, recv)
+            {
                 self.note_method_target(caller_fid, call_byte_pc, function_id, site);
             }
         }
@@ -4017,6 +4020,18 @@ impl Interpreter {
         if newly_mono {
             self.evict_compiled_for_reopt(caller_fid);
         }
+    }
+
+    /// Whether a method-call site's feedback has already saturated to
+    /// `Megamorphic`. Once it has, further [`Self::note_method_target`]
+    /// observations are no-ops, so a caller can skip the receiver/prototype
+    /// shape walk that only exists to build the `MethodSite` argument — the hot
+    /// path for a megamorphic site (e.g. one `arr[i].run()` over many classes).
+    fn method_site_feedback_saturated(&self, caller_fid: u32, call_byte_pc: u32) -> bool {
+        matches!(
+            self.jit_method_site_feedback.get(&(caller_fid, call_byte_pc)),
+            Some(MethodCallFeedback::Megamorphic)
+        )
     }
 
     /// Record a `Mono`/`Poly` observation for one `Op::CallMethodValue` site:
@@ -8097,7 +8112,9 @@ impl Interpreter {
                     // under the new callee frame; the receiver handle may move
                     // during the call, so the prototype shape and method slot are
                     // resolved here while it is still valid).
-                    let method_site = if jit_installed {
+                    let method_site = if jit_installed
+                        && !self.method_site_feedback_saturated(function_id, pc)
+                    {
                         register_operand(context.exec_operand(instr, 1))
                             .ok()
                             .and_then(|r| {

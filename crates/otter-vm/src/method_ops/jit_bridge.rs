@@ -122,7 +122,10 @@ impl Interpreter {
                 Self::bytecode_call_target_parts(method, recv, &self.gc_heap)
         {
             let caller_fid = stack[frame_index].function_id;
-            if let Some(site) = self.method_site_for_receiver(context, caller_fid, name_idx, recv) {
+            if !self.method_site_feedback_saturated(caller_fid, call_byte_pc)
+                && let Some(site) =
+                    self.method_site_for_receiver(context, caller_fid, name_idx, recv)
+            {
                 self.note_method_target(caller_fid, call_byte_pc, method_fid, site);
             }
         }

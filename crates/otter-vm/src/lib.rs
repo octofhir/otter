@@ -4467,10 +4467,13 @@ impl Interpreter {
             return None;
         }
         let mut method_view = context.jit_function_view(target.method_fid)?;
-        // Populate each body property op's monomorphic `(shape, slot)` site
-        // feedback, so a non-receiver access can be resolved against the shape it
-        // actually observed rather than the receiver shape.
+        // Populate each body op's site feedback so the inliner can lower it: the
+        // property `(shape, slot)` for a non-receiver access, and the arithmetic /
+        // element-load kind so a body `|`/`&`/`x[i]` lowers to a typed node
+        // instead of declining on empty feedback.
         self.bake_property_feedback(&mut method_view);
+        self.bake_arith_feedback(&mut method_view, target.method_fid);
+        self.bake_element_load_kind(&mut method_view, target.method_fid);
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
         // byte offset; bail out if any property is absent, an accessor, or spills
         // past the inline value capacity. A receiver property resolves against

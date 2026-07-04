@@ -60,8 +60,8 @@
 use super::Unsupported;
 use super::deopt::{DeoptPoint, OsrEntry};
 use super::ir::{
-    BlockId, CmpOp, ElementLoadKind, Float64MathCall, Float64UnaryOp, Graph, NodeId, NodeKind,
-    Repr, Terminator,
+    BlockId, CmpOp, ElementLoadKind, Float64MathCall, Float64UnaryOp, Graph, InlineResume, NodeId,
+    NodeKind, Repr, Terminator,
 };
 use super::liveness::Liveness;
 use super::regalloc::{Allocation, EdgeMoves, Location};
@@ -315,8 +315,8 @@ mod arm64 {
     use super::super::builder::graph_allows_frameless_self_call;
     use super::{
         Allocation, BlockId, CmpOp, DeoptPoint, EdgeMoves, ElementLoadKind, Float64MathCall,
-        Float64UnaryOp, GP_REGS, Graph, Liveness, Location, NodeId, NodeKind, OptimizedCode,
-        OsrEntry, Repr, Terminator, Unsupported,
+        Float64UnaryOp, GP_REGS, Graph, InlineResume, Liveness, Location, NodeId, NodeKind,
+        OptimizedCode, OsrEntry, Repr, Terminator, Unsupported,
     };
     use crate::CompiledCode;
     use crate::baseline::{
@@ -348,7 +348,8 @@ mod arm64 {
         jit_load_property_stub_optimizing, jit_load_string_stub,
         jit_new_array_stub,
         jit_number_to_string_fast_stub, jit_prepare_direct_call_stub, otter_jit_fmod,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_global_stub_optimizing,
+        jit_prepare_direct_method_call_stub, jit_resume_inline_callee_stub, jit_self_call_bail_stub,
+        jit_store_global_stub_optimizing,
         jit_store_property_stub_optimizing,
         jit_string_char_code_at_guarded_leaf_stub, jit_string_char_code_at_leaf_stub, value_tag,
     };
@@ -2469,6 +2470,8 @@ mod arm64 {
             spill_bytes,
             BOX_SCRATCH,
             callee_saved,
+            &block_labels,
+            threw,
         )?;
         dynasm!(&mut ops
             ; .arch aarch64
@@ -5118,6 +5121,7 @@ mod arm64 {
     /// registers (re-boxed to tagged Values, stored into the frame array), stamps
     /// the resume byte-PC, and returns `STATUS_BAILED`.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn emit_deopt_exits(
         ops: &mut Assembler,
         graph: &Graph,
@@ -5127,6 +5131,8 @@ mod arm64 {
         spill_bytes: u32,
         box_scratch: u32,
         callee_saved: &[CalleeSavedReg],
+        block_labels: &[DynamicLabel],
+        threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
         // Deterministic order for reproducible code.
         let mut nodes: Vec<NodeId> = deopt_labels.keys().copied().collect();
@@ -5137,16 +5143,117 @@ mod arm64 {
                 .get(&nid)
                 .ok_or(Unsupported::Unlowered("deopt exit without frame state"))?;
             dynasm!(ops ; .arch aarch64 ; =>label);
-            emit_frame_restore_and_bail(
-                ops,
-                graph,
-                alloc,
-                point,
-                spill_bytes,
-                box_scratch,
-                callee_saved,
-            )?;
+            // A guard inside a spliced non-GBM callee resumes only that callee in
+            // the interpreter (the caller stays compiled); every other guard bails
+            // the whole compiled frame.
+            if let Some(resume) = graph.inline_resume.get(&nid) {
+                emit_inline_callee_resume(
+                    ops,
+                    graph,
+                    alloc,
+                    resume,
+                    point,
+                    box_scratch,
+                    block_labels,
+                    threw,
+                )?;
+            } else {
+                emit_frame_restore_and_bail(
+                    ops,
+                    graph,
+                    alloc,
+                    point,
+                    spill_bytes,
+                    box_scratch,
+                    callee_saved,
+                )?;
+            }
         }
+        Ok(())
+    }
+
+    /// Slow path for a guard inside a spliced non-GBM callee body: resume the
+    /// callee frame mid-execution in the interpreter, splice its result back
+    /// into the still-compiled caller, and continue.
+    ///
+    /// `point` is the guard's two-frame deopt state: `frames[0]` the caller at
+    /// the call PC (materialized into `[x19]` so GC traces its live values while
+    /// the resumed callee allocates, then reloaded), `frames[1]` the callee at
+    /// the guard PC (boxed into a stack buffer the resume stub rebuilds a frame
+    /// from). The stub's completion value is stored into the inlined call's
+    /// result location and control branches to the continuation block.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inline_callee_resume(
+        ops: &mut Assembler,
+        graph: &Graph,
+        alloc: &Allocation,
+        resume: &InlineResume,
+        point: &DeoptPoint,
+        box_scratch: u32,
+        block_labels: &[DynamicLabel],
+        threw: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        // 1. Materialize the caller frame's live values into `[x19]` so the
+        //    scavenge inside the resumed callee traces and relocates them.
+        emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
+
+        // 2. Stack buffer holding the callee register window (16-byte aligned):
+        //    every slot `undefined`, then the live registers boxed over it.
+        let count = u32::from(resume.callee_register_count);
+        let buf_bytes = (count * 8).div_ceil(16) * 16;
+        if buf_bytes > 0 {
+            dynasm!(ops ; .arch aarch64 ; sub sp, sp, buf_bytes);
+        }
+        for r in 0..count {
+            emit_load_u64(ops, box_scratch, VALUE_UNDEFINED);
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, r * 8]);
+        }
+        let callee = point
+            .frames
+            .get(1)
+            .ok_or(Unsupported::Unlowered("inline resume without callee frame"))?;
+        for &(regn, value) in &callee.registers {
+            let node = graph.node(value);
+            if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
+                let loc = require_loc(alloc, value)?;
+                box_into_gp(ops, box_scratch, node.repr, loc, MOVE_SCRATCH);
+            }
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, u32::from(regn) * 8]);
+        }
+
+        // 3. Box the receiver into x3 (the resumed callee's `this`).
+        let recv_node = graph.node(resume.recv);
+        if !emit_rematerialized_boxed(ops, &recv_node.kind, 3, MOVE_SCRATCH) {
+            let loc = require_loc(alloc, resume.recv)?;
+            box_into_gp(ops, 3, recv_node.repr, loc, MOVE_SCRATCH);
+        }
+
+        // 4. jit_resume_inline_callee_stub(ctx, fid, pc, recv, regs_ptr, count).
+        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+        emit_load_u64(ops, 1, u64::from(resume.callee_fid));
+        emit_load_u64(ops, 2, u64::from(resume.callee_pc));
+        dynasm!(ops ; .arch aarch64 ; mov x4, sp);
+        emit_load_u64(ops, 5, u64::from(count));
+        emit_load_u64(ops, 16, jit_resume_inline_callee_stub as *const () as u64);
+        dynasm!(ops ; .arch aarch64 ; blr x16);
+        if buf_bytes > 0 {
+            dynasm!(ops ; .arch aarch64 ; add sp, sp, buf_bytes);
+        }
+        // x0 = value, x1 = status (low 8 bits). Throw ⇒ the function throw path.
+        dynasm!(ops ; .arch aarch64 ; and x1, x1, #0xff ; cmp x1, #2 ; b.eq =>threw);
+
+        // 5. Store the completion value into the inlined call's result location
+        //    (the continuation's return-phi home), before the reload can clobber
+        //    x0.
+        let result_loc = require_loc(alloc, resume.result)?;
+        store_loc(ops, result_loc, 0);
+
+        // 6. Reload the caller's live values from `[x19]` (relocated by the
+        //    scavenge). The result register is written above, so skip it.
+        emit_frame_reload(ops, graph, alloc, point, Some(resume.dst_reg), box_scratch)?;
+
+        // 7. Continue compiled execution in the continuation block.
+        dynasm!(ops ; .arch aarch64 ; b =>block_labels[resume.cont as usize]);
         Ok(())
     }
 

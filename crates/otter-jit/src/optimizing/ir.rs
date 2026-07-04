@@ -955,6 +955,9 @@ pub struct InlineResume {
     /// Continuation block the caller resumes compiled execution in after the
     /// callee completes.
     pub cont: BlockId,
+    /// Callee register-window length; the reconstructed frame gets this many
+    /// slots (live ones from [`Self::registers`], the rest `undefined`).
+    pub callee_register_count: u16,
     /// Callee live registers at `callee_pc`: `(callee register, SSA value)`,
     /// boxed into the reconstructed frame's register slots.
     pub registers: Vec<(u16, NodeId)>,

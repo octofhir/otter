@@ -493,6 +493,39 @@ impl InlineTrace {
     }
 }
 
+/// Immutable per-method context for one level of a CFG-inline splice.
+///
+/// [`Builder::fill_spliced_blocks`] translates a method body's basic blocks into
+/// the caller graph. Bundling its inputs here lets the same fill run at the top
+/// level and recursively for a nested branchy call — each level supplies its own
+/// register base, block mapping, receiver, and resume context.
+struct MethodSplice<'a> {
+    /// The method whose blocks are being filled.
+    method: &'a JitInlineMethod,
+    /// The method's control-flow graph (forward DAG).
+    ccfg: &'a Cfg,
+    /// Callee blocks reachable from the entry; unreachable blocks are skipped.
+    reachable: &'a FxHashSet<BlockId>,
+    /// Per-byte-PC live callee registers, for resume-mode frame states. Empty
+    /// when the body is guards-before-mutations (re-run deopt, no resume).
+    callee_live: &'a FxHashMap<u32, FxHashSet<u16>>,
+    /// Register-window base: callee register `r` is caller register `base + r`.
+    base: u16,
+    /// Graph block index of this method's callee block 0 (`gblock(cb) = block_base + cb`).
+    block_base: BlockId,
+    /// Continuation block that merges this method's return values.
+    cont: usize,
+    /// Receiver SSA bound as `this` and as the method-identity guard subject.
+    recv: NodeId,
+    /// The method's own closure SSA (present iff the body reads an upvalue).
+    method_closure: Option<NodeId>,
+    /// `true` when the body guards after a mutation (deopts by resuming the
+    /// callee frame mid-execution rather than re-running the call).
+    resume_mode: bool,
+    /// Byte-PC the enclosing call is keyed on (every spliced node's PC).
+    call_pc: u32,
+}
+
 /// In-flight state for folding one object literal in the builder.
 struct ActiveLiteral {
     /// Register the literal's object is written to.
@@ -3227,7 +3260,96 @@ impl<'a> Builder<'a> {
         // predecessors always have a lower index (forward DAG), so they are
         // already filled and sealed — the on-demand SSA reader resolves cross-
         // block values into real phis with no incomplete-phi backlog.
+        let splice = MethodSplice {
+            method,
+            ccfg: &ccfg,
+            reachable: &reachable,
+            callee_live: &callee_live,
+            base,
+            block_base: blocks0 as BlockId,
+            cont,
+            recv,
+            method_closure,
+            resume_mode,
+            call_pc,
+        };
         let mut returns: Vec<NodeId> = Vec::new();
+        if !self.fill_spliced_blocks(&splice, &mut returns, &mut pending_resume)? {
+            // `fill_spliced_blocks` already traced the specific reason; roll the
+            // arena back to the pre-splice snapshot without a second, generic
+            // trace line.
+            self.graph.nodes.truncate(nodes0);
+            self.graph.blocks.truncate(blocks0);
+            self.current_def.truncate(cdef0);
+            self.graph.phi_reg.retain(|&k, _| (k as usize) < nodes0);
+            self.incomplete_phis.retain(|&b, _| (b as usize) < blocks0);
+            return Ok(None);
+        }
+
+        if returns.is_empty() {
+            bail_cfg!();
+        }
+        self.finish_method_splice(
+            block,
+            cfg_block,
+            entry_g,
+            cont,
+            recv,
+            dst,
+            call_pc,
+            method,
+            returns,
+            pending_resume,
+            resume_mode,
+            reachable.len(),
+        )
+    }
+
+    /// Translate a method body's basic blocks into the caller graph at the
+    /// register base and block mapping in `s`. Return ops push their value into
+    /// `returns` and jump to `s.cont`; each resume-mode guard's callee-frame
+    /// snapshot pushes into `pending_resume`. Returns `Ok(false)` — the caller
+    /// rolls the whole splice back — when an op falls outside the inline subset.
+    ///
+    /// Extracted from [`Self::try_inline_method_cfg`] so the same fill runs both
+    /// at the top level and, recursively, for a nested branchy call.
+    fn fill_spliced_blocks(
+        &mut self,
+        s: &MethodSplice,
+        returns: &mut Vec<NodeId>,
+        pending_resume: &mut Vec<(usize, usize, u32, Vec<(u16, NodeId)>)>,
+    ) -> Result<bool, Unsupported> {
+        let method = s.method;
+        let ccfg = s.ccfg;
+        let reachable = s.reachable;
+        let callee_live = s.callee_live;
+        let base = s.base;
+        let block_base = s.block_base;
+        let cont = s.cont;
+        let recv = s.recv;
+        let method_closure = s.method_closure;
+        let resume_mode = s.resume_mode;
+        let call_pc = s.call_pc;
+        let off = |r: u16| -> u16 { base + r };
+        let gblock = |cb: BlockId| -> BlockId { block_base + cb };
+        macro_rules! bail_cfg {
+            () => {
+                bail_cfg!("unsupported op / operand during splice")
+            };
+            ($($arg:tt)*) => {{
+                if let Some(sink) = self.inline_trace.as_mut() {
+                    let msg = format!("rollback: {}", format_args!($($arg)*));
+                    sink.record(&msg);
+                    if sink.verbose {
+                        eprintln!(
+                            "[jit-trace] cfg-inline method_fid={} call_pc={}: {}",
+                            method.method_fid, call_pc, msg
+                        );
+                    }
+                }
+                return Ok(false);
+            }};
+        }
         for cb in 0..ccfg.ranges.len() {
             if !reachable.contains(&(cb as BlockId)) {
                 continue;
@@ -3616,11 +3738,30 @@ impl<'a> Builder<'a> {
             }
             self.graph.blocks[g as usize].filled = true;
         }
+        Ok(true)
+    }
 
-        if returns.is_empty() {
-            bail_cfg!();
-        }
-
+    /// Wire the filled callee blocks into the caller graph and record each
+    /// spliced guard's resume state, after [`Self::fill_spliced_blocks`] has
+    /// translated every reachable callee block. Returns the call's destination
+    /// value (the merged return phi) and the continuation block the caller
+    /// resumes building into.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_method_splice(
+        &mut self,
+        block: BlockId,
+        cfg_block: BlockId,
+        entry_g: BlockId,
+        cont: usize,
+        recv: NodeId,
+        dst: u16,
+        call_pc: u32,
+        method: &JitInlineMethod,
+        returns: Vec<NodeId>,
+        pending_resume: Vec<(usize, usize, u32, Vec<(u16, NodeId)>)>,
+        resume_mode: bool,
+        reachable_len: usize,
+    ) -> Result<Option<(NodeId, BlockId)>, Unsupported> {
         // The caller now enters the callee, and its CFG successors take control
         // from the continuation instead (so their phi operands read the post-call
         // environment).
@@ -3645,12 +3786,21 @@ impl<'a> Builder<'a> {
         // `cont` exist). A guard among these nodes deopts by resuming the callee
         // frame mid-execution rather than re-running the call. `capture_frame_
         // states` consults this only for nodes that can actually deopt.
-        trace_inline!(
-            "OK: spliced {} callee blocks, resume_mode={} ({} guard frame-states)",
-            reachable.len(),
-            resume_mode,
-            pending_resume.iter().map(|(s, e, _, _)| e - s).sum::<usize>()
-        );
+        if let Some(sink) = self.inline_trace.as_mut() {
+            let msg = format!(
+                "OK: spliced {} callee blocks, resume_mode={} ({} guard frame-states)",
+                reachable_len,
+                resume_mode,
+                pending_resume.iter().map(|(s, e, _, _)| e - s).sum::<usize>()
+            );
+            sink.record(&msg);
+            if sink.verbose {
+                eprintln!(
+                    "[jit-trace] cfg-inline method_fid={} call_pc={}: {}",
+                    method.method_fid, call_pc, msg
+                );
+            }
+        }
         for (start, end, callee_pc, registers) in pending_resume {
             for nid in start..end {
                 self.graph.inline_resume.insert(

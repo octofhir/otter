@@ -3286,7 +3286,16 @@ impl Interpreter {
             let function = context
                 .exec_function(f.callee_fid)
                 .ok_or(VmError::InvalidOperand)?;
-            let upvalues: crate::frame_state::UpvalueSpine = Vec::new().into_boxed_slice();
+            // A body that reads an upvalue resumes with its method closure's
+            // captured spine; one that reads none carries `undefined` here and
+            // resumes with an empty spine.
+            let upvalues: crate::frame_state::UpvalueSpine =
+                match f.closure.as_closure(&self.gc_heap) {
+                    Some(c) => self
+                        .gc_heap
+                        .read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice()),
+                    None => Vec::new().into_boxed_slice(),
+                };
             let registers: smallvec::SmallVec<[Value; 8]> =
                 smallvec::SmallVec::from_slice(&f.registers);
             // The bottom (outermost inlined) frame bubbles its result out of the

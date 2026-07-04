@@ -509,6 +509,8 @@ struct PendingResumeFrame {
     /// Register in the parent frame that receives this frame's return value.
     dst_reg: u16,
     register_count: u16,
+    /// The method's own closure SSA (present iff the body reads an upvalue).
+    closure: Option<NodeId>,
     registers: Vec<(u16, NodeId)>,
 }
 
@@ -3126,10 +3128,6 @@ impl<'a> Builder<'a> {
         // compiled) — provided it reads no upvalue (the resumed frame is rebuilt
         // with an empty spine).
         let resume_mode = !Self::inline_cfg_gbm_ok(method);
-        if resume_mode && method.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
-            trace_inline!("decline: non-GBM body reads an upvalue (resume needs empty spine)");
-            return Ok(None);
-        }
         // A resume guard boxes the callee's live registers from their SSA homes
         // into the reconstructed interpreter frame. Under an OSR compile every
         // register the loop does not itself define is Param-seeded from the OSR
@@ -3817,6 +3815,7 @@ impl<'a> Builder<'a> {
                         recv,
                         dst_reg,
                         register_count: method.register_count,
+                        closure: method_closure,
                         registers: regs,
                     });
                     pending_resume.push((resume_node_start, self.graph.nodes.len(), chain));
@@ -3900,6 +3899,7 @@ impl<'a> Builder<'a> {
                     recv: f.recv,
                     dst_reg: f.dst_reg,
                     callee_register_count: f.register_count,
+                    closure: f.closure,
                     registers: f.registers.clone(),
                 })
                 .collect();
@@ -3953,12 +3953,7 @@ impl<'a> Builder<'a> {
         {
             return Ok(false);
         }
-        // A resumed nested body reconstructs its frame with an empty upvalue
-        // spine, so decline a non-GBM body that reads an upvalue.
         let nested_resume = !Self::inline_cfg_gbm_ok(nested);
-        if nested_resume && nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
-            return Ok(false);
-        }
         let ncfg = match Cfg::discover(&nested.instructions) {
             Ok(c) => c,
             Err(_) => return Ok(false),
@@ -4076,6 +4071,7 @@ impl<'a> Builder<'a> {
             recv: s.recv,
             dst_reg: s.dst_reg,
             register_count: s.method.register_count,
+            closure: s.method_closure,
             registers: m_regs,
         });
 

@@ -5206,11 +5206,12 @@ mod arm64 {
             return Err(Unsupported::Unlowered("inline resume frame count mismatch"));
         }
 
-        // 2. Native-stack scratch region: a `k`-entry descriptor array (six u64s
-        //    each — fid, pc, return-register, register-count, `this`, registers
-        //    pointer) followed by one register window per frame. Compute the byte
-        //    offsets up front so each descriptor can point at its own window.
-        const DESC_BYTES: u32 = 48; // six u64 fields
+        // 2. Native-stack scratch region: a `k`-entry descriptor array (seven
+        //    u64s each — fid, pc, return-register, register-count, `this`,
+        //    registers offset, closure) followed by one register window per
+        //    frame. Compute the byte offsets up front so each descriptor can
+        //    point at its own window.
+        const DESC_BYTES: u32 = 56; // seven u64 fields
         let desc_region = k as u32 * DESC_BYTES;
         let mut buf_offs: Vec<u32> = Vec::with_capacity(k);
         let mut cursor = desc_region;
@@ -5272,6 +5273,19 @@ mod arm64 {
             // address arithmetic, which has no valid form with a dynamic register.
             emit_load_u64(ops, box_scratch, u64::from(boff));
             dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 40]);
+            // The method closure the resumed frame draws its upvalue spine from,
+            // or `undefined` (empty spine) when the body reads no upvalue.
+            match f.closure {
+                Some(closure) => {
+                    let node = graph.node(closure);
+                    if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
+                        let loc = require_loc(alloc, closure)?;
+                        box_into_gp(ops, box_scratch, node.repr, loc, MOVE_SCRATCH);
+                    }
+                }
+                None => emit_load_u64(ops, box_scratch, VALUE_UNDEFINED),
+            }
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 48]);
         }
 
         // 3. jit_resume_inline_callee_stack_stub(ctx, descs_ptr = sp, frame_count).

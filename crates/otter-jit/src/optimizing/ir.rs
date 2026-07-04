@@ -938,29 +938,45 @@ pub struct Graph {
 /// resumed mid-execution in the interpreter, run to completion, and its return
 /// value stored into the inlined call's destination.
 #[derive(Clone, Debug)]
-pub struct InlineResume {
-    /// Inlined callee function id.
+pub struct InlineResumeFrame {
+    /// Inlined callee function id for this frame.
     pub callee_fid: u32,
-    /// Callee byte-PC to resume the interpreter at (the failing guard's PC).
+    /// Byte-PC to resume this frame at. For the deepest frame (where the guard
+    /// is) this is the guard's PC; for an intermediate frame it is the PC just
+    /// past its nested call, since the frame above it re-runs that call.
     pub callee_pc: u32,
-    /// Receiver value bound as the resumed callee frame's `this`.
+    /// Receiver value bound as this frame's `this`.
     pub recv: NodeId,
-    /// Caller register that receives the callee's completion value (the inlined
-    /// call's destination).
+    /// Register in the *parent* frame that receives this frame's completion
+    /// value. For the outermost inlined frame this is the compiled caller's call
+    /// destination; for a nested frame it is the enclosing inlined method's
+    /// register the nested call writes.
     pub dst_reg: u16,
+    /// This frame's register-window length; the reconstructed frame gets this
+    /// many slots (live ones from [`Self::registers`], the rest `undefined`).
+    pub callee_register_count: u16,
+    /// Live registers at `callee_pc`: `(register, SSA value)`, boxed into the
+    /// reconstructed frame's register slots.
+    pub registers: Vec<(u16, NodeId)>,
+}
+
+/// A guard's full inline-resume state: the reconstructed interpreter frame
+/// stack (below the still-compiled caller) plus where the completed stack's
+/// value lands in the continuation. See [`InlineResumeFrame`].
+#[derive(Clone, Debug)]
+pub struct InlineResume {
+    /// The inline frame stack from the outermost inlined method down to the
+    /// method the guard is in, each resumed in the interpreter on a deopt while
+    /// the compiled caller stays live. A single-level inline has one frame; a
+    /// nested (recursively spliced) call adds one frame per level.
+    pub frames: Vec<InlineResumeFrame>,
     /// SSA value defining the inlined call's result in the continuation block;
     /// the slow path stores the resumed value into its allocated location so the
     /// continuation reads it identically to the fast (return-phi) path.
     pub result: NodeId,
     /// Continuation block the caller resumes compiled execution in after the
-    /// callee completes.
+    /// callee stack completes.
     pub cont: BlockId,
-    /// Callee register-window length; the reconstructed frame gets this many
-    /// slots (live ones from [`Self::registers`], the rest `undefined`).
-    pub callee_register_count: u16,
-    /// Callee live registers at `callee_pc`: `(callee register, SSA value)`,
-    /// boxed into the reconstructed frame's register slots.
-    pub registers: Vec<(u16, NodeId)>,
 }
 
 impl Graph {

@@ -3656,14 +3656,16 @@ impl<'a> Builder<'a> {
                 self.graph.inline_resume.insert(
                     nid as NodeId,
                     super::ir::InlineResume {
-                        callee_fid: method.method_fid,
-                        callee_pc,
-                        recv,
-                        dst_reg: dst,
+                        frames: vec![super::ir::InlineResumeFrame {
+                            callee_fid: method.method_fid,
+                            callee_pc,
+                            recv,
+                            dst_reg: dst,
+                            callee_register_count: method.register_count,
+                            registers: registers.clone(),
+                        }],
                         result,
                         cont: cont as BlockId,
-                        callee_register_count: method.register_count,
-                        registers: registers.clone(),
                     },
                 );
             }

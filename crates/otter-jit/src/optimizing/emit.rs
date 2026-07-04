@@ -5197,9 +5197,15 @@ mod arm64 {
         //    scavenge inside the resumed callee traces and relocates them.
         emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
 
+        // Single-level inline resume: exactly one reconstructed callee frame. A
+        // nested (multi-level) splice is lowered by the multi-frame path.
+        if resume.frames.len() != 1 {
+            return Err(Unsupported::Unlowered("multi-frame inline resume"));
+        }
+        let frame0 = &resume.frames[0];
         // 2. Stack buffer holding the callee register window (16-byte aligned):
         //    every slot `undefined`, then the live registers boxed over it.
-        let count = u32::from(resume.callee_register_count);
+        let count = u32::from(frame0.callee_register_count);
         let buf_bytes = (count * 8).div_ceil(16) * 16;
         if buf_bytes > 0 {
             dynasm!(ops ; .arch aarch64 ; sub sp, sp, buf_bytes);
@@ -5222,16 +5228,16 @@ mod arm64 {
         }
 
         // 3. Box the receiver into x3 (the resumed callee's `this`).
-        let recv_node = graph.node(resume.recv);
+        let recv_node = graph.node(frame0.recv);
         if !emit_rematerialized_boxed(ops, &recv_node.kind, 3, MOVE_SCRATCH) {
-            let loc = require_loc(alloc, resume.recv)?;
+            let loc = require_loc(alloc, frame0.recv)?;
             box_into_gp(ops, 3, recv_node.repr, loc, MOVE_SCRATCH);
         }
 
         // 4. jit_resume_inline_callee_stub(ctx, fid, pc, recv, regs_ptr, count).
         dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-        emit_load_u64(ops, 1, u64::from(resume.callee_fid));
-        emit_load_u64(ops, 2, u64::from(resume.callee_pc));
+        emit_load_u64(ops, 1, u64::from(frame0.callee_fid));
+        emit_load_u64(ops, 2, u64::from(frame0.callee_pc));
         dynasm!(ops ; .arch aarch64 ; mov x4, sp);
         emit_load_u64(ops, 5, u64::from(count));
         emit_load_u64(ops, 16, jit_resume_inline_callee_stub as *const () as u64);
@@ -5250,7 +5256,7 @@ mod arm64 {
 
         // 6. Reload the caller's live values from `[x19]` (relocated by the
         //    scavenge). The result register is written above, so skip it.
-        emit_frame_reload(ops, graph, alloc, point, Some(resume.dst_reg), box_scratch)?;
+        emit_frame_reload(ops, graph, alloc, point, Some(frame0.dst_reg), box_scratch)?;
 
         // 7. Continue compiled execution in the continuation block.
         dynasm!(ops ; .arch aarch64 ; b =>block_labels[resume.cont as usize]);

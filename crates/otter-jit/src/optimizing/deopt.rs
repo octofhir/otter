@@ -604,22 +604,25 @@ pub fn capture_frame_states(
                 // guard's own PC, so the deopt exit resumes the callee mid-
                 // execution instead of re-running the whole call.
                 let point = if let Some(resume) = graph.inline_resume.get(&nid) {
-                    DeoptPoint {
-                        frames: vec![
-                            DeoptFrame {
-                                function_id: graph.function_id,
-                                byte_pc: pc,
-                                registers,
-                                return_reg: None,
-                            },
-                            DeoptFrame {
-                                function_id: resume.callee_fid,
-                                byte_pc: resume.callee_pc,
-                                registers: resume.registers.clone(),
-                                return_reg: Some(resume.dst_reg),
-                            },
-                        ],
+                    // The compiled function stays live (frame 0, materialized for
+                    // GC only), under the reconstructed inline stack: one frame per
+                    // spliced level, the deepest resuming at the guard's own PC.
+                    let mut frames = Vec::with_capacity(resume.frames.len() + 1);
+                    frames.push(DeoptFrame {
+                        function_id: graph.function_id,
+                        byte_pc: pc,
+                        registers,
+                        return_reg: None,
+                    });
+                    for frame in &resume.frames {
+                        frames.push(DeoptFrame {
+                            function_id: frame.callee_fid,
+                            byte_pc: frame.callee_pc,
+                            registers: frame.registers.clone(),
+                            return_reg: Some(frame.dst_reg),
+                        });
                     }
+                    DeoptPoint { frames }
                 } else {
                     DeoptPoint::single(graph.function_id, pc, registers)
                 };

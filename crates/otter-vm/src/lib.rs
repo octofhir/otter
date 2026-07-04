@@ -4403,12 +4403,21 @@ impl Interpreter {
         {
             return None;
         }
-        let method_view = context.jit_function_view(target.method_fid)?;
+        let mut method_view = context.jit_function_view(target.method_fid)?;
+        // Populate each body property op's monomorphic `(shape, slot)` site
+        // feedback, so a non-receiver access can be resolved against the shape it
+        // actually observed rather than the receiver shape.
+        self.bake_property_feedback(&mut method_view);
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
-        // byte offset in the receiver shape; bail out if any property is absent,
-        // an accessor, or spills past the inline value capacity. Loads carry the
-        // name at operand 2, stores at operand 1.
+        // byte offset; bail out if any property is absent, an accessor, or spills
+        // past the inline value capacity. A receiver property resolves against
+        // the identity-guarded receiver shape (no per-op guard); a non-receiver
+        // property falls back to its own monomorphic site feedback and records
+        // the shape the inliner must guard. Loads carry the name at operand 2,
+        // stores at operand 1.
         let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        let mut prop_shapes: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        const SLOT_BYTES: u32 = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
         for instr in &method_view.instructions {
             let name_operand = match instr.op {
                 Op::LoadProperty => 2,
@@ -4421,10 +4430,16 @@ impl Interpreter {
                 return None;
             };
             let key = context.property_atom(name_idx)?;
-            let slot = self.shape_offset_of(target.recv_shape, key.name())?;
-            let value_byte =
-                slot * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+            if let Some(slot) = self.shape_offset_of(target.recv_shape, key.name()) {
+                prop_offsets.insert(instr.byte_pc, slot * SLOT_BYTES);
+                continue;
+            }
+            // Not a receiver property: use the op's own monomorphic own-data site
+            // feedback (shape offset, slot byte). Anything else — polymorphic,
+            // prototype, accessor, or unobserved — is not inlinable.
+            let (shape_off, value_byte) = instr.property_feedback?;
             prop_offsets.insert(instr.byte_pc, value_byte);
+            prop_shapes.insert(instr.byte_pc, shape_off);
         }
         Some(jit::JitInlineMethod {
             method_fid: target.method_fid,
@@ -4436,6 +4451,7 @@ impl Interpreter {
             register_count: method_view.register_count,
             instructions: method_view.instructions,
             prop_offsets,
+            prop_shapes,
         })
     }
 

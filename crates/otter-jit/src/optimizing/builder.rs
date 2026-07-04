@@ -2614,8 +2614,16 @@ impl<'a> Builder<'a> {
                     let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
                         decline_inline!();
                     };
+                    // A non-receiver access guards its own observed shape; a
+                    // receiver access guards the receiver shape (redundant with the
+                    // entry identity guard but harmless in the linear replay).
+                    let guard_shape = method
+                        .prop_shapes
+                        .get(&instr.byte_pc)
+                        .copied()
+                        .unwrap_or(method.recv_shape);
                     let checked_obj = self.graph.add_node(
-                        NodeKind::CheckShape(obj, method.recv_shape),
+                        NodeKind::CheckShape(obj, guard_shape),
                         block,
                         call_pc,
                     );
@@ -2639,8 +2647,13 @@ impl<'a> Builder<'a> {
                     let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
                         decline_inline!();
                     };
+                    let guard_shape = method
+                        .prop_shapes
+                        .get(&instr.byte_pc)
+                        .copied()
+                        .unwrap_or(method.recv_shape);
                     let checked_obj = self.graph.add_node(
-                        NodeKind::CheckShape(obj, method.recv_shape),
+                        NodeKind::CheckShape(obj, guard_shape),
                         block,
                         call_pc,
                     );
@@ -3110,12 +3123,17 @@ impl<'a> Builder<'a> {
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
                             bail_cfg!();
                         };
-                        // The receiver's shape is already proven by the entry
-                        // `CheckMethodIdentity` (which deopts unless `recv.shape ==
-                        // recv_shape`), and the entry dominates every spliced block,
-                        // so a load off the receiver needs no second shape guard.
-                        // A non-receiver object keeps its guard.
-                        let checked = if obj == recv {
+                        // A non-receiver access guards the monomorphic shape it
+                        // observed. A receiver access is already proven by the
+                        // entry `CheckMethodIdentity` (which deopts unless
+                        // `recv.shape == recv_shape`) — which dominates every
+                        // spliced block — so it needs no second guard; an aliased
+                        // receiver keeps a redundant receiver-shape guard.
+                        let checked = if let Some(&shape) = method.prop_shapes.get(&instr.byte_pc) {
+                            let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                            self.push_body(g, c);
+                            c
+                        } else if obj == recv {
                             recv
                         } else {
                             let c = self.graph.add_node(
@@ -3154,7 +3172,11 @@ impl<'a> Builder<'a> {
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
                             bail_cfg!();
                         };
-                        let checked = if obj == recv {
+                        let checked = if let Some(&shape) = method.prop_shapes.get(&instr.byte_pc) {
+                            let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                            self.push_body(g, c);
+                            c
+                        } else if obj == recv {
                             recv
                         } else {
                             let c = self.graph.add_node(
@@ -3959,6 +3981,7 @@ mod tests {
                 },
             ],
             prop_offsets,
+            prop_shapes: rustc_hash::FxHashMap::default(),
         };
         let mut v = view(
             1,

@@ -493,6 +493,25 @@ impl InlineTrace {
     }
 }
 
+/// One reconstructed frame in a spliced guard's resume chain, accumulated while
+/// filling a method body. The top-level method contributes one; a recursively
+/// spliced nested call prepends its enclosing frame, so a guard deep in the
+/// inline tree carries the whole stack from the outermost inlined method down to
+/// the guard's own method. Lowered to [`super::ir::InlineResumeFrame`] in
+/// [`Builder::finish_method_splice`].
+#[derive(Clone)]
+struct PendingResumeFrame {
+    callee_fid: u32,
+    /// Byte-PC to resume this frame at — the guard's own PC for the innermost
+    /// frame, the PC past the nested call for an ancestor frame.
+    callee_pc: u32,
+    recv: NodeId,
+    /// Register in the parent frame that receives this frame's return value.
+    dst_reg: u16,
+    register_count: u16,
+    registers: Vec<(u16, NodeId)>,
+}
+
 /// Immutable per-method context for one level of a CFG-inline splice.
 ///
 /// [`Builder::fill_spliced_blocks`] translates a method body's basic blocks into
@@ -524,6 +543,14 @@ struct MethodSplice<'a> {
     resume_mode: bool,
     /// Byte-PC the enclosing call is keyed on (every spliced node's PC).
     call_pc: u32,
+    /// Register in the parent frame that receives this method's return value —
+    /// the caller's call destination at the top level, the enclosing method's
+    /// nested-call destination for a recursively spliced callee.
+    dst_reg: u16,
+    /// The resume frames of the methods this one is inlined inside, outermost
+    /// first (empty at the top level). Each guard here prepends this chain, so
+    /// its deopt reconstructs the whole inline stack.
+    ancestors: &'a [PendingResumeFrame],
 }
 
 /// In-flight state for folding one object literal in the builder.
@@ -3265,10 +3292,11 @@ impl<'a> Builder<'a> {
         } else {
             rustc_hash::FxHashMap::default()
         };
-        // `(node range, callee PC, callee live registers)` per resume-mode
-        // instruction; expanded into `graph.inline_resume` once `result`/`cont`
-        // are known below.
-        let mut pending_resume: Vec<(usize, usize, u32, Vec<(u16, NodeId)>)> = Vec::new();
+        // `(node range, resume frame chain)` per resume-mode instruction;
+        // expanded into `graph.inline_resume` once `result`/`cont` are known
+        // below. The chain is one frame at the top level, more once a nested
+        // branchy call recurses.
+        let mut pending_resume: Vec<(usize, usize, Vec<PendingResumeFrame>)> = Vec::new();
 
         // Fill each callee block in topological (index) order. A block's
         // predecessors always have a lower index (forward DAG), so they are
@@ -3286,6 +3314,8 @@ impl<'a> Builder<'a> {
             method_closure,
             resume_mode,
             call_pc,
+            dst_reg: dst,
+            ancestors: &[],
         };
         let mut returns: Vec<NodeId> = Vec::new();
         if !self.fill_spliced_blocks(&splice, &mut returns, &mut pending_resume)? {
@@ -3308,10 +3338,8 @@ impl<'a> Builder<'a> {
             cfg_block,
             entry_g,
             cont,
-            recv,
-            dst,
             call_pc,
-            method,
+            method.method_fid,
             returns,
             pending_resume,
             resume_mode,
@@ -3331,7 +3359,7 @@ impl<'a> Builder<'a> {
         &mut self,
         s: &MethodSplice,
         returns: &mut Vec<NodeId>,
-        pending_resume: &mut Vec<(usize, usize, u32, Vec<(u16, NodeId)>)>,
+        pending_resume: &mut Vec<(usize, usize, Vec<PendingResumeFrame>)>,
     ) -> Result<bool, Unsupported> {
         let method = s.method;
         let ccfg = s.ccfg;
@@ -3344,6 +3372,8 @@ impl<'a> Builder<'a> {
         let method_closure = s.method_closure;
         let resume_mode = s.resume_mode;
         let call_pc = s.call_pc;
+        let dst_reg = s.dst_reg;
+        let ancestors = s.ancestors;
         let off = |r: u16| -> u16 { base + r };
         let gblock = |cb: BlockId| -> BlockId { block_base + cb };
         macro_rules! bail_cfg {
@@ -3740,7 +3770,19 @@ impl<'a> Builder<'a> {
                     _ => bail_cfg!("unsupported inlined op {:?}", op),
                 }
                 if let Some((cpc, regs)) = resume_snapshot {
-                    pending_resume.push((resume_node_start, self.graph.nodes.len(), cpc, regs));
+                    // The guard's full resume chain: the frames it is inlined
+                    // inside (outermost first) plus this method's own frame at the
+                    // guard PC.
+                    let mut chain = ancestors.to_vec();
+                    chain.push(PendingResumeFrame {
+                        callee_fid: method.method_fid,
+                        callee_pc: cpc,
+                        recv,
+                        dst_reg,
+                        register_count: method.register_count,
+                        registers: regs,
+                    });
+                    pending_resume.push((resume_node_start, self.graph.nodes.len(), chain));
                 }
             }
             // A block whose last instruction was not a terminator falls through.
@@ -3767,12 +3809,10 @@ impl<'a> Builder<'a> {
         cfg_block: BlockId,
         entry_g: BlockId,
         cont: usize,
-        recv: NodeId,
-        dst: u16,
         call_pc: u32,
-        method: &JitInlineMethod,
+        method_fid: u32,
         returns: Vec<NodeId>,
-        pending_resume: Vec<(usize, usize, u32, Vec<(u16, NodeId)>)>,
+        pending_resume: Vec<(usize, usize, Vec<PendingResumeFrame>)>,
         resume_mode: bool,
         reachable_len: usize,
     ) -> Result<Option<(NodeId, BlockId)>, Unsupported> {
@@ -3805,29 +3845,32 @@ impl<'a> Builder<'a> {
                 "OK: spliced {} callee blocks, resume_mode={} ({} guard frame-states)",
                 reachable_len,
                 resume_mode,
-                pending_resume.iter().map(|(s, e, _, _)| e - s).sum::<usize>()
+                pending_resume.iter().map(|(s, e, _)| e - s).sum::<usize>()
             );
             sink.record(&msg);
             if sink.verbose {
                 eprintln!(
-                    "[jit-trace] cfg-inline method_fid={} call_pc={}: {}",
-                    method.method_fid, call_pc, msg
+                    "[jit-trace] cfg-inline method_fid={method_fid} call_pc={call_pc}: {msg}"
                 );
             }
         }
-        for (start, end, callee_pc, registers) in pending_resume {
+        for (start, end, chain) in pending_resume {
+            let frames: Vec<super::ir::InlineResumeFrame> = chain
+                .iter()
+                .map(|f| super::ir::InlineResumeFrame {
+                    callee_fid: f.callee_fid,
+                    callee_pc: f.callee_pc,
+                    recv: f.recv,
+                    dst_reg: f.dst_reg,
+                    callee_register_count: f.register_count,
+                    registers: f.registers.clone(),
+                })
+                .collect();
             for nid in start..end {
                 self.graph.inline_resume.insert(
                     nid as NodeId,
                     super::ir::InlineResume {
-                        frames: vec![super::ir::InlineResumeFrame {
-                            callee_fid: method.method_fid,
-                            callee_pc,
-                            recv,
-                            dst_reg: dst,
-                            callee_register_count: method.register_count,
-                            registers: registers.clone(),
-                        }],
+                        frames: frames.clone(),
                         result,
                         cont: cont as BlockId,
                     },

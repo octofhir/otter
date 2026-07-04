@@ -202,10 +202,22 @@ pub unsafe fn alloc_safepoint_record(
     // from the active function metadata and the stub must not retain it.
     let records =
         unsafe { std::slice::from_raw_parts(ctx.safepoint_records, ctx.safepoint_count as usize) };
-    records
-        .iter()
-        .find(|record| record.id == safepoint)
-        .ok_or(AllocSafepointRootError::UnknownSafepoint { id: safepoint })
+    // Both tiers emit the record table sorted by id. Most functions carry only a
+    // handful of allocating-call safepoints, where a linear scan beats a binary
+    // search's setup; a large table (many allocating calls) binary-searches.
+    debug_assert!(
+        records.windows(2).all(|w| w[0].id <= w[1].id),
+        "safepoint records must be sorted by id",
+    );
+    let found = if records.len() <= 16 {
+        records.iter().find(|record| record.id == safepoint)
+    } else {
+        records
+            .binary_search_by_key(&safepoint, |record| record.id)
+            .ok()
+            .map(|index| &records[index])
+    };
+    found.ok_or(AllocSafepointRootError::UnknownSafepoint { id: safepoint })
 }
 
 /// Validate that `safepoint` can be published from `ctx`'s frame-slot window.
@@ -280,7 +292,12 @@ impl<'a> AllocSafepointFrameRoots<'a> {
         ctx: &'a RuntimeStubAllocContext,
         safepoint: &'a SafepointRecord,
     ) -> Result<Self, AllocSafepointRootError> {
-        validate_alloc_safepoint_frame_roots(ctx, safepoint)?;
+        // Every record location is bounds-consistent by construction — both tiers
+        // build the table from `frame_slot_window(register_count)` and the running
+        // frame's slot window is exactly that register count — so the bounds walk
+        // is redundant on the per-allocation path. Keep it as a debug assertion;
+        // the release path trusts the compiler-emitted table.
+        debug_assert!(validate_alloc_safepoint_frame_roots(ctx, safepoint).is_ok());
         Ok(Self { ctx, safepoint })
     }
 

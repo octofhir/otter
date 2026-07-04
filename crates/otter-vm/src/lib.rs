@@ -3280,6 +3280,9 @@ impl Interpreter {
         this_value: Value,
         registers: &[Value],
     ) -> Result<Value, VmError> {
+        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+            eprintln!("[jit-trace] resume inlined callee fid={callee_fid} pc={callee_pc}");
+        }
         let function = context
             .exec_function(callee_fid)
             .ok_or(VmError::InvalidOperand)?;

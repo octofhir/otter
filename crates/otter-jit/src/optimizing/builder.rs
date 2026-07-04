@@ -58,6 +58,9 @@ pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph
     let cfg = Cfg::discover(&view.instructions)?;
     let mut builder = Builder::new(view, cfg, osr_pc)?;
     builder.run()?;
+    if let Some(sink) = builder.inline_trace.as_ref() {
+        sink.flush(view.function_id);
+    }
     reject_call_object_mix(&builder.graph)?;
     Ok(builder.graph)
 }
@@ -407,6 +410,87 @@ struct Builder<'a> {
     /// after any instruction that re-enters the VM, allocates, or could
     /// transition an object's shape.
     checked_shapes: FxHashMap<(NodeId, u32), NodeId>,
+    /// CFG-inline trace sink (`OTTER_JIT_TRACE`). `None` when tracing is off.
+    /// Records every method-inline attempt's outcome so [`build`] can print a
+    /// per-compile summary of the bucketed decline reasons.
+    inline_trace: Option<InlineTrace>,
+}
+
+/// Aggregating sink for CFG-inline tracing (`OTTER_JIT_TRACE`).
+///
+/// A large function attempts to inline many methods, so the raw per-attempt log
+/// scrolls past before the shape of the problem is legible. This records every
+/// outcome into frequency buckets (with PC/number operands stripped, so one
+/// reason does not scatter across many singletons) and prints a ranked summary
+/// when the compile finishes — the fastest way to see which op is blocking the
+/// most inlines next.
+///
+/// Modes (value of `OTTER_JIT_TRACE`): any value prints the per-compile summary;
+/// `summary` additionally suppresses the per-attempt lines (summary only).
+struct InlineTrace {
+    /// Print each per-attempt line. `false` in summary-only mode.
+    verbose: bool,
+    /// Bucketed outcome message → occurrence count, for the current compile.
+    buckets: FxHashMap<String, u32>,
+}
+
+impl InlineTrace {
+    fn from_env() -> Option<Self> {
+        let mode = std::env::var("OTTER_JIT_TRACE").ok()?;
+        Some(Self {
+            verbose: mode != "summary",
+            buckets: FxHashMap::default(),
+        })
+    }
+
+    /// Collapse a raw outcome message to a stable bucket key by replacing each
+    /// run of digits with `#`, so `nested leaf at pc 324 …` and `… pc 276 …`
+    /// fold into one bucket instead of scattering across singleton PCs.
+    fn bucket(msg: &str) -> String {
+        let mut out = String::with_capacity(msg.len());
+        let mut in_digits = false;
+        for c in msg.chars() {
+            if c.is_ascii_digit() {
+                if !in_digits {
+                    out.push('#');
+                }
+                in_digits = true;
+            } else {
+                out.push(c);
+                in_digits = false;
+            }
+        }
+        out
+    }
+
+    fn record(&mut self, msg: &str) {
+        *self.buckets.entry(Self::bucket(msg)).or_insert(0) += 1;
+    }
+
+    /// Print the ranked bucket summary for one compiled function. `attempts`
+    /// counts terminal outcomes only (the `profile` lines are not recorded), so
+    /// `inlined + bridged == attempts`.
+    fn flush(&self, function_id: u32) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        let mut rows: Vec<(&String, &u32)> = self.buckets.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        let attempts: u32 = self.buckets.values().sum();
+        let inlined: u32 = self
+            .buckets
+            .iter()
+            .filter(|(k, _)| k.starts_with("OK"))
+            .map(|(_, v)| *v)
+            .sum();
+        eprintln!(
+            "[jit-trace] cfg-inline summary fn={function_id}: {attempts} attempts, {inlined} inlined, {} bridged",
+            attempts - inlined
+        );
+        for (key, count) in rows {
+            eprintln!("[jit-trace]   {count:>4}× {key}");
+        }
+    }
 }
 
 /// In-flight state for folding one object literal in the builder.
@@ -479,6 +563,7 @@ impl<'a> Builder<'a> {
             incomplete_phis: FxHashMap::default(),
             active_literal: None,
             checked_shapes: FxHashMap::default(),
+            inline_trace: InlineTrace::from_env(),
         })
     }
 
@@ -2898,13 +2983,52 @@ impl<'a> Builder<'a> {
         // the inliner debuggable without recompiling ad-hoc probes.
         macro_rules! trace_inline {
             ($($arg:tt)*) => {
-                if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-                    eprintln!(
-                        "[jit-trace] cfg-inline method_fid={} call_pc={}: {}",
-                        method.method_fid, call_pc, format_args!($($arg)*)
-                    );
+                if let Some(sink) = self.inline_trace.as_mut() {
+                    let msg = format!("{}", format_args!($($arg)*));
+                    sink.record(&msg);
+                    if sink.verbose {
+                        eprintln!(
+                            "[jit-trace] cfg-inline method_fid={} call_pc={}: {}",
+                            method.method_fid, call_pc, msg
+                        );
+                    }
                 }
             };
+        }
+        // One-time method fingerprint per inline attempt: the callee's shape
+        // (params/regs/instrs) plus the op-class counts that drive the inline
+        // decision (nested calls, upvalue reads, element ops). Makes the trace
+        // self-describing — a decline line reads next to what the body actually
+        // contains, so the next unblocking op is obvious without cross-referencing
+        // the source.
+        if self.inline_trace.as_ref().is_some_and(|s| s.verbose) {
+            let nested_calls = method
+                .instructions
+                .iter()
+                .filter(|i| i.op == Op::CallMethodValue)
+                .count();
+            let upvalues = method
+                .instructions
+                .iter()
+                .filter(|i| i.op == Op::LoadUpvalue)
+                .count();
+            let elements = method
+                .instructions
+                .iter()
+                .filter(|i| matches!(i.op, Op::LoadElement | Op::StoreElement))
+                .count();
+            eprintln!(
+                "[jit-trace] cfg-inline method_fid={} call_pc={}: profile params={} regs={} instrs={} nested_calls={} upvalues={} elements={} gbm={}",
+                method.method_fid,
+                call_pc,
+                method.param_count,
+                method.register_count,
+                method.instructions.len(),
+                nested_calls,
+                upvalues,
+                elements,
+                Self::inline_cfg_gbm_ok(method),
+            );
         }
         // Splice only at a real CFG block: the successor rewiring below reads
         // `self.cfg.succs[block]`, which a synthetic merge block (produced by an

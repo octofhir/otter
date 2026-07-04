@@ -3580,7 +3580,11 @@ impl<'a> Builder<'a> {
                             bail_cfg!("nested call at pc {} has no baked inline leaf", instr.byte_pc);
                         };
                         if !Self::inline_cfg_gbm_ok(nested) {
-                            bail_cfg!("nested leaf at pc {} is not guards-before-mutations", instr.byte_pc);
+                            bail_cfg!(
+                                "nested leaf at pc {} is not guards-before-mutations ({})",
+                                instr.byte_pc,
+                                Self::nested_leaf_blocker(nested)
+                            );
                         }
                         let recv2 = self.read_variable(off(recv_reg2), g);
                         let mut args2: Vec<NodeId> = Vec::with_capacity(argc2);
@@ -3591,8 +3595,9 @@ impl<'a> Builder<'a> {
                         match self.splice_nested_leaf(g, recv2, &nested, &args2, call_pc)? {
                             Some(result) => self.write_variable(off(dst2), g, result),
                             None => bail_cfg!(
-                                "nested leaf at pc {} not a linear inlinable body",
-                                instr.byte_pc
+                                "nested leaf at pc {} not a linear inlinable body ({})",
+                                instr.byte_pc,
+                                Self::nested_leaf_blocker(&nested)
                             ),
                         }
                     }
@@ -3668,6 +3673,42 @@ impl<'a> Builder<'a> {
         // receiver-shape guards (control reaches it from several return paths).
         self.checked_shapes.clear();
         Ok(Some((result, cont as BlockId)))
+    }
+
+    /// Name the first structural reason a nested method cannot be spliced as a
+    /// linear leaf, for the inline trace. Mirrors the eligibility gates in
+    /// [`Self::splice_nested_leaf`] (single straight-line block, no nested call,
+    /// no element op) so a decline line points at the concrete wall — a loop, a
+    /// forward branch, a depth-2 call — instead of a generic "not linear".
+    fn nested_leaf_blocker(nested: &JitInlineMethod) -> &'static str {
+        if let Ok(cfg) = Cfg::discover(&nested.instructions) {
+            if cfg.ranges.len() > 1 {
+                // Blocks are in start-PC order, so an edge to a block whose id is
+                // not greater than the source is a back-edge — a loop. Anything
+                // else is a forward branch (an `if` / short-circuit).
+                let has_loop = cfg
+                    .succs
+                    .iter()
+                    .enumerate()
+                    .any(|(b, ss)| ss.iter().any(|&s| (s as usize) <= b));
+                return if has_loop {
+                    "callee has a loop"
+                } else {
+                    "callee has a forward branch"
+                };
+            }
+        }
+        if nested.instructions.iter().any(|i| i.op == Op::CallMethodValue) {
+            return "callee has a nested call (depth-2)";
+        }
+        if nested
+            .instructions
+            .iter()
+            .any(|i| matches!(i.op, Op::LoadElement | Op::StoreElement))
+        {
+            return "callee has an element op";
+        }
+        "callee has an unsupported op"
     }
 
     /// Inline a *linear leaf* method (a single-block, call-free, branch-free body)

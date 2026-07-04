@@ -3982,6 +3982,7 @@ mod tests {
             ],
             prop_offsets,
             prop_shapes: rustc_hash::FxHashMap::default(),
+            nested_methods: rustc_hash::FxHashMap::default(),
         };
         let mut v = view(
             1,

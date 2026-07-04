@@ -3401,7 +3401,8 @@ impl<'a> Builder<'a> {
             let g = gblock(cb as BlockId);
             self.graph.blocks[g as usize].sealed = true;
             let (start, end) = ccfg.ranges[cb];
-            for instr in &method.instructions[start..end] {
+            for ii in start..end {
+                let instr = &method.instructions[ii];
                 let op = instr.op;
                 let operands = instr.operands.as_slice();
                 // Snapshot the callee frame (live registers at this PC) before the
@@ -3739,32 +3740,68 @@ impl<'a> Builder<'a> {
                         // never doubles its store); anything else declines the whole
                         // splice, since keeping the call would need its receiver /
                         // arguments in the safepoint frame state.
+                        let byte_pc = instr.byte_pc;
                         let dst2 = reg(operands, 0)?;
                         let recv_reg2 = reg(operands, 1)?;
                         let argc2 = const_index(operands, 3)? as usize;
-                        let Some(nested) = method.nested_methods.get(&instr.byte_pc) else {
-                            bail_cfg!("nested call at pc {} has no baked inline leaf", instr.byte_pc);
+                        let Some(nested) = method.nested_methods.get(&byte_pc) else {
+                            bail_cfg!("nested call at pc {} has no baked inline leaf", byte_pc);
                         };
-                        if !Self::inline_cfg_gbm_ok(nested) {
-                            bail_cfg!(
-                                "nested leaf at pc {} is not guards-before-mutations ({})",
-                                instr.byte_pc,
-                                Self::nested_leaf_blocker(nested)
-                            );
-                        }
                         let recv2 = self.read_variable(off(recv_reg2), g);
                         let mut args2: Vec<NodeId> = Vec::with_capacity(argc2);
                         for slot in 0..argc2 {
                             args2.push(self.read_variable(off(reg(operands, 4 + slot)?), g));
                         }
                         let nested = nested.clone();
-                        match self.splice_nested_leaf(g, recv2, &nested, &args2, call_pc)? {
-                            Some(result) => self.write_variable(off(dst2), g, result),
-                            None => bail_cfg!(
-                                "nested leaf at pc {} not a linear inlinable body ({})",
-                                instr.byte_pc,
-                                Self::nested_leaf_blocker(&nested)
-                            ),
+                        // A guards-before-mutations linear leaf inlines cheaply: it
+                        // re-runs the call on a deopt, so no resume frame is needed
+                        // and its body emits straight into this block.
+                        let leaf = if Self::inline_cfg_gbm_ok(&nested) {
+                            self.splice_nested_leaf(g, recv2, &nested, &args2, call_pc)?
+                        } else {
+                            None
+                        };
+                        if let Some(result) = leaf {
+                            self.write_variable(off(dst2), g, result);
+                        } else {
+                            // A branchy or non-GBM nested callee needs its own guard
+                            // resume frames. Recurse only in tail position — the call
+                            // is immediately followed by a return of its result — so
+                            // the nested body's returns feed this method's continuation
+                            // with no mid-block split.
+                            let next_returns_dst = ii + 1 < end
+                                && matches!(
+                                    method.instructions[ii + 1].op,
+                                    Op::Return | Op::ReturnValue
+                                )
+                                && reg(method.instructions[ii + 1].operands.as_slice(), 0).ok()
+                                    == Some(dst2);
+                            if !next_returns_dst {
+                                bail_cfg!(
+                                    "nested call at pc {} is not in tail position ({})",
+                                    byte_pc,
+                                    Self::nested_leaf_blocker(&nested)
+                                );
+                            }
+                            let tail_return_pc = method.instructions[ii + 1].byte_pc;
+                            match self.splice_nested_tail(
+                                g,
+                                s,
+                                &nested,
+                                recv2,
+                                &args2,
+                                dst2,
+                                tail_return_pc,
+                                returns,
+                                pending_resume,
+                            )? {
+                                true => break,
+                                false => bail_cfg!(
+                                    "nested tail call at pc {} not inlinable ({})",
+                                    byte_pc,
+                                    Self::nested_leaf_blocker(&nested)
+                                ),
+                            }
                         }
                     }
                     _ => bail_cfg!("unsupported inlined op {:?}", op),
@@ -3882,6 +3919,191 @@ impl<'a> Builder<'a> {
         // receiver-shape guards (control reaches it from several return paths).
         self.checked_shapes.clear();
         Ok(Some((result, cont as BlockId)))
+    }
+
+    /// Recursively splice a *tail-position* nested method call: the branchy /
+    /// non-GBM callee `nested` whose result the enclosing method `s` immediately
+    /// returns. The nested body's own blocks are appended and filled (reusing
+    /// [`Self::fill_spliced_blocks`]); its returns feed the enclosing method's
+    /// continuation directly, so no mid-block split is needed. Each guard inside
+    /// it carries the whole inline stack — the enclosing method's ancestors plus
+    /// a frame for the enclosing method itself, resumed just past this call.
+    ///
+    /// Returns `Ok(true)` when the nested call was spliced (the enclosing block
+    /// `g` now jumps into it), `Ok(false)` when the callee is outside the inline
+    /// subset (the caller rolls the whole splice back).
+    #[allow(clippy::too_many_arguments)]
+    fn splice_nested_tail(
+        &mut self,
+        g: BlockId,
+        s: &MethodSplice,
+        nested: &JitInlineMethod,
+        recv2: NodeId,
+        args2: &[NodeId],
+        dst2: u16,
+        return_pc: u32,
+        returns: &mut Vec<NodeId>,
+        pending_resume: &mut Vec<(usize, usize, Vec<PendingResumeFrame>)>,
+    ) -> Result<bool, Unsupported> {
+        const MAX_INLINE_METHOD_REGS: u16 = 64;
+        if usize::from(nested.param_count) != args2.len()
+            || nested.register_count == 0
+            || nested.register_count > MAX_INLINE_METHOD_REGS
+            || nested.instructions.len() < 2
+        {
+            return Ok(false);
+        }
+        // A resumed nested body reconstructs its frame with an empty upvalue
+        // spine, so decline a non-GBM body that reads an upvalue.
+        let nested_resume = !Self::inline_cfg_gbm_ok(nested);
+        if nested_resume && nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
+            return Ok(false);
+        }
+        let ncfg = match Cfg::discover(&nested.instructions) {
+            Ok(c) => c,
+            Err(_) => return Ok(false),
+        };
+        // Forward DAG only (blocks in start-PC order, so a back edge is a
+        // predecessor whose index is not strictly smaller).
+        for (b, preds) in ncfg.preds.iter().enumerate() {
+            if preds.iter().any(|&p| p as usize >= b) {
+                return Ok(false);
+            }
+        }
+        let reachable = ncfg.reachable_from(0);
+
+        // Register window for the nested body, above the enclosing file.
+        let nbase = self.current_def.len();
+        if nbase + usize::from(nested.register_count) > usize::from(u16::MAX) {
+            return Ok(false);
+        }
+        let nbase = nbase as u16;
+        let call_pc = s.call_pc;
+
+        // One caller-graph block per nested block (appended); the returns merge
+        // into the enclosing continuation, so no separate continuation is made.
+        let nblocks0 = self.graph.blocks.len();
+        for &(start, _) in &ncfg.ranges {
+            let pc = nested.instructions[start].byte_pc;
+            self.graph.blocks.push(super::ir::Block::new(pc));
+        }
+        self.current_def
+            .resize(nbase as usize + usize::from(nested.register_count), Default::default());
+        let noff = |r: u16| -> u16 { nbase + r };
+        let ngblock = |cb: BlockId| -> BlockId { nblocks0 as BlockId + cb };
+
+        for (cb, preds) in ncfg.preds.iter().enumerate() {
+            let gg = ngblock(cb as BlockId) as usize;
+            if !reachable.contains(&(cb as BlockId)) {
+                self.graph.blocks[gg].sealed = true;
+                self.graph.blocks[gg].filled = true;
+                continue;
+            }
+            let mapped: Vec<BlockId> = preds.iter().map(|&p| ngblock(p)).collect();
+            self.graph.blocks[gg].preds = mapped;
+        }
+        let n_entry = ngblock(0);
+        self.graph.blocks[n_entry as usize].preds = vec![g];
+
+        // Entry: identity guard, argument seed, and (if the body reads an upvalue)
+        // the method closure resolved through the identity-guarded method slot.
+        let ident = self.graph.add_node(
+            NodeKind::CheckMethodIdentity {
+                recv: recv2,
+                recv_shape: nested.recv_shape,
+                proto_shape: nested.proto_shape,
+                method_value_byte: nested.method_value_byte,
+                method_on_receiver: nested.method_on_receiver,
+                method_fid: nested.method_fid,
+            },
+            n_entry,
+            call_pc,
+        );
+        self.push_body(n_entry, ident);
+        let method_closure = if nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
+            let node = if nested.method_on_receiver {
+                let checked =
+                    self.graph
+                        .add_node(NodeKind::CheckShape(recv2, nested.recv_shape), n_entry, call_pc);
+                self.push_body(n_entry, checked);
+                self.graph
+                    .add_node(NodeKind::LoadSlot(checked, nested.method_value_byte), n_entry, call_pc)
+            } else {
+                self.graph.add_node(
+                    NodeKind::LoadProtoSlot {
+                        recv: recv2,
+                        recv_shape: nested.recv_shape,
+                        proto_shape: nested.proto_shape,
+                        slot_byte: nested.method_value_byte,
+                    },
+                    n_entry,
+                    call_pc,
+                )
+            };
+            self.push_body(n_entry, node);
+            Some(node)
+        } else {
+            None
+        };
+        for r in 0..nested.register_count {
+            let node = if (r as usize) < args2.len() {
+                args2[r as usize]
+            } else {
+                let u = self.graph.add_node(NodeKind::ConstUndefined, n_entry, call_pc);
+                self.push_body(n_entry, u);
+                u
+            };
+            self.write_variable(noff(r), n_entry, node);
+        }
+
+        // The enclosing method's own frame in the nested guards' resume chain:
+        // resumed just past this call, holding its live registers there (the call
+        // destination excluded — the nested return supplies it).
+        let mut m_regs: Vec<(u16, NodeId)> = Vec::new();
+        if let Some(live) = s.callee_live.get(&return_pc) {
+            let mut rs: Vec<u16> = live.iter().copied().collect();
+            rs.sort_unstable();
+            for r in rs {
+                if r != dst2 && (r as usize) < usize::from(s.method.register_count) {
+                    m_regs.push((r, self.read_variable(s.base + r, g)));
+                }
+            }
+        }
+        let mut n_ancestors: Vec<PendingResumeFrame> = s.ancestors.to_vec();
+        n_ancestors.push(PendingResumeFrame {
+            callee_fid: s.method.method_fid,
+            callee_pc: return_pc,
+            recv: s.recv,
+            dst_reg: s.dst_reg,
+            register_count: s.method.register_count,
+            registers: m_regs,
+        });
+
+        let n_callee_live = if nested_resume {
+            super::deopt::bytecode_liveness_instrs(&nested.instructions)
+        } else {
+            rustc_hash::FxHashMap::default()
+        };
+
+        // The enclosing block enters the nested body; its returns merge into the
+        // enclosing continuation.
+        self.set_term(g, Terminator::Jump(n_entry));
+        let n_splice = MethodSplice {
+            method: nested,
+            ccfg: &ncfg,
+            reachable: &reachable,
+            callee_live: &n_callee_live,
+            base: nbase,
+            block_base: nblocks0 as BlockId,
+            cont: s.cont,
+            recv: recv2,
+            method_closure,
+            resume_mode: nested_resume,
+            call_pc,
+            dst_reg: dst2,
+            ancestors: &n_ancestors,
+        };
+        self.fill_spliced_blocks(&n_splice, returns, pending_resume)
     }
 
     /// Name the first structural reason a nested method cannot be spliced as a

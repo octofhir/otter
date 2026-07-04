@@ -651,6 +651,10 @@ pub struct Interpreter {
     /// back/popped as a strict stack so it is empty between top-level
     /// native calls.
     json_root_stack: Vec<Value>,
+    /// Byte length of the most recent `JSON.stringify` output, used to
+    /// pre-size the next call's scratch buffer. Repeated stringify of
+    /// similarly-shaped data then never re-grows the buffer from empty.
+    json_stringify_capacity_hint: usize,
     /// Protector for the array element store fast path: flips to
     /// `true` once any accessor descriptor lands on an array-index
     /// key anywhere (e.g. `Array.prototype[1] = {set}`); array index
@@ -1679,6 +1683,7 @@ impl Interpreter {
             lean_callback_roots: Vec::new(),
             pending_error_detail: std::cell::RefCell::new(None),
             json_root_stack: Vec::new(),
+            json_stringify_capacity_hint: 0,
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,

@@ -148,7 +148,7 @@ impl Interpreter {
         let rooted_value = self.json_root_get(value_root);
         let wrapper = self.json_make_wrapper(rooted_value)?;
 
-        let mut buffer = String::new();
+        let mut buffer = String::with_capacity(self.json_stringify_capacity_hint);
         let wrote = self.serialize_json_property_into(
             context,
             &mut state,
@@ -160,6 +160,9 @@ impl Interpreter {
         self.json_root_pop_to(value_root);
 
         if wrote {
+            // Pre-size the next stringify from this one's output length so a
+            // repeated call on similarly-shaped data never re-grows from empty.
+            self.json_stringify_capacity_hint = buffer.len();
             let s = JsString::from_str(&buffer, self.gc_heap_mut())
                 .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
             Ok(Value::string(s))

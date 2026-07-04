@@ -3251,6 +3251,49 @@ impl Interpreter {
         self.dispatch_loop(context, stack)
     }
 
+    /// Resume an *inlined* method callee mid-execution in the interpreter.
+    ///
+    /// When the optimizing tier splices a method body into its caller and a guard
+    /// inside that body fails, the caller stays compiled: only the callee frame
+    /// deoptimizes. The inlined body has already applied its side effects up to
+    /// the failing guard, so re-running the call from the start would double them.
+    /// Instead this materializes the callee's partial state as a fresh interpreter
+    /// [`Frame`] at the guard's byte-PC — `registers` are the callee's live
+    /// register values boxed at the guard, `this_value` its receiver — pushes it,
+    /// and runs it to completion. The returned value is the inlined call's result,
+    /// which the caller's compiled code stores into the call destination before
+    /// continuing.
+    ///
+    /// Restricted to callees with no captured upvalues (empty spine): a body that
+    /// reads an upvalue is not admitted for this deopt path, so the interpreter
+    /// never reads a missing cell.
+    ///
+    /// # Errors
+    /// Propagates any error the resumed callee raises, and `InvalidOperand` for an
+    /// unknown callee function id.
+    pub fn jit_resume_inline_callee(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        callee_fid: u32,
+        callee_pc: u32,
+        this_value: Value,
+        registers: smallvec::SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        let function = context
+            .exec_function(callee_fid)
+            .ok_or(VmError::InvalidOperand)?;
+        let upvalues: crate::frame_state::UpvalueSpine = Vec::new().into_boxed_slice();
+        let mut frame =
+            Frame::with_exec_registers(function, None, upvalues, this_value, registers);
+        frame.pc = callee_pc;
+        self.enter_sync_reentry()?;
+        stack.push(frame);
+        let result = self.dispatch_loop(context, stack);
+        self.leave_sync_reentry();
+        result
+    }
+
     /// Finish a direct compiled call whose callee bailed to the interpreter.
     ///
     /// Resumes the interpreter at `bail_pc` inside the already-published callee

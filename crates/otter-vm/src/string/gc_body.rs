@@ -917,47 +917,58 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
     if a == b {
         return true;
     }
-    let (a_len, a_hash, a_is_cons) = heap.read_payload(a, |body| {
-        (
-            body.len,
-            body.hash,
-            matches!(body.repr, JsStringBodyRepr::Cons { .. }),
-        )
-    });
-    let (b_len, b_hash, b_is_cons) = heap.read_payload(b, |body| {
-        (
-            body.len,
-            body.hash,
-            matches!(body.repr, JsStringBodyRepr::Cons { .. }),
-        )
-    });
-    if a_len != b_len {
-        return false;
-    }
-    if a_len == 0 {
-        return true;
-    }
-    // `body.hash` matches the FNV-1a of the flattened content only
-    // when neither side is a cons rope: cons bodies carry a
-    // placeholder hash (see `fnv_combine`). When both sides are
-    // non-cons, mismatched hashes are a fast reject; otherwise fall
-    // through to the body walk.
-    if !a_is_cons && !b_is_cons && a_hash != b_hash {
-        return false;
-    }
-    // Direct content compare when both bodies are flat (inline or side
-    // storage) — the dominant case for interned/flattened keys (e.g. Map/Set
-    // lookups), avoiding two throwaway `to_utf16_vec` allocations. `Cons` /
-    // `Sliced` bodies return `None` and fall through to the materialising walk.
+    // One nested read over both bodies handles the whole flat (inline / side
+    // storage) case — the dominant Map/Set-key shape — in a single pass: length
+    // and (non-cons) hash reject, then a direct content compare that avoids two
+    // throwaway `to_utf16_vec` allocations. `body.hash` matches the FNV-1a of the
+    // flattened content only when neither side is a cons rope (cons bodies carry
+    // a placeholder hash), so the hash reject is gated on both being non-cons. A
+    // `Cons` / `Sliced` body yields `None` and falls through to the materialising
+    // walk. This reads each body's payload once instead of twice.
     if let Some(answer) = heap.read_payload(a, |ba| {
-        let va = flat_content(&ba.repr, a_len as usize)?;
         heap.read_payload(b, |bb| {
-            flat_content(&bb.repr, b_len as usize).map(|vb| va.content_eq(&vb))
+            if ba.len != bb.len {
+                return Some(false);
+            }
+            if ba.len == 0 {
+                return Some(true);
+            }
+            let a_is_cons = matches!(ba.repr, JsStringBodyRepr::Cons { .. });
+            let b_is_cons = matches!(bb.repr, JsStringBodyRepr::Cons { .. });
+            if !a_is_cons && !b_is_cons && ba.hash != bb.hash {
+                return Some(false);
+            }
+            match (
+                flat_content(&ba.repr, ba.len as usize),
+                flat_content(&bb.repr, bb.len as usize),
+            ) {
+                (Some(va), Some(vb)) => Some(va.content_eq(&vb)),
+                _ => None,
+            }
         })
     }) {
         return answer;
     }
     to_utf16_vec(heap, a) == to_utf16_vec(heap, b)
+}
+
+/// Copy a string body's flat Latin-1 bytes into `out` when it is a short,
+/// non-wide flat body (inline or side-storage Latin-1) that fits. Returns the
+/// byte length, or `None` for a wide, cons/sliced, or over-long body — the
+/// caller then takes its general path. Used by the `string + number` concat
+/// fast path to build the result in a single allocation.
+pub fn read_short_flat_latin1(
+    heap: &GcHeap,
+    handle: JsStringHandle,
+    out: &mut [u8; 32],
+) -> Option<usize> {
+    heap.read_payload(handle, |body| match flat_content(&body.repr, body.len as usize) {
+        Some(FlatContent::Latin1(bytes)) if bytes.len() <= out.len() => {
+            out[..bytes.len()].copy_from_slice(bytes);
+            Some(bytes.len())
+        }
+        _ => None,
+    })
 }
 
 /// FNV-1a hash over UTF-16 code units. Stable across runs; used for

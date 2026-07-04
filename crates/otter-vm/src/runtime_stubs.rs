@@ -1113,6 +1113,54 @@ fn string_concat_alloc_inner(
     let Some(interp) = interpreter_mut(ctx.vm) else {
         return RuntimeStubResult::miss();
     };
+    // One-allocation fast path for `<short flat latin1 string> + <int32>` and
+    // its mirror — the common key-building shape (`"k" + n`). The general path
+    // below builds the integer's string body, a cons rope, and then flattens it
+    // (three allocations); here the integer's ASCII digits are formatted
+    // straight into a single flat latin1 result. No root scope is needed: the
+    // string's bytes are copied out before the result allocation, and the
+    // integer operand is not a heap value.
+    {
+        let lhs = Value::from_abi_bits(lhs_bits);
+        let rhs = Value::from_abi_bits(rhs_bits);
+        let combo = match (
+            lhs.as_string(&interp.gc_heap),
+            rhs.as_i32(),
+            lhs.as_i32(),
+            rhs.as_string(&interp.gc_heap),
+        ) {
+            (Some(string), Some(n), _, _) => Some((string.handle(), n, false)),
+            (_, _, Some(n), Some(string)) => Some((string.handle(), n, true)),
+            _ => None,
+        };
+        if let Some((string_handle, n, number_first)) = combo {
+            let mut string_bytes = [0u8; 32];
+            if let Some(string_len) = crate::string::gc_body::read_short_flat_latin1(
+                &interp.gc_heap,
+                string_handle,
+                &mut string_bytes,
+            ) {
+                let mut digits = [0u8; crate::number::integer_fast::I32_BUF_LEN];
+                let digit_len = crate::number::integer_fast::format_i32(n, &mut digits);
+                let mut out = [0u8; 32 + crate::number::integer_fast::I32_BUF_LEN];
+                let (first, second): (&[u8], &[u8]) = if number_first {
+                    (&digits[..digit_len], &string_bytes[..string_len])
+                } else {
+                    (&string_bytes[..string_len], &digits[..digit_len])
+                };
+                out[..first.len()].copy_from_slice(first);
+                out[first.len()..first.len() + second.len()].copy_from_slice(second);
+                let total = first.len() + second.len();
+                return match crate::string::JsString::from_latin1(
+                    &out[..total],
+                    &mut interp.gc_heap,
+                ) {
+                    Ok(result) => RuntimeStubResult::ok_value(Value::string(result)),
+                    Err(_) => RuntimeStubResult::out_of_memory(),
+                };
+            }
+        }
+    }
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame-slot window must remain live for this call.
     let Ok(roots) = (unsafe {

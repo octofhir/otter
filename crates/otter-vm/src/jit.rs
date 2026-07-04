@@ -407,9 +407,16 @@ pub struct JitInlineMethod {
     pub register_count: u16,
     /// Method instruction stream, emitted inline.
     pub instructions: Vec<JitInstrView>,
-    /// Body `LoadProperty`/`StoreProperty` byte-PC → value slab byte offset,
-    /// baked from the receiver shape.
+    /// Body `LoadProperty`/`StoreProperty` byte-PC → value slab byte offset. A
+    /// receiver-shape property is baked from the identity-guarded receiver shape;
+    /// a non-receiver property is baked from its own monomorphic site feedback,
+    /// with the required shape recorded in [`Self::prop_shapes`].
     pub prop_offsets: rustc_hash::FxHashMap<u32, u32>,
+    /// Body byte-PC → the compressed shape-handle offset a **non-receiver**
+    /// property access must match, for the guard the inliner emits before the
+    /// slot load/store. A receiver property is absent here — the entry
+    /// `CheckMethodIdentity` already proves its shape.
+    pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

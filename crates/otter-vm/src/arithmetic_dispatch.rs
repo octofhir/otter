@@ -88,9 +88,13 @@ impl Interpreter {
         // primitive is a String, concatenate; otherwise apply ToNumeric
         // to each primitive and fold via the numeric / BigInt rules.
         let result = if lhs.is_string() || rhs.is_string() {
-            let l_str = self.js_string_for_concat(lhs)?;
-            let r_str = self.js_string_for_concat(rhs)?;
-            Value::string(JsString::concat(l_str, r_str, self.gc_heap_mut())?)
+            if let Some(fast) = self.try_concat_string_int32(lhs, rhs) {
+                fast?
+            } else {
+                let l_str = self.js_string_for_concat(lhs)?;
+                let r_str = self.js_string_for_concat(rhs)?;
+                Value::string(JsString::concat(l_str, r_str, self.gc_heap_mut())?)
+            }
         } else {
             let lk =
                 abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;

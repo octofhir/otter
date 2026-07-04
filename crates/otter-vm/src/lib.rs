@@ -1220,6 +1220,47 @@ impl Interpreter {
         conversion::to_js_string_primitive(&value, self.gc_heap_mut())
     }
 
+    /// One-allocation concat for `<short flat latin1 string> + <int32>` and its
+    /// mirror — the common key-building shape (`"k" + n`). Formats the integer's
+    /// ASCII digits straight into a single flat latin1 result, skipping the
+    /// throwaway number string, the cons rope, and the flatten the general path
+    /// would build. Returns `None` when the operands are not that shape (the
+    /// caller takes the general concat path). Only exact int32-tagged operands
+    /// qualify, so `ToString` semantics are unchanged. No rooting is needed: the
+    /// string's bytes are copied before the result allocation and the integer is
+    /// not a heap value.
+    pub(crate) fn try_concat_string_int32(
+        &mut self,
+        lhs: Value,
+        rhs: Value,
+    ) -> Option<Result<Value, otter_gc::OutOfMemory>> {
+        let (handle, n, number_first) = match (
+            lhs.as_string(&self.gc_heap),
+            rhs.as_i32(),
+            lhs.as_i32(),
+            rhs.as_string(&self.gc_heap),
+        ) {
+            (Some(string), Some(n), _, _) => (string.handle(), n, false),
+            (_, _, Some(n), Some(string)) => (string.handle(), n, true),
+            _ => return None,
+        };
+        let mut string_bytes = [0u8; 32];
+        let string_len =
+            crate::string::gc_body::read_short_flat_latin1(&self.gc_heap, handle, &mut string_bytes)?;
+        let mut digits = [0u8; crate::number::integer_fast::I32_BUF_LEN];
+        let digit_len = crate::number::integer_fast::format_i32(n, &mut digits);
+        let mut out = [0u8; 32 + crate::number::integer_fast::I32_BUF_LEN];
+        let (first, second): (&[u8], &[u8]) = if number_first {
+            (&digits[..digit_len], &string_bytes[..string_len])
+        } else {
+            (&string_bytes[..string_len], &digits[..digit_len])
+        };
+        out[..first.len()].copy_from_slice(first);
+        out[first.len()..first.len() + second.len()].copy_from_slice(second);
+        let total = first.len() + second.len();
+        Some(crate::string::JsString::from_latin1(&out[..total], &mut self.gc_heap).map(Value::string))
+    }
+
     /// Root-tracing view of cached BigInt constants.
     pub(crate) fn bigint_constants_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.bigint_constant_cache.values()

@@ -4391,6 +4391,21 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &PolyMethodTarget,
     ) -> Option<jit::JitInlineMethod> {
+        self.bake_inline_method_rec(context, target, 0)
+    }
+
+    /// Recursion bound for nested method-body inlining. A method whose tail is a
+    /// call splices that callee's body; the callee may in turn call, so the bake
+    /// recurses down the monomorphic call chain to this depth (richards is
+    /// `run → task.run → scheduler.X`), then leaves deeper calls bridged.
+    const MAX_INLINE_METHOD_DEPTH: u32 = 3;
+
+    fn bake_inline_method_rec(
+        &mut self,
+        context: &ExecutionContext,
+        target: &PolyMethodTarget,
+        depth: u32,
+    ) -> Option<jit::JitInlineMethod> {
         let method = context.exec_function(target.method_fid)?;
         if method.is_generator
             || method.is_async
@@ -4441,6 +4456,48 @@ impl Interpreter {
             prop_offsets.insert(instr.byte_pc, value_byte);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }
+        // Recursively bake the body's monomorphic nested method calls so the
+        // inliner can splice their bodies rather than bridge them. Only `Mono`
+        // sites recurse; polymorphic/megamorphic internal calls stay bridged.
+        // Collect targets first — the recursion needs `&mut self`, which cannot
+        // overlap the feedback-map borrow.
+        let mut nested_targets: Vec<(u32, PolyMethodTarget)> = Vec::new();
+        if depth < Self::MAX_INLINE_METHOD_DEPTH {
+            for instr in &method_view.instructions {
+                if instr.op != Op::CallMethodValue {
+                    continue;
+                }
+                if let Some(MethodCallFeedback::Mono {
+                    method_fid,
+                    recv_shape,
+                    proto_shape,
+                    method_value_byte,
+                    method_on_receiver,
+                }) = self
+                    .jit_method_site_feedback
+                    .get(&(target.method_fid, instr.byte_pc))
+                {
+                    nested_targets.push((
+                        instr.byte_pc,
+                        PolyMethodTarget {
+                            method_fid: *method_fid,
+                            recv_shape: *recv_shape,
+                            proto_shape: *proto_shape,
+                            method_value_byte: *method_value_byte,
+                            method_on_receiver: *method_on_receiver,
+                            hits: 1,
+                        },
+                    ));
+                }
+            }
+        }
+        let mut nested_methods: rustc_hash::FxHashMap<u32, jit::JitInlineMethod> =
+            rustc_hash::FxHashMap::default();
+        for (pc, nested_target) in nested_targets {
+            if let Some(nested) = self.bake_inline_method_rec(context, &nested_target, depth + 1) {
+                nested_methods.insert(pc, nested);
+            }
+        }
         Some(jit::JitInlineMethod {
             method_fid: target.method_fid,
             recv_shape: target.recv_shape.offset(),
@@ -4452,6 +4509,7 @@ impl Interpreter {
             instructions: method_view.instructions,
             prop_offsets,
             prop_shapes,
+            nested_methods,
         })
     }
 

@@ -417,6 +417,10 @@ pub struct JitInlineMethod {
     /// slot load/store. A receiver property is absent here — the entry
     /// `CheckMethodIdentity` already proves its shape.
     pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
+    /// Body `CallMethodValue` byte-PC → the monomorphic method it resolves to,
+    /// baked recursively. Lets the inliner splice a nested call's body inline
+    /// (bounded recursion) instead of leaving it a bridged call.
+    pub nested_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
 }
 
 /// VM-resolved direct-call target for one eligible compiled callee.

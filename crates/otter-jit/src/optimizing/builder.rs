@@ -2729,6 +2729,68 @@ impl<'a> Builder<'a> {
     /// built entirely from these can be re-executed from its call site with no
     /// observable effect, which is what makes the re-run-the-call deopt of an
     /// inlined guard correct (see [`Self::try_inline_method_cfg`]).
+    /// Whether a CFG-splice-eligible op writes to memory the interpreter would
+    /// re-do if the inlined call re-ran from `call_pc`. A `StoreProperty` on the
+    /// (identity-guarded, deopt-free) receiver is the only such op the splice
+    /// emits; every other allowed op is a pure computation.
+    fn inline_cfg_op_is_mutation(op: Op) -> bool {
+        matches!(op, Op::StoreProperty)
+    }
+
+    /// Whether an op can deoptimize when the splice lowers it (a shape/type/bool
+    /// guard). Re-running the call at `call_pc` is only correct when no such op
+    /// executes *after* a mutation, so the interpreter never re-applies a store.
+    /// Receiver loads are deopt-free once the entry identity guard proves the
+    /// shape, but a `LoadProperty` may target a non-receiver object (guarded), so
+    /// it stays in the can-deopt set; likewise a not-yet-boolean `JumpIf` cond.
+    fn inline_cfg_op_can_deopt(op: Op) -> bool {
+        matches!(
+            op,
+            Op::LoadProperty
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr
+                | Op::Increment
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual
+                | Op::LooseEqual
+                | Op::LooseNotEqual
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::ToPrimitive
+                | Op::ToNumeric
+        )
+    }
+
+    /// Guards-before-mutations check for the forward-DAG CFG splice: once any
+    /// mutation executes, no later op may deopt (a deopt re-runs the whole call,
+    /// re-applying the store). In a forward DAG control only flows to higher PCs,
+    /// so a single PC-ordered scan over the flat instruction stream is exact — any
+    /// op reachable after a store has a strictly greater PC and is visited here.
+    fn inline_cfg_gbm_ok(method: &JitInlineMethod) -> bool {
+        let mut mutated = false;
+        for instr in &method.instructions {
+            if mutated && Self::inline_cfg_op_can_deopt(instr.op) {
+                return false;
+            }
+            if Self::inline_cfg_op_is_mutation(instr.op) {
+                mutated = true;
+            }
+        }
+        true
+    }
+
     fn inline_cfg_op_is_pure(op: Op) -> bool {
         matches!(
             op,
@@ -2773,8 +2835,8 @@ impl<'a> Builder<'a> {
         )
     }
 
-    /// Inline a *branchy, side-effect-free* monomorphic method by splicing the
-    /// callee's control-flow graph into the caller at the call site.
+    /// Inline a *branchy* monomorphic method by splicing the callee's control-flow
+    /// graph into the caller at the call site.
     ///
     /// The linear replay ([`Self::try_inline_method`]) handles only straight-line
     /// method bodies — a method with an `if` or a short-circuit (`||` / `&&`)
@@ -2787,12 +2849,13 @@ impl<'a> Builder<'a> {
     /// re-running the whole call at `call_pc` with the caller's frame — exactly
     /// what the existing single-frame machinery already captures.
     ///
-    /// Restricted to **pure** callees (see [`Self::inline_cfg_op_is_pure`]):
-    /// re-running the call is only observably-equivalent when the body has no
-    /// side effect. A branchy method that mutates before a guard needs a
-    /// mid-callee resume frame (a nested deopt state) and is left to the bridge.
-    /// The callee CFG must also be a forward DAG (no internal loop), so the
-    /// spliced blocks seal in topological order.
+    /// Re-running the call on a deopt is only observably-equivalent when no store
+    /// has executed yet, so a body that stores is admitted only when it is
+    /// *guards-before-mutations* (see [`Self::inline_cfg_gbm_ok`]): no op that can
+    /// deopt is reachable after any receiver store. A non-GBM body (a guard after a
+    /// mutation) needs a mid-callee resume frame (a nested deopt state) and is left
+    /// to the bridge. The callee CFG must also be a forward DAG (no internal loop),
+    /// so the spliced blocks seal in topological order.
     ///
     /// Returns `(result, continuation)` — the call's destination value and the
     /// merge block the caller continues building into — or `None` (bridge the
@@ -2820,7 +2883,10 @@ impl<'a> Builder<'a> {
             || method.register_count > MAX_INLINE_METHOD_REGS
             || method.instructions.len() < 2
             || method.instructions.len() > MAX_INLINE_METHOD_INSTRS
-            || !method.instructions.iter().all(|i| Self::inline_cfg_op_is_pure(i.op))
+            || !method.instructions.iter().all(|i| {
+                Self::inline_cfg_op_is_pure(i.op) || Self::inline_cfg_op_is_mutation(i.op)
+            })
+            || !Self::inline_cfg_gbm_ok(method)
         {
             return Ok(None);
         }
@@ -3065,6 +3131,46 @@ impl<'a> Builder<'a> {
                                 .add_node(NodeKind::LoadSlot(checked, slot_byte), g, call_pc);
                         self.push_body(g, load);
                         self.write_variable(off(dst), g, load);
+                    }
+                    Op::StoreProperty => {
+                        // `StoreProperty obj, name, src`. Restricted to a primitive
+                        // (int32 / f64) value: a primitive `Value` is never a `Gc`
+                        // pointer, so the slot store needs no write barrier — the
+                        // same restriction the linear replay uses. The receiver's
+                        // shape is proven at entry (deopt-free); a non-receiver
+                        // object keeps its guard. The GBM pre-check guarantees no
+                        // guard executes after this store, so re-running the call on
+                        // a deopt never re-applies it.
+                        let obj_reg = reg(operands, 0)?;
+                        let src_reg = reg(operands, 2)?;
+                        let obj = self.read_variable(off(obj_reg), g);
+                        let value = self.read_variable(off(src_reg), g);
+                        if !matches!(
+                            self.graph.node(value).kind.repr(),
+                            Repr::Int32 | Repr::Float64
+                        ) {
+                            bail_cfg!();
+                        }
+                        let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
+                            bail_cfg!();
+                        };
+                        let checked = if obj == recv {
+                            recv
+                        } else {
+                            let c = self.graph.add_node(
+                                NodeKind::CheckShape(obj, method.recv_shape),
+                                g,
+                                call_pc,
+                            );
+                            self.push_body(g, c);
+                            c
+                        };
+                        let store = self.graph.add_node(
+                            NodeKind::StoreSlot(checked, slot_byte, value),
+                            g,
+                            call_pc,
+                        );
+                        self.push_body(g, store);
                     }
                     Op::Add | Op::Sub | Op::Mul | Op::Div => {
                         let dst = reg(operands, 0)?;

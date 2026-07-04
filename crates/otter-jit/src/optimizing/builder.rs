@@ -2813,6 +2813,7 @@ impl<'a> Builder<'a> {
                 | Op::LoadTrue
                 | Op::LoadFalse
                 | Op::LoadUndefined
+                | Op::LoadNull
                 | Op::LoadHole
                 | Op::LoadLocal
                 | Op::StoreLocal
@@ -3158,12 +3159,12 @@ impl<'a> Builder<'a> {
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
                     }
-                    Op::LoadUndefined | Op::LoadHole => {
+                    Op::LoadUndefined | Op::LoadHole | Op::LoadNull => {
                         let dst = reg(operands, 0)?;
-                        let kind = if matches!(op, Op::LoadUndefined) {
-                            NodeKind::ConstUndefined
-                        } else {
-                            NodeKind::LoadHole
+                        let kind = match op {
+                            Op::LoadUndefined => NodeKind::ConstUndefined,
+                            Op::LoadNull => NodeKind::ConstNull,
+                            _ => NodeKind::LoadHole,
                         };
                         let node = self.graph.add_node(kind, g, call_pc);
                         self.push_body(g, node);
@@ -3245,23 +3246,23 @@ impl<'a> Builder<'a> {
                         self.write_variable(off(dst), g, load);
                     }
                     Op::StoreProperty => {
-                        // `StoreProperty obj, name, src`. Restricted to a primitive
-                        // (int32 / f64) value: a primitive `Value` is never a `Gc`
-                        // pointer, so the slot store needs no write barrier — the
-                        // same restriction the linear replay uses. The receiver's
-                        // shape is proven at entry (deopt-free); a non-receiver
-                        // object keeps its guard. The GBM pre-check guarantees no
-                        // guard executes after this store, so re-running the call on
-                        // a deopt never re-applies it.
+                        // `StoreProperty obj, name, src`. `StoreSlot` emits the
+                        // write barrier for a tagged (pointer) value and none for an
+                        // int32/f64 — the same node the mainline store lowers — so
+                        // the value may be any of those reprs. The receiver's shape
+                        // is proven at entry (deopt-free); a non-receiver object
+                        // keeps its guard. A GBM body re-runs the call on a deopt,
+                        // which re-applies the store idempotently (same value); a
+                        // non-GBM body resumes the callee instead of re-running.
                         let obj_reg = reg(operands, 0)?;
                         let src_reg = reg(operands, 2)?;
                         let obj = self.read_variable(off(obj_reg), g);
                         let value = self.read_variable(off(src_reg), g);
                         if !matches!(
                             self.graph.node(value).kind.repr(),
-                            Repr::Int32 | Repr::Float64
+                            Repr::Int32 | Repr::Float64 | Repr::Tagged
                         ) {
-                            bail_cfg!("store value repr {:?} is not primitive (needs int32/f64)", self.graph.node(value).kind.repr());
+                            bail_cfg!("store value repr {:?} unsupported", self.graph.node(value).kind.repr());
                         }
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
                             bail_cfg!("no baked prop offset for load/store at callee pc {}", instr.byte_pc);

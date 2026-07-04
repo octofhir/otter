@@ -3959,7 +3959,13 @@ impl<'a> Builder<'a> {
         {
             return Ok(None);
         }
-        let nested_resume = !Self::inline_cfg_gbm_ok(nested);
+        // A guards-before-mutations nested body would normally deopt by re-running
+        // its call. But this call is itself inside an inlined method: re-running it
+        // re-runs the enclosing method's call, which re-applies any store the
+        // enclosing method already made before reaching here. So whenever the
+        // enclosing method is non-GBM (has such a store), the nested body must
+        // resume its own frame instead of re-running — force resume mode.
+        let nested_resume = !Self::inline_cfg_gbm_ok(nested) || s.resume_mode;
         let ncfg = match Cfg::discover(&nested.instructions) {
             Ok(c) => c,
             Err(_) => return Ok(None),

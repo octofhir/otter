@@ -514,6 +514,21 @@ struct PendingResumeFrame {
     registers: Vec<(u16, NodeId)>,
 }
 
+/// The prepared state for one recursively-spliced nested call, produced by
+/// [`Builder::setup_nested_splice`] (blocks appended, entry seeded, receiver
+/// guarded, resume chain built) and consumed by the tail and non-tail splice
+/// paths, which differ only in where the nested body's returns land.
+struct NestedSplice {
+    ncfg: Cfg,
+    reachable: FxHashSet<BlockId>,
+    n_ancestors: Vec<PendingResumeFrame>,
+    n_callee_live: FxHashMap<u32, FxHashSet<u16>>,
+    nbase: u16,
+    nblocks0: usize,
+    method_closure: Option<NodeId>,
+    nested_resume: bool,
+}
+
 /// Immutable per-method context for one level of a CFG-inline splice.
 ///
 /// [`Builder::fill_spliced_blocks`] translates a method body's basic blocks into
@@ -3761,26 +3776,17 @@ impl<'a> Builder<'a> {
                         };
                         if let Some(result) = leaf {
                             self.write_variable(off(dst2), g, result);
-                        } else {
-                            // A branchy or non-GBM nested callee needs its own guard
-                            // resume frames. Recurse only in tail position — the call
-                            // is immediately followed by a return of its result — so
-                            // the nested body's returns feed this method's continuation
-                            // with no mid-block split.
-                            let next_returns_dst = ii + 1 < end
-                                && matches!(
-                                    method.instructions[ii + 1].op,
-                                    Op::Return | Op::ReturnValue
-                                )
-                                && reg(method.instructions[ii + 1].operands.as_slice(), 0).ok()
-                                    == Some(dst2);
-                            if !next_returns_dst {
-                                bail_cfg!(
-                                    "nested call at pc {} is not in tail position ({})",
-                                    byte_pc,
-                                    Self::nested_leaf_blocker(&nested)
-                                );
-                            }
+                        } else if ii + 1 < end
+                            && matches!(
+                                method.instructions[ii + 1].op,
+                                Op::Return | Op::ReturnValue
+                            )
+                            && reg(method.instructions[ii + 1].operands.as_slice(), 0).ok()
+                                == Some(dst2)
+                        {
+                            // Tail position: the call's result is immediately
+                            // returned, so the nested returns feed this method's
+                            // continuation with no split. Skip the following return.
                             let tail_return_pc = method.instructions[ii + 1].byte_pc;
                             match self.splice_nested_tail(
                                 g,
@@ -3800,6 +3806,12 @@ impl<'a> Builder<'a> {
                                     Self::nested_leaf_blocker(&nested)
                                 ),
                             }
+                        } else {
+                            bail_cfg!(
+                                "nested call at pc {} is not in tail position ({})",
+                                byte_pc,
+                                Self::nested_leaf_blocker(&nested)
+                            );
                         }
                     }
                     _ => bail_cfg!("unsupported inlined op {:?}", op),
@@ -3921,19 +3933,15 @@ impl<'a> Builder<'a> {
         Ok(Some((result, cont as BlockId)))
     }
 
-    /// Recursively splice a *tail-position* nested method call: the branchy /
-    /// non-GBM callee `nested` whose result the enclosing method `s` immediately
-    /// returns. The nested body's own blocks are appended and filled (reusing
-    /// [`Self::fill_spliced_blocks`]); its returns feed the enclosing method's
-    /// continuation directly, so no mid-block split is needed. Each guard inside
-    /// it carries the whole inline stack — the enclosing method's ancestors plus
-    /// a frame for the enclosing method itself, resumed just past this call.
-    ///
-    /// Returns `Ok(true)` when the nested call was spliced (the enclosing block
-    /// `g` now jumps into it), `Ok(false)` when the callee is outside the inline
-    /// subset (the caller rolls the whole splice back).
+    /// Prepare a recursively-spliced nested call: append the callee's blocks,
+    /// seed its entry (identity guard, arguments, upvalue closure), and build the
+    /// resume chain (the enclosing method's ancestors plus a frame for the
+    /// enclosing method itself, resumed just past this call at `return_pc`, its
+    /// live registers minus the call destination). The enclosing block `g` is
+    /// wired to jump into the nested entry. Returns `None` when the callee is
+    /// outside the inline subset (arity, register window, control-flow shape).
     #[allow(clippy::too_many_arguments)]
-    fn splice_nested_tail(
+    fn setup_nested_splice(
         &mut self,
         g: BlockId,
         s: &MethodSplice,
@@ -3942,27 +3950,25 @@ impl<'a> Builder<'a> {
         args2: &[NodeId],
         dst2: u16,
         return_pc: u32,
-        returns: &mut Vec<NodeId>,
-        pending_resume: &mut Vec<(usize, usize, Vec<PendingResumeFrame>)>,
-    ) -> Result<bool, Unsupported> {
+    ) -> Result<Option<NestedSplice>, Unsupported> {
         const MAX_INLINE_METHOD_REGS: u16 = 64;
         if usize::from(nested.param_count) != args2.len()
             || nested.register_count == 0
             || nested.register_count > MAX_INLINE_METHOD_REGS
             || nested.instructions.len() < 2
         {
-            return Ok(false);
+            return Ok(None);
         }
         let nested_resume = !Self::inline_cfg_gbm_ok(nested);
         let ncfg = match Cfg::discover(&nested.instructions) {
             Ok(c) => c,
-            Err(_) => return Ok(false),
+            Err(_) => return Ok(None),
         };
         // Forward DAG only (blocks in start-PC order, so a back edge is a
         // predecessor whose index is not strictly smaller).
         for (b, preds) in ncfg.preds.iter().enumerate() {
             if preds.iter().any(|&p| p as usize >= b) {
-                return Ok(false);
+                return Ok(None);
             }
         }
         let reachable = ncfg.reachable_from(0);
@@ -3970,13 +3976,13 @@ impl<'a> Builder<'a> {
         // Register window for the nested body, above the enclosing file.
         let nbase = self.current_def.len();
         if nbase + usize::from(nested.register_count) > usize::from(u16::MAX) {
-            return Ok(false);
+            return Ok(None);
         }
         let nbase = nbase as u16;
         let call_pc = s.call_pc;
 
-        // One caller-graph block per nested block (appended); the returns merge
-        // into the enclosing continuation, so no separate continuation is made.
+        // One caller-graph block per nested block, appended above the current
+        // graph blocks.
         let nblocks0 = self.graph.blocks.len();
         for &(start, _) in &ncfg.ranges {
             let pc = nested.instructions[start].byte_pc;
@@ -4051,9 +4057,7 @@ impl<'a> Builder<'a> {
             self.write_variable(noff(r), n_entry, node);
         }
 
-        // The enclosing method's own frame in the nested guards' resume chain:
-        // resumed just past this call, holding its live registers there (the call
-        // destination excluded — the nested return supplies it).
+        // The enclosing method's own frame in the nested guards' resume chain.
         let mut m_regs: Vec<(u16, NodeId)> = Vec::new();
         if let Some(live) = s.callee_live.get(&return_pc) {
             let mut rs: Vec<u16> = live.iter().copied().collect();
@@ -4081,26 +4085,60 @@ impl<'a> Builder<'a> {
             rustc_hash::FxHashMap::default()
         };
 
-        // The enclosing block enters the nested body; its returns merge into the
-        // enclosing continuation.
+        // The enclosing block enters the nested body and is now complete.
         self.set_term(g, Terminator::Jump(n_entry));
+        self.graph.blocks[g as usize].filled = true;
+        Ok(Some(NestedSplice {
+            ncfg,
+            reachable,
+            n_ancestors,
+            n_callee_live,
+            nbase,
+            nblocks0,
+            method_closure,
+            nested_resume,
+        }))
+    }
+
+    /// Recursively splice a *tail-position* nested method call: the callee's
+    /// result is immediately returned, so its blocks' returns feed the enclosing
+    /// method's own continuation with no mid-block split. Returns `Ok(true)` when
+    /// spliced, `Ok(false)` to roll the whole splice back.
+    #[allow(clippy::too_many_arguments)]
+    fn splice_nested_tail(
+        &mut self,
+        g: BlockId,
+        s: &MethodSplice,
+        nested: &JitInlineMethod,
+        recv2: NodeId,
+        args2: &[NodeId],
+        dst2: u16,
+        return_pc: u32,
+        returns: &mut Vec<NodeId>,
+        pending_resume: &mut Vec<(usize, usize, Vec<PendingResumeFrame>)>,
+    ) -> Result<bool, Unsupported> {
+        let Some(setup) = self.setup_nested_splice(g, s, nested, recv2, args2, dst2, return_pc)?
+        else {
+            return Ok(false);
+        };
         let n_splice = MethodSplice {
             method: nested,
-            ccfg: &ncfg,
-            reachable: &reachable,
-            callee_live: &n_callee_live,
-            base: nbase,
-            block_base: nblocks0 as BlockId,
+            ccfg: &setup.ncfg,
+            reachable: &setup.reachable,
+            callee_live: &setup.n_callee_live,
+            base: setup.nbase,
+            block_base: setup.nblocks0 as BlockId,
             cont: s.cont,
             recv: recv2,
-            method_closure,
-            resume_mode: nested_resume,
-            call_pc,
+            method_closure: setup.method_closure,
+            resume_mode: setup.nested_resume,
+            call_pc: s.call_pc,
             dst_reg: dst2,
-            ancestors: &n_ancestors,
+            ancestors: &setup.n_ancestors,
         };
         self.fill_spliced_blocks(&n_splice, returns, pending_resume)
     }
+
 
     /// Name the first structural reason a nested method cannot be spliced as a
     /// linear leaf, for the inline trace. Mirrors the eligibility gates in

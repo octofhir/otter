@@ -348,7 +348,8 @@ mod arm64 {
         jit_load_property_stub_optimizing, jit_load_string_stub,
         jit_new_array_stub,
         jit_number_to_string_fast_stub, jit_prepare_direct_call_stub, otter_jit_fmod,
-        jit_prepare_direct_method_call_stub, jit_resume_inline_callee_stub, jit_self_call_bail_stub,
+        jit_prepare_direct_method_call_stub, jit_resume_inline_callee_stack_stub,
+        jit_self_call_bail_stub,
         jit_store_global_stub_optimizing,
         jit_store_property_stub_optimizing,
         jit_string_char_code_at_guarded_leaf_stub, jit_string_char_code_at_leaf_stub, value_tag,
@@ -5197,68 +5198,102 @@ mod arm64 {
         //    scavenge inside the resumed callee traces and relocates them.
         emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
 
-        // Single-level inline resume: exactly one reconstructed callee frame. A
-        // nested (multi-level) splice is lowered by the multi-frame path.
-        if resume.frames.len() != 1 {
-            return Err(Unsupported::Unlowered("multi-frame inline resume"));
+        // The reconstructed inline stack: one frame per spliced level (`point`'s
+        // frame 0 is the still-compiled caller, materialized above). A single-
+        // level inline has one; a nested splice adds one per level.
+        let k = resume.frames.len();
+        if k == 0 || point.frames.len() != k + 1 {
+            return Err(Unsupported::Unlowered("inline resume frame count mismatch"));
         }
-        let frame0 = &resume.frames[0];
-        // 2. Stack buffer holding the callee register window (16-byte aligned):
-        //    every slot `undefined`, then the live registers boxed over it.
-        let count = u32::from(frame0.callee_register_count);
-        let buf_bytes = (count * 8).div_ceil(16) * 16;
-        if buf_bytes > 0 {
-            dynasm!(ops ; .arch aarch64 ; sub sp, sp, buf_bytes);
+
+        // 2. Native-stack scratch region: a `k`-entry descriptor array (six u64s
+        //    each — fid, pc, return-register, register-count, `this`, registers
+        //    pointer) followed by one register window per frame. Compute the byte
+        //    offsets up front so each descriptor can point at its own window.
+        const DESC_BYTES: u32 = 48; // six u64 fields
+        let desc_region = k as u32 * DESC_BYTES;
+        let mut buf_offs: Vec<u32> = Vec::with_capacity(k);
+        let mut cursor = desc_region;
+        for f in &resume.frames {
+            buf_offs.push(cursor);
+            cursor += u32::from(f.callee_register_count) * 8;
         }
-        for r in 0..count {
-            emit_load_u64(ops, box_scratch, VALUE_UNDEFINED);
-            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, r * 8]);
-        }
-        let callee = point
-            .frames
-            .get(1)
-            .ok_or(Unsupported::Unlowered("inline resume without callee frame"))?;
-        for &(regn, value) in &callee.registers {
-            let node = graph.node(value);
-            if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
-                let loc = require_loc(alloc, value)?;
-                box_into_gp(ops, box_scratch, node.repr, loc, MOVE_SCRATCH);
+        let total = cursor.div_ceil(16) * 16;
+        dynasm!(ops ; .arch aarch64 ; sub sp, sp, total);
+
+        for (j, f) in resume.frames.iter().enumerate() {
+            let frame = point
+                .frames
+                .get(j + 1)
+                .ok_or(Unsupported::Unlowered("inline resume without callee frame"))?;
+            let rc = u32::from(f.callee_register_count);
+            let boff = buf_offs[j];
+            // Fill the window with `undefined`, then box each live register over it.
+            for r in 0..rc {
+                emit_load_u64(ops, box_scratch, VALUE_UNDEFINED);
+                dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, boff + r * 8]);
             }
-            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, u32::from(regn) * 8]);
+            for &(regn, value) in &frame.registers {
+                let node = graph.node(value);
+                if !emit_rematerialized_boxed(ops, &node.kind, box_scratch, MOVE_SCRATCH) {
+                    let loc = require_loc(alloc, value)?;
+                    box_into_gp(ops, box_scratch, node.repr, loc, MOVE_SCRATCH);
+                }
+                dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, boff + u32::from(regn) * 8]);
+            }
+            // Descriptor. The outermost frame (`j == 0`) bubbles its return out of
+            // the dispatch loop, so its return-register is unused; an inner frame
+            // returns into its parent's register (`frame.return_reg`).
+            let doff = j as u32 * DESC_BYTES;
+            let ret = if j == 0 {
+                0
+            } else {
+                u64::from(frame.return_reg.ok_or(Unsupported::Unlowered(
+                    "inner inline resume frame without return register",
+                ))?)
+            };
+            emit_load_u64(ops, box_scratch, u64::from(f.callee_fid));
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff]);
+            emit_load_u64(ops, box_scratch, u64::from(f.callee_pc));
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 8]);
+            emit_load_u64(ops, box_scratch, ret);
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 16]);
+            emit_load_u64(ops, box_scratch, u64::from(rc));
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 24]);
+            // `this` for this frame.
+            let recv_node = graph.node(f.recv);
+            if !emit_rematerialized_boxed(ops, &recv_node.kind, box_scratch, MOVE_SCRATCH) {
+                let loc = require_loc(alloc, f.recv)?;
+                box_into_gp(ops, box_scratch, recv_node.repr, loc, MOVE_SCRATCH);
+            }
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 32]);
+            // Registers offset (bytes from the descriptor array base = `sp`); the
+            // stub resolves it to a pointer. Storing an offset avoids `add`-from-sp
+            // address arithmetic, which has no valid form with a dynamic register.
+            emit_load_u64(ops, box_scratch, u64::from(boff));
+            dynasm!(ops ; .arch aarch64 ; str X(box_scratch), [sp, doff + 40]);
         }
 
-        // 3. Box the receiver into x3 (the resumed callee's `this`).
-        let recv_node = graph.node(frame0.recv);
-        if !emit_rematerialized_boxed(ops, &recv_node.kind, 3, MOVE_SCRATCH) {
-            let loc = require_loc(alloc, frame0.recv)?;
-            box_into_gp(ops, 3, recv_node.repr, loc, MOVE_SCRATCH);
-        }
-
-        // 4. jit_resume_inline_callee_stub(ctx, fid, pc, recv, regs_ptr, count).
-        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-        emit_load_u64(ops, 1, u64::from(frame0.callee_fid));
-        emit_load_u64(ops, 2, u64::from(frame0.callee_pc));
-        dynasm!(ops ; .arch aarch64 ; mov x4, sp);
-        emit_load_u64(ops, 5, u64::from(count));
-        emit_load_u64(ops, 16, jit_resume_inline_callee_stub as *const () as u64);
-        dynasm!(ops ; .arch aarch64 ; blr x16);
-        if buf_bytes > 0 {
-            dynasm!(ops ; .arch aarch64 ; add sp, sp, buf_bytes);
-        }
+        // 3. jit_resume_inline_callee_stack_stub(ctx, descs_ptr = sp, frame_count).
+        dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; mov x1, sp);
+        emit_load_u64(ops, 2, k as u64);
+        emit_load_u64(ops, 16, jit_resume_inline_callee_stack_stub as *const () as u64);
+        dynasm!(ops ; .arch aarch64 ; blr x16 ; add sp, sp, total);
         // x0 = value, x1 = status (low 8 bits). Throw ⇒ the function throw path.
         dynasm!(ops ; .arch aarch64 ; and x1, x1, #0xff ; cmp x1, #2 ; b.eq =>threw);
 
-        // 5. Store the completion value into the inlined call's result location
+        // 4. Store the completion value into the inlined call's result location
         //    (the continuation's return-phi home), before the reload can clobber
         //    x0.
         let result_loc = require_loc(alloc, resume.result)?;
         store_loc(ops, result_loc, 0);
 
-        // 6. Reload the caller's live values from `[x19]` (relocated by the
-        //    scavenge). The result register is written above, so skip it.
-        emit_frame_reload(ops, graph, alloc, point, Some(frame0.dst_reg), box_scratch)?;
+        // 5. Reload the caller's live values from `[x19]` (relocated by the
+        //    scavenge). The result register (the outermost frame's destination in
+        //    the compiled caller) is written above, so skip it.
+        emit_frame_reload(ops, graph, alloc, point, Some(resume.frames[0].dst_reg), box_scratch)?;
 
-        // 7. Continue compiled execution in the continuation block.
+        // 6. Continue compiled execution in the continuation block.
         dynasm!(ops ; .arch aarch64 ; b =>block_labels[resume.cont as usize]);
         Ok(())
     }

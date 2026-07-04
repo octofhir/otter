@@ -722,6 +722,24 @@ pub struct ObjectLiteralProp {
 /// across a re-entrant call.
 pub type JitFrameStack = crate::holt_stack::HoltStack;
 
+/// One reconstructed interpreter frame in a nested inline-resume, decoded from
+/// the emitted deopt exit's stack buffer by the resume stub and handed to
+/// [`crate::Interpreter::jit_resume_inline_callee_stack`]. Frames are ordered
+/// outermost inlined method first; the top frame resumes at the failing guard.
+pub struct JitResumeFrame {
+    /// Function id this frame executes.
+    pub callee_fid: u32,
+    /// Byte-PC to resume this frame at.
+    pub callee_pc: u32,
+    /// Register in the parent frame that receives this frame's return value.
+    /// Ignored for the outermost frame (its result bubbles out to emitted code).
+    pub return_register: u16,
+    /// Value bound as this frame's `this`.
+    pub this: crate::Value,
+    /// Full register window (unwritten slots `undefined`, live slots boxed).
+    pub registers: Vec<crate::Value>,
+}
+
 /// Raw, type-erased pointers the VM hands the JIT so compiled code can re-enter
 /// the VM (recursive calls, closure allocation) through the safe bridge methods
 /// ([`crate::Interpreter::jit_runtime_call`],

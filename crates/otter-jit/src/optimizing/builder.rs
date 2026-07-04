@@ -3044,12 +3044,22 @@ impl<'a> Builder<'a> {
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
                             bail_cfg!();
                         };
-                        let checked = self.graph.add_node(
-                            NodeKind::CheckShape(obj, method.recv_shape),
-                            g,
-                            call_pc,
-                        );
-                        self.push_body(g, checked);
+                        // The receiver's shape is already proven by the entry
+                        // `CheckMethodIdentity` (which deopts unless `recv.shape ==
+                        // recv_shape`), and the entry dominates every spliced block,
+                        // so a load off the receiver needs no second shape guard.
+                        // A non-receiver object keeps its guard.
+                        let checked = if obj == recv {
+                            recv
+                        } else {
+                            let c = self.graph.add_node(
+                                NodeKind::CheckShape(obj, method.recv_shape),
+                                g,
+                                call_pc,
+                            );
+                            self.push_body(g, c);
+                            c
+                        };
                         let load =
                             self.graph
                                 .add_node(NodeKind::LoadSlot(checked, slot_byte), g, call_pc);

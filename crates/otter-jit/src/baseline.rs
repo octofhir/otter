@@ -1316,6 +1316,53 @@ pub(crate) extern "C" fn jit_call_method_stub_optimizing(
     )
 }
 
+/// Slow path for a guard inside a spliced *non-GBM* callee body: resume the
+/// callee frame mid-execution in the interpreter and return its completion
+/// value (the caller stays compiled — see
+/// [`Interpreter::jit_resume_inline_callee`]).
+///
+/// `regs_ptr` addresses `count` boxed callee-register `Value` bits the emitted
+/// deopt exit just wrote. Return status: `Ok` and `value_bits` carries the
+/// callee's result, or `Throw` with the error parked in `ctx`.
+pub(crate) extern "C" fn jit_resume_inline_callee_stub(
+    ctx: *mut JitCtx,
+    callee_fid: u64,
+    callee_pc: u64,
+    recv_bits: u64,
+    regs_ptr: *const u64,
+    count: u64,
+) -> RuntimeStubResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    let count = count as usize;
+    let mut registers: Vec<Value> = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: emitted code wrote `count` boxed register Values at `regs_ptr`.
+        registers.push(Value::from_bits(unsafe { *regs_ptr.add(i) }));
+    }
+    match vm.jit_resume_inline_callee(
+        context,
+        stack,
+        callee_fid as u32,
+        callee_pc as u32,
+        Value::from_bits(recv_bits),
+        &registers,
+    ) {
+        Ok(value) => RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits())),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            RuntimeStubResultPair::from_result(RuntimeStubResult {
+                status: RuntimeStubStatus::Throw,
+                value_bits: 0,
+                payload: 0,
+            })
+        }
+    }
+}
+
 /// Fast primitive `String.prototype.charCodeAt` bridge returning a value pair.
 ///
 /// Return status: `Ok` = hit and `value_bits` carries the result, `Throw` =

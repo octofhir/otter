@@ -3278,12 +3278,14 @@ impl Interpreter {
         callee_fid: u32,
         callee_pc: u32,
         this_value: Value,
-        registers: smallvec::SmallVec<[Value; 8]>,
+        registers: &[Value],
     ) -> Result<Value, VmError> {
         let function = context
             .exec_function(callee_fid)
             .ok_or(VmError::InvalidOperand)?;
         let upvalues: crate::frame_state::UpvalueSpine = Vec::new().into_boxed_slice();
+        let registers: smallvec::SmallVec<[Value; 8]> =
+            smallvec::SmallVec::from_slice(registers);
         let mut frame =
             Frame::with_exec_registers(function, None, upvalues, this_value, registers);
         frame.pc = callee_pc;

@@ -1438,7 +1438,7 @@ impl<'a> Builder<'a> {
                         // graph in instead, continuing the caller in the merge
                         // block the callee's returns feed.
                         if let Some((result, cont)) = self.try_inline_method_cfg(
-                            cfg_block, block, byte_pc, recv, &method, argc, &args,
+                            cfg_block, block, byte_pc, recv, &method, argc, &args, dst,
                         )? {
                             block = cont;
                             self.def_register(dst, block, result, byte_pc);
@@ -2883,30 +2883,68 @@ impl<'a> Builder<'a> {
         method: &JitInlineMethod,
         argc: usize,
         args: &[NodeId],
+        dst: u16,
     ) -> Result<Option<(NodeId, BlockId)>, Unsupported> {
         const MAX_INLINE_METHOD_REGS: u16 = 64;
         const MAX_INLINE_METHOD_INSTRS: usize = 64;
+        // CFG-splice inline tracing (`OTTER_JIT_TRACE=1`): one line per method
+        // inline attempt with its outcome and, on a decline, the reason. Keeps
+        // the inliner debuggable without recompiling ad-hoc probes.
+        macro_rules! trace_inline {
+            ($($arg:tt)*) => {
+                if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                    eprintln!(
+                        "[jit-trace] cfg-inline method_fid={} call_pc={}: {}",
+                        method.method_fid, call_pc, format_args!($($arg)*)
+                    );
+                }
+            };
+        }
         // Splice only at a real CFG block: the successor rewiring below reads
         // `self.cfg.succs[block]`, which a synthetic merge block (produced by an
         // earlier splice in this same bytecode block) does not have.
-        if block != cfg_block
-            || self.view.cage_base == 0
+        if block != cfg_block {
+            trace_inline!("decline: not a real CFG block (mid-block splice)");
+            return Ok(None);
+        }
+        if self.view.cage_base == 0
             || argc != usize::from(method.param_count)
             || method.register_count == 0
             || method.register_count > MAX_INLINE_METHOD_REGS
             || method.instructions.len() < 2
             || method.instructions.len() > MAX_INLINE_METHOD_INSTRS
-            || !method.instructions.iter().all(|i| {
-                Self::inline_cfg_op_is_pure(i.op) || Self::inline_cfg_op_is_mutation(i.op)
-            })
-            || !Self::inline_cfg_gbm_ok(method)
         {
+            trace_inline!(
+                "decline: shape gate (argc={argc}/params={}, regcount={}, instrs={})",
+                method.param_count,
+                method.register_count,
+                method.instructions.len()
+            );
+            return Ok(None);
+        }
+        if let Some(bad) = method
+            .instructions
+            .iter()
+            .find(|i| !(Self::inline_cfg_op_is_pure(i.op) || Self::inline_cfg_op_is_mutation(i.op)))
+        {
+            trace_inline!("decline: unsupported op {:?} (e.g. a nested call)", bad.op);
+            return Ok(None);
+        }
+        // A guards-before-mutations body deopts by re-running the call at
+        // `call_pc`. A body that guards after a mutation cannot re-run, but
+        // resumes the callee frame mid-execution instead (the caller stays
+        // compiled) — provided it reads no upvalue (the resumed frame is rebuilt
+        // with an empty spine).
+        let resume_mode = !Self::inline_cfg_gbm_ok(method);
+        if resume_mode && method.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
+            trace_inline!("decline: non-GBM body reads an upvalue (resume needs empty spine)");
             return Ok(None);
         }
         // The callee registers occupy `[base, base + register_count)` above the
         // caller's file; keep that window inside the `u16` register index space.
         let base = self.current_def.len();
         if base + usize::from(method.register_count) > usize::from(u16::MAX) {
+            trace_inline!("decline: register window overflow");
             return Ok(None);
         }
         let base = base as u16;
@@ -2936,7 +2974,11 @@ impl<'a> Builder<'a> {
         let cdef0 = self.current_def.len();
         let cont = blocks0 + ccfg.ranges.len();
         macro_rules! bail_cfg {
-            () => {{
+            () => {
+                bail_cfg!("unsupported op / operand during splice")
+            };
+            ($($arg:tt)*) => {{
+                trace_inline!("rollback: {}", format_args!($($arg)*));
                 self.graph.nodes.truncate(nodes0);
                 self.graph.blocks.truncate(blocks0);
                 self.current_def.truncate(cdef0);
@@ -3037,6 +3079,20 @@ impl<'a> Builder<'a> {
             None
         };
 
+        // In resume mode (a non-GBM body), a guard resumes the callee frame at
+        // its own PC while the caller stays compiled. Compute the callee's
+        // register liveness so each guard's frame state carries exactly the
+        // callee registers the interpreter reads on resume.
+        let callee_live = if resume_mode {
+            super::deopt::bytecode_liveness_instrs(&method.instructions)
+        } else {
+            rustc_hash::FxHashMap::default()
+        };
+        // `(node range, callee PC, callee live registers)` per resume-mode
+        // instruction; expanded into `graph.inline_resume` once `result`/`cont`
+        // are known below.
+        let mut pending_resume: Vec<(usize, usize, u32, Vec<(u16, NodeId)>)> = Vec::new();
+
         // Fill each callee block in topological (index) order. A block's
         // predecessors always have a lower index (forward DAG), so they are
         // already filled and sealed — the on-demand SSA reader resolves cross-
@@ -3052,6 +3108,25 @@ impl<'a> Builder<'a> {
             for instr in &method.instructions[start..end] {
                 let op = instr.op;
                 let operands = instr.operands.as_slice();
+                // Snapshot the callee frame (live registers at this PC) before the
+                // instruction's nodes are emitted, so a guard among them resumes
+                // the interpreter with the pre-instruction environment.
+                let resume_snapshot = if resume_mode {
+                    let mut regs: Vec<(u16, NodeId)> = Vec::new();
+                    if let Some(live) = callee_live.get(&instr.byte_pc) {
+                        let mut rs: Vec<u16> = live.iter().copied().collect();
+                        rs.sort_unstable();
+                        for r in rs {
+                            if (r as usize) < usize::from(method.register_count) {
+                                regs.push((r, self.read_variable(off(r), g)));
+                            }
+                        }
+                    }
+                    Some((instr.byte_pc, regs))
+                } else {
+                    None
+                };
+                let resume_node_start = self.graph.nodes.len();
                 match op {
                     Op::LoadThis => {
                         let dst = reg(operands, 0)?;
@@ -3140,7 +3215,7 @@ impl<'a> Builder<'a> {
                         let obj_reg = reg(operands, 1)?;
                         let obj = self.read_variable(off(obj_reg), g);
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
-                            bail_cfg!();
+                            bail_cfg!("no baked prop offset for load/store at callee pc {}", instr.byte_pc);
                         };
                         // A non-receiver access guards the monomorphic shape it
                         // observed. A receiver access is already proven by the
@@ -3186,10 +3261,10 @@ impl<'a> Builder<'a> {
                             self.graph.node(value).kind.repr(),
                             Repr::Int32 | Repr::Float64
                         ) {
-                            bail_cfg!();
+                            bail_cfg!("store value repr {:?} is not primitive (needs int32/f64)", self.graph.node(value).kind.repr());
                         }
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
-                            bail_cfg!();
+                            bail_cfg!("no baked prop offset for load/store at callee pc {}", instr.byte_pc);
                         };
                         let checked = if let Some(&shape) = method.prop_shapes.get(&instr.byte_pc) {
                             let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
@@ -3221,7 +3296,7 @@ impl<'a> Builder<'a> {
                             .arith_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
                         {
                             Ok(node) => node,
-                            Err(_) => bail_cfg!(),
+                            Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
                         };
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
@@ -3235,7 +3310,7 @@ impl<'a> Builder<'a> {
                             .bitwise_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
                         {
                             Ok(node) => node,
-                            Err(_) => bail_cfg!(),
+                            Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
                         };
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
@@ -3253,7 +3328,7 @@ impl<'a> Builder<'a> {
                         let node =
                             match self.arith_node_binop(g, Op::Add, src, step, instr.arith_feedback, call_pc) {
                                 Ok(node) => node,
-                                Err(_) => bail_cfg!(),
+                                Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
                             };
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
@@ -3282,7 +3357,7 @@ impl<'a> Builder<'a> {
                             call_pc,
                         ) {
                             Ok(node) => node,
-                            Err(_) => bail_cfg!(),
+                            Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
                         };
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
@@ -3336,7 +3411,10 @@ impl<'a> Builder<'a> {
                         self.graph.blocks[cont].preds.push(g);
                         self.set_term(g, Terminator::Jump(cont as BlockId));
                     }
-                    _ => bail_cfg!(),
+                    _ => bail_cfg!("unsupported inlined op {:?}", op),
+                }
+                if let Some((cpc, regs)) = resume_snapshot {
+                    pending_resume.push((resume_node_start, self.graph.nodes.len(), cpc, regs));
                 }
             }
             // A block whose last instruction was not a terminator falls through.
@@ -3372,6 +3450,34 @@ impl<'a> Builder<'a> {
         self.graph.phi_reg.remove(&phi);
         let result = self.try_remove_trivial_phi(phi);
         self.seal_block(cont as BlockId);
+
+        // Record each spliced guard's callee frame state (now that `result` and
+        // `cont` exist). A guard among these nodes deopts by resuming the callee
+        // frame mid-execution rather than re-running the call. `capture_frame_
+        // states` consults this only for nodes that can actually deopt.
+        trace_inline!(
+            "OK: spliced {} callee blocks, resume_mode={} ({} guard frame-states)",
+            reachable.len(),
+            resume_mode,
+            pending_resume.iter().map(|(s, e, _, _)| e - s).sum::<usize>()
+        );
+        for (start, end, callee_pc, registers) in pending_resume {
+            for nid in start..end {
+                self.graph.inline_resume.insert(
+                    nid as NodeId,
+                    super::ir::InlineResume {
+                        callee_fid: method.method_fid,
+                        callee_pc,
+                        recv,
+                        dst_reg: dst,
+                        result,
+                        cont: cont as BlockId,
+                        callee_register_count: method.register_count,
+                        registers: registers.clone(),
+                    },
+                );
+            }
+        }
 
         // A fresh continuation does not inherit the pre-call block's proven
         // receiver-shape guards (control reaches it from several return paths).

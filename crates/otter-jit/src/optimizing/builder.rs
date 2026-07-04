@@ -2747,7 +2747,10 @@ impl<'a> Builder<'a> {
     /// (identity-guarded, deopt-free) receiver is the only such op the splice
     /// emits; every other allowed op is a pure computation.
     fn inline_cfg_op_is_mutation(op: Op) -> bool {
-        matches!(op, Op::StoreProperty)
+        // A `CallMethodValue` is only admitted when its callee is a nested leaf
+        // that gets inlined (see `splice_nested_leaf`); that inlined body may
+        // store, so treat the call as a mutation for the GBM ordering check.
+        matches!(op, Op::StoreProperty | Op::CallMethodValue)
     }
 
     /// Whether an op can deoptimize when the splice lowers it (a shape/type/bool
@@ -3412,6 +3415,35 @@ impl<'a> Builder<'a> {
                         self.graph.blocks[cont].preds.push(g);
                         self.set_term(g, Terminator::Jump(cont as BlockId));
                     }
+                    Op::CallMethodValue => {
+                        // A nested method call is inlinable only when its callee is
+                        // a guards-before-mutations linear leaf (so a re-run deopt
+                        // never doubles its store); anything else declines the whole
+                        // splice, since keeping the call would need its receiver /
+                        // arguments in the safepoint frame state.
+                        let dst2 = reg(operands, 0)?;
+                        let recv_reg2 = reg(operands, 1)?;
+                        let argc2 = const_index(operands, 3)? as usize;
+                        let Some(nested) = method.nested_methods.get(&instr.byte_pc) else {
+                            bail_cfg!("nested call at pc {} has no baked inline leaf", instr.byte_pc);
+                        };
+                        if !Self::inline_cfg_gbm_ok(nested) {
+                            bail_cfg!("nested leaf at pc {} is not guards-before-mutations", instr.byte_pc);
+                        }
+                        let recv2 = self.read_variable(off(recv_reg2), g);
+                        let mut args2: Vec<NodeId> = Vec::with_capacity(argc2);
+                        for slot in 0..argc2 {
+                            args2.push(self.read_variable(off(reg(operands, 4 + slot)?), g));
+                        }
+                        let nested = nested.clone();
+                        match self.splice_nested_leaf(g, recv2, &nested, &args2, call_pc)? {
+                            Some(result) => self.write_variable(off(dst2), g, result),
+                            None => bail_cfg!(
+                                "nested leaf at pc {} not a linear inlinable body",
+                                instr.byte_pc
+                            ),
+                        }
+                    }
                     _ => bail_cfg!("unsupported inlined op {:?}", op),
                 }
                 if let Some((cpc, regs)) = resume_snapshot {
@@ -3484,6 +3516,325 @@ impl<'a> Builder<'a> {
         // receiver-shape guards (control reaches it from several return paths).
         self.checked_shapes.clear();
         Ok(Some((result, cont as BlockId)))
+    }
+
+    /// Inline a *linear leaf* method (a single-block, call-free, branch-free body)
+    /// at a nested `CallMethodValue` inside a spliced block. `recv2`/`args2` are the
+    /// nested call's receiver and arguments (SSA values in the enclosing splice's
+    /// register window); the leaf's body is replayed into `g` under a fresh
+    /// register base, guarded by its own method-identity check. Returns the leaf's
+    /// return value, or `Ok(None)` if it is not an inlinable linear leaf (the
+    /// caller then declines the whole splice — keeping the call is unsound because
+    /// its receiver/arguments are not in the safepoint frame state).
+    fn splice_nested_leaf(
+        &mut self,
+        g: BlockId,
+        recv2: NodeId,
+        nested: &JitInlineMethod,
+        args2: &[NodeId],
+        call_pc: u32,
+    ) -> Result<Option<NodeId>, Unsupported> {
+        const MAX_REGS: u16 = 64;
+        if usize::from(nested.param_count) != args2.len()
+            || nested.register_count == 0
+            || nested.register_count > MAX_REGS
+        {
+            return Ok(None);
+        }
+        // Linear (single basic block) and free of control flow / calls / element
+        // ops — those need the full CFG splice, not this straight-line replay.
+        let leaf_ok = nested.instructions.iter().all(|i| {
+            matches!(
+                i.op,
+                Op::LoadThis
+                    | Op::LoadInt32
+                    | Op::LoadNumber
+                    | Op::LoadTrue
+                    | Op::LoadFalse
+                    | Op::LoadUndefined
+                    | Op::LoadNull
+                    | Op::LoadHole
+                    | Op::LoadLocal
+                    | Op::StoreLocal
+                    | Op::LoadUpvalue
+                    | Op::ToPrimitive
+                    | Op::ToNumeric
+                    | Op::LoadProperty
+                    | Op::StoreProperty
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::BitwiseOr
+                    | Op::BitwiseAnd
+                    | Op::BitwiseXor
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::Ushr
+                    | Op::Increment
+                    | Op::Return
+                    | Op::ReturnValue
+                    | Op::ReturnUndefined
+            )
+        });
+        if !leaf_ok {
+            return Ok(None);
+        }
+        let base2 = self.current_def.len();
+        if base2 + usize::from(nested.register_count) > usize::from(u16::MAX) {
+            return Ok(None);
+        }
+        let base2 = base2 as u16;
+        self.current_def
+            .resize(base2 as usize + usize::from(nested.register_count), Default::default());
+        let off2 = |r: u16| -> u16 { base2 + r };
+
+        let ident = self.graph.add_node(
+            NodeKind::CheckMethodIdentity {
+                recv: recv2,
+                recv_shape: nested.recv_shape,
+                proto_shape: nested.proto_shape,
+                method_value_byte: nested.method_value_byte,
+                method_on_receiver: nested.method_on_receiver,
+                method_fid: nested.method_fid,
+            },
+            g,
+            call_pc,
+        );
+        self.push_body(g, ident);
+        let method_closure = if nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
+            let node = if nested.method_on_receiver {
+                let checked =
+                    self.graph
+                        .add_node(NodeKind::CheckShape(recv2, nested.recv_shape), g, call_pc);
+                self.push_body(g, checked);
+                self.graph
+                    .add_node(NodeKind::LoadSlot(checked, nested.method_value_byte), g, call_pc)
+            } else {
+                self.graph.add_node(
+                    NodeKind::LoadProtoSlot {
+                        recv: recv2,
+                        recv_shape: nested.recv_shape,
+                        proto_shape: nested.proto_shape,
+                        slot_byte: nested.method_value_byte,
+                    },
+                    g,
+                    call_pc,
+                )
+            };
+            self.push_body(g, node);
+            Some(node)
+        } else {
+            None
+        };
+        for r in 0..nested.register_count {
+            let node = if (r as usize) < args2.len() {
+                args2[r as usize]
+            } else {
+                let u = self.graph.add_node(NodeKind::ConstUndefined, g, call_pc);
+                self.push_body(g, u);
+                u
+            };
+            self.write_variable(off2(r), g, node);
+        }
+
+        let mut result: Option<NodeId> = None;
+        for instr in &nested.instructions {
+            let op = instr.op;
+            let operands = instr.operands.as_slice();
+            match op {
+                Op::LoadThis => {
+                    self.write_variable(off2(reg(operands, 0)?), g, recv2);
+                }
+                Op::LoadInt32 => {
+                    let dst = reg(operands, 0)?;
+                    let node =
+                        self.graph
+                            .add_node(NodeKind::ConstInt32(imm32(operands, 1)?), g, call_pc);
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::LoadNumber => {
+                    let dst = reg(operands, 0)?;
+                    let Some(value) = instr.load_number else {
+                        return Ok(None);
+                    };
+                    let node = self.graph.add_node(NodeKind::ConstF64(value), g, call_pc);
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::LoadTrue | Op::LoadFalse => {
+                    let dst = reg(operands, 0)?;
+                    let node = self.graph.add_node(
+                        NodeKind::ConstBool(matches!(op, Op::LoadTrue)),
+                        g,
+                        call_pc,
+                    );
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::LoadUndefined | Op::LoadNull | Op::LoadHole => {
+                    let dst = reg(operands, 0)?;
+                    let kind = match op {
+                        Op::LoadUndefined => NodeKind::ConstUndefined,
+                        Op::LoadNull => NodeKind::ConstNull,
+                        _ => NodeKind::LoadHole,
+                    };
+                    let node = self.graph.add_node(kind, g, call_pc);
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::LoadLocal | Op::StoreLocal => {
+                    let reg_operand = reg(operands, 0)?;
+                    let imm_operand = u16::try_from(imm32(operands, 1)?)
+                        .map_err(|_| Unsupported::OperandShape("inline local index"))?;
+                    let (src, dst) = if matches!(op, Op::LoadLocal) {
+                        (imm_operand, reg_operand)
+                    } else {
+                        (reg_operand, imm_operand)
+                    };
+                    let node = self.read_variable(off2(src), g);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::ToPrimitive | Op::ToNumeric => {
+                    let dst = reg(operands, 0)?;
+                    let node = self.read_variable(off2(reg(operands, 1)?), g);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::LoadUpvalue => {
+                    let dst = reg(operands, 0)?;
+                    let idx = imm32(operands, 1)?;
+                    let Some(closure) = method_closure else {
+                        return Ok(None);
+                    };
+                    if idx < 0 {
+                        return Ok(None);
+                    }
+                    let node = self.graph.add_node(
+                        NodeKind::InlineUpvalue {
+                            closure,
+                            index: idx as u32,
+                        },
+                        g,
+                        call_pc,
+                    );
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::LoadProperty => {
+                    let dst = reg(operands, 0)?;
+                    let obj = self.read_variable(off2(reg(operands, 1)?), g);
+                    let Some(&slot_byte) = nested.prop_offsets.get(&instr.byte_pc) else {
+                        return Ok(None);
+                    };
+                    let checked = if let Some(&shape) = nested.prop_shapes.get(&instr.byte_pc) {
+                        let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                        self.push_body(g, c);
+                        c
+                    } else if obj == recv2 {
+                        recv2
+                    } else {
+                        let c = self
+                            .graph
+                            .add_node(NodeKind::CheckShape(obj, nested.recv_shape), g, call_pc);
+                        self.push_body(g, c);
+                        c
+                    };
+                    let load =
+                        self.graph
+                            .add_node(NodeKind::LoadSlot(checked, slot_byte), g, call_pc);
+                    self.push_body(g, load);
+                    self.write_variable(off2(dst), g, load);
+                }
+                Op::StoreProperty => {
+                    let obj = self.read_variable(off2(reg(operands, 0)?), g);
+                    let value = self.read_variable(off2(reg(operands, 2)?), g);
+                    if !matches!(
+                        self.graph.node(value).kind.repr(),
+                        Repr::Int32 | Repr::Float64 | Repr::Tagged
+                    ) {
+                        return Ok(None);
+                    }
+                    let Some(&slot_byte) = nested.prop_offsets.get(&instr.byte_pc) else {
+                        return Ok(None);
+                    };
+                    let checked = if let Some(&shape) = nested.prop_shapes.get(&instr.byte_pc) {
+                        let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                        self.push_body(g, c);
+                        c
+                    } else if obj == recv2 {
+                        recv2
+                    } else {
+                        let c = self
+                            .graph
+                            .add_node(NodeKind::CheckShape(obj, nested.recv_shape), g, call_pc);
+                        self.push_body(g, c);
+                        c
+                    };
+                    let store =
+                        self.graph
+                            .add_node(NodeKind::StoreSlot(checked, slot_byte, value), g, call_pc);
+                    self.push_body(g, store);
+                }
+                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                    let dst = reg(operands, 0)?;
+                    let lhs = self.read_variable(off2(reg(operands, 1)?), g);
+                    let rhs = self.read_variable(off2(reg(operands, 2)?), g);
+                    let Ok(node) =
+                        self.arith_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
+                    else {
+                        return Ok(None);
+                    };
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr | Op::Ushr => {
+                    let dst = reg(operands, 0)?;
+                    let lhs = self.read_variable(off2(reg(operands, 1)?), g);
+                    let rhs = self.read_variable(off2(reg(operands, 2)?), g);
+                    let Ok(node) =
+                        self.bitwise_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
+                    else {
+                        return Ok(None);
+                    };
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::Increment => {
+                    let dst = reg(operands, 0)?;
+                    let src = self.read_variable(off2(reg(operands, 1)?), g);
+                    let delta = match operands.get(2) {
+                        Some(Operand::Imm32(v)) => *v,
+                        None => 1,
+                        _ => return Ok(None),
+                    };
+                    let step = self.graph.add_node(NodeKind::ConstInt32(delta), g, call_pc);
+                    self.push_body(g, step);
+                    let Ok(node) =
+                        self.arith_node_binop(g, Op::Add, src, step, instr.arith_feedback, call_pc)
+                    else {
+                        return Ok(None);
+                    };
+                    self.push_body(g, node);
+                    self.write_variable(off2(dst), g, node);
+                }
+                Op::Return | Op::ReturnValue => {
+                    result = Some(self.read_variable(off2(reg(operands, 0)?), g));
+                }
+                Op::ReturnUndefined => {
+                    let u = self.graph.add_node(NodeKind::ConstUndefined, g, call_pc);
+                    self.push_body(g, u);
+                    result = Some(u);
+                }
+                _ => return Ok(None),
+            }
+        }
+        // A body with no explicit return yields `undefined`.
+        Ok(Some(result.unwrap_or_else(|| {
+            let u = self.graph.add_node(NodeKind::ConstUndefined, g, call_pc);
+            self.push_body(g, u);
+            u
+        })))
     }
 
     /// Lower an `Add` / `Sub` / `Mul` / `Div` site to a typed arithmetic node,

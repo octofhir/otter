@@ -2763,6 +2763,7 @@ impl<'a> Builder<'a> {
         matches!(
             op,
             Op::LoadProperty
+                | Op::LoadElement
                 | Op::Add
                 | Op::Sub
                 | Op::Mul
@@ -2824,6 +2825,7 @@ impl<'a> Builder<'a> {
                 | Op::ToPrimitive
                 | Op::ToNumeric
                 | Op::LoadProperty
+                | Op::LoadElement
                 | Op::Add
                 | Op::Sub
                 | Op::Mul
@@ -3245,6 +3247,32 @@ impl<'a> Builder<'a> {
                         let load =
                             self.graph
                                 .add_node(NodeKind::LoadSlot(checked, slot_byte), g, call_pc);
+                        self.push_body(g, load);
+                        self.write_variable(off(dst), g, load);
+                    }
+                    Op::LoadElement => {
+                        // `LoadElement dst, recv, idx` — the same boxed / unboxed
+                        // element load the mainline lowers (deopts on a bounds or
+                        // kind miss). `recv`/`idx` are spliced offset registers.
+                        let dst = reg(operands, 0)?;
+                        let recv_el = self.read_variable(off(reg(operands, 1)?), g);
+                        let idx = match self.int32_index_operand(g, off(reg(operands, 2)?), call_pc)
+                        {
+                            Ok(idx) => idx,
+                            Err(_) => bail_cfg!("element index not int32-lowerable"),
+                        };
+                        let kind = match instr.element_load_kind {
+                            otter_vm::jit::JitElementLoadKind::Float64 => {
+                                NodeKind::LoadElementUnboxed(recv_el, idx, ElementLoadKind::Float64)
+                            }
+                            otter_vm::jit::JitElementLoadKind::Int32 => {
+                                NodeKind::LoadElementUnboxed(recv_el, idx, ElementLoadKind::Int32)
+                            }
+                            otter_vm::jit::JitElementLoadKind::Any => {
+                                NodeKind::LoadElement(recv_el, idx)
+                            }
+                        };
+                        let load = self.graph.add_node(kind, g, call_pc);
                         self.push_body(g, load);
                         self.write_variable(off(dst), g, load);
                     }

@@ -1316,41 +1316,54 @@ pub(crate) extern "C" fn jit_call_method_stub_optimizing(
     )
 }
 
-/// Slow path for a guard inside a spliced *non-GBM* callee body: resume the
-/// callee frame mid-execution in the interpreter and return its completion
-/// value (the caller stays compiled — see
-/// [`Interpreter::jit_resume_inline_callee`]).
+/// Slow path for a guard inside a *nested* (recursively spliced) callee body:
+/// resume the whole inline frame stack in the interpreter and return the
+/// outermost frame's completion value (the caller stays compiled — see
+/// [`Interpreter::jit_resume_inline_callee_stack`]).
 ///
-/// `regs_ptr` addresses `count` boxed callee-register `Value` bits the emitted
-/// deopt exit just wrote. Return status: `Ok` and `value_bits` carries the
-/// callee's result, or `Throw` with the error parked in `ctx`.
-pub(crate) extern "C" fn jit_resume_inline_callee_stub(
+/// `descs_ptr` addresses `frame_count` fixed 6-`u64` descriptors the emitted
+/// deopt exit just wrote — `[callee_fid, callee_pc, return_register, register_
+/// count, this_bits, registers_ptr]` per frame, outermost first. Return status:
+/// `Ok` and `value_bits` carries the result, or `Throw` with the error parked.
+pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
     ctx: *mut JitCtx,
-    callee_fid: u64,
-    callee_pc: u64,
-    recv_bits: u64,
-    regs_ptr: *const u64,
-    count: u64,
+    descs_ptr: *const u64,
+    frame_count: u64,
 ) -> RuntimeStubResultPair {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
-    let count = count as usize;
-    let mut registers: Vec<Value> = Vec::with_capacity(count);
-    for i in 0..count {
-        // SAFETY: emitted code wrote `count` boxed register Values at `regs_ptr`.
-        registers.push(Value::from_bits(unsafe { *regs_ptr.add(i) }));
+    let k = frame_count as usize;
+    let mut frames: Vec<otter_vm::jit::JitResumeFrame> = Vec::with_capacity(k);
+    for j in 0..k {
+        let base = j * 6;
+        // SAFETY: emitted code wrote `frame_count` 6-u64 descriptors at `descs_ptr`.
+        let fid = unsafe { *descs_ptr.add(base) } as u32;
+        let pc = unsafe { *descs_ptr.add(base + 1) } as u32;
+        let ret = unsafe { *descs_ptr.add(base + 2) } as u16;
+        let rc = unsafe { *descs_ptr.add(base + 3) } as usize;
+        let this_bits = unsafe { *descs_ptr.add(base + 4) };
+        // Field 5 is the register window's byte offset from the descriptor base.
+        let regs_off = unsafe { *descs_ptr.add(base + 5) } as usize;
+        // SAFETY: the emitted deopt exit placed the windows after the descriptor
+        // array in the same stack allocation `descs_ptr` addresses.
+        let regs_ptr = unsafe { (descs_ptr as *const u8).add(regs_off) as *const u64 };
+        let mut registers: Vec<Value> = Vec::with_capacity(rc);
+        for i in 0..rc {
+            // SAFETY: emitted code wrote `rc` boxed register Values at `regs_ptr`.
+            registers.push(Value::from_bits(unsafe { *regs_ptr.add(i) }));
+        }
+        frames.push(otter_vm::jit::JitResumeFrame {
+            callee_fid: fid,
+            callee_pc: pc,
+            return_register: ret,
+            this: Value::from_bits(this_bits),
+            registers,
+        });
     }
-    match vm.jit_resume_inline_callee(
-        context,
-        stack,
-        callee_fid as u32,
-        callee_pc as u32,
-        Value::from_bits(recv_bits),
-        &registers,
-    ) {
+    match vm.jit_resume_inline_callee_stack(context, stack, &frames) {
         Ok(value) => RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits())),
         Err(err) => {
             park_jit_error(ctx, err);

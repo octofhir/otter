@@ -3251,49 +3251,56 @@ impl Interpreter {
         self.dispatch_loop(context, stack)
     }
 
-    /// Resume an *inlined* method callee mid-execution in the interpreter.
+    /// Resume a *stack* of inlined callee frames after a guard inside a nested
+    /// (recursively spliced) callee body fails. The compiled caller stays live;
+    /// this rebuilds the whole inline chain in the interpreter — the outermost
+    /// inlined method at the bottom, the guard's method on top — and runs it to
+    /// completion. The outermost frame's completion bubbles out of the dispatch
+    /// loop (its `return_register` is `None`) and is returned to emitted code,
+    /// which stores it into the compiled call's destination; each inner frame's
+    /// `return_register` names the parent-frame register the interpreter writes
+    /// when that frame returns, so the chain unwinds exactly as a real call would.
     ///
-    /// When the optimizing tier splices a method body into its caller and a guard
-    /// inside that body fails, the caller stays compiled: only the callee frame
-    /// deoptimizes. The inlined body has already applied its side effects up to
-    /// the failing guard, so re-running the call from the start would double them.
-    /// Instead this materializes the callee's partial state as a fresh interpreter
-    /// [`Frame`] at the guard's byte-PC — `registers` are the callee's live
-    /// register values boxed at the guard, `this_value` its receiver — pushes it,
-    /// and runs it to completion. The returned value is the inlined call's result,
-    /// which the caller's compiled code stores into the call destination before
-    /// continuing.
-    ///
-    /// Restricted to callees with no captured upvalues (empty spine): a body that
-    /// reads an upvalue is not admitted for this deopt path, so the interpreter
-    /// never reads a missing cell.
-    ///
-    /// # Errors
-    /// Propagates any error the resumed callee raises, and `InvalidOperand` for an
-    /// unknown callee function id.
-    pub fn jit_resume_inline_callee(
+    /// `frames` is ordered outermost first. Every frame's `registers` slice is a
+    /// full register window (unwritten slots `undefined`) and its `pc` is the
+    /// byte-PC to resume at — the guard's PC for the top frame, the byte-PC just
+    /// past the nested call for each frame below it.
+    pub fn jit_resume_inline_callee_stack(
         &mut self,
         context: &ExecutionContext,
         stack: &mut jit::JitFrameStack,
-        callee_fid: u32,
-        callee_pc: u32,
-        this_value: Value,
-        registers: &[Value],
+        frames: &[jit::JitResumeFrame],
     ) -> Result<Value, VmError> {
-        if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-            eprintln!("[jit-trace] resume inlined callee fid={callee_fid} pc={callee_pc}");
+        // Build every frame before pushing any: an invalid function id then
+        // returns cleanly without leaving a half-pushed reentry on the stack.
+        let mut built: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
+        for (i, f) in frames.iter().enumerate() {
+            if std::env::var_os("OTTER_JIT_TRACE").is_some() {
+                eprintln!(
+                    "[jit-trace] resume inline stack frame {i}/{} fid={} pc={}",
+                    frames.len(),
+                    f.callee_fid,
+                    f.callee_pc
+                );
+            }
+            let function = context
+                .exec_function(f.callee_fid)
+                .ok_or(VmError::InvalidOperand)?;
+            let upvalues: crate::frame_state::UpvalueSpine = Vec::new().into_boxed_slice();
+            let registers: smallvec::SmallVec<[Value; 8]> =
+                smallvec::SmallVec::from_slice(&f.registers);
+            // The bottom (outermost inlined) frame bubbles its result out of the
+            // dispatch loop; every frame above it returns into its parent.
+            let return_register = if i == 0 { None } else { Some(f.return_register) };
+            let mut frame =
+                Frame::with_exec_registers(function, return_register, upvalues, f.this, registers);
+            frame.pc = f.callee_pc;
+            built.push(frame);
         }
-        let function = context
-            .exec_function(callee_fid)
-            .ok_or(VmError::InvalidOperand)?;
-        let upvalues: crate::frame_state::UpvalueSpine = Vec::new().into_boxed_slice();
-        let registers: smallvec::SmallVec<[Value; 8]> =
-            smallvec::SmallVec::from_slice(registers);
-        let mut frame =
-            Frame::with_exec_registers(function, None, upvalues, this_value, registers);
-        frame.pc = callee_pc;
         self.enter_sync_reentry()?;
-        stack.push(frame);
+        for frame in built {
+            stack.push(frame);
+        }
         let result = self.dispatch_loop(context, stack);
         self.leave_sync_reentry();
         result

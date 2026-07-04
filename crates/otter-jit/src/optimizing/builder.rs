@@ -2922,6 +2922,14 @@ impl<'a> Builder<'a> {
                 return Ok(None);
             }
         }
+        // Only splice blocks reachable from the callee entry. A method whose arms
+        // all return leaves an unreachable trailing block (its implicit
+        // `return undefined`); replaying it would give a spliced block with phis
+        // but no predecessors, whose garbage leaks into the continuation merge
+        // (harmless at a function entry, but under OSR its Param-seeded home
+        // corrupts the loop-carried and result phis). Skip it, exactly as the OSR
+        // builder skips its inactive blocks.
+        let reachable = ccfg.reachable_from(0);
 
         let nodes0 = self.graph.nodes.len();
         let blocks0 = self.graph.blocks.len();
@@ -2950,9 +2958,17 @@ impl<'a> Builder<'a> {
         let gblock = |cb: BlockId| -> BlockId { blocks0 as BlockId + cb };
 
         // Callee-block predecessors (offset), the entry fed by the caller block.
+        // An unreachable callee block is left empty (sealed + filled, no body) so
+        // no read reconstructs a phi for it and it never enters the RPO.
         for (cb, preds) in ccfg.preds.iter().enumerate() {
+            let g = gblock(cb as BlockId) as usize;
+            if !reachable.contains(&(cb as BlockId)) {
+                self.graph.blocks[g].sealed = true;
+                self.graph.blocks[g].filled = true;
+                continue;
+            }
             let mapped: Vec<BlockId> = preds.iter().map(|&p| gblock(p)).collect();
-            self.graph.blocks[gblock(cb as BlockId) as usize].preds = mapped;
+            self.graph.blocks[g].preds = mapped;
         }
         self.graph.blocks[gblock(0) as usize].preds = vec![block];
 
@@ -3027,6 +3043,9 @@ impl<'a> Builder<'a> {
         // block values into real phis with no incomplete-phi backlog.
         let mut returns: Vec<NodeId> = Vec::new();
         for cb in 0..ccfg.ranges.len() {
+            if !reachable.contains(&(cb as BlockId)) {
+                continue;
+            }
             let g = gblock(cb as BlockId);
             self.graph.blocks[g as usize].sealed = true;
             let (start, end) = ccfg.ranges[cb];

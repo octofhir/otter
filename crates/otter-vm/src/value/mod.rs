@@ -1913,6 +1913,30 @@ impl Value {
         }
     }
 
+    /// Diagnostic only (`OTTER_GC_VERIFY`): if this value is a heap cell, read
+    /// its target object header's `(size_bytes, type_tag)` so a caller can flag
+    /// implausible targets (size 0 / huge / tag 0 = a stale or moved-from
+    /// pointer). Returns `None` for immediates. Reads mapped memory only.
+    pub(crate) fn debug_gc_target_header(
+        &self,
+        _heap: &otter_gc::GcHeap,
+    ) -> Option<(u32, u8, bool)> {
+        if !is_cell_bits(self.0) {
+            return None;
+        }
+        let offset = (self.0 & 0xffff_ffff) as usize;
+        // SAFETY: an in-cage offset resolves to mapped cage memory; reading the
+        // header word is safe even if the object is stale.
+        unsafe {
+            let header = otter_gc::cage_base().add(offset) as *const otter_gc::GcHeader;
+            Some((
+                (*header).size_bytes(),
+                (*header).type_tag(),
+                (*header).is_forwarded(),
+            ))
+        }
+    }
+
     /// Visit this value as an explicitly mutable root slot.
     pub(crate) fn trace_value_slot_mut(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if is_cell_bits(self.0) {

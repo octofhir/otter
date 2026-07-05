@@ -278,6 +278,156 @@ fn apply_temporal_defaults(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DateTimeValueKind {
+    Epoch,
+    Instant,
+    PlainDate,
+    PlainDateTime,
+    PlainMonthDay,
+    PlainTime,
+    PlainYearMonth,
+    ZonedDateTime,
+}
+
+fn date_time_value_kind(value: &Value, heap: &otter_gc::GcHeap) -> DateTimeValueKind {
+    match value.as_temporal(heap).map(|t| t.payload_clone(heap)) {
+        Some(TemporalPayload::Instant(_)) => DateTimeValueKind::Instant,
+        Some(TemporalPayload::PlainDate(_)) => DateTimeValueKind::PlainDate,
+        Some(TemporalPayload::PlainDateTime(_)) => DateTimeValueKind::PlainDateTime,
+        Some(TemporalPayload::PlainMonthDay(_)) => DateTimeValueKind::PlainMonthDay,
+        Some(TemporalPayload::PlainTime(_)) => DateTimeValueKind::PlainTime,
+        Some(TemporalPayload::PlainYearMonth(_)) => DateTimeValueKind::PlainYearMonth,
+        Some(TemporalPayload::ZonedDateTime(_)) => DateTimeValueKind::ZonedDateTime,
+        Some(TemporalPayload::Duration(_)) | None => DateTimeValueKind::Epoch,
+    }
+}
+
+fn has_date_request(p: &DateTimeFormatPayload) -> bool {
+    p.weekday.is_some()
+        || p.era.is_some()
+        || p.year.is_some()
+        || p.month.is_some()
+        || p.day.is_some()
+        || p.date_style.is_some()
+}
+
+fn has_time_request(p: &DateTimeFormatPayload) -> bool {
+    p.day_period.is_some()
+        || p.hour.is_some()
+        || p.minute.is_some()
+        || p.second.is_some()
+        || p.fractional_second_digits.is_some()
+        || p.time_style.is_some()
+}
+
+fn clear_date_request(p: &mut DateTimeFormatPayload) {
+    p.weekday = None;
+    p.era = None;
+    p.year = None;
+    p.month = None;
+    p.day = None;
+    p.date_style = None;
+}
+
+fn clear_time_request(p: &mut DateTimeFormatPayload) {
+    p.day_period = None;
+    p.hour = None;
+    p.minute = None;
+    p.second = None;
+    p.fractional_second_digits = None;
+    p.time_style = None;
+}
+
+fn apply_temporal_field_intersection(
+    payload: &mut DateTimeFormatPayload,
+    value: &Value,
+    name: &'static str,
+    heap: &otter_gc::GcHeap,
+) -> Result<(), NativeError> {
+    let Some(kind) = value.as_temporal(heap).map(|t| t.payload_clone(heap)) else {
+        return Ok(());
+    };
+    match kind {
+        TemporalPayload::Duration(_) => Err(NativeError::TypeError {
+            name,
+            reason: "Temporal.Duration cannot be formatted as a date-time value".to_string(),
+        }),
+        TemporalPayload::Instant(_) | TemporalPayload::ZonedDateTime(_) => Ok(()),
+        TemporalPayload::PlainDateTime(_) => {
+            payload.time_zone_name = None;
+            Ok(())
+        }
+        TemporalPayload::PlainDate(_) => {
+            if !has_date_request(payload) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "no requested date-time fields are present on Temporal.PlainDate"
+                        .to_string(),
+                });
+            }
+            clear_time_request(payload);
+            payload.time_zone_name = None;
+            Ok(())
+        }
+        TemporalPayload::PlainTime(_) => {
+            if !has_time_request(payload) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "no requested date-time fields are present on Temporal.PlainTime"
+                        .to_string(),
+                });
+            }
+            clear_date_request(payload);
+            payload.time_zone_name = None;
+            Ok(())
+        }
+        TemporalPayload::PlainYearMonth(_) => {
+            if !(payload.year.is_some()
+                || payload.month.is_some()
+                || payload.era.is_some()
+                || payload.date_style.is_some())
+            {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "no requested date-time fields are present on Temporal.PlainYearMonth"
+                        .to_string(),
+                });
+            }
+            payload.weekday = None;
+            payload.day = None;
+            payload.date_style = None;
+            clear_time_request(payload);
+            payload.time_zone_name = None;
+            if payload.year.is_none() && payload.month.is_none() {
+                payload.year = Some(DtNumWidth::Numeric);
+                payload.month = Some(DtMonthWidth::Numeric);
+            }
+            Ok(())
+        }
+        TemporalPayload::PlainMonthDay(_) => {
+            if !(payload.month.is_some() || payload.day.is_some() || payload.date_style.is_some()) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "no requested date-time fields are present on Temporal.PlainMonthDay"
+                        .to_string(),
+                });
+            }
+            payload.weekday = None;
+            payload.era = None;
+            payload.year = None;
+            payload.date_style = None;
+            clear_time_request(payload);
+            payload.time_zone_name = None;
+            if payload.month.is_none() && payload.day.is_none() {
+                payload.month = Some(DtMonthWidth::Numeric);
+                payload.day = Some(DtNumWidth::Numeric);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// §11.1.2 `CreateDateTimeFormat` — spec-faithful construction firing
 /// every option getter in the observation order pinned by
 /// `constructor-options-order`, with ToString / ToNumber / ToBoolean
@@ -504,6 +654,7 @@ fn bound_format_call(
     };
     if let Some(arg) = args.first() {
         apply_temporal_defaults(&mut payload, arg, ctx.heap());
+        apply_temporal_field_intersection(&mut payload, arg, "format", ctx.heap())?;
     }
     let civil = arg_to_civil(ctx, args.first(), "format", &payload)?;
     let formatted = format_components(civil, &payload);
@@ -596,6 +747,7 @@ pub(crate) fn temporal_to_locale_string(
     // normalizes the auto-filled date default to the receiver's own
     // component set, so the check sees only user-specified mismatches.
     apply_temporal_defaults(&mut payload, &receiver, ctx.heap());
+    apply_temporal_field_intersection(&mut payload, &receiver, "toLocaleString", ctx.heap())?;
     // §the per-type `toLocaleString` operations reject a resolved option
     // the receiver's fields cannot represent (e.g. a `dateStyle` on a
     // PlainTime, a `timeStyle` on a PlainDate) with a TypeError.
@@ -756,6 +908,7 @@ pub(crate) fn date_time_format_format_to_parts(
     let mut payload = require_date_time(ctx, "formatToParts")?;
     if let Some(arg) = args.first() {
         apply_temporal_defaults(&mut payload, arg, ctx.heap());
+        apply_temporal_field_intersection(&mut payload, arg, "formatToParts", ctx.heap())?;
     }
     let civil = arg_to_civil(ctx, args.first(), "formatToParts", &payload)?;
     let parts = icu_format_segments(civil, &payload)
@@ -806,6 +959,31 @@ fn range_civil(
     Ok((start, end))
 }
 
+fn range_payload(
+    payload: &DateTimeFormatPayload,
+    args: &[Value],
+    heap: &otter_gc::GcHeap,
+    name: &'static str,
+) -> Result<DateTimeFormatPayload, NativeError> {
+    let Some(start) = args.first() else {
+        return Ok(payload.clone());
+    };
+    let Some(end) = args.get(1) else {
+        return Ok(payload.clone());
+    };
+    let start_kind = date_time_value_kind(start, heap);
+    let end_kind = date_time_value_kind(end, heap);
+    if start_kind != end_kind {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "startDate and endDate must be the same date-time value type".to_string(),
+        });
+    }
+    let mut filtered = payload.clone();
+    apply_temporal_field_intersection(&mut filtered, start, name, heap)?;
+    Ok(filtered)
+}
+
 /// §12.4.4 `Intl.DateTimeFormat.prototype.formatRange(startDate, endDate)`.
 ///
 /// ICU4X exposes no interval formatter, so we render each endpoint and
@@ -818,6 +996,7 @@ pub(crate) fn date_time_format_format_range(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRange")?;
+    let payload = range_payload(&payload, args, ctx.heap(), "formatRange")?;
     let (s, e) = range_civil(ctx, args, "formatRange", &payload)?;
     let start_str = format_components(s, &payload);
     let end_str = format_components(e, &payload);
@@ -844,6 +1023,7 @@ pub(crate) fn date_time_format_format_range_to_parts(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRangeToParts")?;
+    let payload = range_payload(&payload, args, ctx.heap(), "formatRangeToParts")?;
     let (s, e) = range_civil(ctx, args, "formatRangeToParts", &payload)?;
     let start_parts = icu_format_segments(s, &payload)
         .unwrap_or_else(|| vec![("literal", format_components(s, &payload))]);
@@ -989,7 +1169,9 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     use icu_datetime::{DateTimeFormatter, fieldsets::builder::FieldSetBuilder};
 
     if time_only_without_hour(payload) {
-        return Some(format_time_only_without_hour(civil, payload));
+        let mut formatted = format_time_only_without_hour(civil, payload);
+        append_time_zone_text(&mut formatted, payload);
+        return Some(formatted);
     }
 
     let locale: icu_locale::Locale = payload.locale.parse().ok()?;
@@ -1000,14 +1182,13 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     builder.date_fields = payload_date_fields(payload);
     builder.time_precision = payload_time_precision(payload);
     builder.year_style = payload_year_style(payload);
-    if builder.date_fields.is_none()
-        && builder.time_precision.is_some()
-        && payload.time_zone_name.is_none()
-    {
+    if builder.date_fields.is_none() && builder.time_precision.is_some() {
         let fieldset = builder.build_time().ok()?;
         let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
         let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
-        return Some(formatter.format(&time).to_string());
+        let mut formatted = formatter.format(&time).to_string();
+        append_time_zone_text(&mut formatted, payload);
+        return Some(formatted);
     }
     // Date + time without a zone — input is a plain `DateTime`, no
     // `TimeZoneInfo` required (zone formatting lands with the timeZone
@@ -1018,7 +1199,9 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         date: Date::try_new_iso(civil.year, civil.month, civil.day).ok()?,
         time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?,
     };
-    Some(formatter.format(&dt).to_string())
+    let mut formatted = formatter.format(&dt).to_string();
+    append_time_zone_text(&mut formatted, payload);
+    Some(formatted)
 }
 
 /// A `writeable::PartsWrite` sink recording `(ECMA-402 part type, text)`
@@ -1097,7 +1280,9 @@ fn icu_format_segments(
     use writeable::Writeable;
 
     if time_only_without_hour(payload) {
-        return Some(format_time_only_without_hour_parts(civil, payload));
+        let mut parts = format_time_only_without_hour_parts(civil, payload);
+        append_time_zone_part(&mut parts, payload);
+        return Some(parts);
     }
 
     let locale: icu_locale::Locale = payload.locale.parse().ok()?;
@@ -1107,10 +1292,7 @@ fn icu_format_segments(
     builder.date_fields = payload_date_fields(payload);
     builder.time_precision = payload_time_precision(payload);
     builder.year_style = payload_year_style(payload);
-    if builder.date_fields.is_none()
-        && builder.time_precision.is_some()
-        && payload.time_zone_name.is_none()
-    {
+    if builder.date_fields.is_none() && builder.time_precision.is_some() {
         let fieldset = builder.build_time().ok()?;
         let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
         let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
@@ -1119,6 +1301,7 @@ fn icu_format_segments(
             current: "literal",
         };
         formatter.format(&time).write_to_parts(&mut sink).ok()?;
+        append_time_zone_part(&mut sink.segments, payload);
         return Some(sink.segments);
     }
     let fieldset = builder.build_composite_datetime().ok()?;
@@ -1132,7 +1315,37 @@ fn icu_format_segments(
         current: "literal",
     };
     formatter.format(&dt).write_to_parts(&mut sink).ok()?;
+    append_time_zone_part(&mut sink.segments, payload);
     Some(sink.segments)
+}
+
+fn time_zone_display_name(payload: &DateTimeFormatPayload) -> Option<String> {
+    payload.time_zone_name?;
+    let zone = payload.time_zone.as_deref().unwrap_or("UTC");
+    Some(match zone {
+        "UTC" | "Etc/UTC" | "Etc/GMT" => "UTC".to_string(),
+        other => other.to_string(),
+    })
+}
+
+fn append_time_zone_text(formatted: &mut String, payload: &DateTimeFormatPayload) {
+    let Some(zone) = time_zone_display_name(payload) else {
+        return;
+    };
+    if !formatted.is_empty() {
+        formatted.push_str(", ");
+    }
+    formatted.push_str(&zone);
+}
+
+fn append_time_zone_part(parts: &mut Vec<(&'static str, String)>, payload: &DateTimeFormatPayload) {
+    let Some(zone) = time_zone_display_name(payload) else {
+        return;
+    };
+    if !parts.is_empty() {
+        parts.push(("literal", ", ".to_string()));
+    }
+    parts.push(("timeZoneName", zone));
 }
 
 /// Overall ICU [`Length`] from the option bag (ECMA-402 has no concept;
@@ -1246,7 +1459,6 @@ fn time_only_without_hour(p: &DateTimeFormatPayload) -> bool {
         && p.day.is_none()
         && p.date_style.is_none()
         && p.time_style.is_none()
-        && p.time_zone_name.is_none()
         && p.hour.is_none()
         && (p.minute.is_some() || p.second.is_some() || p.fractional_second_digits.is_some())
 }
@@ -1346,12 +1558,14 @@ fn format_components(civil: Civil, payload: &DateTimeFormatPayload) -> String {
         }
         time_part.push_str(&fractional_second_digits(civil, digits));
     }
-    match (date_part.is_empty(), time_part.is_empty()) {
+    let mut formatted = match (date_part.is_empty(), time_part.is_empty()) {
         (false, false) => format!("{date_part}, {time_part}"),
         (false, true) => date_part,
         (true, false) => time_part,
         (true, true) => String::new(),
-    }
+    };
+    append_time_zone_text(&mut formatted, payload);
+    formatted
 }
 
 fn subsecond_nanos(millisecond: u16, microsecond: u16, nanosecond: u16) -> u32 {

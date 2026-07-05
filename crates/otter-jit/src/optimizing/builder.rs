@@ -83,34 +83,12 @@ pub(super) fn build(view: &JitFunctionView, osr_pc: Option<u32>) -> Result<Graph
 /// sealed `LoadSlot`s at baked offsets), not a runtime stub. Gating on it would
 /// reject exactly the fully-inlined method bodies this tier exists to optimize.
 fn reject_call_object_mix(graph: &Graph) -> Result<(), Unsupported> {
-    // A polymorphic method inline replaces the `CallMethod` bridge with an inline
-    // dispatch chain, so it no longer trips the call-plus-mem-op reject below. But
-    // when the enclosing loop also indexes an array, the optimizing tier's element
-    // access bridges through the materialize-frame stub and the whole loop runs
-    // slower than the baseline's tuned IC sequence — the same cost model that
-    // motivates the reject. Keep such bodies on the baseline until the optimizing
-    // tier's element access is competitive; a poly dispatch over object fields
-    // (no array op) still compiles.
-    let has_poly_method_inline = graph
-        .nodes
-        .iter()
-        .any(|node| matches!(node.kind, NodeKind::MethodIdentityMatches { .. }));
-    if has_poly_method_inline {
-        let has_array_op = graph.nodes.iter().any(|node| {
-            matches!(
-                node.kind,
-                NodeKind::LoadElement(_, _)
-                    | NodeKind::LoadElementUnboxed(_, _, _)
-                    | NodeKind::StoreElement(_, _, _)
-                    | NodeKind::LoadArrayLength(_)
-            )
-        });
-        if has_array_op {
-            return Err(Unsupported::Unlowered(
-                "polymorphic method inline plus array access",
-            ));
-        }
-    }
+    // A polymorphic method inline (an inline dispatch chain, not a bridge) that
+    // also indexes an array once bridged its element access through the
+    // materialize-frame stub and lost to the baseline's tuned IC sequence. The
+    // optimizing tier's element access is now competitive (an unboxed slot load),
+    // so such bodies — the common "iterate an array of sibling objects, call a
+    // shared method" loop — compile here and win; they no longer reject.
     let has_plain_call = graph
         .nodes
         .iter()

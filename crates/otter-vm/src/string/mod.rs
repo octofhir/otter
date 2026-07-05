@@ -375,6 +375,16 @@ impl JsString {
         gc_body::to_utf16_vec(heap, self.handle)
     }
 
+    /// Run `f` over a borrow of the string's widened UTF-16 code units,
+    /// materialising them at most once onto the body (see
+    /// [`gc_body::with_utf16`]). Use instead of [`Self::to_utf16_vec`] on
+    /// hot paths that re-scan the same large subject repeatedly and only
+    /// need a transient view — `f` must not allocate on the heap while
+    /// holding the borrow.
+    pub fn with_utf16<R>(self, heap: &GcHeap, f: impl FnOnce(&[u16]) -> R) -> R {
+        gc_body::with_utf16(heap, self.handle, f)
+    }
+
     /// Render as a lossy Rust `String` for display / diagnostics.
     /// Lone surrogates round-trip via `String::from_utf16_lossy`.
     #[must_use]

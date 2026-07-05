@@ -69,8 +69,7 @@ pub(crate) fn exec_once_native(
     ctx: &mut NativeCtx<'_>,
     slice_roots: &[&[Value]],
 ) -> Result<Value, NativeError> {
-    let units = text.to_utf16_vec(ctx.heap());
-    let len = units.len();
+    let len = text.len() as usize;
     // §22.2.7.2 step 3 — `lastIndex = ? ToLength(? Get(R, "lastIndex"))`.
     // The read is observable (a user `lastIndex` getter fires) even
     // when the regex is neither global nor sticky.
@@ -95,7 +94,11 @@ pub(crate) fn exec_once_native(
         )?;
         return Ok(Value::null());
     }
-    let m = re.find_one_from_utf16(ctx.heap(), &units, start);
+    // Match over a borrow of the subject's cached UTF-16 units — no
+    // per-`exec` re-materialisation of the whole subject. The matcher does
+    // not allocate on the heap, so borrowing across it is sound.
+    let heap = ctx.heap();
+    let m = text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
     let m = match m {
         Some(m) => m,
         None => {
@@ -133,7 +136,6 @@ pub(crate) fn exec_once_native(
 
     Ok(Value::array(build_match_result_native(
         &m,
-        &units,
         text,
         flags.has_indices,
         ctx,
@@ -147,22 +149,34 @@ pub(crate) fn exec_once_native(
 /// reused by `String.prototype.match` / `.matchAll` so both surfaces
 /// produce identical shapes (full match + capture slots, plus
 /// `index` / `input` / `groups` / optionally `indices`).
+/// Slice `range` out of the subject's cached UTF-16 units and allocate the
+/// substring. Copies the (small) range out under a shared borrow before the
+/// allocation, so the widened subject buffer is never held live across a
+/// heap mutation that could move it.
+fn slice_subject_string(
+    input: JsString,
+    range: std::ops::Range<usize>,
+    ctx: &mut NativeCtx<'_>,
+) -> Result<JsString, NativeError> {
+    let units = input.with_utf16(ctx.heap(), |u| u[range].to_vec());
+    Ok(JsString::from_utf16_units(&units, ctx.heap_mut())?)
+}
+
 pub(crate) fn build_match_result_native(
     m: &crate::regexp::engine::Match,
-    units: &[u16],
     input: JsString,
     has_indices: bool,
     ctx: &mut NativeCtx<'_>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<JsArray, NativeError> {
-    let full = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap_mut())?;
+    let full = slice_subject_string(input, m.range.clone(), ctx)?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
     out.push(Value::string(full));
     for cap in &m.captures {
         match cap {
             Some(r) => {
-                let s = JsString::from_utf16_units(&units[r.clone()], ctx.heap_mut())?;
+                let s = slice_subject_string(input, r.clone(), ctx)?;
                 out.push(Value::string(s));
             }
             None => out.push(Value::undefined()),
@@ -192,14 +206,14 @@ pub(crate) fn build_match_result_native(
         let groups_obj = ctx.alloc_object_with_roots(&roots, &slices)?;
         crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
-            Some(r) => Value::string(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
+            Some(r) => Value::string(slice_subject_string(input, r, ctx)?),
             None => Value::undefined(),
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
             .map_err(vm_shape_error_to_native)?;
         for (name, range) in named_iter {
             let value = match range {
-                Some(r) => Value::string(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
+                Some(r) => Value::string(slice_subject_string(input, r, ctx)?),
                 None => Value::undefined(),
             };
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)

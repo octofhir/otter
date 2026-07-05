@@ -452,6 +452,12 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
+        // The method-resolution IC and the fast array/collection probes above can
+        // install a cache stub (allocating); a young-gen scavenge then relocates
+        // the receiver, so the `recv_value` cached at entry is a moved-from handle
+        // for every resolution branch below. Re-read the live handle from its
+        // register once, here, before any of them run.
+        let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
@@ -1002,6 +1008,12 @@ impl Interpreter {
             );
         }
 
+        // Re-read the receiver from its register before the full `[[Get]]`
+        // resolution: an earlier probe on this path (method-resolution IC stub
+        // install, fast array/collection dispatch) can allocate and a young-gen
+        // scavenge then relocates the receiver, leaving the cached `recv_value`
+        // pointing at a moved-from object whose prototype walk misses the method.
+        let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         if let Some(method) = self.get_method_value_for_call(context, stack, recv_value, name)? {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);

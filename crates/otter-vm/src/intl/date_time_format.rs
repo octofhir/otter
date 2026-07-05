@@ -22,6 +22,39 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "DateTimeFormat";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Civil {
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    nanosecond: u32,
+}
+
+impl Civil {
+    fn new(
+        year: i32,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+        nanosecond: u32,
+    ) -> Self {
+        Self {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            nanosecond,
+        }
+    }
+}
+
 fn parse_text_width(s: &str) -> Option<DtTextWidth> {
     match s {
         "narrow" => Some(DtTextWidth::Narrow),
@@ -472,8 +505,8 @@ fn bound_format_call(
     if let Some(arg) = args.first() {
         apply_temporal_defaults(&mut payload, arg, ctx.heap());
     }
-    let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "format")?;
-    let formatted = format_components(y, mo, d, h, mi, s, &payload);
+    let civil = arg_to_civil(ctx, args.first(), "format", &payload)?;
+    let formatted = format_components(civil, &payload);
     Ok(Value::string(JsString::from_str(
         &formatted,
         ctx.heap_mut(),
@@ -567,8 +600,8 @@ pub(crate) fn temporal_to_locale_string(
     // the receiver's fields cannot represent (e.g. a `dateStyle` on a
     // PlainTime, a `timeStyle` on a PlainDate) with a TypeError.
     validate_temporal_options(&payload, &receiver, ctx.heap())?;
-    let (y, mo, d, h, mi, s) = arg_to_civil_zoned(ctx, Some(&receiver), "toLocaleString")?;
-    let formatted = format_components(y, mo, d, h, mi, s, &payload);
+    let civil = arg_to_civil_zoned(ctx, Some(&receiver), "toLocaleString", &payload)?;
+    let formatted = format_components(civil, &payload);
     Ok(Value::string(JsString::from_str(
         &formatted,
         ctx.heap_mut(),
@@ -614,8 +647,9 @@ fn arg_to_civil(
     ctx: &mut NativeCtx<'_>,
     first: Option<&Value>,
     name: &'static str,
-) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
-    arg_to_civil_inner(ctx, first, name, false)
+    payload: &DateTimeFormatPayload,
+) -> Result<Civil, NativeError> {
+    arg_to_civil_inner(ctx, first, name, false, payload)
 }
 
 /// `arg_to_civil` variant used by the `Temporal.*.prototype.toLocaleString`
@@ -625,8 +659,9 @@ fn arg_to_civil_zoned(
     ctx: &mut NativeCtx<'_>,
     first: Option<&Value>,
     name: &'static str,
-) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
-    arg_to_civil_inner(ctx, first, name, true)
+    payload: &DateTimeFormatPayload,
+) -> Result<Civil, NativeError> {
+    arg_to_civil_inner(ctx, first, name, true, payload)
 }
 
 fn arg_to_civil_inner(
@@ -634,18 +669,20 @@ fn arg_to_civil_inner(
     first: Option<&Value>,
     name: &'static str,
     allow_zoned: bool,
-) -> Result<(i32, u8, u8, u8, u8, u8), NativeError> {
+    payload: &DateTimeFormatPayload,
+) -> Result<Civil, NativeError> {
     if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
         match t.payload_clone(ctx.heap()) {
-            TemporalPayload::PlainDateTime(pdt) => Ok((
+            TemporalPayload::PlainDateTime(pdt) => Ok(Civil::new(
                 pdt.year(),
                 pdt.month(),
                 pdt.day(),
                 pdt.hour(),
                 pdt.minute(),
                 pdt.second(),
+                subsecond_nanos(pdt.millisecond(), pdt.microsecond(), pdt.nanosecond()),
             )),
-            TemporalPayload::PlainDate(pd) => Ok((pd.year(), pd.month(), pd.day(), 0, 0, 0)),
+            TemporalPayload::PlainDate(pd) => Ok(Civil::new(pd.year(), pd.month(), pd.day(), 0, 0, 0, 0)),
             // §FormatDateTime rejects a ZonedDateTime through
             // `DateTimeFormat.prototype.format` (the formatter cannot
             // reconcile its own time zone with the value's); only the
@@ -655,18 +692,27 @@ fn arg_to_civil_inner(
                 name,
                 reason: "Temporal.ZonedDateTime is not supported by DateTimeFormat; use its toLocaleString".to_string(),
             }),
-            TemporalPayload::ZonedDateTime(zdt) => Ok((
+            TemporalPayload::ZonedDateTime(zdt) => Ok(Civil::new(
                 zdt.year(),
                 zdt.month(),
                 zdt.day(),
                 zdt.hour(),
                 zdt.minute(),
                 zdt.second(),
+                subsecond_nanos(zdt.millisecond(), zdt.microsecond(), zdt.nanosecond()),
             )),
             // PlainTime carries no date; render against the Unix-epoch
             // reference date the same way `DateTimeFormat.format` does.
-            TemporalPayload::PlainTime(pt) => Ok((1970, 1, 1, pt.hour(), pt.minute(), pt.second())),
-            TemporalPayload::PlainYearMonth(pym) => Ok((pym.year(), pym.month(), 1, 0, 0, 0)),
+            TemporalPayload::PlainTime(pt) => Ok(Civil::new(
+                1970,
+                1,
+                1,
+                pt.hour(),
+                pt.minute(),
+                pt.second(),
+                subsecond_nanos(pt.millisecond(), pt.microsecond(), pt.nanosecond()),
+            )),
+            TemporalPayload::PlainYearMonth(pym) => Ok(Civil::new(pym.year(), pym.month(), 1, 0, 0, 0, 0)),
             TemporalPayload::PlainMonthDay(pmd) => {
                 // MonthCode is `M01`..`M12`; the ISO reference year 1972
                 // is the standard anchor for a bare month/day.
@@ -677,10 +723,10 @@ fn arg_to_civil_inner(
                     .trim_end_matches('L')
                     .parse::<u8>()
                     .unwrap_or(1);
-                Ok((1972, month, pmd.day(), 0, 0, 0))
+                Ok(Civil::new(1972, month, pmd.day(), 0, 0, 0, 0))
             }
             TemporalPayload::Instant(inst) => {
-                Ok(epoch_to_civil(inst.epoch_milliseconds().div_euclid(1000)))
+                Ok(epoch_millis_to_civil_for_payload(inst.epoch_milliseconds(), payload))
             }
             TemporalPayload::Duration(_) => Err(NativeError::TypeError {
                 name,
@@ -690,13 +736,13 @@ fn arg_to_civil_inner(
     } else if let Some(value) = first.filter(|v| !v.is_undefined()) {
         let ms = coerce_to_number(ctx, value, name)?;
         let ms = time_clip(ms, name)?;
-        Ok(epoch_to_civil((ms as i64).div_euclid(1000)))
+        Ok(epoch_millis_to_civil_for_payload(ms as i64, payload))
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        Ok(epoch_to_civil(now.div_euclid(1000)))
+        Ok(epoch_millis_to_civil_for_payload(now, payload))
     }
 }
 
@@ -711,9 +757,9 @@ pub(crate) fn date_time_format_format_to_parts(
     if let Some(arg) = args.first() {
         apply_temporal_defaults(&mut payload, arg, ctx.heap());
     }
-    let (y, mo, d, h, mi, s) = arg_to_civil(ctx, args.first(), "formatToParts")?;
-    let parts = icu_format_segments(y, mo, d, h, mi, s, &payload)
-        .unwrap_or_else(|| vec![("literal", format_components(y, mo, d, h, mi, s, &payload))]);
+    let civil = arg_to_civil(ctx, args.first(), "formatToParts", &payload)?;
+    let parts = icu_format_segments(civil, &payload)
+        .unwrap_or_else(|| vec![("literal", format_components(civil, &payload))]);
 
     let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
     for (ty, val) in &parts {
@@ -739,8 +785,6 @@ pub(crate) fn date_time_format_format_to_parts(
 /// date range (narrow no-break space, en dash, narrow no-break space).
 const RANGE_SEPARATOR: &str = "\u{2009}\u{2013}\u{2009}";
 
-type Civil = (i32, u8, u8, u8, u8, u8);
-
 /// §12.4.4 step 4 + endpoint coercion: reject an `undefined` start or
 /// end (`TypeError`), then resolve both through the same `ToNumber` /
 /// `TimeClip` path as `format`.
@@ -748,6 +792,7 @@ fn range_civil(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
     name: &'static str,
+    payload: &DateTimeFormatPayload,
 ) -> Result<(Civil, Civil), NativeError> {
     let undef = |v: Option<&Value>| v.is_none() || v.is_some_and(|x| x.is_undefined());
     if undef(args.first()) || undef(args.get(1)) {
@@ -756,8 +801,8 @@ fn range_civil(
             reason: "startDate and endDate must not be undefined".to_string(),
         });
     }
-    let start = arg_to_civil(ctx, args.first(), name)?;
-    let end = arg_to_civil(ctx, args.get(1), name)?;
+    let start = arg_to_civil(ctx, args.first(), name, payload)?;
+    let end = arg_to_civil(ctx, args.get(1), name, payload)?;
     Ok((start, end))
 }
 
@@ -773,9 +818,9 @@ pub(crate) fn date_time_format_format_range(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRange")?;
-    let (s, e) = range_civil(ctx, args, "formatRange")?;
-    let start_str = format_components(s.0, s.1, s.2, s.3, s.4, s.5, &payload);
-    let end_str = format_components(e.0, e.1, e.2, e.3, e.4, e.5, &payload);
+    let (s, e) = range_civil(ctx, args, "formatRange", &payload)?;
+    let start_str = format_components(s, &payload);
+    let end_str = format_components(e, &payload);
     let combined = if start_str == end_str {
         start_str
     } else {
@@ -799,21 +844,11 @@ pub(crate) fn date_time_format_format_range_to_parts(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRangeToParts")?;
-    let (s, e) = range_civil(ctx, args, "formatRangeToParts")?;
-    let start_parts =
-        icu_format_segments(s.0, s.1, s.2, s.3, s.4, s.5, &payload).unwrap_or_else(|| {
-            vec![(
-                "literal",
-                format_components(s.0, s.1, s.2, s.3, s.4, s.5, &payload),
-            )]
-        });
-    let end_parts =
-        icu_format_segments(e.0, e.1, e.2, e.3, e.4, e.5, &payload).unwrap_or_else(|| {
-            vec![(
-                "literal",
-                format_components(e.0, e.1, e.2, e.3, e.4, e.5, &payload),
-            )]
-        });
+    let (s, e) = range_civil(ctx, args, "formatRangeToParts", &payload)?;
+    let start_parts = icu_format_segments(s, &payload)
+        .unwrap_or_else(|| vec![("literal", format_components(s, &payload))]);
+    let end_parts = icu_format_segments(e, &payload)
+        .unwrap_or_else(|| vec![("literal", format_components(e, &payload))]);
 
     let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
     let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();
@@ -949,17 +984,13 @@ pub(crate) fn date_time_format_resolved_options(
 /// [`FieldSetBuilder`] and formats an ISO `DateTime`. Returns `None`
 /// when the locale, field set, or input is unrepresentable so the caller
 /// can fall back to the stable ISO-ish layout.
-fn icu_format_components(
-    year: i32,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
-    payload: &DateTimeFormatPayload,
-) -> Option<String> {
+fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Option<String> {
     use icu_datetime::input::{Date, DateTime, Time};
     use icu_datetime::{DateTimeFormatter, fieldsets::builder::FieldSetBuilder};
+
+    if time_only_without_hour(payload) {
+        return Some(format_time_only_without_hour(civil, payload));
+    }
 
     let locale: icu_locale::Locale = payload.locale.parse().ok()?;
     let prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
@@ -969,14 +1000,23 @@ fn icu_format_components(
     builder.date_fields = payload_date_fields(payload);
     builder.time_precision = payload_time_precision(payload);
     builder.year_style = payload_year_style(payload);
+    if builder.date_fields.is_none()
+        && builder.time_precision.is_some()
+        && payload.time_zone_name.is_none()
+    {
+        let fieldset = builder.build_time().ok()?;
+        let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+        let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
+        return Some(formatter.format(&time).to_string());
+    }
     // Date + time without a zone — input is a plain `DateTime`, no
     // `TimeZoneInfo` required (zone formatting lands with the timeZone
     // option work).
     let fieldset = builder.build_composite_datetime().ok()?;
     let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
     let dt = DateTime {
-        date: Date::try_new_iso(year, month, day).ok()?,
-        time: Time::try_new(hour, minute, second, 0).ok()?,
+        date: Date::try_new_iso(civil.year, civil.month, civil.day).ok()?,
+        time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?,
     };
     Some(formatter.format(&dt).to_string())
 }
@@ -1039,6 +1079,7 @@ fn ecma_part_type(value: &str) -> &'static str {
         "hour" => "hour",
         "minute" => "minute",
         "second" => "second",
+        "fractionalSecond" => "fractionalSecond",
         "timeZoneName" => "timeZoneName",
         _ => "literal",
     }
@@ -1048,17 +1089,16 @@ fn ecma_part_type(value: &str) -> &'static str {
 /// part-aware writing. `None` on the same conditions as
 /// [`icu_format_components`].
 fn icu_format_segments(
-    year: i32,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
+    civil: Civil,
     payload: &DateTimeFormatPayload,
 ) -> Option<Vec<(&'static str, String)>> {
     use icu_datetime::input::{Date, DateTime, Time};
     use icu_datetime::{DateTimeFormatter, fieldsets::builder::FieldSetBuilder};
     use writeable::Writeable;
+
+    if time_only_without_hour(payload) {
+        return Some(format_time_only_without_hour_parts(civil, payload));
+    }
 
     let locale: icu_locale::Locale = payload.locale.parse().ok()?;
     let prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
@@ -1067,11 +1107,25 @@ fn icu_format_segments(
     builder.date_fields = payload_date_fields(payload);
     builder.time_precision = payload_time_precision(payload);
     builder.year_style = payload_year_style(payload);
+    if builder.date_fields.is_none()
+        && builder.time_precision.is_some()
+        && payload.time_zone_name.is_none()
+    {
+        let fieldset = builder.build_time().ok()?;
+        let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
+        let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
+        let mut sink = DateTimePartCollector {
+            segments: Vec::new(),
+            current: "literal",
+        };
+        formatter.format(&time).write_to_parts(&mut sink).ok()?;
+        return Some(sink.segments);
+    }
     let fieldset = builder.build_composite_datetime().ok()?;
     let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
     let dt = DateTime {
-        date: Date::try_new_iso(year, month, day).ok()?,
-        time: Time::try_new(hour, minute, second, 0).ok()?,
+        date: Date::try_new_iso(civil.year, civil.month, civil.day).ok()?,
+        time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?,
     };
     let mut sink = DateTimePartCollector {
         segments: Vec::new(),
@@ -1184,49 +1238,113 @@ fn payload_year_style(p: &DateTimeFormatPayload) -> Option<icu_datetime::options
     }
 }
 
-fn format_components(
-    year: i32,
-    month: u8,
-    day: u8,
-    hour: u8,
-    minute: u8,
-    second: u8,
+fn time_only_without_hour(p: &DateTimeFormatPayload) -> bool {
+    p.weekday.is_none()
+        && p.era.is_none()
+        && p.year.is_none()
+        && p.month.is_none()
+        && p.day.is_none()
+        && p.date_style.is_none()
+        && p.time_style.is_none()
+        && p.time_zone_name.is_none()
+        && p.hour.is_none()
+        && (p.minute.is_some() || p.second.is_some() || p.fractional_second_digits.is_some())
+}
+
+fn format_time_only_without_hour(civil: Civil, payload: &DateTimeFormatPayload) -> String {
+    let mut out = String::new();
+    if payload.minute.is_some() {
+        out.push_str(&format!("{:02}", civil.minute));
+    }
+    if payload.second.is_some() {
+        if !out.is_empty() {
+            out.push(':');
+        }
+        out.push_str(&format!("{:02}", civil.second));
+    }
+    if let Some(digits) = payload.fractional_second_digits {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&fractional_second_digits(civil, digits));
+    }
+    out
+}
+
+fn format_time_only_without_hour_parts(
+    civil: Civil,
     payload: &DateTimeFormatPayload,
-) -> String {
-    if let Some(s) = icu_format_components(year, month, day, hour, minute, second, payload) {
+) -> Vec<(&'static str, String)> {
+    let mut parts = Vec::new();
+    if payload.minute.is_some() {
+        parts.push(("minute", format!("{:02}", civil.minute)));
+    }
+    if payload.second.is_some() {
+        if !parts.is_empty() {
+            parts.push(("literal", ":".to_string()));
+        }
+        parts.push(("second", format!("{:02}", civil.second)));
+    }
+    if let Some(digits) = payload.fractional_second_digits {
+        if !parts.is_empty() {
+            parts.push(("literal", ".".to_string()));
+        }
+        parts.push(("fractionalSecond", fractional_second_digits(civil, digits)));
+    }
+    parts
+}
+
+fn fractional_second_digits(civil: Civil, digits: u8) -> String {
+    let millis = civil.nanosecond / 1_000_000;
+    let frac = match digits {
+        1 => millis / 100,
+        2 => millis / 10,
+        _ => millis,
+    };
+    format!("{:0width$}", frac, width = digits as usize)
+}
+
+fn format_components(civil: Civil, payload: &DateTimeFormatPayload) -> String {
+    if let Some(s) = icu_format_components(civil, payload) {
         return s;
     }
     let mut date_part = String::new();
     if payload.month.is_some() {
-        date_part.push_str(&format!("{:02}", month));
+        date_part.push_str(&format!("{:02}", civil.month));
     }
     if payload.day.is_some() {
         if !date_part.is_empty() {
             date_part.push('/');
         }
-        date_part.push_str(&format!("{:02}", day));
+        date_part.push_str(&format!("{:02}", civil.day));
     }
     if payload.year.is_some() {
         if !date_part.is_empty() {
             date_part.push('/');
         }
-        date_part.push_str(&format!("{}", year));
+        date_part.push_str(&format!("{}", civil.year));
     }
     let mut time_part = String::new();
     if payload.hour.is_some() {
-        time_part.push_str(&format!("{:02}", hour));
+        time_part.push_str(&format!("{:02}", civil.hour));
     }
     if payload.minute.is_some() {
         if !time_part.is_empty() {
             time_part.push(':');
         }
-        time_part.push_str(&format!("{:02}", minute));
+        time_part.push_str(&format!("{:02}", civil.minute));
     }
     if payload.second.is_some() {
         if !time_part.is_empty() {
             time_part.push(':');
         }
-        time_part.push_str(&format!("{:02}", second));
+        time_part.push_str(&format!("{:02}", civil.second));
+    }
+    if let Some(digits) = payload.fractional_second_digits {
+        if !time_part.is_empty() {
+            time_part.push('.');
+        }
+        time_part.push_str(&fractional_second_digits(civil, digits));
     }
     match (date_part.is_empty(), time_part.is_empty()) {
         (false, false) => format!("{date_part}, {time_part}"),
@@ -1236,11 +1354,50 @@ fn format_components(
     }
 }
 
-/// Convert UTC epoch seconds to a civil `(year, month, day, hour,
-/// minute, second)` tuple using the proleptic Gregorian calendar.
+fn subsecond_nanos(millisecond: u16, microsecond: u16, nanosecond: u16) -> u32 {
+    u32::from(millisecond) * 1_000_000 + u32::from(microsecond) * 1_000 + u32::from(nanosecond)
+}
+
+/// Convert UTC epoch milliseconds to a civil tuple using the
+/// proleptic Gregorian calendar.
+fn epoch_millis_to_civil(epoch_millis: i64) -> Civil {
+    let secs = epoch_millis.div_euclid(1000);
+    let millis = epoch_millis.rem_euclid(1000) as u32;
+    let mut civil = epoch_to_civil(secs);
+    civil.nanosecond = millis * 1_000_000;
+    civil
+}
+
+fn epoch_millis_to_civil_for_payload(epoch_millis: i64, payload: &DateTimeFormatPayload) -> Civil {
+    match payload.time_zone.as_deref() {
+        None => crate::date::local_broken_down(epoch_millis as f64)
+            .map(civil_from_broken_down)
+            .unwrap_or_else(|| epoch_millis_to_civil(epoch_millis)),
+        Some("UTC" | "Etc/UTC" | "Etc/GMT") => epoch_millis_to_civil(epoch_millis),
+        // Other time zones are parsed and preserved today, but full
+        // zone-aware formatting is handled by the dedicated timezone
+        // follow-up. UTC fallback keeps behavior deterministic.
+        Some(_) => epoch_millis_to_civil(epoch_millis),
+    }
+}
+
+fn civil_from_broken_down(bd: crate::date::BrokenDown) -> Civil {
+    Civil::new(
+        bd.year,
+        bd.month + 1,
+        bd.day,
+        bd.hour,
+        bd.minute,
+        bd.second,
+        u32::from(bd.millisecond) * 1_000_000,
+    )
+}
+
+/// Convert UTC epoch seconds to a civil tuple using the proleptic
+/// Gregorian calendar.
 /// Howard Hinnant's algorithm — public-domain, exact for the full
 /// `i64` range.
-fn epoch_to_civil(epoch_secs: i64) -> (i32, u8, u8, u8, u8, u8) {
+fn epoch_to_civil(epoch_secs: i64) -> Civil {
     let secs_per_day = 86_400_i64;
     let days = epoch_secs.div_euclid(secs_per_day);
     let secs_of_day = epoch_secs.rem_euclid(secs_per_day);
@@ -1258,7 +1415,7 @@ fn epoch_to_civil(epoch_secs: i64) -> (i32, u8, u8, u8, u8, u8) {
     let hour = (secs_of_day / 3600) as u8;
     let minute = ((secs_of_day % 3600) / 60) as u8;
     let second = (secs_of_day % 60) as u8;
-    (year, m, d, hour, minute, second)
+    Civil::new(year, m, d, hour, minute, second, 0)
 }
 
 #[cfg(test)]
@@ -1267,13 +1424,23 @@ mod tests {
 
     #[test]
     fn epoch_at_unix_zero() {
-        let (y, m, d, h, mi, s) = epoch_to_civil(0);
-        assert_eq!((y, m, d, h, mi, s), (1970, 1, 1, 0, 0, 0));
+        let civil = epoch_to_civil(0);
+        assert_eq!(
+            (
+                civil.year,
+                civil.month,
+                civil.day,
+                civil.hour,
+                civil.minute,
+                civil.second
+            ),
+            (1970, 1, 1, 0, 0, 0)
+        );
     }
 
     #[test]
     fn epoch_2024_january() {
-        let (y, m, d, _, _, _) = epoch_to_civil(1_704_067_200);
-        assert_eq!((y, m, d), (2024, 1, 1));
+        let civil = epoch_to_civil(1_704_067_200);
+        assert_eq!((civil.year, civil.month, civil.day), (2024, 1, 1));
     }
 }

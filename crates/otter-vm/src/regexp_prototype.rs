@@ -157,9 +157,28 @@ fn slice_subject_string(
     input: JsString,
     range: std::ops::Range<usize>,
     ctx: &mut NativeCtx<'_>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
 ) -> Result<JsString, NativeError> {
     let units = input.with_utf16(ctx.heap(), |u| u[range].to_vec());
-    Ok(JsString::from_utf16_units(&units, ctx.heap_mut())?)
+    // Root the caller's live handles (the subject `input`, the accumulated
+    // result parts) across the substring alloc: they are young strings once
+    // string bodies live in the nursery, and this alloc can scavenge.
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for v in value_roots {
+            v.trace_value_slots(visitor);
+        }
+        for slice in slice_roots {
+            for v in *slice {
+                v.trace_value_slots(visitor);
+            }
+        }
+    };
+    Ok(JsString::from_utf16_units_with_roots(
+        &units,
+        ctx.heap_mut(),
+        &mut visit,
+    )?)
 }
 
 pub(crate) fn build_match_result_native(
@@ -170,19 +189,26 @@ pub(crate) fn build_match_result_native(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<JsArray, NativeError> {
-    let full = slice_subject_string(input, m.range.clone(), ctx)?;
+    // Keep the subject rooted across every substring alloc (it is a young
+    // string that a scavenge can relocate); re-derive the live handle each
+    // time, and root the accumulated parts too.
+    let input_value = Value::string(input);
+    let full = slice_subject_string(input, m.range.clone(), ctx, &[&input_value], &[])?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
     out.push(Value::string(full));
     for cap in &m.captures {
         match cap {
             Some(r) => {
-                let s = slice_subject_string(input, r.clone(), ctx)?;
+                let cur_input = input_value
+                    .as_string(ctx.heap())
+                    .expect("subject is a string");
+                let s =
+                    slice_subject_string(cur_input, r.clone(), ctx, &[&input_value], &[out.as_slice()])?;
                 out.push(Value::string(s));
             }
             None => out.push(Value::undefined()),
         }
     }
-    let input_value = Value::string(input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -206,14 +232,20 @@ pub(crate) fn build_match_result_native(
         let groups_obj = ctx.alloc_object_with_roots(&roots, &slices)?;
         crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
-            Some(r) => Value::string(slice_subject_string(input, r, ctx)?),
+            Some(r) => {
+                    let cur_input = input_value.as_string(ctx.heap()).expect("subject is a string");
+                    Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
+                }
             None => Value::undefined(),
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
             .map_err(vm_shape_error_to_native)?;
         for (name, range) in named_iter {
             let value = match range {
-                Some(r) => Value::string(slice_subject_string(input, r, ctx)?),
+                Some(r) => {
+                    let cur_input = input_value.as_string(ctx.heap()).expect("subject is a string");
+                    Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
+                }
                 None => Value::undefined(),
             };
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)

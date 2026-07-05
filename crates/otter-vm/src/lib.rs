@@ -423,11 +423,18 @@ pub(crate) enum CallTargetFeedback {
 /// to hold untraced and to bake). Absence from the map = unobserved.
 /// Maximum number of distinct `(receiver shape, method)` targets one
 /// polymorphic method-call site keeps for inline guard-chain baking. Mirrors
-/// the V8/JSC polymorphic IC width: enough to cover real OO dispatch (a handful
+/// the V8/JSC polymorphic IC width: enough to cover real OO dispatch (a family
 /// of sibling classes sharing a method name through one call site) while
 /// bounding both the emitted guard-chain length and the number of
 /// reoptimization evictions a single site can trigger as its target set grows.
-pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 4;
+///
+/// A site with more shapes than this bakes none and takes the per-call method
+/// bridge (a frame build per call), which is far costlier than a few extra
+/// shape-guard compares — so this covers the common wide-but-not-megamorphic
+/// dispatch (e.g. six sibling classes) rather than stranding it on the bridge.
+/// The cap never lengthens the guard chain for a site with fewer shapes (only
+/// baked shapes are walked), so raising it only helps wider sites.
+pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 
 /// Largest number of receiver shapes the optimizing tier bakes into an inline
 /// polymorphic property-access guard chain (a JSC `MultiGetByOffset` /

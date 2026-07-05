@@ -1741,16 +1741,51 @@ impl Interpreter {
             (0..cap).collect()
         };
         let mut parts: Vec<String> = vec![String::new(); cap];
-        for k in indices {
-            if k >= cap {
-                continue;
+        // Snapshot every element handle in ONE payload read before touching the
+        // allocator. `Get(O, ToString(k))` interns each index-key string, and
+        // that allocation can trigger a young-gen scavenge that relocates the
+        // (young) receiver array mid-loop — reading `o` again afterwards then
+        // dereferences a moved-from cell. A plain dense array has no observable
+        // index getters, so a bulk snapshot is spec-equivalent; anything exotic
+        // (accessors / sparse / prototype indices) keeps the full `[[Get]]`
+        // ladder, rooting the receiver across each allocating read.
+        let dense_snapshot: Option<Vec<Value>> = o.as_array().and_then(|arr| {
+            self.gc_heap.read_payload(arr, |body| {
+                // Plain dense array only (no accessors / sparse / prototype
+                // override / named props) — then a bulk snapshot matches the
+                // per-index `[[Get]]` observably.
+                if body.exotic.is_some() {
+                    return None;
+                }
+                let mut elems = Vec::with_capacity(cap);
+                for k in 0..cap {
+                    elems.push(body.elements.get(k).copied().unwrap_or(Value::hole()));
+                }
+                Some(elems)
+            })
+        });
+        if let Some(elems) = dense_snapshot {
+            for (k, v) in elems.into_iter().enumerate() {
+                if v.is_hole() || v.is_undefined() || v.is_null() {
+                    continue;
+                }
+                parts[k] = self.coerce_to_string(context, &v)?;
             }
-            let v = self.get_property_value_for_call(context, o, &k.to_string())?;
-            parts[k] = if v.is_undefined() || v.is_null() {
-                String::new()
-            } else {
-                self.coerce_to_string(context, &v)?
-            };
+        } else {
+            let o_root = self.json_root_push(o);
+            for k in indices {
+                if k >= cap {
+                    continue;
+                }
+                let o_cur = self.json_root_get(o_root);
+                let v = self.get_property_value_for_call(context, o_cur, &k.to_string())?;
+                parts[k] = if v.is_undefined() || v.is_null() {
+                    String::new()
+                } else {
+                    self.coerce_to_string(context, &v)?
+                };
+            }
+            self.json_root_pop_to(o_root);
         }
         let joined = parts.join(&separator);
         Ok(Value::string(JsString::from_str(

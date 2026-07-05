@@ -1996,6 +1996,12 @@ impl Interpreter {
         // the bag's `prototype` slot already tracks `proto` (the collector
         // forwards live GC slots) when the shape-advancing constructor define
         // below may relocate the heap.
+        // `bag` is a bare local from before the `proto` allocation, which can
+        // scavenge and relocate it; re-fetch the live handle from its rooted
+        // `bag_root` before the define, or it dereferences a moved-from shape cell.
+        let bag = bag_root
+            .as_object()
+            .expect("function bag survives stack rooting");
         let prototype_desc =
             object::PropertyDescriptor::data(Value::object(proto), true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
@@ -2154,6 +2160,12 @@ impl Interpreter {
         // the bag's `prototype` slot already tracks `proto` (the collector
         // forwards live GC slots) when the shape-advancing constructor define
         // below may relocate the heap.
+        // `bag` is a bare local from before the `proto` allocation, which can
+        // scavenge and relocate it; re-fetch the live handle from its rooted
+        // `bag_root` before the define, or it dereferences a moved-from shape cell.
+        let bag = bag_root
+            .as_object()
+            .expect("function bag survives stack rooting");
         let prototype_desc =
             object::PropertyDescriptor::data(Value::object(proto), true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);

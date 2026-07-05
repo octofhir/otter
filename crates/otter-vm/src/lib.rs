@@ -2563,25 +2563,23 @@ impl Interpreter {
         // eligibility on `makes_function`, so no SELF re-read is needed.
         callee_reg: Option<u16>,
         arg_regs: &[u16],
+        // Base of the CALLER's live register window (`JitCtx.regs`). For a
+        // framed caller this equals `stack[frame_index].registers`; for a
+        // frameless caller (register-CC direct call) it is the reg-stack window
+        // the caller runs on, which `frame_index` does NOT point at. Reading the
+        // caller's argument registers from this window is correct in both cases
+        // and is what emitted code uses (x19). The window lives in the fixed,
+        // GC-traced `reg_stack` (never reallocated) or in the caller frame that
+        // cannot move during its own compiled execution, so the pointer is stable
+        // across the `draw_registers` / `build_upvalues_for_exec` below.
+        caller_regs: *const Value,
     ) -> Result<jit::JitPreparedDirectCall, VmError> {
         let bind_count = usize::from(plan.param_count).min(arg_regs.len());
-        {
-            let caller = stack
-                .get(frame_index)
-                .ok_or_else(|| VmError::InvalidOperand)?;
-            for &src in arg_regs.iter().take(bind_count) {
-                caller
-                    .registers
-                    .get(src as usize)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
-            }
-            if let Some(reg) = callee_reg {
-                caller
-                    .registers
-                    .get(reg as usize)
-                    .ok_or_else(|| VmError::InvalidOperand)?;
-            }
-        };
+        let _ = frame_index;
+        // SAFETY: `caller_regs` is the caller's live register base; `arg_regs` /
+        // `callee_reg` are compiler-emitted indices into it (the same indices the
+        // caller's compiled body addresses off x19), so each `add` is in bounds.
+        let read_caller = |reg: u16| -> Value { unsafe { *caller_regs.add(reg as usize) } };
         let upvalues = if function.own_upvalue_count == 0 {
             parent_upvalues
         } else {
@@ -2597,7 +2595,6 @@ impl Interpreter {
             registers,
         ));
         let callee_now = {
-            let caller = &stack[frame_index];
             for (dst_slot, &src) in callee_frame
                 .frame_mut()
                 .registers
@@ -2605,9 +2602,9 @@ impl Interpreter {
                 .zip(arg_regs.iter())
                 .take(bind_count)
             {
-                *dst_slot = caller.registers[src as usize];
+                *dst_slot = read_caller(src);
             }
-            callee_reg.map(|reg| caller.registers[reg as usize])
+            callee_reg.map(read_caller)
         };
         let self_closure = if function.makes_function
             && let Some(closure) = callee_now.and_then(|v| v.as_closure(&self.gc_heap))
@@ -2706,6 +2703,12 @@ impl Interpreter {
         };
 
         self.enter_sync_reentry()?;
+        // Op::Call reaches here only from a framed caller (a frameless callee
+        // makes no plain call — see ExecutableFunction::is_leaf), so the caller's
+        // register window is its HoltStack frame's register array.
+        let caller_regs = stack
+            .get(frame_index)
+            .map_or(std::ptr::null(), |f| f.registers.as_ptr());
         match self.prepare_jit_direct_call_frame(
             context,
             stack,
@@ -2716,6 +2719,7 @@ impl Interpreter {
             plan,
             Some(callee_reg),
             arg_regs,
+            caller_regs,
         ) {
             Ok(prepared) => {
                 self.pin_jit_direct_code(prepared.frame_index, code.clone());
@@ -2793,6 +2797,7 @@ impl Interpreter {
         obj: crate::object::JsObject,
         site: usize,
         arg_regs: &[u16],
+        caller_regs: *const Value,
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
         // Polymorphic cache: find the entry whose cached receiver shape still
         // resolves the same method. A miss just falls to the generic path — the
@@ -2847,6 +2852,7 @@ impl Interpreter {
             plan,
             None,
             arg_regs,
+            caller_regs,
         ) {
             Ok(prepared) => {
                 self.pin_jit_direct_code(prepared.frame_index, code);
@@ -3068,6 +3074,10 @@ impl Interpreter {
         call_byte_pc: u32,
         site: usize,
         arg_regs: &[u16],
+        // Caller's live register window (`JitCtx.regs`); see
+        // [`Self::prepare_jit_direct_call_frame`]. Receiver and args are read
+        // from here, not `stack[frame_index]`, so a frameless caller works.
+        caller_regs: *const Value,
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
         self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL);
         self.jit_runtime_stats.runtime_calls =
@@ -3081,12 +3091,8 @@ impl Interpreter {
         if self.method_call_ics.get(site).is_some_and(Option::is_some) {
             return Ok(None);
         }
-        let recv = *stack
-            .get(frame_index)
-            .ok_or_else(|| VmError::InvalidOperand)?
-            .registers
-            .get(recv_reg as usize)
-            .ok_or_else(|| VmError::InvalidOperand)?;
+        // SAFETY: `recv_reg` is a compiler-emitted index into the caller window.
+        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
         let Some(obj) = recv.as_object() else {
             return Ok(None);
         };
@@ -3098,6 +3104,7 @@ impl Interpreter {
             obj,
             site,
             arg_regs,
+            caller_regs,
         )? {
             return Ok(Some(prepared));
         }
@@ -3190,6 +3197,7 @@ impl Interpreter {
             plan,
             None,
             arg_regs,
+            caller_regs,
         ) {
             Ok(prepared) => {
                 self.pin_jit_direct_code(prepared.frame_index, code.clone());
@@ -3508,6 +3516,9 @@ impl Interpreter {
         // appended frame is covered by the enclosing `dispatch_loop`'s
         // `trace_active_frame_roots` provider, which `run_compiled_frame` alone
         // does not install.
+        let caller_regs = stack
+            .get(frame_index)
+            .map_or(std::ptr::null(), |f| f.registers.as_ptr());
         let prepared = self.prepare_jit_direct_call_frame(
             context,
             stack,
@@ -3518,6 +3529,7 @@ impl Interpreter {
             direct_plan,
             Some(callee_reg),
             arg_regs,
+            caller_regs,
         )?;
         let idx = prepared.frame_index;
         match self.run_compiled_frame(stack, context, idx, code) {

@@ -1608,28 +1608,14 @@ impl GcHeap {
     /// Prune the ephemeron registry to tables that survived the
     /// current mark phase. Must run before sweep frees dead tables.
     pub fn prune_ephemeron_registry_to_marked(&mut self) {
-        let marked: std::collections::HashSet<RawGc> = self
-            .ephemerons
-            .snapshot()
-            .into_iter()
-            .filter(|raw| self.is_marked(*raw))
-            .collect();
-        self.ephemerons.retain_marked(|raw| marked.contains(&raw));
+        self.ephemerons.retain_marked(raw_is_marked);
     }
 
     /// Prune weak-reference/finalization registries to handles
     /// that survived the current mark phase. Must run before sweep
     /// frees dead bodies.
     pub fn prune_weak_finalization_registry_to_marked(&mut self) {
-        let marked: std::collections::HashSet<RawGc> = self
-            .weak_finalization
-            .weak_refs_snapshot()
-            .into_iter()
-            .chain(self.weak_finalization.finalization_registries_snapshot())
-            .filter(|raw| self.is_marked(*raw))
-            .collect();
-        self.weak_finalization
-            .retain_marked(|raw| marked.contains(&raw));
+        self.weak_finalization.retain_marked(raw_is_marked);
     }
 
     /// Finish a full-GC cycle by sweeping everything left white.
@@ -1938,6 +1924,16 @@ impl std::fmt::Debug for GcHeap {
 
 // Drop: pages are owned by the spaces; their Drop returns them
 // to the cage automatically.
+
+/// Header-only mark check for registry pruning: reads the mark bit
+/// straight off the object header without touching heap state.
+fn raw_is_marked(raw: RawGc) -> bool {
+    if raw.is_null() {
+        return false;
+    }
+    // SAFETY: registries only hold heap-issued raw handles.
+    unsafe { (*raw.as_header_ptr()).is_marked() }
+}
 
 #[cfg(test)]
 mod tests {

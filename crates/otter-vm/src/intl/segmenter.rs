@@ -78,14 +78,13 @@ struct SegmentPart {
 
 fn code_point_at(units: &[u16], index: usize) -> (u32, usize) {
     let unit = units[index];
-    if (0xD800..=0xDBFF).contains(&unit) {
-        if let Some(&low) = units.get(index + 1) {
-            if (0xDC00..=0xDFFF).contains(&low) {
-                let high_ten = (unit as u32) - 0xD800;
-                let low_ten = (low as u32) - 0xDC00;
-                return (0x10000 + ((high_ten << 10) | low_ten), 2);
-            }
-        }
+    if (0xD800..=0xDBFF).contains(&unit)
+        && let Some(&low) = units.get(index + 1)
+        && (0xDC00..=0xDFFF).contains(&low)
+    {
+        let high_ten = (unit as u32) - 0xD800;
+        let low_ten = (low as u32) - 0xDC00;
+        return (0x10000 + ((high_ten << 10) | low_ten), 2);
     }
     (unit as u32, 1)
 }

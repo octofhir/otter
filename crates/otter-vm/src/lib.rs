@@ -28,7 +28,7 @@
 // compile in both contexts.
 extern crate self as otter_vm;
 
-pub mod abstract_ops;
+pub(crate) mod abstract_ops;
 mod allocation_ops;
 mod argument_window;
 pub mod arguments_object;

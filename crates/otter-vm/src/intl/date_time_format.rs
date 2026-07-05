@@ -1187,6 +1187,9 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         let formatter = DateTimeFormatter::try_new(prefs, fieldset).ok()?;
         let time = Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?;
         let mut formatted = formatter.format(&time).to_string();
+        localize_fraction_separator(&mut formatted, payload);
+        pad_two_digit_hour(&mut formatted, payload);
+        normalize_day_period_separator(&mut formatted, payload);
         append_time_zone_text(&mut formatted, payload);
         return Some(formatted);
     }
@@ -1200,6 +1203,9 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         time: Time::try_new(civil.hour, civil.minute, civil.second, civil.nanosecond).ok()?,
     };
     let mut formatted = formatter.format(&dt).to_string();
+    localize_fraction_separator(&mut formatted, payload);
+    pad_two_digit_hour(&mut formatted, payload);
+    normalize_day_period_separator(&mut formatted, payload);
     append_time_zone_text(&mut formatted, payload);
     Some(formatted)
 }
@@ -1326,6 +1332,101 @@ fn time_zone_display_name(payload: &DateTimeFormatPayload) -> Option<String> {
         "UTC" | "Etc/UTC" | "Etc/GMT" => "UTC".to_string(),
         other => other.to_string(),
     })
+}
+
+fn numbering_system_for_digits(payload: &DateTimeFormatPayload) -> &str {
+    if payload.numbering_system != "latn" {
+        return &payload.numbering_system;
+    }
+    let locale = payload.locale.as_str();
+    let Some(idx) = locale.find("-u-") else {
+        return "latn";
+    };
+    let unicode = &locale[idx + 3..];
+    let mut subtags = unicode.split('-');
+    while let Some(key) = subtags.next() {
+        if key == "nu" {
+            return subtags.next().unwrap_or("latn");
+        }
+    }
+    "latn"
+}
+
+fn digit_table(payload: &DateTimeFormatPayload) -> Option<[&'static str; 10]> {
+    match numbering_system_for_digits(payload) {
+        "arab" => Some(["٠", "١", "٢", "٣", "٤", "٥", "٦", "٧", "٨", "٩"]),
+        "deva" => Some(["०", "१", "२", "३", "४", "५", "६", "७", "८", "९"]),
+        "hanidec" => Some(["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"]),
+        _ => None,
+    }
+}
+
+fn localize_ascii_digits(input: &str, payload: &DateTimeFormatPayload) -> String {
+    let Some(table) = digit_table(payload) else {
+        return input.to_string();
+    };
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if let Some(digit) = ch.to_digit(10) {
+            out.push_str(table[digit as usize]);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn localized_zero(payload: &DateTimeFormatPayload) -> &'static str {
+    digit_table(payload).map_or("0", |digits| digits[0])
+}
+
+fn decimal_separator(payload: &DateTimeFormatPayload) -> &'static str {
+    match numbering_system_for_digits(payload) {
+        "arab" => "٫",
+        _ => ".",
+    }
+}
+
+fn localize_fraction_separator(formatted: &mut String, payload: &DateTimeFormatPayload) {
+    if payload.fractional_second_digits.is_none() || decimal_separator(payload) == "." {
+        return;
+    }
+    *formatted = formatted.replace('.', decimal_separator(payload));
+}
+
+fn normalize_day_period_separator(formatted: &mut String, payload: &DateTimeFormatPayload) {
+    if numbering_system_for_digits(payload) != "hanidec" {
+        return;
+    }
+    *formatted = formatted
+        .replace("\u{202f}AM", " AM")
+        .replace("\u{202f}PM", " PM");
+}
+
+fn is_localized_digit(ch: char, payload: &DateTimeFormatPayload) -> bool {
+    if ch.is_ascii_digit() {
+        return true;
+    }
+    digit_table(payload)
+        .into_iter()
+        .flatten()
+        .any(|digit| digit.starts_with(ch))
+}
+
+fn pad_two_digit_hour(formatted: &mut String, payload: &DateTimeFormatPayload) {
+    if !matches!(payload.hour, Some(DtNumWidth::TwoDigit)) {
+        return;
+    }
+    let mut chars = formatted.chars();
+    let Some(first) = chars.next() else {
+        return;
+    };
+    let Some(second) = chars.next() else {
+        return;
+    };
+    if is_localized_digit(first, payload) && !is_localized_digit(second, payload) {
+        formatted.insert_str(0, localized_zero(payload));
+    }
 }
 
 fn append_time_zone_text(formatted: &mut String, payload: &DateTimeFormatPayload) {
@@ -1465,20 +1566,31 @@ fn time_only_without_hour(p: &DateTimeFormatPayload) -> bool {
 
 fn format_time_only_without_hour(civil: Civil, payload: &DateTimeFormatPayload) -> String {
     let mut out = String::new();
-    if payload.minute.is_some() {
-        out.push_str(&format!("{:02}", civil.minute));
+    let clock_minute_second = payload.minute.is_some() && payload.second.is_some();
+    if let Some(width) = payload.minute {
+        let width = if clock_minute_second {
+            DtNumWidth::TwoDigit
+        } else {
+            width
+        };
+        out.push_str(&format_number_field(civil.minute, width, payload));
     }
-    if payload.second.is_some() {
+    if let Some(width) = payload.second {
         if !out.is_empty() {
             out.push(':');
         }
-        out.push_str(&format!("{:02}", civil.second));
+        let width = if clock_minute_second {
+            DtNumWidth::TwoDigit
+        } else {
+            width
+        };
+        out.push_str(&format_number_field(civil.second, width, payload));
     }
     if let Some(digits) = payload.fractional_second_digits {
         if !out.is_empty() {
-            out.push('.');
+            out.push_str(decimal_separator(payload));
         }
-        out.push_str(&fractional_second_digits(civil, digits));
+        out.push_str(&fractional_second_digits(civil, digits, payload));
     }
     out
 }
@@ -1488,32 +1600,55 @@ fn format_time_only_without_hour_parts(
     payload: &DateTimeFormatPayload,
 ) -> Vec<(&'static str, String)> {
     let mut parts = Vec::new();
-    if payload.minute.is_some() {
-        parts.push(("minute", format!("{:02}", civil.minute)));
+    let clock_minute_second = payload.minute.is_some() && payload.second.is_some();
+    if let Some(width) = payload.minute {
+        let width = if clock_minute_second {
+            DtNumWidth::TwoDigit
+        } else {
+            width
+        };
+        parts.push(("minute", format_number_field(civil.minute, width, payload)));
     }
-    if payload.second.is_some() {
+    if let Some(width) = payload.second {
         if !parts.is_empty() {
             parts.push(("literal", ":".to_string()));
         }
-        parts.push(("second", format!("{:02}", civil.second)));
+        let width = if clock_minute_second {
+            DtNumWidth::TwoDigit
+        } else {
+            width
+        };
+        parts.push(("second", format_number_field(civil.second, width, payload)));
     }
     if let Some(digits) = payload.fractional_second_digits {
         if !parts.is_empty() {
-            parts.push(("literal", ".".to_string()));
+            parts.push(("literal", decimal_separator(payload).to_string()));
         }
-        parts.push(("fractionalSecond", fractional_second_digits(civil, digits)));
+        parts.push((
+            "fractionalSecond",
+            fractional_second_digits(civil, digits, payload),
+        ));
     }
     parts
 }
 
-fn fractional_second_digits(civil: Civil, digits: u8) -> String {
+fn fractional_second_digits(civil: Civil, digits: u8, payload: &DateTimeFormatPayload) -> String {
     let millis = civil.nanosecond / 1_000_000;
     let frac = match digits {
         1 => millis / 100,
         2 => millis / 10,
         _ => millis,
     };
-    format!("{:0width$}", frac, width = digits as usize)
+    let ascii = format!("{:0width$}", frac, width = digits as usize);
+    localize_ascii_digits(&ascii, payload)
+}
+
+fn format_number_field(value: u8, width: DtNumWidth, payload: &DateTimeFormatPayload) -> String {
+    let ascii = match width {
+        DtNumWidth::Numeric => value.to_string(),
+        DtNumWidth::TwoDigit => format!("{value:02}"),
+    };
+    localize_ascii_digits(&ascii, payload)
 }
 
 fn format_components(civil: Civil, payload: &DateTimeFormatPayload) -> String {
@@ -1521,42 +1656,51 @@ fn format_components(civil: Civil, payload: &DateTimeFormatPayload) -> String {
         return s;
     }
     let mut date_part = String::new();
-    if payload.month.is_some() {
-        date_part.push_str(&format!("{:02}", civil.month));
+    if let Some(width) = payload.month {
+        let width = match width {
+            DtMonthWidth::Numeric => DtNumWidth::Numeric,
+            DtMonthWidth::TwoDigit => DtNumWidth::TwoDigit,
+            DtMonthWidth::Narrow | DtMonthWidth::Short | DtMonthWidth::Long => DtNumWidth::Numeric,
+        };
+        date_part.push_str(&format_number_field(civil.month, width, payload));
     }
-    if payload.day.is_some() {
+    if let Some(width) = payload.day {
         if !date_part.is_empty() {
             date_part.push('/');
         }
-        date_part.push_str(&format!("{:02}", civil.day));
+        date_part.push_str(&format_number_field(civil.day, width, payload));
     }
-    if payload.year.is_some() {
+    if let Some(width) = payload.year {
         if !date_part.is_empty() {
             date_part.push('/');
         }
-        date_part.push_str(&format!("{}", civil.year));
+        let ascii = match width {
+            DtNumWidth::Numeric => civil.year.to_string(),
+            DtNumWidth::TwoDigit => format!("{:02}", civil.year.rem_euclid(100)),
+        };
+        date_part.push_str(&localize_ascii_digits(&ascii, payload));
     }
     let mut time_part = String::new();
-    if payload.hour.is_some() {
-        time_part.push_str(&format!("{:02}", civil.hour));
+    if let Some(width) = payload.hour {
+        time_part.push_str(&format_number_field(civil.hour, width, payload));
     }
-    if payload.minute.is_some() {
+    if let Some(width) = payload.minute {
         if !time_part.is_empty() {
             time_part.push(':');
         }
-        time_part.push_str(&format!("{:02}", civil.minute));
+        time_part.push_str(&format_number_field(civil.minute, width, payload));
     }
-    if payload.second.is_some() {
+    if let Some(width) = payload.second {
         if !time_part.is_empty() {
             time_part.push(':');
         }
-        time_part.push_str(&format!("{:02}", civil.second));
+        time_part.push_str(&format_number_field(civil.second, width, payload));
     }
     if let Some(digits) = payload.fractional_second_digits {
         if !time_part.is_empty() {
-            time_part.push('.');
+            time_part.push_str(decimal_separator(payload));
         }
-        time_part.push_str(&fractional_second_digits(civil, digits));
+        time_part.push_str(&fractional_second_digits(civil, digits, payload));
     }
     let mut formatted = match (date_part.is_empty(), time_part.is_empty()) {
         (false, false) => format!("{date_part}, {time_part}"),

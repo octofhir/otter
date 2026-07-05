@@ -2889,6 +2889,18 @@ impl Interpreter {
         {
             return;
         }
+        // Eligible for the bridge-free asm flat-table link (machine-code callee
+        // window + branch to the compiled entry, no VM frame build): a bare
+        // function, OR an upvalue-free closure — the common monomorphic
+        // class-method shape `obj.run(x){ return x + this.k }` that reached here
+        // through the mono gate above. The link bakes `upvalues_ptr` (0 for an
+        // empty spine, never dereferenced by an upvalue-free callee) and
+        // plain-function SELF bits, unused unless the callee is `makes_function`
+        // (rejected upstream). A capturing closure keeps the empty flat slot and
+        // is served by the Rust fast path. This stays MONO-only (the gate above),
+        // so a megamorphic site — where the flat-table walk loses to the bridge —
+        // is untouched.
+        let asm_link_eligible = method_is_plain_function || upvalues_ptr == 0;
         let method_fid = method
             .as_function()
             .or_else(|| method.as_closure(&self.gc_heap).map(|c| c.function_id()));
@@ -2953,7 +2965,7 @@ impl Interpreter {
             // SELF bits, so it is only sound for an upvalue-free function method. A
             // closure method leaves the flat slot EMPTY (the asm guard bails to the
             // Rust stub, which serves it from the cache with the live spine).
-            let inline = if !method_is_plain_function {
+            let inline = if !asm_link_eligible {
                 JitDirectMethodInline::EMPTY
             } else {
                 match &hit {

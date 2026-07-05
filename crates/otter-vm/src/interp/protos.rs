@@ -1,4 +1,9 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Prototype resolution and primitive receiver boxing.
+//!
+//! # Contents
+//! `get_prototype_for_op`, non-GC exotic prototype overrides, primitive
+//! wrapper prototypes, sloppy-mode `this` boxing, well-known symbols,
+//! and `install_global_class`.
 #![allow(unused_imports)]
 use crate::*;
 

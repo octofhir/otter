@@ -1,4 +1,12 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! `VmError` raising with attached `ErrorDetail`.
+//!
+//! # Contents
+//! `raise` plus the `err_*` constructors (`err_type`, `err_range`, …)
+//! and error-detail take/render accessors.
+//!
+//! # Invariants
+//! One error detail is in flight per isolate at a time; the slot is
+//! overwritten by the next raise and consumed at surfacing boundaries.
 #![allow(unused_imports)]
 use crate::*;
 

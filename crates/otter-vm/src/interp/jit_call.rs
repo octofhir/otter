@@ -1,4 +1,16 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! JIT entry, OSR, and direct-call frame plumbing.
+//!
+//! # Contents
+//! Tier-up dispatch (`maybe_dispatch_jit`, backedge/OSR accounting),
+//! compiled-frame entry (`run_compiled_frame`, `jit_runtime_call`),
+//! direct-call and direct-method-call preparation/finish/abort, the
+//! per-fid direct-method inline cache, and raw frame-pointer accessors
+//! the emitted code reads (`jit_frame_regs_ptr` and friends).
+//!
+//! # Invariants
+//! Every publish of a callee frame is paired with a finish/abort helper
+//! that releases pinned code and the sync-reentry guard; bail paths must
+//! leave the frame stack exactly as the interpreter expects to resume.
 #![allow(unused_imports)]
 use crate::*;
 

@@ -1,4 +1,13 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Shape-transition helpers and property definition slow paths.
+//!
+//! # Contents
+//! `shape_root`/`shape_child` (with rooting variants), data-property
+//! stores (`set_property`, `ordinary_set_data_property`), partial
+//! descriptor definition, freeze/seal, and shape-from-slots rebuild.
+//!
+//! # Invariants
+//! Shape children are interned via the shape runtime; allocating a
+//! child must root any live object value passed alongside it.
 #![allow(unused_imports)]
 use crate::*;
 

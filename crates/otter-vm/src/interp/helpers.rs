@@ -1,4 +1,10 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Free functions backing the dispatch loop and builtins glue.
+//!
+//! # Contents
+//! URL resolution for `import.meta.resolve`, register read/write,
+//! iterator stepping (`step_iterator`, `GeneratorResumeKind`),
+//! callability checks, and small property-key coercions. Re-exported
+//! from the crate root where previously public.
 #![allow(unused_imports)]
 use crate::*;
 

@@ -1,4 +1,12 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! `Interpreter` construction and introspection accessors.
+//!
+//! # Contents
+//! `new`/`with_string_heap_cap` (heap, shape runtime, IC tables, JIT
+//! hooks all start empty), property-IC counters, and JIT stat getters.
+//!
+//! # Invariants
+//! Construction never allocates on the GC heap; intrinsics install later
+//! via bootstrap so a half-built interpreter is never observable.
 #![allow(unused_imports)]
 use crate::*;
 

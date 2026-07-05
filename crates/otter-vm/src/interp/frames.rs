@@ -1,4 +1,14 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Register-window and frame-stack management.
+//!
+//! # Contents
+//! Register drawing/reclaim on the contiguous reg stack, HoltStack
+//! draw/return, cold-frame attach/detach, frame pop/unwind
+//! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), and the
+//! raw pointers compiled code uses to address the reg window.
+//!
+//! # Invariants
+//! The reg stack is a GC root region: windows must be zeroed on alloc
+//! and truncated on reclaim so stale slots never masquerade as values.
 #![allow(unused_imports)]
 use crate::*;
 

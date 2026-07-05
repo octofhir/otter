@@ -1,4 +1,13 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Module-graph runtime state: init, envs, namespaces, dynamic import.
+//!
+//! # Contents
+//! `run_module_init`/`run_module_init_hoist`, dynamic-import settlement,
+//! module environment/namespace registries, and cross-module binding
+//! resolution.
+//!
+//! # Invariants
+//! Namespace objects are created lazily and cached per URL; module
+//! environments registered here are GC roots via the trace surface.
 #![allow(unused_imports)]
 use crate::*;
 

@@ -1,4 +1,14 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! GC root enumeration surface for interpreter-owned state.
+//!
+//! # Contents
+//! `*_for_trace` iterators over module envs/namespaces, global lexicals,
+//! function expando props, iterator prototypes, plus iteration anchors
+//! and module-root slot stacks.
+//!
+//! # Invariants
+//! Every collection reachable from JS values owned by the interpreter
+//! must be enumerated here or in [`crate::trace_active_frame_roots`];
+//! missing a source is a use-after-free under GC stress.
 #![allow(unused_imports)]
 use crate::*;
 

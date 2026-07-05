@@ -177,17 +177,13 @@ pub(crate) fn build_match_result_native(
     slices.extend_from_slice(slice_roots);
     let arr = ctx.array_from_elements_with_roots(out.iter().cloned(), &roots, &slices)?;
 
-    crate::array::set_named_property(
-        arr,
-        ctx.heap_mut(),
-        "index",
-        Value::number_i32(m.range.start as i32),
-    )?;
-    crate::array::set_named_property(arr, ctx.heap_mut(), "input", input_value)?;
-
+    // Build the `groups` value first (the named-group object build must root
+    // `arr`), then install `index` / `input` / `groups` in a single payload
+    // write — the three fixed match-result properties.
+    let index_value = Value::number_i32(m.range.start as i32);
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
-    if let Some((name, range)) = first_named {
+    let groups_value = if let Some((name, range)) = first_named {
         let arr_value = Value::array(arr);
         let mut roots = Vec::with_capacity(value_roots.len() + 2);
         roots.push(&input_value);
@@ -209,10 +205,17 @@ pub(crate) fn build_match_result_native(
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
                 .map_err(vm_shape_error_to_native)?;
         }
-        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::object(groups_obj))?;
+        Value::object(groups_obj)
     } else {
-        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::undefined())?;
-    }
+        Value::undefined()
+    };
+    crate::array::set_match_result_props(
+        arr,
+        ctx.heap_mut(),
+        index_value,
+        input_value,
+        groups_value,
+    )?;
 
     if has_indices {
         let arr_value = Value::array(arr);

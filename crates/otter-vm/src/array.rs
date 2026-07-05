@@ -1405,6 +1405,38 @@ pub fn set_named_property(
     Ok(())
 }
 
+/// Install the three fixed own properties every RegExp match-result array
+/// carries — `index`, `input`, `groups` — in a single payload write.
+///
+/// A freshly built match array is extensible and holds none of these keys, so
+/// the per-key writability / extensibility / absence checks in
+/// [`set_named_property`] are always no-ops here; skip them and the three
+/// separate payload accesses and write barriers they entail. This is on the hot
+/// path of every `RegExp.prototype.exec` / string match.
+pub fn set_match_result_props(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    index: Value,
+    input: Value,
+    groups: Value,
+) -> Result<(), otter_gc::OutOfMemory> {
+    heap.with_payload(arr, |body| {
+        let map = body
+            .exotic_mut()
+            .named_properties
+            .get_or_insert_with(IndexMap::new);
+        map.reserve(3);
+        map.insert("index".to_string(), index);
+        map.insert("input".to_string(), input);
+        map.insert("groups".to_string(), groups);
+        body.mark_dirty();
+    });
+    heap.record_write(arr, &index);
+    heap.record_write(arr, &input);
+    heap.record_write(arr, &groups);
+    Ok(())
+}
+
 /// Store a non-index string-keyed data property as part of
 /// `[[DefineOwnProperty]]`.
 ///

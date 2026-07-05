@@ -331,14 +331,18 @@ pub(crate) fn cjs_instantiate_file(
     // stack relocates its slots in place, so after every subsequent allocation
     // we re-fetch the live handle from the slot instead of trusting the stale
     // `module` local.
+    // Root the caller's `cache` handle BEFORE allocating `exports` / `module`:
+    // those allocations can scavenge and relocate `cache` (a young object), and
+    // a bare local pushed afterwards would already be a stale, moved-from handle.
+    let root_base = ctx.interp_mut().module_root_depth();
+    let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
+
     let exports = ctx.alloc_object().map_err(oom)?;
     let module = ctx.alloc_object().map_err(oom)?;
     let exports_val = Value::object(exports);
     let module_val = Value::object(module);
 
-    let root_base = ctx.interp_mut().module_root_depth();
     let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
-    let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
     let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
 
     // From here on, re-fetch the relocated handles after each allocation.
@@ -376,14 +380,23 @@ pub(crate) fn cjs_instantiate_file(
     let exports_val = ctx.interp_mut().module_root(exports_idx);
     object::set(&mut cache, ctx.heap_mut(), &id, exports_val);
 
-    // Per-module bindings.
+    // Per-module bindings. Each of `require` / `dirname` / `filename` is a young
+    // handle that the *following* allocations here (and `create_commonjs_wrapper`
+    // below) can scavenge and relocate, so park each on the module-root stack the
+    // moment it exists and re-fetch the live handles just before the call. The
+    // `cache` local is likewise stale after the `object::set` above — re-fetch it
+    // before `make_require` captures it into the closure.
+    let cache = ctx
+        .interp_mut()
+        .module_root(cache_idx)
+        .as_object()
+        .expect("require cache survives module-root rooting");
     let require_val = make_require(ctx, cfg.clone(), cache, dir.clone())?;
+    let require_idx = ctx.interp_mut().push_module_root(require_val) - 1;
     let dirname_val = runtime_string_value(ctx, &dir.to_string_lossy())?;
+    let dirname_idx = ctx.interp_mut().push_module_root(dirname_val) - 1;
     let filename_arg = runtime_string_value(ctx, &id)?;
-
-    // Re-fetch the relocated handles after the require/string allocations.
-    let module_val = ctx.interp_mut().module_root(module_idx);
-    let exports_val = ctx.interp_mut().module_root(exports_idx);
+    let filename_idx = ctx.interp_mut().push_module_root(filename_arg) - 1;
 
     // Compile the wrapper and run it.
     let (interp, context) = ctx.interp_mut_and_context();
@@ -393,6 +406,13 @@ pub(crate) fn cjs_instantiate_file(
     let wrapper = interp
         .create_commonjs_wrapper(&id, source)
         .map_err(|e| vm_err(interp, e))?;
+    // Re-fetch every argument from its module-root slot: `create_commonjs_wrapper`
+    // (and the string/require allocations before it) may have relocated them.
+    let exports_val = interp.module_root(exports_idx);
+    let require_val = interp.module_root(require_idx);
+    let module_val = interp.module_root(module_idx);
+    let filename_arg = interp.module_root(filename_idx);
+    let dirname_val = interp.module_root(dirname_idx);
     let call_args: SmallVec<[Value; 8]> = smallvec![
         exports_val,
         require_val,

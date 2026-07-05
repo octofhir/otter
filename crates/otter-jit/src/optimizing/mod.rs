@@ -135,7 +135,9 @@ pub fn compile(
     // JITs the loop through its own tier — rather than emit an unsound bail. No
     // benchmark exercises this path, so the coverage cost is nil today.
     if !block_deopts.is_empty() {
-        return Err(Unsupported::Unlowered("osr region bails to interpreter tail"));
+        return Err(Unsupported::Unlowered(
+            "osr region bails to interpreter tail",
+        ));
     }
     let code = emit::emit(
         view,

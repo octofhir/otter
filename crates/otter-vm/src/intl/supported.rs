@@ -208,7 +208,7 @@ fn to_length(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<usize, NativeErro
 
 /// A locale is "supported" iff ICU has likely-subtags data for its
 /// language (maximize yields a script). Filters out e.g. `zxx` / `xx`.
-fn is_supported(tag: &str) -> bool {
+pub(crate) fn is_supported(tag: &str) -> bool {
     let Ok(loc) = Locale::try_from_str(tag) else {
         return false;
     };

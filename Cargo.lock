@@ -2371,6 +2371,7 @@ dependencies = [
  "thiserror",
  "tinystr",
  "trybuild",
+ "unicode-segmentation",
  "writeable",
 ]
 

@@ -582,7 +582,12 @@ impl<'a> Builder<'a> {
         };
         // Materialize one block per CFG range (the graph starts with just the
         // entry block).
-        let mut graph = Graph::new(view.function_id, view.param_count, view.register_count, entry);
+        let mut graph = Graph::new(
+            view.function_id,
+            view.param_count,
+            view.register_count,
+            entry,
+        );
         graph.blocks.clear();
         for &(start, _) in &cfg.ranges {
             let pc = view.instructions[start].byte_pc;
@@ -1211,9 +1216,9 @@ impl<'a> Builder<'a> {
                 Op::StoreGlobalBinding => {
                     let value_reg = reg(&operands, 0)?;
                     let value = self.read_variable(value_reg, block);
-                    let node = self
-                        .graph
-                        .add_node(NodeKind::StoreGlobalBinding { value }, block, byte_pc);
+                    let node =
+                        self.graph
+                            .add_node(NodeKind::StoreGlobalBinding { value }, block, byte_pc);
                     self.push_body(block, node);
                 }
                 Op::LoadProperty => {
@@ -1301,9 +1306,9 @@ impl<'a> Builder<'a> {
                         // declining the whole function. The receiver stays live
                         // (materialized by the call safepoint) for the bridge to
                         // re-decode; the result reloads into `dst`.
-                        let node = self
-                            .graph
-                            .add_node(NodeKind::LoadPropertyGeneric, block, byte_pc);
+                        let node =
+                            self.graph
+                                .add_node(NodeKind::LoadPropertyGeneric, block, byte_pc);
                         self.graph.set_frame_dst(node, dst);
                         self.push_body(block, node);
                         self.def_register(dst, block, node, byte_pc);
@@ -1411,12 +1416,12 @@ impl<'a> Builder<'a> {
                     // other kind deopts at the guard. Everything else keeps the
                     // generic boxed load.
                     let load_kind = match instr.element_load_kind {
-                        otter_vm::jit::JitElementLoadKind::Float64 => {
-                            Some(NodeKind::LoadElementUnboxed(recv, idx, ElementLoadKind::Float64))
-                        }
-                        otter_vm::jit::JitElementLoadKind::Int32 => {
-                            Some(NodeKind::LoadElementUnboxed(recv, idx, ElementLoadKind::Int32))
-                        }
+                        otter_vm::jit::JitElementLoadKind::Float64 => Some(
+                            NodeKind::LoadElementUnboxed(recv, idx, ElementLoadKind::Float64),
+                        ),
+                        otter_vm::jit::JitElementLoadKind::Int32 => Some(
+                            NodeKind::LoadElementUnboxed(recv, idx, ElementLoadKind::Int32),
+                        ),
                         otter_vm::jit::JitElementLoadKind::Any => None,
                     };
                     let load = self.graph.add_node(
@@ -2768,11 +2773,9 @@ impl<'a> Builder<'a> {
                         .get(&instr.byte_pc)
                         .copied()
                         .unwrap_or(method.recv_shape);
-                    let checked_obj = self.graph.add_node(
-                        NodeKind::CheckShape(obj, guard_shape),
-                        block,
-                        call_pc,
-                    );
+                    let checked_obj =
+                        self.graph
+                            .add_node(NodeKind::CheckShape(obj, guard_shape), block, call_pc);
                     self.push_body(block, checked_obj);
                     let load = self.graph.add_node(
                         NodeKind::LoadSlot(checked_obj, slot_byte),
@@ -2798,11 +2801,9 @@ impl<'a> Builder<'a> {
                         .get(&instr.byte_pc)
                         .copied()
                         .unwrap_or(method.recv_shape);
-                    let checked_obj = self.graph.add_node(
-                        NodeKind::CheckShape(obj, guard_shape),
-                        block,
-                        call_pc,
-                    );
+                    let checked_obj =
+                        self.graph
+                            .add_node(NodeKind::CheckShape(obj, guard_shape), block, call_pc);
                     self.push_body(block, checked_obj);
                     let store = self.graph.add_node(
                         NodeKind::StoreSlot(checked_obj, slot_byte, value),
@@ -3195,8 +3196,10 @@ impl<'a> Builder<'a> {
             self.graph.blocks.push(super::ir::Block::new(pc));
         }
         self.graph.blocks.push(super::ir::Block::new(call_pc));
-        self.current_def
-            .resize(base as usize + usize::from(method.register_count), Default::default());
+        self.current_def.resize(
+            base as usize + usize::from(method.register_count),
+            Default::default(),
+        );
         let off = |r: u16| -> u16 { base + r };
         let gblock = |cb: BlockId| -> BlockId { blocks0 as BlockId + cb };
 
@@ -3237,7 +3240,9 @@ impl<'a> Builder<'a> {
             let node = if (r as usize) < argc {
                 args[r as usize]
             } else {
-                let u = self.graph.add_node(NodeKind::ConstUndefined, entry_g, call_pc);
+                let u = self
+                    .graph
+                    .add_node(NodeKind::ConstUndefined, entry_g, call_pc);
                 self.push_body(entry_g, u);
                 u
             };
@@ -3509,7 +3514,10 @@ impl<'a> Builder<'a> {
                         let obj_reg = reg(operands, 1)?;
                         let obj = self.read_variable(off(obj_reg), g);
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
-                            bail_cfg!("no baked prop offset for load/store at callee pc {}", instr.byte_pc);
+                            bail_cfg!(
+                                "no baked prop offset for load/store at callee pc {}",
+                                instr.byte_pc
+                            );
                         };
                         // A non-receiver access guards the monomorphic shape it
                         // observed. A receiver access is already proven by the
@@ -3518,7 +3526,9 @@ impl<'a> Builder<'a> {
                         // spliced block — so it needs no second guard; an aliased
                         // receiver keeps a redundant receiver-shape guard.
                         let checked = if let Some(&shape) = method.prop_shapes.get(&instr.byte_pc) {
-                            let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                            let c =
+                                self.graph
+                                    .add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
                             self.push_body(g, c);
                             c
                         } else if obj == recv {
@@ -3581,13 +3591,21 @@ impl<'a> Builder<'a> {
                             self.graph.node(value).kind.repr(),
                             Repr::Int32 | Repr::Float64 | Repr::Tagged
                         ) {
-                            bail_cfg!("store value repr {:?} unsupported", self.graph.node(value).kind.repr());
+                            bail_cfg!(
+                                "store value repr {:?} unsupported",
+                                self.graph.node(value).kind.repr()
+                            );
                         }
                         let Some(&slot_byte) = method.prop_offsets.get(&instr.byte_pc) else {
-                            bail_cfg!("no baked prop offset for load/store at callee pc {}", instr.byte_pc);
+                            bail_cfg!(
+                                "no baked prop offset for load/store at callee pc {}",
+                                instr.byte_pc
+                            );
                         };
                         let checked = if let Some(&shape) = method.prop_shapes.get(&instr.byte_pc) {
-                            let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                            let c =
+                                self.graph
+                                    .add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
                             self.push_body(g, c);
                             c
                         } else if obj == recv {
@@ -3612,23 +3630,37 @@ impl<'a> Builder<'a> {
                         let dst = reg(operands, 0)?;
                         let lhs = self.read_variable(off(reg(operands, 1)?), g);
                         let rhs = self.read_variable(off(reg(operands, 2)?), g);
-                        let node = match self
-                            .arith_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
-                        {
+                        let node = match self.arith_node_binop(
+                            g,
+                            op,
+                            lhs,
+                            rhs,
+                            instr.arith_feedback,
+                            call_pc,
+                        ) {
                             Ok(node) => node,
                             Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
                         };
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
                     }
-                    Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr
+                    Op::BitwiseOr
+                    | Op::BitwiseAnd
+                    | Op::BitwiseXor
+                    | Op::Shl
+                    | Op::Shr
                     | Op::Ushr => {
                         let dst = reg(operands, 0)?;
                         let lhs = self.read_variable(off(reg(operands, 1)?), g);
                         let rhs = self.read_variable(off(reg(operands, 2)?), g);
-                        let node = match self
-                            .bitwise_node_binop(g, op, lhs, rhs, instr.arith_feedback, call_pc)
-                        {
+                        let node = match self.bitwise_node_binop(
+                            g,
+                            op,
+                            lhs,
+                            rhs,
+                            instr.arith_feedback,
+                            call_pc,
+                        ) {
                             Ok(node) => node,
                             Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
                         };
@@ -3645,11 +3677,17 @@ impl<'a> Builder<'a> {
                         };
                         let step = self.graph.add_node(NodeKind::ConstInt32(delta), g, call_pc);
                         self.push_body(g, step);
-                        let node =
-                            match self.arith_node_binop(g, Op::Add, src, step, instr.arith_feedback, call_pc) {
-                                Ok(node) => node,
-                                Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
-                            };
+                        let node = match self.arith_node_binop(
+                            g,
+                            Op::Add,
+                            src,
+                            step,
+                            instr.arith_feedback,
+                            call_pc,
+                        ) {
+                            Ok(node) => node,
+                            Err(_) => bail_cfg!("op {:?} not lowerable (feedback?)", op),
+                        };
                         self.push_body(g, node);
                         self.write_variable(off(dst), g, node);
                     }
@@ -3699,7 +3737,8 @@ impl<'a> Builder<'a> {
                             && !self.is_boxed_bool(cond_node, &mut FxHashSet::default())
                         {
                             let check =
-                                self.graph.add_node(NodeKind::CheckBool(cond_node), g, call_pc);
+                                self.graph
+                                    .add_node(NodeKind::CheckBool(cond_node), g, call_pc);
                             self.push_body(g, check);
                             cond_node = check;
                         }
@@ -3978,8 +4017,10 @@ impl<'a> Builder<'a> {
             let pc = nested.instructions[start].byte_pc;
             self.graph.blocks.push(super::ir::Block::new(pc));
         }
-        self.current_def
-            .resize(nbase as usize + usize::from(nested.register_count), Default::default());
+        self.current_def.resize(
+            nbase as usize + usize::from(nested.register_count),
+            Default::default(),
+        );
         let noff = |r: u16| -> u16 { nbase + r };
         let ngblock = |cb: BlockId| -> BlockId { nblocks0 as BlockId + cb };
 
@@ -4013,12 +4054,17 @@ impl<'a> Builder<'a> {
         self.push_body(n_entry, ident);
         let method_closure = if nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
             let node = if nested.method_on_receiver {
-                let checked =
-                    self.graph
-                        .add_node(NodeKind::CheckShape(recv2, nested.recv_shape), n_entry, call_pc);
+                let checked = self.graph.add_node(
+                    NodeKind::CheckShape(recv2, nested.recv_shape),
+                    n_entry,
+                    call_pc,
+                );
                 self.push_body(n_entry, checked);
-                self.graph
-                    .add_node(NodeKind::LoadSlot(checked, nested.method_value_byte), n_entry, call_pc)
+                self.graph.add_node(
+                    NodeKind::LoadSlot(checked, nested.method_value_byte),
+                    n_entry,
+                    call_pc,
+                )
             } else {
                 self.graph.add_node(
                     NodeKind::LoadProtoSlot {
@@ -4040,7 +4086,9 @@ impl<'a> Builder<'a> {
             let node = if (r as usize) < args2.len() {
                 args2[r as usize]
             } else {
-                let u = self.graph.add_node(NodeKind::ConstUndefined, n_entry, call_pc);
+                let u = self
+                    .graph
+                    .add_node(NodeKind::ConstUndefined, n_entry, call_pc);
                 self.push_body(n_entry, u);
                 u
             };
@@ -4129,7 +4177,6 @@ impl<'a> Builder<'a> {
         self.fill_spliced_blocks(&n_splice, returns, pending_resume)
     }
 
-
     /// Name the first structural reason a nested method cannot be spliced as a
     /// linear leaf, for the inline trace. Mirrors the eligibility gates in
     /// [`Self::splice_nested_leaf`] (single straight-line block, no nested call,
@@ -4153,7 +4200,11 @@ impl<'a> Builder<'a> {
                 };
             }
         }
-        if nested.instructions.iter().any(|i| i.op == Op::CallMethodValue) {
+        if nested
+            .instructions
+            .iter()
+            .any(|i| i.op == Op::CallMethodValue)
+        {
             return "callee has a nested call (depth-2)";
         }
         if nested
@@ -4233,8 +4284,10 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
         let base2 = base2 as u16;
-        self.current_def
-            .resize(base2 as usize + usize::from(nested.register_count), Default::default());
+        self.current_def.resize(
+            base2 as usize + usize::from(nested.register_count),
+            Default::default(),
+        );
         let off2 = |r: u16| -> u16 { base2 + r };
 
         let ident = self.graph.add_node(
@@ -4256,8 +4309,11 @@ impl<'a> Builder<'a> {
                     self.graph
                         .add_node(NodeKind::CheckShape(recv2, nested.recv_shape), g, call_pc);
                 self.push_body(g, checked);
-                self.graph
-                    .add_node(NodeKind::LoadSlot(checked, nested.method_value_byte), g, call_pc)
+                self.graph.add_node(
+                    NodeKind::LoadSlot(checked, nested.method_value_byte),
+                    g,
+                    call_pc,
+                )
             } else {
                 self.graph.add_node(
                     NodeKind::LoadProtoSlot {
@@ -4376,15 +4432,19 @@ impl<'a> Builder<'a> {
                         return Ok(None);
                     };
                     let checked = if let Some(&shape) = nested.prop_shapes.get(&instr.byte_pc) {
-                        let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                        let c = self
+                            .graph
+                            .add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
                         self.push_body(g, c);
                         c
                     } else if obj == recv2 {
                         recv2
                     } else {
-                        let c = self
-                            .graph
-                            .add_node(NodeKind::CheckShape(obj, nested.recv_shape), g, call_pc);
+                        let c = self.graph.add_node(
+                            NodeKind::CheckShape(obj, nested.recv_shape),
+                            g,
+                            call_pc,
+                        );
                         self.push_body(g, c);
                         c
                     };
@@ -4407,21 +4467,27 @@ impl<'a> Builder<'a> {
                         return Ok(None);
                     };
                     let checked = if let Some(&shape) = nested.prop_shapes.get(&instr.byte_pc) {
-                        let c = self.graph.add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
+                        let c = self
+                            .graph
+                            .add_node(NodeKind::CheckShape(obj, shape), g, call_pc);
                         self.push_body(g, c);
                         c
                     } else if obj == recv2 {
                         recv2
                     } else {
-                        let c = self
-                            .graph
-                            .add_node(NodeKind::CheckShape(obj, nested.recv_shape), g, call_pc);
+                        let c = self.graph.add_node(
+                            NodeKind::CheckShape(obj, nested.recv_shape),
+                            g,
+                            call_pc,
+                        );
                         self.push_body(g, c);
                         c
                     };
-                    let store =
-                        self.graph
-                            .add_node(NodeKind::StoreSlot(checked, slot_byte, value), g, call_pc);
+                    let store = self.graph.add_node(
+                        NodeKind::StoreSlot(checked, slot_byte, value),
+                        g,
+                        call_pc,
+                    );
                     self.push_body(g, store);
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div => {

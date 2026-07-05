@@ -1029,12 +1029,14 @@ pub fn read_short_flat_latin1(
     handle: JsStringHandle,
     out: &mut [u8; 32],
 ) -> Option<usize> {
-    heap.read_payload(handle, |body| match flat_content(&body.repr, body.len as usize) {
-        Some(FlatContent::Latin1(bytes)) if bytes.len() <= out.len() => {
-            out[..bytes.len()].copy_from_slice(bytes);
-            Some(bytes.len())
+    heap.read_payload(handle, |body| {
+        match flat_content(&body.repr, body.len as usize) {
+            Some(FlatContent::Latin1(bytes)) if bytes.len() <= out.len() => {
+                out[..bytes.len()].copy_from_slice(bytes);
+                Some(bytes.len())
+            }
+            _ => None,
         }
-        _ => None,
     })
 }
 

@@ -1000,7 +1000,12 @@ pub struct InlineResume {
 
 impl Graph {
     /// Construct an empty graph with a single (entry) block at byte-PC 0.
-    pub(super) fn new(function_id: u32, param_count: u16, register_count: u16, entry: BlockId) -> Self {
+    pub(super) fn new(
+        function_id: u32,
+        param_count: u16,
+        register_count: u16,
+        entry: BlockId,
+    ) -> Self {
         Self {
             nodes: Vec::new(),
             blocks: vec![Block::new(0)],

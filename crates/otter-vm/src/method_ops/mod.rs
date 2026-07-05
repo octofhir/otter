@@ -738,12 +738,9 @@ impl Interpreter {
                     0,
                 )? {
                     VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                        context,
-                        &getter,
-                        recv_value,
-                        SmallVec::new(),
-                    )?,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        self.run_callable_sync(context, &getter, recv_value, SmallVec::new())?
+                    }
                 };
                 if self.is_callable_runtime(&method) {
                     stack[top_idx].advance_pc(self.current_byte_len)?;

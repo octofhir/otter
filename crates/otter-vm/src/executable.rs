@@ -382,6 +382,12 @@ pub(crate) struct ExecutableFunction {
     /// records the closure (and acquires a cold frame for it) only when this is
     /// set — leaf functions and most callbacks skip it entirely.
     pub(crate) makes_function: bool,
+    /// `true` when this function body makes no nested JS call / construct — a
+    /// leaf. The frameless direct-method call (register-CC window, no HoltStack
+    /// frame) is only sound for a leaf callee: a nested call reads
+    /// `JitCtx.frame_index` to find its own frame's registers, but a frameless
+    /// callee has no such frame, so a non-leaf callee must stay on the bridge.
+    pub(crate) is_leaf: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
     /// Arguments object shape requested by the compiler.
@@ -507,9 +513,35 @@ impl ExecutableFunction {
             .code
             .iter()
             .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
+        // A leaf body makes no nested JS call / construct. Conservative: any
+        // call- or construct-style opcode (including native builtin calls that
+        // may re-enter the VM) disqualifies it. Used to gate the frameless
+        // register-CC direct-method call to callees that never need a frame.
+        let is_leaf = !function.code.iter().any(|instr| {
+            matches!(
+                instr.op,
+                Op::Call
+                    | Op::CallMethodValue
+                    | Op::CallWithThis
+                    | Op::CallSpread
+                    | Op::TailCall
+                    | Op::New
+                    | Op::NewSpread
+                    | Op::SuperConstructSpread
+                    | Op::PromiseCall
+                    | Op::PromiseNew
+                    | Op::MathCall
+                    | Op::BigIntCall
+                    | Op::ArrayBufferCall
+                    | Op::SharedArrayBufferCall
+                    | Op::DataViewCall
+                    | Op::ArrayConstruct
+            )
+        });
         Self {
             id: function.id,
             makes_function,
+            is_leaf,
             param_count: function.param_count,
             register_count,
             own_upvalue_count: function.own_upvalue_count,

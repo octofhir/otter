@@ -2872,12 +2872,21 @@ impl Interpreter {
         entry_addr: usize,
         register_count: u32,
         upvalues_ptr: usize,
+        // `true` when the callee allocates no OWN upvalue cells
+        // (`own_upvalue_count == 0`): the callee's spine is exactly its captured
+        // spine, so the emitted call can pass a closure's live spine (or the
+        // baked plain-fn value) verbatim without the bridge's
+        // `build_upvalues_for_exec`. A callee that builds own cells stays on the
+        // bridge.
+        frameless_upvalues_ok: bool,
     ) {
-        // Accept the plain-function method value or a closure singleton that
-        // resolves to the same callee. A closure method is cached (and served) by
-        // the Rust fast path via `method_value` identity; only a bare, upvalue-free
-        // function is additionally eligible for the asm flat-table link below.
+        // A closure method is eligible for the bridge-free asm flat-table link
+        // (machine-code callee window + branch to the compiled entry, no VM frame
+        // build) when it builds no own upvalue cells — the emitted call reads its
+        // captured spine LIVE from the resolved closure body. A bare function is
+        // always eligible.
         let method_is_plain_function = method == Value::function(function_id);
+        let asm_link_eligible = method_is_plain_function || frameless_upvalues_ok;
         // A closure method only caches at a monomorphic site. A polymorphic receiver
         // family (one `arr[i].run()` site over sibling classes) exposes no single
         // stable own/direct-prototype stub to cache, so the shape-walk loop below
@@ -2889,18 +2898,6 @@ impl Interpreter {
         {
             return;
         }
-        // Eligible for the bridge-free asm flat-table link (machine-code callee
-        // window + branch to the compiled entry, no VM frame build): a bare
-        // function, OR an upvalue-free closure — the common monomorphic
-        // class-method shape `obj.run(x){ return x + this.k }` that reached here
-        // through the mono gate above. The link bakes `upvalues_ptr` (0 for an
-        // empty spine, never dereferenced by an upvalue-free callee) and
-        // plain-function SELF bits, unused unless the callee is `makes_function`
-        // (rejected upstream). A capturing closure keeps the empty flat slot and
-        // is served by the Rust fast path. This stays MONO-only (the gate above),
-        // so a megamorphic site — where the flat-table walk loses to the bridge —
-        // is untouched.
-        let asm_link_eligible = method_is_plain_function || upvalues_ptr == 0;
         let method_fid = method
             .as_function()
             .or_else(|| method.as_closure(&self.gc_heap).map(|c| c.function_id()));
@@ -2961,10 +2958,14 @@ impl Interpreter {
             // guard and method-slot byte offset for the identity walk, plus the
             // callee entry / window / SELF / upvalue-spine the emitted call needs.
             let cv = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-            // The asm flat-table link bakes a raw `upvalues_ptr` and plain-function
-            // SELF bits, so it is only sound for an upvalue-free function method. A
-            // closure method leaves the flat slot EMPTY (the asm guard bails to the
-            // Rust stub, which serves it from the cache with the live spine).
+            // SELF bits = the resolved method value (closure or bare function);
+            // `makes_function` callees are rejected upstream so SELF is never
+            // read, but keeping it exact is free. The baked `upvalues_ptr` is used
+            // only when the runtime method is a bare function (`fid_immediate`
+            // emit path); a closure hit reads its spine LIVE, so it is inert for a
+            // closure. A closure that builds OWN upvalue cells is not
+            // `asm_link_eligible` and keeps the empty slot (bridge).
+            let self_closure_bits = method.to_bits();
             let inline = if !asm_link_eligible {
                 JitDirectMethodInline::EMPTY
             } else {
@@ -2977,7 +2978,7 @@ impl Interpreter {
                         method_on_receiver: 1,
                         method_value_byte: u32::from(h.slot) * cv,
                         method_fid: function_id,
-                        self_closure_bits: Value::function(function_id).to_bits(),
+                        self_closure_bits,
                         upvalues_ptr,
                     },
                     JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
@@ -2989,7 +2990,7 @@ impl Interpreter {
                             method_on_receiver: 0,
                             method_value_byte: u32::from(prototype_hit.slot) * cv,
                             method_fid: function_id,
-                            self_closure_bits: Value::function(function_id).to_bits(),
+                            self_closure_bits,
                             upvalues_ptr,
                         }
                     }
@@ -3160,6 +3161,11 @@ impl Interpreter {
         } else {
             parent_upvalues.as_ptr() as usize
         };
+        // Frameless closure eligibility: (1) builds no own upvalue cells, so its
+        // captured spine passes verbatim (no `build_upvalues_for_exec`), and
+        // (2) is a leaf — a non-leaf callee's nested call would read a
+        // `JitCtx.frame_index` frame the frameless callee does not own.
+        let frameless_upvalues_ok = function.own_upvalue_count == 0 && function.is_leaf;
         self.install_jit_direct_method_cache(
             site,
             obj,
@@ -3170,6 +3176,7 @@ impl Interpreter {
             plan.entry_addr,
             u32::from(plan.register_count),
             upvalues_ptr,
+            frameless_upvalues_ok,
         );
 
         self.enter_sync_reentry()?;

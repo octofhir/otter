@@ -4648,6 +4648,27 @@ mod arm64 {
                 }
                 Ok(())
             }
+            NodeKind::LoadGlobalCell { cell_offset } => {
+                // The global lexical binding lives in a permanent, non-moving
+                // old-space cell, so `cage_base + cell_offset` is a stable
+                // absolute address of the cell body — one load reads its value
+                // with no bridge, name hash, or live-set spill. A TDZ hole (an
+                // uninitialized read) deopts to the interpreter, which re-runs
+                // the bytecode and raises the spec `ReferenceError`.
+                let exit = deopt_exit_label(ops, frames, deopt_labels, nid)?;
+                let cell_addr = view.cage_base as u64 + u64::from(*cell_offset);
+                emit_load_u64(ops, 16, cell_addr);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr X(box_scratch), [x16, UPVALUE_VALUE_OFFSET]
+                );
+                emit_load_u64(ops, MOVE_SCRATCH, VALUE_HOLE);
+                dynasm!(ops ; .arch aarch64 ; cmp X(box_scratch), X(MOVE_SCRATCH) ; b.eq =>exit);
+                if let Some(loc) = dst {
+                    store_loc(ops, loc, box_scratch);
+                }
+                Ok(())
+            }
             NodeKind::LoadUpvalue(idx) => {
                 let idx =
                     u32::try_from(*idx).map_err(|_| Unsupported::OperandShape("upvalue index"))?;
@@ -5405,6 +5426,7 @@ mod tests {
                 property_proto_feedback: None,
                 object_literal: None,
                 element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                global_lex_cell: None,
                 arith_feedback: *fb,
             })
             .collect();

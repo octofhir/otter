@@ -650,6 +650,18 @@ pub struct JitInstrView {
     /// [`JitElementLoadKind::Any`] (the default) keeps the generic boxed load.
     /// Baked by `Interpreter::bake_element_load_kind`.
     pub element_load_kind: JitElementLoadKind,
+    /// For a `LoadGlobalOrThrow` site whose free identifier resolves to a
+    /// global declarative-record (lexical) cell, the cell's compressed `Gc`
+    /// offset. The optimizing tier bakes `cage_base + offset` and reads the
+    /// cell's value inline (one load + a TDZ-hole guard) instead of calling the
+    /// per-access global-load bridge, which re-decodes the operand, hashes the
+    /// name, and spills/reloads the live set around a full VM reentry. `None`
+    /// when the name is not a lexical binding (a `var` / global-object property,
+    /// left to the bridge) or the binding was unbound at compile time. The cell
+    /// is a permanent, non-moving old-space allocation rooted by
+    /// `global_lexicals`, so the baked offset stays valid for the code's life.
+    /// Baked by `Interpreter::bake_global_lex_cells`.
+    pub global_lex_cell: Option<u32>,
 }
 
 /// Native representation an observed `LoadElement` site can produce unboxed.

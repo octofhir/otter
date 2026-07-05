@@ -493,6 +493,7 @@ fn can_deopt(kind: &NodeKind) -> bool {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadGlobalCell { .. }
             | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::StoreGlobalBinding { .. }
@@ -968,6 +969,7 @@ mod tests {
                 property_proto_feedback: None,
                 object_literal: None,
                 element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                global_lex_cell: None,
                 arith_feedback: *fb,
             })
             .collect();

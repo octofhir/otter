@@ -261,6 +261,18 @@ pub enum NodeKind {
     /// call site: live values are materialized into the frame before entry and
     /// reloaded after. Result [`Repr::Tagged`].
     LoadGlobalOrThrow,
+    /// Read a `LoadGlobalOrThrow` whose free identifier resolves to a global
+    /// declarative-record (lexical) cell, baked to the cell's compressed offset.
+    /// Lowered inline: `cage_base + cell_offset` addresses the permanent,
+    /// non-moving cell body, one load reads its `Value`, and a TDZ-hole guard
+    /// deopts to the interpreter (which re-runs the bytecode and throws the
+    /// proper `ReferenceError` on the rare uninitialized read). No frame
+    /// materialize/reload, no name hash, no bridge. Result [`Repr::Tagged`].
+    LoadGlobalCell {
+        /// Compressed `Gc` offset of the resolved global lexical cell; the
+        /// emitter reads `[cage_base + cell_offset + value_field]`.
+        cell_offset: u32,
+    },
     /// Read a property through the full runtime `[[Get]]` path for a site with no
     /// inline-cacheable shape feedback (a cold site never warmed at compile time,
     /// or a polymorphic / megamorphic miss). The helper re-decodes the destination
@@ -620,6 +632,7 @@ impl NodeKind {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadGlobalCell { .. }
             | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::LoadThis
@@ -705,6 +718,7 @@ impl NodeKind {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadGlobalCell { .. }
             | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::Param(_)
@@ -786,6 +800,7 @@ impl NodeKind {
             | NodeKind::NewArray
             | NodeKind::LoadString
             | NodeKind::LoadGlobalOrThrow
+            | NodeKind::LoadGlobalCell { .. }
             | NodeKind::LoadPropertyGeneric
             | NodeKind::StorePropertyGeneric
             | NodeKind::Call { .. }

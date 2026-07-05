@@ -463,6 +463,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
         call_byte_pc,
         site as usize,
         &all[..argc],
+        ctx.regs.cast::<otter_vm::Value>().cast_const(),
     ) {
         Ok(Some(prepared)) => {
             ctx.direct_entry_addr = prepared.entry_addr;

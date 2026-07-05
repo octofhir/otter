@@ -778,6 +778,20 @@ impl Interpreter {
             }
             return Ok(None);
         }
+        if target.is_intl() {
+            if let Some(bag) = self.non_gc_exotic_user_props(&target) {
+                if let Some(name) = key.string_name() {
+                    if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, name) {
+                        return Ok(Some(desc));
+                    }
+                } else if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
+                {
+                    return Ok(Some(desc));
+                }
+            }
+            return Ok(None);
+        }
         let function_id = target.as_function().or_else(|| {
             target
                 .as_closure(&self.gc_heap)
@@ -1663,6 +1677,19 @@ impl Interpreter {
             // getter in the spec's conversion-fast-path tests) lands on
             // the lazy expando bag.
             let bag = crate::property_dispatch::temporal_ensure_expando_pub(&mut self.gc_heap, &t)?;
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(bag, k, descriptor)?
+            });
+        }
+        if target.is_intl() {
+            let Some(bag) = self.ensure_non_gc_exotic_user_props(target)? else {
+                return Ok(false);
+            };
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
             } else {
@@ -4316,12 +4343,38 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        if let Some(intl) = base.as_intl(&self.gc_heap) {
+        if base.as_intl(&self.gc_heap).is_some() {
+            if let Some(bag) = self.non_gc_exotic_user_props(&base) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(getter) if abstract_ops::is_callable(&getter) => {
+                                VmGetOutcome::InvokeGetter { getter }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
+            }
             // ECMA-402: an `Intl.<Kind>` instance inherits its methods
-            // from `Intl.<Kind>.prototype`. The instance carries no
-            // own-property storage, so resolution walks straight to the
-            // kind prototype installed by `crate::intl::bootstrap`.
-            let proto = self.intl_kind_prototype_value(intl.kind().class_name());
+            // from its actual `[[Prototype]]`, including subclass
+            // prototype overrides selected by `new.target`.
+            let proto = self.get_prototype_for_op(&base)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
             }
@@ -5762,6 +5815,73 @@ impl Interpreter {
             let same_receiver = receiver
                 .as_temporal(&self.gc_heap)
                 .is_some_and(|r| r.ptr_eq(t));
+            let lookup = match key {
+                VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(bag, &self.gc_heap, *sym),
+                _ => object::lookup_own(
+                    bag,
+                    &self.gc_heap,
+                    key.string_name()
+                        .expect("non-symbol key has string spelling"),
+                ),
+            };
+            match lookup {
+                object::PropertyLookup::Data { flags, .. } => {
+                    if !flags.writable() {
+                        return Ok(false);
+                    }
+                    if !same_receiver {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    if let VmPropertyKey::Symbol(sym) = key {
+                        object::set_symbol(bag, &mut self.gc_heap, *sym, value);
+                    } else {
+                        object::set(
+                            &mut bag,
+                            &mut self.gc_heap,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            value,
+                        );
+                    }
+                    return Ok(true);
+                }
+                object::PropertyLookup::Accessor { setter, .. } => {
+                    let Some(setter) = setter else {
+                        return Ok(false);
+                    };
+                    let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    return Ok(true);
+                }
+                object::PropertyLookup::Absent => {
+                    let parent = self.get_prototype_for_op(&target)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    return self.ordinary_set_data_value(
+                        context,
+                        parent,
+                        key,
+                        value,
+                        receiver,
+                        hops + 1,
+                    );
+                }
+            }
+        }
+        if let Some(target_intl) = target.as_intl(&self.gc_heap) {
+            // ECMA-402 service objects have internal slots plus normal
+            // ordinary own properties. The internal slots live in a
+            // non-GC payload, so user properties are stored in a lazy
+            // side-table bag and the prototype walk remains ordinary.
+            let Some(mut bag) = self.ensure_non_gc_exotic_user_props(&target)? else {
+                return Ok(false);
+            };
+            let same_receiver = receiver
+                .as_intl(&self.gc_heap)
+                .is_some_and(|receiver_intl| {
+                    receiver_intl.identity_addr() == target_intl.identity_addr()
+                });
             let lookup = match key {
                 VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(bag, &self.gc_heap, *sym),
                 _ => object::lookup_own(

@@ -89,6 +89,7 @@ icu_datetime = { version = "2.1", features = ["compiled_data"] }
 icu_locale   = { version = "2.1", features = ["compiled_data"] }
 icu_calendar = { version = "2.1", features = ["compiled_data"] }
 icu_time     = { version = "2.1", features = ["compiled_data"] }
+icu_list     = { version = "2.2", features = ["compiled_data"] }
 icu_experimental = { version = "0.5", features = ["compiled_data"] }
 fixed_decimal = "0.7"
 writeable     = "0.6"

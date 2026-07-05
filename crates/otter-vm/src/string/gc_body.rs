@@ -106,6 +106,13 @@ pub enum JsStringBodyRepr {
     },
 }
 
+/// Materialising a large rope / Latin-1 body into `Vec<u16>` is O(len).
+/// Subjects re-scanned many times (a `/g` regex `exec` loop re-widens the
+/// same subject on every match) amortise that once via
+/// [`JsStringBody::utf16_cache`]. Below this length the widen is cheap
+/// enough that caching only wastes memory, so small strings stay uncached.
+const UTF16_CACHE_MIN_LEN: u32 = 256;
+
 /// GC-managed JavaScript string body.
 #[derive(Debug)]
 pub struct JsStringBody {
@@ -118,10 +125,16 @@ pub struct JsStringBody {
     pub hash: u64,
     /// Variant-specific payload.
     pub repr: JsStringBodyRepr,
+    /// Lazily-filled widened UTF-16 units for large subjects. String
+    /// content is immutable (representation may collapse rope→flat, but the
+    /// code units never change), so once filled the buffer stays valid for
+    /// the body's lifetime and moves with it under GC. Not traced: it holds
+    /// plain `u16` data, no GC handles.
+    utf16_cache: std::cell::OnceCell<Box<[u16]>>,
 }
 
 const _: () = assert!(std::mem::size_of::<JsStringBodyRepr>() <= 32);
-const _: () = assert!(std::mem::size_of::<JsStringBody>() <= 48);
+const _: () = assert!(std::mem::size_of::<JsStringBody>() <= 64);
 
 impl JsStringBody {
     /// Stable interner identity.
@@ -217,6 +230,7 @@ pub fn alloc_flat_string_body_with_roots(
             len,
             hash,
             repr,
+            utf16_cache: std::cell::OnceCell::new(),
         },
         external_visit,
     )
@@ -248,6 +262,7 @@ pub fn alloc_latin1_string_body_with_roots(
             len,
             hash,
             repr,
+            utf16_cache: std::cell::OnceCell::new(),
         },
         external_visit,
     )
@@ -372,6 +387,7 @@ pub fn concat_string_bodies(
                 right,
                 depth: final_depth,
             },
+            utf16_cache: std::cell::OnceCell::new(),
         },
         external_visit,
     )
@@ -450,6 +466,7 @@ pub fn slice_string_body(
                         parent: string,
                         start,
                     },
+                    utf16_cache: std::cell::OnceCell::new(),
                 },
                 external_visit,
             )
@@ -497,6 +514,7 @@ pub fn slice_string_body(
                         parent,
                         start: abs_start,
                     },
+                    utf16_cache: std::cell::OnceCell::new(),
                 },
                 external_visit,
             )
@@ -687,8 +705,57 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
 
 /// Materialise a string body into a fresh `Vec<u16>` of UTF-16 code
 /// units. Cold path: hot lookups should compare handles / ids.
+///
+/// Large subjects (≥ [`UTF16_CACHE_MIN_LEN`]) memoise their widened units
+/// on the body's [`JsStringBody::utf16_cache`], so repeated materialisation
+/// (a `/g` regex `exec` loop re-scanning the same subject on every match)
+/// serves a `memcpy` from the cache instead of re-walking the rope /
+/// re-widening Latin-1 on every call.
 #[must_use]
 pub fn to_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
+    materialize_utf16_vec(heap, string)
+}
+
+/// Ensure a large subject's widened UTF-16 units are cached on its body,
+/// then run `f` over a borrow of them. Repeated calls (a `/g` regex `exec`
+/// loop re-scanning the same subject on every match) reuse the buffer, so
+/// only the first call walks the rope / widens Latin-1 — every later call is
+/// O(1) plus whatever `f` copies out. Small subjects skip the cache and
+/// materialise a throwaway `Vec` (the widen is cheap, the memory is not
+/// worth it).
+///
+/// The borrow handed to `f` is valid only for the call. `f` MUST NOT trigger
+/// a heap allocation that could move this body (the borrow would dangle);
+/// callers needing the units across an allocation copy the required ranges
+/// out inside `f` first. Reading other bodies (e.g. the compiled regex) is
+/// fine — that is a shared borrow, not a mutation.
+pub fn with_utf16<R>(heap: &GcHeap, string: JsStringHandle, f: impl FnOnce(&[u16]) -> R) -> R {
+    let len = heap.read_payload(string, |b| b.len);
+    if len < UTF16_CACHE_MIN_LEN {
+        let units = materialize_utf16_vec(heap, string);
+        return f(&units);
+    }
+    // Fill the cache in a scope that holds no live borrow of the units, so
+    // the fill's own body walk cannot alias the borrow handed to `f`.
+    let unfilled = heap.read_payload(string, |b| b.utf16_cache.get().is_none());
+    if unfilled {
+        let widened = materialize_utf16_vec(heap, string).into_boxed_slice();
+        // No allocation happened since the read above; the handle still
+        // resolves to the same body. `set` only races a reentrant fill,
+        // impossible on the single-threaded isolate.
+        heap.read_payload(string, |b| {
+            let _ = b.utf16_cache.set(widened);
+        });
+    }
+    heap.read_payload(string, |b| {
+        f(b.utf16_cache
+            .get()
+            .expect("utf16_cache filled above for large subject"))
+    })
+}
+
+/// Uncached body walk backing [`to_utf16_vec`]. Always re-materialises.
+fn materialize_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
     let len = heap.read_payload(string, |b| b.len);
     let mut out: Vec<u16> = Vec::with_capacity(len as usize);
     let mut stack: Vec<(JsStringHandle, u32, u32)> = Vec::new();

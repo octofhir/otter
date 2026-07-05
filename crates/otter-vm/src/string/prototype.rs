@@ -17,9 +17,10 @@
 //!   ergonomics on a few methods) string-encoded indices.
 //! - `indexOf` polls the runtime interrupt flag every
 //!   [`crate::string::INDEX_OF_INTERRUPT_BUDGET`] iterations.
-//! - `toLowerCase` / `toUpperCase` are **ASCII-only**. Full Unicode
-//!   case folding is deferred until ICU integration; non-ASCII code
-//!   units pass through unchanged.
+//! - `toLowerCase` / `toUpperCase` use Unicode default case mappings
+//!   plus Final_Sigma; locale variants validate the requested locale
+//!   list and apply the Turkic/Lithuanian SpecialCasing rules covered
+//!   by ECMA-402.
 //! - `replace` / `replaceAll` / `split` / `match` / `matchAll` /
 //!   `search` run the full §22.1.3 ladder: an Object argument
 //!   delegates to its `@@replace` / `@@split` / `@@match` /
@@ -1197,6 +1198,14 @@ fn push_char_utf16(out: &mut Vec<u16>, ch: char) {
     out.extend_from_slice(ch.encode_utf16(&mut buf));
 }
 
+fn push_code_point_utf16(out: &mut Vec<u16>, cp: u32) {
+    if let Some(ch) = char::from_u32(cp) {
+        push_char_utf16(out, ch);
+    } else {
+        out.push(cp as u16);
+    }
+}
+
 /// §11.4 Cased — a letter that has a case. Approximated by the
 /// Uppercase / Lowercase derived properties exposed by `char`,
 /// which covers the cased scalars the case-mapping tests exercise
@@ -1238,6 +1247,124 @@ fn sigma_is_final(cps: &[u32], idx: usize) -> bool {
     preceded && !followed
 }
 
+fn combining_class_for_locale_case(cp: u32) -> u8 {
+    match cp {
+        0x0300 | 0x0301 | 0x0303 | 0x0307 | 0x1D185 => 230,
+        0x0323 | 0x0325 | 0x101FD => 220,
+        _ => 0,
+    }
+}
+
+fn has_turkic_dot_above_after_i(cps: &[u32], idx: usize) -> bool {
+    for &cp in cps.iter().skip(idx + 1) {
+        if cp == 0x0307 {
+            return true;
+        }
+        match combining_class_for_locale_case(cp) {
+            0 | 230 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn turkic_dot_above_is_after_i(cps: &[u32], idx: usize) -> bool {
+    for &cp in cps[..idx].iter().rev() {
+        if cp == 0x0049 {
+            return true;
+        }
+        match combining_class_for_locale_case(cp) {
+            0 | 230 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn has_more_above(cps: &[u32], idx: usize) -> bool {
+    for &cp in cps.iter().skip(idx + 1) {
+        match combining_class_for_locale_case(cp) {
+            230 => return true,
+            0 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_soft_dotted(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x0069
+            | 0x006A
+            | 0x012F
+            | 0x0249
+            | 0x0268
+            | 0x029D
+            | 0x02B2
+            | 0x03F3
+            | 0x0456
+            | 0x0458
+            | 0x1D62
+            | 0x1D96
+            | 0x1DA4
+            | 0x1DA8
+            | 0x1E2D
+            | 0x1ECB
+            | 0x2071
+            | 0x2148
+            | 0x2149
+            | 0x2C7C
+            | 0x1D422..=0x1D423
+            | 0x1D456..=0x1D457
+            | 0x1D48A..=0x1D48B
+            | 0x1D4BE..=0x1D4BF
+            | 0x1D4F2..=0x1D4F3
+            | 0x1D526..=0x1D527
+            | 0x1D55A..=0x1D55B
+            | 0x1D58E..=0x1D58F
+            | 0x1D5C2..=0x1D5C3
+            | 0x1D5F6..=0x1D5F7
+            | 0x1D62A..=0x1D62B
+            | 0x1D65E..=0x1D65F
+            | 0x1D692..=0x1D693
+    )
+}
+
+fn dot_above_is_after_soft_dotted(cps: &[u32], idx: usize) -> bool {
+    for &cp in cps[..idx].iter().rev() {
+        if is_soft_dotted(cp) {
+            return true;
+        }
+        match combining_class_for_locale_case(cp) {
+            0 | 230 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn push_default_case_mapping(out: &mut Vec<u16>, cps: &[u32], idx: usize, upper: bool) {
+    let cp = cps[idx];
+    let Some(ch) = char::from_u32(cp) else {
+        out.push(cp as u16);
+        return;
+    };
+    if !upper && cp == 0x03A3 {
+        out.push(if sigma_is_final(cps, idx) {
+            0x03C2
+        } else {
+            0x03C3
+        });
+        return;
+    }
+    if upper {
+        ch.to_uppercase().for_each(|m| push_char_utf16(out, m));
+    } else {
+        ch.to_lowercase().for_each(|m| push_char_utf16(out, m));
+    }
+}
+
 /// §22.1.3.{26,28} `toUnicodeLowercase` / `toUnicodeUppercase` over
 /// code points via the Unicode default case mappings (`char`'s
 /// `to_lowercase` / `to_uppercase`, which include the unconditional
@@ -1246,23 +1373,99 @@ fn sigma_is_final(cps: &[u32], idx: usize) -> bool {
 fn unicode_case_map(units: &[u16], upper: bool) -> Vec<u16> {
     let cps = decode_code_points(units);
     let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    for i in 0..cps.len() {
+        push_default_case_mapping(&mut out, &cps, i, upper);
+    }
+    out
+}
+
+fn locale_language_tag(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Option<String>, NativeError> {
+    let locales = args.first().copied().unwrap_or_else(Value::undefined);
+    let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
+    Ok(requested
+        .first()
+        .and_then(|locale| locale.split('-').next())
+        .map(str::to_ascii_lowercase))
+}
+
+fn locale_case_map(units: &[u16], upper: bool, language: Option<&str>) -> Vec<u16> {
+    let turkic = matches!(language, Some("tr" | "az"));
+    let lithuanian = matches!(language, Some("lt"));
+    if !turkic && !lithuanian {
+        return unicode_case_map(units, upper);
+    }
+
+    let cps = decode_code_points(units);
+    let mut out = Vec::with_capacity(units.len());
     for (i, &cp) in cps.iter().enumerate() {
-        let Some(ch) = char::from_u32(cp) else {
-            out.push(cp as u16);
-            continue;
-        };
-        if !upper && cp == 0x03A3 {
-            out.push(if sigma_is_final(&cps, i) {
-                0x03C2
+        if turkic {
+            if upper {
+                match cp {
+                    0x0069 => {
+                        out.push(0x0130);
+                        continue;
+                    }
+                    0x0131 => {
+                        out.push(0x0049);
+                        continue;
+                    }
+                    _ => {}
+                }
             } else {
-                0x03C3
-            });
-            continue;
+                if cp == 0x0307 && turkic_dot_above_is_after_i(&cps, i) {
+                    continue;
+                }
+                if cp == 0x0130 {
+                    out.push(0x0069);
+                    continue;
+                }
+                if cp == 0x0049 {
+                    out.push(if has_turkic_dot_above_after_i(&cps, i) {
+                        0x0069
+                    } else {
+                        0x0131
+                    });
+                    continue;
+                }
+            }
         }
-        if upper {
-            ch.to_uppercase().for_each(|m| push_char_utf16(&mut out, m));
+
+        if lithuanian {
+            if upper {
+                if cp == 0x0307 && dot_above_is_after_soft_dotted(&cps, i) {
+                    continue;
+                }
+            } else {
+                match cp {
+                    0x0049 | 0x004A | 0x012E if has_more_above(&cps, i) => {
+                        push_default_case_mapping(&mut out, &cps, i, false);
+                        out.push(0x0307);
+                        continue;
+                    }
+                    0x00CC => {
+                        out.extend_from_slice(&[0x0069, 0x0307, 0x0300]);
+                        continue;
+                    }
+                    0x00CD => {
+                        out.extend_from_slice(&[0x0069, 0x0307, 0x0301]);
+                        continue;
+                    }
+                    0x0128 => {
+                        out.extend_from_slice(&[0x0069, 0x0307, 0x0303]);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if char::from_u32(cp).is_some() {
+            push_default_case_mapping(&mut out, &cps, i, upper);
         } else {
-            ch.to_lowercase().for_each(|m| push_char_utf16(&mut out, m));
+            push_code_point_utf16(&mut out, cp);
         }
     }
     out
@@ -1290,6 +1493,36 @@ fn impl_to_upper_case(
     let recv = receiver_string(ctx, receiver)?;
     let units = recv.to_utf16_vec(ctx.heap_mut());
     let upper = unicode_case_map(&units, true);
+    Ok(Value::string(JsString::from_utf16_units(
+        &upper,
+        ctx.heap_mut(),
+    )?))
+}
+
+fn impl_to_locale_lower_case(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let language = locale_language_tag(ctx, args)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
+    let lowered = locale_case_map(&units, false, language.as_deref());
+    Ok(Value::string(JsString::from_utf16_units(
+        &lowered,
+        ctx.heap_mut(),
+    )?))
+}
+
+fn impl_to_locale_upper_case(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let recv = receiver_string(ctx, receiver)?;
+    let language = locale_language_tag(ctx, args)?;
+    let units = recv.to_utf16_vec(ctx.heap_mut());
+    let upper = locale_case_map(&units, true, language.as_deref());
     Ok(Value::string(JsString::from_utf16_units(
         &upper,
         ctx.heap_mut(),
@@ -2123,8 +2356,10 @@ fn intrinsic_impl(name: &str) -> Option<StringNativeFn> {
         "strike" => impl_strike,
         "sub" => impl_sub,
         "sup" => impl_sup,
-        "toLowerCase" | "toLocaleLowerCase" => impl_to_lower_case,
-        "toUpperCase" | "toLocaleUpperCase" => impl_to_upper_case,
+        "toLowerCase" => impl_to_lower_case,
+        "toLocaleLowerCase" => impl_to_locale_lower_case,
+        "toUpperCase" => impl_to_upper_case,
+        "toLocaleUpperCase" => impl_to_locale_upper_case,
         "replace" => impl_replace,
         "replaceAll" => impl_replace_all,
         "split" => impl_split,

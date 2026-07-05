@@ -69,7 +69,9 @@ pub fn resolve_ctx(
         &["lookup", "best fit"],
         None,
     )?;
-    let _numbering_system = get_numbering_system_option(ctx, options, CLASS)?;
+    let numbering_system = get_numbering_system_option(ctx, options, CLASS)?
+        .filter(|ns| crate::intl::supported::is_supported_numbering_system(ns))
+        .unwrap_or_else(|| "latn".to_string());
     let style = get_string_option(
         ctx,
         options,
@@ -321,6 +323,7 @@ pub fn resolve_ctx(
 
     Ok(NumberFormatPayload {
         locale,
+        numbering_system,
         style,
         currency,
         minimum_fraction_digits,
@@ -826,6 +829,10 @@ pub(crate) fn number_format_resolved_options(
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "resolvedOptions")?;
     let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let numbering_system = Value::string(JsString::from_str(
+        &payload.numbering_system,
+        ctx.heap_mut(),
+    )?);
     let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
     let currency_val = match &payload.currency {
         Some(c) => Some(Value::string(JsString::from_str(c, ctx.heap_mut())?)),
@@ -862,7 +869,7 @@ pub(crate) fn number_format_resolved_options(
     let use_grouping = payload.use_grouping;
     let sign_display = Value::string(JsString::from_str(&payload.sign_display, ctx.heap_mut())?);
     let notation = Value::string(JsString::from_str(&payload.notation, ctx.heap_mut())?);
-    let mut value_roots = vec![&locale, &style, &sign_display, &notation];
+    let mut value_roots = vec![&locale, &numbering_system, &style, &sign_display, &notation];
     if let Some(c) = &currency_val {
         value_roots.push(c);
     }
@@ -881,6 +888,7 @@ pub(crate) fn number_format_resolved_options(
     let mut obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
     let heap = ctx.heap_mut();
     crate::object::set(&mut obj, heap, "locale", locale);
+    crate::object::set(&mut obj, heap, "numberingSystem", numbering_system);
     crate::object::set(&mut obj, heap, "style", style);
     if let Some(c) = currency_val {
         crate::object::set(&mut obj, heap, "currency", c);

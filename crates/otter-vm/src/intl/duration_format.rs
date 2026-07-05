@@ -487,6 +487,7 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
             let np = if is_numeric {
                 NumberFormatPayload {
                     locale: payload.locale.clone(),
+                    numbering_system: "latn".to_string(),
                     style: "decimal".to_string(),
                     currency: None,
                     minimum_fraction_digits: min_frac,
@@ -502,6 +503,7 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
             } else {
                 NumberFormatPayload {
                     locale: payload.locale.clone(),
+                    numbering_system: "latn".to_string(),
                     style: "unit".to_string(),
                     currency: None,
                     minimum_fraction_digits: min_frac,
@@ -629,6 +631,7 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
             let np = if is_numeric {
                 NumberFormatPayload {
                     locale: payload.locale.clone(),
+                    numbering_system: "latn".to_string(),
                     style: "decimal".to_string(),
                     currency: None,
                     minimum_fraction_digits: min_frac,
@@ -644,6 +647,7 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
             } else {
                 NumberFormatPayload {
                     locale: payload.locale.clone(),
+                    numbering_system: "latn".to_string(),
                     style: "unit".to_string(),
                     currency: None,
                     minimum_fraction_digits: min_frac,

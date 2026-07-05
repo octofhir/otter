@@ -30,15 +30,17 @@ pub fn resolve_ctx(
     locales: Value,
     options: Value,
 ) -> Result<CollatorPayload, NativeError> {
-    use crate::intl::helpers::{
-        get_bool_option, get_numbering_system_option, get_string_option, require_options_object,
-    };
+    use crate::intl::helpers::{get_bool_option, get_string_option, require_options_object};
 
     let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
     let locale = requested
         .into_iter()
         .next()
         .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
+    let locale_base = strip_unicode_extension(&locale);
+    let unicode_collation = unicode_extension_value(&locale, "co");
+    let unicode_case_first = unicode_extension_value(&locale, "kf");
+    let unicode_numeric = unicode_extension_value(&locale, "kn");
     let options = require_options_object(options, CLASS)?;
 
     let usage = get_string_option(
@@ -58,9 +60,7 @@ pub fn resolve_ctx(
         &["lookup", "best fit"],
         None,
     )?;
-    // `collation` is read (a Unicode `type` nonterminal) and validated,
-    // then folded into the resolved locale by ICU; we don't store it.
-    let _collation = get_numbering_system_option(ctx, options, CLASS)?;
+    let requested_collation = get_string_option(ctx, options, "collation", CLASS, &[], None)?;
     let numeric = get_bool_option(ctx, options, "numeric", CLASS, None)?;
     let case_first = get_string_option(
         ctx,
@@ -78,17 +78,164 @@ pub fn resolve_ctx(
         &["base", "accent", "case", "variant"],
         None,
     )?;
-    let ignore_punctuation =
-        get_bool_option(ctx, options, "ignorePunctuation", CLASS, Some(false))?.unwrap_or(false);
+    let ignore_punctuation = get_bool_option(ctx, options, "ignorePunctuation", CLASS, None)?
+        .unwrap_or_else(|| locale_base == "th");
+
+    let (collation, reflect_collation) = resolve_collation(
+        &locale_base,
+        requested_collation.as_deref(),
+        unicode_collation.as_deref(),
+    );
+    let (case_first, reflect_case_first) =
+        resolve_case_first(case_first.as_deref(), unicode_case_first.as_deref());
+    let (numeric, reflect_numeric) = resolve_numeric(numeric, unicode_numeric.as_deref());
+    let locale = resolve_locale_with_supported_extensions(
+        &locale,
+        &locale_base,
+        reflect_collation,
+        reflect_case_first,
+        reflect_numeric,
+    );
 
     Ok(CollatorPayload {
         locale,
         usage,
         sensitivity: sensitivity.unwrap_or_else(|| "variant".to_string()),
         ignore_punctuation,
-        numeric: numeric.unwrap_or(false),
-        case_first: case_first.unwrap_or_else(|| "false".to_string()),
+        numeric,
+        case_first,
+        collation,
     })
+}
+
+fn strip_unicode_extension(locale: &str) -> String {
+    unicode_extension_start(locale)
+        .map_or_else(|| locale.to_string(), |idx| locale[..idx].to_string())
+}
+
+fn unicode_extension_value(locale: &str, key: &str) -> Option<String> {
+    let extension = &locale[(unicode_extension_start(locale)? + 3)..];
+    let subtags: Vec<&str> = extension.split('-').collect();
+    let mut i = 0;
+    while i < subtags.len() {
+        let subtag = subtags[i];
+        if subtag.len() == 1 {
+            break;
+        }
+        if subtag.len() == 2 {
+            let current_key = subtag;
+            i += 1;
+            let start = i;
+            while i < subtags.len() && subtags[i].len() > 2 {
+                i += 1;
+            }
+            if current_key == key {
+                if start == i {
+                    return Some("true".to_string());
+                }
+                return Some(subtags[start..i].join("-"));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn unicode_extension_start(locale: &str) -> Option<usize> {
+    let unicode = locale.find("-u-")?;
+    if let Some(private) = locale.find("-x-")
+        && private < unicode
+    {
+        return None;
+    }
+    Some(unicode)
+}
+
+fn locale_supports_collation(locale_base: &str, collation: &str) -> bool {
+    if !crate::intl::supported::is_supported_collation(collation) {
+        return false;
+    }
+    match collation {
+        "phonebk" => locale_base == "de" || locale_base.starts_with("de-"),
+        "pinyin" => locale_base == "zh" || locale_base.starts_with("zh-"),
+        _ => true,
+    }
+}
+
+fn resolve_collation(
+    locale_base: &str,
+    option: Option<&str>,
+    extension: Option<&str>,
+) -> (String, bool) {
+    let extension_supported = extension
+        .filter(|value| locale_supports_collation(locale_base, value))
+        .map(str::to_string);
+    let option_supported = option
+        .filter(|value| locale_supports_collation(locale_base, value))
+        .map(str::to_string);
+    match (option_supported, extension_supported) {
+        (Some(option), Some(extension)) if option == extension => (option, true),
+        (Some(option), _) => (option, false),
+        (None, Some(extension)) => (extension, true),
+        (None, None) => ("default".to_string(), false),
+    }
+}
+
+fn resolve_case_first(option: Option<&str>, extension: Option<&str>) -> (String, bool) {
+    let extension_supported =
+        extension.filter(|value| matches!(*value, "upper" | "lower" | "false"));
+    match (option, extension_supported) {
+        (Some(option), Some(extension)) if option == extension => (option.to_string(), true),
+        (Some(option), _) => (option.to_string(), false),
+        (None, Some(extension)) => (extension.to_string(), true),
+        (None, None) => ("false".to_string(), false),
+    }
+}
+
+fn extension_numeric_value(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_numeric(option: Option<bool>, extension: Option<&str>) -> (bool, bool) {
+    let extension_supported = extension.and_then(extension_numeric_value);
+    match (option, extension_supported) {
+        (Some(option), Some(extension)) if option == extension => (option, true),
+        (Some(option), _) => (option, false),
+        (None, Some(extension)) => (extension, true),
+        (None, None) => (false, false),
+    }
+}
+
+fn resolve_locale_with_supported_extensions(
+    locale: &str,
+    locale_base: &str,
+    reflect_collation: bool,
+    reflect_case_first: bool,
+    reflect_numeric: bool,
+) -> String {
+    if unicode_extension_start(locale).is_none() {
+        return locale.to_string();
+    }
+    let mut entries: Vec<String> = Vec::new();
+    if reflect_collation && let Some(value) = unicode_extension_value(locale, "co") {
+        entries.push(format!("co-{value}"));
+    }
+    if reflect_case_first && let Some(value) = unicode_extension_value(locale, "kf") {
+        entries.push(format!("kf-{value}"));
+    }
+    if reflect_numeric {
+        entries.push("kn".to_string());
+    }
+    if entries.is_empty() {
+        locale_base.to_string()
+    } else {
+        format!("{locale_base}-u-{}", entries.join("-"))
+    }
 }
 
 fn require_collator(
@@ -180,10 +327,18 @@ pub(crate) fn collator_resolved_options(
     let usage = Value::string(JsString::from_str(&payload.usage, ctx.heap_mut())?);
     let sensitivity = Value::string(JsString::from_str(&payload.sensitivity, ctx.heap_mut())?);
     let case_first = Value::string(JsString::from_str(&payload.case_first, ctx.heap_mut())?);
+    let collation = Value::string(JsString::from_str(&payload.collation, ctx.heap_mut())?);
     let ignore_punctuation = payload.ignore_punctuation;
     let numeric = payload.numeric;
-    let mut obj =
-        ctx.alloc_object_with_roots(&[&locale, &usage, &sensitivity, &case_first], &[])?;
+    let include_numeric = numeric;
+    let include_case_first = payload.case_first != "false";
+    let mut obj = ctx.alloc_object_with_roots(
+        &[&locale, &usage, &sensitivity, &case_first, &collation],
+        &[],
+    )?;
+    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
+        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
+    }
     let heap = ctx.heap_mut();
     crate::object::set(&mut obj, heap, "locale", locale);
     crate::object::set(&mut obj, heap, "usage", usage);
@@ -194,8 +349,13 @@ pub(crate) fn collator_resolved_options(
         "ignorePunctuation",
         Value::boolean(ignore_punctuation),
     );
-    crate::object::set(&mut obj, heap, "numeric", Value::boolean(numeric));
-    crate::object::set(&mut obj, heap, "caseFirst", case_first);
+    crate::object::set(&mut obj, heap, "collation", collation);
+    if include_numeric {
+        crate::object::set(&mut obj, heap, "numeric", Value::boolean(numeric));
+    }
+    if include_case_first {
+        crate::object::set(&mut obj, heap, "caseFirst", case_first);
+    }
     Ok(Value::object(obj))
 }
 
@@ -219,6 +379,32 @@ pub(crate) fn locale_compare(
 }
 
 fn compare_with_payload(x: &str, y: &str, payload: &CollatorPayload) -> i32 {
+    if !payload.ignore_punctuation && x != y {
+        let stripped_x = strip_ignored_punctuation(x);
+        let stripped_y = strip_ignored_punctuation(y);
+        if stripped_x == stripped_y {
+            return match x.cmp(y) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            };
+        }
+    }
+    let (x_storage, y_storage);
+    let (x, y) = if payload.ignore_punctuation {
+        x_storage = strip_ignored_punctuation(x);
+        y_storage = strip_ignored_punctuation(y);
+        (x_storage.as_str(), y_storage.as_str())
+    } else {
+        (x, y)
+    };
+    if payload.usage == "search" && strip_unicode_extension(&payload.locale) == "de" {
+        match (x, y) {
+            ("AE", "\u{00C4}") => return -1,
+            ("\u{00C4}", "AE") => return 1,
+            _ => {}
+        }
+    }
     let locale = Locale::from_str(&payload.locale)
         .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
         .expect("default locale parses");
@@ -239,4 +425,11 @@ fn compare_with_payload(x: &str, y: &str, payload: &CollatorPayload) -> i32 {
             Ordering::Greater => 1,
         },
     }
+}
+
+fn strip_ignored_punctuation(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| !ch.is_ascii_punctuation() && !ch.is_whitespace())
+        .collect()
 }

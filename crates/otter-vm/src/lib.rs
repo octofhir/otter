@@ -5358,6 +5358,9 @@ impl Interpreter {
         if let Some(view) = value.as_data_view() {
             return Some(view.identity_addr() as usize);
         }
+        if let Some(intl) = value.as_intl(heap) {
+            return Some(intl.identity_addr() as usize);
+        }
         value
             .as_typed_array(heap)
             .map(|array| array.identity_addr() as usize)
@@ -5562,6 +5565,9 @@ impl Interpreter {
                 .unwrap_or(Value::null()));
         }
         if let Some(intl) = value.as_intl(&self.gc_heap) {
+            if let Some(over) = self.non_gc_exotic_prototype_override(value) {
+                return Ok(over);
+            }
             return Ok(self.intl_kind_prototype_value(intl.kind().class_name()));
         }
         if let Some(generator) = value.as_generator() {
@@ -12273,6 +12279,51 @@ mod tests {
         let mut interp = Interpreter::new();
         let context = ExecutionContext::from_module(module);
         assert_eq!(interp.run(&context).unwrap(), Value::undefined());
+    }
+
+    #[test]
+    fn strict_store_global_binding_rejects_non_writable_global_property() {
+        let code = vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(0), Operand::Imm32(12)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::StoreGlobalBinding,
+                operands: vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Imm32(1),
+                ]
+                .into(),
+            },
+            Instruction {
+                pc: 2,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            template_sites: Vec::new(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 1, code)],
+            constants: vec![Constant::String {
+                utf16: "NaN".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module);
+
+        let err = interp
+            .run(&context)
+            .expect_err("strict assignment to NaN should throw");
+        assert!(matches!(err.error, VmError::Uncaught));
+        assert!(err.message().contains("TypeError"));
     }
 
     #[test]

@@ -63,7 +63,9 @@ pub fn resolve_ctx(
         locale,
         style,
         numeric,
-        numbering_system: numbering_system.unwrap_or_else(|| "latn".to_string()),
+        numbering_system: numbering_system
+            .filter(|ns| crate::intl::supported::is_supported_numbering_system(ns))
+            .unwrap_or_else(|| "latn".to_string()),
     })
 }
 

@@ -32,7 +32,7 @@
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
 use crate::Value;
-use crate::abstract_ops::is_callable;
+use crate::abstract_ops::{is_callable, same_value};
 use crate::array::{ARRAY_BODY_TYPE_TAG, ArrayBody};
 use crate::collections::{
     MAP_BODY_TYPE_TAG, MapBody, SET_BODY_TYPE_TAG, SetBody, WEAK_MAP_BODY_TYPE_TAG,
@@ -275,10 +275,19 @@ pub fn finalization_registry_register(
     held_value: Value,
     unregister_token: Option<&Value>,
 ) -> Result<(), crate::VmError> {
-    let target_raw = weak_target_raw(target)?;
-    if held_value.as_raw_gc() == Some(target_raw) {
+    if same_value(target, &held_value, heap) {
         return Err(crate::VmError::TypeMismatch);
     }
+    let Ok(target_raw) = weak_target_raw(target) else {
+        // Bytecode function ids are immediate callable values in the current
+        // VM, not GC-managed object handles. They satisfy Type(Object) for
+        // language semantics but cannot ever become unreachable through GC
+        // weak processing, so registration is observably a successful no-op.
+        if target.is_function_id() {
+            return Ok(());
+        }
+        return Err(crate::VmError::TypeMismatch);
+    };
     let barrier_held_value = held_value;
     let unregister_token = match unregister_token {
         None => None,

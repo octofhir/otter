@@ -297,8 +297,12 @@ pub fn resolve_ctx(
         &["lookup", "best fit"],
         None,
     )?;
-    let _calendar = get_string_option(ctx, options, "calendar", CLASS, &[], None)?;
-    let _numbering_system = get_numbering_system_option(ctx, options, CLASS)?;
+    let calendar = get_string_option(ctx, options, "calendar", CLASS, &[], None)?
+        .filter(|cal| crate::intl::supported::is_supported_calendar(cal))
+        .unwrap_or_else(|| "gregory".to_string());
+    let numbering_system = get_numbering_system_option(ctx, options, CLASS)?
+        .filter(|ns| crate::intl::supported::is_supported_numbering_system(ns))
+        .unwrap_or_else(|| "latn".to_string());
 
     let hour12 = get_bool_option(ctx, options, "hour12", CLASS, None)?;
     let hour_cycle = enum_opt!("hourCycle", HC, parse_hour_cycle);
@@ -384,6 +388,8 @@ pub fn resolve_ctx(
 
     Ok(DateTimeFormatPayload {
         locale,
+        calendar,
+        numbering_system,
         weekday,
         era,
         year,
@@ -865,8 +871,8 @@ pub(crate) fn date_time_format_resolved_options(
         };
     }
     str_entry!("locale", &payload.locale);
-    str_entry!("calendar", "iso8601");
-    str_entry!("numberingSystem", "latn");
+    str_entry!("calendar", &payload.calendar);
+    str_entry!("numberingSystem", &payload.numbering_system);
     let tz = payload
         .time_zone
         .clone()

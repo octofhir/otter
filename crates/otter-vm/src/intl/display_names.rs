@@ -86,17 +86,19 @@ pub fn resolve_ctx(
         Some("code"),
     )?
     .unwrap_or_else(|| "code".to_string());
-    let _language_display = get_string_option(
+    let language_display = get_string_option(
         ctx,
         options,
         "languageDisplay",
         CLASS,
         &["dialect", "standard"],
-        None,
-    )?;
+        Some("dialect"),
+    )?
+    .unwrap_or_else(|| "dialect".to_string());
 
     Ok(DisplayNamesPayload {
         locale,
+        language_display: (kind == "language").then_some(language_display),
         kind,
         style,
         fallback,
@@ -208,6 +210,127 @@ fn lookup_name(kind: &str, code: &str) -> Option<&'static str> {
     }
 }
 
+fn range_err(reason: impl Into<String>) -> NativeError {
+    NativeError::RangeError {
+        name: "of",
+        reason: reason.into(),
+    }
+}
+
+fn is_ascii_alpha_string(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
+fn is_ascii_digit_string(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_ascii_alnum_string(s: &str) -> bool {
+    s.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+fn is_unicode_region_subtag(code: &str) -> bool {
+    (code.len() == 2 && is_ascii_alpha_string(code))
+        || (code.len() == 3 && is_ascii_digit_string(code))
+}
+
+fn is_unicode_variant_subtag(code: &str) -> bool {
+    ((5..=8).contains(&code.len()) && is_ascii_alnum_string(code))
+        || (code.len() == 4 && code.as_bytes()[0].is_ascii_digit() && is_ascii_alnum_string(code))
+}
+
+fn validate_language_code(code: &str) -> Result<(), NativeError> {
+    if code == "root" || code.contains('_') || code.starts_with('-') || code.ends_with('-') {
+        return Err(range_err("invalid language code"));
+    }
+    let subtags: Vec<&str> = code.split('-').collect();
+    if subtags.iter().any(|subtag| subtag.is_empty()) {
+        return Err(range_err("invalid language code"));
+    }
+    let Some(language) = subtags.first() else {
+        return Err(range_err("invalid language code"));
+    };
+    if !matches!(language.len(), 2 | 3 | 5..=8) || !is_ascii_alpha_string(language) {
+        return Err(range_err("invalid language code"));
+    }
+    let mut idx = 1;
+    if subtags
+        .get(idx)
+        .is_some_and(|subtag| subtag.len() == 4 && is_ascii_alpha_string(subtag))
+    {
+        idx += 1;
+    }
+    if subtags
+        .get(idx)
+        .is_some_and(|subtag| is_unicode_region_subtag(subtag))
+    {
+        idx += 1;
+    }
+    let mut variants: Vec<String> = Vec::new();
+    while let Some(subtag) = subtags.get(idx) {
+        if !is_unicode_variant_subtag(subtag) {
+            return Err(range_err("invalid language code"));
+        }
+        let lower = subtag.to_ascii_lowercase();
+        if variants.iter().any(|seen| seen == &lower) {
+            return Err(range_err("duplicate language variant"));
+        }
+        variants.push(lower);
+        idx += 1;
+    }
+    Ok(())
+}
+
+fn validate_calendar_code(code: &str) -> Result<(), NativeError> {
+    let subtags: Vec<&str> = code.split('-').collect();
+    if subtags.is_empty()
+        || subtags
+            .iter()
+            .any(|subtag| !(3..=8).contains(&subtag.len()) || !is_ascii_alnum_string(subtag))
+    {
+        return Err(range_err("invalid calendar code"));
+    }
+    Ok(())
+}
+
+fn validate_datetime_field_code(code: &str) -> Result<(), NativeError> {
+    match code {
+        "era" | "year" | "quarter" | "month" | "weekOfYear" | "weekday" | "day" | "dayPeriod"
+        | "hour" | "minute" | "second" | "timeZoneName" => Ok(()),
+        _ => Err(range_err("invalid dateTimeField code")),
+    }
+}
+
+fn validate_display_name_code(kind: &str, code: &str) -> Result<(), NativeError> {
+    match kind {
+        "language" => validate_language_code(code),
+        "region" => {
+            if is_unicode_region_subtag(code) {
+                Ok(())
+            } else {
+                Err(range_err("invalid region code"))
+            }
+        }
+        "script" => {
+            if code.len() == 4 && is_ascii_alpha_string(code) {
+                Ok(())
+            } else {
+                Err(range_err("invalid script code"))
+            }
+        }
+        "currency" => {
+            if code.len() == 3 && is_ascii_alpha_string(code) {
+                Ok(())
+            } else {
+                Err(range_err("invalid currency code"))
+            }
+        }
+        "calendar" => validate_calendar_code(code),
+        "dateTimeField" => validate_datetime_field_code(code),
+        _ => Ok(()),
+    }
+}
+
 /// §12.4.3 `Intl.DisplayNames.prototype.of(code)`.
 pub(crate) fn display_names_of(
     ctx: &mut NativeCtx<'_>,
@@ -224,8 +347,17 @@ pub(crate) fn display_names_of(
             reason: "argument 0 must be a string code".to_string(),
         });
     };
+    validate_display_name_code(&payload.kind, &code)?;
     if let Some(name) = lookup_name(&payload.kind, &code) {
         return Ok(Value::string(JsString::from_str(name, ctx.heap_mut())?));
+    }
+    let supported_identifier = match payload.kind.as_str() {
+        "calendar" => crate::intl::supported::is_supported_calendar(&code.to_ascii_lowercase()),
+        "currency" => crate::intl::supported::is_supported_currency(&code.to_ascii_uppercase()),
+        _ => false,
+    };
+    if supported_identifier {
+        return Ok(Value::string(JsString::from_str(&code, ctx.heap_mut())?));
     }
     if payload.fallback == "none" {
         return Ok(Value::undefined());
@@ -243,11 +375,29 @@ pub(crate) fn display_names_resolved_options(
     let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
     let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
     let fallback = Value::string(JsString::from_str(&payload.fallback, ctx.heap_mut())?);
-    let mut obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style, &fallback], &[])?;
+    let language_display = if let Some(language_display) = payload.language_display.as_deref() {
+        Some(Value::string(JsString::from_str(
+            language_display,
+            ctx.heap_mut(),
+        )?))
+    } else {
+        None
+    };
+    let language_display_root = language_display.unwrap_or_else(Value::undefined);
+    let mut obj = ctx.alloc_object_with_roots(
+        &[&locale, &kind, &style, &fallback, &language_display_root],
+        &[],
+    )?;
+    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
+        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
+    }
     let heap = ctx.heap_mut();
     crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "type", kind);
     crate::object::set(&mut obj, heap, "style", style);
+    crate::object::set(&mut obj, heap, "type", kind);
     crate::object::set(&mut obj, heap, "fallback", fallback);
+    if !language_display_root.is_undefined() {
+        crate::object::set(&mut obj, heap, "languageDisplay", language_display_root);
+    }
     Ok(Value::object(obj))
 }

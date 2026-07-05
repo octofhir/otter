@@ -701,16 +701,48 @@ impl Interpreter {
             // `[[Get]]` lookup. A method addition changes the prototype shape
             // (guard miss → re-resolve); an in-place override is read live from
             // the slot — both stay correct.
-            if let Some(proto) = self.primitive_method_proto(recv_value)
-                && let Some(atomized_key) =
+            if let Some(proto) = self.primitive_method_proto(recv_value) {
+                // Shape-guarded own-data IC on the well-known prototype, when a
+                // compiled/warmed site exists.
+                if let Some(atomized_key) =
                     context.property_atom_for_function(stack[top_idx].function_id, name_idx)
-                && let Some(site) =
-                    context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                && let Some(method) = self.resolve_method_ic(proto, atomized_key, site)
-                && self.is_callable_runtime(&method)
-            {
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                    && let Some(site) =
+                        context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
+                    && let Some(method) = self.resolve_method_ic(proto, atomized_key, site)
+                    && self.is_callable_runtime(&method)
+                {
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                }
+                // No IC site (an interpreted call site allocates none) or an IC
+                // miss: resolve the method directly on the intrinsic prototype
+                // with the primitive as the `[[Get]]` receiver. `ToObject(V)` is
+                // needed only to *locate* the property (§7.3.11 → §7.1.18), and
+                // `has_plain_builtin_method` already proved the name is a
+                // `%…prototype%` builtin — never the wrapper's own `length` / an
+                // index — so the wrapper carries nothing we read. Skipping it
+                // avoids a String/Number wrapper allocation on every such call
+                // (hot in string method loops: `s.indexOf`, `s.slice`, …).
+                let key = VmPropertyKey::String(name);
+                let method = match self.ordinary_get_value(
+                    context,
+                    Value::object(proto),
+                    recv_value,
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                        context,
+                        &getter,
+                        recv_value,
+                        SmallVec::new(),
+                    )?,
+                };
+                if self.is_callable_runtime(&method) {
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                }
             }
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?

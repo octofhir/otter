@@ -708,7 +708,7 @@ impl ObjectBody {
     /// the out-of-line `values` vector.
     #[inline]
     fn slab_is_inline(&self) -> bool {
-        self.slab_len() <= INLINE_SLOT_CAP
+        self.values.is_empty()
     }
 
     /// Read the compressed word for string-keyed slot `i`.
@@ -2071,8 +2071,7 @@ pub(crate) fn store_own_data_slot_atom(
         } else {
             body_shape_id(heap, body) == hit.shape_id
         };
-        let key_matches =
-            !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
+        let key_matches = !body.shape.is_null() || body_key_matches(heap, body, offset, key.name());
         let slot_attrs =
             (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset));
         (mapped_cell, shape_ok, key_matches, slot_attrs)
@@ -2851,9 +2850,17 @@ pub fn set(obj: &mut JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Va
         record_slot_write(heap, *obj, compressed);
         return;
     }
+    let dictionary_keys = dictionary_keys_for_shape_transition(heap, *obj, existing_offset);
+    let slot_metas = slot_metas_for_shape_transition(heap, *obj, existing_offset);
     let index = heap.read_payload(*obj, |body| body_property_count(heap, body));
     heap.with_payload(*obj, |body| {
         body.dictionary_shape_id = next_shape_id();
+        if let Some(dictionary_keys) = dictionary_keys {
+            dict_set_keys(body, dictionary_keys);
+        }
+        if let Some(slot_metas) = slot_metas {
+            body.exotic_mut().slots = slot_metas;
+        }
         dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
         body.push_slot(index, SlotMeta::data_default(), compressed);
@@ -4211,6 +4218,49 @@ mod tests {
     }
 
     #[test]
+    fn runtime_construction_set_preserves_slots_when_fast_shape_overflows() {
+        let mut interp = crate::Interpreter::new();
+        let mut o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        for i in 0..MAX_FAST_PROPERTIES {
+            let key = format!("p{i}");
+            interp
+                .set_property(o, &key, Value::number_i32(i as i32))
+                .expect("set fast property");
+        }
+        assert!(!shape(o, interp.gc_heap()).is_null());
+
+        set(
+            &mut o,
+            interp.gc_heap_mut(),
+            "overflow",
+            Value::boolean(true),
+        );
+
+        assert!(shape(o, interp.gc_heap()).is_null());
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "p0"),
+            Some(Value::number_i32(0))
+        );
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "p127"),
+            Some(Value::number_i32(127))
+        );
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "overflow"),
+            Some(Value::boolean(true))
+        );
+        let keys: Vec<String> = with_properties(o, interp.gc_heap(), |p| {
+            p.keys().map(str::to_string).collect()
+        });
+        assert_eq!(keys.len(), MAX_FAST_PROPERTIES as usize + 1);
+        assert_eq!(keys.first().map(String::as_str), Some("p0"));
+        assert_eq!(keys.last().map(String::as_str), Some("overflow"));
+    }
+
+    #[test]
     fn shape_id_prefers_installed_shape() {
         let mut interp = crate::Interpreter::new();
         let o = interp
@@ -4870,6 +4920,141 @@ mod tests {
         assert_eq!(len(o, &heap), 1);
         assert!(get(o, &heap, "a").is_none());
         assert!(get(o, &heap, "b").is_some_and(|v| v.is_null()));
+    }
+
+    #[test]
+    fn delete_middle_preserves_later_dictionary_offsets() {
+        let mut heap = fresh_heap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "locale", Value::number_i32(1));
+        set(&mut o, &mut heap, "style", Value::number_i32(2));
+        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+        set(&mut o, &mut heap, "languageDisplay", Value::number_i32(5));
+
+        assert!(delete(o, &mut heap, "style"));
+
+        assert!(get(o, &heap, "style").is_none());
+        assert_eq!(
+            get(o, &heap, "type").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(3))
+        );
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
+        assert_eq!(
+            get(o, &heap, "languageDisplay").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(5))
+        );
+    }
+
+    #[test]
+    fn overwrite_then_delete_middle_preserves_later_dictionary_offsets() {
+        let mut heap = fresh_heap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "locale", Value::number_i32(1));
+        set(&mut o, &mut heap, "style", Value::number_i32(2));
+        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+        set(&mut o, &mut heap, "languageDisplay", Value::number_i32(5));
+
+        set(&mut o, &mut heap, "style", Value::number_i32(20));
+        set(&mut o, &mut heap, "style", Value::number_i32(2));
+        assert!(delete(o, &mut heap, "style"));
+
+        assert!(get(o, &heap, "style").is_none());
+        assert_eq!(
+            get(o, &heap, "type").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(3))
+        );
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
+        assert_eq!(
+            get(o, &heap, "languageDisplay").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(5))
+        );
+    }
+
+    #[test]
+    fn sequential_middle_deletes_preserve_later_dictionary_offsets() {
+        let mut heap = fresh_heap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "locale", Value::number_i32(1));
+        set(&mut o, &mut heap, "style", Value::number_i32(2));
+        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+        set(&mut o, &mut heap, "languageDisplay", Value::number_i32(5));
+
+        assert!(delete(o, &mut heap, "style"));
+        assert_eq!(
+            get(o, &heap, "type").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(3))
+        );
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
+        assert!(delete(o, &mut heap, "type"));
+
+        assert!(get(o, &heap, "style").is_none());
+        assert!(get(o, &heap, "type").is_none());
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
+        assert_eq!(
+            get(o, &heap, "languageDisplay").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(5))
+        );
+    }
+
+    #[test]
+    fn sequential_middle_deletes_preserve_later_offsets_without_tail_optional() {
+        let mut heap = fresh_heap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "locale", Value::number_i32(1));
+        set(&mut o, &mut heap, "style", Value::number_i32(2));
+        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+
+        assert!(delete(o, &mut heap, "style"));
+        assert!(delete(o, &mut heap, "type"));
+
+        assert!(get(o, &heap, "style").is_none());
+        assert!(get(o, &heap, "type").is_none());
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
+    }
+
+    #[test]
+    fn overwrite_between_middle_deletes_preserves_later_dictionary_offsets() {
+        let mut heap = fresh_heap();
+        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
+        set(&mut o, &mut heap, "locale", Value::number_i32(1));
+        set(&mut o, &mut heap, "style", Value::number_i32(2));
+        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        set(&mut o, &mut heap, "fallback", Value::number_i32(4));
+
+        assert!(delete(o, &mut heap, "style"));
+        set(&mut o, &mut heap, "type", Value::number_i32(30));
+        set(&mut o, &mut heap, "type", Value::number_i32(3));
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
+        assert!(delete(o, &mut heap, "type"));
+
+        assert!(get(o, &heap, "style").is_none());
+        assert!(get(o, &heap, "type").is_none());
+        assert_eq!(
+            get(o, &heap, "fallback").and_then(|v| v.as_number()),
+            Some(NumberValue::from_i32(4))
+        );
     }
 
     #[test]

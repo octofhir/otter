@@ -33,6 +33,8 @@ pub struct CollatorPayload {
     pub numeric: bool,
     /// `caseFirst` option (`"upper"` / `"lower"` / `"false"`).
     pub case_first: String,
+    /// Resolved `collation` option.
+    pub collation: String,
 }
 
 impl CollatorPayload {
@@ -55,6 +57,8 @@ impl CollatorPayload {
 pub struct NumberFormatPayload {
     /// Spec-resolved BCP-47 locale tag.
     pub locale: String,
+    /// Resolved `numberingSystem`.
+    pub numbering_system: String,
     /// `style` option (`"decimal"` / `"currency"` / `"percent"`).
     pub style: String,
     /// `currency` option (ISO-4217 code) — set only when
@@ -173,6 +177,10 @@ pub enum DtHourCycle {
 pub struct DateTimeFormatPayload {
     /// Spec-resolved BCP-47 locale tag.
     pub locale: String,
+    /// Resolved `calendar`.
+    pub calendar: String,
+    /// Resolved `numberingSystem`.
+    pub numbering_system: String,
     /// `weekday` width.
     pub weekday: Option<DtTextWidth>,
     /// `era` width.
@@ -258,6 +266,9 @@ pub struct DisplayNamesPayload {
     pub style: String,
     /// `fallback` option (`"code"` / `"none"`).
     pub fallback: String,
+    /// `languageDisplay` option (`"dialect"` / `"standard"`) for
+    /// `type == "language"`.
+    pub language_display: Option<String>,
 }
 
 /// Resolved option bag for `Intl.Segmenter`.
@@ -506,6 +517,13 @@ impl JsIntl {
     #[must_use]
     pub fn handle(self) -> IntlHandle {
         self.inner
+    }
+
+    /// Stable identity key while the GC body is alive.
+    #[inline]
+    #[must_use]
+    pub fn identity_addr(self) -> *const () {
+        self.inner.offset() as usize as *const ()
     }
 
     /// Rebuild a [`JsIntl`] from a pre-existing [`IntlHandle`]. Reads

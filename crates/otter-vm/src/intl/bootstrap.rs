@@ -111,6 +111,11 @@ fn intl_construct(
             reason: "constructor requires 'new'".to_string(),
         });
     }
+    let prototype_override = if ctx.is_construct_call() {
+        crate::bootstrap::native_new_target_prototype(ctx, class)?
+    } else {
+        None
+    };
     let locale = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
 
@@ -164,7 +169,12 @@ fn intl_construct(
             reason: "out of memory".to_string(),
         }
     })?;
-    Ok(Value::intl(intl))
+    let value = Value::intl(intl);
+    if let Some(proto) = prototype_override {
+        ctx.interp_mut()
+            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+    }
+    Ok(value)
 }
 
 fn collator_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

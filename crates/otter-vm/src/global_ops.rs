@@ -1,17 +1,20 @@
-//! Global binding load opcode helpers.
+//! Global binding opcode helpers.
 //!
-//! These are fixed-width global environment reads that can dispatch directly
-//! from executable operands.
+//! These are fixed-width global environment reads and writes that dispatch
+//! directly from executable operands.
 //!
 //! # Contents
 //! - `globalThis` load.
 //! - Throwing global binding lookup for ordinary identifier reads.
 //! - Undefined-returning global lookup for `typeof`.
+//! - Global declaration, initialization, assignment, and deletion helpers.
 //!
 //! # Invariants
 //! - Global properties live on the interpreter's `global_this` object.
 //! - Missing throwing lookups surface as `UndefinedIdentifier` so the normal
 //!   error path can synthesize a `ReferenceError`.
+//! - Identifier assignment routes through descriptor-aware object `[[Set]]`;
+//!   raw property writes are reserved for declaration/bootstrap paths.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -592,6 +595,12 @@ impl Interpreter {
         {
             return Err(self.err_undefined_ident((name.to_string()).into()));
         }
-        self.run_define_global_var_reg(context, frame, name_idx, value_reg)
+        let receiver = Value::object(self.global_this);
+        let key = VmPropertyKey::String(name);
+        if !self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)? && strict {
+            return Err(self.err_type((format!("Cannot assign to property '{name}'")).into()));
+        }
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
     }
 }

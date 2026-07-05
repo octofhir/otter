@@ -956,6 +956,9 @@ impl Interpreter {
             };
         }
         if let Some(intl) = value.as_intl(&self.gc_heap) {
+            if let Some(over) = self.non_gc_exotic_prototype_override(&value) {
+                return Ok(over);
+            }
             return Ok(self.intl_kind_prototype_value(intl.kind().class_name()));
         }
         if value.is_object_type() {

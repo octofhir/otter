@@ -1,4 +1,13 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Top-level execution drivers: `run`, microtask drain, dispatch entry.
+//!
+//! # Contents
+//! `run`/`run_inner`, `link_module`, GC-heap accessors and `force_gc`,
+//! microtask drain (with per-task origin contexts) and capability
+//! settlement, and the `dispatch_loop`/`dispatch_loop_tracked` shells.
+//!
+//! # Invariants
+//! Drains that run outside `run`'s rooted scope must push the
+//! interpreter's extra roots before touching the heap.
 #![allow(unused_imports)]
 use crate::*;
 

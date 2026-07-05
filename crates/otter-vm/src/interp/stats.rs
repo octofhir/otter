@@ -1,4 +1,9 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Runtime-budget bookkeeping and JIT runtime counters.
+//!
+//! # Contents
+//! Runtime budget turn begin/finish/checkpoint, bytecode/native/construct
+//! call tallies, JIT stub and fast-path hit counters, microtask drain
+//! stats, and property-IC capacity management.
 #![allow(unused_imports)]
 use crate::*;
 

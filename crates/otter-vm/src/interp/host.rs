@@ -1,4 +1,10 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Host-facing configuration and diagnostics surface.
+//!
+//! # Contents
+//! Timer scheduler and dynamic-import loader wiring, console sink,
+//! microtask queue accessors, stack-depth limit, eval hook, tracer,
+//! CPU profiler, IC/shape/heap snapshots, interrupt handle, and
+//! `global_this`/`set_global`.
 #![allow(unused_imports)]
 use crate::*;
 

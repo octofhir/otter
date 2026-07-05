@@ -1,4 +1,10 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! The bytecode dispatch loop.
+//!
+//! # Contents
+//! `dispatch_loop_inner`: one `match` arm per opcode, inline caches,
+//! and the JIT tier-up/backedge hooks. Deliberately a single function —
+//! splitting it would defeat the dispatch-locality the interpreter
+//! depends on.
 #![allow(unused_imports)]
 use crate::*;
 

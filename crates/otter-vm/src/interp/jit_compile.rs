@@ -1,4 +1,15 @@
-// Split out of `lib.rs`; inherent `impl Interpreter` methods only.
+//! Optimizing-tier compile requests and profile-feedback baking.
+//!
+//! # Contents
+//! `compile_jit_function`, feedback baking into the instruction view
+//! (arith/element/property/global-cell/object-literal/inline-callee
+//! tables), call/method target profiling (`note_call_target`,
+//! `note_method_target`), and reoptimization eviction.
+//!
+//! # Invariants
+//! Baked pointers (shape ids, global cells, prototype slots) must only
+//! reference permanent or non-moving allocations; anything movable goes
+//! through a runtime stub instead.
 #![allow(unused_imports)]
 use crate::*;
 

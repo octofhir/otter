@@ -1754,10 +1754,15 @@ fn impl_split(
     if sep_units.is_empty() {
         let mut out: Vec<Value> = Vec::with_capacity((limit as usize).min(recv_units.len()));
         for &u in recv_units.iter().take(limit as usize) {
-            out.push(Value::string(JsString::from_utf16_units(
-                &[u],
-                ctx.heap_mut(),
-            )?));
+            let part = {
+                let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for v in &out {
+                        v.trace_value_slots(visitor);
+                    }
+                };
+                JsString::from_utf16_units_with_roots(&[u], ctx.heap_mut(), &mut visit)?
+            };
+            out.push(Value::string(part));
         }
         return Ok(Value::array(ctx.array_from_elements_with_roots(
             out.iter().cloned(),
@@ -1771,7 +1776,21 @@ fn impl_split(
     while (out.len() as u32) < limit {
         match find_substr(&recv_units, &sep_units, start) {
             Some(pos) => {
-                let part = JsString::from_utf16_units(&recv_units[start..pos], ctx.heap_mut())?;
+                // Root the accumulated parts across each substring alloc: the
+                // parts are young strings, and this alloc can scavenge and
+                // relocate the ones already in `out`.
+                let part = {
+                    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                        for v in &out {
+                            v.trace_value_slots(visitor);
+                        }
+                    };
+                    JsString::from_utf16_units_with_roots(
+                        &recv_units[start..pos],
+                        ctx.heap_mut(),
+                        &mut visit,
+                    )?
+                };
                 out.push(Value::string(part));
                 start = pos + sep_units.len();
             }
@@ -1779,7 +1798,14 @@ fn impl_split(
         }
     }
     if (out.len() as u32) < limit {
-        let part = JsString::from_utf16_units(&recv_units[start..], ctx.heap_mut())?;
+        let part = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for v in &out {
+                    v.trace_value_slots(visitor);
+                }
+            };
+            JsString::from_utf16_units_with_roots(&recv_units[start..], ctx.heap_mut(), &mut visit)?
+        };
         out.push(Value::string(part));
     }
     Ok(Value::array(ctx.array_from_elements_with_roots(

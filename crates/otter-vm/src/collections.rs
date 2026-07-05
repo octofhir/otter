@@ -1412,8 +1412,18 @@ fn weak_collection_key(
 
 impl crate::pelt::PeltField for MapKey {
     fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
-        if let MapKey::ObjectValue(value) = self {
-            value.trace_value_slot_mut(visitor);
+        match self {
+            // The object key holds a live `Value` slot the collector rewrites.
+            MapKey::ObjectValue(value) => value.trace_value_slot_mut(visitor),
+            // A string key's body handle moves under a young-gen scavenge, so
+            // its slot must be traced too (the equality path reads the body).
+            MapKey::String(s) => s.trace_handle_slot(visitor),
+            MapKey::Undefined
+            | MapKey::Null
+            | MapKey::Boolean(_)
+            | MapKey::Number(_)
+            | MapKey::BigInt(_)
+            | MapKey::Symbol(_) => {}
         }
     }
 }

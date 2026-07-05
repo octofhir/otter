@@ -132,6 +132,18 @@ impl JsString {
         self.handle
     }
 
+    /// Trace this wrapper's body handle as a GC slot so a moving collector
+    /// rewrites it in place. `cached_len` / `cached_hash` are content-derived
+    /// and never change under a move, so only the handle needs updating. Used
+    /// where a `JsString` is stored in a collector-visited slot that is not a
+    /// `Value` (e.g. `MapKey::String`).
+    pub(crate) fn trace_handle_slot(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if !self.handle.is_null() {
+            let p = std::ptr::addr_of_mut!(self.handle) as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
+    }
+
     /// Construct a flat WTF-16 string body.
     ///
     /// # Errors

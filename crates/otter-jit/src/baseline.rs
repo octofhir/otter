@@ -1179,10 +1179,7 @@ pub(crate) extern "C" fn jit_load_string_stub(ctx: *mut JitCtx, byte_pc: u64) ->
 /// matching the `LoadString` / `NewArray` bridges (no baseline register-window
 /// assumptions). Returns `0` on success, `1` when the read threw (unbound
 /// identifier / throwing accessor; error parked in `ctx`).
-pub(crate) extern "C" fn jit_load_global_stub_optimizing(
-    ctx: *mut JitCtx,
-    byte_pc: u64,
-) -> u64 {
+pub(crate) extern "C" fn jit_load_global_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
@@ -1249,10 +1246,7 @@ otter_jit_math_leaf! {
 /// (materialized by the caller), and performs the global write. Returns `0` on
 /// success, `1` when the write threw (const / TDZ / strict-unbound; error parked
 /// in `ctx`).
-pub(crate) extern "C" fn jit_store_global_stub_optimizing(
-    ctx: *mut JitCtx,
-    byte_pc: u64,
-) -> u64 {
+pub(crate) extern "C" fn jit_store_global_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.vm };
@@ -1367,7 +1361,9 @@ pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
         });
     }
     match vm.jit_resume_inline_callee_stack(context, stack, &frames) {
-        Ok(value) => RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits())),
+        Ok(value) => {
+            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
+        }
         Err(err) => {
             park_jit_error(ctx, err);
             RuntimeStubResultPair::from_result(RuntimeStubResult {
@@ -1817,7 +1813,7 @@ pub(crate) mod arm64 {
         ALLOC_CTX_SAFEPOINT_COUNT_OFFSET, ALLOC_CTX_SAFEPOINT_RECORDS_OFFSET,
         ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_OFFSET,
         ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
-        BACKEDGE_FUEL_OFFSET, BAIL_PC_OFFSET, BaselineCode, CANONICAL_NAN_HI16, INTERRUPT_FLAG_OFFSET,
+        BACKEDGE_FUEL_OFFSET, BAIL_PC_OFFSET, BaselineCode, CANONICAL_NAN_HI16,
         COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET,
         COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET,
         COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
@@ -1825,25 +1821,25 @@ pub(crate) mod arm64 {
         COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
         COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
         DIRECT_FRAME_INDEX_OFFSET, DIRECT_METHOD_INLINE_OFFSET, DIRECT_REGS_OFFSET,
-        DIRECT_SAFEPOINT_COUNT_OFFSET,
-        DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-        DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
-        FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG,
-        MAX_INLINE_ARGS, MAX_METHOD_ARGS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Op, Operand,
-        REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET,
-        SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
-        Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
-        VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell, alloc_value_stub_trampoline_pair,
-        jit_abort_direct_call_stub, jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
-        jit_call_method_stub, jit_delegate_op_stub, jit_finish_direct_call_bailed_stub,
-        jit_finish_direct_call_returned_stub, jit_inline_closure_upvalues_stub,
-        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
-        jit_load_upvalue_stub, jit_make_fn_stub, jit_new_array_stub, jit_new_object_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
-        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub,
-        leaf_no_alloc_stub2_trampoline_pair, pack_method_arg_regs, reg_offset, value_tag,
+        DIRECT_SAFEPOINT_COUNT_OFFSET, DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET,
+        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET,
+        FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET,
+        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS,
+        NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET,
+        REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE,
+        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW,
+        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell,
+        alloc_value_stub_trampoline_pair, jit_abort_direct_call_stub, jit_backedge_poll_stub,
+        jit_call_collection_method_ic_stub, jit_call_method_stub, jit_delegate_op_stub,
+        jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
+        jit_inline_closure_upvalues_stub, jit_load_element_stub, jit_load_global_stub,
+        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
+        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
+        pack_method_arg_regs, reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};

@@ -3857,8 +3857,15 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let site = instr.property_ic_site().ok_or(VmError::InvalidOperand)?;
         let saved_pc = stack[frame_index].pc;
-        let result =
-            self.jit_runtime_store_property(context, stack, frame_index, obj_reg, name_idx, src, site);
+        let result = self.jit_runtime_store_property(
+            context,
+            stack,
+            frame_index,
+            obj_reg,
+            name_idx,
+            src,
+            site,
+        );
         stack[frame_index].pc = saved_pc;
         result.map(|_| ())
     }
@@ -3900,8 +3907,17 @@ impl Interpreter {
             .exec_const_index(instr, 2)
             .ok_or(VmError::InvalidOperand)?;
         let site = instr.property_ic_site().ok_or(VmError::InvalidOperand)?;
-        self.jit_runtime_load_property(context, stack, frame_index, fid, dst, obj_reg, name_idx, site)
-            .map(|_| ())
+        self.jit_runtime_load_property(
+            context,
+            stack,
+            frame_index,
+            fid,
+            dst,
+            obj_reg,
+            name_idx,
+            site,
+        )
+        .map(|_| ())
     }
 
     /// JIT bridge for `LoadString` from compiled code. The constant cache is

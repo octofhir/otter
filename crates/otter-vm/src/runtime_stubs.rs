@@ -1117,9 +1117,10 @@ fn string_concat_alloc_inner(
     // its mirror — the common key-building shape (`"k" + n`), skipping the
     // general path's number-string / cons-rope / flatten allocations. Shared
     // with the interpreter's `Op::Add` string path.
-    if let Some(fast) =
-        interp.try_concat_string_int32(Value::from_abi_bits(lhs_bits), Value::from_abi_bits(rhs_bits))
-    {
+    if let Some(fast) = interp.try_concat_string_int32(
+        Value::from_abi_bits(lhs_bits),
+        Value::from_abi_bits(rhs_bits),
+    ) {
         return match fast {
             Ok(value) => RuntimeStubResult::ok_value(value),
             Err(_) => RuntimeStubResult::out_of_memory(),

@@ -202,8 +202,13 @@ pub(crate) fn build_match_result_native(
                 let cur_input = input_value
                     .as_string(ctx.heap())
                     .expect("subject is a string");
-                let s =
-                    slice_subject_string(cur_input, r.clone(), ctx, &[&input_value], &[out.as_slice()])?;
+                let s = slice_subject_string(
+                    cur_input,
+                    r.clone(),
+                    ctx,
+                    &[&input_value],
+                    &[out.as_slice()],
+                )?;
                 out.push(Value::string(s));
             }
             None => out.push(Value::undefined()),
@@ -233,9 +238,11 @@ pub(crate) fn build_match_result_native(
         crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
             Some(r) => {
-                    let cur_input = input_value.as_string(ctx.heap()).expect("subject is a string");
-                    Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
-                }
+                let cur_input = input_value
+                    .as_string(ctx.heap())
+                    .expect("subject is a string");
+                Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
+            }
             None => Value::undefined(),
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
@@ -243,7 +250,9 @@ pub(crate) fn build_match_result_native(
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => {
-                    let cur_input = input_value.as_string(ctx.heap()).expect("subject is a string");
+                    let cur_input = input_value
+                        .as_string(ctx.heap())
+                        .expect("subject is a string");
                     Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
                 }
                 None => Value::undefined(),

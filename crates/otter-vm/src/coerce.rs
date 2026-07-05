@@ -14,6 +14,9 @@
 //!   the lossy Rust `String` (every caller pushes it through
 //!   `JsString::from_str` anyway, so the boxed step happens at the
 //!   call site once the appropriate `StringHeap` is in scope).
+//! - [`to_js_string_or_throw`] — §7.1.17 `ToString(argument)` returning
+//!   a [`crate::string::JsString`] without losing WTF-16 code units when
+//!   the primitive result is already a JavaScript string.
 //! - [`to_number_or_throw`] — §7.1.4 `ToNumber(argument)`.
 //! - [`to_index_or_throw`] — §7.1.22 `ToIndex(value)`.
 //!
@@ -38,6 +41,7 @@
 use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
+use crate::string::JsString;
 use crate::{ExecutionContext, Interpreter, Value, VmError};
 
 impl Interpreter {
@@ -139,6 +143,44 @@ pub(crate) fn to_string_or_throw(
         return Ok(b.to_decimal_string(&interp.gc_heap));
     }
     Ok(primitive.display_string(&interp.gc_heap))
+}
+
+/// §7.1.17 `ToString(argument)` returning a GC-backed JavaScript
+/// string. Unlike [`to_string_or_throw`], this preserves WTF-16 code
+/// units when the primitive result is already a string, including lone
+/// surrogates.
+pub(crate) fn to_js_string_or_throw(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    input: &Value,
+) -> Result<JsString, VmError> {
+    let primitive = if abstract_ops::is_primitive(input) {
+        *input
+    } else {
+        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
+    };
+    if primitive.is_symbol() {
+        return Err(
+            interp.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
+        );
+    }
+    if let Some(s) = primitive.as_string(&interp.gc_heap) {
+        return Ok(s);
+    }
+    let rendered = if primitive.is_undefined() {
+        "undefined".to_string()
+    } else if primitive.is_null() {
+        "null".to_string()
+    } else if let Some(b) = primitive.as_boolean() {
+        if b { "true" } else { "false" }.to_string()
+    } else if let Some(n) = primitive.as_number() {
+        n.to_display_string()
+    } else if let Some(b) = primitive.as_big_int() {
+        b.to_decimal_string(&interp.gc_heap)
+    } else {
+        primitive.display_string(&interp.gc_heap)
+    };
+    JsString::from_str(&rendered, interp.gc_heap_mut()).map_err(Into::into)
 }
 
 /// §7.1.4 `ToNumber(argument)`. Symbol and BigInt operands surface

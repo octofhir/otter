@@ -1261,8 +1261,11 @@ impl Interpreter {
             _ => return None,
         };
         let mut string_bytes = [0u8; 32];
-        let string_len =
-            crate::string::gc_body::read_short_flat_latin1(&self.gc_heap, handle, &mut string_bytes)?;
+        let string_len = crate::string::gc_body::read_short_flat_latin1(
+            &self.gc_heap,
+            handle,
+            &mut string_bytes,
+        )?;
         let mut digits = [0u8; crate::number::integer_fast::I32_BUF_LEN];
         let digit_len = crate::number::integer_fast::format_i32(n, &mut digits);
         let mut out = [0u8; 32 + crate::number::integer_fast::I32_BUF_LEN];
@@ -1274,7 +1277,10 @@ impl Interpreter {
         out[..first.len()].copy_from_slice(first);
         out[first.len()..first.len() + second.len()].copy_from_slice(second);
         let total = first.len() + second.len();
-        Some(crate::string::JsString::from_latin1(&out[..total], &mut self.gc_heap).map(Value::string))
+        Some(
+            crate::string::JsString::from_latin1(&out[..total], &mut self.gc_heap)
+                .map(Value::string),
+        )
     }
 
     /// Root-tracing view of cached BigInt constants.
@@ -3340,7 +3346,11 @@ impl Interpreter {
                 smallvec::SmallVec::from_slice(&f.registers);
             // The bottom (outermost inlined) frame bubbles its result out of the
             // dispatch loop; every frame above it returns into its parent.
-            let return_register = if i == 0 { None } else { Some(f.return_register) };
+            let return_register = if i == 0 {
+                None
+            } else {
+                Some(f.return_register)
+            };
             let mut frame =
                 Frame::with_exec_registers(function, return_register, upvalues, f.this, registers);
             frame.pc = f.callee_pc;
@@ -4214,7 +4224,8 @@ impl Interpreter {
     /// path for a megamorphic site (e.g. one `arr[i].run()` over many classes).
     fn method_site_feedback_saturated(&self, caller_fid: u32, call_byte_pc: u32) -> bool {
         matches!(
-            self.jit_method_site_feedback.get(&(caller_fid, call_byte_pc)),
+            self.jit_method_site_feedback
+                .get(&(caller_fid, call_byte_pc)),
             Some(MethodCallFeedback::Megamorphic)
         )
     }
@@ -4574,7 +4585,8 @@ impl Interpreter {
         // stores at operand 1.
         let mut prop_offsets: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
         let mut prop_shapes: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
-        const SLOT_BYTES: u32 = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        const SLOT_BYTES: u32 =
+            std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
         for instr in &method_view.instructions {
             let name_operand = match instr.op {
                 Op::LoadProperty => 2,
@@ -5058,7 +5070,8 @@ impl Interpreter {
                 .resize(site_count, jit::JitCollectionMethodIcSlot::EMPTY);
         }
         if self.jit_direct_method_cache.len() < site_count {
-            self.jit_direct_method_cache.resize_with(site_count, Vec::new);
+            self.jit_direct_method_cache
+                .resize_with(site_count, Vec::new);
         }
         if self.jit_direct_method_inline_slots.len() < site_count * MAX_DIRECT_METHOD_WAYS {
             self.jit_direct_method_inline_slots.resize(
@@ -8445,31 +8458,30 @@ impl Interpreter {
                     // under the new callee frame; the receiver handle may move
                     // during the call, so the prototype shape and method slot are
                     // resolved here while it is still valid).
-                    let method_site = if jit_installed
-                        && !self.method_site_feedback_saturated(function_id, pc)
-                    {
-                        register_operand(context.exec_operand(instr, 1))
-                            .ok()
-                            .and_then(|r| {
-                                stack
-                                    .get(top_idx)
-                                    .and_then(|f| f.registers.get(r as usize).copied())
-                            })
-                            .and_then(|recv| {
-                                const_operand(context.exec_operand(instr, 2)).ok().and_then(
-                                    |name_idx| {
-                                        self.method_site_for_receiver(
-                                            context,
-                                            function_id,
-                                            name_idx,
-                                            recv,
-                                        )
-                                    },
-                                )
-                            })
-                    } else {
-                        None
-                    };
+                    let method_site =
+                        if jit_installed && !self.method_site_feedback_saturated(function_id, pc) {
+                            register_operand(context.exec_operand(instr, 1))
+                                .ok()
+                                .and_then(|r| {
+                                    stack
+                                        .get(top_idx)
+                                        .and_then(|f| f.registers.get(r as usize).copied())
+                                })
+                                .and_then(|recv| {
+                                    const_operand(context.exec_operand(instr, 2)).ok().and_then(
+                                        |name_idx| {
+                                            self.method_site_for_receiver(
+                                                context,
+                                                function_id,
+                                                name_idx,
+                                                recv,
+                                            )
+                                        },
+                                    )
+                                })
+                        } else {
+                            None
+                        };
                     self.do_call_method_value(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode method
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.

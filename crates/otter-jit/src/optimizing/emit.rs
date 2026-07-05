@@ -326,33 +326,29 @@ mod arm64 {
         ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_OFFSET,
         ALLOC_CTX_STACK_SIZE, ALLOC_CTX_VM_OFFSET, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
         BACKEDGE_FUEL_OFFSET, BAIL_PC_OFFSET, CANONICAL_NAN_HI16,
-        COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET,
-        COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET, COLLECTION_METHOD_IC_COUNT_OFFSET,
-        INTERRUPT_FLAG_OFFSET,
-        COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET,
-        COLLECTION_METHOD_IC_PROTO_OFFSET, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET,
-        COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET, COLLECTION_METHOD_IC_SLOT_SIZE,
-        COLLECTION_METHOD_IC_STATE_OFFSET, COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET,
-        DIRECT_METHOD_INLINE_OFFSET, DIRECT_METHOD_INLINE_SLOT_SIZE, DMI_ENTRY_ADDR_OFFSET,
-        DMI_METHOD_FID_OFFSET, DMI_METHOD_ON_RECEIVER_OFFSET, DMI_METHOD_VALUE_BYTE_OFFSET,
-        DMI_PROTO_SHAPE_OFFSET, DMI_RECV_SHAPE_OFFSET, DMI_REGISTER_COUNT_OFFSET,
-        DMI_SELF_CLOSURE_OFFSET, DMI_UPVALUES_PTR_OFFSET, DOUBLE_OFFSET_HI16, FRAME_INDEX_OFFSET,
-        FUNCTION_ID_TAG, GC_HEAP_OFFSET,
-        JS_CLOSURE_BODY_TYPE_TAG, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET,
-        REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE,
-        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
-        VALUE_UNDEFINED, VM_OFFSET, jit_alloc_object_literal_stub, jit_array_push_optimizing_stub,
-        jit_backedge_poll_stub, jit_call_collection_method_ic_stub,
-        jit_call_method_stub_optimizing, jit_load_global_stub_optimizing,
-        jit_load_property_stub_optimizing, jit_load_string_stub,
-        jit_new_array_stub,
-        jit_number_to_string_fast_stub, jit_prepare_direct_call_stub, otter_jit_fmod,
+        COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET,
+        COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET,
+        COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
+        COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET,
+        COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
+        COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_METHOD_INLINE_OFFSET,
+        DIRECT_METHOD_INLINE_SLOT_SIZE, DMI_ENTRY_ADDR_OFFSET, DMI_METHOD_FID_OFFSET,
+        DMI_METHOD_ON_RECEIVER_OFFSET, DMI_METHOD_VALUE_BYTE_OFFSET, DMI_PROTO_SHAPE_OFFSET,
+        DMI_RECV_SHAPE_OFFSET, DMI_REGISTER_COUNT_OFFSET, DMI_SELF_CLOSURE_OFFSET,
+        DMI_UPVALUES_PTR_OFFSET, DOUBLE_OFFSET_HI16, FRAME_INDEX_OFFSET, FUNCTION_ID_TAG,
+        GC_HEAP_OFFSET, INTERRUPT_FLAG_OFFSET, JS_CLOSURE_BODY_TYPE_TAG, NUMBER_TAG_HI16,
+        OBJECT_BODY_TYPE_TAG, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET,
+        SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_OFFSET,
+        jit_alloc_object_literal_stub, jit_array_push_optimizing_stub, jit_backedge_poll_stub,
+        jit_call_collection_method_ic_stub, jit_call_method_stub_optimizing,
+        jit_load_global_stub_optimizing, jit_load_property_stub_optimizing, jit_load_string_stub,
+        jit_new_array_stub, jit_number_to_string_fast_stub, jit_prepare_direct_call_stub,
         jit_prepare_direct_method_call_stub, jit_resume_inline_callee_stack_stub,
-        jit_self_call_bail_stub,
-        jit_store_global_stub_optimizing,
-        jit_store_property_stub_optimizing,
-        jit_string_char_code_at_guarded_leaf_stub, jit_string_char_code_at_leaf_stub, value_tag,
+        jit_self_call_bail_stub, jit_store_global_stub_optimizing,
+        jit_store_property_stub_optimizing, jit_string_char_code_at_guarded_leaf_stub,
+        jit_string_char_code_at_leaf_stub, otter_jit_fmod, value_tag,
     };
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
     use otter_vm::{
@@ -3903,7 +3899,11 @@ mod arm64 {
                 emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                 emit_load_u64(ops, 1, u64::from(node.byte_pc));
-                emit_load_u64(ops, 16, jit_load_property_stub_optimizing as *const () as u64);
+                emit_load_u64(
+                    ops,
+                    16,
+                    jit_load_property_stub_optimizing as *const () as u64,
+                );
                 dynasm!(ops
                     ; .arch aarch64
                     ; blr x16
@@ -3933,7 +3933,11 @@ mod arm64 {
                 emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                 emit_load_u64(ops, 1, u64::from(node.byte_pc));
-                emit_load_u64(ops, 16, jit_store_property_stub_optimizing as *const () as u64);
+                emit_load_u64(
+                    ops,
+                    16,
+                    jit_store_property_stub_optimizing as *const () as u64,
+                );
                 dynasm!(ops
                     ; .arch aarch64
                     ; blr x16
@@ -3954,7 +3958,11 @@ mod arm64 {
                 emit_frame_materialize_tagged(ops, graph, alloc, point, box_scratch)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                 emit_load_u64(ops, 1, u64::from(node.byte_pc));
-                emit_load_u64(ops, 16, jit_store_global_stub_optimizing as *const () as u64);
+                emit_load_u64(
+                    ops,
+                    16,
+                    jit_store_global_stub_optimizing as *const () as u64,
+                );
                 dynasm!(ops
                     ; .arch aarch64
                     ; blr x16
@@ -4509,7 +4517,15 @@ mod arm64 {
                     // falls to the collection / prepare / generic path below.
                     let inline_miss = ops.new_dynamic_label();
                     emit_direct_method_call_inline(
-                        ops, view, dst_reg, *recv_reg, arg_regs, site, inline_miss, threw, done,
+                        ops,
+                        view,
+                        dst_reg,
+                        *recv_reg,
+                        arg_regs,
+                        site,
+                        inline_miss,
+                        threw,
+                        done,
                     )?;
                     dynasm!(ops ; .arch aarch64 ; =>inline_miss);
                     emit_opt_live_collection_leaf_method_guarded_call(
@@ -5319,7 +5335,11 @@ mod arm64 {
         // 3. jit_resume_inline_callee_stack_stub(ctx, descs_ptr = sp, frame_count).
         dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; mov x1, sp);
         emit_load_u64(ops, 2, k as u64);
-        emit_load_u64(ops, 16, jit_resume_inline_callee_stack_stub as *const () as u64);
+        emit_load_u64(
+            ops,
+            16,
+            jit_resume_inline_callee_stack_stub as *const () as u64,
+        );
         dynasm!(ops ; .arch aarch64 ; blr x16 ; add sp, sp, total);
         // x0 = value, x1 = status (low 8 bits). Throw ⇒ the function throw path.
         dynasm!(ops ; .arch aarch64 ; and x1, x1, #0xff ; cmp x1, #2 ; b.eq =>threw);
@@ -5333,7 +5353,14 @@ mod arm64 {
         // 5. Reload the caller's live values from `[x19]` (relocated by the
         //    scavenge). The result register (the outermost frame's destination in
         //    the compiled caller) is written above, so skip it.
-        emit_frame_reload(ops, graph, alloc, point, Some(resume.frames[0].dst_reg), box_scratch)?;
+        emit_frame_reload(
+            ops,
+            graph,
+            alloc,
+            point,
+            Some(resume.frames[0].dst_reg),
+            box_scratch,
+        )?;
 
         // 6. Continue compiled execution in the continuation block.
         dynasm!(ops ; .arch aarch64 ; b =>block_labels[resume.cont as usize]);

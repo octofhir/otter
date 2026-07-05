@@ -7206,8 +7206,17 @@ impl Interpreter {
     /// unwind, or generator/async park).
     #[inline]
     pub(crate) fn free_reg_window(&mut self, base: u32) {
-        debug_assert!(base as usize <= self.reg_top, "reg window free above top");
-        self.reg_top = base as usize;
+        // Release this window: truncate the cursor to `base`. Only ever LOWER
+        // `reg_top` — never raise it. A window can be freed more than once (a
+        // frame returns normally, lowering `reg_top`, then `return_stack` drains
+        // the finished re-entry stack and reclaims the same frame); a second
+        // free then arrives with `base > reg_top`. Setting `reg_top = base`
+        // unconditionally would raise the cursor back over slots that were
+        // already released and never re-cleared, so `trace_reg_stack` would then
+        // scan those stale register cells as live roots — feeding moved-from /
+        // garbage pointers to the scavenger (crashes, wrong dispatch, type
+        // mismatches under GC stress). `min` makes a redundant free a no-op.
+        self.reg_top = self.reg_top.min(base as usize);
     }
 
     /// Address of `reg_top` (the live extent of the flat register stack, in
@@ -7270,8 +7279,35 @@ impl Interpreter {
     /// callee window of an in-flight frameless JIT call. A no-op when no such
     /// call is in flight.
     pub(crate) fn trace_reg_stack(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        if std::env::var_os("OTTER_GC_VERIFY").is_some_and(|v| v != "0") {
+            self.verify_reg_stack_roots();
+        }
         for value in &self.reg_stack[..self.reg_top] {
             value.trace_value_slots(visitor);
+        }
+    }
+
+    /// Diagnostic (`OTTER_GC_VERIFY=1`): scan the live register window
+    /// `reg_stack[0..reg_top]` for any slot whose pointer target is not a
+    /// plausible live object, and report its index and the current `reg_top`.
+    /// Pinpoints stale register cells that a window-accounting slip left inside
+    /// the traced range. Off by default; never mutates state.
+    #[cold]
+    fn verify_reg_stack_roots(&self) {
+        let base = self.reg_stack.as_ptr();
+        for (i, value) in self.reg_stack[..self.reg_top].iter().enumerate() {
+            if let Some((size, tag, forwarded)) = value.debug_gc_target_header(&self.gc_heap) {
+                // A forwarded target is fine — the trace pass will rewrite this
+                // slot to the new location. Only a non-forwarded implausible
+                // header is a genuinely stale/dangling register cell.
+                if !forwarded && (size == 0 || size > (1u32 << 20) || tag == 0) {
+                    eprintln!(
+                        "OTTER_GC_VERIFY: stale reg_stack slot idx={i} reg_top={} base={base:p} \
+                         target_size={size} target_tag={tag}",
+                        self.reg_top
+                    );
+                }
+            }
         }
     }
 

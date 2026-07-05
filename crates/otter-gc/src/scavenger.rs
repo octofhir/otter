@@ -250,6 +250,54 @@ pub unsafe fn scavenge(
 /// # Safety
 ///
 /// `slot` must be a dereferenceable `*mut RawGc`.
+/// `OTTER_GC_VERIFY=1` turns on per-slot scavenge validation: every child a
+/// slot points at is sanity-checked (plausible header size / non-zero type tag)
+/// and every corrupt one is reported with the slot's provenance — in-cage
+/// (an object field) vs out-of-cage (a root: register stack, anchor stack,
+/// handle scope) — plus its parent. A diagnostic for use-after-move / dangling
+/// root regressions; off by default (one relaxed atomic load per slot when on).
+#[inline]
+fn gc_verify_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+    match STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = std::env::var_os("OTTER_GC_VERIFY").is_some_and(|v| v != "0");
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Report a slot whose target is not a plausible live object. See
+/// [`gc_verify_enabled`]. Never mutates heap state — pure diagnostic.
+#[cold]
+unsafe fn verify_child_slot(
+    slot: *mut RawGc,
+    raw: u32,
+    header_ptr: *const GcHeader,
+    parent_header: Option<*mut GcHeader>,
+) {
+    // SAFETY: `header_ptr` is an in-cage address by construction; reading the
+    // header word is safe even if the object is stale (still mapped memory).
+    let (size, tag) = unsafe { ((*header_ptr).size_bytes(), (*header_ptr).type_tag()) };
+    if size != 0 && size <= (1u32 << 20) && tag != 0 {
+        return; // plausible object
+    }
+    let slot_off = (slot as usize).wrapping_sub(cage_base() as usize);
+    let region = if slot_off < (1usize << 32) {
+        "object-field (in-cage)"
+    } else {
+        "root (out-of-cage: register/anchor/handle stack)"
+    };
+    eprintln!(
+        "OTTER_GC_VERIFY: corrupt slot -> raw_offset={raw:#x} target_size={size} target_tag={tag} \
+         slot={slot:p} region={region} parent={parent_header:?}"
+    );
+}
+
 unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Option<*mut GcHeader>) {
     // SAFETY: slot is dereferenceable per precondition.
     unsafe {
@@ -264,6 +312,9 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc, parent_header: Optio
         }
         // SAFETY: raw is a valid in-cage offset by precondition.
         let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        if gc_verify_enabled() {
+            verify_child_slot(slot, raw, header_ptr, parent_header);
+        }
         if !(*header_ptr).is_young() {
             return; // old / large objects do not move on scavenge.
         }

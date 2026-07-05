@@ -3629,6 +3629,7 @@ impl Interpreter {
         self.bake_arith_feedback(&mut view, fid);
         self.bake_element_load_kind(&mut view, fid);
         self.bake_property_feedback(&mut view);
+        self.bake_global_lex_cells(&mut view, context);
         self.bake_object_literals(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid);
         self.bake_collection_leaf_methods(&mut view);
@@ -3886,6 +3887,36 @@ impl Interpreter {
                 && let [one] = proto_cases.as_slice()
             {
                 instr.property_proto_feedback = Some(*one);
+            }
+        }
+    }
+
+    /// Resolve each `LoadGlobalOrThrow` site whose free identifier is a global
+    /// declarative-record (lexical) binding to that binding's cell, baking the
+    /// cell's compressed offset onto the instruction. The optimizing tier then
+    /// reads the value inline (`cage_base + offset`, one load, TDZ-hole guard)
+    /// instead of the per-access global-load bridge. Names that are not lexical
+    /// bindings (a `var` or a plain global-object property) or that are unbound
+    /// at compile time are left `None`, keeping the bridge for those sites.
+    fn bake_global_lex_cells(&self, view: &mut jit::JitFunctionView, context: &ExecutionContext) {
+        use otter_bytecode::{Op, Operand};
+        let fid = view.function_id;
+        for instr in &mut view.instructions {
+            if instr.op != Op::LoadGlobalOrThrow {
+                continue;
+            }
+            let Some(Operand::ConstIndex(name_idx)) = instr.operands.get(1).copied() else {
+                continue;
+            };
+            let Some(name) = context.string_constant_str_for_function(fid, name_idx) else {
+                continue;
+            };
+            // A lexical hit shadows the global object (§9.1.1.4), so only these
+            // resolve to a stable cell. The value read from the cell is always
+            // the current binding value (a reassigned `let` updates the cell in
+            // place), so both `const` and `let` are safe to inline.
+            if let Some((cell, _is_const)) = self.global_lexicals.get(name).copied() {
+                instr.global_lex_cell = Some(cell.offset());
             }
         }
     }
@@ -12124,6 +12155,7 @@ mod tests {
             property_proto_feedback: None,
             object_literal: None,
             element_load_kind: jit::JitElementLoadKind::Any,
+            global_lex_cell: None,
         }
     }
 
@@ -17064,6 +17096,7 @@ mod tests {
                     property_proto_feedback: None,
                     object_literal: None,
                     element_load_kind: jit::JitElementLoadKind::Any,
+                    global_lex_cell: None,
                 })
                 .collect(),
             inline_callees: rustc_hash::FxHashMap::default(),

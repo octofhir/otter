@@ -277,6 +277,9 @@ impl ExecutableFunction {
                     // Baked by `Interpreter::bake_element_load_kind` from the
                     // live per-site warmup feedback; the raw snapshot carries none.
                     element_load_kind: crate::jit::JitElementLoadKind::Any,
+                    // Baked by `Interpreter::bake_global_lex_cells` once the
+                    // lexical binding exists; the raw snapshot carries none.
+                    global_lex_cell: None,
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

@@ -1017,6 +1017,7 @@ impl<'a> Builder<'a> {
             let property_proto_feedback = instr.property_proto_feedback;
             let property_ic_site = instr.property_ic_site;
             let object_literal = instr.object_literal.clone();
+            let global_lex_cell = instr.global_lex_cell;
             let operands = instr.operands.clone();
 
             // Object-literal folding. While a literal is active, its key
@@ -1187,9 +1188,14 @@ impl<'a> Builder<'a> {
                 // carries only its destination register for liveness / reload.
                 Op::LoadGlobalOrThrow => {
                     let dst = reg(&operands, 0)?;
-                    let node = self
-                        .graph
-                        .add_node(NodeKind::LoadGlobalOrThrow, block, byte_pc);
+                    // A resolved lexical cell reads inline; every other global
+                    // (var / global-object property, or an unbound name) keeps
+                    // the GC-safe runtime bridge.
+                    let kind = match global_lex_cell {
+                        Some(cell_offset) => NodeKind::LoadGlobalCell { cell_offset },
+                        None => NodeKind::LoadGlobalOrThrow,
+                    };
+                    let node = self.graph.add_node(kind, block, byte_pc);
                     self.graph.set_frame_dst(node, dst);
                     self.push_body(block, node);
                     self.def_register(dst, block, node, byte_pc);
@@ -4910,6 +4916,7 @@ mod tests {
                 property_proto_feedback: None,
                 object_literal: None,
                 element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                global_lex_cell: None,
                 arith_feedback: *fb,
             })
             .collect();
@@ -5001,6 +5008,7 @@ mod tests {
                         property_proto_feedback: None,
                         object_literal: None,
                         element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                        global_lex_cell: None,
                         arith_feedback: ARITH_INT32,
                     },
                     otter_vm::JitInstrView {
@@ -5018,6 +5026,7 @@ mod tests {
                         property_proto_feedback: None,
                         object_literal: None,
                         element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                        global_lex_cell: None,
                         arith_feedback: 0,
                     },
                 ],
@@ -5062,6 +5071,7 @@ mod tests {
                     property_proto_feedback: None,
                     object_literal: None,
                     element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                    global_lex_cell: None,
                     arith_feedback: 0,
                 },
                 otter_vm::JitInstrView {
@@ -5079,6 +5089,7 @@ mod tests {
                     property_proto_feedback: None,
                     object_literal: None,
                     element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                    global_lex_cell: None,
                     arith_feedback: 0,
                 },
                 otter_vm::JitInstrView {
@@ -5096,6 +5107,7 @@ mod tests {
                     property_proto_feedback: None,
                     object_literal: None,
                     element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+                    global_lex_cell: None,
                     arith_feedback: 0,
                 },
             ],
@@ -5225,6 +5237,7 @@ mod tests {
             property_proto_feedback: None,
             object_literal: None,
             element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
+            global_lex_cell: None,
             arith_feedback: fb,
         }
     }

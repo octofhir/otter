@@ -1899,6 +1899,19 @@ impl Interpreter {
                 )?;
             }
             None
+        } else if receiver.is_intl() {
+            // ECMA-402 service instances are ordinary objects with
+            // internal slots. User writes land in the non-GC exotic
+            // expando after the prototype chain has had a chance to
+            // reject through accessors or read-only descriptors.
+            let vm_key = VmPropertyKey::OwnedString(name.to_string());
+            if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
+                self.failed_set_result(
+                    strict,
+                    format!("Cannot assign to read-only property '{name}'"),
+                )?;
+            }
+            None
         } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
             return Err(self.err_type(
                 (format!(

@@ -1,14 +1,20 @@
 //! `Intl.ListFormat` — locale-aware list joining.
 //!
-//! Foundation surface: English templates for the three spec types:
-//! - conjunction: `"a, b, and c"`
-//! - disjunction: `"a, b, or c"`
-//! - unit:        `"a, b, c"`
+//! The rendered list and `formatToParts` layout come from ICU4X list
+//! formatter data, which implements CLDR list patterns for the selected
+//! locale, type, and style.
 //!
 //! # See also
 //! - <https://tc39.es/ecma402/#listformat-objects>
 
+use std::fmt;
+use std::str::FromStr;
+
+use icu_list::options::{ListFormatterOptions, ListLength};
+use icu_list::{ListFormatter, ListFormatterPreferences};
+use icu_locale::Locale;
 use otter_gc::raw::RawGc;
+use writeable::{Part, PartsWrite, Writeable};
 
 use crate::intl::helpers::{DEFAULT_LOCALE, get_string_option, require_options_object};
 use crate::intl::payload::{IntlPayload, ListFormatPayload};
@@ -81,31 +87,15 @@ fn require_payload(
 }
 
 pub(crate) fn join(items: &[String], payload: &ListFormatPayload) -> String {
-    let conjunction = match payload.kind.as_str() {
-        "disjunction" => "or",
-        "unit" => "",
-        _ => "and",
+    let formatter = match formatter_for(payload) {
+        Some(formatter) => formatter,
+        None => return items.join(", "),
     };
-    let narrow = payload.style == "narrow";
-    match items.len() {
-        0 => String::new(),
-        1 => items[0].clone(),
-        2 => {
-            if conjunction.is_empty() || narrow {
-                format!("{}, {}", items[0], items[1])
-            } else {
-                format!("{} {} {}", items[0], conjunction, items[1])
-            }
-        }
-        n => {
-            let head = items[..n - 1].join(", ");
-            if conjunction.is_empty() {
-                format!("{}, {}", head, items[n - 1])
-            } else {
-                format!("{}, {} {}", head, conjunction, items[n - 1])
-            }
-        }
-    }
+    let mut out = String::new();
+    let _ = formatter
+        .format(items.iter().map(String::as_str))
+        .write_to(&mut out);
+    out
 }
 
 /// §13.5.3 `Intl.ListFormat.prototype.format(list)`.
@@ -122,8 +112,7 @@ pub(crate) fn list_format_format(
     )?))
 }
 
-/// §13.5.4 `Intl.ListFormat.prototype.formatToParts(list)` —
-/// single-literal-part fallback.
+/// §13.5.4 `Intl.ListFormat.prototype.formatToParts(list)`.
 pub(crate) fn list_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -155,32 +144,82 @@ pub(crate) fn list_format_format_to_parts(
 
 /// Build the `element` / `literal` part layout matching [`join`].
 fn parts_layout(items: &[String], payload: &ListFormatPayload) -> Vec<(&'static str, String)> {
-    let conjunction = match payload.kind.as_str() {
-        "disjunction" => "or",
-        "unit" => "",
-        _ => "and",
-    };
-    let narrow = payload.style == "narrow";
-    let mut out: Vec<(&'static str, String)> = Vec::new();
-    let n = items.len();
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            let sep = if i == n - 1 {
-                if conjunction.is_empty() || (n == 2 && narrow) {
-                    ", ".to_string()
-                } else if n == 2 {
-                    format!(" {conjunction} ")
-                } else {
-                    format!(", {conjunction} ")
-                }
+    let formatter = match formatter_for(payload) {
+        Some(formatter) => formatter,
+        None => {
+            let joined = items.join(", ");
+            return if joined.is_empty() {
+                Vec::new()
             } else {
-                ", ".to_string()
+                vec![("literal", joined)]
             };
-            out.push(("literal", sep));
         }
-        out.push(("element", item.clone()));
+    };
+    let mut collector = ListPartsCollector::default();
+    let _ = formatter
+        .format(items.iter().map(String::as_str))
+        .write_to_parts(&mut collector);
+    collector.parts
+}
+
+fn formatter_for(payload: &ListFormatPayload) -> Option<ListFormatter> {
+    let locale = Locale::from_str(&payload.locale)
+        .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
+        .ok()?;
+    let prefs = ListFormatterPreferences::from(&locale);
+    let options = ListFormatterOptions::default().with_length(match payload.style.as_str() {
+        "narrow" => ListLength::Narrow,
+        "short" => ListLength::Short,
+        _ => ListLength::Wide,
+    });
+    let formatter = match payload.kind.as_str() {
+        "disjunction" => ListFormatter::try_new_or(prefs, options),
+        "unit" => ListFormatter::try_new_unit(prefs, options),
+        _ => ListFormatter::try_new_and(prefs, options),
+    };
+    formatter.ok()
+}
+
+#[derive(Default)]
+struct ListPartsCollector {
+    current: Option<&'static str>,
+    parts: Vec<(&'static str, String)>,
+}
+
+impl fmt::Write for ListPartsCollector {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if s.is_empty() {
+            return Ok(());
+        }
+        let ty = self.current.unwrap_or("literal");
+        if let Some((last_ty, last_value)) = self.parts.last_mut()
+            && *last_ty == ty
+        {
+            last_value.push_str(s);
+            return Ok(());
+        }
+        self.parts.push((ty, s.to_string()));
+        Ok(())
     }
-    out
+}
+
+impl PartsWrite for ListPartsCollector {
+    type SubPartsWrite = Self;
+
+    fn with_part(
+        &mut self,
+        part: Part,
+        mut f: impl FnMut(&mut Self::SubPartsWrite) -> fmt::Result,
+    ) -> fmt::Result {
+        let previous = self.current;
+        self.current = Some(match part.value {
+            "element" => "element",
+            _ => "literal",
+        });
+        let result = f(self);
+        self.current = previous;
+        result
+    }
 }
 
 /// §13.5.5 `Intl.ListFormat.prototype.resolvedOptions()`.
@@ -193,6 +232,9 @@ pub(crate) fn list_format_resolved_options(
     let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
     let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
     let mut obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style], &[])?;
+    if let Some(proto) = ctx.cx.interp.object_prototype_object_opt() {
+        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
+    }
     let heap = ctx.heap_mut();
     crate::object::set(&mut obj, heap, "locale", locale);
     crate::object::set(&mut obj, heap, "type", kind);

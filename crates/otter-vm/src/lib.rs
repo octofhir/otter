@@ -1086,6 +1086,11 @@ pub struct Interpreter {
     /// interpreter root set, which keeps subclass prototypes safe
     /// without embedding untraced `Value` slots in non-GC bodies.
     non_gc_exotic_prototype_overrides: std::collections::HashMap<usize, Value>,
+    /// Per-instance own-property bags for object-shaped exotics whose
+    /// payloads are not GC-managed objects yet. `Intl.*` instances are
+    /// ordinary objects for user-visible own properties even though
+    /// their internal slots live in compact non-object payloads.
+    non_gc_exotic_user_props: std::collections::HashMap<usize, JsObject>,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].
@@ -1771,6 +1776,7 @@ impl Interpreter {
             function_non_extensible: std::collections::HashSet::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
             non_gc_exotic_prototype_overrides: std::collections::HashMap::new(),
+            non_gc_exotic_user_props: std::collections::HashMap::new(),
             console_sink: console::default_console_sink(),
             timer_scheduler: None,
             timer_callbacks: timers::TimerCallbacks::new(),
@@ -5395,6 +5401,30 @@ impl Interpreter {
         self.non_gc_exotic_prototype_overrides.get(&key).cloned()
     }
 
+    pub(crate) fn non_gc_exotic_user_props(&self, value: &Value) -> Option<JsObject> {
+        let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
+        self.non_gc_exotic_user_props.get(&key).copied()
+    }
+
+    pub(crate) fn ensure_non_gc_exotic_user_props(
+        &mut self,
+        value: &Value,
+    ) -> Result<Option<JsObject>, VmError> {
+        let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
+            return Ok(None);
+        };
+        if let Some(existing) = self.non_gc_exotic_user_props.get(&key) {
+            return Ok(Some(*existing));
+        }
+        let receiver = *value;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            receiver.trace_value_slots(visitor);
+        };
+        let bag = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+        self.non_gc_exotic_user_props.insert(key, bag);
+        Ok(Some(bag))
+    }
+
     /// `[[GetPrototypeOf]]` for non-Proxy heap values. Centralises
     /// the foundation rule that constructor-shaped Objects whose
     /// stored `[[Prototype]]` is missing — or is the realm's
@@ -6562,6 +6592,11 @@ impl Interpreter {
     /// `TypedArray` instances.
     pub fn non_gc_exotic_prototype_overrides_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.non_gc_exotic_prototype_overrides.values()
+    }
+
+    /// Iterator over non-GC exotic own-property bags.
+    pub fn non_gc_exotic_user_props_for_trace(&self) -> impl Iterator<Item = &JsObject> {
+        self.non_gc_exotic_user_props.values()
     }
 
     /// Borrow the GC-managed shape side tables for root tracing.

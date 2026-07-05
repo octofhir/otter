@@ -4911,6 +4911,7 @@ mod arm64 {
         let object_values_ptr_byte = view.object_values_ptr_byte;
         let jit_proto_byte = view.jit_proto_byte;
         let closure_fid_byte = view.closure_fid_byte;
+        let closure_upvalues_ptr_byte = view.closure_upvalues_ptr_byte;
         let slot_size = u64::from(DIRECT_METHOD_INLINE_SLOT_SIZE);
         let dst_off = u32::from(dst_reg) * 8;
 
@@ -4994,9 +4995,14 @@ mod arm64 {
             ; cmp w0, JS_CLOSURE_BODY_TYPE_TAG
             ; b.ne =>fallback
             ; ldr w4, [x13, closure_fid_byte]
+            // Read the resolved closure's captured spine LIVE (x8). A closure
+            // method carries its spine per-instance; using it directly avoids
+            // baking a raw pointer that could dangle across GC.
+            ; ldr x8, [x13, closure_upvalues_ptr_byte]
             ; b =>fid_compare
             ; =>fid_immediate
             ; lsr x4, x4, #16
+            ; ldr x8, [x9, DMI_UPVALUES_PTR_OFFSET]
             ; =>fid_compare
             ; ldr w5, [x9, DMI_METHOD_FID_OFFSET]
             ; cmp w4, w5
@@ -5005,11 +5011,12 @@ mod arm64 {
 
         // Identity confirmed. Stash the callee link fields (entry, self, upvalues,
         // register count) for the whole call — the window build clobbers `x9`.
+        // Upvalue spine is `x8` (live closure spine, or baked plain-fn value).
         dynasm!(ops
             ; .arch aarch64
             ; ldr x10, [x9, DMI_ENTRY_ADDR_OFFSET]
             ; ldr x11, [x9, DMI_SELF_CLOSURE_OFFSET]
-            ; ldr x12, [x9, DMI_UPVALUES_PTR_OFFSET]
+            ; mov x12, x8
             ; ldr w2, [x9, DMI_REGISTER_COUNT_OFFSET]
             ; stp x10, x11, [sp, #-32]!                 // [sp]=entry, [sp+8]=self
             ; stp x12, x2, [sp, #16]                    // [sp+16]=upv, [sp+24]=rc

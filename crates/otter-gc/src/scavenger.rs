@@ -705,7 +705,15 @@ unsafe fn cheney_scan(ctx: &mut ScavCtx, old_cursors: &mut smallvec::SmallVec<[u
                     continue;
                 }
                 progress = true;
+                // Children of freshly-promoted objects promote too (same
+                // policy as the dirty re-trace): leaving them young would
+                // re-remember every promoted parent and re-trace it on all
+                // later scavenges — the transitive closure of an old graph
+                // must reach old space within THIS scavenge.
+                let was_dirty = ctx.in_dirty_scan;
+                ctx.in_dirty_scan = true;
                 scan_range_raw(ctx, base, scan_from, limit);
+                ctx.in_dirty_scan = was_dirty;
                 old_cursors[idx] = limit;
             }
 

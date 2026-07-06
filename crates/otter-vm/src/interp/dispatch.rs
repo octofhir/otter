@@ -1052,7 +1052,10 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let callee = Value::function(frame.function_id);
+                        let callee = self
+                            .frame_cold(frame)
+                            .and_then(|cold| cold.callee_closure)
+                            .map_or_else(|| Value::function(frame.function_id), Value::closure);
                         (
                             elements,
                             function.arguments_object_kind,

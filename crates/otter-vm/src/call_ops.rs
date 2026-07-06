@@ -65,6 +65,7 @@ fn invoke_native_call_with_roots(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     call: crate::native_function::NativeCallTarget,
+    realm_global: Option<JsObject>,
     this_value: Value,
     value_roots: &[&Value],
     args: &[Value],
@@ -82,9 +83,18 @@ fn invoke_native_call_with_roots(
         .gc_heap
         .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let call_info = NativeCallInfo::call(this_root);
-    let mut ctx = NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
-    let raw = call.invoke(&mut ctx, args);
-    let result = raw.map_err(|e| native_to_vm_error(interp, e));
+    let result = if let Some(global) = realm_global {
+        interp.with_host_realm_global(global, |interp| {
+            let mut ctx =
+                NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
+            let raw = call.invoke(&mut ctx, args);
+            raw.map_err(|e| native_to_vm_error(interp, e))
+        })
+    } else {
+        let mut ctx = NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
+        let raw = call.invoke(&mut ctx, args);
+        raw.map_err(|e| native_to_vm_error(interp, e))
+    };
     interp.gc_heap.pop_extra_roots_to(depth - 1);
     result
 }
@@ -839,7 +849,7 @@ impl Interpreter {
         } else {
             (Some(dst), None)
         };
-        let prepared = {
+        let mut prepared = {
             let caller = &stack[top_idx];
             let args = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
             self.prepare_bytecode_call_frame_from_window(
@@ -856,6 +866,14 @@ impl Interpreter {
                 async_state,
             )?
         };
+        // Record the invoked closure so the named-function SELF binding and
+        // `arguments.callee` resolve to the live instance, not a bare
+        // interned function value.
+        if (function.makes_function || function.needs_arguments)
+            && let Some(closure) = current.as_closure(&self.gc_heap)
+        {
+            self.frame_ensure_cold(&mut prepared.frame).callee_closure = Some(closure);
+        }
         self.push_prepared_bytecode_call_frame(stack, context, dst, prepared)?;
         Ok(true)
     }
@@ -890,8 +908,16 @@ impl Interpreter {
                 return Ok(false);
             }
             self.record_runtime_native_call();
-            let result =
-                invoke_native_call_with_roots(self, context, call, this_value, &[callee], args)?;
+            let realm_global = native.realm_global(&self.gc_heap);
+            let result = invoke_native_call_with_roots(
+                self,
+                context,
+                call,
+                realm_global,
+                this_value,
+                &[callee],
+                args,
+            )?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
         }
@@ -902,8 +928,16 @@ impl Interpreter {
                 return Ok(false);
             }
             self.record_runtime_native_call();
-            let result =
-                invoke_native_call_with_roots(self, context, call, this_value, &[callee], args)?;
+            let realm_global = native.realm_global(&self.gc_heap);
+            let result = invoke_native_call_with_roots(
+                self,
+                context,
+                call,
+                realm_global,
+                this_value,
+                &[callee],
+                args,
+            )?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
         }
@@ -1117,10 +1151,12 @@ impl Interpreter {
         {
             let call = native.call_target(&self.gc_heap);
             self.record_runtime_native_call();
+            let realm_global = native.realm_global(&self.gc_heap);
             let result = invoke_native_call_with_roots(
                 self,
                 context,
                 call,
+                realm_global,
                 effective_this,
                 &[&current],
                 effective_args.as_slice(),
@@ -1139,10 +1175,12 @@ impl Interpreter {
                 return Ok(());
             }
             self.record_runtime_native_call();
+            let realm_global = native.realm_global(&self.gc_heap);
             let result = invoke_native_call_with_roots(
                 self,
                 context,
                 call,
+                realm_global,
                 effective_this,
                 &[&current],
                 effective_args.as_slice(),
@@ -2047,10 +2085,12 @@ impl Interpreter {
         {
             let call = native.call_target(&self.gc_heap);
             self.record_runtime_native_call();
+            let realm_global = native.realm_global(&self.gc_heap);
             return invoke_native_call_with_roots(
                 self,
                 context,
                 call,
+                realm_global,
                 effective_this,
                 &[&current],
                 effective_args.as_slice(),
@@ -2068,10 +2108,12 @@ impl Interpreter {
                 );
             }
             self.record_runtime_native_call();
+            let realm_global = native.realm_global(&self.gc_heap);
             return invoke_native_call_with_roots(
                 self,
                 context,
                 call,
+                realm_global,
                 effective_this,
                 &[&current],
                 effective_args.as_slice(),
@@ -2215,10 +2257,12 @@ impl Interpreter {
             Frame::with_exec_window(function, None, upvalues, this_for_callee, ptr, base_off)
         };
         // A closure frame records its instance so the named-function SELF
-        // binding inside the body resolves to it (per-instance `.prototype`).
-        // Only bodies that actually create a closure can read this back, so a
-        // leaf callee skips both the record and the cold-frame acquire.
-        if function.makes_function
+        // binding inside the body resolves to it (per-instance `.prototype`),
+        // and so `arguments.callee` exposes the invoked closure rather than a
+        // bare interned function value. Leaf callees that neither create a
+        // closure nor materialize an arguments object skip the record and the
+        // cold-frame acquire.
+        if (function.makes_function || function.needs_arguments)
             && let Some(closure) = current.as_closure(&self.gc_heap)
         {
             self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);

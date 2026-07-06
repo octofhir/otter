@@ -4380,7 +4380,16 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        Err(VmError::TypeMismatch)
+        // V8-compatible diagnostic: name the base kind and the key being
+        // read ("Cannot read properties of undefined (reading 'foo')").
+        let shown_key = key.string_name().unwrap_or("property");
+        Err(self.err_type(
+            (format!(
+                "Cannot read properties of {} (reading '{shown_key}')",
+                crate::value_kind_name(&base)
+            ))
+            .into(),
+        ))
     }
 
     /// Resolve `Intl.<class_name>.prototype` by walking

@@ -26,6 +26,7 @@
 
 use smallvec::SmallVec;
 
+use otter_gc::RootScope;
 use otter_gc::raw::RawGc;
 
 use crate::Value;
@@ -33,48 +34,15 @@ use crate::number::NumberValue;
 use crate::object::{
     self, JsObject, MappedArgumentEntry, PartialPropertyDescriptor, PropertyDescriptor,
 };
+use crate::rooting::RootScopeExt;
 use crate::symbol::JsSymbol;
 
-/// GC root provider covering the arguments object under construction.
-///
-/// Each `define_own_property` below can allocate (wide-number boxing in
-/// `SlotData::into_flat`, dictionary conversion) and therefore move the
-/// heap. The `obj` handle, the remaining argv values, the callee /
-/// iterator-method values, and the mapped parameter cells must all be
-/// forwarded by that collection, or the next loop iteration reads a
-/// stale handle into reused memory (observed as shape/dictionary hybrid
-/// corruption under `OTTER_GC_STRESS=full`).
-struct ArgsInitRoots {
-    obj: *mut JsObject,
-    args: *mut SmallVec<[Value; 4]>,
-    extra: [*mut Value; 2],
-    entries: *mut Vec<MappedArgumentEntry>,
-}
-
-impl otter_gc::FrameRoots for ArgsInitRoots {
-    fn trace(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        // SAFETY: the pointed-at locals outlive the provider registration —
-        // it is popped before `initialize_*` returns, and GC tracing runs
-        // synchronously during the pause.
-        unsafe {
-            visitor(self.obj.cast::<RawGc>());
-            for value in (*self.args).iter_mut() {
-                value.trace_value_slot_mut(visitor);
-            }
-            for &extra in &self.extra {
-                if !extra.is_null() {
-                    (*extra).trace_value_slot_mut(visitor);
-                }
-            }
-            if !self.entries.is_null() {
-                for entry in (*self.entries).iter_mut() {
-                    visitor((&mut entry.cell as *mut crate::upvalue::UpvalueCell).cast::<RawGc>());
-                }
-            }
-        }
-    }
-}
-
+/// GC-safety: each `define_own_property` below can allocate (wide-number
+/// boxing in `SlotData::into_flat`, dictionary conversion) and move the
+/// heap, so the object handle, remaining argv values, callee / iterator
+/// method, and parameter-map cells are all registered on a
+/// [`otter_gc::RootScope`] for the whole initialization; a collection
+/// forwards them in place.
 /// Populate an unmapped `arguments` object from a captured argv list.
 pub(crate) fn initialize_unmapped(
     mut obj: JsObject,
@@ -87,13 +55,14 @@ pub(crate) fn initialize_unmapped(
         Some((symbol, method)) => (Some(symbol), method),
         None => (None, Value::undefined()),
     };
-    let roots = ArgsInitRoots {
-        obj: &mut obj,
-        args: &mut args,
-        extra: [&mut throw_type_error, &mut iterator_method],
-        entries: std::ptr::null_mut(),
-    };
-    let depth = heap.push_frame_roots(&roots as *const dyn otter_gc::FrameRoots) - 1;
+    let mut scope = RootScope::new(heap);
+    // SAFETY: the rooted locals are declared above the scope and outlive it.
+    unsafe {
+        scope.add_object(&mut obj);
+        scope.add_value_smallvec(&mut args);
+        scope.add_value(&mut throw_type_error);
+        scope.add_value(&mut iterator_method);
+    }
 
     object::mark_as_arguments_object(obj, heap);
     for index in 0..args.len() {
@@ -129,7 +98,7 @@ pub(crate) fn initialize_unmapped(
             },
         );
     }
-    heap.pop_frame_roots_to(depth);
+    drop(scope);
 }
 
 /// Populate a sloppy mapped `arguments` object from a captured argv
@@ -146,13 +115,19 @@ pub(crate) fn initialize_mapped(
         Some((symbol, method)) => (Some(symbol), method),
         None => (None, Value::undefined()),
     };
-    let roots = ArgsInitRoots {
-        obj: &mut obj,
-        args: &mut args,
-        extra: [&mut callee, &mut iterator_method],
-        entries: &mut mapped_entries,
-    };
-    let depth = heap.push_frame_roots(&roots as *const dyn otter_gc::FrameRoots) - 1;
+    let mut scope = RootScope::new(heap);
+    // SAFETY: the rooted locals are declared above the scope and outlive it.
+    unsafe {
+        scope.add_object(&mut obj);
+        scope.add_value_smallvec(&mut args);
+        scope.add_value(&mut callee);
+        scope.add_value(&mut iterator_method);
+        for entry in mapped_entries.iter_mut() {
+            scope.add_raw_slot(
+                (&mut entry.cell as *mut crate::upvalue::UpvalueCell).cast::<RawGc>(),
+            );
+        }
+    }
 
     object::mark_as_arguments_object(obj, heap);
     for index in 0..args.len() {
@@ -188,10 +163,10 @@ pub(crate) fn initialize_mapped(
             },
         );
     }
-    // Move the entries out through the same slot the provider traces:
-    // `mem::take` leaves a valid empty Vec behind, so a collection during
-    // `install_mapped_arguments` still traces coherent state (obj included).
-    let entries = std::mem::take(&mut mapped_entries);
-    object::install_mapped_arguments(obj, heap, entries);
-    heap.pop_frame_roots_to(depth);
+    // The entry cells are rooted as individual slots (stable Vec storage:
+    // the vector is not resized while the scope is open), so the vector can
+    // move into `install_mapped_arguments` only after the scope closes; by
+    // then `obj` and the cells are current.
+    drop(scope);
+    object::install_mapped_arguments(obj, heap, mapped_entries);
 }

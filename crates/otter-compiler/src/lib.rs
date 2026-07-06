@@ -680,7 +680,12 @@ mod tests {
     }
 
     #[test]
-    fn recursive_function_self_binding_keeps_captures() {
+    fn recursive_function_declaration_captures_hoisted_binding() {
+        // §10.2.11 — a function *declaration* has no funcEnv self-name
+        // binding: `f` inside `f`'s body resolves to the enclosing
+        // hoisted binding via an upvalue capture. The body must NOT
+        // re-make its own closure (that would break identity —
+        // `f !== f` — and hide expando properties).
         let module = compile_script_src(
             "function outer() { let prefix = 'x'; function f(n) { if (n <= 0) return prefix; return f(n - 1); } return f(1); }\nouter();",
         );
@@ -689,17 +694,17 @@ mod tests {
             .iter()
             .find(|f| f.name == "f")
             .expect("recursive function record");
-        let self_binding = recursive
-            .code
-            .iter()
-            .find(|i| i.op == Op::MakeClosure)
-            .expect("recursive self binding should emit MakeClosure");
         assert!(
-            self_binding
-                .operands
-                .as_slice()
-                .contains(&Operand::Imm32(recursive.own_upvalue_count as i32)),
-            "recursive self binding should preserve captures: {:?}",
+            !recursive
+                .code
+                .iter()
+                .any(|i| matches!(i.op, Op::MakeClosure | Op::MakeFunction)),
+            "declaration body must not re-make its own closure: {:?}",
+            recursive.code
+        );
+        assert!(
+            recursive.code.iter().any(|i| i.op == Op::LoadUpvalue),
+            "self-call should load the hoisted binding through an upvalue: {:?}",
             recursive.code
         );
     }

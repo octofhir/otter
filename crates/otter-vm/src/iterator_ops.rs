@@ -560,7 +560,14 @@ impl Interpreter {
                 mut counter,
             } => loop {
                 if let Some(inner_iter) = inner.take() {
-                    let (v, done) = self.iterator_next_full(context, &inner_iter)?;
+                    let (v, done) = match self.iterator_next_full(context, &inner_iter) {
+                        Ok(next) => next,
+                        Err(err) => {
+                            self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                            self.close_iterator_preserving_throw(context, &source);
+                            return Err(err);
+                        }
+                    };
                     if !done {
                         return Ok((v, false));
                     }
@@ -632,12 +639,26 @@ impl Interpreter {
                         .well_known_symbols
                         .get(crate::symbol::WellKnown::Iterator);
                     let key = crate::VmPropertyKey::Symbol(iterator_sym);
-                    let outcome = self.ordinary_get_value(context, mapped, mapped, &key, 0)?;
+                    let outcome = match self.ordinary_get_value(context, mapped, mapped, &key, 0) {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                            self.close_iterator_preserving_throw(context, &source);
+                            return Err(err);
+                        }
+                    };
                     let iter_method = match outcome {
                         crate::VmGetOutcome::Value(v) => v,
-                        crate::VmGetOutcome::InvokeGetter { getter } => {
-                            self.run_callable_sync(context, &getter, mapped, SmallVec::new())?
-                        }
+                        crate::VmGetOutcome::InvokeGetter { getter } => match self
+                            .run_callable_sync(context, &getter, mapped, SmallVec::new())
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                                self.close_iterator_preserving_throw(context, &source);
+                                return Err(err);
+                            }
+                        },
                     };
                     let iter_value = if iter_method.is_undefined() || iter_method.is_null() {
                         // Iterator-without-`@@iterator` shape —
@@ -646,8 +667,18 @@ impl Interpreter {
                         // its own `.next`.
                         mapped
                     } else if self.is_callable_runtime(&iter_method) {
-                        self.run_callable_sync(context, &iter_method, mapped, SmallVec::new())?
+                        match self.run_callable_sync(context, &iter_method, mapped, SmallVec::new())
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                                self.close_iterator_preserving_throw(context, &source);
+                                return Err(err);
+                            }
+                        }
                     } else {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        self.close_iterator_preserving_throw(context, &source);
                         return Err(self.err_type(
                             ("Iterator.prototype.flatMap mapper return must be iterable"
                                 .to_string())
@@ -670,19 +701,45 @@ impl Interpreter {
                         // §7.4.2 GetIteratorFlattenable step 3 —
                         // GetIteratorDirect caches `next` once.
                         let key = crate::VmPropertyKey::String("next");
-                        let next_method = match self
-                            .ordinary_get_value(context, iter_value, iter_value, &key, 0)?
+                        let next_method = match match self
+                            .ordinary_get_value(context, iter_value, iter_value, &key, 0)
                         {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                                self.close_iterator_preserving_throw(context, &source);
+                                return Err(err);
+                            }
+                        } {
                             crate::VmGetOutcome::Value(v) => v,
-                            crate::VmGetOutcome::InvokeGetter { getter } => self
-                                .run_callable_sync(context, &getter, iter_value, SmallVec::new())?,
+                            crate::VmGetOutcome::InvokeGetter { getter } => match self
+                                .run_callable_sync(context, &getter, iter_value, SmallVec::new())
+                            {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                                    self.close_iterator_preserving_throw(context, &source);
+                                    return Err(err);
+                                }
+                            },
                         };
+                        if !self.is_callable_runtime(&next_method) {
+                            self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                            self.close_iterator_preserving_throw(context, &source);
+                            return Err(self.err_type(
+                                ("Iterator.prototype.flatMap mapper return must be iterable"
+                                    .to_string())
+                                .into(),
+                            ));
+                        }
                         IteratorState::User {
                             iterator: iter_value,
                             next_method: Some(next_method),
                         }
                     }
                 } else {
+                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                    self.close_iterator_preserving_throw(context, &source);
                     return Err(self.err_type(
                         ("Iterator.prototype.flatMap mapper return must be iterable".to_string())
                             .into(),

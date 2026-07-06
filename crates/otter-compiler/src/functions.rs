@@ -92,6 +92,15 @@ pub(crate) fn compile_function_full(
         if !is_method && !no_self_name && !name.is_empty() && self_name_in_inner {
             child.captured_names.insert(name.to_string());
         }
+        // A nested closure (arrow in a parameter default or in the body)
+        // that references `arguments` captures the arguments object
+        // through an upvalue cell, so the binding must be cell-promoted.
+        // The body-side reference is covered by `analyze_function`; the
+        // parameter-default side (`function f(h = () => arguments) {}`)
+        // is only visible through the params-aware nested-reference scan.
+        if needs_arguments && capture::inner_references_name(Some(params), b, "arguments") {
+            child.captured_names.insert("arguments".to_string());
+        }
         // §19.2.1.3 — a direct eval body reads and writes caller
         // bindings through upvalue cells, so promote every
         // function-scope binding (not just statically captured ones).

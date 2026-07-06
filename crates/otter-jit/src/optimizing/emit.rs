@@ -1728,9 +1728,17 @@ mod arm64 {
         Ok(())
     }
 
+    /// Whether `value` has any consumer the emitted code must satisfy: an SSA
+    /// input, a terminator operand, or an appearance in *any* frame state —
+    /// both the deopt points (`frames`) and the call-resume states. A stub's
+    /// destination that is only re-materialized into the window by a *later*
+    /// op's frame state still counts as used: skipping its post-stub reload
+    /// would leave the SSA home uninitialized, and that later materialize
+    /// would overwrite the window slot the stub just wrote with garbage.
     fn value_is_used_after(
         graph: &Graph,
         frames: &FxHashMap<NodeId, DeoptPoint>,
+        call_resume_frames: &FxHashMap<NodeId, DeoptPoint>,
         value: NodeId,
     ) -> bool {
         for block in &graph.blocks {
@@ -1752,6 +1760,7 @@ mod arm64 {
         }
         frames
             .values()
+            .chain(call_resume_frames.values())
             .any(|point| point.values().any(|v| v == value))
     }
 
@@ -3683,7 +3692,7 @@ mod arm64 {
                     ; str x3, [x0, arr_len_byte]
                     ; str x3, [x0, array_length_byte]
                 );
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                 {
                     dynasm!(ops
@@ -3712,7 +3721,7 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -3784,7 +3793,7 @@ mod arm64 {
                 let dst_off = u32::from(dst_reg) * 8;
                 dynasm!(ops ; .arch aarch64 ; str x0, [x19, dst_off]);
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                 {
                     store_loc(ops, loc, 0);
@@ -3814,7 +3823,7 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -3843,7 +3852,7 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -3872,7 +3881,7 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -3912,7 +3921,7 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -4260,7 +4269,7 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -4312,7 +4321,7 @@ mod arm64 {
                     // to a callee-saved register (or spilled) by the allocator, so
                     // the recursion preserved it. Only the call result needs to be
                     // pulled from the callee's window slot into its home.
-                    if value_is_used_after(graph, call_resume_frames, nid)
+                    if value_is_used_after(graph, frames, call_resume_frames, nid)
                         && let Some(loc) = dst
                     {
                         let off = u32::from(dst_reg) * 8;
@@ -4365,7 +4374,7 @@ mod arm64 {
                 dynasm!(ops ; .arch aarch64 ; =>done);
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -4461,7 +4470,7 @@ mod arm64 {
                         ; b =>full_path
                         ; leaf_hit:
                     );
-                    if value_is_used_after(graph, call_resume_frames, nid)
+                    if value_is_used_after(graph, frames, call_resume_frames, nid)
                         && let Some(loc) = dst
                     {
                         store_loc(ops, loc, 0);
@@ -4624,7 +4633,7 @@ mod arm64 {
                 dynasm!(ops ; .arch aarch64 ; =>done);
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {
@@ -4634,7 +4643,7 @@ mod arm64 {
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>after ; =>fast_done);
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
-                if value_is_used_after(graph, call_resume_frames, nid)
+                if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
                     && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
                 {

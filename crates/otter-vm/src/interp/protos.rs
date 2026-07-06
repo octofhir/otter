@@ -43,6 +43,9 @@ impl Interpreter {
         if let Some(intl) = value.as_intl(heap) {
             return Some(intl.identity_addr() as usize);
         }
+        if let Some(iter) = value.as_iterator() {
+            return Some(iter.as_header_ptr() as usize);
+        }
         value
             .as_typed_array(heap)
             .map(|array| array.identity_addr() as usize)
@@ -223,6 +226,12 @@ impl Interpreter {
             }
             return Ok(intrinsic_or_null(self, value));
         }
+        if value.as_iterator().is_some() {
+            if let Some(over) = self.non_gc_exotic_prototype_override(value) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
         if value.is_function()
             || value.is_closure()
             || value.is_bound_function()
@@ -283,6 +292,9 @@ impl Interpreter {
             return Ok(intrinsic_or_null(self, value));
         }
         if value.is_iterator() {
+            if let Some(over) = self.non_gc_exotic_prototype_override(value) {
+                return Ok(over);
+            }
             return Ok(intrinsic_or_null(self, value));
         }
         // §20.1.2.10 / §7.1.18 — primitives ToObject then walk

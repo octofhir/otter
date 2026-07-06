@@ -21,6 +21,11 @@ impl Interpreter {
         self.module_environments.values()
     }
 
+    /// Borrow additional host-created realms for GC root tracing.
+    pub(crate) fn extra_realms_for_trace(&self) -> impl Iterator<Item = &RealmState> {
+        self.extra_realms.iter()
+    }
+
     /// Borrow the persistent module-init upvalue spines for GC root
     /// tracing. The cells back module-scope bindings shared between
     /// the link-phase and evaluation-phase init invocations.

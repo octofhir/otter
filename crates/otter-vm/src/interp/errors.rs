@@ -44,14 +44,6 @@ impl Interpreter {
         )
     }
 
-    /// Raise a `URIError` carrying `message`.
-    pub(crate) fn err_uri(&self, message: Box<str>) -> VmError {
-        self.raise(
-            run_control::ErrorDetail::Message(message),
-            VmError::URIError,
-        )
-    }
-
     /// Raise a budget-exceeded error carrying `message`.
     pub(crate) fn err_budget(&self, message: Box<str>) -> VmError {
         self.raise(

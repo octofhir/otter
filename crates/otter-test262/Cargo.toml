@@ -29,13 +29,14 @@ serde_json  = { workspace = true }
 serde_yaml  = "0.9"
 toml        = { workspace = true }
 
-# CLI + traversal + parallelism. The test262 driver is CPU-bound per
-# worker and the per-test isolation rules out shared async runtime state.
+# CLI + traversal. The test262 driver uses short-lived worker
+# processes for isolation instead of in-process parallelism.
 clap        = { workspace = true }
 walkdir     = "2"
 ignore      = "0.4"
-rayon       = "1.10"
 indicatif   = "0.18"
+ctrlc       = "3"
+sysinfo     = { workspace = true }
 
 # Errors.
 anyhow      = "1"

@@ -81,17 +81,7 @@ var $262 = (function () {
             return __otter_eval_script(String(source));
         },
         createRealm: function () {
-            // Minimal INTERPRETING.md realm shell. Otter does not yet
-            // allocate a separate VM realm here, but tests that only
-            // need the host shape (`realm.global.*` + `evalScript`)
-            // should observe callable constructors instead of an
-            // undefined host surface.
-            return {
-                global: globalThis,
-                evalScript: function (source) {
-                    return __otter_eval_script(String(source));
-                }
-            };
+            return __otter_create_realm();
         },
         IsHTMLDDA: IsHTMLDDA,
         agent: {

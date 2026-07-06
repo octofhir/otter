@@ -363,30 +363,108 @@ pub fn run_one(
     // bindings visible to every module in the test's import graph —
     // sibling test files imported as dependencies reference them too.
     let body = Frontmatter::body_of(&source);
-    let combined = if frontmatter.is_raw() {
+    let allow_blocking_atomics_wait = !frontmatter
+        .test_flags()
+        .contains(&TestFlag::CanBlockIsFalse);
+
+    let mapped = if frontmatter.is_module() {
+        let outcome = run_module_with_fresh_runtime(
+            exec,
+            allow_blocking_atomics_wait,
+            &preamble,
+            body,
+            test_path,
+        );
+        invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout)
+    } else if frontmatter.is_raw() {
         // `flags: [raw]` — INTERPRETING.md mandates the file run
         // verbatim: no harness preamble, no strict prologue, and no
         // frontmatter stripping. Stripping the frontmatter would also
         // discard a leading hashbang (it precedes the `/*---*/`
         // block), so the hashbang grammar (byte-0-only `#!`) could
         // never be exercised. Feed the original bytes unchanged.
-        source.clone()
-    } else if frontmatter.is_module() {
-        body.to_string()
+        let outcome = run_script_with_fresh_runtime(
+            exec,
+            allow_blocking_atomics_wait,
+            &source,
+            &rel_path,
+            test_path,
+            features.iter().any(|feature| feature == "dynamic-import"),
+        );
+        invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout)
     } else {
-        let mut buf = String::new();
-        if frontmatter.is_only_strict() && !frontmatter.is_raw() {
-            buf.push_str("\"use strict\";\n");
+        let stage_script = features.iter().any(|feature| feature == "dynamic-import");
+        let mut ran_variant = false;
+        if !frontmatter.is_only_strict() {
+            ran_variant = true;
+            let mut sloppy = String::with_capacity(preamble.len() + body.len());
+            sloppy.push_str(&preamble);
+            sloppy.push_str(body);
+            let outcome = run_script_with_fresh_runtime(
+                exec,
+                allow_blocking_atomics_wait,
+                &sloppy,
+                &rel_path,
+                test_path,
+                stage_script,
+            );
+            let mapped = invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout);
+            if !matches!(mapped, Outcome::Pass) {
+                return result_with(
+                    rel_path,
+                    esid,
+                    features,
+                    label_variant_outcome("sloppy", mapped),
+                    start,
+                );
+            }
         }
-        buf.push_str(&preamble);
-        buf.push_str(body);
-        buf
+        if !frontmatter.is_no_strict() {
+            ran_variant = true;
+            let mut strict =
+                String::with_capacity("\"use strict\";\n".len() + preamble.len() + body.len());
+            strict.push_str("\"use strict\";\n");
+            strict.push_str(&preamble);
+            strict.push_str(body);
+            let outcome = run_script_with_fresh_runtime(
+                exec,
+                allow_blocking_atomics_wait,
+                &strict,
+                &rel_path,
+                test_path,
+                stage_script,
+            );
+            let mapped = invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout);
+            if !matches!(mapped, Outcome::Pass) {
+                return result_with(
+                    rel_path,
+                    esid,
+                    features,
+                    label_variant_outcome("strict", mapped),
+                    start,
+                );
+            }
+        }
+        if ran_variant {
+            Outcome::Pass
+        } else {
+            Outcome::Skipped {
+                feature: "no strictness variant".to_string(),
+            }
+        }
     };
 
-    // 9. Allocate fresh runtime + run.
-    let allow_blocking_atomics_wait = !frontmatter
-        .test_flags()
-        .contains(&TestFlag::CanBlockIsFalse);
+    result_with(rel_path, esid, features, mapped, start)
+}
+
+fn run_script_with_fresh_runtime(
+    exec: &ExecConfig,
+    allow_blocking_atomics_wait: bool,
+    source: &str,
+    rel_path: &str,
+    test_path: &Path,
+    stage_on_disk: bool,
+) -> Outcome {
     let mut runtime = match fresh_runtime(
         exec.timeout,
         exec.max_heap_bytes,
@@ -394,42 +472,61 @@ pub fn run_one(
     ) {
         Ok(rt) => rt,
         Err(err) => {
-            return result_with(
-                rel_path,
-                esid,
-                features,
-                Outcome::Crash {
-                    panic: format!("runtime construction failed: {err}"),
-                },
-                start,
-            );
+            return Outcome::Crash {
+                panic: format!("runtime construction failed: {err}"),
+            };
         }
     };
-
-    // 9a. Install `__otter_agent_*` host bindings on the fresh
-    // runtime so the `$262.agent.*` preamble shim resolves. Reset
-    // the cross-test agent registry first so leftover senders /
-    // reports from the previous test do not bleed in.
     crate::agent::reset_for_next_test();
-    let outcome = if frontmatter.is_module() {
-        run_module_test(&mut runtime, &preamble, &combined, test_path, exec.timeout)
-    } else {
-        let stage_script = features.iter().any(|feature| feature == "dynamic-import");
-        run_script_test(
-            &mut runtime,
-            &combined,
-            &rel_path,
-            test_path,
-            stage_script,
-            exec.timeout,
-        )
+    run_script_test(
+        &mut runtime,
+        source,
+        rel_path,
+        test_path,
+        stage_on_disk,
+        exec.timeout,
+    )
+}
+
+fn run_module_with_fresh_runtime(
+    exec: &ExecConfig,
+    allow_blocking_atomics_wait: bool,
+    preamble: &str,
+    body: &str,
+    test_path: &Path,
+) -> Outcome {
+    let mut runtime = match fresh_runtime(
+        exec.timeout,
+        exec.max_heap_bytes,
+        allow_blocking_atomics_wait,
+    ) {
+        Ok(rt) => rt,
+        Err(err) => {
+            return Outcome::Crash {
+                panic: format!("runtime construction failed: {err}"),
+            };
+        }
     };
+    crate::agent::reset_for_next_test();
+    run_module_test(&mut runtime, preamble, body, test_path, exec.timeout)
+}
 
-    // 10. Apply negative-test inversion if the frontmatter expects
-    //     an error.
-    let mapped = invert_negative(outcome, frontmatter.negative.as_ref(), exec.timeout);
-
-    result_with(rel_path, esid, features, mapped, start)
+fn label_variant_outcome(variant: &str, outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Fail { reason, stack } => Outcome::Fail {
+            reason: format!("{variant}: {reason}"),
+            stack,
+        },
+        Outcome::Crash { panic } => Outcome::Crash {
+            panic: format!("{variant}: {panic}"),
+        },
+        Outcome::Timeout { ms } => Outcome::Timeout { ms },
+        Outcome::OutOfMemory { bytes } => Outcome::OutOfMemory { bytes },
+        Outcome::Skipped { feature } => Outcome::Skipped {
+            feature: format!("{variant}: {feature}"),
+        },
+        Outcome::Pass => Outcome::Pass,
+    }
 }
 
 fn run_script_test(

@@ -100,16 +100,74 @@ fn pass_outcome_when_test_returns_normally() {
 }
 
 #[test]
-fn default_script_runs_without_forced_strict_prelude() {
+fn create_realm_uses_distinct_global_and_eval_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "realm/basic.js",
+        r#"/*---
+description: createRealm exposes a separate global and evalScript scope
+---*/
+const realm = $262.createRealm();
+assert.sameValue(realm.global === globalThis, false);
+assert.sameValue(realm.global.TypeError === TypeError, false);
+realm.evalScript("var realmOnly = 42;");
+assert.sameValue(realm.global.realmOnly, 42);
+assert.sameValue(typeof globalThis.realmOnly, "undefined");
+"#,
+    );
+    let outcome = drive(&corpus, &path);
+    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+}
+
+#[test]
+fn create_realm_preserves_iterator_realm_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "realm/iterator.js",
+        r#"/*---
+description: iterator helpers use the realm of the called method
+---*/
+const other = $262.createRealm().global;
+const iter = [1, 2, 3].values();
+assert.sameValue(Iterator.from(iter), iter);
+assert.sameValue(other.Iterator.from(iter) === iter, false);
+
+const arr = other.Iterator.prototype.toArray.call([1, 2, 3].values());
+assert.sameValue(arr instanceof Array, false);
+assert.sameValue(arr instanceof other.Array, true);
+
+let caught;
+try {
+    other.Iterator.prototype.every.call([].values());
+} catch (e) {
+    caught = e;
+}
+assert.sameValue(caught instanceof other.TypeError, true);
+assert.sameValue(caught instanceof TypeError, false);
+"#,
+    );
+    let outcome = drive(&corpus, &path);
+    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+}
+
+#[test]
+fn default_script_runs_strict_variant_too() {
     let tmp = tempfile::tempdir().unwrap();
     let corpus = synth_corpus(&tmp);
     let path = write_test(
         &corpus,
         "strictness/default-sloppy.js",
-        "/*---\ndescription: default script source is not rewritten to strict\n---*/\nassert.sameValue((function() { return this; })(), globalThis);\n",
+        "/*---\ndescription: default script runs both sloppy and strict variants\n---*/\nassert.sameValue((function() { return this; })(), globalThis);\n",
     );
     let outcome = drive(&corpus, &path);
-    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+    match outcome {
+        Outcome::Fail { reason, .. } => assert!(reason.contains("strict"), "reason was: {reason}"),
+        other => panic!("expected strict variant failure, got {other:?}"),
+    }
 }
 
 #[test]

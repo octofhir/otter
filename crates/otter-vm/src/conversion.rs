@@ -471,6 +471,12 @@ impl Interpreter {
             // and override `@@toStringTag`. Route through the cached
             // realm prototypes before falling back to the generic
             // `%IteratorPrototype%`.
+            if let Some(proto) = self
+                .non_gc_exotic_prototype_override(value)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
+            }
             let origin = self.gc_heap.read_payload(handle, |s| s.builtin_origin());
             if let Some(origin) = origin
                 && let Some(proto) = self.builtin_iterator_prototype_for(origin)

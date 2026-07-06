@@ -41,7 +41,8 @@
 //!
 //! - GC architecture plan §1.2 NF6, §7.1.
 
-use indexmap::IndexMap;
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 
 use crate::compressed::RawGc;
@@ -90,7 +91,7 @@ pub unsafe fn write_heap_snapshot(heap: &GcHeap) -> HeapSnapshotJson {
     }
     // Map header offset → node id (1-based; 0 reserved for
     // synthetic root).
-    let mut id_map: IndexMap<u32, u32> = IndexMap::new();
+    let mut id_map: BTreeMap<u32, u32> = BTreeMap::new();
     for (idx, n) in nodes.iter().enumerate() {
         id_map.insert(n.offset, (idx as u32) + 1);
     }
@@ -198,7 +199,7 @@ fn push_node(
 
 #[derive(Debug, Default)]
 struct StringTable {
-    map: IndexMap<String, u32>,
+    map: BTreeMap<String, u32>,
 }
 
 impl StringTable {

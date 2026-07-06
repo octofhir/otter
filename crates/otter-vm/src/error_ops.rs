@@ -508,7 +508,26 @@ pub(crate) fn symbol_to_vm_error(
     }
 }
 
-pub(crate) fn native_to_vm_error(interp: &crate::Interpreter, err: NativeError) -> VmError {
+pub(crate) fn native_to_vm_error(interp: &mut crate::Interpreter, err: NativeError) -> VmError {
+    fn native_spec_error(
+        interp: &mut crate::Interpreter,
+        kind: ErrorKind,
+        message: String,
+    ) -> VmError {
+        match interp.make_error_instance_with_stack_roots(
+            &HoltStack::new(),
+            kind,
+            Some(message.clone()),
+            &Value::undefined(),
+        ) {
+            Ok(obj) => {
+                interp.set_pending_uncaught_throw(Value::object(obj));
+                interp.err_uncaught(message.into())
+            }
+            Err(err) => err,
+        }
+    }
+
     match err {
         NativeError::Thrown { name: _, message } => interp.err_uncaught(message.into()),
         NativeError::Coded {
@@ -517,22 +536,24 @@ pub(crate) fn native_to_vm_error(interp: &crate::Interpreter, err: NativeError) 
             message,
         } => interp.err_coded(kind, code, message),
         NativeError::TypeError { name, reason } => {
-            interp.err_type(format!("{name}: {reason}").into())
+            native_spec_error(interp, ErrorKind::TypeError, format!("{name}: {reason}"))
         }
         NativeError::SyntaxError { name, reason } => {
-            interp.err_syntax(format!("{name}: {reason}").into())
+            native_spec_error(interp, ErrorKind::SyntaxError, format!("{name}: {reason}"))
         }
         NativeError::RangeError { name, reason } => {
-            interp.err_range(format!("{name}: {reason}").into())
+            native_spec_error(interp, ErrorKind::RangeError, format!("{name}: {reason}"))
         }
         NativeError::URIError { name, reason } => {
-            interp.err_uri(format!("{name}: {reason}").into())
+            native_spec_error(interp, ErrorKind::URIError, format!("{name}: {reason}"))
         }
         // Round-trips back to a ReferenceError-classed VmError so a TDZ
         // error raised behind a native boundary keeps its class.
-        NativeError::ReferenceError { name, reason } => {
-            interp.err_this_uninit(format!("{name}: {reason}").into())
-        }
+        NativeError::ReferenceError { name, reason } => native_spec_error(
+            interp,
+            ErrorKind::ReferenceError,
+            format!("{name}: {reason}"),
+        ),
         NativeError::Exit { code } => VmError::Exit { code },
         NativeError::Interrupted => VmError::Interrupted,
         NativeError::OutOfMemory {

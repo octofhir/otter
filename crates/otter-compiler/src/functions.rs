@@ -700,7 +700,17 @@ pub(crate) fn capture_lexical_environment_for_eval(cx: &mut Compiler) {
     }
     names.sort();
     names.dedup();
+    // `Op::MakeClosure` carries at most 252 captures. A pathological
+    // enclosing scope (a bundled script's module wrapper with hundreds of
+    // top-level bindings) would blow that limit, so stop short of it and
+    // leave the remaining names to the pre-fix behaviour (resolvable only
+    // when referenced statically). Names are sorted, so the exposed
+    // subset is deterministic.
+    const CAPTURE_BUDGET: usize = 200;
     for name in names {
+        if cx.top_mut().parent_captures.len() >= CAPTURE_BUDGET {
+            break;
+        }
         let _ = cx.resolve_capture(&name);
     }
 }

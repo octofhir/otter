@@ -64,7 +64,7 @@ Temporal (top-level namespace), Intl.
 
 Shape:
 
-```rust,ignore
+```rust
 holt! {
     name = "Math",
     feature = CORE,
@@ -111,7 +111,7 @@ intrinsics/proxy.rs and the new Temporal class installer.
 
 Shape:
 
-```rust,ignore
+```rust
 couch! {
     name = "Proxy",
     feature = CORE,
@@ -154,7 +154,7 @@ For one-off methods that don't fit a `raft!` table (e.g. a method
 with a long body and lots of doc comment), declare the JS name +
 length inline on the Rust function:
 
-```rust,ignore
+```rust
 #[dive(name = "from", length = 1)]
 pub fn array_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     // …
@@ -177,7 +177,7 @@ embedder root and exposed via a runtime API.
 
 Shape:
 
-```rust,ignore
+```rust
 burrow! {
     name = "OtterRequestContext",
     fields = {
@@ -197,7 +197,7 @@ Methods receive `&mut NativeCtx<'_>` plus the burrow handle
 unpacked from `this`.
 
 Burrow is the only macro that touches the embedder root contract;
-deserves its own runbook section in `docs/book/src/engine/native-call-abi.md` when
+deserves its own runbook section in `docs/site/src/content/docs/engine/native-call-abi.md` when
 the macro lands.
 
 ### `lodge!` — module install
@@ -209,7 +209,7 @@ metadata) plus the loader registration glue.
 
 Shape:
 
-```rust,ignore
+```rust
 lodge! {
     prefix = "otter",
     name   = "kv",
@@ -355,7 +355,7 @@ depends on (see `crates/otter-runtime/tests/compile_fail/`).
    assertions pin the expected `^^^^^` underline range.
 2. **ABI drift.** Generated code embeds the v1 ABI signature; an
    ABI v2 (if and when it ships) breaks every macro expansion at
-   once. Document this in `docs/book/src/engine/native-call-abi.md` as a hard
+once. Document this in `docs/site/src/content/docs/engine/native-call-abi.md` as a hard
    versioning rule: macros target the current ABI verbatim, no
    shim layer.
 3. **`forbid(unsafe_code)`.** None of the planned expansions need
@@ -369,7 +369,7 @@ depends on (see `crates/otter-runtime/tests/compile_fail/`).
 5. **Naming bus-factor.** Otter-themed names are charming but
    undocumented. Mitigation: this design note becomes the
    reference; macro doc comments cite it; the macro book chapter
-   under `docs/book/src/macros/` lists every term with a
+under `docs/site/src/content/docs/macros/` lists every term with a
    one-sentence "what it does" gloss.
 
 ## Open Questions for Owner

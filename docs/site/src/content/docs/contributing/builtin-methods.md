@@ -7,9 +7,13 @@ built-in prototype — `Number.prototype.toFixed`, `Array.prototype.map`,
 `Map.prototype.get`, and so on. Follow it and your method lands on the
 same dispatch path as every other built-in.
 
-There is **one** shape for a built-in method: a native function with the
-[Native Call ABI](/otter/engine/native-call-abi/) signature, installed on
-the prototype through the `couch!` surface.
+There is **one** low-level Rust-native shape for a built-in method: a native
+function with the [Native Call ABI](/otter/engine/native-call-abi/) signature,
+installed on the prototype through the `couch!` surface. That does not mean all
+public API logic should be native. For large or mostly-orchestration APIs,
+prefer a JS shim over narrow native primitives unless there is a capability,
+host-resource, VM/GC, or measured performance reason to cross into Rust. See
+[Dependency Policy](/otter/contributing/dependency-policy/#native-code-versus-js-glue).
 
 ```rust
 fn proto_method(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -140,4 +144,3 @@ cargo test -p otter-vm
 cargo clippy -p otter-vm --all-targets --all-features -- -D warnings
 ./target/debug/otter-test262 run --filter "built-ins/Number" --output after.json
 ```
-

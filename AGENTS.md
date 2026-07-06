@@ -58,7 +58,7 @@ detail; do not expand it or copy the pattern into runtime/session APIs.
 7. **Parse JS/TS with ASTs**: use `oxc`/SWC; never regex-parse JS/TS.
 8. **Protect the runtime boundary**: do not add dependencies from active crates into parked compatibility shims.
 9. **Prefer build-graph cleanup**: when a slice lands, check whether temporary shims, adapters, or parked code can be simplified immediately.
-10. **Use porting markers for uncertain migrations**: for substantial ports from parked shims or reference implementations, follow `docs/book/src/contributing/porting.md` (`TODO(port)`, `PERF(port)`, `PORT NOTE`, optional `PORT STATUS`).
+10. **Use porting markers for uncertain migrations**: for substantial ports from parked shims or reference implementations, follow `docs/site/src/content/docs/contributing/porting.md` (`TODO(port)`, `PERF(port)`, `PORT NOTE`, optional `PORT STATUS`).
 
 ## Repository Map (where to change what)
 
@@ -111,13 +111,13 @@ This separation:
 
 ### Intrinsic and Bootstrap Pattern
 
-New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the descriptor/spec/builder/bootstrap flow documented in `docs/book/src/extensions/js-surface-builders.md`.
+New ECMAScript builtins, global namespaces, Web API globals, and extension-visible host objects must follow the descriptor/spec/builder/bootstrap flow documented in `docs/site/src/content/docs/extensions/js-surface-builders.md`.
 
 - Add new bootstrap work in `crates/otter-vm` / `crates/otter-runtime`.
 - Keep global installation centralized; do not scatter ad-hoc global mutation across unrelated modules.
 - Prefer static specs plus mutator-bound builders over one-off registration functions when exposing JS-visible constructors, prototypes, and namespaces.
 - High-level APIs must compile down to the same runtime shape as handwritten static specs: no per-call allocation, runtime metadata parsing, or hot-path dynamic registry.
-- Contributor-facing workflow docs belong in `docs/book/`; task files are implementation history.
+- Contributor-facing workflow docs belong in `docs/site/src/content/docs/`; task files are implementation history.
 - If a feature exists only in parked code, port or redesign it; do not grow the parked surface.
 
 ## Development Philosophy
@@ -153,7 +153,7 @@ Rules:
 - Macros must generate static specs plus normal Rust functions; they are syntax sugar over JS surface builders, not a parallel runtime registry.
 - Generated builtins should use the static native function-pointer path by default.
 - Keep exported JS names and arity explicit in the macro declaration. Do not hide API shape in unrelated helper code.
-- If a macro-based API surface changes, update tests, `.d.ts` declarations, and mdBook docs in the same patch when applicable.
+- If a macro-based API surface changes, update tests, `.d.ts` declarations, and Astro docs in the same patch when applicable.
 
 Keep code manual when:
 

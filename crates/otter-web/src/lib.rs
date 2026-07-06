@@ -1,22 +1,24 @@
 //! Active Web API slices.
 //!
-//! This crate ports URL, Headers, Request/Response, and Blob behavior onto the
-//! active engine dependency graph. JavaScript-visible surfaces are static specs
-//! installed through the runtime builder/global bootstrap path.
+//! This crate ports Web platform behavior onto the active engine dependency
+//! graph. Native host classes (URL, Blob) are static specs installed through
+//! the runtime builder path; the Fetch classes (Headers, Request, Response)
+//! and the wider pure-JS surface (Event, TextEncoder/Decoder, streams, …) are
+//! JS shims evaluated lazily on first global touch (see [`globals`]).
 //!
 //! # Contents
 //! - [`url`] - URL parsing and mutation.
-//! - [`headers`] - ordered, normalized header list.
 //! - [`blob`] - owned byte blobs.
-//! - [`request_response`] - Fetch-shaped request/response records.
+//! - [`globals`] - function globals plus the lazy JS shim surface
+//!   (`web_bootstrap.js`, `web_streams.js`, `web_fetch.js`).
 //! - [`WEB_API_CLASSES`] - static class specs.
 //!
 //! # Invariants
 //! - Web API state is owned Rust data and contains no VM contexts or handles.
 //! - Global/class installation is described by static specs.
-//! - Network work is outside this crate. Fetch-like records store owned request
-//!   data only; async network integrations must copy that owned data into
-//!   futures and resolve on the isolate.
+//! - Network work is outside this crate. The Fetch classes store owned body
+//!   data only; server/network integrations exchange plain data with them
+//!   through the hidden `__otterFetchInternals` factory in `web_fetch.js`.
 //!
 //! # See also
 //! - [Web API contribution workflow](../../../docs/book/src/web/contributing.md)
@@ -25,8 +27,6 @@ extern crate otter_runtime as otter_vm;
 
 pub mod blob;
 pub mod globals;
-pub mod headers;
-pub mod request_response;
 pub mod url;
 
 use otter_runtime::{
@@ -41,10 +41,7 @@ use otter_runtime::{
 /// path as bootstrap registry entries.
 pub static WEB_API_CLASSES: &[GlobalClass] = &[
     GlobalClass::from_intrinsic::<url::Intrinsic>(),
-    GlobalClass::from_intrinsic::<headers::Intrinsic>(),
     GlobalClass::from_intrinsic::<blob::Intrinsic>(),
-    GlobalClass::from_intrinsic::<request_response::RequestIntrinsic>(),
-    GlobalClass::from_intrinsic::<request_response::ResponseIntrinsic>(),
 ];
 
 /// Return active Web API specs.
@@ -71,7 +68,8 @@ pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
 
 /// Ergonomic extension trait for enabling Web APIs on builders.
 pub trait WebApiBuilderExt: Sized {
-    /// Register URL, Headers, Blob, Request, and Response globals.
+    /// Register the Web platform globals (URL, Blob, the lazy JS shim
+    /// surface including Headers/Request/Response, and function globals).
     #[must_use]
     fn with_web_apis(self) -> Self;
 }

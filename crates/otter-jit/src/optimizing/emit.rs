@@ -685,7 +685,16 @@ mod arm64 {
             ; b =>deopt
             ; =>l_cell
             ; cbz x17, =>l_undef                        // empty slot → undefined
-            ; b =>l_done                                // cell ref = zero-extended offset
+        );
+        // Widen the cell offset to the canonical heap-cell `Value` bits
+        // (`cage_base | offset`, `Value::from_cell_offset`): a bare offset
+        // still dereferences but never bit-compares equal to a canonically
+        // boxed handle of the same object.
+        emit_load_u64(ops, 16, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; orr x17, x17, x16
+            ; b =>l_done
             ; =>l_boxed
             ; and w17, w17, #0xfffffff8
             ; mov w17, w17
@@ -3255,9 +3264,8 @@ mod arm64 {
             NodeKind::CheckMethodIdentity {
                 recv,
                 recv_shape,
-                proto_shape,
+                proto_chain,
                 method_value_byte,
-                method_on_receiver,
                 method_fid,
             } => {
                 let recv_loc = require_loc(alloc, *recv)?;
@@ -3287,7 +3295,9 @@ mod arm64 {
                     ; cmp w4, w5
                     ; b.ne =>exit
                 );
-                if !*method_on_receiver {
+                // One flat-prototype chase + shape guard per chain hop; after
+                // the loop x3 holds the method holder's decompressed header.
+                for &hop_shape in proto_chain {
                     dynasm!(ops
                         ; .arch aarch64
                         ; ldr w2, [x3, view.jit_proto_byte]
@@ -3301,8 +3311,8 @@ mod arm64 {
                         ; cmp w4, OBJECT_BODY_TYPE_TAG
                         ; b.ne =>exit
                         ; ldr w4, [x3, view.object_shape_byte]
-                        ; movz w5, proto_shape & 0xffff
-                        ; movk w5, (proto_shape >> 16) & 0xffff, lsl #16
+                        ; movz w5, hop_shape & 0xffff
+                        ; movk w5, (hop_shape >> 16) & 0xffff, lsl #16
                         ; cmp w4, w5
                         ; b.ne =>exit
                     );
@@ -3351,9 +3361,8 @@ mod arm64 {
             NodeKind::MethodIdentityMatches {
                 recv,
                 recv_shape,
-                proto_shape,
+                proto_chain,
                 method_value_byte,
-                method_on_receiver,
                 method_fid,
             } => {
                 // Same receiver-shape + prototype-method-identity probe as
@@ -3389,7 +3398,9 @@ mod arm64 {
                     ; cmp w4, w5
                     ; b.ne =>miss
                 );
-                if !*method_on_receiver {
+                // One flat-prototype chase + shape guard per chain hop; after
+                // the loop x3 holds the method holder's decompressed header.
+                for &hop_shape in proto_chain {
                     dynasm!(ops
                         ; .arch aarch64
                         ; ldr w2, [x3, view.jit_proto_byte]
@@ -3403,8 +3414,8 @@ mod arm64 {
                         ; cmp w4, OBJECT_BODY_TYPE_TAG
                         ; b.ne =>miss
                         ; ldr w4, [x3, view.object_shape_byte]
-                        ; movz w5, proto_shape & 0xffff
-                        ; movk w5, (proto_shape >> 16) & 0xffff, lsl #16
+                        ; movz w5, hop_shape & 0xffff
+                        ; movk w5, (hop_shape >> 16) & 0xffff, lsl #16
                         ; cmp w4, w5
                         ; b.ne =>miss
                     );
@@ -3487,13 +3498,13 @@ mod arm64 {
             NodeKind::LoadProtoSlot {
                 recv,
                 recv_shape,
-                proto_shape,
+                proto_chain,
                 slot_byte,
             } => {
-                // Direct-prototype data load: guard the receiver shape, follow the
-                // flattened prototype mirror, guard the prototype shape, then read
-                // the baked prototype value slot. Any miss deopts before the load's
-                // value is observed.
+                // Prototype-chain data load: guard the receiver shape, then per
+                // chain hop follow the flattened prototype mirror and guard that
+                // object's shape, finally read the baked holder value slot. Any
+                // miss deopts before the load's value is observed.
                 if *slot_byte > 32760 {
                     return Err(Unsupported::Unlowered(
                         "prototype property slot offset out of ldr range",
@@ -3530,26 +3541,31 @@ mod arm64 {
                         ; cmp w17, W(MOVE_SCRATCH)
                         ; b.ne =>exit
                         ; fmov x16, d6
-                        ; ldr w17, [x16, proto_byte]       // compressed prototype
-                        ; cbz w17, =>exit
                     );
-                    emit_load_u64(ops, MOVE_SCRATCH, view.cage_base as u64);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; add x16, x17, X(MOVE_SCRATCH)    // prototype header
-                        ; ldrb w17, [x16]
-                        ; cmp w17, OBJECT_BODY_TYPE_TAG
-                        ; b.ne =>exit
-                        ; ldr w17, [x16, shape_byte]
-                        ; fmov d6, x16
-                    );
-                    emit_load_u64(ops, MOVE_SCRATCH, u64::from(*proto_shape));
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; cmp w17, W(MOVE_SCRATCH)
-                        ; b.ne =>exit
-                        ; fmov x16, d6
-                    );
+                    for &hop_shape in proto_chain {
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr w17, [x16, proto_byte]   // compressed prototype
+                            ; cbz w17, =>exit
+                        );
+                        emit_load_u64(ops, MOVE_SCRATCH, view.cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x16, x17, X(MOVE_SCRATCH)  // hopped object header
+                            ; ldrb w17, [x16]
+                            ; cmp w17, OBJECT_BODY_TYPE_TAG
+                            ; b.ne =>exit
+                            ; ldr w17, [x16, shape_byte]
+                            ; fmov d6, x16
+                        );
+                        emit_load_u64(ops, MOVE_SCRATCH, u64::from(hop_shape));
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp w17, W(MOVE_SCRATCH)
+                            ; b.ne =>exit
+                            ; fmov x16, d6
+                        );
+                    }
                     crate::baseline::arm64::emit_slab_base(ops, view, 16, 17);
                     dynasm!(ops
                         ; .arch aarch64

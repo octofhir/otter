@@ -608,9 +608,8 @@ impl Interpreter {
         let new_target = PolyMethodTarget {
             method_fid,
             recv_shape: site.recv_shape,
-            proto_shape: site.proto_shape,
+            proto_chain: site.proto_chain,
             method_value_byte: site.method_value_byte,
-            method_on_receiver: site.method_on_receiver,
             hits: 1,
         };
         // `changed` tracks whether the *set* of inlinable targets grew, which is
@@ -625,9 +624,8 @@ impl Interpreter {
                 slot.insert(MethodCallFeedback::Mono {
                     method_fid,
                     recv_shape: site.recv_shape,
-                    proto_shape: site.proto_shape,
+                    proto_chain: site.proto_chain,
                     method_value_byte: site.method_value_byte,
-                    method_on_receiver: site.method_on_receiver,
                 });
                 true
             }
@@ -635,24 +633,21 @@ impl Interpreter {
                 MethodCallFeedback::Mono {
                     method_fid: seen_fid,
                     recv_shape: seen_shape,
-                    proto_shape: seen_proto_shape,
+                    proto_chain: seen_proto_chain,
                     method_value_byte: seen_value_byte,
-                    method_on_receiver: seen_method_on_receiver,
                 } => {
                     let same = *seen_fid == method_fid
                         && seen_shape.offset() == site.recv_shape.offset()
-                        && seen_proto_shape.offset() == site.proto_shape.offset()
-                        && *seen_value_byte == site.method_value_byte
-                        && *seen_method_on_receiver == site.method_on_receiver;
+                        && seen_proto_chain.same(&site.proto_chain)
+                        && *seen_value_byte == site.method_value_byte;
                     if same {
                         false
                     } else {
                         let prior = PolyMethodTarget {
                             method_fid: *seen_fid,
                             recv_shape: *seen_shape,
-                            proto_shape: *seen_proto_shape,
+                            proto_chain: *seen_proto_chain,
                             method_value_byte: *seen_value_byte,
-                            method_on_receiver: *seen_method_on_receiver,
                             hits: 1,
                         };
                         let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
@@ -698,28 +693,35 @@ impl Interpreter {
         if recv_shape.is_null() {
             return None;
         }
+        let slot_byte = |slot: u32| {
+            slot * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
+        };
         if let Some(slot) = self.shape_offset_of(recv_shape, name.name()) {
             return Some(MethodSite {
                 recv_shape,
-                proto_shape: self.shape_root(),
-                method_value_byte: slot
-                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32,
-                method_on_receiver: true,
+                proto_chain: crate::MethodProtoChain::own(),
+                method_value_byte: slot_byte(slot),
             });
         }
-        let proto = crate::object::prototype(recv, &self.gc_heap)?;
-        let proto_shape = crate::object::shape(proto, &self.gc_heap);
-        if proto_shape.is_null() {
-            return None;
+        // Walk the prototype chain, recording each hopped object's shape; the
+        // baked guard replays exactly this walk (flat-prototype chase + shape
+        // compare per hop) before trusting the holder's slot offset.
+        let mut proto_chain = crate::MethodProtoChain::own();
+        let mut cur = recv;
+        loop {
+            cur = crate::object::prototype(cur, &self.gc_heap)?;
+            let shape = crate::object::shape(cur, &self.gc_heap);
+            if shape.is_null() || !proto_chain.push(shape) {
+                return None;
+            }
+            if let Some(slot) = self.shape_offset_of(shape, name.name()) {
+                return Some(MethodSite {
+                    recv_shape,
+                    proto_chain,
+                    method_value_byte: slot_byte(slot),
+                });
+            }
         }
-        self.shape_offset_of(proto_shape, name.name())
-            .map(|slot| MethodSite {
-                recv_shape,
-                proto_shape,
-                method_value_byte: slot
-                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32,
-                method_on_receiver: false,
-            })
     }
 
     /// Drop any compiled body for `fid` (and re-arm its OSR headers) so the next
@@ -841,18 +843,16 @@ impl Interpreter {
                     MethodCallFeedback::Mono {
                         method_fid,
                         recv_shape,
-                        proto_shape,
+                        proto_chain,
                         method_value_byte,
-                        method_on_receiver,
                     } => {
                         let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
                             SmallVec::new();
                         targets.push(PolyMethodTarget {
                             method_fid: *method_fid,
                             recv_shape: *recv_shape,
-                            proto_shape: *proto_shape,
+                            proto_chain: *proto_chain,
                             method_value_byte: *method_value_byte,
-                            method_on_receiver: *method_on_receiver,
                             hits: 1,
                         });
                         Some(PolySnapshot { byte_pc, targets })
@@ -986,9 +986,8 @@ impl Interpreter {
                 if let Some(MethodCallFeedback::Mono {
                     method_fid,
                     recv_shape,
-                    proto_shape,
+                    proto_chain,
                     method_value_byte,
-                    method_on_receiver,
                 }) = self
                     .jit_method_site_feedback
                     .get(&(target.method_fid, instr.byte_pc))
@@ -998,9 +997,8 @@ impl Interpreter {
                         PolyMethodTarget {
                             method_fid: *method_fid,
                             recv_shape: *recv_shape,
-                            proto_shape: *proto_shape,
+                            proto_chain: *proto_chain,
                             method_value_byte: *method_value_byte,
-                            method_on_receiver: *method_on_receiver,
                             hits: 1,
                         },
                     ));
@@ -1017,9 +1015,13 @@ impl Interpreter {
         Some(jit::JitInlineMethod {
             method_fid: target.method_fid,
             recv_shape: target.recv_shape.offset(),
-            proto_shape: target.proto_shape.offset(),
+            proto_chain: target
+                .proto_chain
+                .as_slice()
+                .iter()
+                .map(|s| s.offset())
+                .collect(),
             method_value_byte: target.method_value_byte,
-            method_on_receiver: target.method_on_receiver,
             param_count: method_view.param_count,
             register_count: method_view.register_count,
             instructions: method_view.instructions,

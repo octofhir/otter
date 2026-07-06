@@ -404,12 +404,12 @@ pub enum NodeKind {
         recv: NodeId,
         /// Receiver shape-handle compressed offset.
         recv_shape: u32,
-        /// Prototype shape-handle compressed offset.
-        proto_shape: u32,
-        /// Byte offset of the method slot in the prototype value slab.
+        /// Shape-handle compressed offsets of each prototype hopped to the
+        /// method holder, in hop order (last = holder). Empty when the method
+        /// slot is an own property on the receiver.
+        proto_chain: Vec<u32>,
+        /// Byte offset of the method slot in the holder's value slab.
         method_value_byte: u32,
-        /// Whether the method slot is an own property on the receiver.
-        method_on_receiver: bool,
         /// Expected bytecode function id.
         method_fid: u32,
     },
@@ -427,12 +427,12 @@ pub enum NodeKind {
         recv: NodeId,
         /// Receiver shape-handle compressed offset.
         recv_shape: u32,
-        /// Prototype shape-handle compressed offset.
-        proto_shape: u32,
-        /// Byte offset of the method slot in the prototype value slab.
+        /// Shape-handle compressed offsets of each prototype hopped to the
+        /// method holder, in hop order (last = holder). Empty when the method
+        /// slot is an own property on the receiver.
+        proto_chain: Vec<u32>,
+        /// Byte offset of the method slot in the holder's value slab.
         method_value_byte: u32,
-        /// Whether the method slot is an own property on the receiver.
-        method_on_receiver: bool,
         /// Expected bytecode function id.
         method_fid: u32,
     },
@@ -447,19 +447,21 @@ pub enum NodeKind {
     /// Pure (no deopt, no allocation); the preceding `CheckShape` established the
     /// receiver shape. Result [`Repr::Tagged`].
     LoadSlot(NodeId, u32),
-    /// Direct-prototype data-property load. Input is the receiver; the baked
-    /// metadata carries receiver shape, prototype shape, and the prototype slot
-    /// byte offset. Lowered as object/prototype guards followed by an inline
-    /// prototype slab load; any miss deoptimizes at the load's exact PC. Result
-    /// [`Repr::Tagged`].
+    /// Prototype-chain data-property load. Input is the receiver; the baked
+    /// metadata carries the receiver shape, the shape of each hopped
+    /// prototype, and the holder's slot byte offset. Lowered as an object
+    /// guard plus one flat-prototype chase + shape guard per chain entry,
+    /// followed by an inline holder slab load; any miss deoptimizes at the
+    /// load's exact PC. Result [`Repr::Tagged`].
     LoadProtoSlot {
         /// Receiver object/value.
         recv: NodeId,
         /// Expected receiver shape-handle compressed offset.
         recv_shape: u32,
-        /// Expected direct-prototype shape-handle compressed offset.
-        proto_shape: u32,
-        /// Byte offset of the property slot in the prototype value slab.
+        /// Shape-handle compressed offsets of each hopped prototype, in hop
+        /// order (last = the holder whose slab is read). Never empty.
+        proto_chain: Vec<u32>,
+        /// Byte offset of the property slot in the holder's value slab.
         slot_byte: u32,
     },
     /// Store a value into a fixed byte offset within a shape-guarded receiver's

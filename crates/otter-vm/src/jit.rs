@@ -378,28 +378,28 @@ pub struct JitInlineCallee {
 /// body's sealed property loads/stores are baked against, and, per body
 /// `LoadProperty`/`StoreProperty` byte-PC, the value byte offset within the
 /// decompressed receiver.
-/// Method identity is verified inline every call: the emitter loads the
-/// receiver's flat prototype handle, guards the prototype's shape against
-/// [`proto_shape`](Self::proto_shape), reads the method slot at
-/// [`method_value_byte`](Self::method_value_byte), and compares the resolved
-/// closure's `function_id` to [`method_fid`](Self::method_fid). A
-/// prototype-method reassignment or shape change falls back to the in-place
-/// method call — no per-call resolve bridge.
+/// Method identity is verified inline every call: the emitter chases the
+/// flat prototype handle once per [`proto_chain`](Self::proto_chain) entry,
+/// guards each hopped object's shape, reads the method slot at
+/// [`method_value_byte`](Self::method_value_byte) from the final holder, and
+/// compares the resolved closure's `function_id` to
+/// [`method_fid`](Self::method_fid). A prototype-method reassignment or any
+/// shape change along the chain falls back to the in-place method call — no
+/// per-call resolve bridge.
 #[derive(Debug, Clone)]
 pub struct JitInlineMethod {
     /// Method function id the call-site identity check is keyed on.
     pub method_fid: u32,
     /// Receiver shape-handle compressed offset the sealed loads are baked for.
     pub recv_shape: u32,
-    /// Receiver prototype shape-handle compressed offset the inline identity
-    /// guard requires (the shape of the object holding the method slot).
-    pub proto_shape: u32,
-    /// Byte offset inside the prototype object's value slab for the method
-    /// slot, baked from the prototype shape.
+    /// Shape-handle compressed offsets of each prototype hopped from the
+    /// receiver to the object holding the method slot, in hop order (the last
+    /// entry is the holder). Empty when the method slot is an own property on
+    /// the receiver.
+    pub proto_chain: Vec<u32>,
+    /// Byte offset inside the holder object's value slab for the method
+    /// slot, baked from the holder's shape.
     pub method_value_byte: u32,
-    /// `true` when the method slot is an own property on the receiver rather
-    /// than a property on the receiver's prototype.
-    pub method_on_receiver: bool,
     /// Method formal parameter count (excluding `this`); must equal argc.
     pub param_count: u16,
     /// Method register-window length; the body runs in a scratch block of this

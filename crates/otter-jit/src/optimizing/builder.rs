@@ -1267,7 +1267,7 @@ impl<'a> Builder<'a> {
                             NodeKind::LoadProtoSlot {
                                 recv: obj,
                                 recv_shape,
-                                proto_shape,
+                                proto_chain: vec![proto_shape],
                                 slot_byte,
                             },
                             block,
@@ -2541,9 +2541,8 @@ impl<'a> Builder<'a> {
                 NodeKind::MethodIdentityMatches {
                     recv,
                     recv_shape: arm.recv_shape,
-                    proto_shape: arm.proto_shape,
+                    proto_chain: arm.proto_chain.clone(),
                     method_value_byte: arm.method_value_byte,
-                    method_on_receiver: arm.method_on_receiver,
                     method_fid: arm.method_fid,
                 },
                 guards[i],
@@ -2654,9 +2653,8 @@ impl<'a> Builder<'a> {
                     NodeKind::CheckMethodIdentity {
                         recv,
                         recv_shape: method.recv_shape,
-                        proto_shape: method.proto_shape,
+                        proto_chain: method.proto_chain.clone(),
                         method_value_byte: method.method_value_byte,
-                        method_on_receiver: method.method_on_receiver,
                         method_fid: method.method_fid,
                     },
                     block,
@@ -3227,9 +3225,8 @@ impl<'a> Builder<'a> {
             NodeKind::CheckMethodIdentity {
                 recv,
                 recv_shape: method.recv_shape,
-                proto_shape: method.proto_shape,
+                proto_chain: method.proto_chain.clone(),
                 method_value_byte: method.method_value_byte,
-                method_on_receiver: method.method_on_receiver,
                 method_fid: method.method_fid,
             },
             entry_g,
@@ -3255,7 +3252,7 @@ impl<'a> Builder<'a> {
         // slab for an own-property method. Materialize it once in the entry block
         // so every `LoadUpvalue` in the body reads the method closure's spine.
         let method_closure = if method.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
-            let node = if method.method_on_receiver {
+            let node = if method.proto_chain.is_empty() {
                 let checked = self.graph.add_node(
                     NodeKind::CheckShape(recv, method.recv_shape),
                     entry_g,
@@ -3272,7 +3269,7 @@ impl<'a> Builder<'a> {
                     NodeKind::LoadProtoSlot {
                         recv,
                         recv_shape: method.recv_shape,
-                        proto_shape: method.proto_shape,
+                        proto_chain: method.proto_chain.clone(),
                         slot_byte: method.method_value_byte,
                     },
                     entry_g,
@@ -4043,9 +4040,8 @@ impl<'a> Builder<'a> {
             NodeKind::CheckMethodIdentity {
                 recv: recv2,
                 recv_shape: nested.recv_shape,
-                proto_shape: nested.proto_shape,
+                proto_chain: nested.proto_chain.clone(),
                 method_value_byte: nested.method_value_byte,
-                method_on_receiver: nested.method_on_receiver,
                 method_fid: nested.method_fid,
             },
             n_entry,
@@ -4053,7 +4049,7 @@ impl<'a> Builder<'a> {
         );
         self.push_body(n_entry, ident);
         let method_closure = if nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
-            let node = if nested.method_on_receiver {
+            let node = if nested.proto_chain.is_empty() {
                 let checked = self.graph.add_node(
                     NodeKind::CheckShape(recv2, nested.recv_shape),
                     n_entry,
@@ -4070,7 +4066,7 @@ impl<'a> Builder<'a> {
                     NodeKind::LoadProtoSlot {
                         recv: recv2,
                         recv_shape: nested.recv_shape,
-                        proto_shape: nested.proto_shape,
+                        proto_chain: nested.proto_chain.clone(),
                         slot_byte: nested.method_value_byte,
                     },
                     n_entry,
@@ -4294,9 +4290,8 @@ impl<'a> Builder<'a> {
             NodeKind::CheckMethodIdentity {
                 recv: recv2,
                 recv_shape: nested.recv_shape,
-                proto_shape: nested.proto_shape,
+                proto_chain: nested.proto_chain.clone(),
                 method_value_byte: nested.method_value_byte,
-                method_on_receiver: nested.method_on_receiver,
                 method_fid: nested.method_fid,
             },
             g,
@@ -4304,7 +4299,7 @@ impl<'a> Builder<'a> {
         );
         self.push_body(g, ident);
         let method_closure = if nested.instructions.iter().any(|i| i.op == Op::LoadUpvalue) {
-            let node = if nested.method_on_receiver {
+            let node = if nested.proto_chain.is_empty() {
                 let checked =
                     self.graph
                         .add_node(NodeKind::CheckShape(recv2, nested.recv_shape), g, call_pc);
@@ -4319,7 +4314,7 @@ impl<'a> Builder<'a> {
                     NodeKind::LoadProtoSlot {
                         recv: recv2,
                         recv_shape: nested.recv_shape,
-                        proto_shape: nested.proto_shape,
+                        proto_chain: nested.proto_chain.clone(),
                         slot_byte: nested.method_value_byte,
                     },
                     g,
@@ -5116,9 +5111,8 @@ mod tests {
         let method = JitInlineMethod {
             method_fid: 42,
             recv_shape: 100,
-            proto_shape: 200,
+            proto_chain: vec![200],
             method_value_byte: 8,
-            method_on_receiver: false,
             param_count: 0,
             register_count: 2,
             instructions: vec![

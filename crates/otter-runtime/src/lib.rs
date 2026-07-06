@@ -1113,6 +1113,29 @@ mod permission_tests {
     }
 }
 
+#[cfg(test)]
+mod host_global_tests {
+    use super::*;
+
+    #[test]
+    fn builder_can_disable_product_host_globals() {
+        let mut runtime = Runtime::builder()
+            .process_global(false)
+            .worker_global(false)
+            .build()
+            .expect("runtime");
+        let completion = runtime
+            .run_script(
+                SourceInput::from_javascript("typeof process + ':' + typeof Worker;"),
+                "<host-global-config>",
+            )
+            .expect("script")
+            .completion_string()
+            .to_string();
+        assert_eq!(completion, "undefined:undefined");
+    }
+}
+
 /// Cloneable cooperative-cancellation handle.
 #[derive(Debug, Clone)]
 pub struct InterruptHandle(InterruptFlag);
@@ -1192,6 +1215,8 @@ pub(crate) struct RuntimeConfig {
     global_classes: Vec<GlobalClass>,
     global_installers: Vec<RuntimeGlobalInstaller>,
     allow_blocking_atomics_wait: bool,
+    install_process_global: bool,
+    install_worker_global: bool,
     console_sink: ConsoleSinkHandle,
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
@@ -1375,6 +1400,8 @@ impl Default for RuntimeConfig {
             global_classes: Vec::new(),
             global_installers: Vec::new(),
             allow_blocking_atomics_wait: false,
+            install_process_global: true,
+            install_worker_global: true,
             console_sink: otter_vm::console::default_console_sink(),
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
@@ -1529,6 +1556,24 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Install the product `process` global. Enabled by default for CLI and
+    /// embedding compatibility; spec harnesses can disable it to keep the
+    /// global object closer to an engine shell.
+    #[must_use]
+    pub fn process_global(mut self, install: bool) -> Self {
+        self.config.install_process_global = install;
+        self
+    }
+
+    /// Install Worker-related globals. Enabled by default for product runtimes;
+    /// spec harnesses may disable it once their `$262.agent` host is decoupled
+    /// from the runtime Worker backend.
+    #[must_use]
+    pub fn worker_global(mut self, install: bool) -> Self {
+        self.config.install_worker_global = install;
+        self
+    }
+
     /// Override the implementation behind `console.*`.
     ///
     /// The default sink writes `log` / `info` / `debug` through
@@ -1679,12 +1724,14 @@ impl Runtime {
                 }
             }
         }
-        process::install_global(
-            &mut interp,
-            &config.process_argv,
-            &config.process_cwd,
-            &config.capabilities,
-        )?;
+        if config.install_process_global {
+            process::install_global(
+                &mut interp,
+                &config.process_argv,
+                &config.process_cwd,
+                &config.capabilities,
+            )?;
+        }
         // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
         // `new Function(...)` reach a real parse + compile path.
         // The closure is reusable across calls; each invocation
@@ -1758,7 +1805,9 @@ impl Runtime {
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
         };
-        worker::install_main_worker_globals(&mut runtime)?;
+        if runtime.config.install_worker_global {
+            worker::install_main_worker_globals(&mut runtime)?;
+        }
         let global_installers = runtime.config.global_installers.clone();
         for installer in global_installers {
             installer.install(&mut runtime)?;

@@ -530,6 +530,14 @@ pub(crate) fn hoist_function_declarations_from(
             continue;
         }
         let span = (f.span.start, f.span.end);
+        // §10.2.11 — a function *declaration* has no funcEnv self-name
+        // binding: the name inside the body resolves to the enclosing
+        // binding pass 2 pre-declared (or the global object property for
+        // script globals). Suppressing the child-side self-binding keeps
+        // the identity of `F` inside `F`'s body equal to the hoisted
+        // closure, so expando properties (`F.x = …`) stay visible and no
+        // throwaway closure is allocated per call.
+        cx.next_fn_no_self_name = true;
         let (function_id, captures) = compile_function_full(
             cx,
             &name,

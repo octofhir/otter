@@ -218,9 +218,50 @@ pub(crate) fn compile_expr(
                 f.id.as_ref()
                     .map(|id| id.name.as_str().to_string())
                     .unwrap_or_else(|| "<anonymous>".to_string());
-            // §10.2.11 — a NAMED function expression's self-name
-            // binding is immutable inside the body.
-            cx.fn_self_immutable_hint = f.id.is_some();
+            // §10.2.11 / §15.2.5 NamedEvaluation — a NAMED function
+            // expression whose body observes its own name binds that name
+            // in a funcEnv between the enclosing scope and the function
+            // scope, holding the closure itself, immutably. Model the
+            // funcEnv as a synthetic compiler scope with an own-upvalue
+            // cell: the closure captures the cell, and the cell is filled
+            // with the closure right after `MakeClosure`, so the self-name
+            // resolves to the *same* object every call (identity and
+            // expando properties survive; no per-call re-make).
+            let self_observed = f.id.is_some()
+                && f.body.as_ref().is_some_and(|body| {
+                    capture::body_references_name(Some(&f.params), body, &name)
+                        || capture::body_contains_direct_eval(Some(&f.params), body)
+                });
+            if self_observed {
+                cx.enter_scope();
+                let storage = cx.declare_captured_binding(&name, true, span)?;
+                cx.mark_fn_self_name(&name);
+                cx.next_fn_no_self_name = true;
+                let result = compile_function_full(
+                    cx,
+                    &name,
+                    &f.params,
+                    &f.body,
+                    span,
+                    f.r#async,
+                    f.generator,
+                    false,
+                );
+                let (function_id, captures) = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        cx.exit_scope();
+                        return Err(e);
+                    }
+                };
+                let dst = cx.alloc_scratch();
+                let const_idx = cx.intern_function_id(function_id);
+                emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
+                cx.emit_store_storage(dst, storage, span);
+                cx.mark_initialized(&name);
+                cx.exit_scope();
+                return Ok(dst);
+            }
             let (function_id, captures) = compile_function_full(
                 cx,
                 &name,

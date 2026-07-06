@@ -783,6 +783,30 @@ impl<'rt> NativeCtx<'rt> {
         JsArrayBuffer::try_new_with_roots(len, self.heap_mut(), &mut external_visit)
     }
 
+    /// Install a per-instance `[[Prototype]]` override on an array unless the
+    /// override is redundant: the default realm's `%Array.prototype%` is
+    /// already what an unstamped array resolves to, and stamping it would
+    /// materialize the exotic sidecar that disqualifies the array from every
+    /// dense fast path. A subclass prototype (or any non-default-realm proto)
+    /// is always installed.
+    pub fn set_array_prototype_override_checked(
+        &mut self,
+        array: array::JsArray,
+        proto: Value,
+    ) {
+        if !self.cx.interp.active_realm_is_extra
+            && self
+                .cx
+                .interp
+                .realm_intrinsics
+                .array_prototype
+                .is_some_and(|p| Value::object(p).to_bits() == proto.to_bits())
+        {
+            return;
+        }
+        array::set_prototype_override(array, self.heap_mut(), Some(proto));
+    }
+
     /// Store an array element through the native root contract.
     pub fn array_set(
         &mut self,

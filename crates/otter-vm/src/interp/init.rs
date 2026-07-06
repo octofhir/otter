@@ -167,6 +167,7 @@ impl Interpreter {
             error_classes,
             global_this,
             extra_realms: Vec::new(),
+            active_realm_is_extra: false,
             eval_hook: None,
             pending_generator_throw: None,
             pending_uncaught_throw: None,
@@ -439,6 +440,16 @@ impl Interpreter {
     }
 
     pub(crate) fn register_array_prototype_override(&mut self, array: crate::array::JsArray) {
+        // Stamp the per-instance `[[Prototype]]` only for arrays minted while
+        // a non-default realm is active. A default-realm array resolves
+        // through the active realm's %Array.prototype% anyway, and stamping
+        // it would materialize the exotic sidecar that permanently
+        // disqualifies the array from every dense fast path (method ICs,
+        // builtin dispatch) — one boxed side-table per array, traced on every
+        // scavenge.
+        if !self.active_realm_is_extra {
+            return;
+        }
         let prototype = self.current_array_prototype_override();
         crate::array::set_prototype_override(array, &mut self.gc_heap, prototype);
     }
@@ -581,12 +592,15 @@ impl Interpreter {
         };
         let mut realm = self.extra_realms.remove(index);
         self.swap_active_realm_state(&mut realm);
+        let was_extra = self.active_realm_is_extra;
+        self.active_realm_is_extra = true;
         let depth = self
             .gc_heap
             .push_extra_roots(otter_gc::ExtraRoots::new(&realm));
         let result = body(self);
         self.gc_heap.pop_extra_roots_to(depth - 1);
         self.swap_active_realm_state(&mut realm);
+        self.active_realm_is_extra = was_extra;
         self.extra_realms.insert(index, realm);
         result
     }

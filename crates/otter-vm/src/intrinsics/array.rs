@@ -124,7 +124,7 @@ fn apply_array_new_target_prototype(
         None
     };
     if let Some(proto) = proto {
-        array::set_prototype_override(arr, ctx.heap_mut(), Some(proto));
+        ctx.set_array_prototype_override_checked(arr, proto);
     }
     Ok(())
 }

@@ -1050,6 +1050,13 @@ pub struct Interpreter {
     /// `$262.createRealm`. The first/default realm lives in the
     /// top-level interpreter fields for hot-path compatibility.
     extra_realms: Vec<RealmState>,
+    /// `true` while an extra realm (not the first/default realm) is the
+    /// active one. Array allocation stamps a per-instance prototype
+    /// override only in that window: a default-realm array resolves its
+    /// `[[Prototype]]` through the active realm intrinsics anyway, and
+    /// stamping every array would materialize the exotic sidecar that
+    /// disqualifies it from the dense fast paths.
+    active_realm_is_extra: bool,
     /// Optional embedder hook for `Op::Eval` / `Op::NewFunction`.
     /// Wired by the runtime layer at construction time to parse +
     /// compile a source string into a fresh [`BytecodeModule`].

@@ -574,12 +574,15 @@ impl Cage {
         debug_assert!(offset / (PAGE_SIZE as u32) < cage.page_count);
         let idx = offset / (PAGE_SIZE as u32);
         // Zero the page so reuse always sees a fresh PageHeader.
-        // SAFETY: `idx` is in-range, page memory belongs to the
-        // cage and is owned by the cage allocator (we hold the
-        // mutex).
+        // SAFETY: `idx` is in-range, so this address is inside the cage page
+        // currently being returned to the free-list.
+        let page_ptr = unsafe { cage.base.add(idx as usize * PAGE_SIZE) };
+        // SAFETY: `page_ptr` is in-range, page memory belongs to the cage and
+        // is owned by the cage allocator (we hold the mutex).
         unsafe {
-            core::ptr::write_bytes(cage.base.add(idx as usize * PAGE_SIZE), 0, PAGE_SIZE);
+            core::ptr::write_bytes(page_ptr, 0, PAGE_SIZE);
         }
+        advise_freed_page(page_ptr);
         cage.free_pages.push(idx);
     }
 
@@ -607,6 +610,19 @@ impl Cage {
         })
     }
 }
+
+#[cfg(target_os = "macos")]
+fn advise_freed_page(page: *mut u8) {
+    // The cage keeps freed pages for reuse, but macOS otherwise tends to keep
+    // their physical footprint charged to the process. `MADV_FREE` preserves
+    // cheap reuse while letting the kernel reclaim zeroed pages under pressure.
+    // SAFETY: `page` is PAGE_SIZE-aligned, lies inside the cage reservation, and
+    // no live GC object may reference it after `Cage::free_page`'s precondition.
+    let _ = unsafe { libc::madvise(page.cast::<libc::c_void>(), PAGE_SIZE, libc::MADV_FREE) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn advise_freed_page(_page: *mut u8) {}
 
 impl Drop for Cage {
     fn drop(&mut self) {

@@ -141,6 +141,7 @@ pub(crate) fn compile_synthetic_constructor(
     }
 
     let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
+        capture_lexical_environment_for_eval(parent);
         capture_private_environment_for_eval(parent);
         capture_super_bindings_for_eval(parent);
         collect_direct_eval_bindings(parent, &[])
@@ -331,6 +332,7 @@ pub(crate) fn compile_class_constructor(
         emit_instance_field_inits(parent, instance_fields)?;
     }
     let direct_eval_meta: Vec<otter_bytecode::DirectEvalBinding> = if contains_direct_eval {
+        capture_lexical_environment_for_eval(parent);
         capture_private_environment_for_eval(parent);
         capture_super_bindings_for_eval(parent);
         collect_direct_eval_bindings(parent, &[])

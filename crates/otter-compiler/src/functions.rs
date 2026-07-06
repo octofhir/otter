@@ -242,6 +242,7 @@ pub(crate) fn compile_function_full(
             compile_statement(parent, stmt)?;
         }
         if contains_direct_eval {
+            capture_lexical_environment_for_eval(parent);
             capture_private_environment_for_eval(parent);
             capture_super_bindings_for_eval(parent);
             direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
@@ -501,6 +502,9 @@ pub(crate) fn compile_arrow_function(
         let inner_span = (es.span.start, es.span.end);
         let reg = compile_expr(parent, &es.expression, inner_span)?;
         if contains_direct_eval {
+            capture_lexical_environment_for_eval(parent);
+            capture_private_environment_for_eval(parent);
+            capture_super_bindings_for_eval(parent);
             direct_eval_meta = collect_direct_eval_bindings(parent, &[]);
         }
         parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
@@ -531,6 +535,9 @@ pub(crate) fn compile_arrow_function(
             compile_statement(parent, stmt)?;
         }
         if contains_direct_eval {
+            capture_lexical_environment_for_eval(parent);
+            capture_private_environment_for_eval(parent);
+            capture_super_bindings_for_eval(parent);
             direct_eval_meta = collect_direct_eval_bindings(parent, &lex_names);
         }
         parent.emit(Op::ReturnUndefined, vec![], span);
@@ -653,6 +660,42 @@ fn make_closure_operands(
 /// binding table into the eval frame. Called by every
 /// function-finalization path that collects direct-eval bindings
 /// (ordinary functions, synthetic and user class constructors).
+/// A direct eval can name ANY lexically visible binding, not just the
+/// ones the surrounding function references statically (`class C {
+/// field = eval("C"); }`). Force a passthrough capture of every
+/// cell-backed binding in the enclosing frames so
+/// [`collect_direct_eval_bindings`] can expose them to the eval chunk.
+/// Ancestor bindings are already cell-promoted: the any-depth
+/// direct-eval scan (`body_contains_direct_eval`) marks every enclosing
+/// function `contains_direct_eval`, which promotes its own names.
+pub(crate) fn capture_lexical_environment_for_eval(cx: &mut Compiler) {
+    let top = cx.stack.len();
+    if top < 2 {
+        return;
+    }
+    let mut names: Vec<String> = Vec::new();
+    for frame in &cx.stack[..top - 1] {
+        for scope in &frame.scopes {
+            for (name, info) in &scope.bindings {
+                // Synthetic bindings (private symbols, super homes,
+                // class internals) ride through their dedicated
+                // capture helpers below.
+                if name.starts_with("__") {
+                    continue;
+                }
+                if matches!(info.storage, BindingStorage::Upvalue { .. }) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    for name in names {
+        let _ = cx.resolve_capture(&name);
+    }
+}
+
 pub(crate) fn capture_private_environment_for_eval(cx: &mut Compiler) {
     if cx.private_namespaces.is_empty() {
         return;

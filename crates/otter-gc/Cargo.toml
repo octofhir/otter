@@ -7,7 +7,7 @@ license.workspace = true
 description = "Production-grade page-based generational tracing GC for the Otter new-engine VM."
 
 [lints.rust]
-# `unsafe_code` ban lifted for this crate per the mdBook GC API docs. Every
+# `unsafe_code` ban lifted for this crate per the GC API docs. Every
 # other `crates/*` crate keeps the workspace `forbid(unsafe_code)`.
 missing_docs = "deny"
 

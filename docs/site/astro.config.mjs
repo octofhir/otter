@@ -27,6 +27,7 @@ export default defineConfig({
 					label: 'Contributing',
 					items: [
 						{ label: 'Overview', slug: 'contributing/overview' },
+						{ label: 'Dependency Policy', slug: 'contributing/dependency-policy' },
 						{ label: 'Porting Process', slug: 'contributing/porting' },
 						{ label: 'Adding a Built-in Method', slug: 'contributing/builtin-methods' },
 						{ label: 'Test Harness', slug: 'contributing/test-harness' },

@@ -7,6 +7,8 @@ Otter's active engine and product crates live under `crates/`.
 Start with:
 
 - [Architecture](/otter/engine/architecture/) for active crate ownership;
+- [Dependency Policy](/otter/contributing/dependency-policy/) before adding
+  dependencies or moving logic across crate layers;
 - [Frontend And Compilation](/otter/engine/frontend/) before changing
   parser, module detection, or TypeScript behavior;
 - [`ES_CONFORMANCE.md`](https://github.com/octofhir/otter/blob/main/ES_CONFORMANCE.md) before changing
@@ -60,7 +62,7 @@ cargo build
 cargo test --all --all-features
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
-mdbook build docs/book
+pnpm --dir docs/site build
 ```
 
 Fast loops:

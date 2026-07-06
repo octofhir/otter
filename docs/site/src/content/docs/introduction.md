@@ -17,7 +17,7 @@ When a contributor-facing API stabilizes, its workflow belongs here.
 Build the book with:
 
 ```bash
-mdbook build docs/book
+pnpm --dir docs/site build
 ```
 
 The docs examples that exercise current GC APIs are backed by Rust tests in
@@ -27,5 +27,5 @@ The docs examples that exercise current GC APIs are backed by Rust tests in
 cargo test -p otter-gc
 ```
 
-If `mdbook` is not installed, install it with normal Rust tooling outside
-this repository.
+Install the site dependencies with `pnpm --dir docs/site install` if
+`node_modules` is not present.

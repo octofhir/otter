@@ -78,6 +78,7 @@ pub mod heap;
 pub mod marking;
 pub mod oom;
 pub mod page;
+pub mod root_scope;
 #[doc(hidden)]
 pub mod scavenger;
 pub mod snapshot;
@@ -98,6 +99,7 @@ pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
+pub use root_scope::{ErasedSlotTracer, RootScope};
 pub use snapshot::{HeapSnapshot, SnapshotObject};
 pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
 pub use store::{GcEdge, GcStore};

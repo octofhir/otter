@@ -126,6 +126,7 @@ pub mod realm_intrinsics;
 pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
+mod rooting;
 pub mod run_control;
 pub mod runtime_budget;
 pub mod runtime_cx;

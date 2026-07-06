@@ -717,6 +717,7 @@ fn iterator_proto_map(
     let state = crate::IteratorState::Map {
         source,
         mapper,
+        running: false,
         counter: 0,
     };
     let handle = ctx
@@ -743,6 +744,7 @@ fn iterator_proto_filter(
     let state = crate::IteratorState::Filter {
         source,
         predicate,
+        running: false,
         counter: 0,
     };
     let handle = ctx
@@ -816,6 +818,7 @@ fn iterator_proto_flat_map(
     let state = crate::IteratorState::FlatMap {
         source,
         mapper,
+        running: false,
         inner: None,
         counter: 0,
     };

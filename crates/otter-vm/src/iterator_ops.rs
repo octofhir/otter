@@ -68,11 +68,13 @@ enum IteratorStateSnapshot {
     Map {
         source: IteratorHandle,
         mapper: Value,
+        running: bool,
         counter: u64,
     },
     Filter {
         source: IteratorHandle,
         predicate: Value,
+        running: bool,
         counter: u64,
     },
     Take {
@@ -86,6 +88,7 @@ enum IteratorStateSnapshot {
     FlatMap {
         source: IteratorHandle,
         mapper: Value,
+        running: bool,
         inner: Option<IteratorHandle>,
         counter: u64,
     },
@@ -303,19 +306,23 @@ impl Interpreter {
                 IteratorState::Map {
                     source,
                     mapper,
+                    running,
                     counter,
                 } => Some(IteratorStateSnapshot::Map {
                     source: *source,
                     mapper: *mapper,
+                    running: *running,
                     counter: *counter,
                 }),
                 IteratorState::Filter {
                     source,
                     predicate,
+                    running,
                     counter,
                 } => Some(IteratorStateSnapshot::Filter {
                     source: *source,
                     predicate: *predicate,
+                    running: *running,
                     counter: *counter,
                 }),
                 IteratorState::Take { source, remaining } => Some(IteratorStateSnapshot::Take {
@@ -329,11 +336,13 @@ impl Interpreter {
                 IteratorState::FlatMap {
                     source,
                     mapper,
+                    running,
                     inner,
                     counter,
                 } => Some(IteratorStateSnapshot::FlatMap {
                     source: *source,
                     mapper: *mapper,
+                    running: *running,
                     inner: *inner,
                     counter: *counter,
                 }),
@@ -440,8 +449,14 @@ impl Interpreter {
             IteratorStateSnapshot::Map {
                 source,
                 mapper,
+                running,
                 counter,
             } => {
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
                 let (v, done) = self.iterator_next_full(context, &source)?;
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
@@ -452,13 +467,25 @@ impl Interpreter {
                 // §27.1.4.7 step 5.b.v — IfAbruptCloseIterator: a throw
                 // from the mapper closes the underlying iterator before
                 // propagating.
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Map { running, .. } = state {
+                        *running = true;
+                    }
+                });
                 let mapped = match self.run_callable_sync(
                     context,
                     &mapper,
                     Value::undefined(),
                     smallvec::smallvec![v, counter_value],
                 ) {
-                    Ok(mapped) => mapped,
+                    Ok(mapped) => {
+                        self.gc_heap.with_payload(*iter, |state| {
+                            if let IteratorState::Map { running, .. } = state {
+                                *running = false;
+                            }
+                        });
+                        mapped
+                    }
                     Err(err) => {
                         self.gc_heap.with_payload(*iter, |state| state.exhaust());
                         self.close_iterator_preserving_throw(context, &source);
@@ -475,8 +502,14 @@ impl Interpreter {
             IteratorStateSnapshot::Filter {
                 source,
                 predicate,
+                running,
                 counter,
             } => {
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
                 let mut counter = counter;
                 loop {
                     let (v, done) = self.iterator_next_full(context, &source)?;
@@ -488,13 +521,25 @@ impl Interpreter {
                         Value::number(crate::number::NumberValue::from_f64(counter as f64));
                     // §27.1.4.6 step 5.b.v — IfAbruptCloseIterator on a
                     // throwing predicate.
+                    self.gc_heap.with_payload(*iter, |state| {
+                        if let IteratorState::Filter { running, .. } = state {
+                            *running = true;
+                        }
+                    });
                     let kept = match self.run_callable_sync(
                         context,
                         &predicate,
                         Value::undefined(),
                         smallvec::smallvec![v, counter_value],
                     ) {
-                        Ok(kept) => kept,
+                        Ok(kept) => {
+                            self.gc_heap.with_payload(*iter, |state| {
+                                if let IteratorState::Filter { running, .. } = state {
+                                    *running = false;
+                                }
+                            });
+                            kept
+                        }
                         Err(err) => {
                             self.gc_heap.with_payload(*iter, |state| state.exhaust());
                             self.close_iterator_preserving_throw(context, &source);
@@ -556,9 +601,15 @@ impl Interpreter {
             IteratorStateSnapshot::FlatMap {
                 source,
                 mapper,
+                running,
                 mut inner,
                 mut counter,
             } => loop {
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
                 if let Some(inner_iter) = inner.take() {
                     let (v, done) = match self.iterator_next_full(context, &inner_iter) {
                         Ok(next) => next,
@@ -586,13 +637,25 @@ impl Interpreter {
                     Value::number(crate::number::NumberValue::from_f64(counter as f64));
                 // §27.1.4.5 step 5.b.iv — IfAbruptCloseIterator on a
                 // throwing mapper.
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::FlatMap { running, .. } = state {
+                        *running = true;
+                    }
+                });
                 let mapped = match self.run_callable_sync(
                     context,
                     &mapper,
                     Value::undefined(),
                     smallvec::smallvec![v, counter_value],
                 ) {
-                    Ok(mapped) => mapped,
+                    Ok(mapped) => {
+                        self.gc_heap.with_payload(*iter, |state| {
+                            if let IteratorState::FlatMap { running, .. } = state {
+                                *running = false;
+                            }
+                        });
+                        mapped
+                    }
                     Err(err) => {
                         self.gc_heap.with_payload(*iter, |state| state.exhaust());
                         self.close_iterator_preserving_throw(context, &source);

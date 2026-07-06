@@ -245,6 +245,11 @@ pub enum IteratorState {
         source: IteratorHandle,
         /// Per-element mapper. Must be callable.
         mapper: Value,
+        /// True while the mapper callback is running. Re-entrant
+        /// `.next()` calls on the same helper must throw without
+        /// closing the underlying iterator.
+        #[pelt(skip)]
+        running: bool,
         /// §27.1.4.7 — zero-based counter passed as the mapper's
         /// second argument.
         #[pelt(skip)]
@@ -256,6 +261,9 @@ pub enum IteratorState {
         source: IteratorHandle,
         /// Per-element predicate. Must be callable.
         predicate: Value,
+        /// True while the predicate callback is running.
+        #[pelt(skip)]
+        running: bool,
         /// §27.1.4.6 — zero-based counter passed as the predicate's
         /// second argument.
         #[pelt(skip)]
@@ -289,6 +297,9 @@ pub enum IteratorState {
         source: IteratorHandle,
         /// Per-element mapper. Must be callable.
         mapper: Value,
+        /// True while the mapper callback is running.
+        #[pelt(skip)]
+        running: bool,
         /// Inner iterator currently being drained, when the last
         /// `mapper` call produced an iterable.
         inner: Option<IteratorHandle>,

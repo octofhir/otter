@@ -537,9 +537,17 @@ fn agent_leaving(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    const TEST262_STA: &str = include_str!("../../../vendor/test262/harness/sta.js");
+    const TEST262_ASSERT: &str = include_str!("../../../vendor/test262/harness/assert.js");
+    const TEST262_ATOMICS_HELPER: &str =
+        include_str!("../../../vendor/test262/harness/atomicsHelper.js");
+    static AGENT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn agent_start_reports_without_worker_global() {
+        let _guard = AGENT_TEST_LOCK.lock().expect("agent test lock poisoned");
         reset_for_next_test();
         let mut runtime = Runtime::builder()
             .timeout(Duration::ZERO)
@@ -568,5 +576,138 @@ mod tests {
             .to_string();
         reset_for_next_test();
         assert_eq!(completion, "ok");
+    }
+
+    #[test]
+    fn agent_notify_reports_wait_outcomes() {
+        let _guard = AGENT_TEST_LOCK.lock().expect("agent test lock poisoned");
+        reset_for_next_test();
+        let mut runtime = Runtime::builder()
+            .timeout(Duration::ZERO)
+            .max_heap_bytes(64 * 1024 * 1024)
+            .allow_blocking_atomics_wait(true)
+            .process_global(false)
+            .worker_global(false)
+            .global_installer(RuntimeGlobalInstaller::new(install_natives))
+            .build()
+            .expect("runtime");
+        let source = format!(
+            r#""use strict";
+            {}
+            $262.agent.waitUntil = function(typedArray, index, expected) {{
+                var agents = 0;
+                while ((agents = Atomics.load(typedArray, index)) !== expected) {{}}
+            }};
+            $262.agent.safeBroadcast = function(typedArray) {{
+                $262.agent.broadcast(typedArray.buffer);
+            }};
+            $262.agent.tryYield = function() {{
+                $262.agent.sleep(50);
+            }};
+            $262.agent.trySleep = function(ms) {{
+                $262.agent.sleep(ms);
+            }};
+            for (var i = 0; i < 3; i++) {{
+                $262.agent.start(`
+                    $262.agent.receiveBroadcast(function(sab) {{
+                        const i32a = new Int32Array(sab);
+                        Atomics.add(i32a, 1, 1);
+                        $262.agent.report(Atomics.wait(i32a, 0, 0, 200));
+                        $262.agent.leaving();
+                    }});
+                `);
+            }}
+            const i32a = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 4));
+            $262.agent.safeBroadcast(i32a);
+            $262.agent.waitUntil(i32a, 1, 3);
+            $262.agent.tryYield();
+            Atomics.notify(i32a, 0, 1);
+            $262.agent.trySleep(250);
+            const reports = [];
+            for (var i = 0; i < 3; i++) {{
+                reports.push($262.agent.getReport());
+            }}
+            reports.sort();
+            reports.join(",");
+            "#,
+            D262_HOST_PREAMBLE
+        );
+        let completion = runtime
+            .run_script(SourceInput::from_javascript(source), "<agent-notify-test>")
+            .expect("script")
+            .completion_string()
+            .to_string();
+        reset_for_next_test();
+        assert_eq!(completion, "ok,timed-out,timed-out");
+    }
+
+    #[test]
+    fn agent_notify_test262_helper_path_passes() {
+        let _guard = AGENT_TEST_LOCK.lock().expect("agent test lock poisoned");
+        reset_for_next_test();
+        let mut runtime = Runtime::builder()
+            .timeout(Duration::ZERO)
+            .max_heap_bytes(64 * 1024 * 1024)
+            .allow_blocking_atomics_wait(true)
+            .process_global(false)
+            .worker_global(false)
+            .global_installer(RuntimeGlobalInstaller::new(install_natives))
+            .build()
+            .expect("runtime");
+        let source = format!(
+            r#""use strict";
+            {}
+            {}
+            {}
+            {}
+            const WAIT_INDEX = 0;
+            const RUNNING = 1;
+            const NOTIFYCOUNT = 1;
+            const NUMAGENT = 3;
+            const BUFFER_SIZE = 4;
+            const TIMEOUT = $262.agent.timeouts.long;
+
+            for (var i = 0; i < NUMAGENT; i++ ) {{
+              $262.agent.start(`
+                $262.agent.receiveBroadcast(function(sab) {{
+                  const i32a = new Int32Array(sab);
+                  Atomics.add(i32a, ${{RUNNING}}, 1);
+                  $262.agent.report(Atomics.wait(i32a, ${{WAIT_INDEX}}, 0, ${{TIMEOUT}}));
+                  $262.agent.leaving();
+                }});
+              `);
+            }}
+
+            const i32a = new Int32Array(
+              new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * BUFFER_SIZE)
+            );
+            $262.agent.safeBroadcast(i32a);
+            $262.agent.waitUntil(i32a, RUNNING, NUMAGENT);
+            $262.agent.tryYield();
+            assert.sameValue(Atomics.notify(i32a, 0, NOTIFYCOUNT), NOTIFYCOUNT);
+            $262.agent.trySleep(TIMEOUT);
+
+            const reports = [];
+            for (var i = 0; i < NUMAGENT; i++) {{
+              reports.push($262.agent.getReport());
+            }}
+            reports.sort();
+            for (var i = 0; i < NOTIFYCOUNT; i++) {{
+              assert.sameValue(reports[i], 'ok');
+            }}
+            for (var i = NOTIFYCOUNT; i < NUMAGENT; i++) {{
+              assert.sameValue(reports[i], 'timed-out');
+            }}
+            "pass";
+            "#,
+            D262_HOST_PREAMBLE, TEST262_STA, TEST262_ASSERT, TEST262_ATOMICS_HELPER
+        );
+        let completion = runtime
+            .run_script(SourceInput::from_javascript(source), "<agent-helper-test>")
+            .expect("script")
+            .completion_string()
+            .to_string();
+        reset_for_next_test();
+        assert_eq!(completion, "pass");
     }
 }

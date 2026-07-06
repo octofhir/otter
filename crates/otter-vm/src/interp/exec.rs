@@ -516,7 +516,7 @@ impl Interpreter {
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
-        let entry_this = if main.is_module || main.is_strict {
+        let entry_this = if main.is_module {
             Value::undefined()
         } else {
             Value::object(self.global_this)

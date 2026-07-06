@@ -76,6 +76,11 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Per-run wall-clock timeout in seconds. `0` disables the
+    /// timeout. Defaults to the runtime's 30-second limit.
+    #[arg(long = "timeout", value_name = "secs", global = true)]
+    timeout_secs: Option<u64>,
+
     /// Emit a per-instruction step trace to stderr (or to the path
     /// given with `--trace=<path>`). Off when omitted.
     #[arg(
@@ -468,6 +473,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     startup_timer.mark("parse_args");
     install_cli_trace_target(cli.trace.clone());
+    install_cli_timeout_secs(cli.timeout_secs);
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();
@@ -1354,10 +1360,28 @@ fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
         .capabilities(caps.clone())
         .with_node_apis()
         .with_web_apis();
+    if let Some(secs) = cli_timeout_secs() {
+        builder = builder.timeout(std::time::Duration::from_secs(secs));
+    }
     if let Some(target) = cli_trace_target() {
         builder = builder.tracer_factory(Some(trace_factory_for_target(&target)));
     }
     builder
+}
+
+/// Top-level `--timeout <secs>` installed by [`main`]. `None` keeps
+/// the runtime default; `Some(0)` disables the timeout
+/// (`Duration::ZERO` semantics in the runtime config).
+static CLI_TIMEOUT_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+fn install_cli_timeout_secs(secs: Option<u64>) {
+    let encoded = secs.and_then(|s| i64::try_from(s).ok()).unwrap_or(-1);
+    CLI_TIMEOUT_SECS.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn cli_timeout_secs() -> Option<u64> {
+    let raw = CLI_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    u64::try_from(raw).ok()
 }
 
 /// Top-level `--trace[=<path>]` target installed by [`main`].

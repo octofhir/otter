@@ -24,6 +24,11 @@ const WEB_BOOTSTRAP: &str = include_str!("web_bootstrap.js");
 /// [`WEB_BOOTSTRAP`] (depends on its `TextEncoder` / `TextDecoder`).
 const WEB_STREAMS: &str = include_str!("web_streams.js");
 
+/// WHATWG Fetch classes (`Headers` / `Request` / `Response` + the hidden
+/// `__otterFetchInternals` server factory). Evaluated after [`WEB_STREAMS`]
+/// (the `body` getter wraps buffered bodies in a `ReadableStream`).
+const WEB_FETCH: &str = include_str!("web_fetch.js");
+
 /// Every global the [`WEB_BOOTSTRAP`] + [`WEB_STREAMS`] sources attach to
 /// `globalThis` via their `def(name, value)` helper. Each name is installed
 /// as a lazy accessor so the ~52 KB of shim source is only parsed + compiled
@@ -53,6 +58,10 @@ const WEB_GLOBAL_NAMES: &[&str] = &[
     "TextDecoder",
     "TextEncoder",
     "URLSearchParams",
+    // web_fetch.js
+    "Headers",
+    "Request",
+    "Response",
     // web_streams.js
     "CompressionStream",
     "DecompressionStream",
@@ -78,12 +87,16 @@ const SOURCE_FN_GLOBAL: &str = "__otterWebGlobalsSource";
 /// of any lazy Web global.
 fn web_globals_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     // `web_streams.js` depends on `TextEncoder` / `TextDecoder` from
-    // `web_bootstrap.js`; concatenating them keeps that ordering. The trailing
-    // `;` guards against either shim omitting its own statement terminator.
-    let mut source = String::with_capacity(WEB_BOOTSTRAP.len() + WEB_STREAMS.len() + 8);
+    // `web_bootstrap.js`, and `web_fetch.js` depends on both; concatenating
+    // them keeps that ordering. The trailing `;` guards against a shim
+    // omitting its own statement terminator.
+    let mut source =
+        String::with_capacity(WEB_BOOTSTRAP.len() + WEB_STREAMS.len() + WEB_FETCH.len() + 12);
     source.push_str(WEB_BOOTSTRAP);
     source.push_str("\n;\n");
     source.push_str(WEB_STREAMS);
+    source.push_str("\n;\n");
+    source.push_str(WEB_FETCH);
     source.push_str("\n;\n");
     runtime_string_value(ctx, &source)
 }
@@ -329,7 +342,7 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 #[cfg(test)]
 mod tests {
-    use super::{WEB_BOOTSTRAP, WEB_GLOBAL_NAMES, WEB_STREAMS};
+    use super::{WEB_BOOTSTRAP, WEB_FETCH, WEB_GLOBAL_NAMES, WEB_STREAMS};
     use std::collections::BTreeSet;
 
     /// Scan a shim source for the `def('<name>')` calls that attach a global.
@@ -358,6 +371,7 @@ mod tests {
     fn lazy_global_names_match_shim_def_calls() {
         let mut from_shims = def_names(WEB_BOOTSTRAP);
         from_shims.extend(def_names(WEB_STREAMS));
+        from_shims.extend(def_names(WEB_FETCH));
         let listed: BTreeSet<String> = WEB_GLOBAL_NAMES.iter().map(|s| (*s).to_string()).collect();
         assert_eq!(
             from_shims, listed,

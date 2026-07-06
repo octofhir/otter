@@ -3360,7 +3360,7 @@ pub(crate) mod arm64 {
                             ; cbz x13, =>miss
                             ; ldr w9, [x13, x17]       // 4-byte compressed slot
                         );
-                        emit_decompress_slot(&mut ops, miss);
+                        emit_decompress_slot(&mut ops, cage_base as u64, miss);
                         dynasm!(ops
                             ; .arch aarch64
                             ; str x9, [x19, dst_off]
@@ -4586,7 +4586,7 @@ pub(crate) mod arm64 {
                     ; cbz x13, =>bail
                     ; ldr w9, [x13, off]                // 4-byte compressed slot
                 );
-                emit_decompress_slot(ops, bail);
+                emit_decompress_slot(ops, cage_base as u64, bail);
                 store_reg(ops, 9, dst)?;
                 Ok(())
             }
@@ -4750,11 +4750,12 @@ pub(crate) mod arm64 {
             ; cmp w14, w15
             ; b.ne =>miss
         );
-        if !method.method_on_receiver {
+        for &hop_shape in &method.proto_chain {
             dynasm!(ops
                 ; .arch aarch64
                 // Flat prototype: load the compressed handle, bail on null,
-                // then decompress and guard the prototype object's shape.
+                // then decompress and guard the hopped object's shape. After
+                // the final hop x13 holds the method holder's header.
                 ; ldr w9, [x13, jit_proto_byte]
                 ; cbz w9, =>miss
             );
@@ -4766,8 +4767,8 @@ pub(crate) mod arm64 {
                 ; cmp w14, OBJECT_BODY_TYPE_TAG
                 ; b.ne =>miss
                 ; ldr w14, [x13, object_shape_byte]
-                ; movz w15, method.proto_shape & 0xffff
-                ; movk w15, (method.proto_shape >> 16) & 0xffff, lsl #16
+                ; movz w15, hop_shape & 0xffff
+                ; movk w15, (hop_shape >> 16) & 0xffff, lsl #16
                 ; cmp w14, w15
                 ; b.ne =>miss
             );
@@ -4784,7 +4785,7 @@ pub(crate) mod arm64 {
             ; cbz x13, =>miss
             ; ldr w9, [x13, method.method_value_byte]   // 4-byte compressed slot
         );
-        emit_decompress_slot(ops, miss);
+        emit_decompress_slot(ops, cage_base as u64, miss);
         dynasm!(ops
             ; .arch aarch64
             ; movz x11, NUMBER_TAG_HI16, lsl #48
@@ -5441,7 +5442,7 @@ pub(crate) mod arm64 {
             ; cbz x15, =>miss
             ; ldr w17, [x15, method_value_byte]
         );
-        emit_decompress_slot(ops, miss);
+        emit_decompress_slot(ops, view.cage_base as u64, miss);
         dynasm!(ops
             ; .arch aarch64
             ; mov x9, x17
@@ -6504,7 +6505,7 @@ pub(crate) mod arm64 {
     /// `boxed_bail`, where the interpreter reads the box. Fixed registers (the
     /// `#imm` forms below require literal registers): `x9` is the slot in/out,
     /// `x10` is scratch.
-    fn emit_decompress_slot(ops: &mut Assembler, boxed_bail: DynamicLabel) {
+    fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_bail: DynamicLabel) {
         use otter_vm::value::compressed as cslot;
         // The literal slot tags below are the frozen `compressed` layout.
         debug_assert_eq!(cslot::TAG_MASK, 0b111);
@@ -6540,9 +6541,19 @@ pub(crate) mod arm64 {
             ; b.eq =>l_fid
             ; b =>boxed_bail                            // 010 → boxed number
             ; =>l_cell
-            // A cell ref's zero-extended offset is exactly its `Value` (cells are
-            // bare cage offsets); the empty slot (0) decodes to `undefined`.
+            // A cell ref widens to the canonical heap-cell `Value` bits:
+            // `cage_base | offset` (`Value::from_cell_offset`). A bare offset
+            // would still dereference (consumers rebuild the address from the
+            // low 32 bits) but would never bit-compare equal to a canonically
+            // boxed handle of the same object, breaking strict/loose equality
+            // on any value that flowed through a compiled slot load. The empty
+            // slot (0) decodes to `undefined`.
             ; cbz x9, =>l_undef
+        );
+        emit_load_u64(ops, 10, cage_base);
+        dynasm!(ops
+            ; .arch aarch64
+            ; orr x9, x9, x10
             ; b =>l_done
             ; =>l_smi
             ; asr w9, w9, #1                            // int32 = (i31 << 1 | 1) >> 1

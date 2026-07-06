@@ -494,6 +494,59 @@ pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 /// site's shape set grows.
 pub(crate) const MAX_POLY_PROPERTY_CASES: usize = 4;
 
+/// Longest prototype chain a method-call site's inline identity guard walks
+/// from the receiver to the object holding the method slot. Deeper
+/// resolutions stay on the bridge (a chain this long is already rare; each
+/// hop costs one flat-prototype chase + shape compare per call).
+pub(crate) const MAX_METHOD_PROTO_CHAIN: usize = 4;
+
+/// Shapes of each prototype hopped from the receiver to the method holder,
+/// in hop order — the last entry is the holder's shape. Empty when the
+/// method slot is an own property of the receiver. Each level's shape check
+/// both pins that object's layout (an own-property insertion that would
+/// shadow the method changes the shape) and validates the slot offset baked
+/// for the holder.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MethodProtoChain {
+    len: u8,
+    shapes: [object::ShapeHandle; MAX_METHOD_PROTO_CHAIN],
+}
+
+impl MethodProtoChain {
+    /// Chain for a method living directly on the receiver.
+    pub(crate) fn own() -> Self {
+        Self {
+            len: 0,
+            shapes: [object::ShapeHandle::null(); MAX_METHOD_PROTO_CHAIN],
+        }
+    }
+
+    /// Append one hopped prototype's shape; `false` when the chain is full
+    /// (the site must stay on the bridge).
+    pub(crate) fn push(&mut self, shape: object::ShapeHandle) -> bool {
+        if (self.len as usize) == MAX_METHOD_PROTO_CHAIN {
+            return false;
+        }
+        self.shapes[self.len as usize] = shape;
+        self.len += 1;
+        true
+    }
+
+    pub(crate) fn as_slice(&self) -> &[object::ShapeHandle] {
+        &self.shapes[..self.len as usize]
+    }
+
+    /// Whether both chains walk the same shapes (compared by handle offset).
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self
+                .as_slice()
+                .iter()
+                .zip(other.as_slice())
+                .all(|(a, b)| a.offset() == b.offset())
+    }
+}
+
 /// One observed `(receiver shape, resolved method)` target at a polymorphic
 /// method-call site. Same layout data the baseline bakes for a monomorphic
 /// inline guard ([`MethodCallFeedback::Mono`]), plus a `hits` counter so the
@@ -502,9 +555,8 @@ pub(crate) const MAX_POLY_PROPERTY_CASES: usize = 4;
 pub(crate) struct PolyMethodTarget {
     pub(crate) method_fid: u32,
     pub(crate) recv_shape: object::ShapeHandle,
-    pub(crate) proto_shape: object::ShapeHandle,
+    pub(crate) proto_chain: MethodProtoChain,
     pub(crate) method_value_byte: u32,
-    pub(crate) method_on_receiver: bool,
     /// Observations that resolved to exactly this target. Used only to order
     /// the emitted guard chain; not a correctness input.
     pub(crate) hits: u32,
@@ -516,9 +568,8 @@ impl PolyMethodTarget {
     fn matches(&self, method_fid: u32, site: &MethodSite) -> bool {
         self.method_fid == method_fid
             && self.recv_shape.offset() == site.recv_shape.offset()
-            && self.proto_shape.offset() == site.proto_shape.offset()
+            && self.proto_chain.same(&site.proto_chain)
             && self.method_value_byte == site.method_value_byte
-            && self.method_on_receiver == site.method_on_receiver
     }
 }
 
@@ -526,18 +577,18 @@ impl PolyMethodTarget {
 pub(crate) enum MethodCallFeedback {
     /// One method function id and one receiver shape observed so far.
     ///
-    /// `proto_shape` is the shape of the prototype object that holds the
-    /// method slot, and `method_value_byte` is that slot's byte offset within
-    /// the prototype value slab — both captured at record time from the live
-    /// receiver so the baseline can bake a fully-inline identity guard (read
-    /// the receiver's flat prototype, guard its shape, load the slot, compare
-    /// the closure's `function_id`) with no per-call resolve bridge.
+    /// `proto_chain` holds the shape of each prototype hopped to reach the
+    /// object holding the method slot, and `method_value_byte` is that slot's
+    /// byte offset within the holder's value slab — both captured at record
+    /// time from the live receiver so the baseline can bake a fully-inline
+    /// identity guard (chase the flat prototype per hop, guard each shape,
+    /// load the slot, compare the closure's `function_id`) with no per-call
+    /// resolve bridge.
     Mono {
         method_fid: u32,
         recv_shape: object::ShapeHandle,
-        proto_shape: object::ShapeHandle,
+        proto_chain: MethodProtoChain,
         method_value_byte: u32,
-        method_on_receiver: bool,
     },
     /// Two-to-[`MAX_POLY_METHOD_TARGETS`] distinct inlinable targets observed
     /// at this site. The baseline bakes one inline guard+body per target into a
@@ -560,12 +611,11 @@ pub(crate) enum MethodCallFeedback {
 pub(crate) struct MethodSite {
     /// Receiver hidden-class handle (immortal).
     recv_shape: object::ShapeHandle,
-    /// Shape of the prototype object holding the method slot (immortal).
-    proto_shape: object::ShapeHandle,
-    /// Byte offset of the method slot within the prototype value slab.
+    /// Shapes of the prototypes hopped to the method holder (immortal);
+    /// empty when the method slot lives directly on the receiver.
+    proto_chain: MethodProtoChain,
+    /// Byte offset of the method slot within the holder's value slab.
     method_value_byte: u32,
-    /// Whether the method slot lives directly on the receiver.
-    method_on_receiver: bool,
 }
 
 #[derive(Clone)]

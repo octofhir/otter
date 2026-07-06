@@ -1192,8 +1192,7 @@ impl Value {
     /// [`Self::typeof_string_with_heap`] upgrades that case to
     /// `"function"`.
     #[must_use]
-    #[allow(dead_code)] // Wired up at Phase-1 swap.
-    pub fn typeof_string(self) -> &'static str {
+    pub(crate) fn typeof_string(self) -> &'static str {
         if let Some(t) = self.typeof_pure() {
             return t;
         }
@@ -1211,7 +1210,6 @@ impl Value {
     /// carry a hidden native `[[Call]]` slot, so their visible tag is
     /// `"function"` even though the value kind is `PtrObject`.
     #[must_use]
-    #[allow(dead_code)] // Wired up at Phase-1 swap.
     pub fn typeof_string_with_heap(self, heap: &otter_gc::GcHeap) -> &'static str {
         if self.is_html_dda(heap) {
             return "undefined";

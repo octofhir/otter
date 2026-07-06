@@ -754,13 +754,21 @@ impl ObjectBody {
     #[inline]
     fn push_slab_word(&mut self, value: CompressedValue) {
         let len = self.slab_len();
-        if len < INLINE_SLOT_CAP {
-            self.inline_values[len] = value;
-        } else if len == INLINE_SLOT_CAP {
-            // Spill: move the inline slab out of line, then append.
-            debug_assert!(self.values.is_empty(), "overflow slab already populated");
-            self.values.extend_from_slice(&self.inline_values);
-            self.values.push(value);
+        // Branch on the actual storage location, not on `len`: a slab that
+        // spilled and then shrank back to `INLINE_SLOT_CAP` via
+        // `remove_slab_word` stays out of line, so a length-based spill
+        // test here would re-copy the inline array over the live overflow
+        // vector and duplicate slots (delete-then-add on a 3+-property
+        // object silently corrupted the slab in release; debug builds
+        // panicked with 'overflow slab already populated').
+        if self.slab_is_inline() {
+            if len < INLINE_SLOT_CAP {
+                self.inline_values[len] = value;
+            } else {
+                // Spill: move the inline slab out of line, then append.
+                self.values.extend_from_slice(&self.inline_values);
+                self.values.push(value);
+            }
         } else {
             self.values.push(value);
         }
@@ -1994,12 +2002,13 @@ pub(crate) fn load_own_data_slot_atom(
         // baked data slot straight from the slab — the matching shape fixes the
         // slot kind and bounds, so neither the per-slot attributes nor the
         // property count need consulting.
-        if shaped && hit.is_data && !body.slot_attrs_overridden && body.exotic.is_none() {
+        if shaped
+            && hit.is_data
+            && !body.slot_attrs_overridden
+            && body.exotic.is_none()
+            && !body.slot_attrs(heap, offset).1
+        {
             debug_assert!(offset < body_property_count(heap, body));
-            debug_assert!(
-                !body.slot_attrs(heap, offset).1,
-                "baked data slot resolved to an accessor"
-            );
             return Some(body.data_value(heap, offset));
         }
         if let Some(cell) = mapped_argument_cell(body, key.name()) {

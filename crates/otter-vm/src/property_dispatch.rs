@@ -938,6 +938,11 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = key.name();
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        if receiver.is_nullish() {
+            return Err(
+                self.err_type(("Cannot read property of null or undefined".to_string()).into())
+            );
+        }
         let value = if receiver.as_object().is_some() {
             let key = VmPropertyKey::String(name);
             match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {

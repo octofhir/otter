@@ -112,21 +112,6 @@ pub(crate) fn compile_static_member(
         );
         return Ok(dst);
     }
-    // `Symbol.<name>` — well-known symbol read. The runtime
-    // resolves the name against the per-interpreter
-    // well-known table (ECMA-262 §6.1.5.1).
-    if let Expression::Identifier(id) = &m.object
-        && id.name.as_str() == "Symbol"
-    {
-        let dst = cx.alloc_scratch();
-        let name_idx = cx.intern_string_constant(m.property.name.as_str());
-        cx.emit(
-            Op::SymbolLoad,
-            [Operand::Register(dst), Operand::ConstIndex(name_idx)],
-            span,
-        );
-        return Ok(dst);
-    }
     let mark = cx.scratch;
     let receiver = compile_expr(cx, &m.object, span)?;
     let name_idx = cx.intern_string_constant(m.property.name.as_str());

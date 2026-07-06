@@ -527,18 +527,18 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let receiver = iter.next().unwrap_or(Value::undefined());
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let owner_bag = self.callable_bag_for_value(&this_value);
-                let mut ctx = function_metadata::FunctionMetadataContext::new(
-                    context,
-                    &mut self.gc_heap,
-                    owner_bag,
-                    &self.function_deleted_metadata,
-                );
-                let metadata = function_metadata::bound_create_metadata(
-                    &mut ctx,
-                    &this_value,
+                // §20.2.3.2 / §10.4.1.3 — name and length come from
+                // spec-observable [[Get]]s on the target, so a Proxy get
+                // trap (Function.prototype.bind.call(proxy)) is honoured.
+                let target_name = self.get_property_value_for_call(context, this_value, "name")?;
+                let target_length =
+                    self.get_property_value_for_call(context, this_value, "length")?;
+                let metadata = function_metadata::bound_create_metadata_from_values(
+                    &target_name,
+                    &target_length,
                     bound_args.len(),
-                )?;
+                    &self.gc_heap,
+                );
                 let this_root = this_value;
                 let receiver_root = receiver;
                 let bound_args_root = bound_args.clone();

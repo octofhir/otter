@@ -692,14 +692,18 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
     let mut interp = Interpreter::new();
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let context = ExecutionContext::from_module(module);
-    assert!(interp.run(&context).unwrap().is_function());
+    let completion = interp.run(&context).unwrap();
+    assert!(crate::is_callable(&completion));
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
         after > before,
         "StoreProperty should allocate function user props in young space"
     );
+    let owner = completion
+        .as_closure(interp.gc_heap())
+        .expect("MakeFunction result is a per-instance closure");
     let desc = interp
-        .ordinary_function_own_property_descriptor(Some(&context), None, 1, "custom")
+        .ordinary_function_own_property_descriptor(Some(&context), Some(owner), 1, "custom")
         .unwrap()
         .expect("custom property descriptor");
     assert_eq!(
@@ -840,7 +844,14 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
         )
         .expect("Function constructor");
 
-    let fid = result.as_function().expect("plain function value");
+    let fid = result
+        .as_function()
+        .or_else(|| {
+            result
+                .as_closure(interp.gc_heap())
+                .map(|c| c.cached_function_id)
+        })
+        .expect("function value");
     assert_eq!(
         fid, 2,
         "eval chunk ids rebase past the outer chunk's single function"

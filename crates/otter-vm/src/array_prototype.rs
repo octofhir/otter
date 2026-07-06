@@ -1662,19 +1662,7 @@ impl Interpreter {
                 }
             }
         };
-        let arr_root = o;
-        let heap = self.gc_heap_mut();
-        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            arr_root.trace_value_slots(visit);
-            for root in roots {
-                for value in *root {
-                    value.trace_value_slots(visit);
-                }
-            }
-        };
-        // Old-space: iterator handles cross native frames in Rust locals;
-        // a young-space scavenge moving the cell would leave them stale.
-        heap.alloc_old_with_roots(state, &mut visitor)
+        self.alloc_runtime_rooted_iterator_state(state, &[&o], roots)
             .map(Value::iterator)
             .map_err(|_| self.err_type(("iterator allocation failed".to_string()).into()))
     }
@@ -3548,29 +3536,8 @@ impl Interpreter {
         if values.len() > u32::MAX as usize {
             return Err(self.err_range(("Invalid array length".to_string()).into()));
         }
-        let len = values.len();
-        let alloc = {
-            let heap = self.gc_heap_mut();
-            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for value in &values {
-                    value.trace_value_slots(visit);
-                }
-            };
-            crate::array::alloc_array_with_roots(heap, &mut visitor)
-        };
-        let arr = match alloc {
-            Ok(arr) => arr,
-            Err(_) => return Err(self.err_range(("Invalid array length".to_string()).into())),
-        };
-        let heap = self.gc_heap_mut();
-        crate::array::with_elements_mut(arr, heap, |elements| {
-            elements.extend(values);
-        });
-        let set_len = crate::array::set_length(arr, heap, len);
-        if set_len.is_err() {
-            return Err(self.err_range(("Invalid array length".to_string()).into()));
-        }
-        Ok(Value::array(arr))
+        let array = self.alloc_runtime_rooted_array_from_values(values, &[], &[])?;
+        Ok(Value::array(array))
     }
 }
 
@@ -4341,6 +4308,7 @@ mod tests {
             is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
+            uses_arguments_callee: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             source_text: None,
@@ -4385,6 +4353,7 @@ mod tests {
             is_derived_constructor: false,
             is_module: false,
             needs_arguments: false,
+            uses_arguments_callee: false,
             arguments_object_kind: ArgumentsObjectKind::Unmapped,
             mapped_argument_bindings: Vec::new(),
             source_text: None,

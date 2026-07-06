@@ -196,6 +196,7 @@ mod tests {
                 is_derived_constructor: false,
                 is_module: false,
                 needs_arguments: false,
+                uses_arguments_callee: false,
                 arguments_object_kind: ArgumentsObjectKind::Unmapped,
                 mapped_argument_bindings: Vec::new(),
                 source_text: None,

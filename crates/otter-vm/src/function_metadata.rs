@@ -344,20 +344,6 @@ pub(crate) fn callable_to_string(ctx: &mut FunctionMetadataContext<'_>, callee: 
     }
 }
 
-/// Compute builtin metadata for a newly created bound function.
-pub(crate) fn bound_create_metadata(
-    ctx: &mut FunctionMetadataContext<'_>,
-    target: &Value,
-    bound_arg_count: usize,
-) -> Result<BoundFunctionCreateMetadata, VmError> {
-    let target_name = callable_name(ctx, target)?;
-    let target_len = callable_length(ctx, target)?;
-    Ok(BoundFunctionCreateMetadata {
-        name: format!("bound {target_name}"),
-        length: number_from_length_value((target_len - bound_arg_count as f64).max(0.0)),
-    })
-}
-
 /// Compute bound-function metadata from spec-observable
 /// `Get(target, "name")` / `Get(target, "length")` results.
 #[must_use]

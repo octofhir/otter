@@ -64,10 +64,20 @@ pub struct NumberFormatPayload {
     /// `currency` option (ISO-4217 code) — set only when
     /// `style == "currency"`.
     pub currency: Option<String>,
+    /// `minimumIntegerDigits` (default 1) — integer part is left-padded
+    /// with zeros up to this many digits.
+    pub minimum_integer_digits: u8,
     /// `minimumFractionDigits` (default depends on style).
     pub minimum_fraction_digits: u8,
     /// `maximumFractionDigits` (default depends on style).
     pub maximum_fraction_digits: u8,
+    /// `minimumSignificantDigits` — `Some` selects significant-digit
+    /// rounding (ECMA-402 SetNumberFormatDigitOptions, roundingPriority
+    /// `"auto"`), which overrides the fraction-digit settings.
+    pub minimum_significant_digits: Option<u8>,
+    /// `maximumSignificantDigits` — see
+    /// [`Self::minimum_significant_digits`].
+    pub maximum_significant_digits: Option<u8>,
     /// `useGrouping` option.
     pub use_grouping: bool,
     /// `signDisplay` option (`"auto"` / `"always"` / `"never"` /

@@ -2070,6 +2070,12 @@ pub struct Function {
     /// [`Op::CollectArguments`] can wrap it as an Array.
     #[serde(default)]
     pub needs_arguments: bool,
+    /// `true` when the body may read `arguments.callee` (a literal
+    /// `.callee` member or any computed `arguments[expr]` access). Gates
+    /// the per-call recording of the invoked closure — hot
+    /// arguments-using functions that never touch `callee` skip the
+    /// cold-frame acquire entirely.
+    pub uses_arguments_callee: bool,
     /// Arguments object shape requested by the compiler for this
     /// function. Strict functions, arrows, and non-simple parameter
     /// lists stay unmapped. Sloppy functions with simple parameters

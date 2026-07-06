@@ -390,6 +390,8 @@ pub(crate) struct ExecutableFunction {
     pub(crate) is_leaf: bool,
     /// `true` when this function body needs an `arguments` object.
     pub(crate) needs_arguments: bool,
+    /// Mirrors [`otter_bytecode::Function::uses_arguments_callee`].
+    pub(crate) uses_arguments_callee: bool,
     /// Arguments object shape requested by the compiler.
     pub(crate) arguments_object_kind: ArgumentsObjectKind,
     /// Compact mapped-arguments bindings without debug-only formal names.
@@ -554,6 +556,7 @@ impl ExecutableFunction {
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
             needs_arguments: function.needs_arguments,
+            uses_arguments_callee: function.uses_arguments_callee,
             arguments_object_kind: function.arguments_object_kind,
             mapped_argument_bindings,
             is_module: function.is_module,

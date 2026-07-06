@@ -869,7 +869,7 @@ impl Interpreter {
         // Record the invoked closure so the named-function SELF binding and
         // `arguments.callee` resolve to the live instance, not a bare
         // interned function value.
-        if (function.makes_function || function.needs_arguments)
+        if (function.makes_function || function.uses_arguments_callee)
             && let Some(closure) = current.as_closure(&self.gc_heap)
         {
             self.frame_ensure_cold(&mut prepared.frame).callee_closure = Some(closure);
@@ -2262,7 +2262,7 @@ impl Interpreter {
         // bare interned function value. Leaf callees that neither create a
         // closure nor materialize an arguments object skip the record and the
         // cold-frame acquire.
-        if (function.makes_function || function.needs_arguments)
+        if (function.makes_function || function.uses_arguments_callee)
             && let Some(closure) = current.as_closure(&self.gc_heap)
         {
             self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);

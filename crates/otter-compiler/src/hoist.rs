@@ -716,6 +716,72 @@ pub(crate) fn body_references_arguments(
     finder.found
 }
 
+/// `true` when the body may observe `arguments.callee`: a literal
+/// `.callee` member or any computed member access on the `arguments`
+/// identifier (the key is a runtime value, so it may be "callee").
+/// Nested non-arrow functions own their own `arguments` and are
+/// skipped, mirroring [`body_references_arguments`].
+pub(crate) fn body_uses_arguments_callee(
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    body: Option<&oxc_ast::ast::FunctionBody<'_>>,
+) -> bool {
+    use oxc_ast_visit::Visit;
+    #[derive(Default)]
+    struct CalleeFinder {
+        nested_function_depth: u32,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for CalleeFinder {
+        fn visit_function(
+            &mut self,
+            it: &oxc_ast::ast::Function<'a>,
+            flags: oxc_syntax::scope::ScopeFlags,
+        ) {
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_function(self, it, flags);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_class_body(&mut self, it: &oxc_ast::ast::ClassBody<'a>) {
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_class_body(self, it);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_static_member_expression(
+            &mut self,
+            it: &oxc_ast::ast::StaticMemberExpression<'a>,
+        ) {
+            if self.nested_function_depth == 0 && it.property.name.as_str() == "callee" {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_static_member_expression(self, it);
+        }
+        fn visit_computed_member_expression(
+            &mut self,
+            it: &oxc_ast::ast::ComputedMemberExpression<'a>,
+        ) {
+            if self.nested_function_depth == 0
+                && matches!(&it.object,
+                    oxc_ast::ast::Expression::Identifier(id) if id.name.as_str() == "arguments")
+            {
+                self.found = true;
+            }
+            oxc_ast_visit::walk::walk_computed_member_expression(self, it);
+        }
+    }
+    let mut finder = CalleeFinder::default();
+    for p in &params.items {
+        if let Some(init) = p.initializer.as_deref() {
+            finder.visit_expression(init);
+        }
+    }
+    if let Some(b) = body {
+        for stmt in &b.statements {
+            finder.visit_statement(stmt);
+        }
+    }
+    finder.found
+}
+
 pub(crate) fn module_body_uses_top_level_await(stmts: &[Statement<'_>]) -> bool {
     use oxc_ast_visit::Visit;
     #[derive(Default)]

@@ -304,6 +304,8 @@ pub(crate) fn compile_function_full(
     slot.is_async_generator = is_async_generator;
     slot.is_method = is_method;
     slot.needs_arguments = needs_arguments;
+    slot.uses_arguments_callee =
+        needs_arguments && crate::hoist::body_uses_arguments_callee(params, body.as_deref());
     slot.arguments_object_kind = if uses_mapped_arguments {
         ArgumentsObjectKind::Mapped
     } else {

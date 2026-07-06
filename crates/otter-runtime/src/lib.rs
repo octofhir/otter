@@ -1778,10 +1778,10 @@ impl Runtime {
                 .map_err(|e| format!("compile error: {e:?}"))
             });
         interp.set_eval_hook(Some(hook));
-        // The interpreter is the default execution path. `OTTER_JIT=1`
-        // opts into the baseline JIT for explicit JIT runs; without it the
-        // engine stays interpreter-only.
-        if std::env::var("OTTER_JIT").is_ok_and(|v| v == "1") {
+        // The JIT is the default execution path: functions start in the
+        // interpreter and tier up through the baseline/optimizing JIT.
+        // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
+        if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
             interp.set_jit_compiler(Some(std::sync::Arc::new(
                 otter_jit::BaselineJitCompiler::new(),
             )));

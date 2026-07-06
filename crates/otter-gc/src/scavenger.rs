@@ -481,7 +481,14 @@ unsafe fn process_ephemeron_fixpoint(
     // SAFETY: caller guarantees slot validity under STW.
     unsafe {
         loop {
-            let before = ctx.stats;
+            // Fixpoint progress = NEW EVACUATIONS only. Comparing the whole
+            // stats struct also captured `slot_updates`, which increments
+            // when a re-scanned slot merely rewrites to an existing
+            // forwarding target — that made the loop believe it progressed
+            // every pass and re-run a full to-space re-scan (fresh cheney
+            // cursors each call) millions of times: one first scavenge ran
+            // for minutes on v8-v7 raytrace with ZERO ephemeron tables.
+            let before = (ctx.stats.copied_bytes, ctx.stats.promoted_bytes);
 
             for &slot in ephemeron_registry_slots {
                 if !update_registry_slot_if_forwarded(ctx, slot) {
@@ -497,7 +504,7 @@ unsafe fn process_ephemeron_fixpoint(
 
             cheney_scan(ctx, old_scan_cursors);
 
-            if ctx.stats == before {
+            if (ctx.stats.copied_bytes, ctx.stats.promoted_bytes) == before {
                 break;
             }
         }

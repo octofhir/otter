@@ -88,7 +88,9 @@ impl Interpreter {
                         Ok(None)
                     };
                 }
-                if let Some(thrown) = self.vm_error_to_throwable_with_stack_roots(stack, &err) {
+                if let Some(thrown) =
+                    self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
+                {
                     let uncaught =
                         if matches!(err, VmError::OutOfMemory { .. } | VmError::JsonError) {
                             Some(err)

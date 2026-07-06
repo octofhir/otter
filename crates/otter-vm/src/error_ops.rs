@@ -194,6 +194,7 @@ impl Interpreter {
     /// keep propagating as host errors (StackOverflow, etc.).
     pub(crate) fn vm_error_to_throwable_with_stack_roots(
         &mut self,
+        context: Option<&ExecutionContext>,
         stack: &HoltStack,
         err: &VmError,
     ) -> Option<Value> {
@@ -402,6 +403,12 @@ impl Interpreter {
                     );
                 }
             }
+        }
+        // Engine-raised errors carry the same construction-site call stack
+        // as user `new Error(...)` instances, so `e.stack` shows frames for
+        // a VM TypeError exactly like V8/JSC.
+        if let Some(context) = context {
+            self.capture_error_stack_frames(context, stack, obj);
         }
         Some(Value::object(obj))
     }

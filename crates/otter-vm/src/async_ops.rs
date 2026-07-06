@@ -296,7 +296,7 @@ impl Interpreter {
                     let rejection = if let Some(thrown) = self.pending_uncaught_throw.take() {
                         Some(thrown)
                     } else {
-                        self.vm_error_to_throwable_with_stack_roots(&stack, &error)
+                        self.vm_error_to_throwable_with_stack_roots(Some(context), &stack, &error)
                     };
                     if let Some(reason) = rejection {
                         self.async_generator_complete_step(context, &owner, Err(reason), true)

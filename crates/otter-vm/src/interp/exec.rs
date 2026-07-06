@@ -690,7 +690,7 @@ impl Interpreter {
                             continue;
                         }
                         if let Some(thrown) =
-                            self.vm_error_to_throwable_with_stack_roots(stack, &err)
+                            self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
                         {
                             let uncaught = if matches!(
                                 err,

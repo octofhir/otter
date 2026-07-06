@@ -3127,7 +3127,7 @@ fn vm_error_throwable_uses_stack_rooted_allocation() {
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     let error = interp
-        .vm_error_to_throwable_with_stack_roots(&stack, &VmError::TypeMismatch)
+        .vm_error_to_throwable_with_stack_roots(None, &stack, &VmError::TypeMismatch)
         .and_then(|v| v.as_object())
         .expect("TypeMismatch should convert to a throwable object");
 
@@ -3154,6 +3154,7 @@ fn oom_throwable_uses_range_error_prototype() {
 
     let error = interp
         .vm_error_to_throwable_with_stack_roots(
+            None,
             &stack,
             &VmError::OutOfMemory {
                 requested_bytes: 160,

@@ -254,6 +254,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
             mapper: Value::undefined(),
             inner: Some(iter),
             counter: 0,
+            running: false,
         };
     });
 

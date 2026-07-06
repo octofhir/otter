@@ -548,7 +548,15 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         }
         let size = (*header).size_bytes() as usize;
         let aligned = align_up(size, CELL_SIZE);
-        let promote = {
+        // A young object reached from a remembered old parent promotes
+        // immediately: leaving it young re-remembers the parent, and the
+        // parent is then re-traced in full on EVERY scavenge until the
+        // child ages out — for a large promoted graph that made each
+        // scavenge O(old heap) and the run quadratic (v8-v7 earley-boyer
+        // spent 20+ minutes inside the scavenger). An object an old
+        // object points at is long-lived with overwhelming likelihood
+        // anyway, so this is the standard generational answer.
+        let promote = ctx.in_dirty_scan || {
             let page_header = Page::header_of(header as *const u8);
             page_header.survival_age >= PROMOTE_AFTER_SURVIVALS
         };

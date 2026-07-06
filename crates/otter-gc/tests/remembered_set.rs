@@ -191,9 +191,17 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
         Box1::TYPE_TAG,
         "boxed-slot child header clobbered after scavenge"
     );
+    // A child reached through a remembered parent promotes on that very
+    // scavenge (leaving it young would re-trace the parent on every
+    // subsequent scavenge — quadratic for large promoted graphs), so the
+    // old->young edge is gone and the parent must NOT stay remembered.
     assert!(
-        unsafe { (*parent.as_header_ptr()).is_remembered() },
-        "boxed-slot edge must re-remember the parent while the child stays young"
+        unsafe { (*child_after.as_header_ptr()).is_old() },
+        "dirty-retrace child must promote immediately"
+    );
+    assert!(
+        !unsafe { (*parent.as_header_ptr()).is_remembered() },
+        "promoted child leaves no old->young edge to re-remember"
     );
 
     heap.collect_minor(otter_gc::EmptyRoots);

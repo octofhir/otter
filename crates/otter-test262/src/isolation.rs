@@ -45,6 +45,8 @@ pub fn fresh_runtime(
         .timeout(timeout)
         .max_heap_bytes(max_heap_bytes)
         .allow_blocking_atomics_wait(allow_blocking_atomics_wait)
+        .process_global(false)
+        .worker_global(false)
         .global_installer(RuntimeGlobalInstaller::new(crate::agent::install_natives))
         .build()
 }
@@ -209,5 +211,22 @@ mod tests {
             rt.run_script(SourceInput::from_javascript("var x = 1;"), "<test>")
         });
         assert!(matches!(outcome, WatchdogOutcome::Ok(_)));
+    }
+
+    #[test]
+    fn fresh_runtime_uses_engine_shell_globals() {
+        let mut rt = fresh_runtime(Duration::ZERO, 64 * 1024 * 1024, false).unwrap();
+        let process = rt
+            .run_script(SourceInput::from_javascript("typeof process;"), "<test>")
+            .expect("script")
+            .completion_string()
+            .to_string();
+        let worker = rt
+            .run_script(SourceInput::from_javascript("typeof Worker;"), "<test>")
+            .expect("script")
+            .completion_string()
+            .to_string();
+        assert_eq!(process, "undefined");
+        assert_eq!(worker, "undefined");
     }
 }

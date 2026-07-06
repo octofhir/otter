@@ -177,7 +177,7 @@ pub fn resolve_ctx(
         "percent" => (0, 0),
         _ => (0, 3),
     };
-    let _min_int = get_number_option(
+    let min_int = get_number_option(
         ctx,
         options,
         "minimumIntegerDigits",
@@ -206,7 +206,7 @@ pub fn resolve_ctx(
         None,
     )?
     .map(|n| n as u8);
-    let _min_sig = get_number_option(
+    let min_sig = get_number_option(
         ctx,
         options,
         "minimumSignificantDigits",
@@ -215,7 +215,7 @@ pub fn resolve_ctx(
         21.0,
         None,
     )?;
-    let _max_sig = get_number_option(
+    let max_sig = get_number_option(
         ctx,
         options,
         "maximumSignificantDigits",
@@ -224,6 +224,22 @@ pub fn resolve_ctx(
         21.0,
         None,
     )?;
+    // SetNumberFormatDigitOptions with roundingPriority "auto": a present
+    // significant-digit option selects significant-digit rounding and the
+    // fraction-digit settings become inert.
+    let (minimum_significant_digits, maximum_significant_digits) =
+        if min_sig.is_some() || max_sig.is_some() {
+            let mn = min_sig.map_or(1u8, |v| v as u8);
+            let mx = max_sig.map_or(21u8, |v| v as u8);
+            if mx < mn {
+                return Err(range(
+                    "maximumSignificantDigits is less than minimumSignificantDigits".to_string(),
+                ));
+            }
+            (Some(mn), Some(mx))
+        } else {
+            (None, None)
+        };
     let (minimum_fraction_digits, maximum_fraction_digits) = match (mnfd, mxfd) {
         (None, None) => (default_min, default_max.max(default_min)),
         (Some(mn), None) => (mn, default_max.max(mn)),
@@ -326,8 +342,11 @@ pub fn resolve_ctx(
         numbering_system,
         style,
         currency,
+        minimum_integer_digits: min_int.map_or(1u8, |v| v as u8),
         minimum_fraction_digits,
         maximum_fraction_digits,
+        minimum_significant_digits,
+        maximum_significant_digits,
         use_grouping,
         sign_display,
         notation,
@@ -908,15 +927,43 @@ pub(crate) fn number_format_resolved_options(
     crate::object::set(
         &mut obj,
         heap,
-        "minimumFractionDigits",
-        Value::number_i32(min_fd),
+        "minimumIntegerDigits",
+        Value::number_i32(i32::from(payload.minimum_integer_digits)),
     );
-    crate::object::set(
-        &mut obj,
-        heap,
-        "maximumFractionDigits",
-        Value::number_i32(max_fd),
-    );
+    // Significant-digit rounding (roundingPriority "auto" with a
+    // significant option present) reports the significant-digit pair and
+    // omits the inert fraction-digit pair, matching the spec's internal
+    // slots.
+    if let (Some(mn), Some(mx)) = (
+        payload.minimum_significant_digits,
+        payload.maximum_significant_digits,
+    ) {
+        crate::object::set(
+            &mut obj,
+            heap,
+            "minimumSignificantDigits",
+            Value::number_i32(i32::from(mn)),
+        );
+        crate::object::set(
+            &mut obj,
+            heap,
+            "maximumSignificantDigits",
+            Value::number_i32(i32::from(mx)),
+        );
+    } else {
+        crate::object::set(
+            &mut obj,
+            heap,
+            "minimumFractionDigits",
+            Value::number_i32(min_fd),
+        );
+        crate::object::set(
+            &mut obj,
+            heap,
+            "maximumFractionDigits",
+            Value::number_i32(max_fd),
+        );
+    }
     crate::object::set(&mut obj, heap, "useGrouping", Value::boolean(use_grouping));
     crate::object::set(&mut obj, heap, "notation", notation);
     crate::object::set(&mut obj, heap, "signDisplay", sign_display);
@@ -1199,17 +1246,132 @@ fn format_decimal(n: f64, payload: &NumberFormatPayload) -> String {
     // start with `minimumFractionDigits`, round to
     // `maximumFractionDigits`, and trim any trailing zeros above
     // the minimum so `1234567` doesn't surface as `1,234,567.000`.
-    let max = payload.maximum_fraction_digits as usize;
-    let formatted = format!("{:.max$}", n.abs(), max = max);
-    let trimmed = trim_trailing_zero_fraction(&formatted, payload.minimum_fraction_digits as usize);
+    let trimmed = if let Some(max_sig) = payload.maximum_significant_digits {
+        format_significant(
+            n.abs(),
+            max_sig,
+            payload.minimum_significant_digits.unwrap_or(1),
+        )
+    } else {
+        let max = payload.maximum_fraction_digits as usize;
+        let formatted = format!("{:.max$}", n.abs(), max = max);
+        trim_trailing_zero_fraction(&formatted, payload.minimum_fraction_digits as usize)
+    };
     let mut decimal = match Decimal::from_str(&trimmed) {
         Ok(d) => d,
         Err(_) => return rust_fallback_format(n, payload),
     };
-    decimal.pad_end(-(payload.minimum_fraction_digits as i16));
+    if payload.maximum_significant_digits.is_none() {
+        decimal.pad_end(-(payload.minimum_fraction_digits as i16));
+    }
+    if payload.minimum_integer_digits > 1 {
+        decimal.pad_start(payload.minimum_integer_digits as i16);
+    }
     let mut out = String::new();
     let _ = writeable::Writeable::write_to(&formatter.format(&decimal), &mut out);
     out
+}
+
+/// Render `abs` rounded to `max_sig` significant digits, then trim
+/// trailing fractional zeros down to `min_sig` significant digits
+/// (ECMA-402 significant-digit rounding, roundingMode `halfExpand` —
+/// Rust's `{:e}` rounds half-to-even; the divergence is confined to
+/// exact-tie mantissas).
+fn format_significant(abs: f64, max_sig: u8, min_sig: u8) -> String {
+    if abs == 0.0 {
+        let mut s = String::from("0");
+        if min_sig > 1 {
+            s.push('.');
+            for _ in 1..min_sig {
+                s.push('0');
+            }
+        }
+        return s;
+    }
+    // Start from the shortest round-trip representation (`{:e}` with no
+    // precision) so a double like 1.2 stays "12", not its binary
+    // expansion; re-render at fixed precision only when the shortest form
+    // carries more significant digits than allowed.
+    let shortest = format!("{:e}", abs);
+    let shortest_sig = shortest
+        .split('e')
+        .next()
+        .map_or(0, |m| m.chars().filter(char::is_ascii_digit).count());
+    let sci = if shortest_sig > max_sig as usize {
+        // `{:.P$e}` renders `d.ddd…e±E` with P fractional mantissa digits —
+        // exactly `P + 1` significant digits.
+        format!("{:.*e}", (max_sig - 1) as usize, abs)
+    } else {
+        shortest
+    };
+    let (mantissa, exp) = sci
+        .split_once('e')
+        .expect("{:e} always contains an exponent");
+    let exp: i32 = exp.parse().expect("{:e} exponent parses");
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    // Assemble the plain decimal string for digits × 10^(exp - (len-1)).
+    let len = digits.len() as i32;
+    let point = exp + 1; // digits before the decimal point
+    let mut s = if point <= 0 {
+        let mut out = String::from("0.");
+        for _ in 0..-point {
+            out.push('0');
+        }
+        out.push_str(&digits);
+        out
+    } else if point >= len {
+        let mut out = digits.clone();
+        for _ in 0..(point - len) {
+            out.push('0');
+        }
+        out
+    } else {
+        let (int_part, frac_part) = digits.split_at(point as usize);
+        format!("{int_part}.{frac_part}")
+    };
+    // Trim trailing fractional zeros beyond `min_sig` significant digits.
+    if s.contains('.') {
+        let min_sig = min_sig as usize;
+        loop {
+            let sig_count =
+                s.chars().filter(|c| c.is_ascii_digit()).count() - leading_insignificant_zeros(&s);
+            if !s.ends_with('0') || sig_count <= min_sig {
+                break;
+            }
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    // Pad with trailing zeros up to `min_sig` significant digits.
+    let mut sig_count =
+        s.chars().filter(|c| c.is_ascii_digit()).count() - leading_insignificant_zeros(&s);
+    if sig_count < min_sig as usize {
+        if !s.contains('.') {
+            s.push('.');
+        }
+        while sig_count < min_sig as usize {
+            s.push('0');
+            sig_count += 1;
+        }
+    }
+    s
+}
+
+/// Count leading zeros that are not significant (`0.00123` -> 3: the
+/// integer `0` and the two fraction zeros before the first non-zero).
+fn leading_insignificant_zeros(s: &str) -> usize {
+    let mut count = 0;
+    for c in s.chars() {
+        match c {
+            '0' => count += 1,
+            '.' => {}
+            _ => return count,
+        }
+    }
+    // All-zero string: every digit but one is insignificant.
+    count.saturating_sub(1)
 }
 
 /// Trim trailing fractional zeros above `min_frac` digits.
@@ -1231,19 +1393,33 @@ fn trim_trailing_zero_fraction(s: &str, min_frac: usize) -> String {
 /// Last-resort formatter when ICU rejects the locale: plain Rust
 /// `format!` with manual grouping.
 fn rust_fallback_format(n: f64, payload: &NumberFormatPayload) -> String {
-    let max = payload.maximum_fraction_digits as usize;
-    let mut s = format!("{:.max$}", n.abs(), max = max);
-    // Trim trailing zeros down to `minimumFractionDigits`.
-    if max > payload.minimum_fraction_digits as usize
-        && let Some(dot) = s.find('.')
-    {
-        let allowed_min = dot + 1 + payload.minimum_fraction_digits as usize;
-        while s.len() > allowed_min && s.ends_with('0') {
-            s.pop();
+    let mut s = if let Some(max_sig) = payload.maximum_significant_digits {
+        format_significant(
+            n.abs(),
+            max_sig,
+            payload.minimum_significant_digits.unwrap_or(1),
+        )
+    } else {
+        let max = payload.maximum_fraction_digits as usize;
+        let mut s = format!("{:.max$}", n.abs(), max = max);
+        // Trim trailing zeros down to `minimumFractionDigits`.
+        if max > payload.minimum_fraction_digits as usize
+            && let Some(dot) = s.find('.')
+        {
+            let allowed_min = dot + 1 + payload.minimum_fraction_digits as usize;
+            while s.len() > allowed_min && s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
         }
-        if s.ends_with('.') {
-            s.pop();
-        }
+        s
+    };
+    let int_len = s.split('.').next().map_or(0, str::len);
+    if int_len < payload.minimum_integer_digits as usize {
+        let pad = payload.minimum_integer_digits as usize - int_len;
+        s = format!("{}{}", "0".repeat(pad), s);
     }
     if payload.use_grouping {
         s = group_thousands(&s);

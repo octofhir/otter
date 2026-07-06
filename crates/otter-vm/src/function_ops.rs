@@ -85,7 +85,25 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
-        write_register(frame, dst, Value::function(function_id))?;
+        // §10.2 OrdinaryFunctionCreate — every evaluation of a function
+        // literal produces a DISTINCT function object. A shared interned
+        // `Value::function(fid)` would collapse identity across siblings
+        // minted from the same source template: `Class.create() !==
+        // Class.create()`, and every sibling would share one
+        // `.prototype` / expando bag (prototype.js-style class factories
+        // break). Capture-free functions therefore still allocate a
+        // per-instance closure body with an empty upvalue spine.
+        let closure = crate::closure::alloc_closure(
+            &mut self.gc_heap,
+            function_id,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(crate::oom_to_vm)?;
+        write_register(frame, dst, Value::closure(closure))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }

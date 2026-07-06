@@ -1363,11 +1363,15 @@ fn regexp_string_iterator_proto_next(
 /// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.return>
 fn iterator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    _args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    // §27.1.5.1.3 / §27.1.3.2.2 — `return(value)` ignores its
+    // argument. Generator prototypes have their own `return(value)`
+    // path; built-in iterator helpers and wrapped valid iterators
+    // close with an empty completion.
+    let arg = Value::undefined();
     let iter_value = Value::iterator(handle);
     // §27.1.2.1.2 — `return` on a helper forwards IteratorClose to the
     // underlying iterator chain (helper sources, user `return`
@@ -1423,19 +1427,14 @@ fn iterator_proto_return(
                 &exec_ctx,
                 &return_method,
                 target,
-                smallvec::smallvec![arg],
+                smallvec::SmallVec::new(),
             );
             let result = result.map_err(|e| {
                 crate::native_function::vm_to_native_error(interp, e, "Iterator.prototype.return")
             })?;
-            ctx.cx
-                .interp
-                .gc_heap_for_cx_mut()
-                .with_payload(handle, |state| {
-                    state.exhaust();
-                });
             return Ok(result);
         }
+        return create_iterator_return_result(ctx, iter_value, arg);
     } else if !receiver_is_async_generator {
         let exec_ctx =
             ctx.execution_context()
@@ -1462,8 +1461,16 @@ fn iterator_proto_return(
         .with_payload(handle, |state| {
             state.exhaust();
         });
+    create_iterator_return_result(ctx, iter_value, arg)
+}
+
+fn create_iterator_return_result(
+    ctx: &mut crate::NativeCtx<'_>,
+    iter_value: Value,
+    value: Value,
+) -> Result<Value, crate::NativeError> {
     let obj = ctx
-        .alloc_object_with_roots(&[&iter_value, &arg], &[])
+        .alloc_object_with_roots(&[&iter_value, &value], &[])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.return",
             reason: "result allocation failed".to_string(),
@@ -1473,7 +1480,7 @@ fn iterator_proto_return(
     if let Some(object_proto) = ctx.cx.interp.object_prototype_object_opt() {
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(object_proto));
     }
-    let set_value = ctx.set_property(obj, "value", arg);
+    let set_value = ctx.set_property(obj, "value", value);
     set_value.map_err(|e| {
         crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.return")
     })?;
@@ -1639,20 +1646,9 @@ fn iterator_from_native(
     if iter_value.is_iterator() {
         return Ok(iter_value);
     }
-    // §27.1.4.1 step 2-3 — values already inheriting
-    // `%Iterator.prototype%` (generators, custom Iterator
-    // subclasses, built-in iterator objects) pass through unwrapped.
-    let global = *interp.global_this();
-    let iterator_ctor =
-        crate::object::get(global, interp.gc_heap(), "Iterator").unwrap_or(Value::undefined());
-    let is_iterator_instance = interp.ordinary_has_instance(&exec_ctx, &iterator_ctor, &iter_value);
-    let is_iterator_instance = is_iterator_instance
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?;
-    if is_iterator_instance {
-        return Ok(iter_value);
-    }
-    // §7.4.4 GetIteratorDirect — `next` is read once here, not per
-    // step.
+    // §7.4.4 GetIteratorDirect — `next` is read once here, before
+    // the `%Iterator%` instance check below. Even values that pass
+    // through unwrapped must observe this `[[Get]]`.
     let next_key = crate::VmPropertyKey::String("next");
     let next_outcome = interp.ordinary_get_value(&exec_ctx, iter_value, iter_value, &next_key, 0);
     let next_outcome = next_outcome
@@ -1667,6 +1663,18 @@ fn iterator_from_native(
             })?
         }
     };
+    // §27.1.4.1 step 2-3 — values already inheriting
+    // `%Iterator.prototype%` (generators, custom Iterator
+    // subclasses, built-in iterator objects) pass through unwrapped.
+    let global = *interp.global_this();
+    let iterator_ctor =
+        crate::object::get(global, interp.gc_heap(), "Iterator").unwrap_or(Value::undefined());
+    let is_iterator_instance = interp.ordinary_has_instance(&exec_ctx, &iterator_ctor, &iter_value);
+    let is_iterator_instance = is_iterator_instance
+        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?;
+    if is_iterator_instance {
+        return Ok(iter_value);
+    }
     let state = crate::IteratorState::User {
         iterator: iter_value,
         next_method: Some(next_method),

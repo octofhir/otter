@@ -166,6 +166,7 @@ impl Interpreter {
             symbol_registry: SymbolRegistry::new(),
             error_classes,
             global_this,
+            extra_realms: Vec::new(),
             eval_hook: None,
             pending_generator_throw: None,
             pending_uncaught_throw: None,
@@ -235,6 +236,368 @@ impl Interpreter {
         interp.install_function_kind_prototypes_post_bootstrap();
         interp.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
         interp
+    }
+
+    fn swap_active_realm_state(&mut self, state: &mut RealmState) {
+        std::mem::swap(&mut self.global_this, &mut state.global_this);
+        std::mem::swap(&mut self.error_classes, &mut state.error_classes);
+        std::mem::swap(&mut self.realm_intrinsics, &mut state.realm_intrinsics);
+        std::mem::swap(
+            &mut self.array_iterator_prototype,
+            &mut state.array_iterator_prototype,
+        );
+        std::mem::swap(
+            &mut self.map_iterator_prototype,
+            &mut state.map_iterator_prototype,
+        );
+        std::mem::swap(
+            &mut self.set_iterator_prototype,
+            &mut state.set_iterator_prototype,
+        );
+        std::mem::swap(
+            &mut self.string_iterator_prototype,
+            &mut state.string_iterator_prototype,
+        );
+        std::mem::swap(
+            &mut self.regexp_string_iterator_prototype,
+            &mut state.regexp_string_iterator_prototype,
+        );
+        std::mem::swap(
+            &mut self.iterator_helper_prototype,
+            &mut state.iterator_helper_prototype,
+        );
+        std::mem::swap(
+            &mut self.wrap_for_valid_iterator_prototype,
+            &mut state.wrap_for_valid_iterator_prototype,
+        );
+    }
+
+    fn build_realm_state(&mut self) -> Result<RealmState, VmError> {
+        let error_classes = ErrorClassRegistry::new(&mut self.gc_heap).map_err(crate::oom_to_vm)?;
+        let global_this = bootstrap::build_global_this(&mut self.gc_heap, &self.well_known_symbols)
+            .map_err(|err| {
+                self.err_type((format!("createRealm bootstrap failed: {err}")).into())
+            })?;
+        crate::intrinsics::symbol::install_symbol_well_knowns_post_bootstrap(
+            &mut self.gc_heap,
+            global_this,
+            &self.well_known_symbols,
+        )
+        .map_err(|err| {
+            self.err_type((format!("createRealm Symbol bootstrap failed: {err}")).into())
+        })?;
+        let function_prototype = resolve_ctor_prototype(&mut self.gc_heap, global_this, "Function");
+        if let Some(function_prototype) = function_prototype {
+            let has_instance = self
+                .well_known_symbols
+                .get(crate::symbol::WellKnown::HasInstance);
+            let global_root = Value::object(global_this);
+            function_prototype::install_symbol_has_instance(
+                &mut self.gc_heap,
+                function_prototype,
+                has_instance,
+                &[&global_root],
+            )
+            .map_err(|err| {
+                self.err_type((format!("createRealm Function bootstrap failed: {err}")).into())
+            })?;
+            if let Some(object_prototype) =
+                resolve_ctor_prototype(&mut self.gc_heap, global_this, "Object")
+            {
+                error_classes.finalize_after_bootstrap(
+                    &mut self.gc_heap,
+                    function_prototype,
+                    object_prototype,
+                    global_this,
+                );
+            }
+        }
+        let mut realm_intrinsics = realm_intrinsics::RealmIntrinsics::default();
+        realm_intrinsics.populate(&mut self.gc_heap, global_this);
+        let mut state = RealmState {
+            global_this,
+            error_classes,
+            realm_intrinsics,
+            array_iterator_prototype: None,
+            map_iterator_prototype: None,
+            set_iterator_prototype: None,
+            string_iterator_prototype: None,
+            regexp_string_iterator_prototype: None,
+            iterator_helper_prototype: None,
+            wrap_for_valid_iterator_prototype: None,
+        };
+        if let Some(iter_proto) = object::get(global_this, &self.gc_heap, "Iterator")
+            .and_then(|ctor| {
+                if let Some(obj) = ctor.as_object() {
+                    object::get(obj, &self.gc_heap, "prototype")
+                } else if let Some(native) = ctor.as_native_function() {
+                    native
+                        .own_property_descriptor(&mut self.gc_heap, "prototype")
+                        .ok()
+                        .flatten()
+                        .map(|desc| match desc.kind {
+                            object::DescriptorKind::Data { value } => value,
+                            object::DescriptorKind::Accessor { .. } => Value::undefined(),
+                        })
+                } else {
+                    None
+                }
+            })
+            .and_then(|value| value.as_object())
+        {
+            let shape_root = self.shape_runtime.root();
+            let protos =
+                crate::intrinsics::iterator::build_builtin_iterator_prototypes_post_bootstrap(
+                    &mut self.gc_heap,
+                    shape_root,
+                    iter_proto,
+                    &self.well_known_symbols,
+                )
+                .map_err(|err| {
+                    self.err_type((format!("createRealm Iterator bootstrap failed: {err}")).into())
+                })?;
+            state.array_iterator_prototype = Some(protos.array);
+            state.map_iterator_prototype = Some(protos.map);
+            state.set_iterator_prototype = Some(protos.set);
+            state.string_iterator_prototype = Some(protos.string);
+            state.regexp_string_iterator_prototype = Some(protos.regexp_string);
+            state.iterator_helper_prototype = Some(protos.helper);
+            state.wrap_for_valid_iterator_prototype = Some(protos.wrap_for_valid_iterator);
+        }
+        self.tag_array_realm_natives(global_this);
+        self.tag_iterator_realm_natives(global_this);
+        Ok(state)
+    }
+
+    fn tag_native_value_realm(&mut self, value: Value, global: JsObject) {
+        if let Some(native) = value.as_native_function() {
+            native.set_realm_global(&mut self.gc_heap, Some(global));
+        } else if let Some(class) = value.as_class_constructor() {
+            self.tag_native_value_realm(class.ctor(&self.gc_heap), global);
+        } else if let Some(obj) = value.as_object()
+            && let Some(native) =
+                object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
+        {
+            native.set_realm_global(&mut self.gc_heap, Some(global));
+        }
+    }
+
+    fn native_data_property(&mut self, native: crate::NativeFunction, name: &str) -> Option<Value> {
+        native
+            .own_property_descriptor(&mut self.gc_heap, name)
+            .ok()
+            .flatten()
+            .and_then(|desc| match desc.kind {
+                object::DescriptorKind::Data { value } => Some(value),
+                object::DescriptorKind::Accessor { .. } => None,
+            })
+    }
+
+    pub(crate) fn iterator_prototype_override_for_state(
+        &self,
+        state: &IteratorState,
+    ) -> Option<Value> {
+        state
+            .builtin_origin()
+            .and_then(|origin| self.builtin_iterator_prototype_for(origin))
+            .map(Value::object)
+    }
+
+    pub(crate) fn register_iterator_prototype_override(
+        &mut self,
+        handle: IteratorHandle,
+        prototype: Option<Value>,
+    ) {
+        // Record the override only when it differs from the ACTIVE realm's
+        // default for this iterator kind — i.e. only for iterators minted
+        // while a non-default realm is active. Same-realm iterators (the
+        // overwhelming majority: every for-of / spread / apply drain mints
+        // one) resolve through the realm's builtin prototype cache anyway,
+        // and unconditionally inserting them into
+        // `non_gc_exotic_prototype_overrides` grew a GC-traced map by one
+        // entry per iterator ever created: entries never die (the key is a
+        // reusable header address), every scavenge re-traced the whole map,
+        // and v8-v7 raytrace degraded ~200x.
+        let default_prototype = self
+            .gc_heap
+            .read_payload(handle, |state| state.builtin_origin())
+            .and_then(|origin| self.builtin_iterator_prototype_for(origin))
+            .map(Value::object);
+        let same = match (&prototype, &default_prototype) {
+            (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        self.set_non_gc_exotic_prototype_override(&Value::iterator(handle), prototype);
+    }
+
+    pub(crate) fn current_array_prototype_override(&self) -> Option<Value> {
+        self.realm_intrinsics.array_prototype.map(Value::object)
+    }
+
+    pub(crate) fn register_array_prototype_override(&mut self, array: crate::array::JsArray) {
+        let prototype = self.current_array_prototype_override();
+        crate::array::set_prototype_override(array, &mut self.gc_heap, prototype);
+    }
+
+    fn tag_iterator_realm_natives(&mut self, global: JsObject) {
+        let Some(iterator_value) = object::get(global, &self.gc_heap, "Iterator") else {
+            return;
+        };
+        self.tag_native_value_realm(iterator_value, global);
+        let prototype = if let Some(native) = iterator_value.as_native_function() {
+            self.native_data_property(native, "prototype")
+        } else if let Some(class) = iterator_value.as_class_constructor() {
+            Some(Value::object(class.prototype(&self.gc_heap)))
+        } else if let Some(obj) = iterator_value.as_object() {
+            object::get(obj, &self.gc_heap, "prototype")
+        } else {
+            None
+        };
+        if let Some(native) = iterator_value.as_native_function()
+            && let Some(from) = self.native_data_property(native, "from")
+        {
+            self.tag_native_value_realm(from, global);
+        } else if let Some(class) = iterator_value.as_class_constructor() {
+            let statics = class.statics(&self.gc_heap);
+            if let Some(from) = object::get(statics, &self.gc_heap, "from") {
+                self.tag_native_value_realm(from, global);
+            }
+        } else if let Some(obj) = iterator_value.as_object()
+            && let Some(from) = object::get(obj, &self.gc_heap, "from")
+        {
+            self.tag_native_value_realm(from, global);
+        }
+        let Some(prototype) = prototype.and_then(|value| value.as_object()) else {
+            return;
+        };
+        for name in [
+            "next", "return", "throw", "map", "filter", "take", "drop", "flatMap", "toArray",
+            "forEach", "reduce", "some", "every", "find",
+        ] {
+            if let Some(value) = object::get(prototype, &self.gc_heap, name) {
+                self.tag_native_value_realm(value, global);
+            }
+        }
+    }
+
+    fn tag_array_realm_natives(&mut self, global: JsObject) {
+        let Some(array_value) = object::get(global, &self.gc_heap, "Array") else {
+            return;
+        };
+        self.tag_native_value_realm(array_value, global);
+        let prototype = if let Some(native) = array_value.as_native_function() {
+            for name in ["isArray", "of", "from", "fromAsync"] {
+                if let Some(value) = self.native_data_property(native, name) {
+                    self.tag_native_value_realm(value, global);
+                }
+            }
+            self.native_data_property(native, "prototype")
+        } else if let Some(obj) = array_value.as_object() {
+            for name in ["isArray", "of", "from", "fromAsync"] {
+                if let Some(value) = object::get(obj, &self.gc_heap, name) {
+                    self.tag_native_value_realm(value, global);
+                }
+            }
+            object::get(obj, &self.gc_heap, "prototype")
+        } else {
+            None
+        };
+        let Some(prototype) = prototype.and_then(|value| value.as_object()) else {
+            return;
+        };
+        for name in [
+            "push",
+            "pop",
+            "shift",
+            "unshift",
+            "slice",
+            "concat",
+            "join",
+            "includes",
+            "indexOf",
+            "lastIndexOf",
+            "at",
+            "reverse",
+            "fill",
+            "flat",
+            "splice",
+            "sort",
+            "toString",
+            "copyWithin",
+            "toReversed",
+            "toSpliced",
+            "toSorted",
+            "with",
+            "toLocaleString",
+            "keys",
+            "values",
+            "entries",
+            "forEach",
+            "map",
+            "filter",
+            "some",
+            "every",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "reduce",
+            "reduceRight",
+            "flatMap",
+        ] {
+            if let Some(value) = object::get(prototype, &self.gc_heap, name) {
+                self.tag_native_value_realm(value, global);
+            }
+        }
+    }
+
+    /// Create an additional realm global object inside this interpreter.
+    pub fn create_host_realm_global(&mut self) -> Result<JsObject, VmError> {
+        let state = self.build_realm_state()?;
+        let global = state.global_this;
+        self.extra_realms.push(state);
+        Ok(global)
+    }
+
+    /// Run `body` with the realm identified by `global` as the active realm.
+    pub fn with_host_realm_global<R>(
+        &mut self,
+        global: JsObject,
+        body: impl FnOnce(&mut Self) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        if self.global_this == global {
+            return body(self);
+        }
+        let Some(index) = self
+            .extra_realms
+            .iter()
+            .position(|realm| realm.global_this == global)
+        else {
+            return Err(self.err_type(("unknown host realm global".to_string()).into()));
+        };
+        let mut realm = self.extra_realms.remove(index);
+        self.swap_active_realm_state(&mut realm);
+        let depth = self
+            .gc_heap
+            .push_extra_roots(otter_gc::ExtraRoots::new(&realm));
+        let result = body(self);
+        self.gc_heap.pop_extra_roots_to(depth - 1);
+        self.swap_active_realm_state(&mut realm);
+        self.extra_realms.insert(index, realm);
+        result
+    }
+
+    /// Execute a host script in the realm identified by `global`.
+    pub fn run_host_script_in_realm_global(
+        &mut self,
+        global: JsObject,
+        source: &Value,
+    ) -> Result<Value, VmError> {
+        self.with_host_realm_global(global, |interp| interp.run_host_script(source))
     }
 
     /// Look up `%<Kind>IteratorPrototype%` by origin.

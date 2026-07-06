@@ -245,6 +245,9 @@ pub struct NativeFunctionBody {
     /// at bootstrap. Stored as a [`Value`] so the override can itself
     /// be a callable (a NativeFunction such as `%TypedArray%`).
     prototype_override: Option<Value>,
+    /// Realm global associated with this native function. `None`
+    /// means the default active interpreter realm.
+    realm_global: Option<JsObject>,
 }
 
 pub(crate) const NATIVE_FUNCTION_BODY_JIT_STATIC_FN_OFFSET: usize =
@@ -340,6 +343,7 @@ impl NativeFunction {
                     own_properties,
                     extensible: metadata.extensible,
                     prototype_override: None,
+                    realm_global: None,
                 },
                 &mut visit,
             )?,
@@ -358,6 +362,24 @@ impl NativeFunction {
         if success && let Some(p) = proto_clone {
             heap.record_write(self.inner, &p);
         }
+    }
+
+    /// Set the native function's associated realm global.
+    pub fn set_realm_global(&self, heap: &mut otter_gc::GcHeap, global: Option<JsObject>) {
+        let global_clone = global;
+        let success = heap.with_payload(self.inner, |body| {
+            body.realm_global = global;
+            true
+        });
+        if success && let Some(global) = global_clone {
+            heap.record_write(self.inner, &global);
+        }
+    }
+
+    /// Associated realm global, if this native belongs to a non-default realm.
+    #[must_use]
+    pub fn realm_global(&self, heap: &otter_gc::GcHeap) -> Option<JsObject> {
+        heap.read_payload(self.inner, |body| body.realm_global)
     }
 
     /// Current `[[Prototype]]` override, if set.

@@ -87,6 +87,9 @@ impl<'a> RuntimeState<'a> {
         interp.global_this().trace_gc_roots(visitor);
         // 1b) Cached realm intrinsic prototypes.
         interp.realm_intrinsics().trace_roots(visitor);
+        for realm in interp.extra_realms_for_trace() {
+            realm.trace_roots(visitor);
+        }
         // 2) Module environments.
         for env in interp.module_environments_for_trace() {
             env.trace_gc_roots(visitor);

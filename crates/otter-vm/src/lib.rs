@@ -231,6 +231,55 @@ pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 // Eight-byte tagged value. Canonical `Value` export.
 pub use value::{Value, ValueKind};
 
+/// Active-realm state that must switch together for cross-realm calls.
+///
+/// This keeps the first real realm slice compact: the global object, error
+/// constructors, and intrinsic prototype caches whose identity is observable
+/// through Test262 cross-realm checks.
+#[derive(Clone)]
+pub(crate) struct RealmState {
+    pub(crate) global_this: JsObject,
+    pub(crate) error_classes: ErrorClassRegistry,
+    pub(crate) realm_intrinsics: realm_intrinsics::RealmIntrinsics,
+    pub(crate) array_iterator_prototype: Option<JsObject>,
+    pub(crate) map_iterator_prototype: Option<JsObject>,
+    pub(crate) set_iterator_prototype: Option<JsObject>,
+    pub(crate) string_iterator_prototype: Option<JsObject>,
+    pub(crate) regexp_string_iterator_prototype: Option<JsObject>,
+    pub(crate) iterator_helper_prototype: Option<JsObject>,
+    pub(crate) wrap_for_valid_iterator_prototype: Option<JsObject>,
+}
+
+impl RealmState {
+    pub(crate) fn trace_roots(&self, visitor: &mut gc_trace::GcRootVisitor<'_>) {
+        use crate::gc_trace::GcTrace;
+
+        self.global_this.trace_gc_roots(visitor);
+        self.error_classes.trace_gc_roots(visitor);
+        self.realm_intrinsics.trace_roots(visitor);
+        for object in [
+            &self.array_iterator_prototype,
+            &self.map_iterator_prototype,
+            &self.set_iterator_prototype,
+            &self.string_iterator_prototype,
+            &self.regexp_string_iterator_prototype,
+            &self.iterator_helper_prototype,
+            &self.wrap_for_valid_iterator_prototype,
+        ]
+        .into_iter()
+        .filter_map(Option::as_ref)
+        {
+            object.trace_gc_roots(visitor);
+        }
+    }
+}
+
+impl otter_gc::ExtraRootSource for RealmState {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        self.trace_roots(visitor);
+    }
+}
+
 pub(crate) use bound_function::BoundFunctionMetadataProperty;
 pub use bound_function::{BOUND_FUNCTION_BODY_TYPE_TAG, BoundFunction, BoundFunctionBody};
 pub use class_constructor::{
@@ -997,6 +1046,10 @@ pub struct Interpreter {
     /// observe the standard shape.
     /// <https://tc39.es/ecma262/#sec-globalthis>
     global_this: JsObject,
+    /// Additional realm states created by host shells such as
+    /// `$262.createRealm`. The first/default realm lives in the
+    /// top-level interpreter fields for hot-path compatibility.
+    extra_realms: Vec<RealmState>,
     /// Optional embedder hook for `Op::Eval` / `Op::NewFunction`.
     /// Wired by the runtime layer at construction time to parse +
     /// compile a source string into a fresh [`BytecodeModule`].

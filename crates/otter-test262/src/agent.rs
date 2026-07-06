@@ -141,6 +141,7 @@ pub fn install_natives(runtime: &mut Runtime) -> Result<(), OtterError> {
 const NATIVES: &[(&str, u8, NativeFastFn)] = &[
     ("__otter_is_htmldda", 0, is_html_dda),
     ("__otter_eval_script", 1, eval_script),
+    ("__otter_create_realm", 0, create_realm),
     ("__otter_agent_start", 1, agent_start),
     ("__otter_agent_broadcast", 2, agent_broadcast),
     ("__otter_agent_get_report", 0, agent_get_report),
@@ -170,12 +171,11 @@ fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
     Ok(Value::null())
 }
 
-/// `$262.evalScript(source)` — INTERPRETING.md host API: parse
-/// `source` as an ECMAScript Script and run it in the current realm
-/// with §16.1.7 GlobalDeclarationInstantiation semantics.
-fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
-    let result = ctx.interp_mut().run_host_script(&arg);
+fn map_eval_script_result(
+    ctx: &mut NativeCtx<'_>,
+    result: Result<Value, otter_vm::VmError>,
+    name: &'static str,
+) -> Result<Value, NativeError> {
     let detail = ctx.interp_mut().take_error_detail();
     let detail_msg = match &detail {
         Some(otter_vm::ErrorDetail::Message(m))
@@ -185,7 +185,7 @@ fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     };
     result.map_err(|err| match err {
         otter_vm::VmError::SyntaxError => NativeError::SyntaxError {
-            name: "evalScript",
+            name,
             reason: detail_msg,
         },
         // An uncaught throw from the script body arrives rendered
@@ -208,29 +208,121 @@ fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
                 .map(|(_, tail)| tail.to_string())
                 .unwrap_or(render.clone());
             match class_mapped {
-                Some(0) => NativeError::SyntaxError {
-                    name: "evalScript",
-                    reason,
-                },
-                Some(2) => NativeError::ReferenceError {
-                    name: "evalScript",
-                    reason,
-                },
-                Some(3) => NativeError::RangeError {
-                    name: "evalScript",
-                    reason,
-                },
+                Some(0) => NativeError::SyntaxError { name, reason },
+                Some(2) => NativeError::ReferenceError { name, reason },
+                Some(3) => NativeError::RangeError { name, reason },
                 _ => NativeError::TypeError {
-                    name: "evalScript",
+                    name,
                     reason: render,
                 },
             }
         }
         err => NativeError::TypeError {
-            name: "evalScript",
+            name,
             reason: err.to_string(),
         },
     })
+}
+
+/// `$262.evalScript(source)` — INTERPRETING.md host API: parse
+/// `source` as an ECMAScript Script and run it in the current realm
+/// with §16.1.7 GlobalDeclarationInstantiation semantics.
+fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let result = ctx.interp_mut().run_host_script(&arg);
+    map_eval_script_result(ctx, result, "evalScript")
+}
+
+fn realm_eval_script(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    captures: &[Value],
+) -> Result<Value, NativeError> {
+    run_realm_script_capture(ctx, args, captures, "evalScript")
+}
+
+fn realm_global_eval(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    captures: &[Value],
+) -> Result<Value, NativeError> {
+    run_realm_script_capture(ctx, args, captures, "eval")
+}
+
+fn run_realm_script_capture(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    captures: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let Some(global) = captures.first().and_then(|value| value.as_object()) else {
+        return Err(type_err("realm eval lost its global"));
+    };
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let result = ctx
+        .interp_mut()
+        .run_host_script_in_realm_global(global, &arg);
+    map_eval_script_result(ctx, result, name)
+}
+
+fn create_realm(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let global =
+        ctx.interp_mut()
+            .create_host_realm_global()
+            .map_err(|err| NativeError::TypeError {
+                name: "$262.createRealm",
+                reason: err.to_string(),
+            })?;
+    let global_value = Value::object(global);
+    let realm_obj = ctx
+        .alloc_object_with_roots(&[&global_value], &[])
+        .map_err(|_| NativeError::TypeError {
+            name: "$262.createRealm",
+            reason: "realm object allocation failed".to_string(),
+        })?;
+    let eval_value = ctx
+        .native_value_with_captures(
+            "$262.createRealm.evalScript",
+            smallvec::smallvec![global_value],
+            &[&global_value],
+            &[],
+            realm_eval_script,
+        )
+        .map_err(|_| NativeError::TypeError {
+            name: "$262.createRealm",
+            reason: "evalScript allocation failed".to_string(),
+        })?;
+    let global_eval_value = ctx
+        .native_value_with_captures(
+            "$262.createRealm.global.eval",
+            smallvec::smallvec![global_value],
+            &[&global_value, &eval_value],
+            &[],
+            realm_global_eval,
+        )
+        .map_err(|_| NativeError::TypeError {
+            name: "$262.createRealm",
+            reason: "global eval allocation failed".to_string(),
+        })?;
+    otter_vm::object::define_own_property(
+        realm_obj,
+        ctx.heap_mut(),
+        "global",
+        otter_vm::object::PropertyDescriptor::data(global_value, true, true, true),
+    );
+    otter_vm::object::define_own_property(
+        realm_obj,
+        ctx.heap_mut(),
+        "evalScript",
+        otter_vm::object::PropertyDescriptor::data(eval_value, true, true, true),
+    );
+    otter_vm::object::define_own_property(
+        global,
+        ctx.heap_mut(),
+        "eval",
+        otter_vm::object::PropertyDescriptor::data(global_eval_value, true, false, true),
+    );
+    Ok(Value::object(realm_obj))
 }
 
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {

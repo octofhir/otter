@@ -13,16 +13,19 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{HashSet, VecDeque};
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::sync::Arc;
+use std::process::{ExitCode, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use otter_test262::config::Test262Config;
 use otter_test262::diff::{self, DiffReport};
@@ -46,8 +49,17 @@ const DEFAULT_MAX_HEAP_BYTES: u64 = 512 * 1024 * 1024;
 /// process-global pointer-compression cage than the VM default before the
 /// first per-test runtime is constructed.
 const TEST262_CAGE_BYTES: usize = 1024 * 1024 * 1024;
-/// How often to flush the cursor file mid-shard.
-const CURSOR_FLUSH_EVERY: u64 = 100;
+/// Default number of tests handled by one worker process before the
+/// process exits and releases all process-local allocator / cage state.
+const PROCESS_CHUNK_SIZE: usize = 40;
+/// Default worker RSS soft ceiling. A worker that crosses this after
+/// recording a test exits successfully; the parent requeues the rest of
+/// the chunk on a fresh process.
+const DEFAULT_WORKER_SOFT_RSS_BYTES: u64 = 1024 * 1024 * 1024;
+/// Default ceiling for parent-side worker processes when `--jobs` is
+/// omitted. Full core-count process fan-out can align several memory-heavy
+/// tests and harm interactivity on developer machines.
+const MAX_PROCESS_WORKERS: usize = 8;
 /// Default location for generated baselines.
 const BASELINE_DIR: &str = "tests/test262-baseline";
 
@@ -73,6 +85,9 @@ struct Cli {
 enum Command {
     /// Run the corpus end-to-end.
     Run(RunArgs),
+    /// Internal process-isolation worker. Not a stable CLI surface.
+    #[command(hide = true)]
+    Worker(WorkerArgs),
     /// Pretty-print a single test's frontmatter.
     Parse(ParseArgs),
     /// Diff a freshly produced report against an earlier baseline.
@@ -144,16 +159,60 @@ struct RunArgs {
     #[arg(long, default_value_t = 0)]
     resume: usize,
 
-    /// Number of in-process worker threads. `0` (default) picks the
-    /// host's logical core count for a single-shard run and `1` for a
-    /// multi-shard run (CI already parallelises across shard
-    /// processes, so per-shard threads would oversubscribe). Each
-    /// worker drives its own isolate; tests exercising `$262.agent` /
-    /// shared memory (feature `Atomics` / `SharedArrayBuffer`) run on
-    /// a single serial pass because the agent registry is
-    /// process-global.
+    /// Number of worker processes. `0` (default) uses a conservative
+    /// fraction of logical cores for a single-shard run and `1` for a
+    /// multi-shard run.
     #[arg(long, default_value_t = 0)]
     jobs: usize,
+
+    /// Tests assigned to one worker-process invocation.
+    /// Smaller chunks make crashes easier to localise; larger chunks
+    /// reduce process-spawn overhead.
+    #[arg(long, default_value_t = PROCESS_CHUNK_SIZE)]
+    process_chunk_size: usize,
+
+    /// Worker resident-memory soft ceiling in bytes. `0` disables.
+    /// Defaults to `OTTER_TEST262_WORKER_SOFT_RSS_BYTES` if set, else
+    /// 1 GiB. When crossed after a test result is flushed, the worker
+    /// exits cleanly and the parent requeues the remaining chunk on a
+    /// fresh process.
+    #[arg(long)]
+    worker_soft_rss_bytes: Option<u64>,
+}
+
+#[derive(Parser, Debug)]
+struct WorkerArgs {
+    /// Absolute test path list shared by the parent.
+    #[arg(long)]
+    paths_file: PathBuf,
+
+    /// JSON-lines result file written by this worker.
+    #[arg(long)]
+    out_file: PathBuf,
+
+    /// First test index, inclusive.
+    #[arg(long)]
+    start: usize,
+
+    /// Last test index, exclusive.
+    #[arg(long)]
+    end: usize,
+
+    /// Per-test wall-clock timeout in milliseconds.
+    #[arg(long)]
+    timeout_ms: u64,
+
+    /// Per-test heap cap in bytes.
+    #[arg(long)]
+    max_heap_bytes: u64,
+
+    /// Optional `test262_config.toml` path.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Worker resident-memory soft ceiling in bytes. `0` disables.
+    #[arg(long, default_value_t = DEFAULT_WORKER_SOFT_RSS_BYTES)]
+    worker_soft_rss_bytes: u64,
 }
 
 #[derive(Parser, Debug)]
@@ -209,6 +268,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         .unwrap_or_else(|| std::env::current_dir().expect("cwd should be readable"));
     match cli.command {
         Command::Run(args) => run(&repo_root, args),
+        Command::Worker(args) => worker(&repo_root, args),
         Command::Parse(args) => parse(args),
         Command::Diff(args) => diff_cmd(&repo_root, args),
         Command::Merge(args) => merge_cmd(args),
@@ -249,6 +309,12 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
             .or(config.max_heap_bytes_per_test)
             .unwrap_or(DEFAULT_MAX_HEAP_BYTES)
     });
+    let worker_soft_rss_bytes = args.worker_soft_rss_bytes.unwrap_or_else(|| {
+        std::env::var("OTTER_TEST262_WORKER_SOFT_RSS_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_WORKER_SOFT_RSS_BYTES)
+    });
     if timeout_ms > MAX_TIMEOUT_MS {
         eprintln!(
             "error: --timeout {timeout_ms} ms exceeds the {MAX_TIMEOUT_MS} ms cap — \
@@ -285,36 +351,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Resolve worker count: explicit `--jobs`, else core count for a
-    // single-shard run (and 1 under sharding to avoid oversubscribing
-    // the CI shard processes).
-    let jobs = if args.jobs > 0 {
-        args.jobs
-    } else if shard.total > 1 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
-    };
-
-    if otter_runtime::otter_gc::cage_size() == 0 {
-        // N concurrent isolates can each grow toward `max_heap_bytes`,
-        // so the shared pointer-compression cage must hold the sum or a
-        // heavy test pair exhausts it (a `CageExhausted`, distinct from
-        // the per-isolate cap). Scale with `jobs`, clamped to the cage
-        // maximum (4 GiB).
-        const MAX_CAGE: u64 = 1u64 << 32;
-        let per_worker = if max_heap_bytes > 0 {
-            max_heap_bytes
-        } else {
-            256 * 1024 * 1024
-        };
-        let want = (jobs as u64).saturating_mul(per_worker);
-        let cage = want.max(TEST262_CAGE_BYTES as u64).min(MAX_CAGE) as usize;
-        otter_runtime::otter_gc::init_cage_with_size(cage)
-            .context("failed to initialise Test262 GC cage")?;
-    }
+    let jobs = resolve_jobs(args.jobs, shard.total as usize);
 
     if args.resume > 0 {
         if args.resume >= tests.len() {
@@ -328,42 +365,147 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         tests = tests.split_off(args.resume);
     }
 
-    execute_in_process(
+    execute_process_isolated(
+        repo_root,
         &paths,
         &tests,
-        &config,
+        args.config.as_deref(),
         timeout_ms,
         max_heap_bytes,
         args.output.as_deref(),
         args.cursor.as_deref(),
         args.resume,
         jobs,
+        args.process_chunk_size.max(1),
+        worker_soft_rss_bytes,
     )
 }
 
+fn resolve_jobs(explicit: usize, shard_total: usize) -> usize {
+    if explicit > 0 {
+        return explicit;
+    }
+    if shard_total > 1 {
+        return 1;
+    }
+    let cores = thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    (cores / 2).max(1).min(MAX_PROCESS_WORKERS)
+}
+
+fn init_test262_cage(jobs: usize, max_heap_bytes: u64) -> Result<()> {
+    if otter_runtime::otter_gc::cage_size() != 0 {
+        return Ok(());
+    }
+    // N concurrent isolates can each grow toward `max_heap_bytes`,
+    // so the shared pointer-compression cage must hold the sum or a
+    // heavy test pair exhausts it (a `CageExhausted`, distinct from
+    // the per-isolate cap). Scale with `jobs`, clamped to the cage
+    // maximum (4 GiB).
+    const MAX_CAGE: u64 = 1u64 << 32;
+    let per_worker = if max_heap_bytes > 0 {
+        max_heap_bytes
+    } else {
+        256 * 1024 * 1024
+    };
+    let want = (jobs as u64).saturating_mul(per_worker);
+    let cage = want.max(TEST262_CAGE_BYTES as u64).min(MAX_CAGE) as usize;
+    otter_runtime::otter_gc::init_cage_with_size(cage)
+        .context("failed to initialise Test262 GC cage")?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerLine {
+    idx: usize,
+    result: TestResult,
+}
+
+struct ProgressState {
+    done: AtomicUsize,
+    completed: Mutex<Vec<bool>>,
+    contiguous: AtomicUsize,
+    cursor: Option<PathBuf>,
+    resume_offset: usize,
+}
+
+impl ProgressState {
+    fn new(len: usize, cursor: Option<&Path>, resume_offset: usize) -> Self {
+        Self {
+            done: AtomicUsize::new(0),
+            completed: Mutex::new(vec![false; len]),
+            contiguous: AtomicUsize::new(0),
+            cursor: cursor.map(Path::to_path_buf),
+            resume_offset,
+        }
+    }
+
+    fn record(&self, idx: usize) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+        let mut completed = self.completed.lock().expect("progress state poisoned");
+        if let Some(done) = completed.get_mut(idx) {
+            *done = true;
+        }
+        let mut next = self.contiguous.load(Ordering::Relaxed);
+        while completed.get(next).copied().unwrap_or(false) {
+            next += 1;
+        }
+        self.contiguous.store(next, Ordering::Relaxed);
+        if let Some(path) = &self.cursor {
+            write_cursor(path, self.resume_offset + next);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn execute_in_process(
+fn execute_process_isolated(
+    repo_root: &Path,
     paths: &CorpusPaths,
     tests: &[PathBuf],
-    config: &Test262Config,
+    config_path: Option<&Path>,
     timeout_ms: u64,
     max_heap_bytes: u64,
     output: Option<&Path>,
     cursor: Option<&Path>,
     resume_offset: usize,
     jobs: usize,
+    chunk_size: usize,
+    worker_soft_rss_bytes: u64,
 ) -> Result<ExitCode> {
-    let mut harness = HarnessCache::new(&paths.harness_dir);
-    if let Err(err) = harness.prewarm() {
-        eprintln!("error: failed to prewarm harness: {err}");
-        return Ok(ExitCode::from(2));
+    let temp = tempfile::Builder::new()
+        .prefix("otter-test262-")
+        .tempdir()
+        .context("failed to create process-isolation temp dir")?;
+    let paths_file = temp.path().join("paths.txt");
+    {
+        let mut out = String::new();
+        for path in tests {
+            out.push_str(&path.display().to_string());
+            out.push('\n');
+        }
+        std::fs::write(&paths_file, out).context("failed to write worker path list")?;
     }
 
-    let exec = ExecConfig {
-        timeout: Duration::from_millis(timeout_ms),
-        max_heap_bytes,
-        config: config.clone(),
-    };
+    let config_path = config_path.map(|path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repo_root.join(path)
+        }
+    });
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let queue: Arc<Mutex<VecDeque<(usize, usize)>>> = Arc::new(Mutex::new(
+        (0..tests.len())
+            .step_by(chunk_size)
+            .map(|lo| (lo, (lo + chunk_size).min(tests.len())))
+            .collect(),
+    ));
+    let slots: Arc<Vec<Mutex<Option<TestResult>>>> =
+        Arc::new((0..tests.len()).map(|_| Mutex::new(None)).collect());
+    let tests = Arc::new(tests.to_vec());
+    let paths = Arc::new(paths.clone());
+    let progress = Arc::new(ProgressState::new(tests.len(), cursor, resume_offset));
 
     let pb = ProgressBar::new(tests.len() as u64);
     pb.set_style(
@@ -372,221 +514,491 @@ fn execute_in_process(
             .expect("progress bar template should compile")
             .progress_chars("#>-"),
     );
-    pb.set_message("starting");
+    pb.set_message("process");
 
-    // Ctrl-C handler — flush a partial baseline so the work isn't
-    // lost. Uses an `AtomicBool` polled at the loop boundary.
     let interrupted = Arc::new(AtomicBool::new(false));
     let _ = ctrlc_install(Arc::clone(&interrupted));
-
     let start = Instant::now();
+    eprintln!(
+        "process isolation: {} tests, {} worker(s), chunk size {}",
+        tests.len(),
+        jobs,
+        chunk_size
+    );
 
-    let results: Vec<TestResult> = if jobs > 1 {
-        run_parallel(paths, tests, &exec, jobs, &pb, &interrupted)
-    } else {
-        run_sequential(
-            paths,
-            tests,
-            &exec,
-            &mut harness,
-            &pb,
-            &interrupted,
-            cursor,
-            resume_offset,
-        )
-    };
+    let handles = (0..jobs)
+        .map(|worker_id| {
+            let queue = Arc::clone(&queue);
+            let slots = Arc::clone(&slots);
+            let tests = Arc::clone(&tests);
+            let paths = Arc::clone(&paths);
+            let progress = Arc::clone(&progress);
+            let interrupted = Arc::clone(&interrupted);
+            let pb = pb.clone();
+            let exe = exe.clone();
+            let repo_root = repo_root.to_path_buf();
+            let paths_file = paths_file.clone();
+            let config_path = config_path.clone();
+            let temp_path = temp.path().to_path_buf();
+            thread::spawn(move || {
+                process_parent_worker_loop(
+                    worker_id,
+                    &queue,
+                    &slots,
+                    &tests,
+                    &paths,
+                    &progress,
+                    &interrupted,
+                    &pb,
+                    &exe,
+                    &repo_root,
+                    &paths_file,
+                    config_path.as_deref(),
+                    &temp_path,
+                    timeout_ms,
+                    max_heap_bytes,
+                    worker_soft_rss_bytes,
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        let _ = handle.join();
+    }
     pb.finish_and_clear();
 
-    if let Some(cursor_path) = cursor {
-        write_cursor(cursor_path, resume_offset + results.len());
+    let mut results = Vec::with_capacity(tests.len());
+    for (idx, path) in tests.iter().enumerate() {
+        let result = slots[idx]
+            .lock()
+            .expect("worker result slot poisoned")
+            .take()
+            .unwrap_or_else(|| {
+                synthetic_result(
+                    &paths,
+                    path,
+                    Outcome::Crash {
+                        panic: "not executed by process worker".to_string(),
+                    },
+                )
+            });
+        results.push(result);
     }
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+
+    write_timings_if_requested(&results);
 
     let elapsed = start.elapsed();
-    if let Some(timings_path) = std::env::var_os("OTTER_TEST262_TIMINGS") {
-        let mut rows: Vec<(&str, u64)> = results
-            .iter()
-            .map(|r| (r.path.as_str(), r.wall_ms))
-            .collect();
-        rows.sort_by_key(|b| std::cmp::Reverse(b.1));
-        let mut out = String::new();
-        for (rel, ms) in &rows {
-            out.push_str(&format!("{ms}\t{rel}\n"));
-        }
-        if let Err(err) = std::fs::write(&timings_path, out) {
-            eprintln!("warning: failed to write timings: {err}");
-        }
-    }
-    let baseline = build_baseline(paths, &results);
+    let baseline = build_baseline(&paths, &results);
     print_summary(&baseline, elapsed);
-
     if let Some(json_path) = output {
         write_baseline(json_path, &baseline)?;
     }
-
     if interrupted.load(Ordering::Relaxed) {
-        // Drop a partial baseline next to the cursor file so the
-        // user can inspect the work that did finish.
-        let stem = format!("partial-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
-        let dir = output
-            .and_then(Path::parent)
-            .unwrap_or_else(|| Path::new("."));
-        if let Ok((p, _)) = baseline.write_pair(dir, &stem) {
-            eprintln!("partial baseline at {}", p.display());
-        }
+        write_partial_baseline(output, &paths, &results);
         return Ok(ExitCode::from(130));
     }
-
     if baseline.totals.crashed > 0 {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// Single-threaded driver — preserves cursor flushing and the
-/// `OTTER_TEST262_TRACE_CURRENT` hang-tracing hook.
 #[allow(clippy::too_many_arguments)]
-fn run_sequential(
-    paths: &CorpusPaths,
+fn process_parent_worker_loop(
+    worker_id: usize,
+    queue: &Mutex<VecDeque<(usize, usize)>>,
+    slots: &[Mutex<Option<TestResult>>],
     tests: &[PathBuf],
-    exec: &ExecConfig,
-    harness: &mut HarnessCache,
-    pb: &ProgressBar,
+    paths: &CorpusPaths,
+    progress: &ProgressState,
     interrupted: &AtomicBool,
-    cursor: Option<&Path>,
-    resume_offset: usize,
-) -> Vec<TestResult> {
-    let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
-    let mut seen_since_flush: u64 = 0;
-    for (idx, path) in tests.iter().enumerate() {
+    pb: &ProgressBar,
+    exe: &Path,
+    repo_root: &Path,
+    paths_file: &Path,
+    config_path: Option<&Path>,
+    temp_path: &Path,
+    timeout_ms: u64,
+    max_heap_bytes: u64,
+    worker_soft_rss_bytes: u64,
+) {
+    loop {
         if interrupted.load(Ordering::Relaxed) {
-            eprintln!("\ninterrupted by user — writing partial baseline");
-            break;
+            return;
         }
-        if std::env::var_os("OTTER_TEST262_TRACE_CURRENT").is_some() {
-            let rel = path.strip_prefix(&paths.test_dir).unwrap_or(path).display();
-            eprintln!("test262-current {} {rel}", resume_offset + idx);
-        }
-        let result = run_one(path, paths, harness, exec);
-        record_progress(pb, &result.outcome);
-        results.push(result);
-        seen_since_flush += 1;
-        if let Some(cursor_path) = cursor
-            && seen_since_flush >= CURSOR_FLUSH_EVERY
-        {
-            seen_since_flush = 0;
-            write_cursor(cursor_path, resume_offset + idx + 1);
-        }
-        pb.inc(1);
-    }
-    results
-}
+        let Some((lo, hi)) = queue.lock().expect("worker queue poisoned").pop_front() else {
+            return;
+        };
+        let out_file = temp_path.join(format!("worker-{worker_id}-{lo}-{hi}.jsonl"));
+        let stdout_file = temp_path.join(format!("worker-{worker_id}-{lo}-{hi}.stdout"));
+        let stderr_file = temp_path.join(format!("worker-{worker_id}-{lo}-{hi}.stderr"));
+        let worker_status = run_worker_child(
+            exe,
+            repo_root,
+            paths_file,
+            &out_file,
+            &stdout_file,
+            &stderr_file,
+            lo,
+            hi,
+            timeout_ms,
+            max_heap_bytes,
+            worker_soft_rss_bytes,
+            config_path,
+        );
 
-/// Multi-threaded driver. Each rayon worker owns its own
-/// [`HarnessCache`] and drives a fresh isolate per test; isolates are
-/// independent (per-isolate GC heaps carving pages from the shared,
-/// mutex-guarded cage), so they run concurrently without coordination.
-///
-/// Tests that touch the process-global `$262.agent` registry (feature
-/// `Atomics` / `SharedArrayBuffer`) are pulled out and run on a single
-/// serial pass — `agent::reset_for_next_test` clears that registry
-/// wholesale, so two agent tests in flight at once would corrupt each
-/// other. The parallel phase contains no agent tests, so the registry
-/// stays empty there and the per-test reset is a no-op on empty maps.
-///
-/// Results are sorted by path so the report is deterministic regardless
-/// of completion order.
-fn run_parallel(
-    paths: &CorpusPaths,
-    tests: &[PathBuf],
-    exec: &ExecConfig,
-    jobs: usize,
-    pb: &ProgressBar,
-    interrupted: &AtomicBool,
-) -> Vec<TestResult> {
-    let pool = match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
-        Ok(pool) => pool,
-        Err(err) => {
-            eprintln!("error: failed to build worker pool ({err}); falling back to 1 thread");
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .expect("single-thread pool")
-        }
-    };
-
-    // Classify in parallel: which tests must run serially.
-    let serial_mask: Vec<bool> =
-        pool.install(|| tests.par_iter().map(|p| is_serial_test(p)).collect());
-    let parallel: Vec<&PathBuf> = tests
-        .iter()
-        .zip(&serial_mask)
-        .filter_map(|(p, &s)| (!s).then_some(p))
-        .collect();
-    let serial: Vec<&PathBuf> = tests
-        .iter()
-        .zip(&serial_mask)
-        .filter_map(|(p, &s)| s.then_some(p))
-        .collect();
-
-    let run = |path: &PathBuf, harness: &mut HarnessCache| -> TestResult {
-        let result = run_one(path, paths, harness, exec);
-        record_progress(pb, &result.outcome);
-        pb.inc(1);
-        result
-    };
-
-    let mut results: Vec<TestResult> = pool.install(|| {
-        parallel
-            .par_iter()
-            .map_init(
-                || {
-                    let mut h = HarnessCache::new(&paths.harness_dir);
-                    let _ = h.prewarm();
-                    h
-                },
-                |harness, path| {
-                    if interrupted.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    Some(run(path, harness))
-                },
-            )
-            .flatten()
-            .collect()
-    });
-
-    // Serial pass for agent / shared-memory tests.
-    if !serial.is_empty() {
-        let mut harness = HarnessCache::new(&paths.harness_dir);
-        let _ = harness.prewarm();
-        for path in serial {
-            if interrupted.load(Ordering::Relaxed) {
-                break;
+        let recorded = read_worker_lines(&out_file, slots, pb, progress);
+        let _ = std::fs::remove_file(&out_file);
+        let _ = std::fs::remove_file(&stdout_file);
+        let _ = std::fs::remove_file(&stderr_file);
+        if let Some(first_missing) = (lo..hi).find(|idx| !recorded.contains(idx)) {
+            if !worker_status.timed_out
+                && matches!(&worker_status.status, Some(status) if status.success())
+            {
+                eprintln!(
+                    "worker {worker_id}: retired after {} result(s); requeueing [{first_missing}, {hi})",
+                    recorded.len()
+                );
+                queue
+                    .lock()
+                    .expect("worker queue poisoned")
+                    .push_back((first_missing, hi));
+                continue;
             }
-            results.push(run(path, &mut harness));
+            let outcome = if worker_status.timed_out {
+                Outcome::Timeout { ms: timeout_ms }
+            } else {
+                Outcome::Crash {
+                    panic: worker_status.failure_reason(),
+                }
+            };
+            if store_worker_result(
+                slots,
+                first_missing,
+                synthetic_result(paths, &tests[first_missing], outcome),
+                pb,
+                progress,
+            ) {
+                eprintln!(
+                    "worker {worker_id}: isolated {} at index {}",
+                    relative_to(&paths.test_dir, &tests[first_missing]),
+                    first_missing
+                );
+            }
+            if first_missing + 1 < hi {
+                queue
+                    .lock()
+                    .expect("worker queue poisoned")
+                    .push_back((first_missing + 1, hi));
+            }
         }
     }
-
-    results.sort_by(|a, b| a.path.cmp(&b.path));
-    results
 }
 
-/// `true` when a test must run on the serial pass because it can reach
-/// the process-global `$262.agent` registry / shared memory. Detected
-/// from frontmatter features; an unreadable or frontmatter-less file is
-/// safe to run in parallel (the driver will skip / fail it without
-/// touching agent state).
-fn is_serial_test(path: &Path) -> bool {
-    let Ok(source) = std::fs::read_to_string(path) else {
+struct WorkerRunStatus {
+    status: Option<ExitStatus>,
+    timed_out: bool,
+    stderr_tail: String,
+    stdout_tail: String,
+}
+
+impl WorkerRunStatus {
+    fn failure_reason(&self) -> String {
+        let mut reason = self.status.map_or_else(
+            || "worker spawn failed".to_string(),
+            |status| format!("worker exited before reporting this test ({status})"),
+        );
+        if !self.stderr_tail.is_empty() {
+            reason.push_str("; stderr: ");
+            reason.push_str(&self.stderr_tail);
+        }
+        if !self.stdout_tail.is_empty() {
+            reason.push_str("; stdout: ");
+            reason.push_str(&self.stdout_tail);
+        }
+        reason
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_worker_child(
+    exe: &Path,
+    repo_root: &Path,
+    paths_file: &Path,
+    out_file: &Path,
+    stdout_file: &Path,
+    stderr_file: &Path,
+    start: usize,
+    end: usize,
+    timeout_ms: u64,
+    max_heap_bytes: u64,
+    worker_soft_rss_bytes: u64,
+    config_path: Option<&Path>,
+) -> WorkerRunStatus {
+    let mut cmd = std::process::Command::new(exe);
+    let stdout = File::create(stdout_file).ok();
+    let stderr = File::create(stderr_file).ok();
+    cmd.current_dir(repo_root)
+        .arg("--repo-root")
+        .arg(repo_root)
+        .arg("worker")
+        .arg("--paths-file")
+        .arg(paths_file)
+        .arg("--out-file")
+        .arg(out_file)
+        .arg("--start")
+        .arg(start.to_string())
+        .arg("--end")
+        .arg(end.to_string())
+        .arg("--timeout-ms")
+        .arg(timeout_ms.to_string())
+        .arg("--max-heap-bytes")
+        .arg(max_heap_bytes.to_string())
+        .arg("--worker-soft-rss-bytes")
+        .arg(worker_soft_rss_bytes.to_string());
+    if let Some(stdout) = stdout {
+        cmd.stdout(stdout);
+    }
+    if let Some(stderr) = stderr {
+        cmd.stderr(stderr);
+    }
+    if let Some(config_path) = config_path {
+        cmd.arg("--config").arg(config_path);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("worker spawn failed for [{start}, {end}): {err}");
+            return WorkerRunStatus {
+                status: None,
+                timed_out: false,
+                stderr_tail: String::new(),
+                stdout_tail: String::new(),
+            };
+        }
+    };
+
+    let startup_stall = Duration::from_millis(timeout_ms.saturating_add(5_000).max(10_000));
+    let progress_stall = Duration::from_millis(timeout_ms.saturating_add(2_000).max(5_000));
+    let mut stall = startup_stall;
+    let mut deadline = Instant::now() + stall;
+    let mut last_len = 0;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return WorkerRunStatus {
+                    status: Some(status),
+                    timed_out: false,
+                    stderr_tail: tail_file(stderr_file),
+                    stdout_tail: tail_file(stdout_file),
+                };
+            }
+            Ok(None) => {
+                let len = std::fs::metadata(out_file).map(|m| m.len()).unwrap_or(0);
+                if len > last_len {
+                    last_len = len;
+                    stall = progress_stall;
+                    deadline = Instant::now() + stall;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return WorkerRunStatus {
+                        status: None,
+                        timed_out: true,
+                        stderr_tail: tail_file(stderr_file),
+                        stdout_tail: tail_file(stdout_file),
+                    };
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => {
+                eprintln!("worker wait failed for [{start}, {end}): {err}");
+                return WorkerRunStatus {
+                    status: None,
+                    timed_out: false,
+                    stderr_tail: tail_file(stderr_file),
+                    stdout_tail: tail_file(stdout_file),
+                };
+            }
+        }
+    }
+}
+
+fn read_worker_lines(
+    out_file: &Path,
+    slots: &[Mutex<Option<TestResult>>],
+    pb: &ProgressBar,
+    progress: &ProgressState,
+) -> HashSet<usize> {
+    let mut recorded = HashSet::new();
+    let Ok(text) = std::fs::read_to_string(out_file) else {
+        return recorded;
+    };
+    for line in text.lines() {
+        let Ok(row) = serde_json::from_str::<WorkerLine>(line) else {
+            continue;
+        };
+        recorded.insert(row.idx);
+        store_worker_result(slots, row.idx, row.result, pb, progress);
+    }
+    recorded
+}
+
+fn store_worker_result(
+    slots: &[Mutex<Option<TestResult>>],
+    idx: usize,
+    result: TestResult,
+    pb: &ProgressBar,
+    progress: &ProgressState,
+) -> bool {
+    let Some(slot) = slots.get(idx) else {
         return false;
     };
-    let Ok(frontmatter) = Frontmatter::parse(&source) else {
+    let mut slot = slot.lock().expect("worker result slot poisoned");
+    if slot.is_some() {
+        return false;
+    }
+    record_progress(pb, &result.outcome);
+    *slot = Some(result);
+    pb.inc(1);
+    progress.record(idx);
+    true
+}
+
+fn synthetic_result(paths: &CorpusPaths, path: &Path, outcome: Outcome) -> TestResult {
+    TestResult {
+        path: relative_to(&paths.test_dir, path),
+        esid: None,
+        features: Vec::new(),
+        outcome,
+        wall_ms: 0,
+    }
+}
+
+fn worker(repo_root: &Path, args: WorkerArgs) -> Result<ExitCode> {
+    let paths = ensure_corpus_present(repo_root).context("failed to locate test262 corpus")?;
+    let config = Test262Config::load_or_default(args.config.as_deref());
+    init_test262_cage(1, args.max_heap_bytes)?;
+    let mut harness = HarnessCache::new(&paths.harness_dir);
+    if let Err(err) = harness.prewarm() {
+        eprintln!("error: failed to prewarm harness: {err}");
+        return Ok(ExitCode::from(2));
+    }
+    let exec = ExecConfig {
+        timeout: Duration::from_millis(args.timeout_ms),
+        max_heap_bytes: args.max_heap_bytes,
+        config,
+    };
+    let test_paths = std::fs::read_to_string(&args.paths_file)
+        .with_context(|| format!("failed to read {}", args.paths_file.display()))?;
+    let test_paths = test_paths.lines().map(PathBuf::from).collect::<Vec<_>>();
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.out_file)
+        .with_context(|| format!("failed to open {}", args.out_file.display()))?;
+    for idx in args.start..args.end.min(test_paths.len()) {
+        if std::env::var_os("OTTER_TEST262_TRACE_CURRENT").is_some() {
+            let rel = test_paths[idx]
+                .strip_prefix(&paths.test_dir)
+                .unwrap_or(&test_paths[idx])
+                .display();
+            eprintln!("test262-current {idx} {rel}");
+        }
+        let result = run_one(&test_paths[idx], &paths, &mut harness, &exec);
+        let row = WorkerLine { idx, result };
+        let line = serde_json::to_string(&row).context("failed to serialize worker result")?;
+        use std::io::Write as _;
+        writeln!(out, "{line}").context("failed to write worker result")?;
+        out.flush().context("failed to flush worker result")?;
+        if should_retire_worker(args.worker_soft_rss_bytes) {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn should_retire_worker(soft_rss_bytes: u64) -> bool {
+    if soft_rss_bytes == 0 {
+        return false;
+    }
+    let Some(rss) = current_rss_bytes() else {
         return false;
     };
-    frontmatter
-        .features
+    if rss <= soft_rss_bytes {
+        return false;
+    }
+    eprintln!(
+        "worker soft-retire: rss={} soft_cap={}",
+        format_bytes(rss),
+        format_bytes(soft_rss_bytes)
+    );
+    true
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).map(sysinfo::Process::memory)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{}MiB", bytes / MIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn write_timings_if_requested(results: &[TestResult]) {
+    let Some(timings_path) = std::env::var_os("OTTER_TEST262_TIMINGS") else {
+        return;
+    };
+    let mut rows: Vec<(&str, u64)> = results
         .iter()
-        .any(|f| f == "Atomics" || f == "SharedArrayBuffer")
+        .map(|result| (result.path.as_str(), result.wall_ms))
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+    let mut out = String::new();
+    for (rel, ms) in &rows {
+        out.push_str(&format!("{ms}\t{rel}\n"));
+    }
+    if let Err(err) = std::fs::write(&timings_path, out) {
+        eprintln!("warning: failed to write timings: {err}");
+    }
+}
+
+fn write_partial_baseline(output: Option<&Path>, paths: &CorpusPaths, results: &[TestResult]) {
+    let stem = format!("partial-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    let dir = output
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let baseline = build_baseline(paths, results);
+    if let Ok((json, _)) = baseline.write_pair(dir, &stem) {
+        eprintln!("partial baseline at {}", json.display());
+    }
+}
+
+fn tail_file(path: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut lines = text.lines().rev().take(5).collect::<Vec<_>>();
+    lines.reverse();
+    let joined = lines.join(" | ");
+    if joined.chars().count() > 800 {
+        format!("{}...", joined.chars().take(800).collect::<String>())
+    } else {
+        joined
+    }
 }
 
 fn record_progress(pb: &ProgressBar, outcome: &Outcome) {
@@ -649,13 +1061,10 @@ fn write_cursor(path: &Path, next_index: usize) {
 }
 
 fn ctrlc_install(flag: Arc<AtomicBool>) -> std::io::Result<()> {
-    // Foundation: a polled atomic flag is enough; ctrlc handlers
-    // are notoriously fragile across platforms and the runner
-    // already has the watchdog interrupting the engine. The
-    // dependency-free approach mirrors how the legacy runner's
-    // `scripts/test262-safe.sh` logic worked.
-    let _ = flag;
-    Ok(())
+    ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    })
+    .map_err(std::io::Error::other)
 }
 
 fn relative_to(base: &Path, p: &Path) -> String {

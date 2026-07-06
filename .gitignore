@@ -47,3 +47,6 @@ tests/node-compat/reports/
 
 # profile.mjs scratch (auto-sized bench wrappers + sample dumps)
 benchmarks/.profile-tmp/
+
+# Local V8 benchmark suite (downloaded on first run)
+/v8-v7/

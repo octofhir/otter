@@ -1592,9 +1592,7 @@ fn iterator_from_native(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let input = args.first().cloned().unwrap_or(Value::undefined());
-    if input.is_iterator() {
-        return Ok(input);
-    }
+    let receiver_ctor = *ctx.this_value();
     // §7.4.2 GetIteratorFlattenable — primitives other than String
     // throw TypeError.
     if crate::abstract_ops::is_primitive(&input) && input.as_string(ctx.heap()).is_none() {
@@ -1646,9 +1644,6 @@ fn iterator_from_native(
             reason: "@@iterator did not return an object".to_string(),
         });
     }
-    if iter_value.is_iterator() {
-        return Ok(iter_value);
-    }
     // §7.4.4 GetIteratorDirect — `next` is read once here, before
     // the `%Iterator%` instance check below. Even values that pass
     // through unwrapped must observe this `[[Get]]`.
@@ -1669,9 +1664,17 @@ fn iterator_from_native(
     // §27.1.4.1 step 2-3 — values already inheriting
     // `%Iterator.prototype%` (generators, custom Iterator
     // subclasses, built-in iterator objects) pass through unwrapped.
-    let global = *interp.global_this();
-    let iterator_ctor =
-        crate::object::get(global, interp.gc_heap(), "Iterator").unwrap_or(Value::undefined());
+    let iterator_ctor = if interp.is_callable_runtime(&receiver_ctor) {
+        receiver_ctor
+    } else if let Some(receiver_obj) = receiver_ctor.as_object()
+        && let Some(candidate) = crate::object::get(receiver_obj, interp.gc_heap(), "Iterator")
+        && interp.is_callable_runtime(&candidate)
+    {
+        candidate
+    } else {
+        let global = *interp.global_this();
+        crate::object::get(global, interp.gc_heap(), "Iterator").unwrap_or(Value::undefined())
+    };
     let is_iterator_instance = interp.ordinary_has_instance(&exec_ctx, &iterator_ctor, &iter_value);
     let is_iterator_instance = is_iterator_instance
         .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "Iterator.from"))?;

@@ -739,6 +739,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
+        let prototype = self.cx.interp.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -748,8 +749,14 @@ impl<'rt> NativeCtx<'rt> {
                 value_roots,
                 slice_roots,
             );
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
+            }
         };
-        array::from_elements_with_roots(self.heap_mut(), elements, &mut external_visit)
+        let array =
+            array::from_elements_with_roots(self.heap_mut(), elements, &mut external_visit)?;
+        self.cx.interp.register_array_prototype_override(array);
+        Ok(array)
     }
 
     /// Allocate a zero-filled fixed-length `ArrayBuffer` through the native
@@ -833,6 +840,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
+        let prototype = self.cx.interp.iterator_prototype_override_for_state(&state);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -842,12 +850,20 @@ impl<'rt> NativeCtx<'rt> {
                 value_roots,
                 slice_roots,
             );
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
+            }
         };
         // Old-space: native callers copy the returned handle into Rust
         // locals across GC-bearing calls, so the cell must never move
         // under a young-space scavenge.
-        self.heap_mut()
-            .alloc_old_with_roots(state, &mut external_visit)
+        let handle = self
+            .heap_mut()
+            .alloc_old_with_roots(state, &mut external_visit)?;
+        self.cx
+            .interp
+            .register_iterator_prototype_override(handle, prototype);
+        Ok(handle)
     }
 
     /// Enter a branded GC session for root/weak operations.

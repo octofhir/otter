@@ -280,9 +280,13 @@ impl Interpreter {
     {
         let elements: Vec<Value> = elements.into_iter().collect();
         let roots = self.collect_runtime_roots();
+        let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
+            }
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
             }
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -293,8 +297,11 @@ impl Interpreter {
                 }
             }
         };
-        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
-            .map_err(VmError::from)
+        let array =
+            crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+                .map_err(VmError::from)?;
+        self.register_array_prototype_override(array);
+        Ok(array)
     }
 
     /// Allocate a host-created array while exposing runtime roots and
@@ -314,9 +321,13 @@ impl Interpreter {
     {
         let elements: Vec<Value> = elements.into_iter().collect();
         let roots = self.collect_runtime_roots();
+        let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
+            }
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
             }
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -327,7 +338,10 @@ impl Interpreter {
                 }
             }
         };
-        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+        let array =
+            crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)?;
+        self.register_array_prototype_override(array);
+        Ok(array)
     }
 
     /// Allocate a host-created static native function while exposing
@@ -442,9 +456,13 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<IteratorHandle, VmError> {
         let roots = self.collect_runtime_roots();
+        let prototype = self.iterator_prototype_override_for_state(&state);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
+            }
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
             }
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -458,9 +476,12 @@ impl Interpreter {
         // Old-space: iterator handles are copied into Rust locals across
         // GC-bearing calls (IteratorStep drains, native `next` bodies), so
         // the cell must never move under a young-space scavenge.
-        self.gc_heap
+        let handle = self
+            .gc_heap
             .alloc_old_with_roots(state, &mut external_visit)
-            .map_err(VmError::from)
+            .map_err(VmError::from)?;
+        self.register_iterator_prototype_override(handle, prototype);
+        Ok(handle)
     }
 
     pub(crate) fn make_runtime_rooted_iter_result(
@@ -629,9 +650,13 @@ impl Interpreter {
     {
         let elements: Vec<Value> = elements.into_iter().collect();
         let roots = self.collect_allocation_roots(stack);
+        let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
+            }
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
             }
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -642,8 +667,11 @@ impl Interpreter {
                 }
             }
         };
-        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
-            .map_err(VmError::from)
+        let array =
+            crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+                .map_err(VmError::from)?;
+        self.register_array_prototype_override(array);
+        Ok(array)
     }
 
     pub(crate) fn alloc_stack_rooted_iterator_state(
@@ -654,9 +682,13 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<IteratorHandle, VmError> {
         let roots = self.collect_allocation_roots(stack);
+        let prototype = self.iterator_prototype_override_for_state(&state);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
+            }
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
             }
             for value in value_roots {
                 value.trace_value_slots(visitor);
@@ -670,9 +702,12 @@ impl Interpreter {
         // Old-space for the same reason as
         // `alloc_runtime_rooted_iterator_state`: the handle outlives this
         // call inside Rust locals that a moving scavenge cannot rewrite.
-        self.gc_heap
+        let handle = self
+            .gc_heap
             .alloc_old_with_roots(state, &mut external_visit)
-            .map_err(VmError::from)
+            .map_err(VmError::from)?;
+        self.register_iterator_prototype_override(handle, prototype);
+        Ok(handle)
     }
 
     fn alloc_stack_rooted_array_from_vec(

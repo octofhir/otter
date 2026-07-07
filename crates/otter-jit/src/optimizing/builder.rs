@@ -1318,77 +1318,17 @@ impl<'a> Builder<'a> {
                     self.push_body(block, load);
                     self.def_register(dst, block, load, byte_pc);
                 }
-                // `StoreProperty obj, name, src` — `CheckShape` + inline
-                // `StoreSlot`. A primitive (int32 / f64) value needs no write
-                // barrier (a primitive `Value` is never a `Gc` pointer). A
-                // `Tagged` value may be a heap pointer, so its `StoreSlot` carries
-                // the inline generational card-mark (parent old + child young →
-                // mark the parent's card); the card-mark allocates nothing and
-                // never moves GC, so it needs no safepoint. A non-own-data site
-                // (no baked shape feedback) still bails to the baseline.
+                // `StoreProperty` is observable and can transition object shape,
+                // invoke setters, and require write-barrier/state repair. Keep it
+                // on the interpreter path until the optimizing tier has a fully
+                // audited side-effect model for named stores.
                 Op::StoreProperty => {
-                    let obj_reg = reg(&operands, 0)?;
-                    let src_reg = reg(&operands, 2)?;
-                    // No inline-cacheable shape feedback (a shape-transition add, an
-                    // accessor, or a polymorphic miss): run the full runtime store
-                    // through the bridge so a constructor body that grows objects
-                    // still compiles instead of declining the whole function. The
-                    // receiver and value stay live (modeled in `reg_effects`) so the
-                    // call safepoint materializes them for the bridge to re-decode.
-                    if property_feedback.is_none() && property_feedback_poly.is_empty() {
-                        let node =
-                            self.graph
-                                .add_node(NodeKind::StorePropertyGeneric, block, byte_pc);
-                        self.push_body(block, node);
-                        continue;
-                    }
-                    if self.view.cage_base == 0 {
-                        self.deopt_or_decline(
-                            block,
-                            byte_pc,
-                            Unsupported::Opcode(Op::StoreProperty),
-                        )?;
-                        return Ok(());
-                    }
-                    let value = self.read_variable(src_reg, block);
-                    if !matches!(
-                        self.graph.node(value).kind.repr(),
-                        Repr::Int32 | Repr::Float64 | Repr::Tagged
-                    ) {
-                        self.deopt_or_decline(
-                            block,
-                            byte_pc,
-                            Unsupported::Opcode(Op::StoreProperty),
-                        )?;
-                        return Ok(());
-                    }
-                    let obj = self.read_variable(obj_reg, block);
-                    if let Some((shape, slot_byte)) = property_feedback {
-                        // Monomorphic: a single shape guard then the slot store. The
-                        // guard is shared with an earlier same-shape access to this
-                        // receiver in the block; a slot store writes a value and
-                        // never transitions the shape, so the cache stays valid.
-                        let checked = self.guarded_receiver(obj, shape, block, byte_pc);
-                        let store = self.graph.add_node(
-                            NodeKind::StoreSlot(checked, slot_byte, value),
-                            block,
-                            byte_pc,
-                        );
-                        self.push_body(block, store);
-                    } else {
-                        // Polymorphic: an inline structure-guard chain over the
-                        // baked `(shape, slot)` cases, deopt on the final miss.
-                        let store = self.graph.add_node(
-                            NodeKind::StoreSlotPoly(
-                                obj,
-                                property_feedback_poly.clone().into_boxed_slice(),
-                                value,
-                            ),
-                            block,
-                            byte_pc,
-                        );
-                        self.push_body(block, store);
-                    }
+                    self.deopt_or_decline(
+                        block,
+                        byte_pc,
+                        Unsupported::Opcode(Op::StoreProperty),
+                    )?;
+                    return Ok(());
                 }
                 // `LoadElement dst, recv, idx` — inline only dense Array and
                 // Float64Array / Int32Array fast paths. Every miss deoptimizes at
@@ -2151,32 +2091,11 @@ impl<'a> Builder<'a> {
         Ok(self.graph.add_node(kind, block, byte_pc))
     }
 
-    fn inline_method_allows_store(method: &JitInlineMethod) -> bool {
-        let mut store_seen = false;
-        for instr in &method.instructions {
-            if store_seen
-                && !matches!(
-                    instr.op,
-                    Op::LoadThis
-                        | Op::LoadInt32
-                        | Op::LoadLocal
-                        | Op::LoadUndefined
-                        | Op::LoadHole
-                        | Op::LoadTrue
-                        | Op::LoadFalse
-                        | Op::StoreLocal
-                        | Op::Return
-                        | Op::ReturnValue
-                        | Op::ReturnUndefined
-                )
-            {
-                return false;
-            }
-            if instr.op == Op::StoreProperty {
-                store_seen = true;
-            }
-        }
-        true
+    fn inline_method_has_no_store_property(method: &JitInlineMethod) -> bool {
+        method
+            .instructions
+            .iter()
+            .all(|instr| instr.op != Op::StoreProperty)
     }
 
     fn try_inline_direct_call(
@@ -2628,7 +2547,7 @@ impl<'a> Builder<'a> {
             || argc != usize::from(method.param_count)
             || method.register_count > MAX_INLINE_METHOD_REGS
             || method.instructions.len() > MAX_INLINE_METHOD_INSTRS
-            || !Self::inline_method_allows_store(method)
+            || !Self::inline_method_has_no_store_property(method)
         {
             return Ok(None);
         }

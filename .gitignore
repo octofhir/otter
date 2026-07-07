@@ -50,3 +50,4 @@ benchmarks/.profile-tmp/
 
 # Local V8 benchmark suite (downloaded on first run)
 /v8-v7/
+/octane/

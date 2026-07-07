@@ -38,7 +38,7 @@ use std::sync::Arc;
 use otter_bytecode::ModuleInit;
 use otter_vm::{Interpreter, JsObject};
 
-use crate::{CapabilitySet, ConfigError, HostedModule, OtterError};
+use crate::{CapabilitySet, ConfigError, HostedModule, OtterError, RuntimeTaskSpawner};
 
 /// Lifecycle phases per ECMA-262 §16.2 Cyclic Module Records.
 ///
@@ -113,6 +113,7 @@ impl RuntimeModuleRecords {
         module_inits: &[ModuleInit],
         hosted_modules: &[HostedModule],
         capabilities: &CapabilitySet,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<(), OtterError> {
         self.records.clear();
         interp.reset_module_state();
@@ -122,7 +123,7 @@ impl RuntimeModuleRecords {
                 .find(|hosted| hosted.specifier() == init.url)
             {
                 hosted
-                    .install(interp, capabilities)
+                    .install(interp, capabilities, runtime_task_spawner.clone())
                     .map_err(|message| OtterError::Config {
                         reason: ConfigError::ConflictingCapabilities { message },
                     })?

@@ -31,8 +31,8 @@ use smallvec::{SmallVec, smallvec};
 use otter_vm::{NativeCtx, Value, object};
 
 use crate::{
-    CapabilitySet, HostedModule, RuntimeNativeError as NativeError, runtime_string_value,
-    runtime_type_error,
+    CapabilitySet, HostedModule, RuntimeNativeError as NativeError, RuntimeTaskSpawner,
+    runtime_string_value, runtime_type_error,
 };
 
 /// Shared configuration for a CommonJS run: capability snapshot and the hosted
@@ -41,6 +41,7 @@ use crate::{
 pub(crate) struct CjsConfig {
     pub(crate) capabilities: CapabilitySet,
     pub(crate) hosted: Vec<HostedModule>,
+    pub(crate) runtime_task_spawner: Option<RuntimeTaskSpawner>,
 }
 
 fn oom(err: impl std::fmt::Display) -> NativeError {
@@ -279,7 +280,7 @@ pub(crate) fn cjs_load(
         } else {
             let interp = ctx.interp_mut();
             let namespace = hm
-                .install(interp, &cfg.capabilities)
+                .install(interp, &cfg.capabilities, cfg.runtime_task_spawner.clone())
                 .map_err(|err| runtime_type_error("require", err))?;
             Value::object(namespace)
         };

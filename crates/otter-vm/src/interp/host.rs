@@ -37,6 +37,31 @@ impl Interpreter {
         &self.timer_callbacks
     }
 
+    /// Insert a generic persistent root and return its id.
+    pub fn persistent_root_insert(&mut self, value: Value) -> persistent_roots::PersistentRootId {
+        self.persistent_roots.insert(value)
+    }
+
+    /// Read a generic persistent root.
+    #[must_use]
+    pub fn persistent_root_get(&self, id: persistent_roots::PersistentRootId) -> Option<Value> {
+        self.persistent_roots.get(id)
+    }
+
+    /// Remove a generic persistent root.
+    pub fn persistent_root_remove(
+        &mut self,
+        id: persistent_roots::PersistentRootId,
+    ) -> Option<Value> {
+        self.persistent_roots.remove(id)
+    }
+
+    /// Borrow persistent roots for GC tracing.
+    #[must_use]
+    pub(crate) fn persistent_roots_for_trace(&self) -> &persistent_roots::PersistentRoots {
+        &self.persistent_roots
+    }
+
     /// Install the host-side dynamic-import scheduler.
     pub fn set_dynamic_import_loader(&mut self, loader: dynamic_import::DynamicImportLoaderHandle) {
         self.dynamic_import_loader = Some(loader);

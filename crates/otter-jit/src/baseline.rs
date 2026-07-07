@@ -2543,7 +2543,13 @@ pub(crate) mod arm64 {
         if let Some(instr) = view.instructions.iter().find(|instr| {
             matches!(
                 instr.op,
-                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally | Op::StoreElement
+                Op::EnterTry
+                    | Op::LeaveTry
+                    | Op::Throw
+                    | Op::EndFinally
+                    | Op::StoreElement
+                    | Op::StoreProperty
+                    | Op::MathCall
             )
         }) {
             return Err(Unsupported::Opcode(instr.op));

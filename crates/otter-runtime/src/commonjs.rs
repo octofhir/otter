@@ -278,10 +278,20 @@ pub(crate) fn cjs_load(
             value_install(ctx, &cfg.capabilities)
                 .map_err(|err| runtime_type_error("require", err))?
         } else {
+            // Shared with the ESM loader: one namespace object (and one run
+            // of the installer's side effects) per builtin specifier per
+            // isolate, whichever loader touches it first.
             let interp = ctx.interp_mut();
-            let namespace = hm
-                .install(interp, &cfg.capabilities, cfg.runtime_task_spawner.clone())
-                .map_err(|err| runtime_type_error("require", err))?;
+            let namespace = match interp.host_module_env_cached(hm.specifier()) {
+                Some(env) => env,
+                None => {
+                    let env = hm
+                        .install(interp, &cfg.capabilities, cfg.runtime_task_spawner.clone())
+                        .map_err(|err| runtime_type_error("require", err))?;
+                    interp.cache_host_module_env(Arc::from(hm.specifier()), env);
+                    env
+                }
+            };
             Value::object(namespace)
         };
         let depth = ctx.interp_mut().push_module_root(value);

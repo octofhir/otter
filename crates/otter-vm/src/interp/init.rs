@@ -114,6 +114,7 @@ impl Interpreter {
             allow_blocking_atomics_wait: false,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
+            host_module_env_cache: std::collections::HashMap::new(),
             module_init_upvalues: std::collections::HashMap::new(),
             global_lexicals: rustc_hash::FxHashMap::default(),
             global_lexical_load_ic: rustc_hash::FxHashMap::default(),

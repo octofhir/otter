@@ -661,7 +661,7 @@ impl Interpreter {
                             SmallVec::new();
                         targets.push(prior);
                         targets.push(new_target);
-                        *slot.get_mut() = MethodCallFeedback::Poly(targets);
+                        *slot.get_mut() = MethodCallFeedback::Poly(Box::new(targets));
                         true
                     }
                 }
@@ -865,7 +865,7 @@ impl Interpreter {
                         Some(PolySnapshot { byte_pc, targets })
                     }
                     MethodCallFeedback::Poly(observed) => {
-                        let mut targets = observed.clone();
+                        let mut targets = (**observed).clone();
                         // Most-frequent target first: the common receiver shape
                         // then hits the shortest guard chain.
                         targets.sort_by_key(|t| std::cmp::Reverse(t.hits));

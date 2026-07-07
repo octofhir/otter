@@ -597,7 +597,11 @@ pub(crate) enum MethodCallFeedback {
     /// most-frequent-first chain; a receiver matching none of the guards falls
     /// through to the in-place method bridge. Still GC-safe: each target only
     /// holds immortal shape handles and a function id.
-    Poly(SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>),
+    ///
+    /// Boxed: the inline target array dwarfs the `Mono` payload, and most
+    /// sites stay monomorphic, so keeping it out of line keeps every
+    /// feedback-map entry `Mono`-sized.
+    Poly(Box<SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>>),
     /// More than [`MAX_POLY_METHOD_TARGETS`] distinct targets observed; the
     /// site is too polymorphic to inline profitably and always takes the
     /// in-place method bridge.
@@ -842,6 +846,14 @@ pub struct Interpreter {
     /// interpreter so a fresh script doesn't observe stale
     /// modules.
     module_environments: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
+    /// Host-installed builtin module namespaces (e.g. `otter:kv`), keyed by
+    /// specifier. Unlike [`Self::module_environments`] this cache survives
+    /// [`Self::reset_module_state`] and is shared by the ESM and CommonJS
+    /// loaders, so one runtime observes exactly one namespace object — and
+    /// runs its installer's side effects exactly once — per builtin
+    /// specifier, regardless of import style or how many programs run on
+    /// the isolate. Traced as GC roots.
+    host_module_env_cache: std::collections::HashMap<std::sync::Arc<str>, JsObject>,
     /// Per-module persistent `<module-init>` own-upvalue cells — the
     /// engine's module environment record. The link-phase (hoist) and
     /// evaluation-phase invocations of one module's init share these

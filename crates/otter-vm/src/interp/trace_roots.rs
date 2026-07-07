@@ -21,6 +21,13 @@ impl Interpreter {
         self.module_environments.values()
     }
 
+    /// Iterator over cached host-installed builtin module namespaces
+    /// (`otter:*` etc.). These outlive `reset_module_state`, so they must be
+    /// enumerated as GC roots independently of the per-run module registry.
+    pub fn host_module_envs_for_trace(&self) -> impl Iterator<Item = &JsObject> {
+        self.host_module_env_cache.values()
+    }
+
     /// Borrow additional host-created realms for GC root tracing.
     pub(crate) fn extra_realms_for_trace(&self) -> impl Iterator<Item = &RealmState> {
         self.extra_realms.iter()

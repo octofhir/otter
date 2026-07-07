@@ -1707,6 +1707,18 @@ impl Runtime {
                 },
             });
         }
+        // Hosted-module lookups take the first specifier match, so a
+        // duplicate registration would silently shadow the later installer.
+        // Surface the conflict at build time instead.
+        let mut seen = std::collections::HashSet::new();
+        for module in &config.hosted_modules {
+            if !seen.insert(module.specifier()) {
+                return Err(OtterError::HostedModule {
+                    specifier: module.specifier().to_string(),
+                    message: "registered more than once".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 

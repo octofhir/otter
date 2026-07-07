@@ -1116,7 +1116,18 @@ impl Interpreter {
             // closure. A closure that builds OWN upvalue cells is not
             // `asm_link_eligible` and keeps the empty slot (bridge).
             let self_closure_bits = method.to_bits();
-            let inline = if !asm_link_eligible {
+            // A dictionary-mode shape handle is null (compressed offset 0) —
+            // the same value every dictionary-mode object stores in its shape
+            // field — so an inline guard baked from it would match any
+            // dictionary receiver and trust a slot offset that is not
+            // shape-stable. Such a hit keeps the bridge path.
+            let shapes_guardable = match &hit {
+                JitDirectMethodHit::Own(h) => !h.shape.is_null(),
+                JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
+                    !object::shape(obj, &self.gc_heap).is_null() && !prototype_hit.shape.is_null()
+                }
+            };
+            let inline = if !asm_link_eligible || !shapes_guardable {
                 JitDirectMethodInline::EMPTY
             } else {
                 match &hit {

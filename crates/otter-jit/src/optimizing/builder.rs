@@ -1017,9 +1017,22 @@ impl<'a> Builder<'a> {
             let load_number = instr.load_number;
             let load_array_length = instr.load_array_length;
             let method_hint = instr.method_hint;
-            let property_feedback = instr.property_feedback;
-            let property_feedback_poly = instr.property_feedback_poly.clone();
-            let property_proto_feedback = instr.property_proto_feedback;
+            // Shape offset 0 is the compressed null handle — what a
+            // dictionary-mode object stores in its shape field — so a guard
+            // baked against it would match any dictionary receiver while the
+            // baked slot offset is not shape-stable. The VM never bakes such
+            // feedback; drop it here too so no future bake path can smuggle an
+            // unguardable case into an inline slot access.
+            let property_feedback = instr.property_feedback.filter(|&(shape, _)| shape != 0);
+            let property_feedback_poly: Vec<(u32, u32)> = instr
+                .property_feedback_poly
+                .iter()
+                .copied()
+                .filter(|&(shape, _)| shape != 0)
+                .collect();
+            let property_proto_feedback = instr
+                .property_proto_feedback
+                .filter(|&(recv, proto, _)| recv != 0 && proto != 0);
             let property_ic_site = instr.property_ic_site;
             let object_literal = instr.object_literal.clone();
             let global_lex_cell = instr.global_lex_cell;

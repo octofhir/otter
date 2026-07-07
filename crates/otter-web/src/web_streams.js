@@ -549,4 +549,43 @@
   Object.defineProperty(DecompressionStream.prototype, Symbol.toStringTag,
     { value: 'DecompressionStream', configurable: true });
   def('DecompressionStream', DecompressionStream);
+
+  // ---- Queuing strategies ----
+  // Spec: both constructors take a QueuingStrategyInit dictionary whose
+  // `highWaterMark` member is required and converted to unrestricted double
+  // (NaN and negatives are stored as-is; validation happens at stream
+  // construction). The `size` getter returns a per-realm shared function.
+  const Q = { hwm: Symbol('highWaterMark') };
+
+  function initHighWaterMark(name, init) {
+    if (init === null || (typeof init !== 'object' && typeof init !== 'function')) {
+      throw new TypeError(`Failed to construct '${name}': parameter 1 is not an object`);
+    }
+    const hwm = init.highWaterMark;
+    if (hwm === undefined) {
+      throw new TypeError(`Failed to construct '${name}': required member highWaterMark is undefined`);
+    }
+    return Number(hwm);
+  }
+
+  const byteLengthSize = function size(chunk) { return chunk.byteLength; };
+  const countSize = function size() { return 1; };
+
+  class ByteLengthQueuingStrategy {
+    constructor(init) { this[Q.hwm] = initHighWaterMark('ByteLengthQueuingStrategy', init); }
+    get highWaterMark() { return this[Q.hwm]; }
+    get size() { return byteLengthSize; }
+  }
+  Object.defineProperty(ByteLengthQueuingStrategy.prototype, Symbol.toStringTag,
+    { value: 'ByteLengthQueuingStrategy', configurable: true });
+  def('ByteLengthQueuingStrategy', ByteLengthQueuingStrategy);
+
+  class CountQueuingStrategy {
+    constructor(init) { this[Q.hwm] = initHighWaterMark('CountQueuingStrategy', init); }
+    get highWaterMark() { return this[Q.hwm]; }
+    get size() { return countSize; }
+  }
+  Object.defineProperty(CountQueuingStrategy.prototype, Symbol.toStringTag,
+    { value: 'CountQueuingStrategy', configurable: true });
+  def('CountQueuingStrategy', CountQueuingStrategy);
 })(globalThis);

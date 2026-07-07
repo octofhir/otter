@@ -9,6 +9,7 @@
 //! # Contents
 //! - [`url`] - URL parsing and mutation.
 //! - [`blob`] - owned byte blobs.
+//! - [`crypto`] - native CSPRNG + digest backing for the `crypto` global.
 //! - [`globals`] - function globals plus the lazy JS shim surface
 //!   (`web_bootstrap.js`, `web_streams.js`, `web_fetch.js`).
 //! - [`WEB_API_CLASSES`] - static class specs.
@@ -26,6 +27,7 @@
 extern crate otter_runtime as otter_vm;
 
 pub mod blob;
+pub mod crypto;
 pub mod globals;
 pub mod url;
 

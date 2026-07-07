@@ -11,6 +11,9 @@ otter-gc = { workspace = true }
 otter-macros = { workspace = true }
 otter-runtime = { workspace = true }
 flate2 = { workspace = true }
+getrandom = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = "2"
 

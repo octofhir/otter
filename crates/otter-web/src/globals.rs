@@ -4,9 +4,11 @@
 //! AbortController/AbortSignal/MessageEvent/…).
 //!
 //! These belong to the Web platform (not Node), so they live here and are
-//! installed for every runtime that enables Web APIs. `atob`/`btoa` and the
-//! native in-realm `structuredClone` + Streams compression codec are
-//! implemented; `fetch` is still a placeholder.
+//! installed for every runtime that enables Web APIs. `atob`/`btoa`,
+//! `queueMicrotask`, `navigator`, the native in-realm `structuredClone`
+//! plus Streams compression codec, and the native CSPRNG/digest backing
+//! for `crypto` (see [`crate::crypto`]) are implemented; `fetch` is still
+//! a placeholder.
 
 use otter_runtime::{
     OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCtx as NativeCtx,
@@ -43,6 +45,7 @@ const WEB_GLOBAL_NAMES: &[&str] = &[
     "AbortSignal",
     "BroadcastChannel",
     "CloseEvent",
+    "crypto",
     "CustomEvent",
     "DOMException",
     "ErrorEvent",
@@ -63,7 +66,9 @@ const WEB_GLOBAL_NAMES: &[&str] = &[
     "Request",
     "Response",
     // web_streams.js
+    "ByteLengthQueuingStrategy",
     "CompressionStream",
+    "CountQueuingStrategy",
     "DecompressionStream",
     "ReadableStream",
     "ReadableStreamDefaultController",
@@ -174,7 +179,32 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
+    crate::crypto::install(runtime)?;
+    install_navigator(runtime)?;
     install_lazy_web_globals(runtime)?;
+    Ok(())
+}
+
+/// Install the `navigator` global (WinterTC Minimum Common API): a plain
+/// object exposing `userAgent` with the engine name and crate version.
+/// Defined writable + configurable to match the WebIDL `[Replaceable]`
+/// attribute shape, and non-enumerable like the other Web globals.
+fn install_navigator(runtime: &mut Runtime) -> Result<(), OtterError> {
+    let shim = format!(
+        "Object.defineProperty(globalThis, 'navigator', {{\n\
+           value: {{ userAgent: 'Otter/{version}' }},\n\
+           writable: true,\n\
+           enumerable: false,\n\
+           configurable: true,\n\
+         }});",
+        version = env!("CARGO_PKG_VERSION"),
+    );
+    runtime
+        .eval(SourceInput::from_javascript(shim))
+        .map_err(|err| OtterError::Internal {
+            code: "WEB_NAVIGATOR_INSTALL".to_string(),
+            message: format!("navigator install failed: {err}"),
+        })?;
     Ok(())
 }
 
@@ -250,12 +280,17 @@ fn atob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     runtime_string_value(ctx, &out)
 }
 
-// ---- placeholders (present so referencing code loads) ----
-
-fn queue_microtask(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    // TODO: enqueue the callback on the microtask queue.
+/// `queueMicrotask(callback)` — HTML §8.7. Direct bare-identifier calls
+/// compile to the VM microtask opcode; this native body serves indirect
+/// calls (an aliased or reflected `queueMicrotask`) by enqueueing on the
+/// same per-isolate queue. Throws `TypeError` for non-callable arguments.
+fn queue_microtask(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let callback = args.first().copied().unwrap_or_else(Value::undefined);
+    ctx.queue_microtask(callback, [])?;
     Ok(Value::undefined())
 }
+
+// ---- placeholders (present so referencing code loads) ----
 
 fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     Err(runtime_type_error("fetch", "fetch is not implemented"))

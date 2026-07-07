@@ -137,7 +137,7 @@ fn response_honors_init_statics_and_body_mixin() {
     );
     assert_eq!(
         result,
-        "201|Created|false|abc|true|text/plain;charset=UTF-8|202|application/json|307|https://example.com/next|error"
+        "201|Created|true|abc|true|text/plain;charset=UTF-8|202|application/json|307|https://example.com/next|error"
     );
     let after = eval_string(&mut runtime, "out");
     assert!(after.ends_with("|created"), "unexpected: {after}");
@@ -246,6 +246,161 @@ fn web_api_globals_install_and_run_through_runtime_builder() {
     );
 }
 
+/// WinterTC Minimum Common API conformance ledger.
+///
+/// Every global (or dotted path) in the WinterTC minimum-common-API list
+/// appears in exactly one of the two ledgers below:
+///
+/// - `SUPPORTED` — must resolve to a defined value on `globalThis`.
+/// - `NOT_YET` — must be absent (`undefined`).
+///
+/// Implementing one of the `NOT_YET` APIs makes this test fail with a
+/// "move to SUPPORTED" message; move the name between the lists as part of
+/// that change so the ledger always reflects the real runtime surface.
+#[test]
+fn wintertc_minimum_common_api_ledger() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        const SUPPORTED = [
+          "AbortController",
+          "AbortSignal",
+          "Blob",
+          "ByteLengthQueuingStrategy",
+          "clearInterval",
+          "clearTimeout",
+          "CompressionStream",
+          "CountQueuingStrategy",
+          "crypto",
+          "crypto.getRandomValues",
+          "crypto.randomUUID",
+          "crypto.subtle.digest",
+          "DecompressionStream",
+          "DOMException",
+          "Event",
+          "EventTarget",
+          "fetch",
+          "File",
+          "FormData",
+          "Headers",
+          "navigator.userAgent",
+          "performance.now",
+          "performance.timeOrigin",
+          "queueMicrotask",
+          "ReadableStream",
+          "ReadableStreamDefaultController",
+          "ReadableStreamDefaultReader",
+          "Request",
+          "Response",
+          "setInterval",
+          "setTimeout",
+          "structuredClone",
+          "TextDecoder",
+          "TextDecoderStream",
+          "TextEncoder",
+          "TextEncoderStream",
+          "TransformStream",
+          "URL",
+          "URLSearchParams",
+          "WritableStream",
+          "WritableStreamDefaultController",
+          "WritableStreamDefaultWriter",
+        ];
+        const NOT_YET = [
+          "Crypto",
+          "CryptoKey",
+          "ReadableByteStreamController",
+          "ReadableStreamBYOBReader",
+          "ReadableStreamBYOBRequest",
+          "SubtleCrypto",
+          "TransformStreamDefaultController",
+          "URLPattern",
+        ];
+        function lookup(path) {
+          let value = globalThis;
+          for (const part of path.split(".")) {
+            if (value === undefined || value === null) return undefined;
+            value = value[part];
+          }
+          return value;
+        }
+        const problems = [];
+        for (const name of SUPPORTED) {
+          if (lookup(name) === undefined) problems.push("missing SUPPORTED API: " + name);
+        }
+        for (const name of NOT_YET) {
+          if (lookup(name) !== undefined) {
+            problems.push("implemented but listed NOT_YET (move to SUPPORTED): " + name);
+          }
+        }
+        problems.join("; ")
+        "#,
+    );
+    assert_eq!(result, "");
+}
+
+#[test]
+fn navigator_reports_otter_user_agent() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        navigator.userAgent + "|" + (navigator.userAgentData === undefined) + "|" +
+          Object.getOwnPropertyDescriptor(globalThis, "navigator").enumerable
+        "#,
+    );
+    assert_eq!(
+        result,
+        format!("Otter/{}|true|false", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn queuing_strategies_follow_spec_shape() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        const bls = new ByteLengthQueuingStrategy({ highWaterMark: 16 });
+        out += bls.highWaterMark + "|" + bls.size(new Uint8Array(8)) + "|";
+        out += (bls.size === new ByteLengthQueuingStrategy({ highWaterMark: 1 }).size) + "|";
+        const cqs = new CountQueuingStrategy({ highWaterMark: 4 });
+        out += cqs.highWaterMark + "|" + cqs.size("anything") + "|";
+        out += bls.size.name + "," + bls.size.length + "|" + cqs.size.name + "," + cqs.size.length + "|";
+        try { new CountQueuingStrategy(); } catch (e) { out += e.constructor.name + "|"; }
+        try { new ByteLengthQueuingStrategy({}); } catch (e) { out += e.constructor.name + "|"; }
+        const rs = new ReadableStream({}, new CountQueuingStrategy({ highWaterMark: 3 }));
+        out += (rs instanceof ReadableStream);
+        out
+        "#,
+    );
+    assert_eq!(
+        result,
+        "16|8|true|4|1|size,1|size,0|TypeError|TypeError|true"
+    );
+}
+
+#[test]
+fn queue_microtask_runs_indirect_callers() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        const indirect = queueMicrotask;
+        try { indirect(null); } catch (e) { out += e.constructor.name; }
+        indirect(() => { out += "|ran"; });
+        out
+        "#,
+    );
+    assert_eq!(result, "TypeError");
+    // The queued callback drains at the eval checkpoint; observe it after.
+    let after = eval_string(&mut runtime, "out");
+    assert_eq!(after, "TypeError|ran");
+}
+
 #[test]
 fn structured_clone_transfer_detaches_array_buffer() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
@@ -271,4 +426,91 @@ fn structured_clone_transfer_detaches_array_buffer() {
         ))
         .unwrap();
     assert_eq!(result.completion_string(), "ok");
+}
+
+#[test]
+fn crypto_get_random_values_fills_and_returns_same_array() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        const array = new Uint8Array(32);
+        const returned = crypto.getRandomValues(array);
+        // 32 zero bytes from a CSPRNG has probability 2^-256.
+        const filled = array.some((byte) => byte !== 0);
+        const offsetView = new Uint32Array(new ArrayBuffer(16), 4, 2);
+        crypto.getRandomValues(offsetView);
+        (returned === array) + "|" + filled + "|" + array.length
+        "#,
+    );
+    assert_eq!(result, "true|true|32");
+}
+
+#[test]
+fn crypto_get_random_values_rejects_non_integer_and_oversized_arrays() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        try { crypto.getRandomValues(new Float64Array(4)); }
+        catch (e) { out += e.name + "," + (e instanceof DOMException); }
+        try { crypto.getRandomValues(new DataView(new ArrayBuffer(4))); }
+        catch (e) { out += "|" + e.name; }
+        try { crypto.getRandomValues(new Uint8Array(65537)); }
+        catch (e) { out += "|" + e.name; }
+        out += "|" + crypto.getRandomValues(new Uint8Array(65536)).length;
+        out
+        "#,
+    );
+    assert_eq!(
+        result,
+        "TypeMismatchError,true|TypeMismatchError|QuotaExceededError|65536"
+    );
+}
+
+#[test]
+fn crypto_random_uuid_is_version_4_and_unique() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        const first = crypto.randomUUID();
+        const second = crypto.randomUUID();
+        const shape = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+        shape.test(first) + "|" + shape.test(second) + "|" + (first !== second)
+        "#,
+    );
+    assert_eq!(result, "true|true|true");
+}
+
+#[test]
+fn crypto_subtle_digest_matches_known_vectors_and_rejects_unknowns() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        function hex(buffer) {
+          return Array.from(new Uint8Array(buffer))
+            .map((byte) => ("0" + byte.toString(16)).slice(-2))
+            .join("");
+        }
+        out += (crypto.subtle === crypto.subtle) + "|";
+        crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc"))
+          .then((buffer) => { out += hex(buffer); });
+        crypto.subtle.digest({ name: "sha-1" }, new ArrayBuffer(0))
+          .then((buffer) => { out += "|" + hex(buffer); });
+        crypto.subtle.digest("MD5", new Uint8Array(0))
+          .catch((error) => { out += "|" + error.name; });
+        out
+        "#,
+    );
+    assert_eq!(result, "true|");
+    let after = eval_string(&mut runtime, "out");
+    assert_eq!(
+        after,
+        "true|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|\
+         da39a3ee5e6b4b0d3255bfef95601890afd80709|NotSupportedError"
+    );
 }

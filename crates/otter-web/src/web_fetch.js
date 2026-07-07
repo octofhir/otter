@@ -805,8 +805,10 @@
       },
       responseParts(response) {
         if (!(response instanceof Response)) return null;
+        // Sorted-and-combined view (Fetch § 5.1), matching Headers iteration:
+        // deterministic wire output regardless of init/default insert order.
         const flat = [];
-        for (const [name, value] of response[kHeaders][kHeaderList]) {
+        for (const [name, value] of sortedCombinedEntries(response[kHeaders])) {
           flat.push(name, value);
         }
         let body = null;

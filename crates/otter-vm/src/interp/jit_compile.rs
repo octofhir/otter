@@ -217,24 +217,27 @@ impl Interpreter {
             // Collect every entry's own-data `(shape_offset, slot_byte)` case, or
             // `None` if any entry is not an own-data hit (a prototype / accessor /
             // transition stub the guard chain cannot represent) — in which case the
-            // whole site is left uncached for the tier.
+            // whole site is left uncached for the tier. A dictionary-mode hit
+            // carries a null shape handle; its compressed offset is 0, which is
+            // also what every dictionary-mode object stores in its shape field, so
+            // baking it would produce a guard that matches *any* dictionary object
+            // and an inline slot access against a layout that is not
+            // shape-stable. Such a hit disqualifies the whole site.
+            let jit_hit = |hit: crate::object::AtomOwnPropertyHit| {
+                (!hit.shape.is_null())
+                    .then_some((hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
+            };
             let cases: Option<Vec<(u32, u32)>> = match instr.op {
                 otter_bytecode::Op::LoadProperty => self.load_property_ics.get(site).map(|e| {
                     e.entries()
                         .iter()
-                        .map(|stub| {
-                            stub.own_data_hit()
-                                .map(|hit| (hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
-                        })
+                        .map(|stub| stub.own_data_hit().and_then(jit_hit))
                         .collect::<Option<Vec<_>>>()
                 }),
                 otter_bytecode::Op::StoreProperty => self.store_property_ics.get(site).map(|e| {
                     e.entries()
                         .iter()
-                        .map(|stub| {
-                            stub.store_own_data_hit()
-                                .map(|hit| (hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
-                        })
+                        .map(|stub| stub.store_own_data_hit().and_then(jit_hit))
                         .collect::<Option<Vec<_>>>()
                 }),
                 _ => None,
@@ -274,13 +277,17 @@ impl Interpreter {
                 e.entries()
                     .iter()
                     .map(|stub| {
-                        stub.direct_prototype_load_jit().map(|(recv_shape, hit)| {
-                            (
-                                recv_shape.offset(),
-                                hit.shape.offset(),
-                                u32::from(hit.slot) * SLOT_BYTES,
-                            )
-                        })
+                        stub.direct_prototype_load_jit()
+                            .and_then(|(recv_shape, hit)| {
+                                // Same null-shape rule as the own-data cases above:
+                                // a dictionary-mode receiver or holder cannot be
+                                // shape-guarded, so it disqualifies the site.
+                                (!recv_shape.is_null() && !hit.shape.is_null()).then_some((
+                                    recv_shape.offset(),
+                                    hit.shape.offset(),
+                                    u32::from(hit.slot) * SLOT_BYTES,
+                                ))
+                            })
                     })
                     .collect::<Option<Vec<_>>>()
             });

@@ -341,6 +341,10 @@ pub(crate) fn compile_update(
             key_reg: u16,
             _phantom: std::marker::PhantomData<&'c ()>,
         },
+        PrivateField {
+            obj_reg: u16,
+            key_reg: u16,
+        },
         SuperStatic {
             home_reg: u16,
             name: &'b str,
@@ -474,6 +478,30 @@ pub(crate) fn compile_update(
                 _phantom: std::marker::PhantomData,
             }
         }
+        SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+            // §13.4 update on `obj.#field`. The reference is evaluated
+            // once: the same object and private-key registers back both
+            // the read (`PrivateGet`) and the write (`PrivateSet`), so a
+            // side-effecting object expression runs a single time.
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            crate::class::emit_private_method_brand_check(
+                cx,
+                obj_reg,
+                member.field.name.as_str(),
+                span,
+            )?;
+            let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
+            cx.emit(
+                Op::PrivateGet,
+                vec![
+                    Operand::Register(old),
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                ],
+                span,
+            );
+            UpdateTarget::PrivateField { obj_reg, key_reg }
+        }
         _ => {
             return Err(CompileError::Unsupported {
                 node: "UpdateExpression on non-identifier operand".to_string(),
@@ -571,6 +599,17 @@ pub(crate) fn compile_update(
             obj_reg, key_reg, ..
         } => {
             cx.emit_store_element(obj_reg, key_reg, next, span);
+        }
+        UpdateTarget::PrivateField { obj_reg, key_reg } => {
+            cx.emit(
+                Op::PrivateSet,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(next),
+                ],
+                span,
+            );
         }
         UpdateTarget::SuperStatic { home_reg, name } => {
             let name_idx = cx.intern_string_constant(name);

@@ -229,6 +229,22 @@ impl Interpreter {
         self.module_environments.insert(url, env);
     }
 
+    /// Look up the cached namespace object for a host-installed builtin
+    /// module specifier (e.g. `otter:kv`). The cache survives
+    /// [`Self::reset_module_state`], so every loader (ESM graph, CommonJS
+    /// `require`) observes the identical namespace for the isolate's life.
+    #[must_use]
+    pub fn host_module_env_cached(&self, specifier: &str) -> Option<JsObject> {
+        self.host_module_env_cache.get(specifier).copied()
+    }
+
+    /// Record a freshly installed builtin-module namespace so later loads of
+    /// `specifier` — from any loader, in any later program run — reuse it
+    /// instead of re-running the installer.
+    pub fn cache_host_module_env(&mut self, specifier: std::sync::Arc<str>, env: JsObject) {
+        self.host_module_env_cache.insert(specifier, env);
+    }
+
     /// Register a module's §16.2.1.6 ResolveExport table (exported name
     /// → `(defining_module, binding)`), computed by the linker. Read by
     /// the Module Namespace Exotic Object MOP forks and

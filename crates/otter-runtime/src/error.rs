@@ -42,6 +42,14 @@ pub enum OtterError {
         /// Specific configuration problem.
         reason: ConfigError,
     },
+    /// A hosted builtin module's namespace installer failed.
+    #[error("hosted module '{specifier}' failed to install: {message}")]
+    HostedModule {
+        /// Module specifier, for example `otter:kv`.
+        specifier: String,
+        /// Installer failure detail.
+        message: String,
+    },
     /// Filesystem / module loader error.
     #[error("io error reading {}: {message}", .path.display())]
     Io {
@@ -164,7 +172,10 @@ impl OtterError {
     pub fn exit_code(&self) -> i32 {
         match self {
             OtterError::Compile { .. } | OtterError::Runtime { .. } => 1,
-            OtterError::Config { .. } | OtterError::SourceKind { .. } | OtterError::Io { .. } => 2,
+            OtterError::Config { .. }
+            | OtterError::HostedModule { .. }
+            | OtterError::SourceKind { .. }
+            | OtterError::Io { .. } => 2,
             OtterError::Capability { .. } => 3,
             OtterError::Timeout { .. } => 4,
             OtterError::OutOfMemory { .. } => 5,

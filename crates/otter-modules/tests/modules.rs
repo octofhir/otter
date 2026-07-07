@@ -141,3 +141,51 @@ fn otter_global_installs_serve() {
         ))
         .unwrap();
 }
+
+#[test]
+fn hosted_namespace_is_cached_across_runs_and_loaders() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Run 1 (ESM): stamp an expando on the `otter:kv` namespace object.
+    let first = dir.path().join("first.mjs");
+    std::fs::write(
+        &first,
+        r#"
+            import * as kv from "otter:kv";
+            kv.openKv(":memory:");
+        "#,
+    )
+    .unwrap();
+
+    // Run 2 (ESM, same runtime): the namespace must be the same installed
+    // object, not a fresh install.
+    let second = dir.path().join("second.mjs");
+    std::fs::write(
+        &second,
+        r#"
+            import { openKv } from "otter:kv";
+            if (typeof openKv !== "function") {
+                throw new Error("cached namespace lost openKv");
+            }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
+    runtime.run_module(&first).unwrap();
+    runtime.run_module(&second).unwrap();
+}
+
+#[test]
+fn duplicate_hosted_specifier_is_a_build_error() {
+    let err = Runtime::builder()
+        .with_otter_modules()
+        .hosted_modules(hosted_modules().iter().copied())
+        .build()
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("registered more than once"),
+        "unexpected error: {message}"
+    );
+}

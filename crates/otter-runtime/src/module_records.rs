@@ -38,7 +38,7 @@ use std::sync::Arc;
 use otter_bytecode::ModuleInit;
 use otter_vm::{Interpreter, JsObject};
 
-use crate::{CapabilitySet, ConfigError, HostedModule, OtterError, RuntimeTaskSpawner};
+use crate::{CapabilitySet, HostedModule, OtterError, RuntimeTaskSpawner};
 
 /// Lifecycle phases per ECMA-262 §16.2 Cyclic Module Records.
 ///
@@ -122,11 +122,24 @@ impl RuntimeModuleRecords {
                 .iter()
                 .find(|hosted| hosted.specifier() == init.url)
             {
-                hosted
-                    .install(interp, capabilities, runtime_task_spawner.clone())
-                    .map_err(|message| OtterError::Config {
-                        reason: ConfigError::ConflictingCapabilities { message },
-                    })?
+                // One namespace per specifier per isolate: the installer's
+                // side effects (opening host resources, spawning tasks) must
+                // run once, and the CommonJS loader shares the same cache so
+                // `import` and `require` of one builtin observe the identical
+                // object.
+                match interp.host_module_env_cached(init.url.as_str()) {
+                    Some(env) => env,
+                    None => {
+                        let env = hosted
+                            .install(interp, capabilities, runtime_task_spawner.clone())
+                            .map_err(|message| OtterError::HostedModule {
+                                specifier: init.url.clone(),
+                                message,
+                            })?;
+                        interp.cache_host_module_env(Arc::from(init.url.as_str()), env);
+                        env
+                    }
+                }
             } else {
                 interp.alloc_host_object_with_roots(&[], &[])?
             };

@@ -1,9 +1,7 @@
 //! Otter-specific server API surface.
 //!
 //! This module owns the public `import { serve } from "otter"` and
-//! `globalThis.Otter.serve` entry points. The HTTP backend lands in a follow-up
-//! slice; this file establishes the module/global shape on the active runtime
-//! stack so the server implementation has one stable public surface.
+//! `globalThis.Otter.serve` entry points.
 //!
 //! # Contents
 //! - Hosted module registration for the bare `"otter"` specifier.
@@ -20,25 +18,42 @@
 //! # See also
 //! - [`crate::hosted_modules`]
 
+mod body;
+
+use body::ServeBody;
 use otter_runtime::{
-    OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCall, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNativeFn, RuntimeValue as Value, SourceInput, object,
+    CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
+    RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeNativeCall,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimePersistentRootId, RuntimeTask,
+    RuntimeTaskSpawner, RuntimeValue as Value, SourceInput, object, runtime_this_object,
+    runtime_with_host_data,
 };
 use smallvec::SmallVec;
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::Duration,
 };
 
-otter_macros::lodge! {
-    specifier = "otter",
-    name = "otter",
-    capabilities = true,
-    exports = {
-        "serve" / 1 => serve,
-    },
+/// Static hosted module row for `import { serve } from "otter"`.
+pub static OTTER_HOSTED_MODULE: HostedModule =
+    HostedModule::new("otter", HostedModuleInstall::new(install_otter_module));
+
+/// Install the bare `"otter"` hosted module.
+pub fn install_otter_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
+    let capabilities = ctx.capabilities().clone();
+    let task_spawner = ctx.runtime_task_spawner();
+    let serve_call: Arc<RuntimeNativeFn> =
+        Arc::new(move |ctx, args, _captures| serve(ctx, args, &capabilities, task_spawner.clone()));
+    ctx.method("serve", 1, HostedNativeCall::dynamic(serve_call))?;
+    Ok(())
 }
 
 /// Installer for the global `Otter` namespace.
@@ -49,8 +64,9 @@ pub fn otter_global_installer() -> RuntimeGlobalInstaller {
 
 fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
     let capabilities = runtime.capabilities().clone();
+    let task_spawner = runtime.runtime_task_spawner();
     let serve_call: Arc<RuntimeNativeFn> =
-        Arc::new(move |ctx, args, _captures| serve(ctx, args, &capabilities));
+        Arc::new(move |ctx, args, _captures| serve(ctx, args, &capabilities, task_spawner.clone()));
     runtime.install_native_global_call(
         "__otterServe",
         1,
@@ -81,18 +97,22 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
               });
               Object.defineProperty(g, '__otterServeInternals', {
                 value: Object.freeze({
-                  makeRequest: function (method, url, flatHeaders, body) {
+                  ensureFetchInternals: function () {
+                    void g.Request;
+                    void g.Response;
+                    void g.Headers;
                     var internals = g.__otterFetchInternals;
                     if (internals == null) {
                       throw new TypeError('Otter.serve requires Web Fetch globals');
                     }
+                    return internals;
+                  },
+                  makeRequest: function (method, url, flatHeaders, body) {
+                    var internals = this.ensureFetchInternals();
                     return internals.makeRequest(method, url, flatHeaders, body);
                   },
                   responseParts: function (response) {
-                    var internals = g.__otterFetchInternals;
-                    if (internals == null) {
-                      throw new TypeError('Otter.serve requires Web Fetch globals');
-                    }
+                    var internals = this.ensureFetchInternals();
                     var parts = internals.responseParts(response);
                     if (parts === null) return null;
                     var headersText = '';
@@ -124,8 +144,11 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
 fn serve(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
-    capabilities: &otter_runtime::CapabilitySet,
+    capabilities: &CapabilitySet,
+    task_spawner: Option<RuntimeTaskSpawner>,
 ) -> Result<Value, NativeError> {
+    let task_spawner = task_spawner
+        .ok_or_else(|| crate::type_error("serve", "Otter.serve requires a runtime event loop"))?;
     let options = parse_options(ctx, args, capabilities)?;
     let listener = TcpListener::bind((options.hostname.as_str(), options.port)).map_err(|err| {
         crate::type_error(
@@ -139,34 +162,34 @@ fn serve(
     let actual_addr = listener.local_addr().map_err(|err| {
         crate::type_error("serve", format!("failed to read local address: {err}"))
     })?;
-    println!("Otter.serve listening on http://{actual_addr}");
+    listener.set_nonblocking(true).map_err(|err| {
+        crate::type_error("serve", format!("failed to configure listener: {err}"))
+    })?;
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(err) = handle_stream(ctx, &options, &mut stream) {
-                    let body = format!("Internal Server Error\n{err}");
-                    let _ = write_response(
-                        &mut stream,
-                        500,
-                        "Internal Server Error",
-                        &[(
-                            "content-type".to_string(),
-                            "text/plain; charset=utf-8".to_string(),
-                        )],
-                        body.as_bytes(),
-                    );
-                }
-            }
-            Err(err) => {
-                return Err(crate::type_error(
-                    "serve",
-                    format!("failed to accept connection: {err}"),
-                ));
-            }
-        }
-    }
-    Ok(Value::undefined())
+    let roots = ServeRoots {
+        fetch: ctx.persistent_root_insert(options.fetch),
+        internals: ctx.persistent_root_insert(options.internals),
+        make_request: ctx.persistent_root_insert(options.fns.make_request),
+        response_parts: ctx.persistent_root_insert(options.fns.response_parts),
+    };
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| crate::type_error("serve", "missing execution context"))?;
+    let keep_alive = task_spawner.retain_keep_alive(RuntimeLiveness::Ref);
+    let control = Arc::new(ServeServerControl {
+        shutdown: AtomicBool::new(false),
+        keep_alive,
+        roots: Mutex::new(Some(roots)),
+    });
+    let server = ServeServer {
+        control: control.clone(),
+    };
+    let hostname = options.hostname.clone();
+    let port = actual_addr.port();
+    let url = format!("http://{actual_addr}");
+    spawn_accept_loop(listener, task_spawner, context, control, roots);
+    build_server_object(ctx, server, hostname, port, url)
 }
 
 #[derive(Clone, Copy)]
@@ -183,24 +206,258 @@ struct ServeOptions {
     fns: ServeFns,
 }
 
+#[derive(Clone, Copy)]
+struct ServeRoots {
+    fetch: RuntimePersistentRootId,
+    internals: RuntimePersistentRootId,
+    make_request: RuntimePersistentRootId,
+    response_parts: RuntimePersistentRootId,
+}
+
+struct ServeServerControl {
+    shutdown: AtomicBool,
+    keep_alive: RuntimeKeepAlive,
+    roots: Mutex<Option<ServeRoots>>,
+}
+
+#[derive(Clone)]
+struct ServeServer {
+    control: Arc<ServeServerControl>,
+}
+
 struct HttpRequest {
     method: String,
     url: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: ServeBody,
 }
 
 struct HttpResponse {
     status: u16,
     status_text: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: ServeBody,
+}
+
+struct ServeRequestTask {
+    context: otter_runtime::RuntimeExecutionContext,
+    roots: ServeRoots,
+    request: HttpRequest,
+    reply: mpsc::SyncSender<Result<HttpResponse, String>>,
+}
+
+impl RuntimeTask for ServeRequestTask {
+    fn run(self: Box<Self>, runtime: &mut Runtime) -> Result<(), OtterError> {
+        let ServeRequestTask {
+            context,
+            roots,
+            request,
+            reply,
+        } = *self;
+        let mut response = None;
+        let result = runtime.run_native_event(&context, |ctx| {
+            let options = ServeDispatchOptions::from_roots(ctx, roots)?;
+            let js_request = make_request(ctx, &options, &request)?;
+            let response_value = call_js(
+                ctx,
+                "serve.fetch",
+                options.fetch,
+                Value::undefined(),
+                smallvec::smallvec![js_request],
+            )?;
+            response = Some(response_from_value(ctx, &options, response_value)?);
+            Ok(Value::undefined())
+        });
+        let send_result = match result {
+            Ok(_) => Ok(response.expect("serve response should be set")),
+            Err(err) => Err(err.to_string()),
+        };
+        let _ = reply.send(send_result);
+        Ok(())
+    }
+}
+
+struct ServeDispatchOptions {
+    fetch: Value,
+    internals: Value,
+    fns: ServeFns,
+}
+
+impl ServeDispatchOptions {
+    fn from_roots(ctx: &mut NativeCtx<'_>, roots: ServeRoots) -> Result<Self, NativeError> {
+        let fetch = ctx
+            .persistent_root_get(roots.fetch)
+            .ok_or_else(|| crate::type_error("serve", "server fetch root is closed"))?;
+        let internals = ctx
+            .persistent_root_get(roots.internals)
+            .ok_or_else(|| crate::type_error("serve", "server internals root is closed"))?;
+        let make_request = ctx
+            .persistent_root_get(roots.make_request)
+            .ok_or_else(|| crate::type_error("serve", "server Request factory root is closed"))?;
+        let response_parts = ctx
+            .persistent_root_get(roots.response_parts)
+            .ok_or_else(|| {
+                crate::type_error("serve", "server Response extractor root is closed")
+            })?;
+        Ok(Self {
+            fetch,
+            internals,
+            fns: ServeFns {
+                make_request,
+                response_parts,
+            },
+        })
+    }
+}
+
+fn spawn_accept_loop(
+    listener: TcpListener,
+    task_spawner: RuntimeTaskSpawner,
+    context: otter_runtime::RuntimeExecutionContext,
+    control: Arc<ServeServerControl>,
+    roots: ServeRoots,
+) {
+    thread::Builder::new()
+        .name("otter-serve".to_string())
+        .spawn(move || {
+            while !control.shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        let task_spawner = task_spawner.clone();
+                        let context = context.clone();
+                        thread::spawn(move || {
+                            if let Err(err) =
+                                handle_stream_async(&task_spawner, context, roots, &mut stream)
+                            {
+                                let body = ServeBody::from_bytes(
+                                    format!("Internal Server Error\n{err}").into_bytes(),
+                                );
+                                let _ = write_response(
+                                    &mut stream,
+                                    500,
+                                    "Internal Server Error",
+                                    &[(
+                                        "content-type".to_string(),
+                                        "text/plain; charset=utf-8".to_string(),
+                                    )],
+                                    &body,
+                                );
+                            }
+                        });
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            control.keep_alive.close();
+        })
+        .expect("failed to spawn otter serve accept loop");
+}
+
+fn handle_stream_async(
+    task_spawner: &RuntimeTaskSpawner,
+    context: otter_runtime::RuntimeExecutionContext,
+    roots: ServeRoots,
+    stream: &mut TcpStream,
+) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("failed to set read timeout: {err}"))?;
+    let request = read_request(stream).map_err(|err| err.to_string())?;
+    let (reply, rx) = mpsc::sync_channel(1);
+    task_spawner
+        .enqueue(
+            ServeRequestTask {
+                context,
+                roots,
+                request,
+                reply,
+            },
+            RuntimeLiveness::Ref,
+        )
+        .map_err(|err| err.to_string())?;
+    let response = rx
+        .recv()
+        .map_err(|_| "runtime closed before request completed".to_string())??;
+    write_response(
+        stream,
+        response.status,
+        &response.status_text,
+        &response.headers,
+        &response.body,
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn build_server_object(
+    ctx: &mut NativeCtx<'_>,
+    server: ServeServer,
+    hostname: String,
+    port: u16,
+    url: String,
+) -> Result<Value, NativeError> {
+    let hostname = crate::string_value(ctx, &hostname)?;
+    let url = crate::string_value(ctx, &url)?;
+    let mut builder = ObjectBuilder::from_host_data(ctx, server)?;
+    builder
+        .readonly_property("hostname", hostname)
+        .and_then(|builder| builder.readonly_property("port", Value::number_f64(port as f64)))
+        .and_then(|builder| builder.readonly_property("url", url))
+        .and_then(|builder| builder.builtin_method("stop", 0, server_stop))
+        .and_then(|builder| builder.builtin_method("close", 0, server_stop))
+        .and_then(|builder| builder.builtin_method("ref", 0, server_ref))
+        .and_then(|builder| builder.builtin_method("unref", 0, server_unref))
+        .map_err(|err| crate::type_error("serve", err.to_string()))?;
+    Ok(Value::object(builder.build()))
+}
+
+fn server_receiver(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<otter_runtime::RuntimeJsObject, NativeError> {
+    runtime_this_object(ctx, name, "ServeServer")
+}
+
+fn server_control(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<Arc<ServeServerControl>, NativeError> {
+    let object = server_receiver(ctx, name)?;
+    runtime_with_host_data::<ServeServer, _>(ctx, object, |server| server.control.clone())
+        .map_err(|err| crate::type_error(name, err.to_string()))
+}
+
+fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let control = server_control(ctx, "ServeServer.stop")?;
+    control.shutdown.store(true, Ordering::Release);
+    control.keep_alive.close();
+    if let Some(roots) = control.roots.lock().expect("serve roots poisoned").take() {
+        let _ = ctx.persistent_root_remove(roots.fetch);
+        let _ = ctx.persistent_root_remove(roots.internals);
+        let _ = ctx.persistent_root_remove(roots.make_request);
+        let _ = ctx.persistent_root_remove(roots.response_parts);
+    }
+    Ok(Value::undefined())
+}
+
+fn server_ref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let control = server_control(ctx, "ServeServer.ref")?;
+    control.keep_alive.ref_();
+    Ok(*ctx.this_value())
+}
+
+fn server_unref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let control = server_control(ctx, "ServeServer.unref")?;
+    control.keep_alive.unref();
+    Ok(*ctx.this_value())
 }
 
 fn parse_options(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
-    capabilities: &otter_runtime::CapabilitySet,
+    capabilities: &CapabilitySet,
 ) -> Result<ServeOptions, NativeError> {
     let options = args
         .first()
@@ -253,33 +510,6 @@ fn parse_options(
             response_parts,
         },
     })
-}
-
-fn handle_stream(
-    ctx: &mut NativeCtx<'_>,
-    options: &ServeOptions,
-    stream: &mut TcpStream,
-) -> Result<(), NativeError> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|err| crate::type_error("serve", format!("failed to set read timeout: {err}")))?;
-    let request = read_request(stream)?;
-    let js_request = make_request(ctx, options, &request)?;
-    let response_value = call_js(
-        ctx,
-        "serve.fetch",
-        options.fetch,
-        Value::undefined(),
-        smallvec::smallvec![js_request],
-    )?;
-    let response = response_from_value(ctx, options, response_value)?;
-    write_response(
-        stream,
-        response.status,
-        &response.status_text,
-        &response.headers,
-        &response.body,
-    )
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, NativeError> {
@@ -339,16 +569,16 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, NativeError> {
         }
         headers.push((name, value));
     }
-    let mut body = buffer[header_end..].to_vec();
-    if body.len() < content_length {
-        let missing = content_length - body.len();
-        let start = body.len();
-        body.resize(content_length, 0);
+    let mut body_bytes = buffer[header_end..].to_vec();
+    if body_bytes.len() < content_length {
+        let missing = content_length - body_bytes.len();
+        let start = body_bytes.len();
+        body_bytes.resize(content_length, 0);
         stream
-            .read_exact(&mut body[start..start + missing])
+            .read_exact(&mut body_bytes[start..start + missing])
             .map_err(|err| crate::type_error("serve", format!("failed to read body: {err}")))?;
-    } else if body.len() > content_length {
-        body.truncate(content_length);
+    } else if body_bytes.len() > content_length {
+        body_bytes.truncate(content_length);
     }
     let url = if target.starts_with("http://") || target.starts_with("https://") {
         target.to_string()
@@ -363,13 +593,13 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, NativeError> {
         method,
         url,
         headers,
-        body,
+        body: ServeBody::from_bytes(body_bytes),
     })
 }
 
 fn make_request(
     ctx: &mut NativeCtx<'_>,
-    options: &ServeOptions,
+    options: &ServeDispatchOptions,
     request: &HttpRequest,
 ) -> Result<Value, NativeError> {
     let root_base = ctx.push_scratch_root(options.internals);
@@ -390,20 +620,13 @@ fn make_request(
             .map_err(|err| crate::type_error("serve", err.to_string()))?,
     );
     let flat_headers_root = ctx.push_scratch_root(flat_headers);
-    let body_root = if request.body.is_empty() {
-        None
-    } else {
-        let body = String::from_utf8_lossy(&request.body);
-        Some(push_string_root(ctx, &body)?)
-    };
-    let body = body_root
-        .map(|idx| ctx.scratch_root(idx))
-        .unwrap_or_else(Value::null);
+    let body = request.body.to_js_body(ctx)?;
+    let body_root = ctx.push_scratch_root(body);
     let args = smallvec::smallvec![
         ctx.scratch_root(method_root),
         ctx.scratch_root(url_root),
         ctx.scratch_root(flat_headers_root),
-        body,
+        ctx.scratch_root(body_root),
     ];
     let value = call_js(
         ctx,
@@ -418,7 +641,7 @@ fn make_request(
 
 fn response_from_value(
     ctx: &mut NativeCtx<'_>,
-    options: &ServeOptions,
+    options: &ServeDispatchOptions,
     value: Value,
 ) -> Result<HttpResponse, NativeError> {
     let root_base = ctx.push_scratch_root(options.internals);
@@ -478,7 +701,7 @@ fn response_from_value(
         }
     }
     let body_value = object::get(parts_obj, ctx.heap(), "body").unwrap_or_else(Value::null);
-    let body = body_bytes(ctx, body_value)?;
+    let body = ServeBody::from_js_value(ctx, body_value)?;
     Ok(HttpResponse {
         status,
         status_text,
@@ -487,38 +710,12 @@ fn response_from_value(
     })
 }
 
-fn body_bytes(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Vec<u8>, NativeError> {
-    if value.is_null() || value.is_undefined() {
-        return Ok(Vec::new());
-    }
-    if let Some(string) = value.as_string(ctx.heap()) {
-        return Ok(string.to_lossy_string(ctx.heap()).into_bytes());
-    }
-    if let Some(typed_array) = value.as_typed_array(ctx.heap()) {
-        let offset = typed_array.byte_offset(ctx.heap());
-        let len = typed_array.byte_length(ctx.heap());
-        return Ok(typed_array
-            .buffer(ctx.heap())
-            .with_bytes(ctx.heap(), |bytes| {
-                bytes.get(offset..offset + len).map(<[u8]>::to_vec)
-            })
-            .unwrap_or_default());
-    }
-    if let Some(buffer) = value.as_array_buffer() {
-        return Ok(buffer.with_bytes(ctx.heap(), |bytes| bytes.to_vec()));
-    }
-    Err(crate::type_error(
-        "serve",
-        "Response body streams are not supported yet; return a buffered Response body",
-    ))
-}
-
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
     status_text: &str,
     headers: &[(String, String)],
-    body: &[u8],
+    body: &ServeBody,
 ) -> Result<(), NativeError> {
     write!(stream, "HTTP/1.1 {status} {status_text}\r\n")
         .and_then(|_| write!(stream, "content-length: {}\r\n", body.len()))
@@ -541,7 +738,7 @@ fn write_response(
     }
     stream
         .write_all(b"connection: close\r\n\r\n")
-        .and_then(|_| stream.write_all(body))
+        .and_then(|_| stream.write_all(body.as_buffered_bytes()))
         .map_err(|err| crate::type_error("serve", format!("failed to write response: {err}")))
 }
 

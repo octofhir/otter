@@ -39,6 +39,7 @@ use crate::generator::JsGenerator;
 use crate::microtask::{Microtask, MicrotaskQueue};
 use crate::native_function::NativeFunction;
 use crate::object::JsObject;
+use crate::persistent_roots::PersistentRoots;
 use crate::promise::{JsPromiseHandle, PurePromise};
 use crate::regexp::JsRegExp;
 use crate::symbol::{JsSymbol, SymbolRegistry, WellKnownSymbols};
@@ -249,6 +250,13 @@ impl GcTrace for TimerCallbacks {
     /// Trace every registered timer-callback payload so the JS
     /// callback + extra arguments survive any GC that occurs
     /// between scheduling and firing.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_gc_slots(visitor);
+    }
+}
+
+impl GcTrace for PersistentRoots {
+    /// Trace every host-resource persistent root.
     fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
         self.trace_gc_slots(visitor);
     }

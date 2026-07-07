@@ -37,6 +37,9 @@ use crate::event_loop::{
     EventLoop, RuntimeLiveness, TimerRequest, TimerToken, TimerWake, TokioEventLoop,
 };
 use crate::host_services::{HttpsModuleFetchSink, HttpsModuleFetcherHandle};
+use crate::runtime_activity::{
+    RuntimeActivityAccounting, RuntimeKeepAlive, RuntimeTask, RuntimeTaskQueue, RuntimeTaskSpawner,
+};
 use crate::{
     DiagnosticCode, DynamicImportBegin, ExecutionResult, OtterError, Runtime, RuntimeConfig,
     SourceInput, TimerFireOutcome,
@@ -163,8 +166,87 @@ struct RuntimeCounters {
     shutdown: AtomicBool,
 }
 
+struct InboxRuntimeTaskQueue {
+    tx: SyncSender<RuntimeMessage>,
+    counters: Arc<RuntimeCounters>,
+}
+
+impl RuntimeTaskQueue for InboxRuntimeTaskQueue {
+    fn enqueue_boxed(
+        &self,
+        task: Box<dyn RuntimeTask>,
+        liveness: RuntimeLiveness,
+    ) -> Result<(), OtterError> {
+        self.counters.retain_host_activity(liveness);
+        match self
+            .tx
+            .try_send(RuntimeMessage::RuntimeTask { task, liveness })
+        {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.counters.cancel_host_activity(liveness);
+                self.counters
+                    .backpressure_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(OtterError::Internal {
+                    code: DiagnosticCode::RuntimeBackpressure.as_str().to_string(),
+                    message: "runtime inbox is full".to_string(),
+                })
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.cancel_host_activity(liveness);
+                Err(OtterError::Internal {
+                    code: DiagnosticCode::RuntimeShutdown.as_str().to_string(),
+                    message: "runtime isolate is no longer accepting tasks".to_string(),
+                })
+            }
+        }
+    }
+}
+
+impl RuntimeActivityAccounting for RuntimeCounters {
+    fn retain_host_activity(&self, liveness: RuntimeLiveness) {
+        increment_liveness(
+            liveness,
+            &self.pending_ref_host_ops,
+            &self.pending_unref_host_ops,
+        );
+    }
+
+    fn complete_host_activity(&self, liveness: RuntimeLiveness) {
+        decrement_liveness(
+            liveness,
+            &self.pending_ref_host_ops,
+            &self.pending_unref_host_ops,
+        );
+        self.completed_host_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn cancel_host_activity(&self, liveness: RuntimeLiveness) {
+        decrement_liveness(
+            liveness,
+            &self.pending_ref_host_ops,
+            &self.pending_unref_host_ops,
+        );
+        self.cancelled_host_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn move_host_activity(&self, from: RuntimeLiveness, to: RuntimeLiveness) {
+        decrement_liveness(
+            from,
+            &self.pending_ref_host_ops,
+            &self.pending_unref_host_ops,
+        );
+        increment_liveness(to, &self.pending_ref_host_ops, &self.pending_unref_host_ops);
+    }
+}
+
 enum RuntimeMessage {
     Command(RuntimeCommand),
+    RuntimeTask {
+        task: Box<dyn RuntimeTask>,
+        liveness: RuntimeLiveness,
+    },
     TimerFired {
         token: TimerToken,
         liveness: RuntimeLiveness,
@@ -482,6 +564,44 @@ impl RuntimeHandle {
                 .failed_host_ops
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Retain one long-lived host resource in the runtime liveness counters.
+    ///
+    /// The returned guard must be closed when the host resource closes. Dropping
+    /// the last guard also releases the hold, which covers error paths.
+    #[must_use]
+    pub fn retain_keep_alive(&self, liveness: RuntimeLiveness) -> RuntimeKeepAlive {
+        let accounting: Arc<dyn RuntimeActivityAccounting> = self.inner.counters.clone();
+        RuntimeKeepAlive::retain(accounting, liveness)
+    }
+
+    /// Enqueue an owned task to run on the isolate event-loop thread.
+    ///
+    /// The task is accounted as one host activity until the runner executes it.
+    /// Feature crates should use this for cross-thread callbacks instead of
+    /// calling into VM/JS from worker threads.
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] when the runtime inbox is full or shutting down.
+    pub fn enqueue_runtime_task(
+        &self,
+        task: impl RuntimeTask,
+        liveness: RuntimeLiveness,
+    ) -> Result<(), OtterError> {
+        self.task_spawner().enqueue(task, liveness)
+    }
+
+    /// Clone a sender for scheduling typed runtime tasks.
+    #[must_use]
+    pub fn task_spawner(&self) -> RuntimeTaskSpawner {
+        RuntimeTaskSpawner::new(
+            Arc::new(InboxRuntimeTaskQueue {
+                tx: self.inner.tx.clone(),
+                counters: self.inner.counters.clone(),
+            }),
+            self.inner.counters.clone(),
+        )
     }
 
     /// Cancel a pending timer.
@@ -808,10 +928,18 @@ fn run_isolate(
     scheduler_tx: SyncSender<RuntimeMessage>,
     event_loop: TokioEventLoop,
 ) {
-    let mut runtime = match Runtime::from_config(config) {
-        Ok(runtime) => runtime,
-        Err(_) => return,
-    };
+    let runtime_task_spawner = RuntimeTaskSpawner::new(
+        Arc::new(InboxRuntimeTaskQueue {
+            tx: scheduler_tx.clone(),
+            counters: counters.clone(),
+        }),
+        counters.clone(),
+    );
+    let mut runtime =
+        match Runtime::from_config_with_task_spawner(config, Some(runtime_task_spawner)) {
+            Ok(runtime) => runtime,
+            Err(_) => return,
+        };
     let https_module_fetcher = event_loop.https_module_fetcher();
     let timer_scheduler = Arc::new(InboxTimerScheduler {
         tx: scheduler_tx.clone(),
@@ -1140,6 +1268,28 @@ impl IsolateRunner {
                 if id == 0 {
                     return TickOutcome::Idle;
                 }
+                TickOutcome::Processed
+            }
+            RuntimeMessage::RuntimeTask { task, liveness } => {
+                let result = task.run(&mut self.runtime);
+                decrement_liveness(
+                    liveness,
+                    &self.counters.pending_ref_host_ops,
+                    &self.counters.pending_unref_host_ops,
+                );
+                match result {
+                    Ok(()) => {
+                        self.counters
+                            .completed_host_ops
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        self.counters
+                            .failed_host_ops
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.record_microtask_snapshot();
                 TickOutcome::Processed
             }
             RuntimeMessage::TimerFired {

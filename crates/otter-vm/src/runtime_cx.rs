@@ -193,9 +193,9 @@ impl<'rt> NativeCtx<'rt> {
         }
     }
 
-    /// Execution context for the active native call.
+    /// Return the execution context active for this native call, when present.
     #[must_use]
-    pub(crate) fn execution_context(&self) -> Option<&ExecutionContext> {
+    pub fn execution_context(&self) -> Option<&ExecutionContext> {
         self.context
     }
 
@@ -319,6 +319,22 @@ impl<'rt> NativeCtx<'rt> {
     /// [`Self::push_scratch_root`] returned).
     pub fn pop_scratch_root_to(&mut self, idx: usize) {
         self.cx.interp.json_root_pop_to(idx);
+    }
+
+    /// Insert a generic persistent root for a host-owned resource.
+    pub fn persistent_root_insert(&mut self, value: Value) -> crate::PersistentRootId {
+        self.cx.interp.persistent_root_insert(value)
+    }
+
+    /// Read a generic persistent root.
+    #[must_use]
+    pub fn persistent_root_get(&self, id: crate::PersistentRootId) -> Option<Value> {
+        self.cx.interp.persistent_root_get(id)
+    }
+
+    /// Remove a generic persistent root.
+    pub fn persistent_root_remove(&mut self, id: crate::PersistentRootId) -> Option<Value> {
+        self.cx.interp.persistent_root_remove(id)
     }
 
     /// Allocate an ordinary object while keeping additional local values alive.

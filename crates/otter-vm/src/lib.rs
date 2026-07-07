@@ -115,6 +115,7 @@ mod object_internal_ops;
 pub mod object_statics;
 mod operand_decode;
 pub mod pelt;
+pub mod persistent_roots;
 pub mod promise;
 pub mod promise_dispatch;
 mod promise_ops;
@@ -217,6 +218,7 @@ pub use native_function::{
 };
 pub use number::{NumberValue, NumericOrdering};
 pub use object::JsObject;
+pub use persistent_roots::{PersistentRootId, PersistentRoots};
 pub use promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseReaction, PromiseSettleJobs,
     PromiseState, PromiseThenOutcome, PurePromise, ReactionKind,
@@ -1219,6 +1221,9 @@ pub struct Interpreter {
     /// ordinary objects for user-visible own properties even though
     /// their internal slots live in compact non-object payloads.
     non_gc_exotic_user_props: std::collections::HashMap<usize, JsObject>,
+    /// Generic persistent roots owned by host resources. Host data stores root
+    /// ids from this table rather than raw JS values.
+    persistent_roots: persistent_roots::PersistentRoots,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].

@@ -68,6 +68,7 @@ pub mod module_scope;
 mod package_graph_resolver;
 mod process;
 pub mod promise_registry;
+mod runtime_activity;
 pub mod structured_clone;
 pub mod surface;
 pub mod web_structured_clone;
@@ -112,9 +113,13 @@ pub use otter_vm::{
 };
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{
+    ExecutionContext as RuntimeExecutionContext, PersistentRootId as RuntimePersistentRootId,
+};
+pub use otter_vm::{
     JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,
 };
 pub use promise_registry::{HostSettleOutcome, PromiseId};
+pub use runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 pub use structured_clone::{
     StructuredCloneError, StructuredCloneMapEntry, StructuredCloneNumber, StructuredCloneOptions,
     StructuredCloneProperty, StructuredCloneTransfer, StructuredCloneTransferId,
@@ -145,16 +150,19 @@ pub use worker::{
 pub struct HostedModuleCtx<'rt> {
     builder: RuntimeObjectBuilder<'rt>,
     capabilities: &'rt CapabilitySet,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
 }
 
 impl<'rt> HostedModuleCtx<'rt> {
     fn new(
         interp: &'rt mut Interpreter,
         capabilities: &'rt CapabilitySet,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             builder: RuntimeObjectBuilder::new_in_interpreter(interp)?,
             capabilities,
+            runtime_task_spawner,
         })
     }
 
@@ -162,6 +170,12 @@ impl<'rt> HostedModuleCtx<'rt> {
     #[must_use]
     pub const fn capabilities(&self) -> &CapabilitySet {
         self.capabilities
+    }
+
+    /// Return the runtime event-loop task spawner, when this runtime has one.
+    #[must_use]
+    pub fn runtime_task_spawner(&self) -> Option<RuntimeTaskSpawner> {
+        self.runtime_task_spawner.clone()
     }
 
     /// Define a native method on the module namespace object.
@@ -284,8 +298,9 @@ impl HostedModuleInstall {
         self,
         interp: &mut Interpreter,
         capabilities: &CapabilitySet,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<JsObject, String> {
-        let mut ctx = HostedModuleCtx::new(interp, capabilities)
+        let mut ctx = HostedModuleCtx::new(interp, capabilities, runtime_task_spawner)
             .map_err(|err| format!("out of memory: {err}"))?;
         (self.raw)(&mut ctx)?;
         Ok(ctx.build())
@@ -354,8 +369,10 @@ impl HostedModule {
         self,
         interp: &mut Interpreter,
         capabilities: &CapabilitySet,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<JsObject, String> {
-        self.install.install(interp, capabilities)
+        self.install
+            .install(interp, capabilities, runtime_task_spawner)
     }
 }
 
@@ -1694,6 +1711,13 @@ impl Runtime {
     }
 
     pub(crate) fn from_config(config: RuntimeConfig) -> Result<Self, OtterError> {
+        Self::from_config_with_task_spawner(config, None)
+    }
+
+    pub(crate) fn from_config_with_task_spawner(
+        config: RuntimeConfig,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Result<Self, OtterError> {
         Self::validate_config(&config)?;
         let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
         let package_manager =
@@ -1804,6 +1828,7 @@ impl Runtime {
             package_manager,
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
+            runtime_task_spawner,
         };
         if runtime.config.install_worker_global {
             worker::install_main_worker_globals(&mut runtime)?;
@@ -1844,6 +1869,8 @@ pub struct Runtime {
     /// resolves / rejects it through the standard promise
     /// dispatch path so reactions land on the microtask queue.
     promise_registry: promise_registry::PromiseRegistry,
+    /// Sender for owned tasks that must run on the isolate event loop.
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
 }
 
 pub(crate) enum MessageEventDispatchError {
@@ -1915,6 +1942,12 @@ impl Runtime {
     #[must_use]
     pub fn interrupt_handle(&self) -> InterruptHandle {
         InterruptHandle(self.interp.interrupt_handle())
+    }
+
+    /// Clone the runtime event-loop task spawner, if this runtime has one.
+    #[must_use]
+    pub fn runtime_task_spawner(&self) -> Option<RuntimeTaskSpawner> {
+        self.runtime_task_spawner.clone()
     }
 
     pub(crate) fn set_allow_blocking_atomics_wait(&mut self, allow: bool) {
@@ -2469,6 +2502,39 @@ impl Runtime {
                 map_vm_error(err),
             ))
         })
+    }
+
+    /// Run one host event on the isolate thread through a fresh native context.
+    ///
+    /// The closure must materialize any JS values from owned host data while it
+    /// is executing. VM values must not be stored in the task that calls this
+    /// method; use persistent root ids for long-lived references.
+    ///
+    /// # Errors
+    /// Returns mapped runtime errors for native failures or microtask drain
+    /// failures.
+    pub fn run_native_event<F>(
+        &mut self,
+        context: &ExecutionContext,
+        run: F,
+    ) -> Result<otter_vm::Value, OtterError>
+    where
+        F: FnOnce(&mut otter_vm::NativeCtx<'_>) -> Result<otter_vm::Value, otter_vm::NativeError>,
+    {
+        let global = *self.interp.global_this();
+        let global_value = otter_vm::Value::object(global);
+        let value = {
+            let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
+                &mut self.interp,
+                otter_vm::NativeCallInfo::call(global_value),
+                Some(context),
+            );
+            run(&mut ctx).map_err(map_native_error)?
+        };
+        self.interp.drain_microtasks(context).map_err(|err| {
+            enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
+        })?;
+        Ok(value)
     }
 
     fn map_reentry_error(&mut self, err: otter_vm::VmError) -> OtterError {
@@ -3217,6 +3283,7 @@ impl Runtime {
             &module.module_inits,
             &self.config.hosted_modules,
             &self.config.capabilities,
+            self.runtime_task_spawner.clone(),
         )?;
         // After `allocate_for_module_inits` (which resets per-run module
         // state); registering earlier would be wiped by that reset.
@@ -3458,6 +3525,7 @@ impl Runtime {
         let cfg = std::sync::Arc::new(commonjs::CjsConfig {
             capabilities: self.config.capabilities.clone(),
             hosted: self.config.hosted_modules.clone(),
+            runtime_task_spawner: self.runtime_task_spawner.clone(),
         });
         // Entry execution context, linked into the interpreter code space so the
         // wrapper closures resolve from any frame.
@@ -4796,6 +4864,82 @@ mod tests {
         assert_eq!(stats.pending_dynamic_module_jobs, 0);
         assert_eq!(stats.completed_dynamic_module_jobs, 1);
         assert_eq!(stats.diagnostics, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_keep_alive_liveness_is_idempotent() {
+        let otter = Otter::new();
+        let handle = otter.handle().clone();
+
+        let resource = handle.retain_keep_alive(RuntimeLiveness::Ref);
+        assert_eq!(handle.activity_stats().pending_ref_host_ops, 1);
+        assert!(!resource.is_closed());
+
+        resource.unref();
+        let stats = handle.activity_stats();
+        assert_eq!(stats.pending_ref_host_ops, 0);
+        assert_eq!(stats.pending_unref_host_ops, 1);
+        assert_eq!(stats.completed_host_ops, 0);
+        assert_eq!(stats.cancelled_host_ops, 0);
+
+        resource.ref_();
+        resource.ref_();
+        let stats = handle.activity_stats();
+        assert_eq!(stats.pending_ref_host_ops, 1);
+        assert_eq!(stats.pending_unref_host_ops, 0);
+        assert_eq!(stats.completed_host_ops, 0);
+        assert_eq!(stats.cancelled_host_ops, 0);
+
+        resource.close();
+        resource.close();
+        assert!(resource.is_closed());
+        let stats = handle.activity_stats();
+        assert_eq!(stats.pending_ref_host_ops, 0);
+        assert_eq!(stats.pending_unref_host_ops, 0);
+        assert_eq!(stats.completed_host_ops, 1);
+        assert_eq!(stats.cancelled_host_ops, 0);
+
+        let unref = handle.retain_keep_alive(RuntimeLiveness::Unref);
+        assert_eq!(handle.activity_stats().pending_unref_host_ops, 1);
+        drop(unref);
+        let stats = handle.activity_stats();
+        assert_eq!(stats.pending_unref_host_ops, 0);
+        assert_eq!(stats.cancelled_host_ops, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_task_runs_on_isolate_loop() {
+        struct NotifyTask(std::sync::mpsc::Sender<()>);
+
+        impl RuntimeTask for NotifyTask {
+            fn run(self: Box<Self>, _runtime: &mut Runtime) -> Result<(), OtterError> {
+                self.0
+                    .send(())
+                    .expect("runtime task receiver should be alive");
+                Ok(())
+            }
+        }
+
+        let otter = Otter::new();
+        let handle = otter.handle().clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        handle
+            .enqueue_runtime_task(NotifyTask(tx), RuntimeLiveness::Ref)
+            .expect("runtime task should enqueue");
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("runtime task should run");
+        let mut stats = handle.activity_stats();
+        for _ in 0..50 {
+            if stats.pending_ref_host_ops == 0 && stats.completed_host_ops == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            stats = handle.activity_stats();
+        }
+        assert_eq!(stats.pending_ref_host_ops, 0);
+        assert_eq!(stats.completed_host_ops, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

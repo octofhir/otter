@@ -391,7 +391,7 @@ fn resolve_jobs(explicit: usize, shard_total: usize) -> usize {
     let cores = thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
-    (cores / 2).max(1).min(MAX_PROCESS_WORKERS)
+    (cores / 2).clamp(1, MAX_PROCESS_WORKERS)
 }
 
 fn init_test262_cage(jobs: usize, max_heap_bytes: u64) -> Result<()> {
@@ -899,15 +899,16 @@ fn worker(repo_root: &Path, args: WorkerArgs) -> Result<ExitCode> {
         .append(true)
         .open(&args.out_file)
         .with_context(|| format!("failed to open {}", args.out_file.display()))?;
-    for idx in args.start..args.end.min(test_paths.len()) {
+    let end = args.end.min(test_paths.len());
+    for (idx, test_path) in test_paths.iter().enumerate().take(end).skip(args.start) {
         if std::env::var_os("OTTER_TEST262_TRACE_CURRENT").is_some() {
-            let rel = test_paths[idx]
+            let rel = test_path
                 .strip_prefix(&paths.test_dir)
-                .unwrap_or(&test_paths[idx])
+                .unwrap_or(test_path)
                 .display();
             eprintln!("test262-current {idx} {rel}");
         }
-        let result = run_one(&test_paths[idx], &paths, &mut harness, &exec);
+        let result = run_one(test_path, &paths, &mut harness, &exec);
         let row = WorkerLine { idx, result };
         let line = serde_json::to_string(&row).context("failed to serialize worker result")?;
         use std::io::Write as _;

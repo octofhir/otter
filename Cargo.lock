@@ -2140,7 +2140,6 @@ dependencies = [
  "clap",
  "criterion",
  "otter-bytecode",
- "otter-compiler",
  "otter-modules",
  "otter-node",
  "otter-pm",
@@ -2232,7 +2231,7 @@ name = "otter-node"
 version = "0.1.0"
 dependencies = [
  "flate2",
- "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "globset",
  "libc",
  "md-5",
@@ -2305,7 +2304,6 @@ dependencies = [
 name = "otter-regex"
 version = "0.0.0"
 dependencies = [
- "bitflags 2.13.0",
  "icu_casemap",
  "icu_properties",
  "smallvec",
@@ -2371,7 +2369,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "walkdir",
 ]
 
 [[package]]
@@ -2381,7 +2378,6 @@ dependencies = [
  "criterion",
  "elsa",
  "fixed_decimal",
- "icu_calendar",
  "icu_collator",
  "icu_datetime",
  "icu_decimal",
@@ -2389,7 +2385,6 @@ dependencies = [
  "icu_list",
  "icu_locale",
  "icu_normalizer",
- "icu_time",
  "indexmap",
  "num-bigint",
  "num-traits",
@@ -2423,9 +2418,12 @@ name = "otter-web"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "getrandom 0.3.4",
  "otter-gc",
  "otter-macros",
  "otter-runtime",
+ "sha1",
+ "sha2",
  "thiserror",
  "url",
 ]

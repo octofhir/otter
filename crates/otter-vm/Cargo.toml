@@ -47,8 +47,6 @@ icu_normalizer = { workspace = true }
 icu_decimal = { workspace = true }
 icu_datetime = { workspace = true }
 icu_locale = { workspace = true }
-icu_calendar = { workspace = true }
-icu_time = { workspace = true }
 icu_list = { workspace = true }
 icu_experimental = { workspace = true }
 fixed_decimal = { workspace = true }

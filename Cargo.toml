@@ -45,7 +45,6 @@ oxc_resolver    = "11.19"
 # Errors and serialization.
 anyhow      = "1"
 chrono      = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-glob        = "0.3"
 libc        = "0.2"
 thiserror   = "2"
 serde       = { version = "1", features = ["derive"] }
@@ -54,6 +53,8 @@ serde_yaml  = "0.9"
 toml        = "0.9"
 semver      = "1"
 base64      = "0.22"
+getrandom   = "0.3"
+sha1        = "0.10"
 sha2        = "0.10"
 reqwest     = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "gzip"] }
 http        = "1"
@@ -62,9 +63,6 @@ tar         = "0.4.45"
 
 # CLI / diagnostics / tracing.
 clap                = { version = "4", features = ["derive"] }
-miette              = { version = "7", features = ["fancy"] }
-tracing             = "0.1"
-tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
 tokio               = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util", "process", "net"] }
 
 # Collections / utilities.
@@ -88,8 +86,6 @@ icu_normalizer = { version = "2.1", features = ["compiled_data"] }
 icu_decimal  = { version = "2.1", features = ["compiled_data"] }
 icu_datetime = { version = "2.1", features = ["compiled_data"] }
 icu_locale   = { version = "2.1", features = ["compiled_data"] }
-icu_calendar = { version = "2.1", features = ["compiled_data"] }
-icu_time     = { version = "2.1", features = ["compiled_data"] }
 icu_list     = { version = "2.2", features = ["compiled_data"] }
 icu_experimental = { version = "0.5", features = ["compiled_data"] }
 fixed_decimal = "0.7"

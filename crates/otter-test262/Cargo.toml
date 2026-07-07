@@ -26,20 +26,19 @@ smallvec     = { workspace = true }
 # Parsing helpers (frontmatter + reports).
 serde       = { workspace = true }
 serde_json  = { workspace = true }
-serde_yaml  = "0.9"
+serde_yaml  = { workspace = true }
 toml        = { workspace = true }
 
 # CLI + traversal. The test262 driver uses short-lived worker
 # processes for isolation instead of in-process parallelism.
 clap        = { workspace = true }
-walkdir     = "2"
 ignore      = "0.4"
 indicatif   = "0.18"
 ctrlc       = "3"
 sysinfo     = { workspace = true }
 
 # Errors.
-anyhow      = "1"
+anyhow      = { workspace = true }
 thiserror   = { workspace = true }
 
 # Module-flagged tests need an on-disk entry; we stage them in a
@@ -47,4 +46,4 @@ thiserror   = { workspace = true }
 tempfile    = "3"
 
 # RFC-3339 timestamps for baseline `ran_at` field.
-chrono      = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono      = { workspace = true }

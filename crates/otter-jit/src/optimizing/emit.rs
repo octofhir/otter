@@ -5219,7 +5219,6 @@ mod arm64 {
     /// registers (re-boxed to tagged Values, stored into the frame array), stamps
     /// the resume byte-PC, and returns `STATUS_BAILED`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn emit_deopt_exits(
         ops: &mut Assembler,
         graph: &Graph,

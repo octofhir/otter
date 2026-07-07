@@ -1043,20 +1043,21 @@ fn order_parallel_moves(
             continue;
         }
         // Only cycles remain (every destination is some other move's source).
-        // Break one: copy a cycle member's source to the scratch, rewrite the
-        // move that reads it to read the scratch, and re-run.
-        let (src, dst) = pending[0];
+        // Break one: park a member's source in the scratch and rewrite every
+        // move reading it to read the scratch instead. The parked move itself
+        // stays pending — its destination is still another pending move's
+        // source, so writing it now would clobber a value not yet consumed
+        // (e.g. a two-register swap). With its dependency on the live source
+        // gone, the cycle is open and the readiness rule above schedules the
+        // remaining moves, the parked one last.
+        let (src, _) = pending[0];
         let scratch = Location::Spill(scratch_slot);
         ordered.push((src, scratch));
-        // Whatever read `src` now reads the scratch.
         for m in pending.iter_mut() {
             if m.0 == src {
                 m.0 = scratch;
             }
         }
-        // The first move's source is now satisfied via scratch; emit it directly.
-        ordered.push((scratch, dst));
-        pending.remove(0);
     }
 
     ordered
@@ -1334,5 +1335,56 @@ mod tests {
             alloc.spill_slots >= 1,
             "a 1-register budget on a multi-value loop must spill"
         );
+    }
+    /// Simulate a parallel-move schedule: apply the ordered moves to an
+    /// environment keyed by location and return the final register state.
+    fn run_moves(
+        init: &[(Location, i64)],
+        ordered: &[(Location, Location)],
+    ) -> std::collections::HashMap<Location, i64> {
+        let mut env: std::collections::HashMap<Location, i64> = init.iter().copied().collect();
+        for &(src, dst) in ordered {
+            let v = *env.get(&src).expect("move reads an unwritten location");
+            env.insert(dst, v);
+        }
+        env
+    }
+
+    #[test]
+    fn parallel_moves_two_register_swap() {
+        let a = Location::Reg(0);
+        let b = Location::Reg(1);
+        let ordered = order_parallel_moves(vec![(a, b), (b, a)], 7);
+        let env = run_moves(&[(a, 10), (b, 20)], &ordered);
+        assert_eq!(env[&a], 20, "swap must move b's old value into a");
+        assert_eq!(env[&b], 10, "swap must move a's old value into b");
+    }
+
+    #[test]
+    fn parallel_moves_three_cycle() {
+        let a = Location::Reg(0);
+        let b = Location::Reg(1);
+        let c = Location::Reg(2);
+        // a->b, b->c, c->a (each destination is another move's source).
+        let ordered = order_parallel_moves(vec![(a, b), (b, c), (c, a)], 7);
+        let env = run_moves(&[(a, 1), (b, 2), (c, 3)], &ordered);
+        assert_eq!((env[&b], env[&c], env[&a]), (1, 2, 3));
+    }
+
+    #[test]
+    fn parallel_moves_cycle_with_chain() {
+        // The shape that miscompiled crypto's am3 loop entry: a two-register
+        // swap {j<->n} plus an independent chain {c->x, i->c}.
+        let n_ = Location::Reg(0);
+        let j = Location::Reg(1);
+        let i = Location::Reg(2);
+        let c = Location::Reg(3);
+        let x = Location::Reg(4);
+        let ordered = order_parallel_moves(vec![(n_, j), (j, n_), (c, x), (i, c)], 7);
+        let env = run_moves(&[(n_, 100), (j, 200), (i, 300), (c, 400), (x, 500)], &ordered);
+        assert_eq!(env[&j], 100);
+        assert_eq!(env[&n_], 200);
+        assert_eq!(env[&x], 400);
+        assert_eq!(env[&c], 300);
     }
 }

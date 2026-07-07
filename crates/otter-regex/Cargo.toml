@@ -11,8 +11,6 @@ build = "build.rs"
 # the VM consumes this engine; this engine never reaches back into the VM/GC.
 # Only well-maintained third-party crates are permitted here.
 [dependencies]
-# Flag bit-set ergonomics.
-bitflags = "2"
 # UCD `\p{...}` property data (General_Category, Script, Script_Extensions,
 # binary properties). ICU4X ships the tables under the permissive Unicode
 # license; already present elsewhere in the workspace dependency graph.

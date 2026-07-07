@@ -89,7 +89,7 @@ fn random_bytes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         ));
     }
     let mut buf = vec![0u8; size];
-    getrandom::getrandom(&mut buf)
+    getrandom::fill(&mut buf)
         .map_err(|e| crate::type_error("crypto", format!("randomBytes failed: {e}")))?;
     crate::string_value(ctx, &bytes_to_latin1(&buf))
 }

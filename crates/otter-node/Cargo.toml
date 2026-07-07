@@ -13,9 +13,9 @@ otter-gc = { workspace = true }
 thiserror = { workspace = true }
 globset = { workspace = true }
 sha2 = { workspace = true }
-sha1 = "0.10"
+sha1 = { workspace = true }
 md-5 = "0.10"
-getrandom = "0.2"
+getrandom = { workspace = true }
 flate2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

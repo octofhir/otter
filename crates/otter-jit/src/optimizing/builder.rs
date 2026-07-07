@@ -4192,22 +4192,22 @@ impl<'a> Builder<'a> {
     /// no element op) so a decline line points at the concrete wall — a loop, a
     /// forward branch, a depth-2 call — instead of a generic "not linear".
     fn nested_leaf_blocker(nested: &JitInlineMethod) -> &'static str {
-        if let Ok(cfg) = Cfg::discover(&nested.instructions) {
-            if cfg.ranges.len() > 1 {
-                // Blocks are in start-PC order, so an edge to a block whose id is
-                // not greater than the source is a back-edge — a loop. Anything
-                // else is a forward branch (an `if` / short-circuit).
-                let has_loop = cfg
-                    .succs
-                    .iter()
-                    .enumerate()
-                    .any(|(b, ss)| ss.iter().any(|&s| (s as usize) <= b));
-                return if has_loop {
-                    "callee has a loop"
-                } else {
-                    "callee has a forward branch"
-                };
-            }
+        if let Ok(cfg) = Cfg::discover(&nested.instructions)
+            && cfg.ranges.len() > 1
+        {
+            // Blocks are in start-PC order, so an edge to a block whose id is
+            // not greater than the source is a back-edge — a loop. Anything
+            // else is a forward branch (an `if` / short-circuit).
+            let has_loop = cfg
+                .succs
+                .iter()
+                .enumerate()
+                .any(|(b, ss)| ss.iter().any(|&s| (s as usize) <= b));
+            return if has_loop {
+                "callee has a loop"
+            } else {
+                "callee has a forward branch"
+            };
         }
         if nested
             .instructions

@@ -138,6 +138,8 @@ impl Interpreter {
             jit_arith_feedback: rustc_hash::FxHashMap::default(),
             jit_element_load_kind: rustc_hash::FxHashMap::default(),
             jit_arith_widen_float: rustc_hash::FxHashSet::default(),
+            jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
+            jit_entry_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
             jit_osr_threshold: std::env::var("OTTER_JIT_OSR_THRESHOLD")
@@ -703,6 +705,19 @@ impl Interpreter {
     /// that genuinely hot functions tier up early, high enough that one-shot
     /// calls never pay compile latency.
     pub(crate) const JIT_TIER_UP_THRESHOLD: u32 = 50;
+
+    /// Entry-bail count at which an installed body is evicted and recompiled
+    /// against current feedback (see [`Self::note_jit_entry_bail`]). Low enough
+    /// that a body bailing on every call stops wasting entries quickly, high
+    /// enough that a handful of cold-path bails (a rare branch hitting an
+    /// unsupported region) never evicts a body that is fine on its hot path.
+    pub(crate) const JIT_ENTRY_BAIL_REOPT_THRESHOLD: u32 = 8;
+
+    /// Recompile budget per function for entry-bail eviction. A body still
+    /// bail-looping after this many fresh-feedback recompiles is stuck on
+    /// something feedback cannot express; it is pinned to the interpreter
+    /// rather than thrashing the compiler.
+    pub(crate) const JIT_MAX_ENTRY_BAIL_REOPTS: u32 = 4;
 
     /// Number of compiled back-edges the fuel counter allows between cooperative
     /// budget checkpoints. Large enough to amortize the VM re-entry across a hot

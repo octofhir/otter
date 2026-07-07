@@ -98,6 +98,12 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
             }
         }
 
+        if osr_pc.is_some() {
+            return Ok(otter_vm::JitCompileStatus::Unsupported {
+                reason: format!("function {fid} has no optimizing OSR entry"),
+            });
+        }
+
         match baseline::compile(&request.function) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),

@@ -825,6 +825,17 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// `true` when this body is sound to run *frameless* — entered directly
+    /// from another compiled function's machine code with only a raw register
+    /// window and no published VM frame. That requires every op in the body to
+    /// address registers through the window (`JitCtx.regs`); any stub that
+    /// resolves registers through `JitCtx.frame_index` (interpreter delegates,
+    /// call/closure bridges) would read and write the *caller's* frame instead.
+    /// Gates the bridge-free direct-method inline link. Default `false`.
+    fn frameless_entry_safe(&self) -> bool {
+        false
+    }
+
     /// Safepoint table for compiled code that can call allocating runtime
     /// stubs. Tiers without a published VM-native safepoint contract return an
     /// empty table and must not emit allocating stub calls.

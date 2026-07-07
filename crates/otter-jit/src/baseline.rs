@@ -113,6 +113,7 @@ const MAX_INLINE_ARGS: usize = 4;
 /// room in the C ABI's eight argument registers); raising this past 4 needs a
 /// second packed word.
 pub(crate) const MAX_METHOD_ARGS: usize = 4;
+const MAX_BASELINE_METHOD_ARGS: usize = 2;
 
 /// Pack up to [`MAX_METHOD_ARGS`] argument register indices into one word (one
 /// per 16-bit lane), the form the method-call stubs receive.
@@ -570,6 +571,45 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
         ctx.frame_index,
         bail_pc as u32,
         regcount as usize,
+    ) {
+        Ok(value) => JitRet {
+            value: value.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(err) => {
+            park_jit_error(ctx, err);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
+}
+
+/// Bridge stub for a bridge-free *direct-method* callee that bailed: like
+/// [`jit_self_call_bail_stub`], but the callee is a different function from
+/// the compiled caller, so the interpreter frame is rebuilt from the method's
+/// own value (`callee_bits`, the inline link's SELF bits) and the bound
+/// receiver (`this_bits`) rather than from the caller frame.
+pub(crate) extern "C" fn jit_direct_method_bail_stub(
+    ctx: *mut JitCtx,
+    bail_pc: u64,
+    regcount: u64,
+    callee_bits: u64,
+    this_bits: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_direct_method_call_bail(
+        context,
+        stack,
+        bail_pc as u32,
+        regcount as usize,
+        Value::from_bits(callee_bits),
+        Value::from_bits(this_bits),
     ) {
         Ok(value) => JitRet {
             value: value.to_bits(),
@@ -1626,6 +1666,10 @@ pub struct BaselineCode {
     /// code passes this table through `JitCtx` into `RuntimeStubAllocContext`;
     /// the records must therefore live with the executable code object.
     safepoint_records: Box<[SafepointRecord]>,
+    /// Every op in the body addresses registers through the window
+    /// (`JitCtx.regs`), so the body is sound to enter frameless (see
+    /// [`JitFunctionCode::frameless_entry_safe`]).
+    frameless_entry_safe: bool,
 }
 
 impl std::fmt::Debug for BaselineCode {
@@ -1643,6 +1687,10 @@ impl JitFunctionCode for BaselineCode {
 
     fn osr_only(&self) -> bool {
         self.osr_only
+    }
+
+    fn frameless_entry_safe(&self) -> bool {
+        self.frameless_entry_safe
     }
 
     fn entry_addr(&self) -> Option<usize> {
@@ -2495,10 +2543,19 @@ pub(crate) mod arm64 {
         if let Some(instr) = view.instructions.iter().find(|instr| {
             matches!(
                 instr.op,
-                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally
+                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally | Op::StoreElement
             )
         }) {
             return Err(Unsupported::Opcode(instr.op));
+        }
+        if let Some(argc) = view
+            .instructions
+            .iter()
+            .filter(|instr| instr.op == Op::CallMethodValue)
+            .filter_map(|instr| const_index(&instr.operands, 3).ok())
+            .find(|&argc| argc as usize > super::MAX_BASELINE_METHOD_ARGS)
+        {
+            return Err(Unsupported::ArgCount(argc as usize));
         }
 
         let mut ops = Assembler::new().expect("assembler alloc");
@@ -3665,6 +3722,10 @@ pub(crate) mod arm64 {
             load_ic_cells,
             store_ic_cells,
             safepoint_records,
+            // Baseline bodies can reach delegate/runtime stubs that address
+            // registers through JitCtx.frame_index. They require a published
+            // frame when entered as a method callee.
+            frameless_entry_safe: false,
         })
     }
 

@@ -40,8 +40,11 @@ use otter_gc::raw::RawGc;
 
 use crate::{
     ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, VmError,
-    array, binary::array_buffer::JsArrayBuffer, collections, native_function, object,
-    promise::JsPromiseHandle, weak_refs,
+    array,
+    binary::array_buffer::JsArrayBuffer,
+    collections, native_function, object,
+    promise::{JsPromise, JsPromiseHandle, PromiseState},
+    weak_refs,
 };
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -924,6 +927,49 @@ impl<'rt> NativeCtx<'rt> {
 
     pub(crate) fn collect_native_roots(&self) -> Vec<*mut RawGc> {
         self.cx.interp.collect_runtime_roots()
+    }
+
+    /// Drain the current isolate microtask queue and unwrap a native promise
+    /// that settled during the drain.
+    ///
+    /// This is a generic host-event helper for native integrations that accept
+    /// `T | Promise<T>` results. It does not block on future host work; a
+    /// promise that remains pending after the current microtask drain is
+    /// reported as a type error so callers can wire a real async continuation
+    /// instead of parking the VM.
+    pub fn resolve_native_promise_after_microtasks(
+        &mut self,
+        value: Value,
+        name: &'static str,
+    ) -> Result<Value, NativeError> {
+        let Some(promise) = value.as_promise() else {
+            return Ok(value);
+        };
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+        self.cx
+            .interp
+            .drain_microtasks(&context)
+            .map_err(|err| NativeError::TypeError {
+                name,
+                reason: err.to_string(),
+            })?;
+        match promise.state(self.heap()) {
+            PromiseState::Fulfilled(value) => Ok(value),
+            PromiseState::Rejected(reason) => Err(NativeError::Thrown {
+                name,
+                message: reason.display_string(self.heap()),
+            }),
+            PromiseState::Pending => Err(NativeError::TypeError {
+                name,
+                reason: "promise is still pending after microtask drain".to_string(),
+            }),
+        }
     }
 
     /// Allocate a fixed-length `ArrayBuffer` backing store, keeping the

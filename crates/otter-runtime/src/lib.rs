@@ -4954,6 +4954,26 @@ mod tests {
         assert_eq!(stats.completed_host_ops, 1);
     }
 
+    #[test]
+    fn async_function_adopts_returned_native_promise() {
+        let mut runtime = Runtime::builder().build().unwrap();
+        runtime
+            .eval(SourceInput::from_javascript(
+                r#"
+                let out = "pending";
+                async function inner() {
+                  return Promise.resolve("adopted");
+                }
+                inner().then((value) => {
+                  out = value;
+                });
+                "#,
+            ))
+            .unwrap();
+        let result = runtime.eval(SourceInput::from_javascript("out")).unwrap();
+        assert_eq!(result.completion_string(), "adopted");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "hangs intermittently after active runtime changes; keep targeted while Node compat work continues"]
     async fn runtime_handle_timer_cancellation_and_timeout_are_observable() {

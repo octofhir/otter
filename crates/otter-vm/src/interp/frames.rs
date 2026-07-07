@@ -394,10 +394,12 @@ impl Interpreter {
             }
         };
         if let Some(state) = popped.async_state {
-            let jobs = state.result_promise.fulfill(&mut self.gc_heap, resolved);
-            for j in jobs.jobs {
-                self.microtasks.enqueue(j);
-            }
+            crate::promise_dispatch::resolve_promise_from_interpreter(
+                self,
+                state.result_promise,
+                resolved,
+                None,
+            )?;
             if stack.is_empty() {
                 return Ok(Some(Value::undefined()));
             }

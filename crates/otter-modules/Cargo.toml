@@ -7,11 +7,13 @@ license.workspace = true
 description = "Otter-hosted modules for the active runtime stack."
 
 [dependencies]
+http = { workspace = true }
 libloading = "0.8"
 otter-macros = { workspace = true }
 otter-runtime = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

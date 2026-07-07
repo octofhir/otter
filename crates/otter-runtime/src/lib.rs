@@ -2365,7 +2365,18 @@ impl Runtime {
         Ok(())
     }
 
-    pub(crate) fn install_native_global_call(
+    /// Install a host-defined native function or closure as a global binding.
+    ///
+    /// This is the captured-state counterpart to [`Self::install_native_global`].
+    /// Product crates use it when a global native needs immutable runtime-owned
+    /// captures such as a capability snapshot. Captured JS values must still be
+    /// supplied through the native-function capture list; this helper only
+    /// exposes the call target shape, not arbitrary untraced VM handles.
+    ///
+    /// # Errors
+    /// Returns [`OtterError::OutOfMemory`] when the heap cap blocks the native
+    /// function allocation.
+    pub fn install_native_global_call(
         &mut self,
         name: &'static str,
         length: u8,

@@ -789,11 +789,7 @@ impl<'rt> NativeCtx<'rt> {
     /// materialize the exotic sidecar that disqualifies the array from every
     /// dense fast path. A subclass prototype (or any non-default-realm proto)
     /// is always installed.
-    pub fn set_array_prototype_override_checked(
-        &mut self,
-        array: array::JsArray,
-        proto: Value,
-    ) {
+    pub fn set_array_prototype_override_checked(&mut self, array: array::JsArray, proto: Value) {
         if !self.cx.interp.active_realm_is_extra
             && self
                 .cx

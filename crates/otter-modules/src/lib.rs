@@ -9,6 +9,7 @@
 //! - [`kv`] - permission-gated key/value storage.
 //! - [`sql`] - permission-gated SQLite access.
 //! - [`ffi`] - permission-gated native library loading metadata.
+//! - [`serve`] - Otter-specific HTTP server entry points.
 //! - [`HOSTED_MODULES`] - static hosted-module specs.
 //!
 //! # Invariants
@@ -22,17 +23,19 @@
 
 pub mod ffi;
 pub mod kv;
+pub mod serve;
 pub mod sql;
 
 use otter_runtime::{
-    HostedModule, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNumberValue as NumberValue, RuntimeValue as Value, runtime_arg_to_string,
-    runtime_string_value, runtime_type_error,
+    HostedModule, OtterBuilder, RuntimeBuilder, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue, RuntimeValue as Value,
+    runtime_arg_to_string, runtime_string_value, runtime_type_error,
 };
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 
 /// Active `otter:*` hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[
+    serve::OTTER_HOSTED_MODULE,
     kv::KV_HOSTED_MODULE,
     sql::SQL_HOSTED_MODULE,
     ffi::FFI_HOSTED_MODULE,
@@ -42,6 +45,27 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
 #[must_use]
 pub const fn hosted_modules() -> &'static [HostedModule] {
     HOSTED_MODULES
+}
+
+/// Builder extension for opting into Otter-specific hosted modules.
+pub trait OtterModulesBuilderExt: Sized {
+    /// Install the active Otter-specific hosted modules and globals.
+    #[must_use]
+    fn with_otter_modules(self) -> Self;
+}
+
+impl OtterModulesBuilderExt for RuntimeBuilder {
+    fn with_otter_modules(self) -> Self {
+        self.hosted_modules(HOSTED_MODULES.iter().copied())
+            .global_installer(serve::otter_global_installer())
+    }
+}
+
+impl OtterModulesBuilderExt for OtterBuilder {
+    fn with_otter_modules(self) -> Self {
+        self.hosted_modules(HOSTED_MODULES.iter().copied())
+            .global_installer(serve::otter_global_installer())
+    }
 }
 
 fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {

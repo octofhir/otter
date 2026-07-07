@@ -351,10 +351,11 @@ mod arm64 {
         VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_OFFSET,
         jit_alloc_object_literal_stub, jit_array_push_optimizing_stub, jit_backedge_poll_stub,
         jit_call_collection_method_ic_stub, jit_call_method_stub_optimizing,
-        jit_load_global_stub_optimizing, jit_load_property_stub_optimizing, jit_load_string_stub,
-        jit_new_array_stub, jit_number_to_string_fast_stub, jit_prepare_direct_call_stub,
+        jit_direct_method_bail_stub, jit_load_global_stub_optimizing,
+        jit_load_property_stub_optimizing, jit_load_string_stub, jit_new_array_stub,
+        jit_number_to_string_fast_stub, jit_prepare_direct_call_stub,
         jit_prepare_direct_method_call_stub, jit_resume_inline_callee_stack_stub,
-        jit_direct_method_bail_stub, jit_self_call_bail_stub, jit_store_global_stub_optimizing,
+        jit_self_call_bail_stub, jit_store_global_stub_optimizing,
         jit_store_property_stub_optimizing, jit_string_char_code_at_guarded_leaf_stub,
         jit_string_char_code_at_leaf_stub, otter_jit_fmod, value_tag,
     };
@@ -2578,9 +2579,8 @@ mod arm64 {
                 NodeKind::Call { .. } | NodeKind::CallMethod { .. }
             )
         });
-        let frameless_entry_safe = !entry_via_osr_only
-            && !has_calls
-            && graph_allows_frameless_self_call(graph);
+        let frameless_entry_safe =
+            !entry_via_osr_only && !has_calls && graph_allows_frameless_self_call(graph);
         Ok(OptimizedCode {
             code: CompiledCode::new(buf, entry),
             osr_offsets,

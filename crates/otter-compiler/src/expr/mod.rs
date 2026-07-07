@@ -26,6 +26,7 @@ mod binary;
 mod construct;
 pub(crate) mod identifier;
 mod import_meta;
+mod jsx;
 pub(crate) mod literal;
 mod member;
 mod object_array;
@@ -211,6 +212,10 @@ pub(crate) fn compile_expr(
         Expression::ObjectExpression(obj) => {
             object_array::compile_object_literal(cx, obj, enclosing_span)
         }
+
+        Expression::JSXElement(element) => jsx::compile_jsx_element(cx, element),
+
+        Expression::JSXFragment(fragment) => jsx::compile_jsx_fragment(cx, fragment),
 
         Expression::FunctionExpression(f) => {
             let span = (f.span.start, f.span.end);

@@ -1,19 +1,20 @@
 use std::collections::BTreeMap;
 
 use otter_modules::ffi::{FfiSignature, FfiType};
-use otter_modules::hosted_modules;
 use otter_modules::kv::KvStore;
 use otter_modules::sql::SqlDatabase;
+use otter_modules::{OtterModulesBuilderExt, hosted_modules};
 use otter_runtime::{CapabilitySet, Permission, Runtime};
 use serde_json::json;
 
 #[test]
 fn hosted_module_specs_are_static_and_ordered() {
     let specs = hosted_modules();
-    assert_eq!(specs.len(), 3);
-    assert_eq!(specs[0].specifier(), "otter:kv");
-    assert_eq!(specs[1].specifier(), "otter:sql");
-    assert_eq!(specs[2].specifier(), "otter:ffi");
+    assert_eq!(specs.len(), 4);
+    assert_eq!(specs[0].specifier(), "otter");
+    assert_eq!(specs[1].specifier(), "otter:kv");
+    assert_eq!(specs[2].specifier(), "otter:sql");
+    assert_eq!(specs[3].specifier(), "otter:ffi");
 }
 
 #[test]
@@ -82,10 +83,7 @@ fn otter_kv_resolves_and_runs_from_module_graph() {
     )
     .unwrap();
 
-    let mut runtime = Runtime::builder()
-        .hosted_modules(hosted_modules().iter().copied())
-        .build()
-        .unwrap();
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
     runtime.run_module(&main).unwrap();
 }
 
@@ -108,9 +106,38 @@ fn otter_sql_resolves_and_runs_from_module_graph() {
     )
     .unwrap();
 
-    let mut runtime = Runtime::builder()
-        .hosted_modules(hosted_modules().iter().copied())
-        .build()
-        .unwrap();
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
     runtime.run_module(&main).unwrap();
+}
+
+#[test]
+fn bare_otter_module_exports_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.mjs");
+    std::fs::write(
+        &main,
+        r#"
+            import { serve } from "otter";
+            if (typeof serve !== "function") {
+                throw new Error("serve export missing");
+            }
+        "#,
+    )
+    .unwrap();
+
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
+    runtime.run_module(&main).unwrap();
+}
+
+#[test]
+fn otter_global_installs_serve() {
+    let mut runtime = Runtime::builder().with_otter_modules().build().unwrap();
+    runtime
+        .eval(otter_runtime::SourceInput::from_javascript(
+            r#"
+            if (typeof Otter !== "object") throw new Error("Otter global missing");
+            if (typeof Otter.serve !== "function") throw new Error("Otter.serve missing");
+            "#,
+        ))
+        .unwrap();
 }

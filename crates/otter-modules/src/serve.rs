@@ -265,14 +265,18 @@ impl RuntimeTask for ServeRequestTask {
                 Value::undefined(),
                 smallvec::smallvec![js_request],
             )?;
+            let response_value = resolve_fetch_result(ctx, response_value)?;
             response = Some(response_from_value(ctx, &options, response_value)?);
             Ok(Value::undefined())
         });
-        let send_result = match result {
-            Ok(_) => Ok(response.expect("serve response should be set")),
-            Err(err) => Err(err.to_string()),
-        };
-        let _ = reply.send(send_result);
+        match result {
+            Ok(_) => {
+                let _ = reply.send(Ok(response.expect("serve response should be set")));
+            }
+            Err(err) => {
+                let _ = reply.send(Err(err.to_string()));
+            }
+        }
         Ok(())
     }
 }
@@ -708,6 +712,10 @@ fn response_from_value(
         headers,
         body,
     })
+}
+
+fn resolve_fetch_result(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
+    ctx.resolve_native_promise_after_microtasks(value, "serve.fetch")
 }
 
 fn write_response(

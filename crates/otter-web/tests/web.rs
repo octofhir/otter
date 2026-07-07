@@ -96,6 +96,32 @@ fn request_parses_standard_init_and_reads_body() {
 }
 
 #[test]
+fn request_text_awaits_inside_async_function() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "pending";
+        const request = new Request("https://example.com/api", {
+          method: "post",
+          body: "hello",
+        });
+        async function readBody() {
+          return await request.text();
+        }
+        readBody().then(
+          (text) => { out = text; },
+          (err) => { out = "ERR:" + err; },
+        );
+        out
+        "#,
+    );
+    assert_eq!(result, "pending");
+    let after = eval_string(&mut runtime, "out");
+    assert_eq!(after, "hello");
+}
+
+#[test]
 fn request_rejects_bodied_get_and_forbidden_methods() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(

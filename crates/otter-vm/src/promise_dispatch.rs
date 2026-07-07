@@ -3042,6 +3042,35 @@ fn resolve_native_body(
     Ok(Value::undefined())
 }
 
+/// Resolve a promise from interpreter code without requiring a [`NativeCtx`].
+///
+/// This is the same core path needed by async function frame completion:
+/// returning a native promise must adopt that promise instead of fulfilling the
+/// async function's promise with the promise object itself.
+pub(crate) fn resolve_promise_from_interpreter(
+    interp: &mut Interpreter,
+    promise: JsPromiseHandle,
+    value: Value,
+    context: Option<ExecutionContext>,
+) -> Result<(), crate::VmError> {
+    if !matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
+        return Ok(());
+    }
+
+    if let Some(inner) = value.as_promise() {
+        let value_root = Value::promise(inner);
+        let (on_fulfill, on_reject) =
+            make_resolve_adoption_handlers_runtime_rooted(interp, promise, &[&value_root], &[])
+                .map_err(crate::oom_to_vm)?;
+        attach_then(interp, context, &inner, Some(on_fulfill), Some(on_reject));
+        return Ok(());
+    }
+
+    let jobs = promise.fulfill(interp.gc_heap_mut(), value);
+    drain_jobs(interp, jobs);
+    Ok(())
+}
+
 /// §27.2.1.3.2 PromiseResolveThenableJob — a native that calls
 /// `then.call(thenable, resolve, reject)` and, if that call throws,
 /// rejects the promise with the abrupt completion's value. Enqueued
@@ -3092,6 +3121,58 @@ fn make_resolve_thenable_job(
     .map_err(|_| oom_native("PromiseResolveThenableJob"))
 }
 
+fn make_resolve_adoption_handlers_runtime_rooted(
+    interp: &mut Interpreter,
+    resolver: JsPromiseHandle,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<(Value, Value), otter_gc::OutOfMemory> {
+    let resolver_value = Value::promise(resolver);
+    let mut fulfill_roots = Vec::with_capacity(value_roots.len() + 1);
+    fulfill_roots.extend_from_slice(value_roots);
+    fulfill_roots.push(&resolver_value);
+    let on_fulfill = promise_native_runtime(
+        interp,
+        "Promise resolve adopt fulfill",
+        1,
+        smallvec![resolver_value],
+        &fulfill_roots,
+        slice_roots,
+        move |ctx, args, captures| {
+            let resolver = settle_native_promise(captures);
+            let interp = ctx.interp_mut();
+            let v = args.first().cloned().unwrap_or(Value::undefined());
+            let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
+            drain_jobs(interp, jobs);
+            Ok(Value::undefined())
+        },
+    )?;
+
+    let resolver_reject_value = Value::promise(resolver);
+    let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
+    reject_roots.extend_from_slice(value_roots);
+    reject_roots.push(&resolver_reject_value);
+    reject_roots.push(&on_fulfill);
+    let on_reject = promise_native_runtime(
+        interp,
+        "Promise resolve adopt reject",
+        1,
+        smallvec![resolver_reject_value],
+        &reject_roots,
+        slice_roots,
+        move |ctx, args, captures| {
+            let resolver = settle_native_promise(captures);
+            let interp = ctx.interp_mut();
+            let reason = args.first().cloned().unwrap_or(Value::undefined());
+            let jobs = resolver.reject(interp.gc_heap_mut(), reason);
+            drain_jobs(interp, jobs);
+            Ok(Value::undefined())
+        },
+    )?;
+
+    Ok((on_fulfill, on_reject))
+}
+
 fn make_resolve_adoption_handlers_native_rooted(
     ctx: &mut NativeCtx<'_>,
     resolver: JsPromiseHandle,
@@ -3108,7 +3189,8 @@ fn make_resolve_adoption_handlers_native_rooted(
         smallvec![resolver_value],
         &fulfill_roots,
         slice_roots,
-        move |ctx, args, _captures| {
+        move |ctx, args, captures| {
+            let resolver = settle_native_promise(captures);
             let interp = ctx.interp_mut();
             let v = args.first().cloned().unwrap_or(Value::undefined());
             let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
@@ -3117,8 +3199,7 @@ fn make_resolve_adoption_handlers_native_rooted(
         },
     )?;
 
-    let resolver_for_reject = resolver;
-    let resolver_reject_value = Value::promise(resolver_for_reject);
+    let resolver_reject_value = Value::promise(resolver);
     let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
     reject_roots.extend_from_slice(value_roots);
     reject_roots.push(&resolver_reject_value);
@@ -3129,10 +3210,11 @@ fn make_resolve_adoption_handlers_native_rooted(
         smallvec![resolver_reject_value],
         &reject_roots,
         slice_roots,
-        move |ctx, args, _captures| {
+        move |ctx, args, captures| {
+            let resolver = settle_native_promise(captures);
             let interp = ctx.interp_mut();
             let reason = args.first().cloned().unwrap_or(Value::undefined());
-            let jobs = resolver_for_reject.reject(interp.gc_heap_mut(), reason);
+            let jobs = resolver.reject(interp.gc_heap_mut(), reason);
             drain_jobs(interp, jobs);
             Ok(Value::undefined())
         },

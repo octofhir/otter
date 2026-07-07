@@ -975,6 +975,23 @@ pub struct Interpreter {
     /// feedback: operands may still be int32-only while the result no longer
     /// fits int32.
     jit_arith_widen_float: rustc_hash::FxHashSet<(u32, u32)>,
+    /// Per-function count of *entry* bails out of an installed compiled body
+    /// (function-entry, sync-entry, and direct-call callee entries alike). A
+    /// body that bails on every call — typically compiled early against
+    /// feedback that later turned polymorphic — is worse than the interpreter:
+    /// each call pays the compiled prologue, the failing guard, and the frame
+    /// hand-off, then interprets anyway. At
+    /// [`Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD`] the body is evicted so the next
+    /// resolve recompiles it against the richer feedback those interpreter
+    /// completions recorded.
+    jit_entry_bail_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// How many times a function's body has been evicted for recompilation by
+    /// [`Self::note_jit_entry_bail`]. Bounded by
+    /// [`Self::JIT_MAX_ENTRY_BAIL_REOPTS`]: a body still bail-looping after
+    /// that many fresh-feedback recompiles is stuck on something feedback
+    /// cannot express, and is pinned to the interpreter instead of thrashing
+    /// the compiler.
+    jit_entry_reopt_counts: rustc_hash::FxHashMap<u32, u32>,
     /// OSR targets that bailed, had no trampoline, or whose function is
     /// uncompilable; OSR is not retried for them. Keyed by `(function_id,
     /// loop_header_pc)` so a bail in one loop disables only *that* loop header,

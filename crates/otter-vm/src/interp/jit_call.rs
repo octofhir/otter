@@ -63,10 +63,13 @@ impl Interpreter {
                 let fid = stack[top_idx].function_id;
                 Self::trace_jit_bail(context, fid, "entry", None, pc);
                 stack[top_idx].pc = pc;
-                self.reoptimize_arith_overflow_bail(context, fid, pc);
+                if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                    self.note_jit_entry_bail(fid);
+                }
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => {
+                self.note_jit_entry_success(stack[top_idx].function_id);
                 let popped = self.return_running_finally(stack, value)?;
                 Ok(Some(popped))
             }
@@ -315,6 +318,52 @@ impl Interpreter {
         true
     }
 
+    /// Record one *entry* bail out of `fid`'s installed compiled body and
+    /// evict-for-recompile when it keeps happening.
+    ///
+    /// A body whose guard fails right after entry on every call (typically
+    /// compiled at the tier-up threshold against feedback that later turned
+    /// polymorphic) is strictly worse than interpreting: each call pays the
+    /// compiled prologue, the failing guard, and the bail hand-off, then
+    /// interprets anyway — and nothing evicts it, so it stays that way forever.
+    /// Each bailed call *does* complete in the interpreter, enriching the
+    /// property/method/arith feedback for exactly the sites that failed, so at
+    /// [`Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD`] the body is dropped and the
+    /// next resolve recompiles it against that richer snapshot. A function
+    /// that has been recompiled [`Self::JIT_MAX_ENTRY_BAIL_REOPTS`] times and
+    /// still bail-loops is pinned to the interpreter (`jit_code[fid] = None`,
+    /// the "uncompilable" verdict) instead of thrashing the compiler.
+    /// The count is of *consecutive* bails: a successful compiled completion
+    /// clears it (see [`Self::note_jit_entry_success`]), so a body whose rare
+    /// cold branch bails but whose hot path completes fine never accumulates
+    /// to the threshold — only a bail-dominated body is evicted.
+    pub(crate) fn note_jit_entry_bail(&mut self, fid: u32) {
+        let bails = self.jit_entry_bail_counts.entry(fid).or_insert(0);
+        *bails = bails.saturating_add(1);
+        if *bails < Self::JIT_ENTRY_BAIL_REOPT_THRESHOLD {
+            return;
+        }
+        self.jit_entry_bail_counts.remove(&fid);
+        let reopts = self.jit_entry_reopt_counts.entry(fid).or_insert(0);
+        let exhausted = *reopts >= Self::JIT_MAX_ENTRY_BAIL_REOPTS;
+        *reopts = reopts.saturating_add(1);
+        self.invalidate_jit_function(fid);
+        if exhausted {
+            self.jit_code.insert(fid, None);
+        }
+    }
+
+    /// Clear `fid`'s consecutive-entry-bail count after a successful compiled
+    /// completion. The empty-map probe keeps this free on the hot path: the
+    /// map only holds functions that bailed since their last success, which is
+    /// almost always none.
+    #[inline]
+    pub(crate) fn note_jit_entry_success(&mut self, fid: u32) {
+        if !self.jit_entry_bail_counts.is_empty() {
+            self.jit_entry_bail_counts.remove(&fid);
+        }
+    }
+
     /// Drop every installed optimizing-tier body for `fid` so the next tier-up
     /// sees the latest compile policy / feedback snapshot.
     pub(crate) fn invalidate_jit_function(&mut self, fid: u32) {
@@ -355,10 +404,15 @@ impl Interpreter {
                 let fid = stack[top_idx].function_id;
                 Self::trace_jit_bail(context, fid, "sync-entry", None, pc);
                 stack[top_idx].pc = pc;
-                self.reoptimize_arith_overflow_bail(context, fid, pc);
+                if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                    self.note_jit_entry_bail(fid);
+                }
                 Ok(None)
             }
-            jit::JitExecOutcome::Returned(value) => Ok(Some(value)),
+            jit::JitExecOutcome::Returned(value) => {
+                self.note_jit_entry_success(stack[top_idx].function_id);
+                Ok(Some(value))
+            }
             jit::JitExecOutcome::Threw(err) => Err(err),
         }
     }
@@ -974,11 +1028,15 @@ impl Interpreter {
     ) {
         // A closure method is eligible for the bridge-free asm flat-table link
         // (machine-code callee window + branch to the compiled entry, no VM frame
-        // build) when it builds no own upvalue cells — the emitted call reads its
-        // captured spine LIVE from the resolved closure body. A bare function is
-        // always eligible.
+        // build) only when the compiled body itself is sound to run frameless:
+        // every op addresses registers through the window, never through
+        // `JitCtx.frame_index` (which would name the compiled *caller's* frame).
+        // On top of that, a closure method must build no own upvalue cells — the
+        // emitted call reads its captured spine LIVE from the resolved closure
+        // body. A bare function has no spine constraint.
         let method_is_plain_function = method == Value::function(function_id);
-        let asm_link_eligible = method_is_plain_function || frameless_upvalues_ok;
+        let asm_link_eligible = code.frameless_entry_safe()
+            && (method_is_plain_function || frameless_upvalues_ok);
         // A closure method only caches at a monomorphic site. A polymorphic receiver
         // family (one `arr[i].run()` site over sibling classes) exposes no single
         // stable own/direct-prototype stub to cache, so the shape-walk loop below
@@ -1323,6 +1381,7 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         if let Some(mut done) = stack.pop() {
+            self.note_jit_entry_success(done.function_id);
             self.reclaim_registers(&mut done);
         }
         self.release_jit_direct_code_at(callee_frame_index);
@@ -1369,9 +1428,56 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let fid = caller.function_id;
         let upvalues = caller.upvalues.clone();
+        self.note_jit_entry_bail(fid);
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let mut frame =
             Frame::with_exec_registers(function, None, upvalues, Value::undefined(), registers);
+        frame.pc = bail_pc;
+        stack.push(frame);
+        self.dispatch_loop(context, stack)
+    }
+
+    /// Rebuild and run the interpreter frame for a bridge-free *direct-method*
+    /// callee that bailed out of its compiled entry. Unlike
+    /// [`Self::jit_self_call_bail`] the callee is a different function from the
+    /// compiled caller, so the caller frame names the wrong body: the frame is
+    /// rebuilt from the method value itself (`callee`, the inline link's SELF
+    /// bits — a closure carrying fid + captured spine, or a bare interned
+    /// function) with the receiver the inline path bound as `this`. The window
+    /// was built on the flat register stack by emitted code and is popped here
+    /// exactly like the self-call path.
+    pub fn jit_direct_method_call_bail(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut jit::JitFrameStack,
+        bail_pc: u32,
+        regcount: usize,
+        callee: Value,
+        this: Value,
+    ) -> Result<Value, VmError> {
+        let base = self
+            .reg_top
+            .checked_sub(regcount)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut registers: smallvec::SmallVec<[Value; 8]> =
+            smallvec::SmallVec::with_capacity(regcount);
+        registers.extend_from_slice(&self.reg_stack[base..base + regcount]);
+        self.reg_top = base;
+
+        let (fid, upvalues) = match callee.as_closure(&self.gc_heap) {
+            Some(c) => (
+                c.function_id(),
+                self.gc_heap
+                    .read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice()),
+            ),
+            None => (
+                callee.as_function().ok_or(VmError::InvalidOperand)?,
+                Vec::new().into_boxed_slice(),
+            ),
+        };
+        self.note_jit_entry_bail(fid);
+        let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
+        let mut frame = Frame::with_exec_registers(function, None, upvalues, this, registers);
         frame.pc = bail_pc;
         stack.push(frame);
         self.dispatch_loop(context, stack)
@@ -1465,6 +1571,7 @@ impl Interpreter {
             return Err(VmError::InvalidOperand);
         }
         self.release_jit_direct_code_at(callee_frame_index);
+        self.note_jit_entry_bail(stack[callee_frame_index].function_id);
         stack[callee_frame_index].pc = bail_pc;
         match self.dispatch_loop(context, stack) {
             Ok(value) => {
@@ -1635,6 +1742,7 @@ impl Interpreter {
         match self.run_compiled_frame(stack, context, idx, code) {
             jit::JitExecOutcome::Returned(value) => {
                 if let Some(mut done) = stack.pop() {
+                    self.note_jit_entry_success(done.function_id);
                     self.reclaim_registers(&mut done);
                 }
                 Ok(value)
@@ -1651,6 +1759,7 @@ impl Interpreter {
             // bounded to this appended frame, never unwinding the caller frames
             // below it.
             jit::JitExecOutcome::Bailed(pc) => {
+                self.note_jit_entry_bail(stack[idx].function_id);
                 stack[idx].pc = pc;
                 self.dispatch_loop(context, stack)
             }

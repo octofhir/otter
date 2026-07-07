@@ -178,6 +178,24 @@ impl Interpreter {
         context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
+        let frame_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        self.do_math_call_at_frame(stack, context, frame_index, operands, self.current_byte_len)
+    }
+
+    /// Handle guarded `Math.<method>(args...)` intrinsic calls for a known
+    /// caller frame. JIT re-entry uses this instead of relying on the dispatch
+    /// loop's current top frame and `current_byte_len` side channels.
+    pub(crate) fn do_math_call_at_frame(
+        &mut self,
+        stack: &mut HoltStack,
+        context: &ExecutionContext,
+        frame_index: usize,
+        operands: &[Operand],
+        byte_len: u32,
+    ) -> Result<(), VmError> {
+        if frame_index >= stack.len() {
+            return Err(VmError::InvalidOperand);
+        }
         let dst = register_operand(operands.first())?;
         let method_id = const_operand(operands.get(1))?;
         let method = otter_bytecode::method_id::MathMethod::from_u32(method_id)
@@ -186,12 +204,10 @@ impl Interpreter {
             Some(&Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let caller_byte_len = self.current_byte_len;
-        let top_idx = stack.len() - 1;
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
             let r = register_operand(operands.get(3 + i))?;
-            arg_values.push(*read_register(&stack[top_idx], r)?);
+            arg_values.push(*read_register(&stack[frame_index], r)?);
         }
 
         let lexical_math = self.read_global_lexical("Math")?;
@@ -209,8 +225,8 @@ impl Interpreter {
                         self.err_type((format!("Math.{} {reason}", method.name())).into())
                     }
                 })?;
-            write_register(&mut stack[top_idx], dst, value)?;
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            write_register(&mut stack[frame_index], dst, value)?;
+            stack[frame_index].advance_pc(byte_len)?;
             return Ok(());
         }
 
@@ -243,7 +259,7 @@ impl Interpreter {
         if !self.is_callable_runtime(&callee) {
             return Err(VmError::NotCallable);
         }
-        stack[top_idx].advance_pc(caller_byte_len)?;
+        stack[frame_index].advance_pc(byte_len)?;
         self.invoke(stack, context, &callee, math_value, arg_values, dst)
     }
 

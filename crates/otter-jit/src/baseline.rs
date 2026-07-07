@@ -1280,6 +1280,10 @@ otter_jit_math_leaf! {
     otter_jit_cbrt => cbrt,
 }
 
+extern "C" fn otter_jit_math_random() -> u64 {
+    Value::number(otter_vm::math::random_number()).to_bits()
+}
+
 /// Bridge stub: perform a `StoreGlobalBinding` from optimizing-tier code. The VM
 /// decodes the value register, name-constant index, and strict flag from the
 /// bytecode at `byte_pc`, reads the stored value from the interpreter frame slot
@@ -1887,7 +1891,7 @@ pub(crate) mod arm64 {
         jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
         jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
         jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        pack_method_arg_regs, reg_offset, value_tag,
+        otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -2543,13 +2547,7 @@ pub(crate) mod arm64 {
         if let Some(instr) = view.instructions.iter().find(|instr| {
             matches!(
                 instr.op,
-                Op::EnterTry
-                    | Op::LeaveTry
-                    | Op::Throw
-                    | Op::EndFinally
-                    | Op::StoreElement
-                    | Op::StoreProperty
-                    | Op::MathCall
+                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally | Op::StoreElement
             )
         }) {
             return Err(Unsupported::Opcode(instr.op));
@@ -3628,9 +3626,26 @@ pub(crate) mod arm64 {
                 // constants, checked upvalue store, arithmetic tails, and
                 // descriptor writes). All run to completion without pushing a
                 // frame.
+                Op::MathCall => {
+                    let dst = reg(ops_ref, 0)?;
+                    let method_id = const_index(ops_ref, 1)?;
+                    let argc = const_index(ops_ref, 2)?;
+                    if argc == 0
+                        && otter_bytecode::method_id::MathMethod::from_u32(method_id)
+                            == Some(otter_bytecode::method_id::MathMethod::Random)
+                    {
+                        emit_load_u64(&mut ops, 16, otter_jit_math_random as *const () as u64);
+                        dynasm!(ops ; .arch aarch64 ; blr x16);
+                        store_reg(&mut ops, 0, dst)?;
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                        emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
+                        emit_load_u64(&mut ops, 2, u64::from(view.function_id));
+                        emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
+                    }
+                }
                 Op::MakeClosure
                 | Op::LoadString
-                | Op::MathCall
                 | Op::DefineDataProperty
                 | Op::FreshUpvalue
                 | Op::LoadBuiltinError

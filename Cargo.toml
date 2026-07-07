@@ -56,6 +56,7 @@ semver      = "1"
 base64      = "0.22"
 sha2        = "0.10"
 reqwest     = { version = "0.13.4", default-features = false, features = ["rustls", "http2", "json", "gzip"] }
+http        = "1"
 flate2      = "1.1.9"
 tar         = "0.4.45"
 

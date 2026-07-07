@@ -28,6 +28,7 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use otter_bytecode::disasm::disassemble;
+use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
@@ -698,6 +699,7 @@ async fn run_file_with_cpu_profile(
     let mut builder = otter_runtime::Runtime::builder()
         .capabilities(caps.clone())
         .with_node_apis()
+        .with_otter_modules()
         .with_web_apis()
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
@@ -1359,6 +1361,7 @@ fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
     let mut builder = otter_runtime::Otter::builder()
         .capabilities(caps.clone())
         .with_node_apis()
+        .with_otter_modules()
         .with_web_apis();
     if let Some(secs) = cli_timeout_secs() {
         builder = builder.timeout(std::time::Duration::from_secs(secs));
@@ -1664,6 +1667,7 @@ async fn run_dump(
     let mut runtime = otter_runtime::Runtime::builder()
         .capabilities(caps.clone())
         .with_node_apis()
+        .with_otter_modules()
         .with_web_apis()
         .module_loader(cli_loader_config_for_entry(path).await)
         .build()?;

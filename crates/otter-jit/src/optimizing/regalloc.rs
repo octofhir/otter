@@ -1381,7 +1381,10 @@ mod tests {
         let c = Location::Reg(3);
         let x = Location::Reg(4);
         let ordered = order_parallel_moves(vec![(n_, j), (j, n_), (c, x), (i, c)], 7);
-        let env = run_moves(&[(n_, 100), (j, 200), (i, 300), (c, 400), (x, 500)], &ordered);
+        let env = run_moves(
+            &[(n_, 100), (j, 200), (i, 300), (c, 400), (x, 500)],
+            &ordered,
+        );
         assert_eq!(env[&j], 100);
         assert_eq!(env[&n_], 200);
         assert_eq!(env[&x], 400);

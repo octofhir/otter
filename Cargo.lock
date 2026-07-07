@@ -2141,6 +2141,7 @@ dependencies = [
  "criterion",
  "otter-bytecode",
  "otter-compiler",
+ "otter-modules",
  "otter-node",
  "otter-pm",
  "otter-pm-lockfile",
@@ -2215,11 +2216,13 @@ dependencies = [
 name = "otter-modules"
 version = "0.1.0"
 dependencies = [
+ "http",
  "libloading",
  "otter-macros",
  "otter-runtime",
  "rusqlite",
  "serde_json",
+ "smallvec",
  "tempfile",
  "thiserror",
 ]

@@ -1035,8 +1035,8 @@ impl Interpreter {
         // emitted call reads its captured spine LIVE from the resolved closure
         // body. A bare function has no spine constraint.
         let method_is_plain_function = method == Value::function(function_id);
-        let asm_link_eligible = code.frameless_entry_safe()
-            && (method_is_plain_function || frameless_upvalues_ok);
+        let asm_link_eligible =
+            code.frameless_entry_safe() && (method_is_plain_function || frameless_upvalues_ok);
         // A closure method only caches at a monomorphic site. A polymorphic receiver
         // family (one `arr[i].run()` site over sibling classes) exposes no single
         // stable own/direct-prototype stub to cache, so the shape-walk loop below

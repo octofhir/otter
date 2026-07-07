@@ -179,7 +179,7 @@ pub fn call(
         M::Max => impl_max(&nums),
         M::Min => impl_min(&nums),
         M::Pow => impl_pow(&nums),
-        M::Random => impl_random(&nums),
+        M::Random => random_number(),
         M::Round => impl_round(&nums),
         M::Sign => impl_sign(&nums),
         M::Sin => impl_sin(&nums),
@@ -657,7 +657,7 @@ fn impl_imul(args: &[NumberValue]) -> NumberValue {
 /// §21.3.2.27 Math.random() — non-cryptographic pseudo-random.
 /// Uses a process-local SplitMix64 stream seeded from the system
 /// clock. This is intentionally not cryptographic.
-fn impl_random(_args: &[NumberValue]) -> NumberValue {
+pub fn random_number() -> NumberValue {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEED: AtomicU64 = AtomicU64::new(0);

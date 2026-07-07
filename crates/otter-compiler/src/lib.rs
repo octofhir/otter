@@ -173,6 +173,65 @@ mod tests {
         compile_script_source(src, SyntaxSourceKind::TypeScript, "test.ts").unwrap_err()
     }
 
+    fn compile_tsx_script_src(src: &str) -> BytecodeModule {
+        compile_script_source(src, SyntaxSourceKind::TypeScriptJsx, "test.tsx").unwrap()
+    }
+
+    fn string_constants(module: &BytecodeModule) -> Vec<String> {
+        module
+            .constants
+            .iter()
+            .filter_map(|constant| match constant {
+                Constant::String { utf16 } => Some(String::from_utf16(utf16).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn jsx_element_lowers_to_react_create_element() {
+        let module = compile_tsx_script_src("const x = <div id=\"a\">hi</div>;");
+        let main = &module.functions[0];
+        assert!(main.code.iter().any(|i| i.op == Op::CallWithThis));
+        assert!(main.code.iter().any(|i| i.op == Op::DefineDataProperty));
+        let strings = string_constants(&module);
+        for expected in ["React", "createElement", "div", "id", "a", "hi"] {
+            assert!(
+                strings.iter().any(|value| value == expected),
+                "missing string constant {expected:?}; got {strings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jsx_fragment_lowers_to_react_fragment() {
+        let module = compile_tsx_script_src("const x = <>hi</>;");
+        let main = &module.functions[0];
+        assert!(main.code.iter().any(|i| i.op == Op::CallWithThis));
+        let strings = string_constants(&module);
+        for expected in ["React", "Fragment", "createElement", "hi"] {
+            assert!(
+                strings.iter().any(|value| value == expected),
+                "missing string constant {expected:?}; got {strings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jsx_spread_props_preserve_copy_data_properties() {
+        let module = compile_tsx_script_src("const props = {}; const x = <Comp {...props} ok />;");
+        let main = &module.functions[0];
+        assert!(main.code.iter().any(|i| i.op == Op::CopyDataProperties));
+        assert!(main.code.iter().any(|i| i.op == Op::DefineDataProperty));
+        let strings = string_constants(&module);
+        for expected in ["Comp", "ok", "React", "createElement"] {
+            assert!(
+                strings.iter().any(|value| value == expected),
+                "missing string constant {expected:?}; got {strings:?}"
+            );
+        }
+    }
+
     #[test]
     fn module_fragment_marks_module_init() {
         let module = compile_module_src("export let x = 7;", &host_info(&[]));

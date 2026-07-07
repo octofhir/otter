@@ -23,6 +23,18 @@
 //! }
 //! ```
 //!
+//! Bare module — static export fns under an exact module specifier:
+//!
+//! ```rust,ignore
+//! lodge! {
+//!     specifier = "otter",
+//!     name = "otter",
+//!     exports = {
+//!         "serve" / 1 => serve,
+//!     },
+//! }
+//! ```
+//!
 //! Capability-aware module — each export receives a borrowed
 //! `CapabilitySet` snapshot captured at install time:
 //!
@@ -88,7 +100,8 @@ impl Parse for LodgeExport {
 }
 
 pub(crate) struct LodgeInput {
-    pub(crate) prefix: LitStr,
+    pub(crate) prefix: Option<LitStr>,
+    pub(crate) specifier: Option<LitStr>,
     pub(crate) name: LitStr,
     pub(crate) capabilities: bool,
     pub(crate) exports: Vec<LodgeExport>,
@@ -99,6 +112,7 @@ pub(crate) struct LodgeInput {
 impl Parse for LodgeInput {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut prefix: Option<LitStr> = None;
+        let mut specifier: Option<LitStr> = None;
         let mut name: Option<LitStr> = None;
         let mut capabilities = false;
         let mut exports: Vec<LodgeExport> = Vec::new();
@@ -110,6 +124,7 @@ impl Parse for LodgeInput {
             input.parse::<Token![=]>()?;
             match key.to_string().as_str() {
                 "prefix" => prefix = Some(input.parse()?),
+                "specifier" => specifier = Some(input.parse()?),
                 "name" => name = Some(input.parse()?),
                 "capabilities" => {
                     let lit: LitBool = input.parse()?;
@@ -131,8 +146,8 @@ impl Parse for LodgeInput {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
-                            "unknown `lodge!` field `{other}` — expected `prefix`, `name`, \
-                             `capabilities`, `exports`, `install`, or `module_static`"
+                            "unknown `lodge!` field `{other}` — expected `prefix`, `specifier`, \
+                             `name`, `capabilities`, `exports`, `install`, or `module_static`"
                         ),
                     ));
                 }
@@ -142,9 +157,12 @@ impl Parse for LodgeInput {
             }
         }
 
-        let prefix = prefix.ok_or_else(|| {
-            syn::Error::new(Span::call_site(), "lodge!: missing `prefix = \"...\"`")
-        })?;
+        if prefix.is_none() && specifier.is_none() {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "lodge!: missing `prefix = \"...\"` or `specifier = \"...\"`",
+            ));
+        }
         let name = name.ok_or_else(|| {
             syn::Error::new(Span::call_site(), "lodge!: missing `name = \"...\"`")
         })?;
@@ -167,6 +185,7 @@ impl Parse for LodgeInput {
 
         Ok(Self {
             prefix,
+            specifier,
             name,
             capabilities,
             exports,
@@ -186,6 +205,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as LodgeInput);
     let LodgeInput {
         prefix,
+        specifier,
         name,
         capabilities,
         exports,
@@ -205,7 +225,13 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         }
     }
 
-    let module_url = format!("{}:{}", prefix.value(), name.value());
+    let module_url = specifier.as_ref().map(LitStr::value).unwrap_or_else(|| {
+        format!(
+            "{}:{}",
+            prefix.as_ref().expect("prefix checked").value(),
+            name.value()
+        )
+    });
 
     // Per-export installer fragments. Two shapes:
     //   - capabilities = false → ctx.builtin_method(...)

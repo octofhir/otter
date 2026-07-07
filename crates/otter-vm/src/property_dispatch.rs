@@ -3717,7 +3717,7 @@ impl Interpreter {
             }
             Op::MathCall => {
                 let operands = context.exec_operands(instr);
-                self.do_math_call(stack, context, operands)
+                self.do_math_call_at_frame(stack, context, frame_index, operands, instr.byte_len())
             }
             Op::DefineDataProperty => {
                 let (obj_reg, key_reg, value_reg) = context

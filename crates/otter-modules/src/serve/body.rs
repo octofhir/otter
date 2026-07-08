@@ -41,16 +41,7 @@ impl ServeBody {
         }
     }
 
-    /// Number of bytes available without asynchronous reads.
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Empty => 0,
-            Self::Buffered(bytes) => bytes.len(),
-        }
-    }
-
-    /// Borrow buffered bytes for the current bootstrap HTTP writer.
+    /// Borrow the buffered request/response bytes.
     #[must_use]
     pub(crate) fn as_buffered_bytes(&self) -> &[u8] {
         match self {

@@ -601,6 +601,7 @@ impl RuntimeHandle {
                 counters: self.inner.counters.clone(),
             }),
             self.inner.counters.clone(),
+            Some(self.inner.event_loop.handle()),
         )
     }
 
@@ -934,6 +935,7 @@ fn run_isolate(
             counters: counters.clone(),
         }),
         counters.clone(),
+        Some(event_loop.handle()),
     );
     let mut runtime =
         match Runtime::from_config_with_task_spawner(config, Some(runtime_task_spawner)) {

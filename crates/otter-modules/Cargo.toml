@@ -7,11 +7,16 @@ license.workspace = true
 description = "Otter-hosted modules for the active runtime stack."
 
 [dependencies]
+bytes = "1"
 http = { workspace = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libloading = "0.8"
 otter-macros = { workspace = true }
 otter-runtime = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }

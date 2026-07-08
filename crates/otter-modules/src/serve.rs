@@ -21,6 +21,13 @@
 mod body;
 
 use body::ServeBody;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request as HyperRequest, Response as HyperResponse};
+use hyper_util::rt::TokioIo;
 use otter_runtime::{
     CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
     RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeNativeCall,
@@ -30,17 +37,11 @@ use otter_runtime::{
     runtime_with_host_data,
 };
 use smallvec::SmallVec;
-use std::{
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread,
-    time::Duration,
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::{Notify, oneshot};
 
 /// Static hosted module row for `import { serve } from "otter"`.
 pub static OTTER_HOSTED_MODULE: HostedModule =
@@ -149,16 +150,23 @@ fn serve(
 ) -> Result<Value, NativeError> {
     let task_spawner = task_spawner
         .ok_or_else(|| crate::type_error("serve", "Otter.serve requires a runtime event loop"))?;
+    let io_handle = task_spawner
+        .io_handle()
+        .ok_or_else(|| crate::type_error("serve", "Otter.serve requires a runtime event loop"))?;
     let options = parse_options(ctx, args, capabilities)?;
-    let listener = TcpListener::bind((options.hostname.as_str(), options.port)).map_err(|err| {
-        crate::type_error(
-            "serve",
-            format!(
-                "failed to listen on {}:{}: {err}",
-                options.hostname, options.port
-            ),
-        )
-    })?;
+    // Bind synchronously so the returned `server.url`/`server.port` are exact
+    // (including an OS-assigned port when `port: 0`). The std listener is handed
+    // to the async accept loop, which drives it on the shared Tokio runtime.
+    let listener =
+        std::net::TcpListener::bind((options.hostname.as_str(), options.port)).map_err(|err| {
+            crate::type_error(
+                "serve",
+                format!(
+                    "failed to listen on {}:{}: {err}",
+                    options.hostname, options.port
+                ),
+            )
+        })?;
     let actual_addr = listener.local_addr().map_err(|err| {
         crate::type_error("serve", format!("failed to read local address: {err}"))
     })?;
@@ -179,6 +187,7 @@ fn serve(
     let keep_alive = task_spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let control = Arc::new(ServeServerControl {
         shutdown: AtomicBool::new(false),
+        shutdown_signal: Notify::new(),
         keep_alive,
         roots: Mutex::new(Some(roots)),
     });
@@ -188,7 +197,7 @@ fn serve(
     let hostname = options.hostname.clone();
     let port = actual_addr.port();
     let url = format!("http://{actual_addr}");
-    spawn_accept_loop(listener, task_spawner, context, control, roots);
+    io_handle.spawn(accept_loop(listener, task_spawner, context, control, roots));
     build_server_object(ctx, server, hostname, port, url)
 }
 
@@ -216,6 +225,9 @@ struct ServeRoots {
 
 struct ServeServerControl {
     shutdown: AtomicBool,
+    /// Wakes the accept loop so it stops taking new connections promptly on
+    /// `server.stop()` instead of only noticing the flag on the next accept.
+    shutdown_signal: Notify,
     keep_alive: RuntimeKeepAlive,
     roots: Mutex<Option<ServeRoots>>,
 }
@@ -234,7 +246,6 @@ struct HttpRequest {
 
 struct HttpResponse {
     status: u16,
-    status_text: String,
     headers: Vec<(String, String)>,
     body: ServeBody,
 }
@@ -243,7 +254,7 @@ struct ServeRequestTask {
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
     request: HttpRequest,
-    reply: mpsc::SyncSender<Result<HttpResponse, String>>,
+    reply: oneshot::Sender<Result<HttpResponse, String>>,
 }
 
 impl RuntimeTask for ServeRequestTask {
@@ -314,63 +325,75 @@ impl ServeDispatchOptions {
     }
 }
 
-fn spawn_accept_loop(
-    listener: TcpListener,
+/// Accept connections on the shared Tokio runtime, serving each with HTTP/1.1
+/// keep-alive through hyper. Each connection runs concurrently; per-request VM
+/// re-entry stays on the isolate thread via [`RuntimeTaskSpawner::enqueue`].
+async fn accept_loop(
+    listener: std::net::TcpListener,
     task_spawner: RuntimeTaskSpawner,
     context: otter_runtime::RuntimeExecutionContext,
     control: Arc<ServeServerControl>,
     roots: ServeRoots,
 ) {
-    thread::Builder::new()
-        .name("otter-serve".to_string())
-        .spawn(move || {
-            while !control.shutdown.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((mut stream, _addr)) => {
-                        let task_spawner = task_spawner.clone();
-                        let context = context.clone();
-                        thread::spawn(move || {
-                            if let Err(err) =
-                                handle_stream_async(&task_spawner, context, roots, &mut stream)
-                            {
-                                let body = ServeBody::from_bytes(
-                                    format!("Internal Server Error\n{err}").into_bytes(),
-                                );
-                                let _ = write_response(
-                                    &mut stream,
-                                    500,
-                                    "Internal Server Error",
-                                    &[(
-                                        "content-type".to_string(),
-                                        "text/plain; charset=utf-8".to_string(),
-                                    )],
-                                    &body,
-                                );
-                            }
-                        });
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
-                }
-            }
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(listener) => listener,
+        Err(_) => {
             control.keep_alive.close();
-        })
-        .expect("failed to spawn otter serve accept loop");
+            return;
+        }
+    };
+    loop {
+        if control.shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let accepted = tokio::select! {
+            result = listener.accept() => result,
+            () = control.shutdown_signal.notified() => break,
+        };
+        let Ok((stream, _addr)) = accepted else {
+            break;
+        };
+        let task_spawner = task_spawner.clone();
+        let context = context.clone();
+        // One task per connection; hyper reads successive keep-alive requests
+        // off it until the peer closes or the connection goes idle.
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let service = service_fn(move |req: HyperRequest<Incoming>| {
+                let task_spawner = task_spawner.clone();
+                let context = context.clone();
+                async move { serve_one(&task_spawner, context, roots, req).await }
+            });
+            let _ = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(io, service)
+                .await;
+        });
+    }
+    control.keep_alive.close();
 }
 
-fn handle_stream_async(
+/// Convert one hyper request into the isolate's `fetch` dispatch and back.
+async fn serve_one(
     task_spawner: &RuntimeTaskSpawner,
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
-    stream: &mut TcpStream,
-) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|err| format!("failed to set read timeout: {err}"))?;
-    let request = read_request(stream).map_err(|err| err.to_string())?;
-    let (reply, rx) = mpsc::sync_channel(1);
+    req: HyperRequest<Incoming>,
+) -> Result<HyperResponse<Full<Bytes>>, std::convert::Infallible> {
+    match dispatch_request(task_spawner, context, roots, req).await {
+        Ok(response) => Ok(build_hyper_response(response)),
+        Err(err) => Ok(error_response(&err)),
+    }
+}
+
+async fn dispatch_request(
+    task_spawner: &RuntimeTaskSpawner,
+    context: otter_runtime::RuntimeExecutionContext,
+    roots: ServeRoots,
+    req: HyperRequest<Incoming>,
+) -> Result<HttpResponse, String> {
+    let request = read_hyper_request(req).await?;
+    let (reply, rx) = oneshot::channel();
     task_spawner
         .enqueue(
             ServeRequestTask {
@@ -382,17 +405,80 @@ fn handle_stream_async(
             RuntimeLiveness::Ref,
         )
         .map_err(|err| err.to_string())?;
-    let response = rx
-        .recv()
-        .map_err(|_| "runtime closed before request completed".to_string())??;
-    write_response(
-        stream,
-        response.status,
-        &response.status_text,
-        &response.headers,
-        &response.body,
-    )
-    .map_err(|err| err.to_string())
+    rx.await
+        .map_err(|_| "runtime closed before request completed".to_string())?
+}
+
+/// Build the engine's [`HttpRequest`] from a hyper request, resolving the
+/// absolute URL from the request target and `Host` header and buffering the
+/// body (hyper handles Content-Length and chunked transfer decoding).
+async fn read_hyper_request(req: HyperRequest<Incoming>) -> Result<HttpRequest, String> {
+    let method = req.method().as_str().to_string();
+    let mut host: Option<String> = None;
+    let mut headers: Vec<(String, String)> = Vec::with_capacity(req.headers().len());
+    for (name, value) in req.headers() {
+        let value = value
+            .to_str()
+            .map_err(|_| "request header value is not valid UTF-8".to_string())?
+            .to_string();
+        let lower = name.as_str().to_ascii_lowercase();
+        if lower == "host" {
+            host = Some(value.clone());
+        }
+        headers.push((lower, value));
+    }
+    let uri = req.uri();
+    let url = if uri.authority().is_some() {
+        // Absolute-form target (proxy-style) already carries scheme + authority.
+        uri.to_string()
+    } else {
+        let authority = host
+            .as_deref()
+            .or_else(|| uri.host())
+            .unwrap_or("localhost");
+        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        format!("http://{authority}{path}")
+    };
+    let collected = req
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| format!("failed to read request body: {err}"))?;
+    let body = ServeBody::from_bytes(collected.to_bytes().to_vec());
+    Ok(HttpRequest {
+        method,
+        url,
+        headers,
+        body,
+    })
+}
+
+fn build_hyper_response(response: HttpResponse) -> HyperResponse<Full<Bytes>> {
+    let mut builder = HyperResponse::builder().status(response.status);
+    let mut has_content_type = false;
+    for (name, value) in &response.headers {
+        if name.eq_ignore_ascii_case("content-type") {
+            has_content_type = true;
+        }
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if !has_content_type {
+        builder = builder.header("content-type", "text/plain;charset=UTF-8");
+    }
+    let bytes = Bytes::from(response.body.as_buffered_bytes().to_vec());
+    builder
+        .body(Full::new(bytes))
+        .unwrap_or_else(|_| error_response("failed to build response"))
+}
+
+fn error_response(message: &str) -> HyperResponse<Full<Bytes>> {
+    HyperResponse::builder()
+        .status(500)
+        .header("content-type", "text/plain;charset=UTF-8")
+        .body(Full::new(Bytes::from(format!(
+            "Internal Server Error\n{message}"
+        ))))
+        .expect("static 500 response is always valid")
 }
 
 fn build_server_object(
@@ -436,6 +522,7 @@ fn server_control(
 fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let control = server_control(ctx, "ServeServer.stop")?;
     control.shutdown.store(true, Ordering::Release);
+    control.shutdown_signal.notify_waiters();
     control.keep_alive.close();
     if let Some(roots) = control.roots.lock().expect("serve roots poisoned").take() {
         let _ = ctx.persistent_root_remove(roots.fetch);
@@ -513,91 +600,6 @@ fn parse_options(
             make_request,
             response_parts,
         },
-    })
-}
-
-fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, NativeError> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 1024];
-    let header_end = loop {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|err| crate::type_error("serve", format!("failed to read request: {err}")))?;
-        if read == 0 {
-            return Err(crate::type_error(
-                "serve",
-                "connection closed before request headers",
-            ));
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > 64 * 1024 {
-            return Err(crate::type_error("serve", "request headers exceed 64 KiB"));
-        }
-        if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-    };
-    let header_bytes = &buffer[..header_end - 4];
-    let header_text = std::str::from_utf8(header_bytes)
-        .map_err(|_| crate::type_error("serve", "request headers must be UTF-8"))?;
-    let mut lines = header_text.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| crate::type_error("serve", "missing request line"))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| crate::type_error("serve", "missing request method"))?
-        .to_string();
-    let target = parts
-        .next()
-        .ok_or_else(|| crate::type_error("serve", "missing request target"))?;
-    let mut headers = Vec::new();
-    let mut host = None;
-    let mut content_length = 0usize;
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(crate::type_error("serve", "malformed request header"));
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_string();
-        if name == "host" {
-            host = Some(value.clone());
-        } else if name == "content-length" {
-            content_length = value.parse::<usize>().map_err(|_| {
-                crate::type_error("serve", "content-length must be a non-negative integer")
-            })?;
-        }
-        headers.push((name, value));
-    }
-    let mut body_bytes = buffer[header_end..].to_vec();
-    if body_bytes.len() < content_length {
-        let missing = content_length - body_bytes.len();
-        let start = body_bytes.len();
-        body_bytes.resize(content_length, 0);
-        stream
-            .read_exact(&mut body_bytes[start..start + missing])
-            .map_err(|err| crate::type_error("serve", format!("failed to read body: {err}")))?;
-    } else if body_bytes.len() > content_length {
-        body_bytes.truncate(content_length);
-    }
-    let url = if target.starts_with("http://") || target.starts_with("https://") {
-        target.to_string()
-    } else {
-        format!(
-            "http://{}{}",
-            host.unwrap_or_else(|| "127.0.0.1".to_string()),
-            target
-        )
-    };
-    Ok(HttpRequest {
-        method,
-        url,
-        headers,
-        body: ServeBody::from_bytes(body_bytes),
     })
 }
 
@@ -682,11 +684,9 @@ fn response_from_value(
         ));
     }
     let status = status as u16;
-    let status_text = object::get(parts_obj, ctx.heap(), "statusText")
-        .and_then(|value| value.as_string(ctx.heap()))
-        .map(|value| value.to_lossy_string(ctx.heap()))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default_status_text(status).to_string());
+    // The HTTP/1.1 reason phrase is not observable to a Fetch client (it reads
+    // `status`), and hyper derives the canonical phrase from the status code on
+    // the wire, so a custom `statusText` is intentionally not carried here.
     let headers_text = object::get(parts_obj, ctx.heap(), "headersText")
         .and_then(|value| value.as_string(ctx.heap()))
         .map(|value| value.to_lossy_string(ctx.heap()))
@@ -708,7 +708,6 @@ fn response_from_value(
     let body = ServeBody::from_js_value(ctx, body_value)?;
     Ok(HttpResponse {
         status,
-        status_text,
         headers,
         body,
     })
@@ -716,38 +715,6 @@ fn response_from_value(
 
 fn resolve_fetch_result(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
     ctx.resolve_native_promise_after_microtasks(value, "serve.fetch")
-}
-
-fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    status_text: &str,
-    headers: &[(String, String)],
-    body: &ServeBody,
-) -> Result<(), NativeError> {
-    write!(stream, "HTTP/1.1 {status} {status_text}\r\n")
-        .and_then(|_| write!(stream, "content-length: {}\r\n", body.len()))
-        .map_err(|err| crate::type_error("serve", format!("failed to write response: {err}")))?;
-    let mut has_content_type = false;
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("content-type") {
-            has_content_type = true;
-        }
-        write!(stream, "{name}: {value}\r\n").map_err(|err| {
-            crate::type_error("serve", format!("failed to write response: {err}"))
-        })?;
-    }
-    if !has_content_type {
-        stream
-            .write_all(b"content-type: text/plain; charset=utf-8\r\n")
-            .map_err(|err| {
-                crate::type_error("serve", format!("failed to write response: {err}"))
-            })?;
-    }
-    stream
-        .write_all(b"connection: close\r\n\r\n")
-        .and_then(|_| stream.write_all(body.as_buffered_bytes()))
-        .map_err(|err| crate::type_error("serve", format!("failed to write response: {err}")))
 }
 
 fn call_js(
@@ -781,11 +748,4 @@ fn push_string_root(ctx: &mut NativeCtx<'_>, value: &str) -> Result<usize, Nativ
 
 fn header_is_managed(name: &str) -> bool {
     name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection")
-}
-
-fn default_status_text(status: u16) -> &'static str {
-    http::StatusCode::from_u16(status)
-        .ok()
-        .and_then(|status| status.canonical_reason())
-        .unwrap_or("OK")
 }

@@ -133,6 +133,14 @@ impl TokioEventLoop {
         }
     }
 
+    /// The backing Tokio runtime handle. Host resources that own
+    /// long-lived async IO (the HTTP server, future `node:net`) spawn
+    /// their accept/serve loops onto it so all IO shares the one runtime.
+    #[must_use]
+    pub(crate) fn handle(&self) -> tokio::runtime::Handle {
+        self.handle.clone()
+    }
+
     /// Build a narrow HTTPS module fetch service backed by this
     /// event loop's Tokio handle.
     #[must_use]

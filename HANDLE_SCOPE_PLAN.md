@@ -263,6 +263,17 @@ still-open truncation repro:
 returns all 7 keys for strides 1..16.
 
 ### P5 — macros + enforcement
+
+Additional item (found during P4 review): `scoped_set` storing a wide
+number boxes a `HeapNumber` inside `object::set`; that internal allocation
+traces only the receiver, and outside dispatch (no extra-roots provider
+registered) the arena is not walked by that collection — so sibling parked
+handles could go stale. Unreachable today (every scoped_set caller runs
+under dispatch), but before host-side scope use lands, thread a runtime-root
+snapshot through the write (an `object::set_with_roots`) or make the
+snapshot implicit in `NativeCtx::scope`. Also: expose the scope surface on
+`RuntimeNativeCtx` (otter-runtime) so ffi.rs/kv.rs/sql.rs deferred sites can
+migrate.
 1. `#[dive]` / `raft!` / `burrow!` hand scoped handles to bodies (new arg
    shape or helper injection) so new natives are scoped by default.
 2. trybuild compile-fail tests: `Scoped` escaping the closure, `Scoped` from

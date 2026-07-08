@@ -84,8 +84,10 @@ impl HandleArena {
         self.slots[idx as usize]
     }
 
-    /// Overwrite the value parked at `idx`. Used when an operation reallocates
-    /// the handle it was given (e.g. an object shape transition).
+    /// Overwrite the value parked at `idx`. Test-only: production writes never
+    /// re-park a handle, because the only way a parked object relocates is a
+    /// collection that rewrites its slot in place (see [`Interpreter::scoped_set`]).
+    #[cfg(test)]
     pub(crate) fn set(&mut self, idx: u32, v: Value) {
         self.slots[idx as usize] = v;
     }
@@ -175,10 +177,10 @@ impl Interpreter {
     /// returned; an early `?` inside `f` propagates through the returned `R`,
     /// so the truncation still runs on the normal return path here.
     ///
-    /// The interpreter-internal callers of this variant land with the reflection
-    /// rewrites; today the native-context [`crate::NativeCtx::scope`] wrapper is
-    /// the live entry point and this one is exercised only by the module tests.
-    #[allow(dead_code)]
+    /// Interpreter-internal reflection paths (e.g.
+    /// `Object.getOwnPropertyDescriptors`) drive this variant directly; the
+    /// native-context [`crate::NativeCtx::scope`] wrapper is the surface feature
+    /// authors use.
     pub(crate) fn with_handle_scope<R>(
         &mut self,
         f: impl FnOnce(&mut Interpreter, &HandleScope) -> R,
@@ -342,9 +344,14 @@ impl Interpreter {
     }
 
     /// Write `value` to property `key` on the object handle `obj`, resolving
-    /// both handles through the arena at call time. A shape transition can
-    /// reallocate the object, so the fresh handle is parked back into `obj`'s
-    /// slot to keep it current.
+    /// both handles through the arena at call time.
+    ///
+    /// `object::set` never reassigns the `JsObject` handle it is given; the only
+    /// way the object relocates is a moving collection driven by the write's own
+    /// allocation, and that collection rewrites the arena slot in place. The
+    /// slot is therefore authoritative on return — parking the (now-stale) local
+    /// back would clobber the collector's fix-up, so the write intentionally
+    /// does not re-park.
     pub(crate) fn scoped_set(
         &mut self,
         _scope: &HandleScope,
@@ -359,8 +366,74 @@ impl Interpreter {
             .ok_or(VmError::TypeMismatch)?;
         let stored = self.handle_arena.get(value.index());
         crate::object::set(&mut object, &mut self.gc_heap, key, stored);
-        self.handle_arena.set(obj.index(), Value::object(object));
         Ok(())
+    }
+
+    /// Write `value` to the symbol-keyed property `key` on the object handle
+    /// `obj`, resolving both handles through the arena at call time. Same
+    /// authoritative-slot contract as [`Self::scoped_set`]. A rejected write
+    /// (non-extensible object) surfaces as [`VmError::TypeMismatch`].
+    pub(crate) fn scoped_set_symbol(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        key: crate::symbol::JsSymbol,
+        value: Scoped<'_>,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let stored = self.handle_arena.get(value.index());
+        if crate::object::set_symbol(object, &mut self.gc_heap, key, stored) {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch)
+        }
+    }
+
+    /// Build a §6.2.5.4 FromPropertyDescriptor result object for `desc` and park
+    /// it in the current scope.
+    ///
+    /// The descriptor's own `Value` fields (data value, accessor get/set) are
+    /// parked *before* the result object is allocated, so the allocation and
+    /// each subsequent field write cannot strand them; every write then resolves
+    /// the result through the arena, so an intermediate collection can never
+    /// leave a half-built descriptor. Field order matches the spec:
+    /// `value`/`writable` (data) or `get`/`set` (accessor), then `enumerable`
+    /// and `configurable`.
+    pub(crate) fn scoped_descriptor_object<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        desc: &crate::object::PropertyDescriptor,
+    ) -> Result<Scoped<'s>, VmError> {
+        use crate::object::DescriptorKind;
+        let (value_h, get_h, set_h) = match &desc.kind {
+            DescriptorKind::Data { value } => (Some(self.scoped_value(scope, *value)), None, None),
+            DescriptorKind::Accessor { getter, setter } => (
+                None,
+                Some(self.scoped_value(scope, getter.unwrap_or_else(Value::undefined))),
+                Some(self.scoped_value(scope, setter.unwrap_or_else(Value::undefined))),
+            ),
+        };
+        let result = self.scoped_object(scope)?;
+        match &desc.kind {
+            DescriptorKind::Data { .. } => {
+                self.scoped_set(scope, result, "value", value_h.expect("data value parked"))?;
+                let writable = self.scoped_boolean(scope, desc.writable());
+                self.scoped_set(scope, result, "writable", writable)?;
+            }
+            DescriptorKind::Accessor { .. } => {
+                self.scoped_set(scope, result, "get", get_h.expect("accessor getter parked"))?;
+                self.scoped_set(scope, result, "set", set_h.expect("accessor setter parked"))?;
+            }
+        }
+        let enumerable = self.scoped_boolean(scope, desc.enumerable());
+        self.scoped_set(scope, result, "enumerable", enumerable)?;
+        let configurable = self.scoped_boolean(scope, desc.configurable());
+        self.scoped_set(scope, result, "configurable", configurable)?;
+        Ok(result)
     }
 
     /// Define data property `key` on the object handle `obj` with explicit

@@ -2242,6 +2242,30 @@ impl Interpreter {
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
+        // §27.7.5.1 async-call entry for the synchronous re-entry path — a
+        // builtin invoking a user async function (e.g. the `Otter.serve`
+        // dispatch calling the fetch handler). Mirror the opcode call path:
+        // synthesise the pending result promise now and park the frame with
+        // `async_state` so its completion settles that promise. Without this
+        // an async callee runs as a plain frame and its first `Op::Await`
+        // finds a frame with no `async_state`, which `do_await` reports as
+        // `VmError::InvalidOperand`. The promise is allocated before the
+        // upvalue spine and receiver coercion (which also allocate), rooting
+        // the raw receiver and arguments exactly as the opcode path does.
+        let is_plain_async = function.is_async && !function.is_generator;
+        let async_result_promise = if is_plain_async {
+            Some(
+                promise_dispatch::PromiseBuilder::with_context(context.clone())
+                    .pending_stack_rooted(
+                        self,
+                        inner,
+                        &[&this_for_callee],
+                        &[effective_args.as_slice()],
+                    )?,
+            )
+        } else {
+            None
+        };
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
@@ -2249,13 +2273,20 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let mut new_frame = if function.is_generator {
+        // An async frame can suspend on `await`, which moves it off the
+        // active stack; it must therefore own its registers rather than
+        // borrow a stack-tied register window (a window cannot survive
+        // parking). Generators own their registers for the same reason.
+        let mut new_frame = if function.is_generator || is_plain_async {
             let registers = self.draw_registers(function.register_count as usize);
             Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
         } else {
             let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
             Frame::with_exec_window(function, None, upvalues, this_for_callee, ptr, base_off)
         };
+        if let Some(result_promise) = async_result_promise {
+            new_frame.async_state = Some(crate::frame_state::AsyncFrameState { result_promise });
+        }
         // A closure frame records its instance so the named-function SELF
         // binding inside the body resolves to it (per-instance `.prototype`),
         // and so `arguments.callee` exposes the invoked closure rather than a
@@ -2332,6 +2363,17 @@ impl Interpreter {
         // frame directly onto this stack, so it must never reallocate. The frame
         // is popped on every completion path, leaving `inner` empty + reusable.
         inner.push(new_frame);
+        if let Some(result_promise) = async_result_promise {
+            // The async frame runs to its first `await` (which parks it off
+            // `inner`) or to completion (which settles the promise and pops
+            // the frame); either way `inner` is left empty and the dispatch
+            // loop returns. This call's value is the result promise, not the
+            // loop's terminal frame value. A suspending frame must never take
+            // the compiled sync-entry path, whose fast tier assumes the entry
+            // frame cannot suspend.
+            self.dispatch_loop(context, inner)?;
+            return Ok(Value::promise(result_promise));
+        }
         // Tier-up the entry frame itself: a synchronously-entered callee reaches
         // `dispatch_loop` directly (no `Op::Call`), so without this hook the
         // entry level would always interpret while only its sub-calls JIT. This

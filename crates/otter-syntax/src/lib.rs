@@ -108,6 +108,63 @@ pub fn detect_source_kind(path: &Path) -> Option<SourceKind> {
     })
 }
 
+/// Decide source kind from an HTTP `Content-Type` header value.
+///
+/// Remote modules (http/https) carry no meaningful path extension, so the
+/// server-declared media type is authoritative — mirroring Deno's
+/// `MediaType::from_content_type`. Parameters (`; charset=…`) are stripped and
+/// the bare MIME is matched case-insensitively. Returns `None` for a media type
+/// this engine does not classify (the caller falls back to the URL extension,
+/// then to a default).
+///
+/// JSON is intentionally not mapped here: JSON modules take a separate
+/// `export default (<text>)` wrapping path, not one of the four script
+/// [`SourceKind`]s.
+#[must_use]
+pub fn source_kind_from_content_type(content_type: &str) -> Option<SourceKind> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    Some(match mime.as_str() {
+        "application/typescript"
+        | "text/typescript"
+        | "application/x-typescript"
+        | "video/vnd.dlna.mpeg-tts"
+        | "video/mp2t" => SourceKind::TypeScript,
+        "application/javascript"
+        | "text/javascript"
+        | "application/ecmascript"
+        | "text/ecmascript"
+        | "application/x-javascript"
+        | "application/node" => SourceKind::JavaScript,
+        "text/jsx" | "text/jscript" => SourceKind::JavaScriptJsx,
+        "text/tsx" => SourceKind::TypeScriptJsx,
+        _ => return None,
+    })
+}
+
+/// Decide the source kind of a remote module from its response
+/// `Content-Type` and its (possibly post-redirect) URL.
+///
+/// Precedence follows Deno: the declared media type wins; a generic or absent
+/// type falls back to the URL's path extension; anything still unknown defaults
+/// to JavaScript, since a bare CDN specifier such as `https://esm.sh/hono` is
+/// overwhelmingly ECMAScript.
+#[must_use]
+pub fn remote_source_kind(content_type: Option<&str>, url: &str) -> SourceKind {
+    if let Some(ct) = content_type
+        && let Some(kind) = source_kind_from_content_type(ct)
+    {
+        return kind;
+    }
+    // Fall back to the extension of the URL path (ignoring any query/fragment).
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    detect_source_kind(Path::new(path)).unwrap_or(SourceKind::JavaScript)
+}
+
 /// Parse `source` once and pass the AST to `f`.
 ///
 /// Use this on compile and analysis paths that need to inspect AST state. The
@@ -179,6 +236,55 @@ mod tests {
             Some(SourceKind::JavaScriptJsx)
         );
         assert_eq!(detect_source_kind(Path::new("x.foo")), None);
+    }
+
+    #[test]
+    fn content_type_maps_media_types() {
+        assert_eq!(
+            source_kind_from_content_type("application/javascript"),
+            Some(SourceKind::JavaScript)
+        );
+        // Parameters are stripped and matching is case-insensitive.
+        assert_eq!(
+            source_kind_from_content_type("text/JavaScript; charset=utf-8"),
+            Some(SourceKind::JavaScript)
+        );
+        assert_eq!(
+            source_kind_from_content_type("application/typescript"),
+            Some(SourceKind::TypeScript)
+        );
+        assert_eq!(
+            source_kind_from_content_type("text/tsx"),
+            Some(SourceKind::TypeScriptJsx)
+        );
+        assert_eq!(
+            source_kind_from_content_type("text/jsx"),
+            Some(SourceKind::JavaScriptJsx)
+        );
+        assert_eq!(source_kind_from_content_type("text/html"), None);
+    }
+
+    #[test]
+    fn remote_kind_prefers_content_type_then_extension_then_default() {
+        // Content-Type wins over an extensionless URL.
+        assert_eq!(
+            remote_source_kind(Some("application/typescript"), "https://esm.sh/hono@4"),
+            SourceKind::TypeScript
+        );
+        // Unknown/absent Content-Type falls back to the URL extension.
+        assert_eq!(
+            remote_source_kind(Some("text/plain"), "https://x/a.tsx?v=1"),
+            SourceKind::TypeScriptJsx
+        );
+        assert_eq!(
+            remote_source_kind(None, "https://x/a.mjs"),
+            SourceKind::JavaScript
+        );
+        // Bare extensionless CDN specifier defaults to JavaScript.
+        assert_eq!(
+            remote_source_kind(None, "https://esm.sh/hono@4"),
+            SourceKind::JavaScript
+        );
     }
 
     #[test]

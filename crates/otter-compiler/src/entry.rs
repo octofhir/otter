@@ -1603,6 +1603,7 @@ pub fn compile_module_program(
             target: target.clone(),
             deferred: deferred_only_specs.contains(specifier),
             dynamic: false,
+            synthetic: false,
         })
         .collect();
 

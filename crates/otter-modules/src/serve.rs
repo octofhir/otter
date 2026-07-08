@@ -127,54 +127,72 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
                 enumerable: false,
                 configurable: true,
               });
+              // Resolve the Fetch internals once and cache them in this
+              // closure; the fast path per request must not re-walk globals.
+              var fetchInternals = null;
+              function ensureFetch() {
+                if (fetchInternals !== null) return fetchInternals;
+                void g.Request;
+                void g.Response;
+                void g.Headers;
+                var internals = g.__otterFetchInternals;
+                if (internals == null) {
+                  throw new TypeError('Otter.serve requires Web Fetch globals');
+                }
+                fetchInternals = internals;
+                return internals;
+              }
+              function responseParts(response) {
+                var internals = fetchInternals || ensureFetch();
+                var parts = internals.responseParts(response);
+                if (parts === null) return null;
+                var headers = parts[2];
+                var headersText = '';
+                for (var i = 0; i + 1 < headers.length; i += 2) {
+                  headersText += String(headers[i]) + '\n' + String(headers[i + 1]) + '\n';
+                }
+                return {
+                  status: parts[0],
+                  statusText: parts[1],
+                  headersText: headersText,
+                  body: parts[3],
+                };
+              }
               Object.defineProperty(g, '__otterServeInternals', {
                 value: Object.freeze({
-                  ensureFetchInternals: function () {
-                    void g.Request;
-                    void g.Response;
-                    void g.Headers;
-                    var internals = g.__otterFetchInternals;
-                    if (internals == null) {
-                      throw new TypeError('Otter.serve requires Web Fetch globals');
-                    }
-                    return internals;
-                  },
                   makeRequest: function (method, url, flatHeaders, body) {
-                    var internals = this.ensureFetchInternals();
+                    var internals = fetchInternals || ensureFetch();
                     return internals.makeRequest(method, url, flatHeaders, body);
                   },
                   dispatch: function (handler, request, deliver, deliverError, token) {
-                    var self = this;
                     try {
-                      Promise.resolve(handler(request)).then(
-                        function (response) {
-                          try {
-                            deliver(token, self.responseParts(response));
-                          } catch (err) {
-                            deliverError(token, err);
-                          }
-                        },
-                        function (err) { deliverError(token, err); }
-                      );
+                      var result = handler(request);
+                      // Deliver a synchronous handler inline — no promise,
+                      // microtask, or reaction closures. Only a genuine thenable
+                      // parks until a later drain (correct async semantics).
+                      if (
+                        result !== null &&
+                        typeof result === 'object' &&
+                        typeof result.then === 'function'
+                      ) {
+                        result.then(
+                          function (response) {
+                            try {
+                              deliver(token, responseParts(response));
+                            } catch (err) {
+                              deliverError(token, err);
+                            }
+                          },
+                          function (err) { deliverError(token, err); }
+                        );
+                      } else {
+                        deliver(token, responseParts(result));
+                      }
                     } catch (err) {
                       deliverError(token, err);
                     }
                   },
-                  responseParts: function (response) {
-                    var internals = this.ensureFetchInternals();
-                    var parts = internals.responseParts(response);
-                    if (parts === null) return null;
-                    var headersText = '';
-                    for (var i = 0; i + 1 < parts[2].length; i += 2) {
-                      headersText += String(parts[2][i]) + '\n' + String(parts[2][i + 1]) + '\n';
-                    }
-                    return {
-                      status: parts[0],
-                      statusText: parts[1],
-                      headersText: headersText,
-                      body: parts[3],
-                    };
-                  },
+                  responseParts: responseParts,
                 }),
                 writable: false,
                 enumerable: false,

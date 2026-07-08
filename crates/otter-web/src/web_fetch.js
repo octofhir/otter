@@ -803,6 +803,20 @@
         }
         return request;
       },
+      // The private slot symbols, handed to the native server so it can read a
+      // Response's status/headers/body directly in Rust instead of round-tripping
+      // through `responseParts` + intermediate arrays. Exposed only on this
+      // hidden internals object, so user code never gains slot access.
+      slots: Object.freeze({
+        status: kStatus,
+        statusText: kStatusText,
+        headers: kHeaders,
+        headerList: kHeaderList,
+        bodyText: kBodyText,
+        bodyBytes: kBodyBytes,
+        bodyStream: kBodyStream,
+        bodyUsed: kBodyUsed,
+      }),
       responseParts(response) {
         if (!(response instanceof Response)) return null;
         // Sorted-and-combined view (Fetch § 5.1), matching Headers iteration:

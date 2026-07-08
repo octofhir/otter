@@ -38,6 +38,42 @@ pub(crate) enum ObjectIntegrityLevel {
     Frozen,
 }
 
+/// Allocate one own-property key string and append it to `keys`, keeping the
+/// whole in-flight key list (plus any caller-held values) rooted across the
+/// allocation.
+///
+/// `[[OwnPropertyKeys]]` builds its result by allocating one `JsString` per
+/// key. Each allocation can trigger a moving collection, which would leave
+/// every previously collected young key handle (and the receiver itself)
+/// dangling — the collection then silently rewrites those stale offsets to
+/// whatever object later occupies the memory. Rooting the accumulated list
+/// through the allocation lets the collector rewrite the slots in place, so
+/// the finished list is valid regardless of how many collections ran.
+fn push_key_string_rooted(
+    heap: &mut otter_gc::GcHeap,
+    keys: &mut Vec<Value>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+    name: &str,
+) -> Result<(), VmError> {
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for v in keys.iter() {
+            v.trace_value_slots(visitor);
+        }
+        for v in value_roots {
+            v.trace_value_slots(visitor);
+        }
+        for s in slice_roots {
+            for v in *s {
+                v.trace_value_slots(visitor);
+            }
+        }
+    };
+    let s = JsString::from_str_with_roots(name, heap, &mut visit).map_err(VmError::from)?;
+    keys.push(Value::string(s));
+    Ok(())
+}
+
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
 /// §7.1.19 step 2-3: Symbol values pass through unchanged; every
 /// other primitive coerces to a UTF-16 string spelling.
@@ -2603,10 +2639,11 @@ impl Interpreter {
         {
             let mut keys: Vec<Value> = Vec::new();
             for name in self.module_namespace_export_names(obj) {
-                keys.push(Value::string(
-                    string::JsString::from_str(&name, &mut self.gc_heap).map_err(VmError::from)?,
-                ));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &name)?;
             }
+            // Re-read the receiver: the key allocations above may have moved
+            // it; `target` is rewritten in place by the rooted visitor.
+            let obj = target.as_object().ok_or(VmError::InvalidOperand)?;
             let symbols: Vec<Value> = object::with_properties(obj, &self.gc_heap, |p| {
                 p.symbol_keys().map(Value::symbol).collect()
             });
@@ -2639,12 +2676,19 @@ impl Interpreter {
                 let len = t.length(&self.gc_heap);
                 keys.reserve(len);
                 for idx in 0..len {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&idx.to_string(), &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[],
+                        &idx.to_string(),
+                    )?;
                 }
             }
+            // Re-read the receiver after the index-key allocations above.
+            let t = target
+                .as_typed_array(&self.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
             if let Some(bag) = t.expando(&self.gc_heap) {
                 let (strings, symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(bag, &self.gc_heap, |p| {
@@ -2654,10 +2698,13 @@ impl Interpreter {
                         )
                     });
                 for name in strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&name, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &name,
+                    )?;
                 }
                 keys.extend(symbols);
             }
@@ -2670,13 +2717,12 @@ impl Interpreter {
                 keys.reserve(value.len() as usize + 1);
                 for idx in 0..value.len() {
                     let key = idx.to_string();
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &key)?;
                 }
             }
             let is_string_exotic = string_data.is_some();
+            // Re-read the receiver after the index-key allocations above.
+            let obj = target.as_object().ok_or(VmError::InvalidOperand)?;
             let (ordinary_strings, symbols): (Vec<String>, Vec<Value>) =
                 object::with_properties(obj, &self.gc_heap, |p| {
                     (
@@ -2702,27 +2748,39 @@ impl Interpreter {
                 }
                 for index in indexed {
                     let key = index.to_string();
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
-                keys.push(Value::string(
-                    string::JsString::from_str("length", &mut self.gc_heap)
-                        .map_err(VmError::from)?,
-                ));
+                push_key_string_rooted(
+                    &mut self.gc_heap,
+                    &mut keys,
+                    &[target],
+                    &[&symbols],
+                    "length",
+                )?;
                 for key in non_index_strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
             } else {
                 for key in ordinary_strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
             }
             keys.extend(symbols);
@@ -2733,22 +2791,18 @@ impl Interpreter {
             let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + string_keys.len() + 2);
             for idx in indices {
                 let key = idx.to_string();
-                let s =
-                    string::JsString::from_str(&key, &mut self.gc_heap).map_err(VmError::from)?;
-                keys.push(Value::string(s));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &key)?;
             }
             // §10.4.2 Array exotic objects always expose `length`.
-            keys.push(Value::string(
-                string::JsString::from_str("length", &mut self.gc_heap).map_err(VmError::from)?,
-            ));
+            push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], "length")?;
             for key in string_keys {
-                let s =
-                    string::JsString::from_str(&key, &mut self.gc_heap).map_err(VmError::from)?;
-                keys.push(Value::string(s));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &key)?;
             }
             // §10.4.2 — own symbol-keyed properties follow the
             // string keys per §7.3.22 OrdinaryOwnPropertyKeys
-            // ordering.
+            // ordering. Re-read the receiver after the key
+            // allocations above.
+            let arr = target.as_array().ok_or(VmError::InvalidOperand)?;
             for sym in array::own_symbol_keys(arr, &self.gc_heap) {
                 keys.push(Value::symbol(sym));
             }
@@ -2764,8 +2818,7 @@ impl Interpreter {
             let names = self.ordinary_function_own_property_keys(context, owner, function_id);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             for n in names {
-                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                keys.push(Value::string(s));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &n)?;
             }
             return Ok(keys);
         }
@@ -2773,8 +2826,7 @@ impl Interpreter {
             let names = native.own_property_keys(&self.gc_heap);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             for n in names {
-                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                keys.push(Value::string(s));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &n)?;
             }
             return Ok(keys);
         }
@@ -2782,8 +2834,7 @@ impl Interpreter {
             let names = function_metadata::bound_own_property_keys(&bound, &self.gc_heap);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             for n in names {
-                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                keys.push(Value::string(s));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &n)?;
             }
             return Ok(keys);
         }
@@ -2791,12 +2842,15 @@ impl Interpreter {
             let names = self.class_constructor_own_property_keys(Some(context), class)?;
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
             for n in names {
-                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                keys.push(Value::string(s));
+                push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], &n)?;
             }
             // §10.1.11 — symbol keys follow the string keys. A class
             // constructor's own symbol-keyed properties (e.g. a static
-            // `[sym]() {}` method) live on its statics object.
+            // `[sym]() {}` method) live on its statics object. Re-read
+            // the constructor after the key allocations above.
+            let class = target
+                .as_class_constructor()
+                .ok_or(VmError::InvalidOperand)?;
             let statics = class.statics(&self.gc_heap);
             let symbols: Vec<Value> = object::with_properties(statics, &self.gc_heap, |p| {
                 p.symbol_keys().map(Value::symbol).collect()
@@ -2804,12 +2858,11 @@ impl Interpreter {
             keys.extend(symbols);
             return Ok(keys);
         }
-        if let Some(regexp) = target.as_regexp() {
+        if target.as_regexp().is_some() {
             let mut keys = Vec::new();
-            keys.push(Value::string(
-                string::JsString::from_str("lastIndex", &mut self.gc_heap)
-                    .map_err(VmError::from)?,
-            ));
+            push_key_string_rooted(&mut self.gc_heap, &mut keys, &[target], &[], "lastIndex")?;
+            // Re-read the receiver after the key allocation above.
+            let regexp = target.as_regexp().ok_or(VmError::InvalidOperand)?;
             if let Some(expando) = regexp.expando(&self.gc_heap) {
                 let (strings, symbols): (Vec<String>, Vec<Value>) =
                     object::with_properties(expando, &self.gc_heap, |p| {
@@ -2819,10 +2872,13 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
                 keys.extend(symbols);
             }
@@ -2841,10 +2897,13 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
                 keys.extend(symbols);
             }
@@ -2863,10 +2922,13 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
                 keys.extend(symbols);
             }
@@ -2885,10 +2947,13 @@ impl Interpreter {
                         )
                     });
                 for key in strings {
-                    keys.push(Value::string(
-                        string::JsString::from_str(&key, &mut self.gc_heap)
-                            .map_err(VmError::from)?,
-                    ));
+                    push_key_string_rooted(
+                        &mut self.gc_heap,
+                        &mut keys,
+                        &[target],
+                        &[&symbols],
+                        &key,
+                    )?;
                 }
                 keys.extend(symbols);
             }

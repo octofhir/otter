@@ -346,64 +346,61 @@ impl Interpreter {
             };
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
-        if is_oom && let Ok(message_str) = JsString::from_str(message, self.gc_heap_mut()) {
-            crate::object::set(
-                &mut obj,
-                &mut self.gc_heap,
-                "message",
-                Value::string(message_str),
-            );
-        }
-        // Stamp the Node-style `.code` as an own, non-enumerable, writable,
-        // configurable property (matches Node's error.code descriptor).
-        if let Some(code) = node_code
-            && let Ok(code_str) = JsString::from_str(code, self.gc_heap_mut())
-        {
-            crate::object::define_own_property(
-                obj,
-                &mut self.gc_heap,
-                "code",
-                crate::object::PropertyDescriptor::data(Value::string(code_str), true, false, true),
-            );
-            if code == "ERR_SYSTEM_ERROR" {
-                if let Ok(name_str) = JsString::from_str("SystemError", self.gc_heap_mut()) {
-                    crate::object::define_own_property(
-                        obj,
-                        &mut self.gc_heap,
-                        "name",
-                        crate::object::PropertyDescriptor::data(
-                            Value::string(name_str),
-                            true,
-                            false,
-                            true,
-                        ),
+        // Build the diagnostic `message` / `code` / `info` properties inside a
+        // handle scope. `obj` is a young object; each `from_str` and the nested
+        // `info` allocation can relocate it, so writing through the raw local
+        // would target a vacated cell. The scope parks `obj`, resolves it
+        // through the arena for every write, and hands back its post-relocation
+        // offset for the stack-frame capture below. String-allocation failures
+        // skip the individual property, matching the original best-effort build.
+        obj = self.with_handle_scope(|interp, scope| {
+            let obj_h = interp.scoped_value(scope, Value::object(obj));
+            if is_oom && let Ok(message_h) = interp.scoped_string(scope, message) {
+                let _ = interp.scoped_set(scope, obj_h, "message", message_h);
+            }
+            // Stamp the Node-style `.code` as an own, non-enumerable, writable,
+            // configurable property (matches Node's error.code descriptor).
+            if let Some(code) = node_code {
+                if let Ok(code_h) = interp.scoped_string(scope, code) {
+                    let _ = interp.scoped_define_data(
+                        scope,
+                        obj_h,
+                        "code",
+                        code_h,
+                        crate::object::PropertyFlags::new(true, false, true),
                     );
                 }
-                if let Ok(mut info) = object::alloc_object_old(self.gc_heap_mut()) {
-                    if let Ok(info_code) =
-                        JsString::from_str(system_error_code(message), self.gc_heap_mut())
-                    {
-                        crate::object::set(
-                            &mut info,
-                            &mut self.gc_heap,
-                            "code",
-                            Value::string(info_code),
+                if code == "ERR_SYSTEM_ERROR" {
+                    if let Ok(name_h) = interp.scoped_string(scope, "SystemError") {
+                        let _ = interp.scoped_define_data(
+                            scope,
+                            obj_h,
+                            "name",
+                            name_h,
+                            crate::object::PropertyFlags::new(true, false, true),
                         );
                     }
-                    crate::object::define_own_property(
-                        obj,
-                        &mut self.gc_heap,
-                        "info",
-                        crate::object::PropertyDescriptor::data(
-                            Value::object(info),
-                            true,
-                            false,
-                            true,
-                        ),
-                    );
+                    if let Ok(info_h) = interp.scoped_object_bare(scope) {
+                        if let Ok(info_code_h) =
+                            interp.scoped_string(scope, system_error_code(message))
+                        {
+                            let _ = interp.scoped_set(scope, info_h, "code", info_code_h);
+                        }
+                        let _ = interp.scoped_define_data(
+                            scope,
+                            obj_h,
+                            "info",
+                            info_h,
+                            crate::object::PropertyFlags::new(true, false, true),
+                        );
+                    }
                 }
             }
-        }
+            interp
+                .escape_scoped(obj_h)
+                .as_object()
+                .expect("error object handle resolves to an object")
+        });
         // Engine-raised errors carry the same construction-site call stack
         // as user `new Error(...)` instances, so `e.stack` shows frames for
         // a VM TypeError exactly like V8/JSC.

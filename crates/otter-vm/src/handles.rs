@@ -301,6 +301,32 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::string(string)))
     }
 
+    /// Build interned `JsString` values for `keys`, rooting each in a handle
+    /// scope so an earlier key is never stranded by a later string allocation,
+    /// and return them as plain `Value`s for immediate hand-off to an array
+    /// allocator.
+    ///
+    /// Key-list reflection (`Object.keys`, `Object.getOwnPropertyNames`,
+    /// for-in) allocates one key string at a time; each allocation can drive a
+    /// full sweep that reclaims a previously built, still-unrooted key. Parking
+    /// every key in the arena as it is built lets the collector keep them live,
+    /// and each is read back out once building finishes. The returned `Value`s
+    /// are handed straight to the caller's single array allocation — which
+    /// traces the pending element vector itself — with no intervening
+    /// allocation, so the post-scope reads are current.
+    pub(crate) fn scoped_key_strings(&mut self, keys: &[String]) -> Result<Vec<Value>, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let mut handles = Vec::with_capacity(keys.len());
+            for key in keys {
+                handles.push(interp.scoped_string(scope, key)?);
+            }
+            Ok(handles
+                .into_iter()
+                .map(|handle| interp.escape_scoped(handle))
+                .collect())
+        })
+    }
+
     /// Allocate an ordinary object with `%Object.prototype%` installed (the
     /// prototype an object-literal `{}` resolves to) and park it in the current
     /// scope. The allocation snapshots the runtime roots (including the arena),
@@ -887,9 +913,7 @@ mod tests {
                 .as_string(interp.gc_heap())
                 .expect("sibling property value still a string")
                 .to_lossy_string(interp.gc_heap());
-            let target_number = interp
-                .scoped_get(s, target, "n")
-                .unwrap();
+            let target_number = interp.scoped_get(s, target, "n").unwrap();
             let target_number = interp.escape_scoped(target_number).as_f64();
             (moved, sibling_content, target_number)
         });

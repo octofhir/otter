@@ -26,9 +26,7 @@ use crate::{
     ExecutionContext, Frame, Interpreter, Scoped, Value, VmError, VmPropertyKey, array, bigint,
     binary, object,
     operand_decode::{const_operand, register_operand},
-    read_register,
-    string::JsString,
-    write_register,
+    read_register, write_register,
 };
 
 /// Full property-bearing object-like family used by Object.* and
@@ -200,10 +198,7 @@ impl Interpreter {
         };
         let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
         let args_root = [target];
-        let mut names = Vec::with_capacity(keys.len());
-        for key in keys {
-            names.push(stack_static_string_value(&key, self)?);
-        }
+        let names = self.scoped_key_strings(&keys)?;
         let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
             stack,
             names,
@@ -602,10 +597,7 @@ impl Interpreter {
             M::ForInKeys => {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
                 let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
-                let mut names = Vec::with_capacity(keys.len());
-                for key in keys {
-                    names.push(stack_static_string_value(&key, self)?);
-                }
+                let names = self.scoped_key_strings(&keys)?;
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     names,
@@ -648,10 +640,7 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let mut names = Vec::with_capacity(owned.len());
-                for key in owned {
-                    names.push(stack_static_string_value(&key, self)?);
-                }
+                let names = self.scoped_key_strings(&owned)?;
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     names,
@@ -750,23 +739,44 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let mut pairs = Vec::with_capacity(raw.len());
-                for (key, value) in raw {
-                    let key_value = stack_static_string_value(&key, self)?;
-                    let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                let array = self.with_handle_scope(|interp, scope| {
+                    // Park every property value up front: `raw`'s young values
+                    // would otherwise be stranded by the key-string and pair
+                    // allocations below. The arena keeps each current across
+                    // every collection those allocations drive.
+                    let value_handles: Vec<Scoped> = raw
+                        .iter()
+                        .map(|(_, value)| interp.scoped_value(scope, *value))
+                        .collect();
+                    let mut pair_handles: Vec<Scoped> = Vec::with_capacity(raw.len());
+                    for ((key, _), value_h) in raw.iter().zip(value_handles) {
+                        let key_h = interp.scoped_string(scope, key)?;
+                        // Resolve both handles through the arena immediately
+                        // before the pair allocation, which traces its pending
+                        // element vector.
+                        let key_value = interp.escape_scoped(key_h);
+                        let value = interp.escape_scoped(value_h);
+                        let pair = interp.alloc_stack_rooted_array_from_values_with_root_slices(
+                            stack,
+                            [key_value, value],
+                            &[],
+                            &[args],
+                        )?;
+                        // Park the freshly built pair so later pair allocations
+                        // never strand it.
+                        pair_handles.push(interp.scoped_value(scope, Value::array(pair)));
+                    }
+                    let pairs: Vec<Value> = pair_handles
+                        .iter()
+                        .map(|pair_h| interp.escape_scoped(*pair_h))
+                        .collect();
+                    interp.alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
-                        [key_value, value],
+                        pairs,
                         &[],
-                        &[args, pairs.as_slice()],
-                    )?;
-                    pairs.push(Value::array(pair));
-                }
-                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                    stack,
-                    pairs,
-                    &[],
-                    &[args],
-                )?;
+                        &[args],
+                    )
+                })?;
                 Ok(Some(Value::array(array)))
             }
             M::FromEntries => {
@@ -1123,10 +1133,7 @@ impl Interpreter {
                 } else {
                     return Err(VmError::TypeMismatch);
                 };
-                let mut names = Vec::with_capacity(owned.len());
-                for key in owned {
-                    names.push(stack_static_string_value(&key, self)?);
-                }
+                let names = self.scoped_key_strings(&owned)?;
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     names,
@@ -1437,12 +1444,6 @@ fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> Strin
             .expect("non-symbol key has string spelling")
             .to_string(),
     }
-}
-
-fn stack_static_string_value(s: &str, interp: &mut Interpreter) -> Result<Value, VmError> {
-    Ok(Value::string(
-        JsString::from_str(s, interp.gc_heap_mut()).map_err(|_| VmError::TypeMismatch)?,
-    ))
 }
 
 fn decode_static_call(

@@ -191,6 +191,23 @@ fn alloc_registry_object(
     crate::object::alloc_object_with_roots(gc_heap, &mut external_visit).map_err(|_| oom())
 }
 
+/// Allocate a `JsString` while keeping `roots` live across the allocation.
+///
+/// Bootstrap builds a prototype's `name` / `message` strings one at a time; the
+/// string body allocation can drive a collection that relocates the young
+/// prototype (and sweep a prior, still-unrooted string), so the caller passes
+/// the prototype and any earlier string as roots. Mirrors [`alloc_registry_object`].
+fn from_str_rooted(
+    s: &str,
+    gc_heap: &mut otter_gc::GcHeap,
+    roots: &[&Value],
+) -> Result<JsString, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        trace_value_roots(roots, visitor);
+    };
+    JsString::from_str_with_roots(s, gc_heap, &mut external_visit)
+}
+
 fn native_static_with_roots(
     gc_heap: &mut otter_gc::GcHeap,
     name: &'static str,
@@ -488,16 +505,26 @@ impl ErrorClassRegistry {
         // configurable: true }`. The plain `set` path leaves
         // `enumerable: true` which fails every `name`/`message`
         // descriptor test in `built-ins/{Error,NativeErrors}/prototype/*`.
-        let error_name = JsString::from_str("Error", gc_heap)?;
-        let empty = JsString::from_str("", gc_heap)?;
-        let _ = object::define_own_property(
-            error_proto,
+        let error_name = from_str_rooted("Error", gc_heap, &[&error_proto_root])?;
+        let empty = from_str_rooted(
+            "",
+            gc_heap,
+            &[&error_proto_root, &Value::string(error_name)],
+        )?;
+        // The string allocations above may have relocated the young prototype;
+        // take its current handle from the rooted Value, and write through
+        // `_in_place` so each define reflects any further relocation.
+        let mut error_proto = error_proto_root
+            .as_object()
+            .expect("error prototype is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_proto,
             gc_heap,
             "name",
             PropertyDescriptor::data(Value::string(error_name), true, false, true),
         );
-        let _ = object::define_own_property(
-            error_proto,
+        let _ = object::define_own_property_in_place(
+            &mut error_proto,
             gc_heap,
             "message",
             PropertyDescriptor::data(Value::string(empty), true, false, true),
@@ -1270,16 +1297,21 @@ impl ErrorClassRegistry {
             object::set_prototype(proto, gc_heap, Some(error_proto));
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
-            let class_name = JsString::from_str(kind.class_name(), gc_heap)?;
-            let _ = object::define_own_property(
-                proto,
+            let class_name = from_str_rooted(kind.class_name(), gc_heap, &[&proto_root])?;
+            let empty = from_str_rooted("", gc_heap, &[&proto_root, &Value::string(class_name)])?;
+            // The string allocations may have relocated the young prototype;
+            // refresh it from the rooted Value and write through `_in_place`.
+            let mut proto = proto_root
+                .as_object()
+                .expect("native error prototype is an object");
+            let _ = object::define_own_property_in_place(
+                &mut proto,
                 gc_heap,
                 "name",
                 PropertyDescriptor::data(Value::string(class_name), true, false, true),
             );
-            let empty = JsString::from_str("", gc_heap)?;
-            let _ = object::define_own_property(
-                proto,
+            let _ = object::define_own_property_in_place(
+                &mut proto,
                 gc_heap,
                 "message",
                 PropertyDescriptor::data(Value::string(empty), true, false, true),

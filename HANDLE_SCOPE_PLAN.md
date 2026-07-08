@@ -283,6 +283,33 @@ migrate.
    code; grep-based CI check for new `value_roots` additions outside the
    whitelisted core.
 
+### P6a — final hazard-site migration (DONE)
+The audited remaining sites that held a raw GC handle across an allocation are
+migrated. After this the codebase invariant holds: **no raw GC handle is held
+across an allocation outside sound-but-boilerplate `*_with_roots` code.**
+
+- `object_statics.rs` `Object.keys` / `Object.getOwnPropertyNames` fallbacks —
+  key strings built through the new `Interpreter::scoped_key_strings` (each key
+  parked in the arena, so a later string allocation cannot sweep an earlier
+  one), then handed to the existing array allocator.
+- `static_call_ops.rs` `Object.keys` / `getOwnPropertyNames` / for-in key
+  lists — same `scoped_key_strings` path. The misnamed
+  `stack_static_string_value` helper (a bare `JsString::from_str` that rooted
+  nothing) is deleted; its last non-list caller, the `Object.entries` pair
+  loop, is rewritten to park every property value + built pair in the arena
+  and build through the prototype-override-aware allocator.
+- `error_ops.rs` system-error / node-`code` construction — the error object is
+  parked in a handle scope; each message / code / `info` string is built and
+  written through the arena, and the refreshed object handle escapes for the
+  stack-frame capture.
+- `error_classes.rs` `Error.prototype` and native-error prototype `name` /
+  `message` installs (bootstrap) — strings built through a rooted
+  `from_str_rooted` helper with the prototype live, then written with
+  `define_own_property_in_place` so the receiver handle tracks any relocation.
+
+Remaining: `ObjectBuilder` internals, macro surfaces, and the `value_roots` /
+`slice_roots` boilerplate sweep (P6 below).
+
 ### P6 — cleanup + perf follow-ups (separate track, after adoption)
 - Sweep now-dead `value_roots`/`slice_roots` threading (hundreds of sites).
 - Root-walk cost: arena is one contiguous region; then attack the fixed

@@ -37,11 +37,42 @@ use otter_runtime::{
     runtime_with_host_data,
 };
 use smallvec::SmallVec;
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::{Notify, oneshot};
+
+/// Per-server table of in-flight replies keyed by a monotonic token. A request
+/// registers its oneshot sender, then the `deliver`/`deliverError` natives —
+/// fired as promise reactions during a normal microtask drain — take the sender
+/// back by token and settle it. This decouples handler completion from the
+/// dispatch call so async handlers deliver on a later drain instead of forcing
+/// an inline microtask flush per request (the old reg-window leak).
+#[derive(Default)]
+struct ReplyRegistry {
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<HttpResponse, String>>>>,
+    next: AtomicU64,
+}
+
+impl ReplyRegistry {
+    fn register(&self, reply: oneshot::Sender<Result<HttpResponse, String>>) -> u64 {
+        let token = self.next.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .lock()
+            .expect("serve reply registry poisoned")
+            .insert(token, reply);
+        token
+    }
+
+    fn take(&self, token: u64) -> Option<oneshot::Sender<Result<HttpResponse, String>>> {
+        self.pending
+            .lock()
+            .expect("serve reply registry poisoned")
+            .remove(&token)
+    }
+}
 
 /// Static hosted module row for `import { serve } from "otter"`.
 pub static OTTER_HOSTED_MODULE: HostedModule =
@@ -112,6 +143,23 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
                     var internals = this.ensureFetchInternals();
                     return internals.makeRequest(method, url, flatHeaders, body);
                   },
+                  dispatch: function (handler, request, deliver, deliverError, token) {
+                    var self = this;
+                    try {
+                      Promise.resolve(handler(request)).then(
+                        function (response) {
+                          try {
+                            deliver(token, self.responseParts(response));
+                          } catch (err) {
+                            deliverError(token, err);
+                          }
+                        },
+                        function (err) { deliverError(token, err); }
+                      );
+                    } catch (err) {
+                      deliverError(token, err);
+                    }
+                  },
                   responseParts: function (response) {
                     var internals = this.ensureFetchInternals();
                     var parts = internals.responseParts(response);
@@ -174,11 +222,39 @@ fn serve(
         crate::type_error("serve", format!("failed to configure listener: {err}"))
     })?;
 
+    let registry = Arc::new(ReplyRegistry::default());
+    let internals_root = ctx.persistent_root_insert(options.internals);
+    let response_parts_root = ctx.persistent_root_insert(options.fns.response_parts);
+    let deliver = {
+        let registry = registry.clone();
+        ctx.native_value_with_captures(
+            "serve.deliver",
+            smallvec::smallvec![],
+            &[],
+            &[],
+            move |ctx, args, _captures| deliver_reply(ctx, &registry, args),
+        )
+        .map_err(|err| crate::type_error("serve", err.to_string()))?
+    };
+    let deliver_error = {
+        let registry = registry.clone();
+        ctx.native_value_with_captures(
+            "serve.deliverError",
+            smallvec::smallvec![],
+            &[],
+            &[],
+            move |ctx, args, _captures| deliver_error(ctx, &registry, args),
+        )
+        .map_err(|err| crate::type_error("serve", err.to_string()))?
+    };
     let roots = ServeRoots {
         fetch: ctx.persistent_root_insert(options.fetch),
-        internals: ctx.persistent_root_insert(options.internals),
+        internals: internals_root,
         make_request: ctx.persistent_root_insert(options.fns.make_request),
-        response_parts: ctx.persistent_root_insert(options.fns.response_parts),
+        response_parts: response_parts_root,
+        dispatch: ctx.persistent_root_insert(options.fns.dispatch),
+        deliver: ctx.persistent_root_insert(deliver),
+        deliver_error: ctx.persistent_root_insert(deliver_error),
     };
     let context = ctx
         .execution_context()
@@ -197,7 +273,14 @@ fn serve(
     let hostname = options.hostname.clone();
     let port = actual_addr.port();
     let url = format!("http://{actual_addr}");
-    io_handle.spawn(accept_loop(listener, task_spawner, context, control, roots));
+    io_handle.spawn(accept_loop(
+        listener,
+        task_spawner,
+        context,
+        control,
+        roots,
+        registry,
+    ));
     build_server_object(ctx, server, hostname, port, url)
 }
 
@@ -205,6 +288,7 @@ fn serve(
 struct ServeFns {
     make_request: Value,
     response_parts: Value,
+    dispatch: Value,
 }
 
 struct ServeOptions {
@@ -221,6 +305,9 @@ struct ServeRoots {
     internals: RuntimePersistentRootId,
     make_request: RuntimePersistentRootId,
     response_parts: RuntimePersistentRootId,
+    dispatch: RuntimePersistentRootId,
+    deliver: RuntimePersistentRootId,
+    deliver_error: RuntimePersistentRootId,
 }
 
 struct ServeServerControl {
@@ -255,6 +342,7 @@ struct ServeRequestTask {
     roots: ServeRoots,
     request: HttpRequest,
     reply: oneshot::Sender<Result<HttpResponse, String>>,
+    registry: Arc<ReplyRegistry>,
 }
 
 impl RuntimeTask for ServeRequestTask {
@@ -264,27 +352,37 @@ impl RuntimeTask for ServeRequestTask {
             roots,
             request,
             reply,
+            registry,
         } = *self;
-        let mut response = None;
+        // Hand the reply to the registry and drive the JS dispatch trampoline.
+        // For a sync handler the reaction fires inside this event's single
+        // microtask drain and `deliver` settles the token before we return; an
+        // async handler's reaction settles on a later drain, so the token stays
+        // parked in the registry and we must NOT touch `reply` here.
+        let token = registry.register(reply);
         let result = runtime.run_native_event(&context, |ctx| {
             let options = ServeDispatchOptions::from_roots(ctx, roots)?;
             let js_request = make_request(ctx, &options, &request)?;
-            let response_value = call_js(
+            call_js(
                 ctx,
-                "serve.fetch",
-                options.fetch,
-                Value::undefined(),
-                smallvec::smallvec![js_request],
+                "serve.dispatch",
+                options.fns.dispatch,
+                options.internals,
+                smallvec::smallvec![
+                    options.fetch,
+                    js_request,
+                    options.deliver,
+                    options.deliver_error,
+                    Value::number_f64(token as f64),
+                ],
             )?;
-            let response_value = resolve_fetch_result(ctx, response_value)?;
-            response = Some(response_from_value(ctx, &options, response_value)?);
             Ok(Value::undefined())
         });
-        match result {
-            Ok(_) => {
-                let _ = reply.send(Ok(response.expect("serve response should be set")));
-            }
-            Err(err) => {
+        // The trampoline catches handler errors itself; a hard `Err` here means
+        // dispatch failed before scheduling any reaction. Unblock the client if
+        // the token is still parked.
+        if let Err(err) = result {
+            if let Some(reply) = registry.take(token) {
                 let _ = reply.send(Err(err.to_string()));
             }
         }
@@ -292,35 +390,74 @@ impl RuntimeTask for ServeRequestTask {
     }
 }
 
+fn deliver_reply(
+    ctx: &mut NativeCtx<'_>,
+    registry: &ReplyRegistry,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let Some(token) = token_arg(args) else {
+        return Ok(Value::undefined());
+    };
+    // The JS reaction already ran `responseParts`, so `args[1]` is the plain
+    // parts object. Parsing it touches only the heap — no re-entrant VM call,
+    // which is what leaked a register window per request when a nested
+    // `run_callable_sync` ran inside this VM-invoked native.
+    let parts = args.get(1).copied().unwrap_or_else(Value::null);
+    let result = http_response_from_parts(ctx, parts);
+    if let Some(reply) = registry.take(token) {
+        let _ = reply.send(result.map_err(|err| err.to_string()));
+    }
+    Ok(Value::undefined())
+}
+
+fn deliver_error(
+    ctx: &mut NativeCtx<'_>,
+    registry: &ReplyRegistry,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let Some(token) = token_arg(args) else {
+        return Ok(Value::undefined());
+    };
+    let message = args
+        .get(1)
+        .and_then(|value| value.as_string(ctx.heap()))
+        .map(|value| value.to_lossy_string(ctx.heap()))
+        .unwrap_or_else(|| "fetch handler rejected".to_string());
+    if let Some(reply) = registry.take(token) {
+        let _ = reply.send(Err(message));
+    }
+    Ok(Value::undefined())
+}
+
+fn token_arg(args: &[Value]) -> Option<u64> {
+    let token = args.first().and_then(|value| value.as_number()).map(|n| n.as_f64())?;
+    token.is_finite().then_some(token as u64)
+}
+
 struct ServeDispatchOptions {
     fetch: Value,
     internals: Value,
     fns: ServeFns,
+    deliver: Value,
+    deliver_error: Value,
 }
 
 impl ServeDispatchOptions {
     fn from_roots(ctx: &mut NativeCtx<'_>, roots: ServeRoots) -> Result<Self, NativeError> {
-        let fetch = ctx
-            .persistent_root_get(roots.fetch)
-            .ok_or_else(|| crate::type_error("serve", "server fetch root is closed"))?;
-        let internals = ctx
-            .persistent_root_get(roots.internals)
-            .ok_or_else(|| crate::type_error("serve", "server internals root is closed"))?;
-        let make_request = ctx
-            .persistent_root_get(roots.make_request)
-            .ok_or_else(|| crate::type_error("serve", "server Request factory root is closed"))?;
-        let response_parts = ctx
-            .persistent_root_get(roots.response_parts)
-            .ok_or_else(|| {
-                crate::type_error("serve", "server Response extractor root is closed")
-            })?;
+        let get = |ctx: &NativeCtx<'_>, id, what| {
+            ctx.persistent_root_get(id)
+                .ok_or_else(|| crate::type_error("serve", format!("server {what} root is closed")))
+        };
         Ok(Self {
-            fetch,
-            internals,
+            fetch: get(ctx, roots.fetch, "fetch")?,
+            internals: get(ctx, roots.internals, "internals")?,
             fns: ServeFns {
-                make_request,
-                response_parts,
+                make_request: get(ctx, roots.make_request, "Request factory")?,
+                response_parts: get(ctx, roots.response_parts, "Response extractor")?,
+                dispatch: get(ctx, roots.dispatch, "dispatch")?,
             },
+            deliver: get(ctx, roots.deliver, "deliver")?,
+            deliver_error: get(ctx, roots.deliver_error, "deliverError")?,
         })
     }
 }
@@ -334,6 +471,7 @@ async fn accept_loop(
     context: otter_runtime::RuntimeExecutionContext,
     control: Arc<ServeServerControl>,
     roots: ServeRoots,
+    registry: Arc<ReplyRegistry>,
 ) {
     let listener = match tokio::net::TcpListener::from_std(listener) {
         Ok(listener) => listener,
@@ -355,6 +493,7 @@ async fn accept_loop(
         };
         let task_spawner = task_spawner.clone();
         let context = context.clone();
+        let registry = registry.clone();
         // One task per connection; hyper reads successive keep-alive requests
         // off it until the peer closes or the connection goes idle.
         tokio::spawn(async move {
@@ -362,7 +501,8 @@ async fn accept_loop(
             let service = service_fn(move |req: HyperRequest<Incoming>| {
                 let task_spawner = task_spawner.clone();
                 let context = context.clone();
-                async move { serve_one(&task_spawner, context, roots, req).await }
+                let registry = registry.clone();
+                async move { serve_one(&task_spawner, context, roots, registry, req).await }
             });
             let _ = http1::Builder::new()
                 .keep_alive(true)
@@ -378,9 +518,10 @@ async fn serve_one(
     task_spawner: &RuntimeTaskSpawner,
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
+    registry: Arc<ReplyRegistry>,
     req: HyperRequest<Incoming>,
 ) -> Result<HyperResponse<Full<Bytes>>, std::convert::Infallible> {
-    match dispatch_request(task_spawner, context, roots, req).await {
+    match dispatch_request(task_spawner, context, roots, registry, req).await {
         Ok(response) => Ok(build_hyper_response(response)),
         Err(err) => Ok(error_response(&err)),
     }
@@ -390,6 +531,7 @@ async fn dispatch_request(
     task_spawner: &RuntimeTaskSpawner,
     context: otter_runtime::RuntimeExecutionContext,
     roots: ServeRoots,
+    registry: Arc<ReplyRegistry>,
     req: HyperRequest<Incoming>,
 ) -> Result<HttpResponse, String> {
     let request = read_hyper_request(req).await?;
@@ -401,6 +543,7 @@ async fn dispatch_request(
                 roots,
                 request,
                 reply,
+                registry,
             },
             RuntimeLiveness::Ref,
         )
@@ -529,6 +672,9 @@ fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
         let _ = ctx.persistent_root_remove(roots.internals);
         let _ = ctx.persistent_root_remove(roots.make_request);
         let _ = ctx.persistent_root_remove(roots.response_parts);
+        let _ = ctx.persistent_root_remove(roots.dispatch);
+        let _ = ctx.persistent_root_remove(roots.deliver);
+        let _ = ctx.persistent_root_remove(roots.deliver_error);
     }
     Ok(Value::undefined())
 }
@@ -591,6 +737,9 @@ fn parse_options(
     let response_parts = object::get(internals_obj, ctx.heap(), "responseParts")
         .filter(|value| value.is_callable())
         .ok_or_else(|| crate::type_error("serve", "missing Response extractor"))?;
+    let dispatch = object::get(internals_obj, ctx.heap(), "dispatch")
+        .filter(|value| value.is_callable())
+        .ok_or_else(|| crate::type_error("serve", "missing dispatch trampoline"))?;
     Ok(ServeOptions {
         hostname,
         port,
@@ -599,6 +748,7 @@ fn parse_options(
         fns: ServeFns {
             make_request,
             response_parts,
+            dispatch,
         },
     })
 }
@@ -645,22 +795,14 @@ fn make_request(
     value
 }
 
-fn response_from_value(
+/// Build an [`HttpResponse`] from the plain parts object the JS
+/// `responseParts` shim already produced (`{ status, headersText, body }`).
+/// This runs inside the `deliver` native, so it must not re-enter the VM — a
+/// nested `run_callable_sync` here leaked a register window per request.
+fn http_response_from_parts(
     ctx: &mut NativeCtx<'_>,
-    options: &ServeDispatchOptions,
-    value: Value,
+    parts: Value,
 ) -> Result<HttpResponse, NativeError> {
-    let root_base = ctx.push_scratch_root(options.internals);
-    let response_parts_root = ctx.push_scratch_root(options.fns.response_parts);
-    let response_root = ctx.push_scratch_root(value);
-    let parts = call_js(
-        ctx,
-        "serve.responseParts",
-        ctx.scratch_root(response_parts_root),
-        ctx.scratch_root(root_base),
-        smallvec::smallvec![ctx.scratch_root(response_root)],
-    )?;
-    ctx.pop_scratch_root_to(root_base);
     if parts.is_null() {
         return Err(crate::type_error(
             "serve",
@@ -711,10 +853,6 @@ fn response_from_value(
         headers,
         body,
     })
-}
-
-fn resolve_fetch_result(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
-    ctx.resolve_native_promise_after_microtasks(value, "serve.fetch")
 }
 
 fn call_js(

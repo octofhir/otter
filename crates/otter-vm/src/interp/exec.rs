@@ -609,11 +609,15 @@ impl Interpreter {
         let previous = self.active_frame_stack;
         self.active_frame_stack = stack as *const HoltStack;
         // A nested dispatch allocates its frames' register windows above the
-        // caller's flat-stack cursor; restore the cursor on exit so any window
-        // a non-locally-exited sub-frame left behind is released.
+        // caller's flat-stack cursor; on exit clamp the cursor down to release
+        // any window a non-locally-exited sub-frame left behind. Only ever
+        // LOWER it: when this loop entered on a re-entry frame (its window was
+        // allocated below the saved cursor by the caller and then reclaimed as
+        // that frame returned here), the cursor is already below `saved` and
+        // raising it back would re-leak that window on every `run_callable_sync`.
         let saved_reg_top = self.reg_top;
         let result = self.dispatch_loop_tracked(context, stack);
-        self.reg_top = saved_reg_top;
+        self.reg_top = self.reg_top.min(saved_reg_top);
         self.active_frame_stack = previous;
         result
     }

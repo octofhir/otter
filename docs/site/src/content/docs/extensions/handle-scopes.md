@@ -1,4 +1,6 @@
-# Writing Native Functions: the Handle-Scope API
+---
+title: "Handle Scopes: Building JS Values"
+---
 
 This is the standard way to build JS values from Rust in otter. Every new
 native function uses it; existing code is being migrated to it. If you are
@@ -148,7 +150,7 @@ let leaked = ctx.scope(|ctx, s| ctx.scoped_string(s, "x").unwrap());
 
 ## Migration status
 
-Design + phase plan: [`HANDLE_SCOPE_PLAN.md`](../HANDLE_SCOPE_PLAN.md).
+Design + phase plan: `HANDLE_SCOPE_PLAN.md` (repo root).
 Migrated: otter-web URL/Blob, serve server object, the `Object.*` reflection
 paths. In flight: ffi/kv/sql modules, `RuntimeNativeCtx` aliases, remaining
 `Object.keys`/`getOwnPropertyNames` fallbacks, error-object construction,

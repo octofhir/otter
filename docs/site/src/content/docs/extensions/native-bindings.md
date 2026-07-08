@@ -8,6 +8,9 @@ runtime context. They must not reach for thread-local heap state or move VM
 
 The current safe path is:
 
+- build multi-allocation JS values inside a handle scope — `ctx.scope` +
+  `scoped_*` — so no raw `Value` local is held across an allocation (see
+  [Handle Scopes: Building JS Values](/extensions/handle-scopes/));
 - use `NativeCtx` for allocation and mutation;
 - use `NativeCtx::record_write` or higher-level container helpers after
   storing GC-bearing values;

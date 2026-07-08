@@ -209,7 +209,8 @@ allocation triggers a collection.
 with the `scoped_*` methods. Handles live in a collector-traced arena and can
 never go stale; the compiler stops them escaping the scope. **This is the
 standard API for all native value building** — see
-[docs/NATIVE_API.md](docs/NATIVE_API.md). Do not add new code with the
+[the handle-scopes doc page](docs/site/src/content/docs/extensions/handle-scopes.md).
+Do not add new code with the
 deprecated manual `value_roots` threading or raw-`Value` juggling; verify any
 multi-allocation native under `OTTER_GC_STRESS=1..16` (identical output every
 stride).

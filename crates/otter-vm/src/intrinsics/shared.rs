@@ -91,6 +91,37 @@ pub fn native_static_with_value_roots(
     )
 }
 
+/// Allocate a native function from a full [`crate::NativeCall`] target with
+/// `value_roots` kept live.
+///
+/// `pub` for the `couch!` macro's generated `install` body: unlike
+/// [`native_static_with_value_roots`] (which only takes the `NativeFastFn` of a
+/// `NativeCall::Static`), this accepts every `NativeCall` variant — including
+/// the `VmIntrinsic` fast-path targets many builtin prototype methods use — so
+/// the prototype install loop can build methods by reference without dropping to
+/// the `ObjectBuilder`. Mirrors the allocation `crate::ObjectBuilder::method`
+/// performs.
+pub fn native_from_call_with_value_roots(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeCall,
+    value_roots: &[&Value],
+) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots {
+            value.trace_value_slots(visitor);
+        }
+    };
+    crate::native_function::NativeFunction::from_call_with_roots(
+        heap,
+        name,
+        length,
+        call,
+        &mut external_visit,
+    )
+}
+
 /// Resolve `new.target.prototype` for a native constructor — used by
 /// every builtin whose `[[Construct]]` allocates via
 /// `OrdinaryCreateFromConstructor`.

@@ -39,7 +39,8 @@ use crate::{
 // import either path.
 pub use crate::intrinsics::shared::{
     alloc_object_with_value_roots_pub, define_global_value,
-    native_constructor_static_with_value_roots, native_static_with_value_roots,
+    native_constructor_static_with_value_roots, native_from_call_with_value_roots,
+    native_static_with_value_roots,
 };
 pub(crate) use crate::intrinsics::shared::{install_placeholder, native_new_target_prototype};
 

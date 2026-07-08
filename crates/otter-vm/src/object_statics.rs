@@ -35,7 +35,7 @@ use crate::object::{
 };
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
-use crate::{NativeCtx, NativeError, Value, VmError};
+use crate::{NativeCtx, NativeError, Scoped, Value, VmError};
 
 enum PropertyKey {
     String(String),
@@ -2117,25 +2117,47 @@ pub fn call(
                     .map(|(k, v)| (k.to_string(), v))
                     .collect()
             });
-            let mut pairs: Vec<Value> = Vec::with_capacity(raw.len());
-            for (k, v) in raw {
-                let key = string_value(&k, gc_heap)?;
-                let pair: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![key, v];
-                let target_root = Value::object(target);
-                pairs.push(Value::array(rooted_array_from_elements(
-                    gc_heap,
-                    pair,
+            let array = interp.with_handle_scope(|interp, scope| {
+                // Park the receiver and every property value up front: `raw`'s
+                // young values (and the receiver) would otherwise be stranded
+                // by the key-string and pair allocations below. The arena keeps
+                // each current across every collection those allocations drive.
+                let target_h = interp.scoped_value(scope, Value::object(target));
+                let value_handles: Vec<Scoped> = raw
+                    .iter()
+                    .map(|(_, v)| interp.scoped_value(scope, *v))
+                    .collect();
+                let mut pair_handles: Vec<Scoped> = Vec::with_capacity(raw.len());
+                for ((k, _), value_h) in raw.iter().zip(value_handles) {
+                    let key_h = interp.scoped_string(scope, k)?;
+                    // Resolve through the arena immediately before the pair
+                    // allocation, which traces its pending element vector.
+                    let key = interp.escape_scoped(key_h);
+                    let value = interp.escape_scoped(value_h);
+                    let target_root = interp.escape_scoped(target_h);
+                    let pair = rooted_array_from_elements(
+                        interp.gc_heap_for_cx_mut(),
+                        [key, value],
+                        &[&target_root],
+                        &[args],
+                    )?;
+                    // Park the freshly built pair so later pair allocations
+                    // never strand it.
+                    pair_handles.push(interp.scoped_value(scope, Value::array(pair)));
+                }
+                let pairs: Vec<Value> = pair_handles
+                    .iter()
+                    .map(|pair_h| interp.escape_scoped(*pair_h))
+                    .collect();
+                let target_root = interp.escape_scoped(target_h);
+                rooted_array_from_elements(
+                    interp.gc_heap_for_cx_mut(),
+                    pairs,
                     &[&target_root],
-                    &[args, pairs.as_slice()],
-                )?));
-            }
-            let target_root = Value::object(target);
-            Ok(Value::array(rooted_array_from_elements(
-                gc_heap,
-                pairs,
-                &[&target_root],
-                &[args],
-            )?))
+                    &[args],
+                )
+            })?;
+            Ok(Value::array(array))
         }
         // §20.1.2.1 Object.assign(target, ...sources). Copies own
         // enumerable string-keyed data properties from each source
@@ -2304,12 +2326,6 @@ pub fn call(
             ("Object.__forInKeys requires an active execution context".to_string()).into(),
         )),
     }
-}
-
-fn string_value(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, VmError> {
-    Ok(Value::string(
-        JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
-    ))
 }
 
 /// Implement §6.2.5.5 ToPropertyDescriptor against `desc_obj`.

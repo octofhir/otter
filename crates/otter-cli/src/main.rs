@@ -468,7 +468,10 @@ struct TestArgs {
     paths: Vec<PathBuf>,
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Multi-thread: host IO (HTTP server, fetch, timers) runs on Tokio workers
+// while the VM stays pinned to the isolate thread. Current-thread would stall
+// IO whenever the main thread blocks joining the isolate.
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse();

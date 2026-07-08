@@ -153,27 +153,14 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
                   fetchSlots: function () {
                     return ensureFetch().slots;
                   },
-                  dispatch: function (handler, request, deliver, deliverError, token) {
-                    try {
-                      var result = handler(request);
-                      // `deliver` extracts the Response natively. A sync handler
-                      // delivers inline (no promise/microtask); only a genuine
-                      // thenable parks until a later drain.
-                      if (
-                        result !== null &&
-                        typeof result === 'object' &&
-                        typeof result.then === 'function'
-                      ) {
-                        result.then(
-                          function (response) { deliver(token, response); },
-                          function (err) { deliverError(token, err); }
-                        );
-                      } else {
-                        deliver(token, result);
-                      }
-                    } catch (err) {
-                      deliverError(token, err);
-                    }
+                  // Async tail only: the server calls the handler directly and
+                  // extracts a synchronous Response natively. A thenable result
+                  // is routed here to settle on a later microtask drain.
+                  asyncDeliver: function (promise, deliver, deliverError, token) {
+                    promise.then(
+                      function (response) { deliver(token, response); },
+                      function (err) { deliverError(token, err); }
+                    );
                   },
                 }),
                 writable: false,
@@ -260,7 +247,7 @@ fn serve(
         fetch: ctx.persistent_root_insert(options.fetch),
         internals: internals_root,
         make_request: ctx.persistent_root_insert(options.fns.make_request),
-        dispatch: ctx.persistent_root_insert(options.fns.dispatch),
+        async_deliver: ctx.persistent_root_insert(options.fns.async_deliver),
         deliver: ctx.persistent_root_insert(deliver),
         deliver_error: ctx.persistent_root_insert(deliver_error),
         slots,
@@ -297,7 +284,7 @@ fn serve(
 struct ServeFns {
     make_request: Value,
     fetch_slots: Value,
-    dispatch: Value,
+    async_deliver: Value,
 }
 
 struct ServeOptions {
@@ -362,7 +349,7 @@ struct ServeRoots {
     fetch: RuntimePersistentRootId,
     internals: RuntimePersistentRootId,
     make_request: RuntimePersistentRootId,
-    dispatch: RuntimePersistentRootId,
+    async_deliver: RuntimePersistentRootId,
     deliver: RuntimePersistentRootId,
     deliver_error: RuntimePersistentRootId,
     slots: ServeSlots,
@@ -412,33 +399,44 @@ impl RuntimeTask for ServeRequestTask {
             reply,
             registry,
         } = *self;
-        // Hand the reply to the registry and drive the JS dispatch trampoline.
-        // For a sync handler the reaction fires inside this event's single
-        // microtask drain and `deliver` settles the token before we return; an
-        // async handler's reaction settles on a later drain, so the token stays
-        // parked in the registry and we must NOT touch `reply` here.
+        // Park the reply under a token, then call the user handler directly.
+        // A synchronous Response is extracted and settled inline; a thenable
+        // result is handed to `asyncDeliver`, whose reaction settles the token
+        // on a later microtask drain (so we must NOT touch the reply here for
+        // the async path). A hard error settles the token with a 500.
         let token = registry.register(reply);
+        let registry_for_event = registry.clone();
         let result = runtime.run_native_event(&context, |ctx| {
             let options = ServeDispatchOptions::from_roots(ctx, roots)?;
             let js_request = make_request(ctx, &options, &request)?;
-            call_js(
+            let outcome = call_js(
                 ctx,
-                "serve.dispatch",
-                options.dispatch,
-                options.internals,
-                smallvec::smallvec![
-                    options.fetch,
-                    js_request,
-                    options.deliver,
-                    options.deliver_error,
-                    Value::number_f64(token as f64),
-                ],
+                "serve.fetch",
+                options.fetch,
+                Value::undefined(),
+                smallvec::smallvec![js_request],
             )?;
+            if is_thenable(ctx, outcome) {
+                call_js(
+                    ctx,
+                    "serve.asyncDeliver",
+                    options.async_deliver,
+                    options.internals,
+                    smallvec::smallvec![
+                        outcome,
+                        options.deliver,
+                        options.deliver_error,
+                        Value::number_f64(token as f64),
+                    ],
+                )?;
+            } else {
+                let response = extract_response(ctx, options.slots, outcome);
+                if let Some(reply) = registry_for_event.take(token) {
+                    let _ = reply.send(response.map_err(|err| err.to_string()));
+                }
+            }
             Ok(Value::undefined())
         });
-        // The trampoline catches handler errors itself; a hard `Err` here means
-        // dispatch failed before scheduling any reaction. Unblock the client if
-        // the token is still parked.
         if let Err(err) = result {
             if let Some(reply) = registry.take(token) {
                 let _ = reply.send(Err(err.to_string()));
@@ -496,9 +494,10 @@ struct ServeDispatchOptions {
     fetch: Value,
     internals: Value,
     make_request: Value,
-    dispatch: Value,
+    async_deliver: Value,
     deliver: Value,
     deliver_error: Value,
+    slots: ServeSlots,
 }
 
 impl ServeDispatchOptions {
@@ -511,11 +510,20 @@ impl ServeDispatchOptions {
             fetch: get(ctx, roots.fetch, "fetch")?,
             internals: get(ctx, roots.internals, "internals")?,
             make_request: get(ctx, roots.make_request, "Request factory")?,
-            dispatch: get(ctx, roots.dispatch, "dispatch")?,
+            async_deliver: get(ctx, roots.async_deliver, "asyncDeliver")?,
             deliver: get(ctx, roots.deliver, "deliver")?,
             deliver_error: get(ctx, roots.deliver_error, "deliverError")?,
+            slots: roots.slots,
         })
     }
+}
+
+/// A `Promise` handler result parks for a later microtask drain; a `Response`
+/// is delivered synchronously. An `async` fetch handler returns a native
+/// `Promise`, so this covers the async contract; a plain `Response` object is
+/// not a promise and takes the fast synchronous extraction path.
+fn is_thenable(_ctx: &NativeCtx<'_>, value: Value) -> bool {
+    value.is_promise()
 }
 
 /// Accept connections on the shared Tokio runtime, serving each with HTTP/1.1
@@ -727,7 +735,7 @@ fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
         let _ = ctx.persistent_root_remove(roots.fetch);
         let _ = ctx.persistent_root_remove(roots.internals);
         let _ = ctx.persistent_root_remove(roots.make_request);
-        let _ = ctx.persistent_root_remove(roots.dispatch);
+        let _ = ctx.persistent_root_remove(roots.async_deliver);
         let _ = ctx.persistent_root_remove(roots.deliver);
         let _ = ctx.persistent_root_remove(roots.deliver_error);
         roots.slots.remove(ctx);
@@ -793,9 +801,9 @@ fn parse_options(
     let fetch_slots = object::get(internals_obj, ctx.heap(), "fetchSlots")
         .filter(|value| value.is_callable())
         .ok_or_else(|| crate::type_error("serve", "missing Fetch slot accessor"))?;
-    let dispatch = object::get(internals_obj, ctx.heap(), "dispatch")
+    let async_deliver = object::get(internals_obj, ctx.heap(), "asyncDeliver")
         .filter(|value| value.is_callable())
-        .ok_or_else(|| crate::type_error("serve", "missing dispatch trampoline"))?;
+        .ok_or_else(|| crate::type_error("serve", "missing async deliver trampoline"))?;
     Ok(ServeOptions {
         hostname,
         port,
@@ -804,7 +812,7 @@ fn parse_options(
         fns: ServeFns {
             make_request,
             fetch_slots,
-            dispatch,
+            async_deliver,
         },
     })
 }

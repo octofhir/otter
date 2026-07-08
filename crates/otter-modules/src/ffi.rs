@@ -11,8 +11,8 @@ use std::sync::Arc;
 use libloading::Library;
 use otter_runtime::CapabilitySet;
 use otter_runtime::{
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
+    RuntimeAttr as Attr, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeValue as Value,
 };
 
 /// Errors produced by `otter:ffi`.
@@ -215,11 +215,15 @@ fn open_library(
     let signatures = BTreeMap::new();
     let library = unsafe { FfiLibrary::open(&path, signatures, capabilities) }
         .map_err(|err| crate::type_error("dlopen", err.to_string()))?;
-    let path_value = crate::string_value(ctx, &library.path().display().to_string())?;
-    let mut builder = ObjectBuilder::new(ctx)?;
-    builder
-        .data_property("path", path_value)
-        .map_err(|err| crate::type_error("dlopen", err.to_string()))?;
-    let object = builder.build();
-    Ok(Value::object(object))
+    // Snapshot the path as a Rust value first: minting the JS string and the
+    // result object are two allocations, and the string must not be held as a
+    // raw handle across the object alloc. The scope parks each handle so a
+    // moving collection can never strand it.
+    let path_text = library.path().display().to_string();
+    ctx.scope(|ctx, s| {
+        let object = ctx.scoped_object(s)?;
+        let path_value = ctx.scoped_string(s, &path_text)?;
+        ctx.scoped_define_data(s, object, "path", path_value, Attr::data().to_flags())?;
+        Ok::<Value, NativeError>(ctx.escape(object))
+    })
 }

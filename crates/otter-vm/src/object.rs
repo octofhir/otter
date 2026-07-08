@@ -3394,6 +3394,23 @@ pub fn define_own_property(
     descriptor: PropertyDescriptor,
 ) -> bool {
     let mut obj = obj;
+    define_own_property_in_place(&mut obj, heap, key, descriptor)
+}
+
+/// Like [`define_own_property`], but reflects any relocation the write's own
+/// allocation drove back into the caller's handle.
+///
+/// A wide-number value boxes a `HeapNumber` and the shape transition can move a
+/// young receiver; the caller's `obj` must be refreshed so a following write on
+/// the same builder (e.g. [`crate::ObjectBuilder`] chaining several properties)
+/// never dereferences a vacated cell.
+pub fn define_own_property_in_place(
+    obj_ref: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    let mut obj = *obj_ref;
     let map_descriptor = descriptor.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
@@ -3420,7 +3437,12 @@ pub fn define_own_property(
     };
     let (meta, stored) = match slot_source.into_flat(heap, &mut obj) {
         Ok(parts) => parts,
-        Err(_) => return false,
+        Err(_) => {
+            // `into_flat` may have relocated the receiver before failing; reflect
+            // it so the caller's handle is never left pointing at a vacated cell.
+            *obj_ref = obj;
+            return false;
+        }
     };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
@@ -3460,6 +3482,8 @@ pub fn define_own_property(
         }
         record_slot_write(heap, obj, stored);
     }
+    // Reflect any relocation the write drove back into the caller's handle.
+    *obj_ref = obj;
     success
 }
 

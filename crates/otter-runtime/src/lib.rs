@@ -128,10 +128,11 @@ pub use structured_clone::{
 };
 pub use surface::{
     RuntimeAccessorSpec, RuntimeAttr, RuntimeClassSpec, RuntimeConstSpec, RuntimeConstValue,
-    RuntimeConstructorSpec, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeJsObject,
-    RuntimeJsString, RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall, RuntimeNativeCtx,
-    RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNumberValue,
-    RuntimeObjectBuilder, RuntimePropertySpec, RuntimeSurfaceError, RuntimeValue, runtime_accessor,
+    RuntimeConstructorSpec, RuntimeHandleScope, RuntimeHostObjectData, RuntimeHostObjectError,
+    RuntimeJsObject, RuntimeJsString, RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall,
+    RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNumberValue,
+    RuntimeObjectBuilder, RuntimePropertySpec, RuntimeScoped, RuntimeSurfaceError, RuntimeValue,
+    runtime_accessor,
     runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements, runtime_class,
     runtime_constant, runtime_constructor, runtime_getter, runtime_method,
     runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,

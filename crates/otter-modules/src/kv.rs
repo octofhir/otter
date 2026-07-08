@@ -11,8 +11,8 @@ use otter_runtime::CapabilitySet;
 use otter_runtime::{
     RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
-    RuntimeValue as Value, runtime_array_from_elements, runtime_this_object,
-    runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeValue as Value, runtime_this_object, runtime_with_host_data,
+    runtime_with_host_data_mut,
 };
 use serde_json::Value as JsonValue;
 
@@ -265,12 +265,18 @@ fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
     let object = store_receiver(ctx, "KvStore.keys")?;
     let keys = runtime_with_host_data::<KvStore, _>(ctx, object, KvStore::keys)
         .map_err(|err| host_error("KvStore.keys", err))?;
-    let values = keys
-        .iter()
-        .map(|key| crate::string_value(ctx, key))
-        .collect::<Result<Vec<_>, _>>()?;
-    let array = runtime_array_from_elements(ctx, values)?;
-    Ok(Value::array(array))
+    // Each key string and the backing array are separate allocations. Collecting
+    // the strings into a `Vec` first left every earlier `JsString` unrooted
+    // across the later allocations; fill the array through the scope instead so
+    // each element is parked the moment it is created.
+    ctx.scope(|ctx, s| {
+        let array = ctx.scoped_array(s, keys.len())?;
+        for (index, key) in keys.iter().enumerate() {
+            let value = ctx.scoped_string(s, key)?;
+            ctx.scoped_set_index(s, array, index, value)?;
+        }
+        Ok::<Value, NativeError>(ctx.escape(array))
+    })
 }
 
 fn method_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

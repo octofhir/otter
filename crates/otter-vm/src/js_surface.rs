@@ -407,7 +407,7 @@ impl<'rt> ObjectBuilder<'rt> {
         value: Value,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
-        define_data(self.object, self.heap, name, value, attrs)?;
+        define_data_in_place(&mut self.object, self.heap, name, value, attrs)?;
         Ok(self)
     }
 
@@ -437,8 +437,17 @@ impl<'rt> ObjectBuilder<'rt> {
             roots.as_slice(),
             &[],
         )?;
-        define_data(
-            self.object,
+        // Building the native function can drive a moving collection that
+        // relocates the builder object. The root walk rewrote `object_root` in
+        // place, but not the `self.object` field the write below dereferences —
+        // refresh it from the rooted copy so `define_data` never writes through a
+        // vacated cell (the `ObjectBody shape points at non-shape cell` crash
+        // under `OTTER_GC_STRESS`).
+        self.object = object_root
+            .as_object()
+            .expect("builder object handle stays an object across the native allocation");
+        define_data_in_place(
+            &mut self.object,
             self.heap,
             name,
             Value::native_function(native),
@@ -487,13 +496,21 @@ impl<'rt> ObjectBuilder<'rt> {
             )?)),
             None => None,
         };
+        // Both native allocations above can relocate the receiver and the
+        // getter; the root walk rewrote `object_root`/`getter_root` in place but
+        // not the `self.object`/`getter` locals, so refresh them before the write
+        // dereferences the receiver or stores the getter.
+        self.object = object_root
+            .as_object()
+            .expect("builder object handle stays an object across the native allocations");
+        let getter = getter.map(|_| getter_root);
         let descriptor = PropertyDescriptor::accessor(
             getter,
             setter,
             spec.attrs.enumerable,
             spec.attrs.configurable,
         );
-        if object::define_own_property(self.object, self.heap, spec.name, descriptor) {
+        if object::define_own_property_in_place(&mut self.object, self.heap, spec.name, descriptor) {
             Ok(self)
         } else {
             Err(JsSurfaceError::DefinePropertyFailed(spec.name))
@@ -824,24 +841,25 @@ impl<'rt> NamespaceBuilder<'rt> {
 
     /// Install all constants, methods, and accessors on the object.
     pub fn build(self) -> Result<JsObject, JsSurfaceError> {
-        {
-            let mut object = ObjectBuilder::from_object_with_raw_and_value_roots(
-                self.heap,
-                self.object,
-                self.raw_roots,
-                self.value_roots,
-            );
-            for property in self.spec.constants {
-                object.property_from_spec(property)?;
-            }
-            for method in self.spec.methods {
-                object.method_from_spec(method)?;
-            }
-            for accessor in self.spec.accessors {
-                object.accessor_from_spec(accessor)?;
-            }
+        let mut object = ObjectBuilder::from_object_with_raw_and_value_roots(
+            self.heap,
+            self.object,
+            self.raw_roots,
+            self.value_roots,
+        );
+        for property in self.spec.constants {
+            object.property_from_spec(property)?;
         }
-        Ok(self.object)
+        for method in self.spec.methods {
+            object.method_from_spec(method)?;
+        }
+        for accessor in self.spec.accessors {
+            object.accessor_from_spec(accessor)?;
+        }
+        // Return the builder's refreshed handle, not `self.object`: the
+        // installs above can relocate the namespace object, and the inner
+        // builder tracked the move while `self.object` stayed at the old offset.
+        Ok(object.build())
     }
 }
 
@@ -870,11 +888,25 @@ fn define_data(
     value: Value,
     attrs: Attr,
 ) -> Result<(), JsSurfaceError> {
+    let mut object = object;
+    define_data_in_place(&mut object, heap, name, value, attrs)
+}
+
+/// [`define_data`] that reflects any relocation the write drove back into
+/// `object`, so a builder chaining several properties never writes through a
+/// stale handle when an intermediate allocation moves the receiver.
+fn define_data_in_place(
+    object: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    value: Value,
+    attrs: Attr,
+) -> Result<(), JsSurfaceError> {
     let descriptor = PropertyDescriptor {
         kind: crate::object::DescriptorKind::Data { value },
         flags: attrs.to_flags(),
     };
-    if object::define_own_property(object, heap, name, descriptor) {
+    if object::define_own_property_in_place(object, heap, name, descriptor) {
         Ok(())
     } else {
         Err(JsSurfaceError::DefinePropertyFailed(name))

@@ -269,19 +269,67 @@ fn native_from_call_with_raw_roots(
     NativeFunction::from_call_with_roots(heap, name, length, call, &mut external_visit)
 }
 
+/// A GC-rooted object handle the builder threads into every allocating call it
+/// makes.
+///
+/// The builder reaches its object *only* through this slot. Each native /
+/// object allocation the builder drives is handed [`Self::root`] in its
+/// external root set, so the collector rewrites the parked `Value` in place on a
+/// move; a later read through [`Self::get`] resolves the object's current
+/// location and can never dereference a vacated cell, no matter how the
+/// builder's allocations are ordered. There is no bare `JsObject` field to
+/// desync — this is the internally-enforced form of the post-alloc "refresh the
+/// receiver handle" pattern the builder methods used to bolt on by hand.
+struct RootedObject {
+    /// The object as a rooted `Value`; kept current by every allocation that
+    /// threads [`Self::root`].
+    slot: Value,
+}
+
+impl RootedObject {
+    fn new(object: JsObject) -> Self {
+        Self {
+            slot: Value::object(object),
+        }
+    }
+
+    /// The rooted slot to thread into an allocation's external root set. Passed
+    /// by reference so the collector can rewrite it in place across the alloc.
+    fn root(&self) -> &Value {
+        &self.slot
+    }
+
+    /// The object's current location, resolved through the collector-tracked
+    /// slot.
+    fn get(&self) -> JsObject {
+        self.slot
+            .as_object()
+            .expect("builder object handle stays an object across allocations")
+    }
+
+    /// Re-park the handle an in-place define refreshed. A define roots only its
+    /// own receiver (not this slot), so its relocation is reflected back here.
+    fn store(&mut self, object: JsObject) {
+        self.slot = Value::object(object);
+    }
+}
+
 /// Mutator-bound builder for an ordinary object.
 ///
-/// This builder roots only the single value being stored on each call, so a
-/// caller that holds sibling values in raw `Value` locals across builder calls
-/// can still see them go stale under a moving collection. For native code that
-/// assembles a value out of several allocations, prefer
-/// [`crate::NativeCtx::scope`] and its `scoped_*` methods: every intermediate
-/// handle is parked in the collector-traced handle arena, so none can dangle.
-/// (Rebuilding this builder's internals on top of scoped handles is a separate
-/// step.)
+/// The builder object lives in a [`RootedObject`] slot that every allocating
+/// method threads into its root set, so the object is always resolved through a
+/// collector-tracked slot and no builder method can dereference a stale handle
+/// even if a future edit reorders the allocations.
+///
+/// Sibling values the *caller* holds in raw `Value` locals across builder calls
+/// are a different matter: the builder keeps them alive (they are traced as
+/// `value_roots`) but cannot rewrite the caller's copies. Native code that
+/// assembles a value out of several allocations should prefer
+/// [`crate::NativeCtx::scope`] and its `scoped_*` methods, where every
+/// intermediate handle is parked in the collector-traced handle arena.
 pub struct ObjectBuilder<'rt> {
     heap: &'rt mut otter_gc::GcHeap,
-    object: JsObject,
+    object: RootedObject,
     raw_roots: Vec<*mut otter_gc::raw::RawGc>,
     value_roots: Vec<Value>,
     _not_send_sync: PhantomData<*mut ()>,
@@ -293,7 +341,7 @@ impl<'rt> ObjectBuilder<'rt> {
         let object = alloc_object_with_roots(heap, &[], &[])?;
         Ok(Self {
             heap,
-            object,
+            object: RootedObject::new(object),
             raw_roots: Vec::new(),
             value_roots: Vec::new(),
             _not_send_sync: PhantomData,
@@ -358,7 +406,7 @@ impl<'rt> ObjectBuilder<'rt> {
     pub fn from_object(heap: &'rt mut otter_gc::GcHeap, object: JsObject) -> Self {
         Self {
             heap,
-            object,
+            object: RootedObject::new(object),
             raw_roots: Vec::new(),
             value_roots: Vec::new(),
             _not_send_sync: PhantomData,
@@ -375,7 +423,7 @@ impl<'rt> ObjectBuilder<'rt> {
     ) -> Self {
         Self {
             heap,
-            object,
+            object: RootedObject::new(object),
             raw_roots: Vec::new(),
             value_roots,
             _not_send_sync: PhantomData,
@@ -393,11 +441,44 @@ impl<'rt> ObjectBuilder<'rt> {
     ) -> Self {
         Self {
             heap,
-            object,
+            object: RootedObject::new(object),
             raw_roots,
             value_roots,
             _not_send_sync: PhantomData,
         }
+    }
+
+    /// Allocate a static builtin native function, threading the builder's object
+    /// slot and carried roots so nothing the caller relies on can be swept.
+    ///
+    /// The single funnel every allocating builder method routes through: it
+    /// unconditionally roots [`RootedObject::root`], so the object slot is
+    /// rewritten in place across the allocation and a following
+    /// [`RootedObject::get`] read is never stale. `extra_roots` carries any
+    /// in-flight sibling (e.g. an accessor getter live across the setter
+    /// allocation).
+    fn alloc_native(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        extra_roots: &[&Value],
+    ) -> Result<NativeFunction, JsSurfaceError> {
+        let mut roots: Vec<&Value> =
+            Vec::with_capacity(self.value_roots.len() + 1 + extra_roots.len());
+        roots.push(self.object.root());
+        roots.extend(extra_roots.iter().copied());
+        roots.extend(self.value_roots.iter());
+        native_from_call_with_raw_roots(
+            self.heap,
+            name,
+            length,
+            call,
+            self.raw_roots.as_slice(),
+            roots.as_slice(),
+            &[],
+        )
+        .map_err(JsSurfaceError::from)
     }
 
     /// Define a data property.
@@ -407,7 +488,9 @@ impl<'rt> ObjectBuilder<'rt> {
         value: Value,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
-        define_data_in_place(&mut self.object, self.heap, name, value, attrs)?;
+        let mut object = self.object.get();
+        define_data_in_place(&mut object, self.heap, name, value, attrs)?;
+        self.object.store(object);
         Ok(self)
     }
 
@@ -424,35 +507,21 @@ impl<'rt> ObjectBuilder<'rt> {
         call: NativeCall,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
-        let object_root = Value::object(self.object);
-        let mut roots = Vec::with_capacity(self.value_roots.len() + 1);
-        roots.push(&object_root);
-        roots.extend(self.value_roots.iter());
-        let native = native_from_call_with_raw_roots(
-            self.heap,
-            name,
-            length,
-            call,
-            self.raw_roots.as_slice(),
-            roots.as_slice(),
-            &[],
-        )?;
         // Building the native function can drive a moving collection that
-        // relocates the builder object. The root walk rewrote `object_root` in
-        // place, but not the `self.object` field the write below dereferences —
-        // refresh it from the rooted copy so `define_data` never writes through a
-        // vacated cell (the `ObjectBody shape points at non-shape cell` crash
-        // under `OTTER_GC_STRESS`).
-        self.object = object_root
-            .as_object()
-            .expect("builder object handle stays an object across the native allocation");
+        // relocates the builder object. `alloc_native` threads the object slot,
+        // so the collector rewrites it in place; the post-alloc `object()` read
+        // resolves the current location and the define never writes through a
+        // vacated cell.
+        let native = self.alloc_native(name, length, call, &[])?;
+        let mut object = self.object.get();
         define_data_in_place(
-            &mut self.object,
+            &mut object,
             self.heap,
             name,
             Value::native_function(native),
             attrs,
         )?;
+        self.object.store(object);
         Ok(self)
     }
 
@@ -463,46 +532,32 @@ impl<'rt> ObjectBuilder<'rt> {
 
     /// Define an accessor property.
     pub fn accessor_from_spec(&mut self, spec: &AccessorSpec) -> Result<&mut Self, JsSurfaceError> {
-        let object_root = Value::object(self.object);
-        let mut roots = Vec::with_capacity(self.value_roots.len() + 1);
-        roots.push(&object_root);
-        roots.extend(self.value_roots.iter());
         let getter = match &spec.get {
-            Some(call) => Some(Value::native_function(native_from_call_with_raw_roots(
-                self.heap,
+            Some(call) => Some(Value::native_function(self.alloc_native(
                 spec.get_name,
                 0,
                 call.clone(),
-                self.raw_roots.as_slice(),
-                roots.as_slice(),
                 &[],
             )?)),
             None => None,
         };
-        let getter_root = getter.unwrap_or(Value::undefined());
-        let mut setter_roots = Vec::with_capacity(self.value_roots.len() + 2);
-        setter_roots.push(&object_root);
-        setter_roots.push(&getter_root);
-        setter_roots.extend(self.value_roots.iter());
+        // The getter is live across the setter allocation; thread it as an extra
+        // root so `getter_root` is rewritten in place and stays current. The
+        // object slot is kept current by the funnel itself.
+        let getter_root = getter.unwrap_or_else(Value::undefined);
         let setter = match &spec.set {
-            Some(call) => Some(Value::native_function(native_from_call_with_raw_roots(
-                self.heap,
+            Some(call) => Some(Value::native_function(self.alloc_native(
                 spec.set_name,
                 1,
                 call.clone(),
-                self.raw_roots.as_slice(),
-                setter_roots.as_slice(),
-                &[],
+                &[&getter_root],
             )?)),
             None => None,
         };
-        // Both native allocations above can relocate the receiver and the
-        // getter; the root walk rewrote `object_root`/`getter_root` in place but
-        // not the `self.object`/`getter` locals, so refresh them before the write
-        // dereferences the receiver or stores the getter.
-        self.object = object_root
-            .as_object()
-            .expect("builder object handle stays an object across the native allocations");
+        // `getter_root` tracked the setter allocation's relocation; `setter` is
+        // fresh (nothing allocates after it) and defining an accessor performs no
+        // GC allocation, so no handle is stale here. The object is resolved
+        // through its slot for the write.
         let getter = getter.map(|_| getter_root);
         let descriptor = PropertyDescriptor::accessor(
             getter,
@@ -510,7 +565,9 @@ impl<'rt> ObjectBuilder<'rt> {
             spec.attrs.enumerable,
             spec.attrs.configurable,
         );
-        if object::define_own_property_in_place(&mut self.object, self.heap, spec.name, descriptor) {
+        let mut object = self.object.get();
+        if object::define_own_property_in_place(&mut object, self.heap, spec.name, descriptor) {
+            self.object.store(object);
             Ok(self)
         } else {
             Err(JsSurfaceError::DefinePropertyFailed(spec.name))
@@ -520,7 +577,7 @@ impl<'rt> ObjectBuilder<'rt> {
     /// Finish object construction.
     #[must_use]
     pub fn build(self) -> JsObject {
-        self.object
+        self.object.get()
     }
 }
 

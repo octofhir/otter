@@ -37,10 +37,10 @@
 //!   pinned as own data properties on the constructor
 //!   (`Proxy.revocable`).
 //! - `static_method_specs = [path::TO_SLICE, ...]` — references to
-//!   pre-built `&[MethodSpec]` slices iterated through the
-//!   constructor's `ObjectBuilder`. Used when the same slice is
-//!   also consumed elsewhere (e.g. `Op::CallMethod` intrinsic
-//!   dispatch fast path for `String.fromCharCode`).
+//!   pre-built `&[MethodSpec]` slices pinned as own data properties
+//!   on the constructor. Used when the same slice is also consumed
+//!   elsewhere (e.g. `Op::CallMethod` intrinsic dispatch fast path
+//!   for `String.fromCharCode`).
 //! - `static_constants = [("NAME", Kind(expr) [, attrs]), ...]` —
 //!   numeric / boolean / nullish constants pinned as own data
 //!   properties on the constructor (`Number.MAX_VALUE`,
@@ -93,13 +93,15 @@
 //!      `callable_only = true`),
 //!   2. pins each `statics` row + `static_method_specs` slice +
 //!      `static_constants` row as own properties on the ctor,
-//!   3. if the prototype block has any content, allocates the
+//!      3. if the prototype block has any content, allocates the
 //!      prototype, links it to `%Object.prototype%`, installs the
-//!      prototype methods (inline + slice) + accessors via
-//!      `ObjectBuilder`, attaches it on the ctor's `prototype` slot
-//!      (non-writable / non-enumerable / non-configurable), and
-//!      pins the `prototype.constructor = ctor` back-pointer
-//!      (writable / non-enumerable / configurable),
+//!      prototype methods (inline + slice) + accessors through the
+//!      `bootstrap::*_with_value_roots` allocators (which thread the
+//!      prototype + ctor as rooted values by reference, so no raw
+//!      handle is read across an allocation), attaches it on the
+//!      ctor's `prototype` slot (non-writable / non-enumerable /
+//!      non-configurable), and pins the `prototype.constructor = ctor`
+//!      back-pointer (writable / non-enumerable / configurable),
 //!   4. binds the ctor on `globalThis` through
 //!      `bootstrap::define_global_value`,
 //!   5. calls `post_install(heap, global, ctor)?` when supplied.
@@ -307,11 +309,10 @@ pub(crate) struct CouchInput {
     pub(crate) intrinsic_ident: Ident,
     pub(crate) constructor: ConstructorSpecArgs,
     pub(crate) statics: Vec<MethodEntry>,
-    /// References to pre-built `&[MethodSpec]` slices iterated through
-    /// the constructor's `ObjectBuilder`. Mirrors
-    /// `prototype.method_specs` for cases where the static surface is
-    /// declared via a separate generator macro (e.g.
-    /// `STRING_STATIC_METHODS`).
+    /// References to pre-built `&[MethodSpec]` slices pinned as own data
+    /// properties on the constructor. Mirrors `prototype.method_specs`
+    /// for cases where the static surface is declared via a separate
+    /// generator macro (e.g. `STRING_STATIC_METHODS`).
     pub(crate) static_method_specs: Vec<Path>,
     /// Numeric / boolean / nullish constants pinned as own data
     /// properties on the constructor itself (e.g. `Number.MAX_VALUE`,
@@ -760,6 +761,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     method_spec.attrs.enumerable,
                     method_spec.attrs.configurable,
                 );
+                let ctor = ctor_value
+                    .as_native_function()
+                    .expect("couch!: constructor stays a native function across allocation");
                 if !ctor.define_own_property(heap, method_spec.name, desc) {
                     return ::core::result::Result::Err(
                         ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
@@ -768,10 +772,41 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             }
         }
     });
+    // Prototype method-spec slices install by reference, mirroring the inline
+    // prototype-method loop: every allocation threads the rooted `_value` copies,
+    // so `prototype_value` stays current and no raw handle is read across an
+    // allocation. `native_from_call_with_value_roots` accepts every `NativeCall`
+    // variant, including the `VmIntrinsic` fast-path targets.
     let extra_method_spec_iters = prototype.method_specs.iter().map(|path| {
         quote! {
             for method_spec in #path.iter() {
-                builder.method_from_spec(method_spec)?;
+                let fn_obj = ::otter_vm::bootstrap::native_from_call_with_value_roots(
+                    heap,
+                    method_spec.name,
+                    method_spec.length,
+                    method_spec.call.clone(),
+                    &[&global_root, &ctor_value, &prototype_value],
+                )
+                .map_err(::otter_vm::JsSurfaceError::from)?;
+                let desc = ::otter_vm::object::PropertyDescriptor::data(
+                    ::otter_vm::Value::native_function(fn_obj),
+                    method_spec.attrs.writable,
+                    method_spec.attrs.enumerable,
+                    method_spec.attrs.configurable,
+                );
+                let prototype = prototype_value
+                    .as_object()
+                    .expect("couch!: prototype stays an object across allocation");
+                if !::otter_vm::object::define_own_property(
+                    prototype,
+                    heap,
+                    method_spec.name,
+                    desc,
+                ) {
+                    return ::core::result::Result::Err(
+                        ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
+                    );
+                }
             }
         }
     });
@@ -781,6 +816,12 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 
     let post_install_call = match post_install {
         Some(path) => quote! {
+            // Resolve the constructor through its rooted `Value`: the install
+            // allocations may have relocated it, and only `ctor_value` was kept
+            // current.
+            let ctor = ctor_value
+                .as_native_function()
+                .expect("couch!: constructor stays a native function across allocation");
             #path(heap, global, ctor)?;
         },
         None => quote! {},
@@ -1019,6 +1060,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     &[&global_root],
                 )
                 .map_err(::otter_vm::JsSurfaceError::from)?;
+                // `ctor_value` is the single source of truth for the (possibly
+                // relocated) constructor: it is threaded into every allocation
+                // below, so the collector keeps it current, and each raw-handle
+                // use re-resolves through it rather than reading a stale offset.
                 let ctor_value = ::otter_vm::Value::native_function(ctor);
                 #ctor_parent_link
 
@@ -1046,6 +1091,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         method_spec.attrs.enumerable,
                         method_spec.attrs.configurable,
                     );
+                    let ctor = ctor_value
+                        .as_native_function()
+                        .expect("couch!: constructor stays a native function across allocation");
                     if !ctor.define_own_property(heap, method_spec.name, desc) {
                         return ::core::result::Result::Err(
                             ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
@@ -1079,6 +1127,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         const_spec.attrs.enumerable,
                         const_spec.attrs.configurable,
                     );
+                    let ctor = ctor_value
+                        .as_native_function()
+                        .expect("couch!: constructor stays a native function across allocation");
                     if !ctor.define_own_property(heap, const_spec.name, desc) {
                         return ::core::result::Result::Err(
                             ::otter_vm::JsSurfaceError::DefinePropertyFailed(const_spec.name),
@@ -1086,14 +1137,15 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     }
                 }
 
-                // §19.4 prototype object (only when the spec lists
-                // prototype methods or accessors). Alloc empty
-                // prototype + link to %Object.prototype% + pin each
-                // entry via ObjectBuilder, then attach the prototype
-                // back on the constructor as a non-writable /
-                // non-enumerable / non-configurable own data
-                // property (matches the canonical builtin prototype
-                // descriptor).
+                // §19.4 prototype object (only when the spec lists prototype
+                // methods or accessors). Alloc empty prototype + link to
+                // %Object.prototype% + pin each entry, then attach the
+                // prototype back on the constructor as a non-writable /
+                // non-enumerable / non-configurable own data property (matches
+                // the canonical builtin prototype descriptor). Every install
+                // allocation threads the rooted `global_root` / `ctor_value` /
+                // `prototype_value` copies by reference, so the collector keeps
+                // them current and no raw handle is read across an allocation.
                 if #prototype_block_needed {
                     let prototype = ::otter_vm::bootstrap::alloc_object_with_value_roots_pub(
                         heap,
@@ -1102,28 +1154,107 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     .map_err(::otter_vm::JsSurfaceError::from)?;
                     #prototype_parent_link
                     let prototype_value = ::otter_vm::Value::object(prototype);
-                    {
-                        let mut builder =
-                            ::otter_vm::ObjectBuilder::from_object_with_value_roots(
-                                heap,
-                                prototype,
-                                ::std::vec![global_root, ctor_value, prototype_value],
+
+                    for method_spec in #spec_ident.prototype_methods.iter() {
+                        let fn_obj = ::otter_vm::bootstrap::native_from_call_with_value_roots(
+                            heap,
+                            method_spec.name,
+                            method_spec.length,
+                            method_spec.call.clone(),
+                            &[&global_root, &ctor_value, &prototype_value],
+                        )
+                        .map_err(::otter_vm::JsSurfaceError::from)?;
+                        let desc = ::otter_vm::object::PropertyDescriptor::data(
+                            ::otter_vm::Value::native_function(fn_obj),
+                            method_spec.attrs.writable,
+                            method_spec.attrs.enumerable,
+                            method_spec.attrs.configurable,
+                        );
+                        let prototype = prototype_value
+                            .as_object()
+                            .expect("couch!: prototype stays an object across allocation");
+                        if !::otter_vm::object::define_own_property(
+                            prototype,
+                            heap,
+                            method_spec.name,
+                            desc,
+                        ) {
+                            return ::core::result::Result::Err(
+                                ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
                             );
-                        for method_spec in #spec_ident.prototype_methods.iter() {
-                            builder.method_from_spec(method_spec)?;
                         }
-                        for accessor_spec in #prototype_accessors_ident.iter() {
-                            builder.accessor_from_spec(accessor_spec)?;
-                        }
-                        // Extra `method_specs = [path, ...]` paths —
-                        // iterate each pre-built `&[MethodSpec]` slice
-                        // through the same `ObjectBuilder`. Used by
-                        // builtins (e.g. `Date`) whose prototype
-                        // method list is generated by a separate
-                        // declarative macro that produces a static
-                        // slice.
-                        #(#extra_method_spec_iters)*
                     }
+
+                    for accessor_spec in #prototype_accessors_ident.iter() {
+                        let getter = match &accessor_spec.get {
+                            ::core::option::Option::Some(call) => {
+                                ::core::option::Option::Some(::otter_vm::Value::native_function(
+                                    ::otter_vm::bootstrap::native_from_call_with_value_roots(
+                                        heap,
+                                        accessor_spec.get_name,
+                                        0,
+                                        call.clone(),
+                                        &[&global_root, &ctor_value, &prototype_value],
+                                    )
+                                    .map_err(::otter_vm::JsSurfaceError::from)?,
+                                ))
+                            }
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        };
+                        // The getter is live across the setter allocation; thread
+                        // it as an extra root so `getter_root` tracks any move.
+                        let getter_root = getter.unwrap_or_else(::otter_vm::Value::undefined);
+                        let setter = match &accessor_spec.set {
+                            ::core::option::Option::Some(call) => {
+                                ::core::option::Option::Some(::otter_vm::Value::native_function(
+                                    ::otter_vm::bootstrap::native_from_call_with_value_roots(
+                                        heap,
+                                        accessor_spec.set_name,
+                                        1,
+                                        call.clone(),
+                                        &[
+                                            &global_root,
+                                            &ctor_value,
+                                            &prototype_value,
+                                            &getter_root,
+                                        ],
+                                    )
+                                    .map_err(::otter_vm::JsSurfaceError::from)?,
+                                ))
+                            }
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        };
+                        let getter = getter.map(|_| getter_root);
+                        let descriptor = ::otter_vm::object::PropertyDescriptor::accessor(
+                            getter,
+                            setter,
+                            accessor_spec.attrs.enumerable,
+                            accessor_spec.attrs.configurable,
+                        );
+                        let prototype = prototype_value
+                            .as_object()
+                            .expect("couch!: prototype stays an object across allocation");
+                        if !::otter_vm::object::define_own_property(
+                            prototype,
+                            heap,
+                            accessor_spec.name,
+                            descriptor,
+                        ) {
+                            return ::core::result::Result::Err(
+                                ::otter_vm::JsSurfaceError::DefinePropertyFailed(
+                                    accessor_spec.name,
+                                ),
+                            );
+                        }
+                    }
+
+                    // Extra `method_specs = [path, ...]` paths — install each
+                    // pre-built `&[MethodSpec]` slice through the same
+                    // by-reference loop. Used by builtins (e.g. `Date`) whose
+                    // prototype method list is generated by a separate
+                    // declarative macro that produces a static slice.
+                    #(#extra_method_spec_iters)*
+
                     // Prototype constants (e.g. per-kind
                     // `TypedArray.prototype.BYTES_PER_ELEMENT`).
                     for const_spec in #prototype_constants_ident.iter() {
@@ -1139,6 +1270,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                             const_spec.attrs.enumerable,
                             const_spec.attrs.configurable,
                         );
+                        let prototype = prototype_value
+                            .as_object()
+                            .expect("couch!: prototype stays an object across allocation");
                         if !::otter_vm::object::define_own_property(
                             prototype,
                             heap,
@@ -1156,6 +1290,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         false,
                         false,
                     );
+                    let ctor = ctor_value
+                        .as_native_function()
+                        .expect("couch!: constructor stays a native function across allocation");
                     if !ctor.define_own_property(heap, "prototype", proto_desc) {
                         return ::core::result::Result::Err(
                             ::otter_vm::JsSurfaceError::DefinePropertyFailed("prototype"),
@@ -1172,6 +1309,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         false,
                         true,
                     );
+                    let prototype = prototype_value
+                        .as_object()
+                        .expect("couch!: prototype stays an object across allocation");
                     let _ = ::otter_vm::object::define_own_property(
                         prototype,
                         heap,

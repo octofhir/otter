@@ -150,6 +150,13 @@ let leaked = ctx.scope(|ctx, s| ctx.scoped_string(s, "x").unwrap());
 ## Codebase invariant
 
 No raw GC handle is held across an allocation, except inside `*_with_roots`
-internals that root explicitly. `ObjectBuilder` and the binding macros use
-manual rooting internally; their public surfaces are sound. Design:
-`HANDLE_SCOPE_PLAN.md` (repo root).
+internals that root explicitly. `ObjectBuilder` now reaches its object only
+through a private rooted slot that every allocating method threads into the
+collection root set, so no builder method can dereference a stale handle even if
+the allocations are reordered; `NamespaceBuilder` delegates to it. The binding
+macros (`couch!`, `holt!`, …) emit static specs plus install glue that builds
+through the by-reference `bootstrap::*_with_value_roots` allocators — the object
+being assembled is rooted across every install allocation, so macro users
+inherit sound value construction and never touch raw handles. Your method bodies
+build values with `ctx.scope` (above). Design: `HANDLE_SCOPE_PLAN.md` (repo
+root).

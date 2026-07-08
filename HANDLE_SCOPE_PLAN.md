@@ -311,8 +311,42 @@ across an allocation outside sound-but-boilerplate `*_with_roots` code.**
   `from_str_rooted` helper with the prototype live, then written with
   `define_own_property_in_place` so the receiver handle tracks any relocation.
 
-Remaining: `ObjectBuilder` internals, macro surfaces, and the `value_roots` /
-`slice_roots` boilerplate sweep (P6 below).
+### P6b — builder internals + macro surfaces (DONE)
+
+- `ObjectBuilder` internals rewritten on an internally-enforced rooted-slot
+  invariant. The object now lives in a private `RootedObject` slot (a rooted
+  `Value`) reached only through `get`/`root`/`store`; every allocating method
+  routes through one `alloc_native` funnel that unconditionally threads
+  `RootedObject::root` into the allocation's root set, so the collector rewrites
+  the slot in place and a following `get` never resolves a stale offset — no bare
+  `JsObject` field can desync even if a future edit reorders the allocations.
+  This replaces the per-method "refresh `self.object` from a rooted copy" patches
+  bolted on in `ba91fdbd`. The arena path (`Interpreter::with_handle_scope`) was
+  not usable here: the builder borrows `&mut GcHeap`, not `&mut Interpreter`, and
+  several construction paths (`from_object`, `from_object_with_*`) run at
+  bootstrap where no `Interpreter` exists — hence the rooted-slot invariant.
+- `NamespaceBuilder` inherits soundness: its `build` hands its object to the
+  hardened `ObjectBuilder` with no interleaved allocation and returns the
+  builder's refreshed handle.
+- `couch!` install glue (the class macro) rewritten to build the prototype
+  surface through the by-reference `bootstrap::*_with_value_roots` allocators
+  instead of an owned-roots `ObjectBuilder`, and to re-resolve the constructor /
+  prototype from their rooted `Value` copies before each define. A new
+  `bootstrap::native_from_call_with_value_roots` accepts every `NativeCall`
+  variant (including the `VmIntrinsic` prototype-method fast path), so the
+  by-reference loop is a drop-in for the old builder path. The whole install body
+  now threads `global` / ctor / prototype as rooted values by reference — no raw
+  handle is read across an allocation.
+- `holt!` / `raft!` / `lodge!` / `#[dive]` / `burrow!` emit static specs plus
+  glue that routes through the hardened builders / by-reference allocators; the
+  audit found no raw-handle-across-alloc windows in their codegen. Contributor
+  guidance for method bodies (`ctx.scope`) added to `crates/otter-macros/README.md`.
+
+Remaining: the organic `value_roots` / `slice_roots` boilerplate sweep (P6 below;
+hundreds of now-dead threading sites). Two pre-existing, unrelated test failures
+are out of scope for this track: `fetch_internals_round_trip_for_server_glue`
+(otter-modules) and `hot_global_and_property_loads_use_owner_constants`
+(otter-runtime jit).
 
 ### P6 — cleanup + perf follow-ups (separate track, after adoption)
 - Sweep now-dead `value_roots`/`slice_roots` threading (hundreds of sites).

@@ -3330,6 +3330,7 @@ impl Runtime {
                         target: url.to_string(),
                         deferred: false,
                         dynamic: false,
+                        synthetic: true,
                     });
                 module
                     .module_resolutions
@@ -3339,6 +3340,7 @@ impl Runtime {
                         target: url.to_string(),
                         deferred: false,
                         dynamic: false,
+                        synthetic: true,
                     });
             });
 

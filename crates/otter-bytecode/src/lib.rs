@@ -2346,6 +2346,16 @@ pub struct ModuleResolution {
     /// the returned promise (§13.3.10).
     #[serde(default)]
     pub dynamic: bool,
+    /// `true` when the runtime added this edge after linking purely so the
+    /// `<entry>` driver / import-namespace dispatcher can resolve a module's
+    /// environment by URL. A synthetic edge is `(referrer, url, url)` — its
+    /// specifier equals its target — and is **not** a real `[[RequestedModules]]`
+    /// dependency, so evaluation and dependency walks skip it. Real imports
+    /// carry `synthetic == false`, including absolute-URL imports (remote
+    /// http/https, hosted `otter:` specifiers) whose specifier also equals the
+    /// resolved target and so cannot be told apart by shape alone.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 /// One module's `<module-init>` entry record: `URL → function ID`.

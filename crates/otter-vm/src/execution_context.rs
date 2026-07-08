@@ -484,15 +484,14 @@ impl ExecutionContext {
     }
 
     /// Canonical URLs of a module's non-deferred dependency targets.
-    /// Self-loop edges (`specifier == target`, added by the runtime so
-    /// `<entry>` can resolve envs) and deferred edges are excluded, so
-    /// the result is exactly the modules to evaluate before `url`.
+    /// Runtime-added synthetic env-resolution edges and deferred edges are
+    /// excluded, so the result is exactly the modules to evaluate before `url`.
     #[must_use]
     pub fn eager_dep_targets(&self, url: &str) -> Vec<&str> {
         self.module
             .module_resolutions
             .iter()
-            .filter(|r| r.referrer == url && !r.deferred && r.specifier != r.target)
+            .filter(|r| r.referrer == url && !r.deferred && !r.synthetic)
             .map(|r| r.target.as_str())
             .collect()
     }
@@ -500,13 +499,13 @@ impl ExecutionContext {
     /// A module's `[[RequestedModules]]` in source order, with each
     /// edge's defer phase. `import("x")` preload edges (synthetic
     /// `deferred && dynamic`) are not source requests and are
-    /// excluded, as are runtime self-loop edges.
+    /// excluded, as are runtime synthetic env-resolution edges.
     #[must_use]
     pub fn module_requests(&self, url: &str) -> Vec<(&str, bool)> {
         self.module
             .module_resolutions
             .iter()
-            .filter(|r| r.referrer == url && r.specifier != r.target && !(r.deferred && r.dynamic))
+            .filter(|r| r.referrer == url && !r.synthetic && !(r.deferred && r.dynamic))
             .map(|r| (r.target.as_str(), r.deferred))
             .collect()
     }

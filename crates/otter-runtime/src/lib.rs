@@ -109,7 +109,7 @@ pub use otter_gc;
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{
     AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
-    MethodSpec, NativeCall, ObjectBuilder, Value, bootstrap, intrinsic_install, object,
+    MethodSpec, NativeCall, ObjectBuilder, Value, array, bootstrap, intrinsic_install, object,
 };
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{

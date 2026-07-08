@@ -142,57 +142,39 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
                 fetchInternals = internals;
                 return internals;
               }
-              function responseParts(response) {
-                var internals = fetchInternals || ensureFetch();
-                var parts = internals.responseParts(response);
-                if (parts === null) return null;
-                var headers = parts[2];
-                var headersText = '';
-                for (var i = 0; i + 1 < headers.length; i += 2) {
-                  headersText += String(headers[i]) + '\n' + String(headers[i + 1]) + '\n';
-                }
-                return {
-                  status: parts[0],
-                  statusText: parts[1],
-                  headersText: headersText,
-                  body: parts[3],
-                };
-              }
               Object.defineProperty(g, '__otterServeInternals', {
                 value: Object.freeze({
                   makeRequest: function (method, url, flatHeaders, body) {
                     var internals = fetchInternals || ensureFetch();
                     return internals.makeRequest(method, url, flatHeaders, body);
                   },
+                  // Hand the private Fetch slot symbols to the native server once,
+                  // so it reads a Response's status/headers/body directly in Rust.
+                  fetchSlots: function () {
+                    return ensureFetch().slots;
+                  },
                   dispatch: function (handler, request, deliver, deliverError, token) {
                     try {
                       var result = handler(request);
-                      // Deliver a synchronous handler inline — no promise,
-                      // microtask, or reaction closures. Only a genuine thenable
-                      // parks until a later drain (correct async semantics).
+                      // `deliver` extracts the Response natively. A sync handler
+                      // delivers inline (no promise/microtask); only a genuine
+                      // thenable parks until a later drain.
                       if (
                         result !== null &&
                         typeof result === 'object' &&
                         typeof result.then === 'function'
                       ) {
                         result.then(
-                          function (response) {
-                            try {
-                              deliver(token, responseParts(response));
-                            } catch (err) {
-                              deliverError(token, err);
-                            }
-                          },
+                          function (response) { deliver(token, response); },
                           function (err) { deliverError(token, err); }
                         );
                       } else {
-                        deliver(token, responseParts(result));
+                        deliver(token, result);
                       }
                     } catch (err) {
                       deliverError(token, err);
                     }
                   },
-                  responseParts: responseParts,
                 }),
                 writable: false,
                 enumerable: false,
@@ -242,7 +224,16 @@ fn serve(
 
     let registry = Arc::new(ReplyRegistry::default());
     let internals_root = ctx.persistent_root_insert(options.internals);
-    let response_parts_root = ctx.persistent_root_insert(options.fns.response_parts);
+    // Force the Fetch globals to initialize and grab the private slot symbols so
+    // `deliver` can read Response fields natively.
+    let slots_value = call_js(
+        ctx,
+        "serve.fetchSlots",
+        options.fns.fetch_slots,
+        options.internals,
+        smallvec::smallvec![],
+    )?;
+    let slots = ServeSlots::resolve(ctx, slots_value)?;
     let deliver = {
         let registry = registry.clone();
         ctx.native_value_with_captures(
@@ -250,7 +241,7 @@ fn serve(
             smallvec::smallvec![],
             &[],
             &[],
-            move |ctx, args, _captures| deliver_reply(ctx, &registry, args),
+            move |ctx, args, _captures| deliver_reply(ctx, &registry, slots, args),
         )
         .map_err(|err| crate::type_error("serve", err.to_string()))?
     };
@@ -269,10 +260,10 @@ fn serve(
         fetch: ctx.persistent_root_insert(options.fetch),
         internals: internals_root,
         make_request: ctx.persistent_root_insert(options.fns.make_request),
-        response_parts: response_parts_root,
         dispatch: ctx.persistent_root_insert(options.fns.dispatch),
         deliver: ctx.persistent_root_insert(deliver),
         deliver_error: ctx.persistent_root_insert(deliver_error),
+        slots,
     };
     let context = ctx
         .execution_context()
@@ -305,7 +296,7 @@ fn serve(
 #[derive(Clone, Copy)]
 struct ServeFns {
     make_request: Value,
-    response_parts: Value,
+    fetch_slots: Value,
     dispatch: Value,
 }
 
@@ -317,15 +308,64 @@ struct ServeOptions {
     fns: ServeFns,
 }
 
+/// Persistent roots for the private Fetch slot symbols, resolved once at
+/// `serve()` time. The `deliver` native reads a Response's own symbol-keyed
+/// slots through these to build an [`HttpResponse`] in Rust — no `responseParts`
+/// JS round-trip, intermediate arrays, or header string per request.
+#[derive(Clone, Copy)]
+struct ServeSlots {
+    status: RuntimePersistentRootId,
+    status_text: RuntimePersistentRootId,
+    headers: RuntimePersistentRootId,
+    header_list: RuntimePersistentRootId,
+    body_text: RuntimePersistentRootId,
+    body_bytes: RuntimePersistentRootId,
+}
+
+impl ServeSlots {
+    fn resolve(ctx: &mut NativeCtx<'_>, slots: Value) -> Result<Self, NativeError> {
+        let obj = slots
+            .as_object()
+            .ok_or_else(|| crate::type_error("serve", "invalid Fetch slot table"))?;
+        let mut symbol_root = |name: &str| -> Result<RuntimePersistentRootId, NativeError> {
+            let value = object::get(obj, ctx.heap(), name).ok_or_else(|| {
+                crate::type_error("serve", format!("missing Fetch slot `{name}`"))
+            })?;
+            Ok(ctx.persistent_root_insert(value))
+        };
+        Ok(Self {
+            status: symbol_root("status")?,
+            status_text: symbol_root("statusText")?,
+            headers: symbol_root("headers")?,
+            header_list: symbol_root("headerList")?,
+            body_text: symbol_root("bodyText")?,
+            body_bytes: symbol_root("bodyBytes")?,
+        })
+    }
+
+    fn remove(self, ctx: &mut NativeCtx<'_>) {
+        for id in [
+            self.status,
+            self.status_text,
+            self.headers,
+            self.header_list,
+            self.body_text,
+            self.body_bytes,
+        ] {
+            let _ = ctx.persistent_root_remove(id);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ServeRoots {
     fetch: RuntimePersistentRootId,
     internals: RuntimePersistentRootId,
     make_request: RuntimePersistentRootId,
-    response_parts: RuntimePersistentRootId,
     dispatch: RuntimePersistentRootId,
     deliver: RuntimePersistentRootId,
     deliver_error: RuntimePersistentRootId,
+    slots: ServeSlots,
 }
 
 struct ServeServerControl {
@@ -384,7 +424,7 @@ impl RuntimeTask for ServeRequestTask {
             call_js(
                 ctx,
                 "serve.dispatch",
-                options.fns.dispatch,
+                options.dispatch,
                 options.internals,
                 smallvec::smallvec![
                     options.fetch,
@@ -411,17 +451,17 @@ impl RuntimeTask for ServeRequestTask {
 fn deliver_reply(
     ctx: &mut NativeCtx<'_>,
     registry: &ReplyRegistry,
+    slots: ServeSlots,
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let Some(token) = token_arg(args) else {
         return Ok(Value::undefined());
     };
-    // The JS reaction already ran `responseParts`, so `args[1]` is the plain
-    // parts object. Parsing it touches only the heap — no re-entrant VM call,
-    // which is what leaked a register window per request when a nested
-    // `run_callable_sync` ran inside this VM-invoked native.
-    let parts = args.get(1).copied().unwrap_or_else(Value::null);
-    let result = http_response_from_parts(ctx, parts);
+    // `args[1]` is the raw `Response` the handler returned. Read its status,
+    // headers, and body straight out of the private symbol slots in Rust — no
+    // `responseParts` JS call, intermediate arrays, or header string.
+    let response = args.get(1).copied().unwrap_or_else(Value::null);
+    let result = extract_response(ctx, slots, response);
     if let Some(reply) = registry.take(token) {
         let _ = reply.send(result.map_err(|err| err.to_string()));
     }
@@ -455,7 +495,8 @@ fn token_arg(args: &[Value]) -> Option<u64> {
 struct ServeDispatchOptions {
     fetch: Value,
     internals: Value,
-    fns: ServeFns,
+    make_request: Value,
+    dispatch: Value,
     deliver: Value,
     deliver_error: Value,
 }
@@ -469,11 +510,8 @@ impl ServeDispatchOptions {
         Ok(Self {
             fetch: get(ctx, roots.fetch, "fetch")?,
             internals: get(ctx, roots.internals, "internals")?,
-            fns: ServeFns {
-                make_request: get(ctx, roots.make_request, "Request factory")?,
-                response_parts: get(ctx, roots.response_parts, "Response extractor")?,
-                dispatch: get(ctx, roots.dispatch, "dispatch")?,
-            },
+            make_request: get(ctx, roots.make_request, "Request factory")?,
+            dispatch: get(ctx, roots.dispatch, "dispatch")?,
             deliver: get(ctx, roots.deliver, "deliver")?,
             deliver_error: get(ctx, roots.deliver_error, "deliverError")?,
         })
@@ -689,10 +727,10 @@ fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
         let _ = ctx.persistent_root_remove(roots.fetch);
         let _ = ctx.persistent_root_remove(roots.internals);
         let _ = ctx.persistent_root_remove(roots.make_request);
-        let _ = ctx.persistent_root_remove(roots.response_parts);
         let _ = ctx.persistent_root_remove(roots.dispatch);
         let _ = ctx.persistent_root_remove(roots.deliver);
         let _ = ctx.persistent_root_remove(roots.deliver_error);
+        roots.slots.remove(ctx);
     }
     Ok(Value::undefined())
 }
@@ -752,9 +790,9 @@ fn parse_options(
     let make_request = object::get(internals_obj, ctx.heap(), "makeRequest")
         .filter(|value| value.is_callable())
         .ok_or_else(|| crate::type_error("serve", "missing Request factory"))?;
-    let response_parts = object::get(internals_obj, ctx.heap(), "responseParts")
+    let fetch_slots = object::get(internals_obj, ctx.heap(), "fetchSlots")
         .filter(|value| value.is_callable())
-        .ok_or_else(|| crate::type_error("serve", "missing Response extractor"))?;
+        .ok_or_else(|| crate::type_error("serve", "missing Fetch slot accessor"))?;
     let dispatch = object::get(internals_obj, ctx.heap(), "dispatch")
         .filter(|value| value.is_callable())
         .ok_or_else(|| crate::type_error("serve", "missing dispatch trampoline"))?;
@@ -765,7 +803,7 @@ fn parse_options(
         internals,
         fns: ServeFns {
             make_request,
-            response_parts,
+            fetch_slots,
             dispatch,
         },
     })
@@ -777,7 +815,7 @@ fn make_request(
     request: &HttpRequest,
 ) -> Result<Value, NativeError> {
     let root_base = ctx.push_scratch_root(options.internals);
-    let make_request_root = ctx.push_scratch_root(options.fns.make_request);
+    let make_request_root = ctx.push_scratch_root(options.make_request);
     let method_root = push_string_root(ctx, &request.method)?;
     let url_root = push_string_root(ctx, &request.url)?;
     let mut header_roots = Vec::with_capacity(request.headers.len() * 2);
@@ -813,27 +851,34 @@ fn make_request(
     value
 }
 
-/// Build an [`HttpResponse`] from the plain parts object the JS
-/// `responseParts` shim already produced (`{ status, headersText, body }`).
-/// This runs inside the `deliver` native, so it must not re-enter the VM — a
-/// nested `run_callable_sync` here leaked a register window per request.
-fn http_response_from_parts(
+/// Build an [`HttpResponse`] by reading a `Response`'s private Fetch slots
+/// directly. Runs inside the `deliver` native; the slot symbols were resolved
+/// once at `serve()` time. The HTTP/1.1 reason phrase is not observable to a
+/// Fetch client and hyper derives the canonical phrase from the status code, so
+/// `statusText` is intentionally not carried onto the wire.
+fn extract_response(
     ctx: &mut NativeCtx<'_>,
-    parts: Value,
+    slots: ServeSlots,
+    response: Value,
 ) -> Result<HttpResponse, NativeError> {
-    if parts.is_null() {
+    let Some(obj) = response.as_object() else {
         return Err(crate::type_error(
             "serve",
             "fetch handler must return a Response",
         ));
-    }
-    let Some(parts_obj) = parts.as_object() else {
-        return Err(crate::type_error(
-            "serve",
-            "invalid Response extractor result",
-        ));
     };
-    let status = object::get(parts_obj, ctx.heap(), "status")
+    let symbol = |ctx: &NativeCtx<'_>, id| {
+        ctx.persistent_root_get(id)
+            .and_then(|value| value.as_symbol(ctx.heap()))
+            .ok_or_else(|| crate::type_error("serve", "Fetch slot symbol is closed"))
+    };
+    let status_sym = symbol(ctx, slots.status)?;
+    let headers_sym = symbol(ctx, slots.headers)?;
+    let header_list_sym = symbol(ctx, slots.header_list)?;
+    let body_text_sym = symbol(ctx, slots.body_text)?;
+    let body_bytes_sym = symbol(ctx, slots.body_bytes)?;
+
+    let status = object::get_own_symbol(obj, ctx.heap(), status_sym)
         .and_then(|value| value.as_number())
         .map(|value| value.as_f64())
         .unwrap_or(200.0);
@@ -844,27 +889,43 @@ fn http_response_from_parts(
         ));
     }
     let status = status as u16;
-    // The HTTP/1.1 reason phrase is not observable to a Fetch client (it reads
-    // `status`), and hyper derives the canonical phrase from the status code on
-    // the wire, so a custom `statusText` is intentionally not carried here.
-    let headers_text = object::get(parts_obj, ctx.heap(), "headersText")
-        .and_then(|value| value.as_string(ctx.heap()))
-        .map(|value| value.to_lossy_string(ctx.heap()))
-        .unwrap_or_default();
+
+    // `kHeaders` -> Headers object -> `kHeaderList` array of `[name, value]`
+    // pairs (lowercased names, insertion order — hyper writes them as-is).
     let mut headers = Vec::new();
-    let mut lines = headers_text.split('\n');
-    while let Some(name) = lines.next() {
-        if name.is_empty() {
-            continue;
-        }
-        let Some(value) = lines.next() else {
-            break;
-        };
-        if !header_is_managed(name) {
-            headers.push((name.to_string(), value.to_string()));
+    if let Some(headers_obj) =
+        object::get_own_symbol(obj, ctx.heap(), headers_sym).and_then(|value| value.as_object())
+        && let Some(list) = object::get_own_symbol(headers_obj, ctx.heap(), header_list_sym)
+            .and_then(|value| value.as_array())
+    {
+        for i in 0..otter_runtime::array::len(list, ctx.heap()) {
+            let Some(pair) = otter_runtime::array::get(list, ctx.heap(), i).as_array() else {
+                continue;
+            };
+            let name = otter_runtime::array::get(pair, ctx.heap(), 0)
+                .as_string(ctx.heap())
+                .map(|value| value.to_lossy_string(ctx.heap()));
+            let value = otter_runtime::array::get(pair, ctx.heap(), 1)
+                .as_string(ctx.heap())
+                .map(|value| value.to_lossy_string(ctx.heap()));
+            if let (Some(name), Some(value)) = (name, value)
+                && !header_is_managed(&name)
+            {
+                headers.push((name, value));
+            }
         }
     }
-    let body_value = object::get(parts_obj, ctx.heap(), "body").unwrap_or_else(Value::null);
+
+    // At most one body slot is non-null. Read it last: `ServeBody::from_js_value`
+    // takes `&mut`, and nothing above allocates on the GC heap.
+    let body_value = {
+        let text = object::get_own_symbol(obj, ctx.heap(), body_text_sym).unwrap_or_else(Value::null);
+        if !text.is_null() && !text.is_undefined() {
+            text
+        } else {
+            object::get_own_symbol(obj, ctx.heap(), body_bytes_sym).unwrap_or_else(Value::null)
+        }
+    };
     let body = ServeBody::from_js_value(ctx, body_value)?;
     Ok(HttpResponse {
         status,

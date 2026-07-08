@@ -90,6 +90,7 @@ pub mod generator;
 pub mod global_functions;
 mod global_ops;
 pub mod groom;
+pub mod handles;
 pub mod heap_number;
 mod holt_stack;
 pub mod inspect;
@@ -186,6 +187,7 @@ pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKe
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
+pub use handles::{HandleArena, HandleScope, Scoped};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLayout,
@@ -764,6 +766,12 @@ pub struct Interpreter {
     /// back/popped as a strict stack so it is empty between top-level
     /// native calls.
     json_root_stack: Vec<Value>,
+    /// Scope-based GC handle storage for native value building. Handles minted
+    /// through [`Self::with_handle_scope`] park their `Value` here; the runtime
+    /// root walk traces every live slot and the collector rewrites it in place,
+    /// so a handle read is never stale across an allocation. Truncated back to
+    /// the opening length when each scope returns. See [`crate::handles`].
+    handle_arena: handles::HandleArena,
     /// Byte length of the most recent `JSON.stringify` output, used to
     /// pre-size the next call's scratch buffer. Repeated stringify of
     /// similarly-shaped data then never re-grows the buffer from empty.
@@ -1453,6 +1461,12 @@ impl Interpreter {
     /// Root-tracing view of the native serializer scratch root stack.
     pub(crate) fn json_root_stack_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.json_root_stack.iter()
+    }
+
+    /// Trace every live scope-handle slot as a GC root. Called from the runtime
+    /// root walk so the collector rewrites parked handles on a move.
+    pub(crate) fn handle_arena_trace(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        self.handle_arena.trace(visitor);
     }
 
     pub(crate) fn load_string_constant_value(

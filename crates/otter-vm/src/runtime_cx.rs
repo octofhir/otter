@@ -40,8 +40,7 @@ use otter_gc::raw::RawGc;
 
 use crate::{
     ExecutionContext, HandleScope, Interpreter, IteratorHandle, IteratorState, NativeError, Scoped,
-    Value, VmError,
-    array,
+    Value, VmError, array,
     binary::array_buffer::JsArrayBuffer,
     collections, native_function, object,
     promise::{JsPromise, JsPromiseHandle, PromiseState},
@@ -1270,6 +1269,22 @@ impl<'rt> NativeCtx<'rt> {
         Ok(self.cx.interp.scoped_value(s, Value::object(object)))
     }
 
+    /// Allocate a static builtin native function value and park it in scope
+    /// `s`. Mirrors the object-builder `builtin_method` path (a builtin-tagged
+    /// function backed by the static fast-call `call`); define the result on a
+    /// scoped object with `object::PropertyFlags` from
+    /// [`crate::Attr::builtin_function`] via [`Self::scoped_define_data`].
+    pub fn scoped_native_method<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        name: &'static str,
+        length: u8,
+        call: native_function::NativeFastFn,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_native_static(s, name, length, call);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_native_method"))
+    }
+
     /// Read a handle as a Rust `String`, if it currently holds a JS string.
     /// Non-allocating on the VM heap.
     #[must_use]
@@ -1536,11 +1551,12 @@ mod tests {
 
             let items_read = ctx.scoped_get(s, obj, "items").unwrap();
             let items_value = ctx.escape(items_read);
-            let js_array = items_value.as_array().expect("items reads back as an array");
-            let (first, second, len) =
-                crate::array::with_elements(js_array, ctx.heap(), |els| {
-                    (els[0], els[1], els.len())
-                });
+            let js_array = items_value
+                .as_array()
+                .expect("items reads back as an array");
+            let (first, second, len) = crate::array::with_elements(js_array, ctx.heap(), |els| {
+                (els[0], els[1], els.len())
+            });
             assert_eq!(len, 2);
             assert_eq!(first.as_f64(), Some(1.0));
             assert_eq!(
@@ -1599,7 +1615,9 @@ mod tests {
             );
 
             let read_back = ctx.scoped_get(s, obj, "k").unwrap();
-            let content = ctx.scoped_as_str(read_back).expect("property still a string");
+            let content = ctx
+                .scoped_as_str(read_back)
+                .expect("property still a string");
             (moved, content)
         });
         assert!(moved);

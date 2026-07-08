@@ -1,8 +1,8 @@
 //! WHATWG Blob host-side bytes.
 
 use otter_runtime::{
-    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_optional_arg_to_string,
+    RuntimeAttr as Attr, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_optional_arg_to_string,
     runtime_this_object, runtime_with_host_data,
 };
 
@@ -138,17 +138,27 @@ fn blob_type_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 }
 
 pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value, NativeError> {
-    let content_type = crate::string_value(ctx, state.content_type())?;
-    let size = Value::number_f64(state.size() as f64);
-    let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
-    builder
-        .readonly_property("size", size)
-        .and_then(|builder| builder.readonly_property("type", content_type))
-        .and_then(|builder| builder.builtin_method("text", 0, blob_text_native))
-        .and_then(|builder| builder.builtin_method("arrayBuffer", 0, blob_array_buffer_native))
-        .and_then(|builder| builder.builtin_method("slice", 2, blob_slice_native))
-        .map_err(|err| crate::type_error("Blob", err.to_string()))?;
-    Ok(Value::object(builder.build()))
+    // Snapshot the fields as Rust values before moving `state` into the host
+    // object; each JS value is minted inside the scope right before its define.
+    let size = state.size() as f64;
+    let content_type = state.content_type().to_string();
+    ctx.scope(|ctx, s| {
+        let obj = ctx.scoped_host_object(s, state)?;
+        let read_only = Attr::read_only().to_flags();
+        let size_value = ctx.scoped_number(s, size);
+        ctx.scoped_define_data(s, obj, "size", size_value, read_only)?;
+        let type_value = ctx.scoped_string(s, &content_type)?;
+        ctx.scoped_define_data(s, obj, "type", type_value, read_only)?;
+        let builtin = Attr::builtin_function().to_flags();
+        let text = ctx.scoped_native_method(s, "text", 0, blob_text_native)?;
+        ctx.scoped_define_data(s, obj, "text", text, builtin)?;
+        let array_buffer =
+            ctx.scoped_native_method(s, "arrayBuffer", 0, blob_array_buffer_native)?;
+        ctx.scoped_define_data(s, obj, "arrayBuffer", array_buffer, builtin)?;
+        let slice = ctx.scoped_native_method(s, "slice", 2, blob_slice_native)?;
+        ctx.scoped_define_data(s, obj, "slice", slice, builtin)?;
+        Ok::<Value, NativeError>(ctx.escape(obj))
+    })
 }
 
 fn arg_usize(args: &[Value], index: usize) -> Option<usize> {

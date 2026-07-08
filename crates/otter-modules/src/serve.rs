@@ -30,11 +30,10 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::TokioIo;
 use otter_runtime::{
     CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
-    RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeNativeCall,
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimePersistentRootId, RuntimeTask,
-    RuntimeTaskSpawner, RuntimeValue as Value, SourceInput, object, runtime_this_object,
-    runtime_with_host_data,
+    RuntimeAttr as Attr, RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness,
+    RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNativeFn, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
+    RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -437,10 +436,10 @@ impl RuntimeTask for ServeRequestTask {
             }
             Ok(Value::undefined())
         });
-        if let Err(err) = result {
-            if let Some(reply) = registry.take(token) {
-                let _ = reply.send(Err(err.to_string()));
-            }
+        if let Err(err) = result
+            && let Some(reply) = registry.take(token)
+        {
+            let _ = reply.send(Err(err.to_string()));
         }
         Ok(())
     }
@@ -486,7 +485,10 @@ fn deliver_error(
 }
 
 fn token_arg(args: &[Value]) -> Option<u64> {
-    let token = args.first().and_then(|value| value.as_number()).map(|n| n.as_f64())?;
+    let token = args
+        .first()
+        .and_then(|value| value.as_number())
+        .map(|n| n.as_f64())?;
     token.is_finite().then_some(token as u64)
 }
 
@@ -695,19 +697,29 @@ fn build_server_object(
     port: u16,
     url: String,
 ) -> Result<Value, NativeError> {
-    let hostname = crate::string_value(ctx, &hostname)?;
-    let url = crate::string_value(ctx, &url)?;
-    let mut builder = ObjectBuilder::from_host_data(ctx, server)?;
-    builder
-        .readonly_property("hostname", hostname)
-        .and_then(|builder| builder.readonly_property("port", Value::number_f64(port as f64)))
-        .and_then(|builder| builder.readonly_property("url", url))
-        .and_then(|builder| builder.builtin_method("stop", 0, server_stop))
-        .and_then(|builder| builder.builtin_method("close", 0, server_stop))
-        .and_then(|builder| builder.builtin_method("ref", 0, server_ref))
-        .and_then(|builder| builder.builtin_method("unref", 0, server_unref))
-        .map_err(|err| crate::type_error("serve", err.to_string()))?;
-    Ok(Value::object(builder.build()))
+    // Mint each JS value inside the scope right before its define; `server` moves
+    // into the host object and the strings are built from the Rust locals above,
+    // so no unrooted JsString local is held across another allocation.
+    ctx.scope(|ctx, s| {
+        let obj = ctx.scoped_host_object(s, server)?;
+        let read_only = Attr::read_only().to_flags();
+        let hostname_value = ctx.scoped_string(s, &hostname)?;
+        ctx.scoped_define_data(s, obj, "hostname", hostname_value, read_only)?;
+        let port_value = ctx.scoped_number(s, f64::from(port));
+        ctx.scoped_define_data(s, obj, "port", port_value, read_only)?;
+        let url_value = ctx.scoped_string(s, &url)?;
+        ctx.scoped_define_data(s, obj, "url", url_value, read_only)?;
+        let builtin = Attr::builtin_function().to_flags();
+        let stop = ctx.scoped_native_method(s, "stop", 0, server_stop)?;
+        ctx.scoped_define_data(s, obj, "stop", stop, builtin)?;
+        let close = ctx.scoped_native_method(s, "close", 0, server_stop)?;
+        ctx.scoped_define_data(s, obj, "close", close, builtin)?;
+        let ref_method = ctx.scoped_native_method(s, "ref", 0, server_ref)?;
+        ctx.scoped_define_data(s, obj, "ref", ref_method, builtin)?;
+        let unref = ctx.scoped_native_method(s, "unref", 0, server_unref)?;
+        ctx.scoped_define_data(s, obj, "unref", unref, builtin)?;
+        Ok::<Value, NativeError>(ctx.escape(obj))
+    })
 }
 
 fn server_receiver(
@@ -927,7 +939,8 @@ fn extract_response(
     // At most one body slot is non-null. Read it last: `ServeBody::from_js_value`
     // takes `&mut`, and nothing above allocates on the GC heap.
     let body_value = {
-        let text = object::get_own_symbol(obj, ctx.heap(), body_text_sym).unwrap_or_else(Value::null);
+        let text =
+            object::get_own_symbol(obj, ctx.heap(), body_text_sym).unwrap_or_else(Value::null);
         if !text.is_null() && !text.is_undefined() {
             text
         } else {

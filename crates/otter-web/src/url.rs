@@ -1,8 +1,8 @@
 //! WHATWG URL host-side record.
 
 use otter_runtime::{
-    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_optional_arg_to_string,
+    RuntimeAttr as Attr, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_optional_arg_to_string,
     runtime_this_object, runtime_with_host_data,
 };
 use url::Url;
@@ -159,23 +159,40 @@ fn url_to_string_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Valu
 }
 
 pub(crate) fn url_object(ctx: &mut NativeCtx<'_>, state: WebUrl) -> Result<Value, NativeError> {
-    let href = crate::string_value(ctx, &state.href())?;
-    let protocol = crate::string_value(ctx, &state.protocol())?;
-    let origin = crate::string_value(ctx, &state.origin())?;
-    let host = crate::string_value(ctx, &state.host())?;
-    let pathname = crate::string_value(ctx, &state.pathname())?;
-    let search = crate::string_value(ctx, &state.search())?;
-    let hash = crate::string_value(ctx, &state.hash())?;
-    let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
-    builder
-        .builtin_method("toString", 0, url_to_string_native)
-        .and_then(|builder| builder.data_property("href", href))
-        .and_then(|builder| builder.data_property("protocol", protocol))
-        .and_then(|builder| builder.data_property("origin", origin))
-        .and_then(|builder| builder.data_property("host", host))
-        .and_then(|builder| builder.data_property("pathname", pathname))
-        .and_then(|builder| builder.data_property("search", search))
-        .and_then(|builder| builder.data_property("hash", hash))
-        .map_err(|err| crate::type_error("URL", err.to_string()))?;
-    Ok(Value::object(builder.build()))
+    // Snapshot the string fields as Rust values before moving `state` into the
+    // host object; the JS strings are minted inside the scope, each right
+    // before its define, so no unrooted JsString local is held across another
+    // allocation.
+    let href = state.href();
+    let protocol = state.protocol();
+    let origin = state.origin();
+    let host = state.host();
+    let pathname = state.pathname();
+    let search = state.search();
+    let hash = state.hash();
+    ctx.scope(|ctx, s| {
+        let obj = ctx.scoped_host_object(s, state)?;
+        let to_string = ctx.scoped_native_method(s, "toString", 0, url_to_string_native)?;
+        ctx.scoped_define_data(
+            s,
+            obj,
+            "toString",
+            to_string,
+            Attr::builtin_function().to_flags(),
+        )?;
+        let data = Attr::data().to_flags();
+        for (name, text) in [
+            ("href", &href),
+            ("protocol", &protocol),
+            ("origin", &origin),
+            ("host", &host),
+            ("pathname", &pathname),
+            ("search", &search),
+            ("hash", &hash),
+        ] {
+            let value = ctx.scoped_string(s, text)?;
+            ctx.scoped_define_data(s, obj, name, value, data)?;
+        }
+        Ok::<Value, NativeError>(ctx.escape(obj))
+    })
 }

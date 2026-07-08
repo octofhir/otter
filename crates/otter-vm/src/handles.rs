@@ -256,9 +256,8 @@ impl Interpreter {
                 visitor(slot);
             }
         };
-        let array =
-            crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
-                .map_err(VmError::from)?;
+        let array = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
+            .map_err(VmError::from)?;
         // Park before growing so the handle survives any allocation the length
         // reservation drives; then resolve the (possibly relocated) handle from
         // the arena to set the length.
@@ -294,6 +293,34 @@ impl Interpreter {
     /// Park the `null` immediate in the current scope.
     pub(crate) fn scoped_null<'s>(&mut self, scope: &'s HandleScope) -> Scoped<'s> {
         self.scoped_value(scope, Value::null())
+    }
+
+    /// Allocate a static builtin native function and park it in the current
+    /// scope. Mirrors the object-builder `builtin_method` path: a builtin-tagged
+    /// function backed by the static fast-call `call`. The allocation snapshots
+    /// the runtime roots (including the arena), so prior handles survive any
+    /// collection it drives; the fresh function is parked immediately.
+    pub(crate) fn scoped_native_static<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        name: &'static str,
+        length: u8,
+        call: crate::native_function::NativeFastFn,
+    ) -> Result<Scoped<'s>, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let function = crate::native_function::NativeFunction::new_static_with_roots(
+            &mut self.gc_heap,
+            name,
+            length,
+            call,
+            &mut external_visit,
+        )?;
+        Ok(self.scoped_value(scope, Value::native_function(function)))
     }
 
     /// Read property `key` from the object handle `obj`, resolving `obj`

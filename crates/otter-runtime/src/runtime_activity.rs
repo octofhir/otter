@@ -63,14 +63,30 @@ pub(crate) trait RuntimeTaskQueue: Send + Sync + 'static {
 pub struct RuntimeTaskSpawner {
     queue: Arc<dyn RuntimeTaskQueue>,
     accounting: Arc<dyn RuntimeActivityAccounting>,
+    io_handle: Option<tokio::runtime::Handle>,
 }
 
 impl RuntimeTaskSpawner {
     pub(crate) fn new(
         queue: Arc<dyn RuntimeTaskQueue>,
         accounting: Arc<dyn RuntimeActivityAccounting>,
+        io_handle: Option<tokio::runtime::Handle>,
     ) -> Self {
-        Self { queue, accounting }
+        Self {
+            queue,
+            accounting,
+            io_handle,
+        }
+    }
+
+    /// The shared Tokio runtime handle for host resources that own async IO
+    /// (the HTTP server). `None` when the spawner was built without an event
+    /// loop (unit tests). A server binds and accepts on this runtime so its
+    /// connections are driven by the same executor as timers and fetch, keeping
+    /// all VM re-entry on the isolate thread through [`Self::enqueue`].
+    #[must_use]
+    pub fn io_handle(&self) -> Option<tokio::runtime::Handle> {
+        self.io_handle.clone()
     }
 
     /// Enqueue an owned task to run on the isolate event-loop thread.

@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use otter_runtime::CapabilitySet;
 use otter_runtime::{
-    RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
-    RuntimeValue as Value, runtime_alloc_object, runtime_array_from_elements, runtime_set_property,
-    runtime_this_object, runtime_with_host_data_mut,
+    RuntimeHandleScope, RuntimeHostObjectError, RuntimeJsObject as JsObject,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeScoped, RuntimeValue as Value, runtime_this_object,
+    runtime_with_host_data_mut,
 };
 use rusqlite::types::{ToSqlOutput, Value as SqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags};
@@ -268,7 +268,10 @@ fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.query_one(&sql, &params))
             .map_err(|err| host_error("SqlDatabase.queryOne", err))?;
     match result.map_err(|err| crate::type_error("SqlDatabase.queryOne", err.to_string()))? {
-        Some(row) => json_row_to_object(ctx, row).map(Value::object),
+        Some(row) => ctx.scope(|ctx, s| {
+            let object = scoped_json_row_to_object(ctx, s, row)?;
+            Ok::<Value, NativeError>(ctx.escape(object))
+        }),
         None => Ok(Value::null()),
     }
 }
@@ -284,16 +287,33 @@ fn js_params(
 }
 
 fn json_rows_to_array(ctx: &mut NativeCtx<'_>, rows: Vec<JsonValue>) -> Result<Value, NativeError> {
-    let values = rows
-        .into_iter()
-        .map(|row| json_row_to_object(ctx, row).map(Value::object))
-        .collect::<Result<Vec<_>, _>>()?;
-    let arr = runtime_array_from_elements(ctx, values)?;
-    Ok(Value::array(arr))
+    // Each row object and the backing array are separate allocations, and each
+    // row itself allocates per field. Collecting the row objects into a `Vec`
+    // left every earlier object unrooted across the later allocations. Build the
+    // array through the scope, storing each row into the (rooted) array before
+    // an inner scope drops the row's transient field handles.
+    ctx.scope(|ctx, s| {
+        let array = ctx.scoped_array(s, rows.len())?;
+        for (index, row) in rows.into_iter().enumerate() {
+            ctx.scope(|ctx, row_scope| {
+                let object = scoped_json_row_to_object(ctx, row_scope, row)?;
+                ctx.scoped_set_index(row_scope, array, index, object)
+            })?;
+        }
+        Ok::<Value, NativeError>(ctx.escape(array))
+    })
 }
 
-fn json_row_to_object(ctx: &mut NativeCtx<'_>, row: JsonValue) -> Result<JsObject, NativeError> {
-    let object = runtime_alloc_object(ctx)?;
+/// Build a JS object for a SQL result row, parking it and every field value in
+/// scope `s`. The object is created first and every field is written through the
+/// arena, so a moving collection driven by a later field allocation can never
+/// strand the object or an earlier field.
+fn scoped_json_row_to_object<'s>(
+    ctx: &mut NativeCtx<'_>,
+    s: &'s RuntimeHandleScope,
+    row: JsonValue,
+) -> Result<RuntimeScoped<'s>, NativeError> {
+    let object = ctx.scoped_object(s)?;
     let JsonValue::Object(map) = row else {
         return Err(crate::type_error(
             "SqlDatabase.query",
@@ -301,8 +321,26 @@ fn json_row_to_object(ctx: &mut NativeCtx<'_>, row: JsonValue) -> Result<JsObjec
         ));
     };
     for (name, value) in map {
-        let value = crate::json_to_value(ctx, value)?;
-        runtime_set_property(ctx, object, &name, value);
+        let value = scoped_json_to_value(ctx, s, value)?;
+        ctx.scoped_set(s, object, &name, value)?;
     }
     Ok(object)
+}
+
+/// Scoped counterpart of [`crate::json_to_value`]: convert a JSON scalar to a JS
+/// value parked in scope `s`. Only the string arm allocates; parking keeps every
+/// arm reading like an ordinary scoped creation so the caller never holds a raw
+/// handle across a sibling allocation.
+fn scoped_json_to_value<'s>(
+    ctx: &mut NativeCtx<'_>,
+    s: &'s RuntimeHandleScope,
+    value: JsonValue,
+) -> Result<RuntimeScoped<'s>, NativeError> {
+    match value {
+        JsonValue::Null => Ok(ctx.scoped_null(s)),
+        JsonValue::Bool(b) => Ok(ctx.scoped_boolean(s, b)),
+        JsonValue::Number(n) => Ok(ctx.scoped_number(s, n.as_f64().unwrap_or(f64::NAN))),
+        JsonValue::String(text) => ctx.scoped_string(s, &text),
+        other => ctx.scoped_string(s, &other.to_string()),
+    }
 }

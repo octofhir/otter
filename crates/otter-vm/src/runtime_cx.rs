@@ -1120,7 +1120,14 @@ impl<'rt> NativeCtx<'rt> {
     pub fn scope<R>(&mut self, f: impl FnOnce(&mut NativeCtx<'_>, &HandleScope) -> R) -> R {
         let base = self.cx.interp.handle_arena_len();
         let scope = HandleScope::new(base);
+        // Host-side native calls (module init, timer/worker dispatch) run without
+        // the dispatch loop's extra-roots provider. Register the runtime root set
+        // — which traces the handle arena — for the scope so a wide-number box
+        // allocated inside a scoped write cannot strand a sibling handle. No-op
+        // (and free) under dispatch, where a provider is already installed.
+        let roots_depth = self.cx.interp.push_scope_runtime_roots();
         let r = f(self, &scope);
+        self.cx.interp.pop_scope_runtime_roots(roots_depth);
         self.cx.interp.handle_arena_truncate(base);
         r
     }

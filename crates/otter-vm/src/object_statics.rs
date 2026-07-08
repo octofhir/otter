@@ -2083,10 +2083,8 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let mut names = Vec::with_capacity(owned.len());
-            for k in owned {
-                names.push(string_value(&k, gc_heap)?);
-            }
+            let names = interp.scoped_key_strings(&owned)?;
+            let gc_heap = interp.gc_heap_for_cx_mut();
             Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 names,
@@ -2255,10 +2253,8 @@ pub fn call(
             } else {
                 return Err(VmError::TypeMismatch);
             };
-            let mut names: Vec<Value> = Vec::with_capacity(owned.len());
-            for k in owned {
-                names.push(string_value(&k, gc_heap)?);
-            }
+            let names = interp.scoped_key_strings(&owned)?;
+            let gc_heap = interp.gc_heap_for_cx_mut();
             Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 names,

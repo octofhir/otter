@@ -2,8 +2,7 @@
 title: "Handle Scopes: Building JS Values"
 ---
 
-This is the standard way to build JS values from Rust in otter. Every new
-native function uses it; existing code is being migrated to it. If you are
+This is the standard way to build JS values from Rust in otter. If you are
 adding a builtin, a Web API, or an `otter:*` module surface — start here.
 
 ## Why this API exists (read this once)
@@ -103,7 +102,7 @@ Interpreter-internal code (inside `otter-vm`) uses the same core via
    in a loop; its handles die at the inner boundary, the outer ones survive.
    Keeps the arena small in long loops.
 
-## What NOT to write (pre-scope patterns you'll see in old code)
+## What NOT to write
 
 ```rust
 // BROKEN: every later alloc can move the earlier strings.
@@ -113,8 +112,8 @@ let obj = ObjectBuilder::from_host_data(ctx, state)?;  // both may be stale now
 ```
 
 ```rust
-// SOUND BUT DEPRECATED: manual value_roots threading + re-reads.
-// Don't add new code in this style; migrate it to ctx.scope when touched.
+// SOUND BUT WRONG STYLE: manual value_roots threading + re-reads.
+// Don't write this; use ctx.scope.
 let desc = self.some_helper_runtime_rooted(ctx, v, &[&a, &b], &[slice])?;
 a = a_root.as_object().unwrap(); // manual re-read after the rooted call
 ```
@@ -148,10 +147,9 @@ let leaked = ctx.scope(|ctx, s| ctx.scoped_string(s, "x").unwrap());
 // error[E0597]: borrowed value does not live long enough
 ```
 
-## Migration status
+## Codebase invariant
 
-Design + phase plan: `HANDLE_SCOPE_PLAN.md` (repo root).
-Migrated: otter-web URL/Blob, serve server object, the `Object.*` reflection
-paths. In flight: ffi/kv/sql modules, `RuntimeNativeCtx` aliases, remaining
-`Object.keys`/`getOwnPropertyNames` fallbacks, error-object construction,
-the `ObjectBuilder` internals. New code never adds the deprecated patterns.
+No raw GC handle is held across an allocation, except inside `*_with_roots`
+internals that root explicitly. `ObjectBuilder` and the binding macros use
+manual rooting internally; their public surfaces are sound. Design:
+`HANDLE_SCOPE_PLAN.md` (repo root).

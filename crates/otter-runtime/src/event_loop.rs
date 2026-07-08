@@ -143,6 +143,20 @@ impl TokioEventLoop {
         })
     }
 
+    /// Blocking remote-module fetcher for the synchronous module-graph loader
+    /// (static http/https imports). Backed by the same Tokio handle + client as
+    /// the async dynamic-import fetcher; the loader calls it on the isolate
+    /// thread and blocks that thread until the whole remote graph is fetched,
+    /// mirroring how it blocks on filesystem reads for local modules.
+    pub(crate) fn blocking_module_fetcher(
+        &self,
+    ) -> Arc<dyn crate::module_loader::RemoteModuleFetch> {
+        Arc::new(TokioBlockingModuleFetcher {
+            handle: self.handle.clone(),
+            client: self.http_client.clone(),
+        })
+    }
+
     /// Block on a future using the backing Tokio runtime.
     ///
     /// This is intended for CLI and non-async embedders. Async callers
@@ -203,6 +217,50 @@ impl TokioEventLoop {
 struct TokioHttpsModuleFetcher {
     handle: tokio::runtime::Handle,
     client: reqwest::Client,
+}
+
+#[derive(Debug)]
+struct TokioBlockingModuleFetcher {
+    handle: tokio::runtime::Handle,
+    client: reqwest::Client,
+}
+
+impl crate::module_loader::RemoteModuleFetch for TokioBlockingModuleFetcher {
+    fn fetch(&self, url: &str) -> Result<crate::module_loader::RemoteModuleSource, String> {
+        let client = self.client.clone();
+        let url = url.to_string();
+        // Drive the async request to completion on the shared Tokio runtime.
+        // `block_in_place` yields the current worker so the request's own I/O
+        // task can run when this is called from inside the runtime; from the
+        // plain isolate thread it is a direct `handle.block_on`.
+        tokio::task::block_in_place(|| {
+            self.handle.block_on(async move {
+                let resp = client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("HTTPS request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTPS status {} for \"{url}\"", resp.status()));
+                }
+                let final_url = resp.url().to_string();
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let source = resp
+                    .text()
+                    .await
+                    .map_err(|e| format!("HTTPS body read failed: {e}"))?;
+                Ok(crate::module_loader::RemoteModuleSource {
+                    source,
+                    content_type,
+                    final_url,
+                })
+            })
+        })
+    }
 }
 
 impl HttpsModuleFetcher for TokioHttpsModuleFetcher {

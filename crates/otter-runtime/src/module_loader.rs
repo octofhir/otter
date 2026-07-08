@@ -29,13 +29,46 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-use otter_syntax::SourceKind;
+use otter_syntax::{SourceKind, remote_source_kind};
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 
 use crate::package_graph_resolver;
 use crate::{CapabilitySet, Permission};
+
+/// One remote module fetched over http/https.
+#[derive(Debug, Clone)]
+pub struct RemoteModuleSource {
+    /// UTF-8 source text.
+    pub source: String,
+    /// Response `Content-Type` header, used to classify the source kind
+    /// (Deno-style: the server's declared media type is authoritative for a
+    /// specifier that carries no meaningful path extension).
+    pub content_type: Option<String>,
+    /// Post-redirect final URL. Relative imports inside the module resolve
+    /// against this, and it becomes the module's canonical graph key.
+    pub final_url: String,
+}
+
+/// Blocking remote-module fetch hook.
+///
+/// Injected by the runtime and backed by the host event loop's HTTP client so
+/// the synchronous module-graph loader can pull http/https sources the same way
+/// it reads files — following redirects and reporting the response media type.
+/// Absent in embedders that disable remote loading, where an http(s) import
+/// surfaces a clean [`LoaderError::Load`] instead of a network call.
+pub trait RemoteModuleFetch: Send + Sync + std::fmt::Debug {
+    /// Fetch `url`, following redirects. Blocking; called on the isolate
+    /// thread during graph construction.
+    fn fetch(&self, url: &str) -> Result<RemoteModuleSource, String>;
+}
+
+/// Whether `url` is an http/https URL (a remote module).
+#[must_use]
+pub fn is_http_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
 
 /// Which resolver flavour to use when consulting
 /// [`oxc_resolver`] for a bare specifier. ESM is the default;
@@ -79,6 +112,16 @@ fn referrer_file(referrer: Option<&str>) -> Option<PathBuf> {
     referrer
         .and_then(|r| r.strip_prefix("file://"))
         .map(PathBuf::from)
+}
+
+/// Join a relative or absolute-path `specifier` against a remote `referrer`
+/// URL, yielding an absolute http(s) URL (Deno-style remote resolution).
+fn join_remote_url(referrer: &str, specifier: &str) -> Result<String, String> {
+    let base = url::Url::parse(referrer)
+        .map_err(|e| format!("invalid remote referrer URL `{referrer}`: {e}"))?;
+    base.join(specifier)
+        .map(|u| u.to_string())
+        .map_err(|e| format!("cannot resolve `{specifier}` against `{referrer}`: {e}"))
 }
 
 /// Extract the `host[:port]` portion of an `http://` / `https://`
@@ -465,6 +508,7 @@ pub struct ModuleLoader {
     cjs_resolver: Resolver,
     package_scope_cache: Option<package_graph_resolver::PackageScopeCache>,
     filesystem_package_scope_cache: FilesystemPackageScopeCache,
+    remote_fetch: Option<Arc<dyn RemoteModuleFetch>>,
 }
 
 impl std::fmt::Debug for ModuleLoader {
@@ -514,7 +558,17 @@ impl ModuleLoader {
             cjs_resolver: Resolver::new(cjs_options),
             package_scope_cache,
             filesystem_package_scope_cache: FilesystemPackageScopeCache::default(),
+            remote_fetch: None,
         }
+    }
+
+    /// Install the blocking remote-module fetch hook (http/https loading).
+    /// The runtime wires this from its event loop's HTTP client; without it,
+    /// http(s) imports fail with a clean load error instead of a network call.
+    #[must_use]
+    pub fn with_remote_fetch(mut self, remote_fetch: Arc<dyn RemoteModuleFetch>) -> Self {
+        self.remote_fetch = Some(remote_fetch);
+        self
     }
 
     /// Borrow the active config.
@@ -606,12 +660,40 @@ impl ModuleLoader {
                     resource: host,
                 });
             }
-            // Capability granted: the resolver returns the URL
-            // as-is. Static-graph callers (the linker) still cannot
-            // fetch over HTTPS, but the dynamic-import path
-            // (`Runtime::load_dynamic_module_https`) handles it on
-            // the isolate-runner thread via the wired Tokio handle.
+            // Capability granted: an absolute http(s) specifier resolves to
+            // itself. The static graph loader fetches it through the wired
+            // remote-fetch hook; the dynamic-import path handles it on the
+            // isolate-runner thread via the Tokio handle.
             return Ok(specifier.to_string());
+        }
+        // A relative or absolute-path specifier imported from a remote module
+        // resolves as a URL against its referrer, not a filesystem path — the
+        // Deno-style remote graph. Bare specifiers stay on the node_modules
+        // path below (a remote CDN already rewrites its own imports to
+        // absolute URLs, so this covers `./chunk.js` and `/v135/x.js`).
+        if let Some(referrer) = referrer
+            && is_http_url(referrer)
+            && (specifier.starts_with("./")
+                || specifier.starts_with("../")
+                || specifier.starts_with('/'))
+        {
+            let joined =
+                join_remote_url(referrer, specifier).map_err(|message| LoaderError::Resolve {
+                    specifier: specifier.to_string(),
+                    referrer: referrer.to_string(),
+                    message,
+                })?;
+            if let Some(host) = http_specifier_host(&joined)
+                && !matches!(self.config.capabilities.net, Permission::AllowAll)
+                && !self.config.capabilities.net.matches(&host)
+            {
+                return Err(LoaderError::CapabilityDenied {
+                    specifier: joined,
+                    capability: "net".to_string(),
+                    resource: host,
+                });
+            }
+            return Ok(joined);
         }
         if let Some(rest) = specifier.strip_prefix("file://") {
             let path = canonicalise(Path::new(rest)).map_err(|e| LoaderError::Resolve {
@@ -753,6 +835,30 @@ impl ModuleLoader {
                 kind: SourceKind::JavaScript,
                 jsx: None,
                 text: String::new(),
+            });
+        }
+        // Remote (http/https) module: fetch through the wired hook, following
+        // redirects. The response Content-Type classifies the source kind, and
+        // the post-redirect final URL becomes the canonical graph key so the
+        // module's own relative imports resolve against where it actually came
+        // from (Deno-style).
+        if is_http_url(&url) {
+            let Some(fetcher) = &self.remote_fetch else {
+                return Err(LoaderError::Load {
+                    url: url.clone(),
+                    message: "remote module loading is not enabled in this runtime".to_string(),
+                });
+            };
+            let fetched = fetcher.fetch(&url).map_err(|message| LoaderError::Load {
+                url: url.clone(),
+                message,
+            })?;
+            let kind = remote_source_kind(fetched.content_type.as_deref(), &fetched.final_url);
+            return Ok(ResolvedSource {
+                url: fetched.final_url,
+                kind,
+                jsx: None,
+                text: fetched.source,
             });
         }
         let path = url.strip_prefix("file://").unwrap_or(&url);

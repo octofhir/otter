@@ -941,6 +941,7 @@ fn run_isolate(
             Err(_) => return,
         };
     let https_module_fetcher = event_loop.https_module_fetcher();
+    runtime.install_remote_module_fetch(event_loop.blocking_module_fetcher());
     let timer_scheduler = Arc::new(InboxTimerScheduler {
         tx: scheduler_tx.clone(),
         event_loop,

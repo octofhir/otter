@@ -1841,6 +1841,7 @@ impl Runtime {
             layer_a_dynamic_imports,
             promise_registry: promise_registry::PromiseRegistry::new(),
             runtime_task_spawner,
+            remote_module_fetch: None,
         };
         if runtime.config.install_worker_global {
             worker::install_main_worker_globals(&mut runtime)?;
@@ -1883,6 +1884,10 @@ pub struct Runtime {
     promise_registry: promise_registry::PromiseRegistry,
     /// Sender for owned tasks that must run on the isolate event loop.
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    /// Blocking remote-module fetch hook, wired by the isolate runner from the
+    /// event loop's HTTP client. Enables static http/https imports (the
+    /// Deno-style remote graph); `None` in embedders without remote loading.
+    remote_module_fetch: Option<Arc<dyn module_loader::RemoteModuleFetch>>,
 }
 
 pub(crate) enum MessageEventDispatchError {
@@ -1995,6 +2000,16 @@ impl Runtime {
     /// reach the loader through the runtime inbox.
     pub fn install_dynamic_import_loader(&mut self, loader: otter_vm::DynamicImportLoaderHandle) {
         self.interp.set_dynamic_import_loader(loader);
+    }
+
+    /// Install the blocking remote-module fetch hook so static http/https
+    /// imports load through the synchronous module graph (Deno-style). Wired
+    /// by the isolate runner from the event loop's HTTP client.
+    pub fn install_remote_module_fetch(
+        &mut self,
+        fetch: Arc<dyn module_loader::RemoteModuleFetch>,
+    ) {
+        self.remote_module_fetch = Some(fetch);
     }
 
     /// Begin loading a dynamic import on the isolate thread.
@@ -3376,12 +3391,16 @@ impl Runtime {
     }
 
     fn module_loader_for_entry(&self, entry_path: &Path) -> module_loader::ModuleLoader {
-        self.module_loader.for_entry(
+        let loader = self.module_loader.for_entry(
             entry_path,
             &self.config.hosted_modules,
             &self.package_manager,
             &self.config.capabilities,
-        )
+        );
+        match &self.remote_module_fetch {
+            Some(fetch) => loader.with_remote_fetch(fetch.clone()),
+            None => loader,
+        }
     }
 
     /// Parse and compile a file without executing it.

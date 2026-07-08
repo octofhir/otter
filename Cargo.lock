@@ -2334,6 +2334,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "trybuild",
+ "url",
 ]
 
 [[package]]

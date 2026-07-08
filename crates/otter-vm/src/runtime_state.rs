@@ -136,6 +136,11 @@ impl<'a> RuntimeState<'a> {
         for value in interp.json_root_stack_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // 2b-quinquies-pre) Scope-handle arena — native value-building roots.
+        // Every collection that can run while a native call holds handles must
+        // trace these, or a parked handle goes stale across a move. The
+        // snapshot path (`collect_runtime_roots`) also reaches here.
+        interp.handle_arena_trace(visitor);
         // 2b-quinquies) Host-resource persistent roots.
         interp.persistent_roots_for_trace().trace_gc_roots(visitor);
         // 2c) Global declarative-record cells (§9.1.1.4 script

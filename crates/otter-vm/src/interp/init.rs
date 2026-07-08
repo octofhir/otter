@@ -97,6 +97,7 @@ impl Interpreter {
             lean_callback_roots: Vec::new(),
             pending_error_detail: std::cell::RefCell::new(None),
             json_root_stack: Vec::new(),
+            handle_arena: crate::handles::HandleArena::new(),
             json_stringify_capacity_hint: 0,
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),

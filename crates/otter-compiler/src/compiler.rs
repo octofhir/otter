@@ -251,6 +251,22 @@ impl Compiler {
         Some(current)
     }
 
+    /// Resolve the [`BindingInfo`] a captured name refers to by walking the
+    /// frame stack outward. Used to recover a captured binding's immutability
+    /// flags (`is_const`, `fn_self_name`) — e.g. a named function expression's
+    /// self-name cell — which are needed so a direct `eval` that writes the
+    /// captured binding enforces the same immutability the enclosing code does.
+    pub(crate) fn captured_binding_info(&self, name: &str) -> Option<BindingInfo> {
+        for frame in self.stack.iter().rev() {
+            for scope in frame.scopes.iter().rev() {
+                if let Some(info) = scope.bindings.get(name) {
+                    return Some(*info);
+                }
+            }
+        }
+        None
+    }
+
     /// Mirror an assignment to an exported module binding through to
     /// `module_env`, including assignments emitted inside nested
     /// functions. Nested functions capture the synthetic module-env

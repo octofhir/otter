@@ -23,8 +23,8 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, VmPropertyKey, array, bigint, binary,
-    object,
+    ExecutionContext, Frame, Interpreter, Scoped, Value, VmError, VmPropertyKey, array, bigint,
+    binary, object,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
@@ -975,27 +975,15 @@ impl Interpreter {
                 // - Null / Undefined throw TypeError per spec.
                 // The result inherits from `%Object.prototype%` per
                 // step 2 (`OrdinaryObjectCreate(%Object.prototype%)`).
-                let object_proto = self.constructor_prototype_value("Object").ok();
-                let mut result_value_roots: SmallVec<[&Value; 1]> = SmallVec::new();
-                if let Some(proto) = object_proto.as_ref() {
-                    result_value_roots.push(proto);
-                }
-                let mut result = self.alloc_stack_rooted_object_with_value_roots(
-                    stack,
-                    result_value_roots.as_slice(),
-                    args,
-                )?;
-                if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
-                    object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
-                }
-                // `result_root` is the value the rooted calls below rewrite in
-                // place when a collection moves the result object. `result` is
-                // a plain copy that goes stale at the same moment, so every
-                // mutation below must re-read the object from `result_root`
-                // first (and re-sync `result_root` after a `set` that can
-                // itself trigger a moving collection, e.g. number boxing).
-                let mut result_root = Value::object(result);
-                let Some(target) = args.first() else {
+                //
+                // Every heap value the enumeration touches — the result object,
+                // the target, each own key, and each per-key descriptor object —
+                // is parked in a handle scope and resolved through the arena at
+                // every use. The arena is traced on every collection, so an
+                // allocation anywhere in the loop (descriptor build, key string,
+                // property store) can never strand a raw offset and silently
+                // truncate the key set.
+                let Some(&target) = args.first() else {
                     return Err(self.err_type(
                         ("Object.getOwnPropertyDescriptors called on null or undefined"
                             .to_string())
@@ -1009,108 +997,97 @@ impl Interpreter {
                         .into(),
                     ));
                 }
-                if target.is_boolean()
-                    || target.is_number()
-                    || target.is_symbol()
-                    || target.is_big_int()
-                {
-                    // Empty result; primitive wrapper carries no
-                    // own keys reachable through the foundation surface.
-                } else if let Some(s) = target.as_string(&self.gc_heap) {
-                    let units = s.to_utf16_vec(&self.gc_heap);
-                    for (i, u) in units.iter().enumerate() {
-                        let key = i.to_string();
-                        let unit =
-                            crate::string::JsString::from_utf16_units(&[*u], self.gc_heap_mut())
-                                .map_err(|_| VmError::TypeMismatch)?;
-                        let desc = crate::object::PropertyDescriptor::data(
-                            Value::string(unit),
+                self.with_handle_scope(|interp, scope| {
+                    // Park the incoming receiver before any allocation: the
+                    // result object below is young and its allocation can
+                    // relocate `target`, stranding an unparked raw offset.
+                    let target_h = interp.scoped_value(scope, target);
+                    let result = interp.scoped_object(scope)?;
+
+                    if target.is_boolean()
+                        || target.is_number()
+                        || target.is_symbol()
+                        || target.is_big_int()
+                    {
+                        // Empty result; a primitive wrapper carries no own keys
+                        // reachable through the foundation surface.
+                    } else if let Some(s) = target.as_string(&interp.gc_heap) {
+                        let units = s.to_utf16_vec(&interp.gc_heap);
+                        for (i, u) in units.iter().enumerate() {
+                            let unit = crate::string::JsString::from_utf16_units(
+                                &[*u],
+                                interp.gc_heap_mut(),
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?;
+                            let desc = crate::object::PropertyDescriptor::data(
+                                Value::string(unit),
+                                false,
+                                true,
+                                false,
+                            );
+                            let desc_h = interp.scoped_descriptor_object(scope, &desc)?;
+                            interp.scoped_set(scope, result, &i.to_string(), desc_h)?;
+                        }
+                        let length_desc = crate::object::PropertyDescriptor::data(
+                            Value::number_f64(units.len() as f64),
                             false,
-                            true,
+                            false,
                             false,
                         );
-                        let desc_obj = self.descriptor_to_object_stack_rooted(
-                            stack,
-                            &desc,
-                            &[&result_root],
-                            &[args],
-                        )?;
-                        let desc_value = Value::object(desc_obj);
-                        result = result_root.as_object().expect("result stays an object");
-                        object::set(&mut result, &mut self.gc_heap, &key, desc_value);
-                        result_root = Value::object(result);
-                    }
-                    let length_desc = crate::object::PropertyDescriptor::data(
-                        Value::number_f64(units.len() as f64),
-                        false,
-                        false,
-                        false,
-                    );
-                    let length_obj = self.descriptor_to_object_stack_rooted(
-                        stack,
-                        &length_desc,
-                        &[&result_root],
-                        &[args],
-                    )?;
-                    let length_value = Value::object(length_obj);
-                    result = result_root.as_object().expect("result stays an object");
-                    object::set(&mut result, &mut self.gc_heap, "length", length_value);
-                    result_root = Value::object(result);
-                } else if own_property_descriptors_uses_internal_methods(target) {
-                    // §20.1.2.10.1 step 3 — drive the spec
-                    // ladder via `own_property_keys_value`, then
-                    // read each descriptor through the target's
-                    // `[[GetOwnProperty]]`.
-                    let target_value = *target;
-                    let keys = self.own_property_keys_value(context, &target_value)?;
-                    for index in 0..keys.len() {
-                        let key = keys[index];
-                        let vm_key = if let Some(s) = key.as_string(&self.gc_heap) {
-                            crate::VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-                        } else if let Some(sym) = key.as_symbol(&self.gc_heap) {
-                            crate::VmPropertyKey::Symbol(sym)
-                        } else {
-                            continue;
-                        };
-                        let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                            context,
-                            target_value,
-                            &vm_key,
-                            0,
-                            &[&target_value, &result_root],
-                            &[args, keys.as_slice()],
-                        )?;
-                        let Some(desc) = desc else {
-                            continue;
-                        };
-                        let desc_obj = self.descriptor_to_object_stack_rooted(
-                            stack,
-                            &desc,
-                            &[&target_value, &result_root],
-                            &[args, keys.as_slice()],
-                        )?;
-                        let current_key = keys[index];
-                        let desc_value = Value::object(desc_obj);
-                        result = result_root.as_object().expect("result stays an object");
-                        if let Some(s) = current_key.as_string(&self.gc_heap) {
-                            let key_string = s.to_lossy_string(&self.gc_heap);
-                            object::set(&mut result, &mut self.gc_heap, &key_string, desc_value);
-                            result_root = Value::object(result);
-                        } else if let Some(sym) = current_key.as_symbol(&self.gc_heap)
-                            && !object::set_symbol(
-                                result,
-                                &mut self.gc_heap,
-                                sym,
-                                Value::object(desc_obj),
-                            )
-                        {
-                            return Err(VmError::TypeMismatch);
+                        let length_h = interp.scoped_descriptor_object(scope, &length_desc)?;
+                        interp.scoped_set(scope, result, "length", length_h)?;
+                    } else if own_property_descriptors_uses_internal_methods(&target) {
+                        // §20.1.2.10.1 step 3 — drive the spec ladder via
+                        // `own_property_keys_value`, then read each descriptor
+                        // through the target's `[[GetOwnProperty]]`.
+                        let target_value = interp.escape_scoped(target_h);
+                        let keys = interp.own_property_keys_value(context, &target_value)?;
+                        // Park every key before the first descriptor allocation:
+                        // the fresh young key strings would otherwise dangle.
+                        let mut key_handles: Vec<Scoped> = Vec::with_capacity(keys.len());
+                        for key in &keys {
+                            key_handles.push(interp.scoped_value(scope, *key));
                         }
+                        for key_h in key_handles {
+                            let key = interp.escape_scoped(key_h);
+                            let vm_key = if let Some(s) = key.as_string(&interp.gc_heap) {
+                                crate::VmPropertyKey::OwnedString(
+                                    s.to_lossy_string(&interp.gc_heap),
+                                )
+                            } else if let Some(sym) = key.as_symbol(&interp.gc_heap) {
+                                crate::VmPropertyKey::Symbol(sym)
+                            } else {
+                                continue;
+                            };
+                            let target_value = interp.escape_scoped(target_h);
+                            let desc = interp
+                                .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                    context,
+                                    target_value,
+                                    &vm_key,
+                                    0,
+                                    &[],
+                                    &[],
+                                )?;
+                            let Some(desc) = desc else {
+                                continue;
+                            };
+                            let desc_h = interp.scoped_descriptor_object(scope, &desc)?;
+                            // Resolve the key spelling through the arena again:
+                            // the descriptor allocation may have relocated it.
+                            let key = interp.escape_scoped(key_h);
+                            if let Some(s) = key.as_string(&interp.gc_heap) {
+                                let key_string = s.to_lossy_string(&interp.gc_heap);
+                                interp.scoped_set(scope, result, &key_string, desc_h)?;
+                            } else if let Some(sym) = key.as_symbol(&interp.gc_heap) {
+                                interp.scoped_set_symbol(scope, result, sym, desc_h)?;
+                            }
+                        }
+                    } else {
+                        return Err(VmError::TypeMismatch);
                     }
-                } else {
-                    return Err(VmError::TypeMismatch);
-                }
-                Ok(Some(result_root))
+                    Ok(Some(interp.escape_scoped(result)))
+                })
             }
             M::GetOwnPropertyNames => {
                 let Some(target) = args.first() else {

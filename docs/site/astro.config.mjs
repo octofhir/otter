@@ -60,6 +60,7 @@ export default defineConfig({
 						{ label: 'Overview', slug: 'extensions/overview' },
 						{ label: 'Hosted Modules', slug: 'extensions/hosted-modules' },
 						{ label: 'Native Bindings', slug: 'extensions/native-bindings' },
+						{ label: 'Handle Scopes: Building JS Values', slug: 'extensions/handle-scopes' },
 						{ label: 'JS Surface Builders', slug: 'extensions/js-surface-builders' },
 						{ label: 'Plugin System', slug: 'extensions/plugin-system' },
 					],

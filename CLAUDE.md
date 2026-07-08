@@ -72,7 +72,7 @@ otter-gc
 
 4. **Native Functions**: Add native bindings against the current runtime/VM ABI.
    **Build JS values through handle scopes** (`ctx.scope` + `scoped_*`,
-   see `docs/NATIVE_API.md`) — never hold raw `Value`/`JsString` locals across
+   see `docs/site/src/content/docs/extensions/handle-scopes.md`) — never hold raw `Value`/`JsString` locals across
    an allocation; verify multi-allocation natives under `OTTER_GC_STRESS`.
    `otter:kv`, `otter:sql`, and `otter:ffi` live in `crates/otter-modules`, and `otter:ffi` includes the active `CFunction`, `linkSymbols`, and `JSCallback` path there.
    Prefer the active macro set when it matches the surface:

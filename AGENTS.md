@@ -201,8 +201,18 @@ fn stringify(value: &Value, depth: usize) -> Result<String, Error> {
 ```
 
 ### 3. Forgetting GC Roots
-**Problem**: Values get collected while still in use.
-**Solution**: Root values before operations that might trigger GC (allocations, function calls).
+**Problem**: `Value`/`JsObject`/`JsString` are raw `Copy` cage offsets; the young
+generation is a moving collector, so a value held in a Rust local goes stale
+(and is later silently "laundered" into a wrong object) the moment a later
+allocation triggers a collection.
+**Solution**: Build values inside a handle scope — `ctx.scope(|ctx, s| …)`
+with the `scoped_*` methods. Handles live in a collector-traced arena and can
+never go stale; the compiler stops them escaping the scope. **This is the
+standard API for all native value building** — see
+[docs/NATIVE_API.md](docs/NATIVE_API.md). Do not add new code with the
+deprecated manual `value_roots` threading or raw-`Value` juggling; verify any
+multi-allocation native under `OTTER_GC_STRESS=1..16` (identical output every
+stride).
 
 ### 4. Non-deterministic Test Failures
 **Problem**: Tests pass/fail randomly due to hash map iteration order.

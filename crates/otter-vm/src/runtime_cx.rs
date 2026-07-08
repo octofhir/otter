@@ -39,7 +39,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, VmError,
+    ExecutionContext, HandleScope, Interpreter, IteratorHandle, IteratorState, NativeError, Scoped,
+    Value, VmError,
     array,
     binary::array_buffer::JsArrayBuffer,
     collections, native_function, object,
@@ -1066,6 +1067,250 @@ impl<'rt> NativeCtx<'rt> {
         });
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Handle-scope surface (see `crate::handles`).
+    //
+    // `scope` opens a collector-traced arena range; the `scoped_*` methods
+    // allocate through the already-rooted VM paths and immediately park the
+    // result, handing back a `Scoped` index handle that resolves through the
+    // arena on every read. A moving scavenge rewrites the parked slot in place,
+    // so a handle can never go stale — the ad-hoc `value_roots` threading these
+    // methods replace is no longer the caller's problem.
+
+    /// Open a handle scope, run `f`, then truncate the scope-handle arena back
+    /// to the length it had on entry.
+    ///
+    /// This is the sound path for native code that builds a JS value out of
+    /// several allocations. Every handle minted inside `f` (via the `scoped_*`
+    /// methods) is parked in a collector-traced arena, so a moving scavenge
+    /// driven by a later allocation rewrites the slot in place instead of
+    /// leaving a Rust local pointing at a vacated cell. A [`Scoped`] handle
+    /// borrows the `&HandleScope` token, not the context, so allocating calls
+    /// (`&mut self`) interleave freely with live handles, and its `'s` lifetime
+    /// pins it to the closure so none can escape.
+    ///
+    /// Read a handle back out with [`Self::escape`] for immediate hand-off to
+    /// the VM (a function return, or a store into an already-rooted object);
+    /// the raw `Value` it yields is valid only until the next allocation.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), otter_vm::NativeError> {
+    /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, Value};
+    ///
+    /// let mut interp = Interpreter::new();
+    /// let mut ctx = NativeCtx::new_with_call_info_and_context(
+    ///     &mut interp,
+    ///     NativeCallInfo::default_call(),
+    ///     None,
+    /// );
+    ///
+    /// let port: u16 = 8080;
+    /// let object_value = ctx.scope(|ctx, s| {
+    ///     let obj = ctx.scoped_object(s)?;
+    ///     let href = ctx.scoped_string(s, "http://localhost:8080/")?;
+    ///     ctx.scoped_set(s, obj, "href", href)?;
+    ///     let port_value = ctx.scoped_number(s, f64::from(port));
+    ///     ctx.scoped_set(s, obj, "port", port_value)?;
+    ///     Ok::<Value, otter_vm::NativeError>(ctx.escape(obj))
+    /// })?;
+    /// # let _ = object_value;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scope<R>(&mut self, f: impl FnOnce(&mut NativeCtx<'_>, &HandleScope) -> R) -> R {
+        let base = self.cx.interp.handle_arena_len();
+        let scope = HandleScope::new(base);
+        let r = f(self, &scope);
+        self.cx.interp.handle_arena_truncate(base);
+        r
+    }
+
+    /// Map an interpreter-side [`VmError`] onto the native error model, the way
+    /// the neighbouring native allocation helpers do.
+    fn scoped_error(&self, err: VmError, name: &'static str) -> NativeError {
+        native_function::vm_to_native_error(self.cx.interp, err, name)
+    }
+
+    /// Allocate a string and park it in scope `s`.
+    pub fn scoped_string<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        text: &str,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_string(s, text);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_string"))
+    }
+
+    /// Allocate an ordinary object with `%Object.prototype%` (the prototype a
+    /// `{}` literal resolves to) and park it in scope `s`.
+    pub fn scoped_object<'s>(&mut self, s: &'s HandleScope) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_object(s);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_object"))
+    }
+
+    /// Allocate a bare (null-prototype) object and park it in scope `s`.
+    pub fn scoped_object_bare<'s>(
+        &mut self,
+        s: &'s HandleScope,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_object_bare(s);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_object_bare"))
+    }
+
+    /// Allocate an array of `length` `len` (elements start as holes) and park
+    /// it in scope `s`. Fill it with [`Self::scoped_set_index`].
+    pub fn scoped_array<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        len: usize,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_array(s, len);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_array"))
+    }
+
+    /// Park an `f64` number in scope `s`. Numbers are NaN-boxed immediates, so
+    /// this never allocates and never fails; parking keeps number construction
+    /// reading like every other scoped creation.
+    #[must_use]
+    pub fn scoped_number<'s>(&mut self, s: &'s HandleScope, n: f64) -> Scoped<'s> {
+        self.cx.interp.scoped_number(s, n)
+    }
+
+    /// Park a boolean immediate in scope `s`.
+    #[must_use]
+    pub fn scoped_boolean<'s>(&mut self, s: &'s HandleScope, b: bool) -> Scoped<'s> {
+        self.cx.interp.scoped_boolean(s, b)
+    }
+
+    /// Park the `undefined` immediate in scope `s`.
+    #[must_use]
+    pub fn scoped_undefined<'s>(&mut self, s: &'s HandleScope) -> Scoped<'s> {
+        self.cx.interp.scoped_undefined(s)
+    }
+
+    /// Park the `null` immediate in scope `s`.
+    #[must_use]
+    pub fn scoped_null<'s>(&mut self, s: &'s HandleScope) -> Scoped<'s> {
+        self.cx.interp.scoped_null(s)
+    }
+
+    /// Root an incoming raw `Value` in scope `s` and hand back a handle to it.
+    /// Use this at the top of a native body to bring receiver/argument values
+    /// under scope management before the first allocation.
+    #[must_use]
+    pub fn scoped_value<'s>(&mut self, s: &'s HandleScope, value: Value) -> Scoped<'s> {
+        self.cx.interp.scoped_value(s, value)
+    }
+
+    /// Read property `key` from the object handle `obj` and park the result in
+    /// scope `s`. Both handles resolve through the arena at call time. Absent
+    /// properties read back as `undefined`.
+    pub fn scoped_get<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        obj: Scoped<'_>,
+        key: &str,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_get(s, obj, key);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_get"))
+    }
+
+    /// Write `value` to property `key` on the object handle `obj`, resolving
+    /// both handles through the arena at call time.
+    pub fn scoped_set(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        key: &str,
+        value: Scoped<'_>,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_set(s, obj, key, value);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set"))
+    }
+
+    /// Define data property `key` on the object handle `obj` with explicit
+    /// attribute `flags`, resolving both handles through the arena at call
+    /// time.
+    pub fn scoped_define_data(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        key: &str,
+        value: Scoped<'_>,
+        flags: object::PropertyFlags,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_define_data(s, obj, key, value, flags);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_define_data"))
+    }
+
+    /// Store `value` at array index `index` on the array handle `arr`,
+    /// resolving both handles through the arena at call time.
+    pub fn scoped_set_index(
+        &mut self,
+        s: &HandleScope,
+        arr: Scoped<'_>,
+        index: usize,
+        value: Scoped<'_>,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_set_index(s, arr, index, value);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set_index"))
+    }
+
+    /// Allocate a host-data object through the native root contract and park it
+    /// in scope `s`. The object is created null-prototype (as by
+    /// [`Self::alloc_host_object`]); install a prototype and methods afterwards
+    /// through the scope.
+    pub fn scoped_host_object<'s, T: object::HostObjectData>(
+        &mut self,
+        s: &'s HandleScope,
+        data: T,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let object = self.alloc_host_object(data)?;
+        Ok(self.cx.interp.scoped_value(s, Value::object(object)))
+    }
+
+    /// Read a handle as a Rust `String`, if it currently holds a JS string.
+    /// Non-allocating on the VM heap.
+    #[must_use]
+    pub fn scoped_as_str(&self, v: Scoped<'_>) -> Option<String> {
+        let raw = self.cx.interp.escape_scoped(v);
+        raw.as_string(self.heap())
+            .map(|s| s.to_lossy_string(self.heap()))
+    }
+
+    /// Read a handle as an `f64`, if it currently holds a number.
+    #[must_use]
+    pub fn scoped_as_f64(&self, v: Scoped<'_>) -> Option<f64> {
+        self.cx.interp.escape_scoped(v).as_f64()
+    }
+
+    /// Whether the handle currently holds `undefined`.
+    #[must_use]
+    pub fn scoped_is_undefined(&self, v: Scoped<'_>) -> bool {
+        self.cx.interp.escape_scoped(v).is_undefined()
+    }
+
+    /// Whether the handle currently holds `null`.
+    #[must_use]
+    pub fn scoped_is_null(&self, v: Scoped<'_>) -> bool {
+        self.cx.interp.escape_scoped(v).is_null()
+    }
+
+    /// Whether the handle currently holds an ordinary object.
+    #[must_use]
+    pub fn scoped_is_object(&self, v: Scoped<'_>) -> bool {
+        self.cx.interp.escape_scoped(v).as_object().is_some()
+    }
+
+    /// Read the current raw `Value` behind a scope handle for immediate
+    /// hand-off across the scope boundary — a function return to the VM, or a
+    /// store into an already-rooted object. The returned `Value` is valid only
+    /// until the next allocation; never hold it across one.
+    #[must_use]
+    pub fn escape(&self, v: Scoped<'_>) -> Value {
+        self.cx.interp.escape_scoped(v)
+    }
 }
 
 pub(crate) fn visit_native_roots(
@@ -1247,6 +1492,118 @@ mod tests {
             after > before,
             "Native AggregateError should allocate the error and errors array through root-aware young allocation"
         );
+    }
+
+    /// Build a nested value (`{ name, count, items: [1, "two"] }`) through
+    /// `NativeCtx::scope`, forcing a minor collection between every allocation
+    /// so each parked handle is relocated at least once, then read every field
+    /// back through the (rewritten) handles. Proves the native scoped surface
+    /// keeps sibling handles current across the moves that turn a raw held
+    /// offset stale.
+    #[test]
+    fn native_ctx_scope_builds_nested_value_across_minor_gc() {
+        let mut interp = Interpreter::new();
+        let mut ctx = NativeCtx::new(&mut interp);
+        let ok = ctx.scope(|ctx, s| {
+            let obj = ctx.scoped_object(s).unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+
+            let name = ctx.scoped_string(s, "otter").unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+            ctx.scoped_set(s, obj, "name", name).unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+
+            let count = ctx.scoped_number(s, 42.0);
+            ctx.scoped_set(s, obj, "count", count).unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+
+            let arr = ctx.scoped_array(s, 0).unwrap();
+            let e0 = ctx.scoped_number(s, 1.0);
+            ctx.scoped_set_index(s, arr, 0, e0).unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+            let e1 = ctx.scoped_string(s, "two").unwrap();
+            ctx.scoped_set_index(s, arr, 1, e1).unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+            ctx.scoped_set(s, obj, "items", arr).unwrap();
+            ctx.cx.interp.collect_minor_tracing_runtime_roots();
+
+            // Read every field back through the relocated object handle.
+            let name_read = ctx.scoped_get(s, obj, "name").unwrap();
+            assert_eq!(ctx.scoped_as_str(name_read).as_deref(), Some("otter"));
+
+            let count_read = ctx.scoped_get(s, obj, "count").unwrap();
+            assert_eq!(ctx.scoped_as_f64(count_read), Some(42.0));
+
+            let items_read = ctx.scoped_get(s, obj, "items").unwrap();
+            let items_value = ctx.escape(items_read);
+            let js_array = items_value.as_array().expect("items reads back as an array");
+            let (first, second, len) =
+                crate::array::with_elements(js_array, ctx.heap(), |els| {
+                    (els[0], els[1], els.len())
+                });
+            assert_eq!(len, 2);
+            assert_eq!(first.as_f64(), Some(1.0));
+            assert_eq!(
+                second
+                    .as_string(ctx.heap())
+                    .expect("element 1 is a string")
+                    .to_lossy_string(ctx.heap()),
+                "two"
+            );
+            true
+        });
+        assert!(ok);
+    }
+
+    /// A `%Object.prototype%`-proto'd object built inside `NativeCtx::scope`
+    /// must survive — and relocate under — a minor scavenge, with its stored
+    /// property still readable through the rewritten handle. The raw offset is
+    /// asserted to change so the test provably exercised a move (mirrors the
+    /// interpreter-level `scoped_object_survives_and_moves_under_minor_gc`).
+    #[test]
+    fn native_ctx_scoped_object_relocates_under_minor_gc() {
+        let mut interp = Interpreter::new();
+        let mut ctx = NativeCtx::new(&mut interp);
+        let (moved, content) = ctx.scope(|ctx, s| {
+            let obj = ctx.scoped_object(s).unwrap();
+            let value = ctx.scoped_string(s, "payload").unwrap();
+            ctx.scoped_set(s, obj, "k", value).unwrap();
+            let before = ctx
+                .escape(obj)
+                .as_raw_gc()
+                .expect("object is a heap cell")
+                .0;
+
+            // Churn young space and scavenge until the survivor is evacuated to
+            // the other semispace (its offset changes), proving the arena slot
+            // was rewritten in place rather than left dangling.
+            let mut after = before;
+            let mut moved = false;
+            for _ in 0..8 {
+                let _churn = ctx.scoped_object(s).unwrap();
+                ctx.cx.interp.collect_minor_tracing_runtime_roots();
+                after = ctx
+                    .escape(obj)
+                    .as_raw_gc()
+                    .expect("object still a heap cell after gc")
+                    .0;
+                if after != before {
+                    moved = true;
+                    break;
+                }
+            }
+            assert!(
+                moved,
+                "scoped object never relocated across a minor GC (before={before}, after={after}); \
+                 the move test did not exercise a relocation",
+            );
+
+            let read_back = ctx.scoped_get(s, obj, "k").unwrap();
+            let content = ctx.scoped_as_str(read_back).expect("property still a string");
+            (moved, content)
+        });
+        assert!(moved);
+        assert_eq!(content, "payload");
     }
 }
 

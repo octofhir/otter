@@ -45,6 +45,8 @@
 
 use std::marker::PhantomData;
 
+use otter_gc::raw::RawGc;
+
 use crate::{Interpreter, JsString, Value, VmError};
 
 /// Contiguous scope-handle storage. One per [`crate::Interpreter`].
@@ -56,7 +58,6 @@ pub struct HandleArena {
     slots: Vec<Value>,
 }
 
-#[allow(dead_code)]
 impl HandleArena {
     /// A fresh, empty arena.
     #[must_use]
@@ -109,19 +110,23 @@ impl HandleArena {
 ///
 /// Kept private-constructible so user code cannot forge one and hand a
 /// [`Scoped`] a range it does not own.
-#[allow(dead_code)]
 pub struct HandleScope {
+    // Read only by the test-only `base()` accessor today; the scope wrappers
+    // truncate from the `base` value they captured on entry, not the field.
+    #[allow(dead_code)]
     base: usize,
 }
 
-#[allow(dead_code)]
 impl HandleScope {
     /// Open a scope over the arena range starting at `base`.
     pub(crate) fn new(base: usize) -> Self {
         Self { base }
     }
 
-    /// The arena length captured when this scope opened.
+    /// The arena length captured when this scope opened. Test-only today: the
+    /// scope wrappers truncate from the `base` they captured directly, never
+    /// through the token.
+    #[allow(dead_code)]
     pub(crate) fn base(&self) -> usize {
         self.base
     }
@@ -133,13 +138,11 @@ impl HandleScope {
 /// lifetime pins it inside the [`HandleScope`] that created it, so it cannot
 /// escape the `with_handle_scope` closure and can never dangle.
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 pub struct Scoped<'s> {
     idx: u32,
     _scope: PhantomData<&'s HandleScope>,
 }
 
-#[allow(dead_code)]
 impl<'s> Scoped<'s> {
     /// Wrap an arena index as a handle pinned to scope `'s`.
     pub(crate) fn new(idx: u32) -> Self {
@@ -158,11 +161,9 @@ impl<'s> Scoped<'s> {
 /// Scope entry point and scoped allocation/access built on the arena.
 ///
 /// These are the surface VM-internal callers use to build JS values without
-/// hand-threading `value_roots`. They are consumed by the native-context
-/// surface and interpreter-internal adoption; the `#[allow(dead_code)]` covers
-/// the window before those callers land, keeping the core landable with its
-/// own test coverage.
-#[allow(dead_code)]
+/// hand-threading `value_roots`. They back the native-context surface
+/// ([`crate::NativeCtx::scope`] and its `scoped_*` methods) and
+/// interpreter-internal adoption.
 impl Interpreter {
     /// Open a handle scope, run `f`, then truncate the arena back to the length
     /// it had on entry.
@@ -173,6 +174,11 @@ impl Interpreter {
     /// none can escape. Truncation happens before the closure's result is
     /// returned; an early `?` inside `f` propagates through the returned `R`,
     /// so the truncation still runs on the normal return path here.
+    ///
+    /// The interpreter-internal callers of this variant land with the reflection
+    /// rewrites; today the native-context [`crate::NativeCtx::scope`] wrapper is
+    /// the live entry point and this one is exercised only by the module tests.
+    #[allow(dead_code)]
     pub(crate) fn with_handle_scope<R>(
         &mut self,
         f: impl FnOnce(&mut Interpreter, &HandleScope) -> R,
@@ -205,7 +211,8 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::string(string)))
     }
 
-    /// Allocate a bare (null-prototype) object and park it in the current
+    /// Allocate an ordinary object with `%Object.prototype%` installed (the
+    /// prototype an object-literal `{}` resolves to) and park it in the current
     /// scope. The allocation snapshots the runtime roots (including the arena),
     /// so prior handles survive any collection it drives.
     pub(crate) fn scoped_object<'s>(
@@ -213,7 +220,80 @@ impl Interpreter {
         scope: &'s HandleScope,
     ) -> Result<Scoped<'s>, VmError> {
         let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        // Install the prototype only after the allocation: the object alloc can
+        // drive a scavenge that relocates the realm prototype while it is still
+        // young, so reading the handle beforehand could bake a stale offset
+        // (mirrors `run_new_object_reg`). The realm-intrinsic table is always
+        // traced, so a post-alloc read yields the relocated handle.
+        if let Some(proto) = self.object_prototype_object_opt() {
+            crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
+        }
         Ok(self.scoped_value(scope, Value::object(object)))
+    }
+
+    /// Allocate a bare (null-prototype) object and park it in the current
+    /// scope. Same rooting contract as [`Self::scoped_object`], without the
+    /// prototype install.
+    pub(crate) fn scoped_object_bare<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+    ) -> Result<Scoped<'s>, VmError> {
+        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        Ok(self.scoped_value(scope, Value::object(object)))
+    }
+
+    /// Allocate an array whose `length` is `len` (elements start as holes) and
+    /// park it in the current scope. The runtime-root snapshot keeps prior
+    /// handles live across the allocation and the length reservation.
+    pub(crate) fn scoped_array<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        len: usize,
+    ) -> Result<Scoped<'s>, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let array =
+            crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
+                .map_err(VmError::from)?;
+        // Park before growing so the handle survives any allocation the length
+        // reservation drives; then resolve the (possibly relocated) handle from
+        // the arena to set the length.
+        let handle = self.scoped_value(scope, Value::array(array));
+        if len > 0 {
+            let array = self
+                .handle_arena
+                .get(handle.index())
+                .as_array()
+                .ok_or(VmError::TypeMismatch)?;
+            crate::array::set_length(array, &mut self.gc_heap, len).map_err(VmError::from)?;
+        }
+        Ok(handle)
+    }
+
+    /// Park an `f64` number in the current scope. Numbers are NaN-boxed
+    /// immediates, so this never allocates; it exists so number construction
+    /// reads the same as every other scoped creation.
+    pub(crate) fn scoped_number<'s>(&mut self, scope: &'s HandleScope, n: f64) -> Scoped<'s> {
+        self.scoped_value(scope, Value::number_f64(n))
+    }
+
+    /// Park a boolean immediate in the current scope.
+    pub(crate) fn scoped_boolean<'s>(&mut self, scope: &'s HandleScope, b: bool) -> Scoped<'s> {
+        self.scoped_value(scope, Value::boolean(b))
+    }
+
+    /// Park the `undefined` immediate in the current scope.
+    pub(crate) fn scoped_undefined<'s>(&mut self, scope: &'s HandleScope) -> Scoped<'s> {
+        self.scoped_value(scope, Value::undefined())
+    }
+
+    /// Park the `null` immediate in the current scope.
+    pub(crate) fn scoped_null<'s>(&mut self, scope: &'s HandleScope) -> Scoped<'s> {
+        self.scoped_value(scope, Value::null())
     }
 
     /// Read property `key` from the object handle `obj`, resolving `obj`
@@ -256,6 +336,78 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Define data property `key` on the object handle `obj` with explicit
+    /// attribute `flags`, resolving both handles through the arena at call
+    /// time. A rejected define (non-extensible object, non-configurable
+    /// redefinition) surfaces as [`VmError::TypeMismatch`].
+    pub(crate) fn scoped_define_data(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        key: &str,
+        value: Scoped<'_>,
+        flags: crate::object::PropertyFlags,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let stored = self.handle_arena.get(value.index());
+        let descriptor = crate::object::PropertyDescriptor {
+            kind: crate::object::DescriptorKind::Data { value: stored },
+            flags,
+        };
+        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch)
+        }
+    }
+
+    /// Store `value` at array index `index` on the array handle `arr`,
+    /// resolving both handles through the arena at call time. The array shell
+    /// keeps its identity across the store, so the collector-tracked arena slot
+    /// stays current without a re-park.
+    pub(crate) fn scoped_set_index(
+        &mut self,
+        _scope: &HandleScope,
+        arr: Scoped<'_>,
+        index: usize,
+        value: Scoped<'_>,
+    ) -> Result<(), VmError> {
+        let array = self
+            .handle_arena
+            .get(arr.index())
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        let stored = self.handle_arena.get(value.index());
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        crate::array::set_with_roots(array, &mut self.gc_heap, index, stored, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    /// Current scope-handle arena length — the truncation base a fresh scope
+    /// captures on entry. Used by the native-context [`crate::NativeCtx::scope`]
+    /// wrapper, which opens and closes a scope without threading through
+    /// [`Self::with_handle_scope`] (its closure hands back the interpreter, not
+    /// the native context).
+    pub(crate) fn handle_arena_len(&self) -> usize {
+        self.handle_arena.len()
+    }
+
+    /// Truncate the scope-handle arena back to `base`, dropping every slot a
+    /// scope opened. Paired with [`Self::handle_arena_len`] by the native-context
+    /// scope wrapper.
+    pub(crate) fn handle_arena_truncate(&mut self, base: usize) {
+        self.handle_arena.truncate(base);
+    }
+
     /// Read the current raw `Value` behind a scope handle for immediate
     /// hand-off across the scope boundary (returning to the VM, or storing into
     /// an already-rooted object). Valid until the next allocation.
@@ -274,7 +426,10 @@ impl Interpreter {
     /// Force a minor collection while tracing the full runtime root set
     /// (including the handle arena), mirroring the host-side snapshot path so
     /// tests can drive a relocation with handles live.
-    fn collect_minor_tracing_runtime_roots(&mut self) {
+    ///
+    /// `pub(crate)` so the native-context test module can drive a scavenge from
+    /// inside a `NativeCtx::scope` closure with handles live.
+    pub(crate) fn collect_minor_tracing_runtime_roots(&mut self) {
         let roots = self.collect_runtime_roots();
         self.gc_heap.collect_minor_with_roots(&mut |visitor| {
             for &slot in &roots {

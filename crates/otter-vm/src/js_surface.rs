@@ -270,6 +270,15 @@ fn native_from_call_with_raw_roots(
 }
 
 /// Mutator-bound builder for an ordinary object.
+///
+/// This builder roots only the single value being stored on each call, so a
+/// caller that holds sibling values in raw `Value` locals across builder calls
+/// can still see them go stale under a moving collection. For native code that
+/// assembles a value out of several allocations, prefer
+/// [`crate::NativeCtx::scope`] and its `scoped_*` methods: every intermediate
+/// handle is parked in the collector-traced handle arena, so none can dangle.
+/// (Rebuilding this builder's internals on top of scoped handles is a separate
+/// step.)
 pub struct ObjectBuilder<'rt> {
     heap: &'rt mut otter_gc::GcHeap,
     object: JsObject,

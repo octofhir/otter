@@ -298,6 +298,10 @@ across an allocation outside sound-but-boilerplate `*_with_roots` code.**
   nothing) is deleted; its last non-list caller, the `Object.entries` pair
   loop, is rewritten to park every property value + built pair in the arena
   and build through the prototype-override-aware allocator.
+- `object_statics.rs` context-less `Object.entries` twin (indirect calls:
+  `(Object.entries)(o)`, `Reflect.apply`) — same scoped rewrite: receiver +
+  property values + built pairs parked in the arena; the unrooted
+  `string_value` helper is deleted with it.
 - `error_ops.rs` system-error / node-`code` construction — the error object is
   parked in a handle scope; each message / code / `info` string is built and
   written through the arena, and the refreshed object handle escapes for the

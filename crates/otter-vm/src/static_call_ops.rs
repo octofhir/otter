@@ -988,7 +988,13 @@ impl Interpreter {
                 if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
                     object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
                 }
-                let result_root = Value::object(result);
+                // `result_root` is the value the rooted calls below rewrite in
+                // place when a collection moves the result object. `result` is
+                // a plain copy that goes stale at the same moment, so every
+                // mutation below must re-read the object from `result_root`
+                // first (and re-sync `result_root` after a `set` that can
+                // itself trigger a moving collection, e.g. number boxing).
+                let mut result_root = Value::object(result);
                 let Some(target) = args.first() else {
                     return Err(self.err_type(
                         ("Object.getOwnPropertyDescriptors called on null or undefined"
@@ -1030,7 +1036,9 @@ impl Interpreter {
                             &[args],
                         )?;
                         let desc_value = Value::object(desc_obj);
+                        result = result_root.as_object().expect("result stays an object");
                         object::set(&mut result, &mut self.gc_heap, &key, desc_value);
+                        result_root = Value::object(result);
                     }
                     let length_desc = crate::object::PropertyDescriptor::data(
                         Value::number_f64(units.len() as f64),
@@ -1045,7 +1053,9 @@ impl Interpreter {
                         &[args],
                     )?;
                     let length_value = Value::object(length_obj);
+                    result = result_root.as_object().expect("result stays an object");
                     object::set(&mut result, &mut self.gc_heap, "length", length_value);
+                    result_root = Value::object(result);
                 } else if own_property_descriptors_uses_internal_methods(target) {
                     // §20.1.2.10.1 step 3 — drive the spec
                     // ladder via `own_property_keys_value`, then
@@ -1081,9 +1091,11 @@ impl Interpreter {
                         )?;
                         let current_key = keys[index];
                         let desc_value = Value::object(desc_obj);
+                        result = result_root.as_object().expect("result stays an object");
                         if let Some(s) = current_key.as_string(&self.gc_heap) {
                             let key_string = s.to_lossy_string(&self.gc_heap);
                             object::set(&mut result, &mut self.gc_heap, &key_string, desc_value);
+                            result_root = Value::object(result);
                         } else if let Some(sym) = current_key.as_symbol(&self.gc_heap)
                             && !object::set_symbol(
                                 result,
@@ -1098,7 +1110,7 @@ impl Interpreter {
                 } else {
                     return Err(VmError::TypeMismatch);
                 }
-                Ok(Some(Value::object(result)))
+                Ok(Some(result_root))
             }
             M::GetOwnPropertyNames => {
                 let Some(target) = args.first() else {

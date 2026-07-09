@@ -1055,7 +1055,16 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 heap: &mut ::otter_gc::GcHeap,
                 global: ::otter_vm::JsObject,
             ) -> ::core::result::Result<(), ::otter_vm::JsSurfaceError> {
-                let global_root = ::otter_vm::Value::object(global);
+                let mut global_root = ::otter_vm::Value::object(global);
+                let mut global_scope = ::otter_gc::RootScope::new(heap);
+                // SAFETY: `global_root` was declared before the scope and both
+                // remain live until the generated installer returns.
+                unsafe {
+                    ::otter_vm::rooting::RootScopeExt::add_value(
+                        &mut global_scope,
+                        &mut global_root,
+                    );
+                }
 
                 // Generated specs only ever carry `NativeCall::Static`;
                 // every other variant is unreachable inside macro
@@ -1084,7 +1093,17 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 // relocated) constructor: it is threaded into every allocation
                 // below, so the collector keeps it current, and each raw-handle
                 // use re-resolves through it rather than reading a stale offset.
-                let ctor_value = ::otter_vm::Value::native_function(ctor);
+                let mut ctor_value = ::otter_vm::Value::native_function(ctor);
+                let mut ctor_scope = ::otter_gc::RootScope::new(heap);
+                // SAFETY: `ctor_value` was declared before the scope. This is
+                // the canonical constructor slot for the complete install;
+                // hidden allocations inside property definitions rewrite it.
+                unsafe {
+                    ::otter_vm::rooting::RootScopeExt::add_value(
+                        &mut ctor_scope,
+                        &mut ctor_value,
+                    );
+                }
                 #ctor_parent_link
 
                 for method_spec in #spec_ident.static_methods.iter() {
@@ -1173,7 +1192,16 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     )
                     .map_err(::otter_vm::JsSurfaceError::from)?;
                     #prototype_parent_link
-                    let prototype_value = ::otter_vm::Value::object(prototype);
+                    let mut prototype_value = ::otter_vm::Value::object(prototype);
+                    let mut prototype_scope = ::otter_gc::RootScope::new(heap);
+                    // SAFETY: `prototype_value` was declared before the scope
+                    // and stays live through every generated prototype write.
+                    unsafe {
+                        ::otter_vm::rooting::RootScopeExt::add_value(
+                            &mut prototype_scope,
+                            &mut prototype_value,
+                        );
+                    }
 
                     for method_spec in #spec_ident.prototype_methods.iter() {
                         let fn_obj = ::otter_vm::bootstrap::native_from_call_with_value_roots(

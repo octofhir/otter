@@ -47,7 +47,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
         Value::promise(promise),
     );
     let _ = retained;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "promise")
@@ -64,7 +64,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
 #[test]
 fn deep_promise_chain_is_reaped_when_unrooted() {
     let mut interp = Interpreter::new();
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline = live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG);
 
     let mut current = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
@@ -85,7 +85,7 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
         "promise chain setup must allocate pure promise bodies"
     );
     let _ = current;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert_eq!(
         live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG),
         baseline,
@@ -107,7 +107,7 @@ fn pending_promise_microtask_payload_roots_until_drained() {
     });
 
     let _ = payload;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let _ = interp
         .microtasks_mut()
@@ -150,7 +150,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
     let _ = object;
     let _ = array;
     let _ = iter;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "iter").expect("iter");
@@ -182,7 +182,7 @@ fn generator_and_parked_frame_roots_register_values() {
     );
 
     let _ = object;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let mut global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "generator")
         .expect("generator root survives force_gc");
@@ -217,7 +217,7 @@ fn generator_and_parked_frame_roots_register_values() {
     );
 
     let _ = parked_object;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "awaitPromise")
         .expect("await promise root survives force_gc");
@@ -236,7 +236,7 @@ fn generator_and_parked_frame_roots_register_values() {
 #[test]
 fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     let mut interp = Interpreter::new();
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let promise_baseline = live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG);
     let iter_baseline = live_bytes(&mut interp, ITERATOR_STATE_TYPE_TAG);
     let gen_baseline = live_bytes(&mut interp, GENERATOR_BODY_TYPE_TAG);
@@ -267,7 +267,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     let _ = promise;
     let _ = iter;
     let _ = generator;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     assert_eq!(
         live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG),

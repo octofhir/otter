@@ -53,7 +53,8 @@ fn insertion_barrier_saves_white_child_published_mid_cycle() {
     // Only `a` is reachable from a root.
     let _root_a = scope.local(a);
 
-    heap.start_incremental_mark_phase(&mut |_| {});
+    heap.start_incremental_mark_phase(&mut |_| {})
+        .expect("start mark");
     assert!(heap.marking().is_marking());
 
     // Drain any gray work — `a` came in gray; `b` and `c` are
@@ -107,7 +108,8 @@ fn incremental_step_respects_budget() {
     let head = tail;
     let _root = scope.local(head);
 
-    heap.start_incremental_mark_phase(&mut |_| {});
+    heap.start_incremental_mark_phase(&mut |_| {})
+        .expect("start mark");
 
     // Budgeted steps must each process at most `budget` headers
     // and the total must reach the chain length (root + chain).
@@ -145,7 +147,7 @@ fn convenience_mark_phase_matches_split_path() {
     let _root = scope.local(a);
     let _orphan = heap.alloc_old(Cell { next: Gc::null() }).unwrap();
 
-    heap.mark_phase(&mut |_| {});
+    heap.mark_phase(&mut |_| {}).expect("mark phase");
     assert!(heap.is_marked(a.raw()));
     heap.sweep_phase();
     assert!(!heap.marking().is_marking());

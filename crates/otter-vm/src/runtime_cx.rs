@@ -311,28 +311,6 @@ impl<'rt> NativeCtx<'rt> {
         self.alloc_object_with_roots(&[], &[])
     }
 
-    /// Park `value` on the interpreter's GC-traced scratch root stack and return
-    /// its index. Host helpers that hold a JS handle across a re-entrant call
-    /// (`run_callable_sync`, a nested allocation) must park it here, then read
-    /// the relocated handle back via [`Self::scratch_root`] before reusing it,
-    /// because a bare local is not a GC root and a moving scavenge during the
-    /// call would leave it pointing at the value's vacated slot.
-    pub fn push_scratch_root(&mut self, value: Value) -> usize {
-        self.cx.interp.json_root_push(value)
-    }
-
-    /// Read the (possibly relocated) value parked at `idx`.
-    #[must_use]
-    pub fn scratch_root(&self, idx: usize) -> Value {
-        self.cx.interp.json_root_get(idx)
-    }
-
-    /// Pop the scratch root stack back down to `idx` (the value
-    /// [`Self::push_scratch_root`] returned).
-    pub fn pop_scratch_root_to(&mut self, idx: usize) {
-        self.cx.interp.json_root_pop_to(idx);
-    }
-
     /// Insert a generic persistent root for a host-owned resource.
     pub fn persistent_root_insert(&mut self, value: Value) -> crate::PersistentRootId {
         self.cx.interp.persistent_root_insert(value)
@@ -350,7 +328,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate an ordinary object while keeping additional local values alive.
-    pub fn alloc_object_with_roots(
+    pub(crate) fn alloc_object_with_roots(
         &mut self,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -442,7 +420,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate a host-data object while keeping additional local values alive.
-    pub fn alloc_host_object_with_roots<T: object::HostObjectData>(
+    pub(crate) fn alloc_host_object_with_roots<T: object::HostObjectData>(
         &mut self,
         data: T,
         value_roots: &[&Value],
@@ -471,7 +449,39 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate a captured native function through the native root contract.
-    pub fn native_value_with_captures<F>(
+    ///
+    /// Captures are traced automatically. Code that must keep other temporary
+    /// JS values alive across this allocation should use [`Self::scope`] and
+    /// park them as [`Scoped`] handles instead of threading root slices.
+    pub fn native_value<F>(
+        &mut self,
+        name: &'static str,
+        captures: smallvec::SmallVec<[Value; 4]>,
+        call: F,
+    ) -> Result<Value, otter_gc::OutOfMemory>
+    where
+        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
+        };
+        native_function::native_value_with_captures_and_roots(
+            self.heap_mut(),
+            name,
+            captures,
+            &mut external_visit,
+            call,
+        )
+    }
+
+    /// VM-internal captured native allocation with additional transient roots.
+    pub(crate) fn native_value_with_captures<F>(
         &mut self,
         name: &'static str,
         captures: smallvec::SmallVec<[Value; 4]>,
@@ -510,7 +520,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate a pre-fulfilled promise through the native root contract.
-    pub fn fulfilled_promise_with_roots(
+    pub(crate) fn fulfilled_promise_with_roots(
         &mut self,
         value: Value,
         value_roots: &[&Value],
@@ -609,7 +619,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate a `WeakRef` body through the native root contract.
-    pub fn alloc_weak_ref(
+    pub(crate) fn alloc_weak_ref(
         &mut self,
         target: &Value,
         value_roots: &[&Value],
@@ -632,7 +642,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate a `FinalizationRegistry` body through the native root contract.
-    pub fn alloc_finalization_registry(
+    pub(crate) fn alloc_finalization_registry(
         &mut self,
         cleanup_callback: Value,
         cleanup_context: Option<ExecutionContext>,
@@ -772,7 +782,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate an array while keeping additional local values alive.
-    pub fn array_from_elements_with_roots<I>(
+    pub(crate) fn array_from_elements_with_roots<I>(
         &mut self,
         elements: I,
         value_roots: &[&Value],
@@ -807,7 +817,7 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Allocate a zero-filled fixed-length `ArrayBuffer` through the native
     /// root contract.
-    pub fn alloc_array_buffer_zeroed(
+    pub(crate) fn alloc_array_buffer_zeroed(
         &mut self,
         len: usize,
         value_roots: &[&Value],
@@ -897,7 +907,7 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Allocate iterator state through the native root contract.
-    pub fn alloc_iterator_state(
+    pub(crate) fn alloc_iterator_state(
         &mut self,
         state: IteratorState,
         value_roots: &[&Value],
@@ -999,10 +1009,20 @@ impl<'rt> NativeCtx<'rt> {
         }
     }
 
-    /// Allocate a fixed-length `ArrayBuffer` backing store, keeping the
-    /// receiver, call arguments, and caller-supplied roots reachable
-    /// across the reservation.
-    pub fn array_buffer_from_bytes_rooted(
+    /// Allocate a fixed-length `ArrayBuffer` backing store.
+    ///
+    /// Receiver, call arguments, runtime state, and the owned input buffer are
+    /// rooted/accounted automatically. Multi-allocation callers keep any
+    /// additional JS temporaries in [`Self::scope`].
+    pub fn array_buffer_from_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<crate::binary::JsArrayBuffer, otter_gc::OutOfMemory> {
+        self.array_buffer_from_bytes_rooted(bytes, &[], &[])
+    }
+
+    /// VM-internal variant for algorithms that have not yet adopted handles.
+    pub(crate) fn array_buffer_from_bytes_rooted(
         &mut self,
         bytes: Vec<u8>,
         value_roots: &[&Value],
@@ -1030,7 +1050,7 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Allocate a resizable `ArrayBuffer` backing store under the same
     /// root contract as [`Self::array_buffer_from_bytes_rooted`].
-    pub fn array_buffer_resizable_rooted(
+    pub(crate) fn array_buffer_resizable_rooted(
         &mut self,
         len: usize,
         max_byte_length: usize,
@@ -1104,8 +1124,8 @@ impl<'rt> NativeCtx<'rt> {
     // so a handle can never go stale — the ad-hoc `value_roots` threading these
     // methods replace is no longer the caller's problem.
 
-    /// Open a handle scope, run `f`, then truncate the scope-handle arena back
-    /// to the length it had on entry.
+    /// Open a handle scope, run `f`, then restore its arena and root-provider
+    /// depths on ordinary return or panic.
     ///
     /// This is the sound path for native code that builds a JS value out of
     /// several allocations. Every handle minted inside `f` (via the `scoped_*`
@@ -1145,18 +1165,9 @@ impl<'rt> NativeCtx<'rt> {
     /// # }
     /// ```
     pub fn scope<R>(&mut self, f: impl FnOnce(&mut NativeCtx<'_>, &HandleScope) -> R) -> R {
-        let base = self.cx.interp.handle_arena_len();
-        let scope = HandleScope::new(base);
-        // Host-side native calls (module init, timer/worker dispatch) run without
-        // the dispatch loop's extra-roots provider. Register the runtime root set
-        // — which traces the handle arena — for the scope so a wide-number box
-        // allocated inside a scoped write cannot strand a sibling handle. No-op
-        // (and free) under dispatch, where a provider is already installed.
-        let roots_depth = self.cx.interp.push_scope_runtime_roots();
-        let r = f(self, &scope);
-        self.cx.interp.pop_scope_runtime_roots(roots_depth);
-        self.cx.interp.handle_arena_truncate(base);
-        r
+        let frame = crate::handles::HandleScopeFrame::enter(self.cx.interp);
+        let scope = frame.token();
+        f(self, &scope)
     }
 
     /// Map an interpreter-side [`VmError`] onto the native error model, the way
@@ -1352,6 +1363,28 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<Scoped<'s>, NativeError> {
         let result = self.cx.interp.scoped_native_static(s, name, length, call);
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_native_method"))
+    }
+
+    /// Allocate a native callable from an already-classified call target and
+    /// park it in scope `s`.
+    ///
+    /// Runtime bootstrap code uses this for dynamic `Arc<NativeFn>` methods;
+    /// ordinary static surface declarations should prefer
+    /// [`Self::scoped_native_method`]. Runtime roots and every previously
+    /// parked handle are traced automatically.
+    pub fn scoped_native_call<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        name: &'static str,
+        length: u8,
+        call: crate::NativeCall,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self
+            .cx
+            .interp
+            .native_function_from_call_host_rooted(name, length, call, &[], &[])
+            .map(|value| self.cx.interp.scoped_value(s, value));
+        result.map_err(|err| self.scoped_error(VmError::from(err), "NativeCtx::scoped_native_call"))
     }
 
     /// Read a handle as a Rust `String`, if it currently holds a JS string.

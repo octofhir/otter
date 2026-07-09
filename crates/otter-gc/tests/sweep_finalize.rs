@@ -72,7 +72,7 @@ fn sweep_invokes_safe_finalize_for_dead_bodies() {
     // root → dead at the next full GC sweep.
     let _dead = heap.alloc_old(RegisteredFinalizerBody).unwrap();
 
-    heap.collect_full(&mut |_| {});
+    heap.collect_full(&mut |_| {}).expect("full GC");
 
     let observed = FINALIZE_COUNT_REGISTERED.load(Ordering::SeqCst);
     assert_eq!(
@@ -94,7 +94,7 @@ fn unregistered_body_skips_finalize_dispatch() {
     // `register_finalize::<UnregisteredFinalizerBody>()`
 
     let _dead = heap.alloc_old(UnregisteredFinalizerBody).unwrap();
-    heap.collect_full(&mut |_| {});
+    heap.collect_full(&mut |_| {}).expect("full GC");
 
     assert_eq!(
         FINALIZE_COUNT_UNREGISTERED.load(Ordering::SeqCst),
@@ -112,7 +112,7 @@ fn scavenge_invokes_safe_finalize_for_dead_young_bodies() {
     heap.register_finalize::<YoungFinalizerBody>();
     let _dead = heap.alloc(YoungFinalizerBody).unwrap();
 
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     assert_eq!(FINALIZE_COUNT_YOUNG.load(Ordering::SeqCst), 1);
 }

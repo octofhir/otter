@@ -41,7 +41,7 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
     let _ = bound_this;
     let _ = arg;
     let _ = bound;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global, interp.gc_heap(), "__gc_bound_function")
         .expect("bound function survives");
@@ -75,7 +75,7 @@ fn native_function_captures_root_gc_values_when_rooted() {
     );
 
     let _ = captured;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global, interp.gc_heap(), "__gc_native_function")
         .expect("native function survives");
@@ -104,7 +104,7 @@ fn regexp_body_survives_force_gc_when_rooted() {
         Value::regexp(re),
     );
     let _ = re;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted =
         crate::object::get(global, interp.gc_heap(), "__gc_regexp").expect("regexp survives");
@@ -123,7 +123,7 @@ fn regexp_body_survives_force_gc_when_rooted() {
 #[test]
 fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     let mut interp = Interpreter::new();
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let object_baseline = live_bytes(&mut interp, OBJECT_BODY_TYPE_TAG);
     let bound_baseline = live_bytes(&mut interp, BOUND_FUNCTION_BODY_TYPE_TAG);
     let native_baseline = live_bytes(&mut interp, NATIVE_FUNCTION_BODY_TYPE_TAG);
@@ -176,7 +176,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     let _ = native_object;
     let _ = regexp_object;
     let _ = re;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     assert!(live_bytes(&mut interp, BOUND_FUNCTION_BODY_TYPE_TAG) <= bound_baseline);
     assert!(live_bytes(&mut interp, NATIVE_FUNCTION_BODY_TYPE_TAG) <= native_baseline);

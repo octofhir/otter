@@ -25,7 +25,7 @@ use sysinfo::{ProcessesToUpdate, System};
 
 use crate::{
     CapabilityRequest, CapabilitySet, DiagnosticCode, OtterError, RuntimeCapability,
-    default_check_capability, gc_oom_to_error, string_oom_to_error,
+    default_check_capability,
 };
 
 pub(crate) fn default_argv() -> Vec<String> {
@@ -45,295 +45,184 @@ pub(crate) fn install_global(
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
-    let mut process = interp
-        .alloc_host_object_with_roots(&[], &[])
-        .map_err(gc_oom_to_error)?;
-    let process_root = Value::object(process);
-    let process_tag = JsString::from_str("process", interp.gc_heap_mut())
-        .map(Value::string)
-        .map_err(string_oom_to_error)?;
-    let tag_sym = interp
-        .well_known_symbols()
-        .get(otter_vm::symbol::WellKnown::ToStringTag);
-    otter_vm::object::define_own_symbol_property_partial(
-        process,
-        interp.gc_heap_mut(),
-        tag_sym,
-        otter_vm::object::PartialPropertyDescriptor {
-            value: Some(process_tag),
-            writable: Some(false),
-            enumerable: Some(false),
-            configurable: Some(true),
-            ..Default::default()
-        },
-    );
-    let argv_values = process_argv
-        .iter()
-        .map(|arg| {
-            JsString::from_str(arg, interp.gc_heap_mut())
-                .map(otter_vm::Value::string)
-                .map_err(string_oom_to_error)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let argv = interp
-        .array_from_elements_host_rooted(
-            argv_values.iter().cloned(),
-            &[&process_root],
-            &[&argv_values],
-        )
-        .map_err(gc_oom_to_error)?;
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "argv",
-        otter_vm::Value::array(argv),
-    );
-
-    let exec_argv = interp
-        .array_from_elements_host_rooted([], &[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "execArgv",
-        otter_vm::Value::array(exec_argv),
-    );
-
-    let argv0 = process_argv.first().map(String::as_str).unwrap_or("otter");
-    let argv0 = string_value(interp, argv0)?;
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "argv0", argv0);
-
-    let exec_path = string_value(interp, &snapshot.exec_path)?;
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "execPath", exec_path);
-
-    let platform = string_value(interp, node_platform())?;
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "platform", platform);
-
-    let arch = string_value(interp, node_arch())?;
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "arch", arch);
-
-    let version = string_value(interp, concat!("v", env!("CARGO_PKG_VERSION")))?;
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "version", version);
-
-    let mut versions = interp
-        .alloc_host_object_with_roots(&[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    let otter_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
-    otter_vm::object::set(&mut versions, interp.gc_heap_mut(), "otter", otter_version);
-    let node_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
-    otter_vm::object::set(&mut versions, interp.gc_heap_mut(), "node", node_version);
-    // The crypto subset (hashing / HMAC / CSPRNG) is available, so advertise an
-    // OpenSSL version — the test harness gates `hasCrypto` on `versions.openssl`.
-    let openssl_version = string_value(interp, "3.0.0")?;
-    otter_vm::object::set(
-        &mut versions,
-        interp.gc_heap_mut(),
-        "openssl",
-        openssl_version,
-    );
-    let v8_version = string_value(interp, "12.0.0")?;
-    otter_vm::object::set(&mut versions, interp.gc_heap_mut(), "v8", v8_version);
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "versions",
-        otter_vm::Value::object(versions),
-    );
-
-    let mut release = interp
-        .alloc_host_object_with_roots(&[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    let release_name = string_value(interp, "node")?;
-    otter_vm::object::set(&mut release, interp.gc_heap_mut(), "name", release_name);
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "release",
-        otter_vm::Value::object(release),
-    );
-
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "pid",
-        Value::number(NumberValue::from_i32(pid_to_i32(snapshot.pid))),
-    );
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "ppid",
-        Value::number(NumberValue::from_i32(pid_to_i32(
-            snapshot.ppid.unwrap_or(0),
-        ))),
-    );
-
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "exitCode",
-        otter_vm::Value::undefined(),
-    );
-
-    let mut env = interp
-        .alloc_host_object_with_roots(&[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    for (name, value) in std::env::vars() {
-        if !default_check_capability(
-            capabilities,
-            RuntimeCapability::Env,
-            &CapabilityRequest::EnvVar(&name),
-        ) {
-            continue;
-        }
-        let value = JsString::from_str(&value, interp.gc_heap_mut())
-            .map(otter_vm::Value::string)
-            .map_err(string_oom_to_error)?;
-        otter_vm::object::set(&mut env, interp.gc_heap_mut(), &name, value);
-    }
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "env",
-        otter_vm::Value::object(env),
-    );
-
-    define_process_method(
+    let mut ctx = NativeCtx::new_with_call_info_and_context(
         interp,
-        process,
-        &process_root,
-        "cwd",
-        0,
-        cwd_call(process_cwd.to_string_lossy().to_string()),
-    )?;
-    define_process_method(
-        interp,
-        process,
-        &process_root,
-        "exit",
-        1,
-        NativeCall::Static(process_exit),
-    )?;
-    define_process_method(
-        interp,
-        process,
-        &process_root,
-        "nextTick",
-        1,
-        NativeCall::Static(process_next_tick),
-    )?;
-    define_process_method(
-        interp,
-        process,
-        &process_root,
-        "uptime",
-        0,
-        uptime_call(start, uptime_base_secs),
-    )?;
-    define_process_method(
-        interp,
-        process,
-        &process_root,
-        "memoryUsage",
-        0,
-        NativeCall::Static(process_memory_usage),
-    )?;
-    let hrtime = hrtime_value(interp, start).map_err(gc_oom_to_error)?;
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), "hrtime", hrtime);
+        otter_vm::NativeCallInfo::default_call(),
+        None,
+    );
+    let result: Result<(), NativeError> = ctx.scope(|ctx, scope| {
+        let process = ctx.scoped_object_bare(scope)?;
 
-    install_stdio_streams(interp, process, &process_root)?;
-
-    define_process_method(
-        interp,
-        process,
-        &process_root,
-        "umask",
-        1,
-        NativeCall::Static(process_umask),
-    )?;
-
-    // Minimal EventEmitter surface so harness/test code that registers process
-    // event listeners loads. TODO: real event dispatch (exit/uncaughtException).
-    for name in [
-        "on",
-        "once",
-        "off",
-        "addListener",
-        "removeListener",
-        "prependListener",
-        "prependOnceListener",
-        "removeAllListeners",
-        "emit",
-        "listenerCount",
-        "listeners",
-        "setMaxListeners",
-    ] {
-        define_process_method(
-            interp,
+        let process_tag = ctx.scoped_string(scope, "process")?;
+        let tag_sym = ctx
+            .interp_mut()
+            .well_known_symbols()
+            .get(otter_vm::symbol::WellKnown::ToStringTag);
+        let tag_sym = ctx.scoped_value(scope, Value::symbol(tag_sym));
+        ctx.scoped_define_symbol(
+            scope,
             process,
-            &process_root,
-            name,
-            1,
-            NativeCall::Static(process_event_noop),
+            tag_sym,
+            process_tag,
+            Attr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            }
+            .to_flags(),
         )?;
+
+        let argv = ctx.scoped_array(scope, process_argv.len())?;
+        for (index, arg) in process_argv.iter().enumerate() {
+            let arg = ctx.scoped_string(scope, arg)?;
+            ctx.scoped_set_index(scope, argv, index, arg)?;
+        }
+        ctx.scoped_set(scope, process, "argv", argv)?;
+        let exec_argv = ctx.scoped_array(scope, 0)?;
+        ctx.scoped_set(scope, process, "execArgv", exec_argv)?;
+
+        for (name, value) in [
+            (
+                "argv0",
+                process_argv.first().map(String::as_str).unwrap_or("otter"),
+            ),
+            ("execPath", snapshot.exec_path.as_str()),
+            ("platform", node_platform()),
+            ("arch", node_arch()),
+            ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
+        ] {
+            let value = ctx.scoped_string(scope, value)?;
+            ctx.scoped_set(scope, process, name, value)?;
+        }
+
+        let versions = ctx.scoped_object_bare(scope)?;
+        for (name, value) in [
+            ("otter", env!("CARGO_PKG_VERSION")),
+            ("node", env!("CARGO_PKG_VERSION")),
+            ("openssl", "3.0.0"),
+            ("v8", "12.0.0"),
+        ] {
+            let value = ctx.scoped_string(scope, value)?;
+            ctx.scoped_set(scope, versions, name, value)?;
+        }
+        ctx.scoped_set(scope, process, "versions", versions)?;
+
+        let release = ctx.scoped_object_bare(scope)?;
+        let release_name = ctx.scoped_string(scope, "node")?;
+        ctx.scoped_set(scope, release, "name", release_name)?;
+        ctx.scoped_set(scope, process, "release", release)?;
+
+        let pid = ctx.scoped_number(scope, f64::from(pid_to_i32(snapshot.pid)));
+        ctx.scoped_set(scope, process, "pid", pid)?;
+        let ppid = ctx.scoped_number(scope, f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
+        ctx.scoped_set(scope, process, "ppid", ppid)?;
+        let undefined = ctx.scoped_undefined(scope);
+        ctx.scoped_set(scope, process, "exitCode", undefined)?;
+
+        let env = ctx.scoped_object_bare(scope)?;
+        for (name, value) in std::env::vars() {
+            if default_check_capability(
+                capabilities,
+                RuntimeCapability::Env,
+                &CapabilityRequest::EnvVar(&name),
+            ) {
+                let value = ctx.scoped_string(scope, &value)?;
+                ctx.scoped_set(scope, env, &name, value)?;
+            }
+        }
+        ctx.scoped_set(scope, process, "env", env)?;
+
+        for (name, length, call) in [
+            (
+                "cwd",
+                0,
+                cwd_call(process_cwd.to_string_lossy().to_string()),
+            ),
+            ("exit", 1, NativeCall::Static(process_exit)),
+            ("nextTick", 1, NativeCall::Static(process_next_tick)),
+            ("uptime", 0, uptime_call(start, uptime_base_secs)),
+            ("memoryUsage", 0, NativeCall::Static(process_memory_usage)),
+        ] {
+            define_process_method(ctx, scope, process, name, length, call)?;
+        }
+        let hrtime = hrtime_value(ctx, scope, start)?;
+        ctx.scoped_set(scope, process, "hrtime", hrtime)?;
+        install_stdio_streams(ctx, scope, process)?;
+        define_process_method(
+            ctx,
+            scope,
+            process,
+            "umask",
+            1,
+            NativeCall::Static(process_umask),
+        )?;
+
+        for name in [
+            "on",
+            "once",
+            "off",
+            "addListener",
+            "removeListener",
+            "prependListener",
+            "prependOnceListener",
+            "removeAllListeners",
+            "emit",
+            "listenerCount",
+            "listeners",
+            "setMaxListeners",
+        ] {
+            define_process_method(
+                ctx,
+                scope,
+                process,
+                name,
+                1,
+                NativeCall::Static(process_event_noop),
+            )?;
+        }
+
+        let config = ctx.scoped_object_bare(scope)?;
+        let variables = ctx.scoped_object_bare(scope)?;
+        let disabled = ctx.scoped_boolean(scope, false);
+        ctx.scoped_set(scope, variables, "v8_enable_i18n_support", disabled)?;
+        ctx.scoped_set(scope, config, "variables", variables)?;
+        ctx.scoped_set(scope, process, "config", config)?;
+
+        let features = ctx.scoped_object_bare(scope)?;
+        for (name, on) in [
+            ("inspector", false),
+            ("quic", false),
+            ("tls", false),
+            ("debug", false),
+            ("uv", true),
+            ("ipv6", true),
+            ("cached_builtins", false),
+            ("require_module", true),
+            ("typescript", false),
+        ] {
+            let value = ctx.scoped_boolean(scope, on);
+            ctx.scoped_set(scope, features, name, value)?;
+        }
+        ctx.scoped_set(scope, process, "features", features)?;
+
+        let global_object = *ctx.interp_mut().global_this();
+        let global = ctx.scoped_value(scope, Value::object(global_object));
+        ctx.scoped_define_data(
+            scope,
+            global,
+            "process",
+            process,
+            Attr::global_binding().to_flags(),
+        )
+    });
+    result.map_err(process_bootstrap_error)
+}
+
+fn process_bootstrap_error(error: NativeError) -> OtterError {
+    OtterError::Internal {
+        code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+        message: format!("process bootstrap failed: {error}"),
     }
-
-    // `process.config.variables.*` is read by the Node test harness at load.
-    let mut config = interp
-        .alloc_host_object_with_roots(&[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    let mut variables = interp
-        .alloc_host_object_with_roots(&[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    otter_vm::object::set(
-        &mut variables,
-        interp.gc_heap_mut(),
-        "v8_enable_i18n_support",
-        Value::boolean(false),
-    );
-    otter_vm::object::set(
-        &mut config,
-        interp.gc_heap_mut(),
-        "variables",
-        otter_vm::Value::object(variables),
-    );
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "config",
-        otter_vm::Value::object(config),
-    );
-
-    // `process.features.*` — feature flags read by the Node test harness.
-    let mut features = interp
-        .alloc_host_object_with_roots(&[&process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    for (name, on) in [
-        ("inspector", false),
-        ("quic", false),
-        ("tls", false),
-        ("debug", false),
-        ("uv", true),
-        ("ipv6", true),
-        ("cached_builtins", false),
-        ("require_module", true),
-        ("typescript", false),
-    ] {
-        otter_vm::object::set(
-            &mut features,
-            interp.gc_heap_mut(),
-            name,
-            Value::boolean(on),
-        );
-    }
-    otter_vm::object::set(
-        &mut process,
-        interp.gc_heap_mut(),
-        "features",
-        otter_vm::Value::object(features),
-    );
-
-    interp.set_global("process", otter_vm::Value::object(process));
-    Ok(())
 }
 
 /// `process.umask([mask])` — returns the previous mask. Otter does not change
@@ -360,32 +249,32 @@ fn process_event_noop(
 /// `process.stdout.write`; the EventEmitter-style methods are no-ops that
 /// return the stream for chaining.
 fn install_stdio_streams(
-    interp: &mut Interpreter,
-    process: otter_vm::object::JsObject,
-    process_root: &Value,
-) -> Result<(), OtterError> {
+    ctx: &mut NativeCtx<'_>,
+    scope: &otter_vm::HandleScope,
+    process: otter_vm::Scoped<'_>,
+) -> Result<(), NativeError> {
     install_one_stdio(
-        interp,
+        ctx,
+        scope,
         process,
-        process_root,
         "stdout",
         1,
         false,
         NativeCall::Static(stdout_write),
     )?;
     install_one_stdio(
-        interp,
+        ctx,
+        scope,
         process,
-        process_root,
         "stderr",
         2,
         false,
         NativeCall::Static(stderr_write),
     )?;
     install_one_stdio(
-        interp,
+        ctx,
+        scope,
         process,
-        process_root,
         "stdin",
         0,
         true,
@@ -395,50 +284,27 @@ fn install_stdio_streams(
 }
 
 fn install_one_stdio(
-    interp: &mut Interpreter,
-    mut process: otter_vm::object::JsObject,
-    process_root: &Value,
+    ctx: &mut NativeCtx<'_>,
+    scope: &otter_vm::HandleScope,
+    process: otter_vm::Scoped<'_>,
     name: &'static str,
     fd: i32,
     readable: bool,
     write_call: NativeCall,
-) -> Result<(), OtterError> {
-    let mut stream = interp
-        .alloc_host_object_with_roots(&[process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    let stream_root = Value::object(stream);
-    let i32n = |n: i32| Value::number(NumberValue::from_i32(n));
-    otter_vm::object::set(
-        &mut stream,
-        interp.gc_heap_mut(),
-        "isTTY",
-        Value::boolean(false),
-    );
-    otter_vm::object::set(&mut stream, interp.gc_heap_mut(), "fd", i32n(fd));
-    otter_vm::object::set(
-        &mut stream,
-        interp.gc_heap_mut(),
-        "writable",
-        Value::boolean(!readable),
-    );
-    otter_vm::object::set(
-        &mut stream,
-        interp.gc_heap_mut(),
-        "readable",
-        Value::boolean(readable),
-    );
-    otter_vm::object::set(&mut stream, interp.gc_heap_mut(), "columns", i32n(80));
-    otter_vm::object::set(&mut stream, interp.gc_heap_mut(), "rows", i32n(24));
+) -> Result<(), NativeError> {
+    let stream = ctx.scoped_object_bare(scope)?;
+    for (key, value) in [
+        ("isTTY", ctx.scoped_boolean(scope, false)),
+        ("fd", ctx.scoped_number(scope, f64::from(fd))),
+        ("writable", ctx.scoped_boolean(scope, !readable)),
+        ("readable", ctx.scoped_boolean(scope, readable)),
+        ("columns", ctx.scoped_number(scope, 80.0)),
+        ("rows", ctx.scoped_number(scope, 24.0)),
+    ] {
+        ctx.scoped_set(scope, stream, key, value)?;
+    }
 
-    define_method_on(
-        interp,
-        stream,
-        &stream_root,
-        process_root,
-        "write",
-        1,
-        write_call,
-    )?;
+    define_method_on(ctx, scope, stream, "write", 1, write_call)?;
     for method in [
         "end",
         "cork",
@@ -457,37 +323,33 @@ fn install_one_stdio(
         "unref",
     ] {
         define_method_on(
-            interp,
+            ctx,
+            scope,
             stream,
-            &stream_root,
-            process_root,
             method,
             0,
             NativeCall::Static(stdio_return_this),
         )?;
     }
-    otter_vm::object::set(&mut process, interp.gc_heap_mut(), name, stream_root);
-    Ok(())
+    ctx.scoped_set(scope, process, name, stream)
 }
 
 fn define_method_on(
-    interp: &mut Interpreter,
-    target: otter_vm::object::JsObject,
-    target_root: &Value,
-    extra_root: &Value,
+    ctx: &mut NativeCtx<'_>,
+    scope: &otter_vm::HandleScope,
+    target: otter_vm::Scoped<'_>,
     name: &'static str,
     length: u8,
     call: NativeCall,
-) -> Result<(), OtterError> {
-    let value = interp
-        .native_function_from_call_host_rooted(name, length, call, &[target_root, extra_root], &[])
-        .map_err(gc_oom_to_error)?;
-    let descriptor = otter_vm::object::PropertyDescriptor {
-        kind: otter_vm::object::DescriptorKind::Data { value },
-        flags: Attr::builtin_function().to_flags(),
-    };
-    otter_vm::object::define_own_property(target, interp.gc_heap_mut(), name, descriptor);
-    Ok(())
+) -> Result<(), NativeError> {
+    let value = ctx.scoped_native_call(scope, name, length, call)?;
+    ctx.scoped_define_data(
+        scope,
+        target,
+        name,
+        value,
+        Attr::builtin_function().to_flags(),
+    )
 }
 
 fn stdout_write(
@@ -524,28 +386,14 @@ fn stdio_return_this(
 }
 
 fn define_process_method(
-    interp: &mut Interpreter,
-    process: otter_vm::object::JsObject,
-    process_root: &Value,
+    ctx: &mut NativeCtx<'_>,
+    scope: &otter_vm::HandleScope,
+    process: otter_vm::Scoped<'_>,
     name: &'static str,
     length: u8,
     call: NativeCall,
-) -> Result<(), OtterError> {
-    let value = interp
-        .native_function_from_call_host_rooted(name, length, call, &[process_root], &[])
-        .map_err(gc_oom_to_error)?;
-    let descriptor = otter_vm::object::PropertyDescriptor {
-        kind: otter_vm::object::DescriptorKind::Data { value },
-        flags: Attr::builtin_function().to_flags(),
-    };
-    if otter_vm::object::define_own_property(process, interp.gc_heap_mut(), name, descriptor) {
-        Ok(())
-    } else {
-        Err(OtterError::Internal {
-            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-            message: format!("failed to define process.{name}"),
-        })
-    }
+) -> Result<(), NativeError> {
+    define_method_on(ctx, scope, process, name, length, call)
 }
 
 pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
@@ -558,12 +406,6 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
         return 0;
     };
     normalize_exit_code(&value).unwrap_or(0)
-}
-
-fn string_value(interp: &mut Interpreter, value: &str) -> Result<otter_vm::Value, OtterError> {
-    Ok(otter_vm::Value::string(
-        JsString::from_str(value, interp.gc_heap_mut()).map_err(string_oom_to_error)?,
-    ))
 }
 
 fn cwd_call(cwd: String) -> NativeCall {
@@ -662,19 +504,24 @@ fn function_prototype_object(interp: &mut Interpreter) -> Option<otter_vm::objec
     otter_vm::object::get(ctor, interp.gc_heap(), "prototype")?.as_object()
 }
 
-fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter_gc::OutOfMemory> {
-    let function =
-        interp.native_function_from_call_host_rooted("hrtime", 1, hrtime_call(start), &[], &[])?;
-    let bigint = interp.native_function_from_call_host_rooted(
-        "bigint",
-        0,
-        hrtime_bigint_call(start),
-        &[&function],
-        &[],
-    )?;
-    let mut object = interp.alloc_host_object_with_roots(&[&function, &bigint], &[])?;
-    otter_vm::object::set_call_native(object, interp.gc_heap_mut(), function);
-    otter_vm::object::set(&mut object, interp.gc_heap_mut(), "bigint", bigint);
+fn hrtime_value<'s>(
+    ctx: &mut NativeCtx<'_>,
+    scope: &'s otter_vm::HandleScope,
+    start: Instant,
+) -> Result<otter_vm::Scoped<'s>, NativeError> {
+    let function = ctx.scoped_native_call(scope, "hrtime", 1, hrtime_call(start))?;
+    let bigint = ctx.scoped_native_call(scope, "bigint", 0, hrtime_bigint_call(start))?;
+    let object = ctx.scoped_object_bare(scope)?;
+    let object_value = ctx.escape(object);
+    let object_handle = object_value
+        .as_object()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "process.hrtime",
+            reason: "callable object allocation failed".to_string(),
+        })?;
+    let function_value = ctx.escape(function);
+    otter_vm::object::set_call_native(object_handle, ctx.heap_mut(), function_value);
+    ctx.scoped_set(scope, object, "bigint", bigint)?;
     // `process.hrtime` is a callable host object (so it can carry the
     // `.bigint` own property), but a host object defaults to a null
     // `[[Prototype]]`. A callable with no `%Function.prototype%` in its
@@ -682,10 +529,14 @@ fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter
     // (and any `ToPrimitive`) throws instead of yielding the native
     // form. Re-seat it on `%Function.prototype%` to match an ordinary
     // function object.
-    if let Some(function_prototype) = function_prototype_object(interp) {
-        otter_vm::object::set_prototype(object, interp.gc_heap_mut(), Some(function_prototype));
+    if let Some(function_prototype) = function_prototype_object(ctx.interp_mut()) {
+        let object = ctx
+            .escape(object)
+            .as_object()
+            .expect("scoped hrtime object remains an object");
+        otter_vm::object::set_prototype(object, ctx.heap_mut(), Some(function_prototype));
     }
-    Ok(Value::object(object))
+    Ok(object)
 }
 
 fn hrtime_call(start: Instant) -> NativeCall {
@@ -710,7 +561,7 @@ fn hrtime_call(start: Instant) -> NativeCall {
             Value::number(NumberValue::from_f64(seconds.max(0) as f64)),
             Value::number(NumberValue::from_f64(nanos.max(0) as f64)),
         ];
-        let array = ctx.array_from_elements_with_roots(values, &[], &[args])?;
+        let array = ctx.array_from_elements(values)?;
         Ok(Value::array(array))
     });
     NativeCall::Dynamic(call)

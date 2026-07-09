@@ -360,6 +360,18 @@ impl ColdFramePool {
     pub fn live_len(&self) -> usize {
         self.slots.len() - self.free.len()
     }
+
+    /// Trace every pool slot. Released slots are reset to the empty
+    /// default on release, so tracing them is a no-op; acquired slots are
+    /// traced whether or not a stacked frame references them yet. This is
+    /// what keeps a cold record filled during frame construction — before
+    /// the frame is pushed onto any traced stack — alive and forwarded
+    /// across a collection.
+    pub fn trace_all(&self, visitor: &mut SlotVisitor<'_>) {
+        for slot in &self.slots {
+            slot.trace_cold_slots(visitor);
+        }
+    }
 }
 
 #[cfg(test)]

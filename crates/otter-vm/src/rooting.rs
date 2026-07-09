@@ -36,8 +36,17 @@ unsafe fn trace_value_smallvec4(slot: *mut (), visitor: &mut dyn FnMut(*mut RawG
     }
 }
 
+unsafe fn trace_value_vec(slot: *mut (), visitor: &mut dyn FnMut(*mut RawGc)) {
+    // SAFETY: registered for a `*mut Vec<Value>` slot.
+    let vec = unsafe { &mut *slot.cast::<Vec<Value>>() };
+    for value in vec.iter_mut() {
+        value.trace_value_slot_mut(visitor);
+    }
+}
+
 /// Typed rooting entry points for VM locals.
-pub(crate) trait RootScopeExt {
+#[doc(hidden)]
+pub trait RootScopeExt {
     /// Root a `Value` local.
     ///
     /// # Safety
@@ -49,6 +58,14 @@ pub(crate) trait RootScopeExt {
     /// # Safety
     /// `slot` must outlive the scope.
     unsafe fn add_object(&mut self, slot: &mut JsObject);
+
+    /// Root every element of an owned value vector in place.
+    ///
+    /// # Safety
+    /// `slot` must outlive the scope and the vector itself must not be
+    /// moved-from while the scope is open. Its backing allocation may grow or
+    /// shrink because the tracer resolves the live buffer on every visit.
+    unsafe fn add_value_vec(&mut self, slot: &mut Vec<Value>);
 
     /// Root every element of an argv-shaped vector in place.
     ///
@@ -67,6 +84,11 @@ impl RootScopeExt for RootScope {
     unsafe fn add_object(&mut self, slot: &mut JsObject) {
         // SAFETY: `JsObject` is a bare GC handle; contract forwarded.
         unsafe { self.add_raw_slot((slot as *mut JsObject).cast::<RawGc>()) }
+    }
+
+    unsafe fn add_value_vec(&mut self, slot: &mut Vec<Value>) {
+        // SAFETY: contract forwarded to the caller.
+        unsafe { self.add_erased((slot as *mut Vec<Value>).cast::<()>(), trace_value_vec) }
     }
 
     unsafe fn add_value_smallvec(&mut self, slot: &mut SmallVec<[Value; 4]>) {

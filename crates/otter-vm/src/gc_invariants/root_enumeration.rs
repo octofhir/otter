@@ -101,7 +101,7 @@ fn upvalue_cell_root_survives_force_gc() {
     // compressed offset); explicit `let _ = cell` documents
     // intent to release the reference.
     let _ = cell;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[UPVALUE_CELL_TYPE_TAG as usize].live_bytes;
     assert_eq!(
         after,
@@ -152,7 +152,7 @@ fn globals_keep_object_alive() {
     // Force GC. With `GcTrace for JsObject` emitting the slot
     // and `ObjectBody::trace_slots_safe` walking property
     // values, the global's property must still resolve.
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let resolved = crate::object::get(global, interp.gc_heap(), "__gc_roots_test_stash")
         .expect("globalThis property survives force_gc");
     assert!(
@@ -201,7 +201,7 @@ fn module_env_keeps_object_alive() {
     );
 
     let _ = stashed;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let env_handle = interp
         .module_env(&url)
         .expect("module env still registered");
@@ -216,7 +216,7 @@ fn module_env_keeps_object_alive() {
 #[test]
 fn error_class_registry_prototypes_survive_force_gc() {
     let mut interp = Interpreter::new();
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let registry = interp.error_classes_clone();
     let proto = registry.prototype(crate::ErrorKind::TypeError);
@@ -245,7 +245,7 @@ fn array_element_root_survives_force_gc() {
     );
 
     let _ = arr;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global_this, interp.gc_heap(), "__array_root")
         .expect("array root survives force_gc");
@@ -284,7 +284,7 @@ fn map_entry_root_survives_force_gc() {
 
     let _ = map;
     let _ = stashed;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global_this, interp.gc_heap(), "__map_root")
         .expect("map root survives force_gc");
@@ -339,7 +339,7 @@ fn weak_collections_root_survives_force_gc() {
     let _ = set;
     let _ = key;
     let _ = value;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted_key = crate::object::get(global_this, interp.gc_heap(), "__weak_key_root")
         .expect("weak key root survives force_gc");
@@ -389,7 +389,7 @@ fn promise_resolution_root_survives_force_gc() {
 
     let _ = object;
     let _ = promise;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global_this, interp.gc_heap(), "__promise_root")
         .expect("promise root survives force_gc");
@@ -420,7 +420,7 @@ fn microtask_payload_root_survives_force_gc() {
     });
 
     let _ = object;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let _ = interp
         .microtasks_mut()
@@ -444,7 +444,7 @@ fn parked_frame_keeps_alive() {
     use otter_bytecode::Function;
 
     let mut interp = Interpreter::new();
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[PARKED_FRAME_BODY_TYPE_TAG as usize].live_bytes;
 
@@ -486,7 +486,7 @@ fn parked_frame_keeps_alive() {
     let _ = object;
     let _ = parked;
     let _ = promise;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let after =
         interp.gc_heap_mut().gc_stats().by_type[PARKED_FRAME_BODY_TYPE_TAG as usize].live_bytes;
@@ -519,7 +519,7 @@ fn bound_function_root_survives_force_gc() {
     let _ = target;
     let _ = bound_this;
     let _ = bound;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global_this, interp.gc_heap(), "__bound_root")
         .expect("bound root survives force_gc");
@@ -546,7 +546,7 @@ fn regexp_root_survives_force_gc() {
     );
 
     let _ = re;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     let rooted = crate::object::get(global_this, interp.gc_heap(), "__regexp_root")
         .expect("regexp root survives force_gc");

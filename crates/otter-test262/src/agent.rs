@@ -273,56 +273,73 @@ fn create_realm(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
                 name: "$262.createRealm",
                 reason: err.to_string(),
             })?;
-    let global_value = Value::object(global);
-    let realm_obj = ctx
-        .alloc_object_with_roots(&[&global_value], &[])
-        .map_err(|_| NativeError::TypeError {
-            name: "$262.createRealm",
-            reason: "realm object allocation failed".to_string(),
-        })?;
-    let eval_value = ctx
-        .native_value_with_captures(
-            "$262.createRealm.evalScript",
-            smallvec::smallvec![global_value],
-            &[&global_value],
-            &[],
-            realm_eval_script,
-        )
-        .map_err(|_| NativeError::TypeError {
-            name: "$262.createRealm",
-            reason: "evalScript allocation failed".to_string(),
-        })?;
-    let global_eval_value = ctx
-        .native_value_with_captures(
-            "$262.createRealm.global.eval",
-            smallvec::smallvec![global_value],
-            &[&global_value, &eval_value],
-            &[],
-            realm_global_eval,
-        )
-        .map_err(|_| NativeError::TypeError {
-            name: "$262.createRealm",
-            reason: "global eval allocation failed".to_string(),
-        })?;
-    otter_vm::object::define_own_property(
-        realm_obj,
-        ctx.heap_mut(),
-        "global",
-        otter_vm::object::PropertyDescriptor::data(global_value, true, true, true),
-    );
-    otter_vm::object::define_own_property(
-        realm_obj,
-        ctx.heap_mut(),
-        "evalScript",
-        otter_vm::object::PropertyDescriptor::data(eval_value, true, true, true),
-    );
-    otter_vm::object::define_own_property(
-        global,
-        ctx.heap_mut(),
-        "eval",
-        otter_vm::object::PropertyDescriptor::data(global_eval_value, true, false, true),
-    );
-    Ok(Value::object(realm_obj))
+    ctx.scope(|ctx, scope| {
+        let global = ctx.scoped_value(scope, Value::object(global));
+        let realm_obj = ctx.scoped_object(scope)?;
+
+        let global_value = ctx.escape(global);
+        let eval_value = ctx
+            .native_value(
+                "$262.createRealm.evalScript",
+                smallvec::smallvec![global_value],
+                realm_eval_script,
+            )
+            .map_err(|_| NativeError::TypeError {
+                name: "$262.createRealm",
+                reason: "evalScript allocation failed".to_string(),
+            })?;
+        let eval_value = ctx.scoped_value(scope, eval_value);
+
+        let global_value = ctx.escape(global);
+        let global_eval_value = ctx
+            .native_value(
+                "$262.createRealm.global.eval",
+                smallvec::smallvec![global_value],
+                realm_global_eval,
+            )
+            .map_err(|_| NativeError::TypeError {
+                name: "$262.createRealm",
+                reason: "global eval allocation failed".to_string(),
+            })?;
+        let global_eval_value = ctx.scoped_value(scope, global_eval_value);
+
+        let realm_object = ctx
+            .escape(realm_obj)
+            .as_object()
+            .ok_or_else(|| type_err("realm object allocation failed"))?;
+        let global_value = ctx.escape(global);
+        otter_vm::object::define_own_property(
+            realm_object,
+            ctx.heap_mut(),
+            "global",
+            otter_vm::object::PropertyDescriptor::data(global_value, true, true, true),
+        );
+
+        let realm_object = ctx
+            .escape(realm_obj)
+            .as_object()
+            .ok_or_else(|| type_err("realm object allocation failed"))?;
+        let eval_value = ctx.escape(eval_value);
+        otter_vm::object::define_own_property(
+            realm_object,
+            ctx.heap_mut(),
+            "evalScript",
+            otter_vm::object::PropertyDescriptor::data(eval_value, true, true, true),
+        );
+
+        let global_object = ctx
+            .escape(global)
+            .as_object()
+            .ok_or_else(|| type_err("realm eval lost its global"))?;
+        let global_eval_value = ctx.escape(global_eval_value);
+        otter_vm::object::define_own_property(
+            global_object,
+            ctx.heap_mut(),
+            "eval",
+            otter_vm::object::PropertyDescriptor::data(global_eval_value, true, false, true),
+        );
+        Ok(ctx.escape(realm_obj))
+    })
 }
 
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {

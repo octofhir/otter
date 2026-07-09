@@ -1,14 +1,40 @@
 //! `Interpreter` construction and introspection accessors.
 //!
 //! # Contents
-//! `new`/`with_string_heap_cap` (heap, shape runtime, IC tables, JIT
-//! hooks all start empty), property-IC counters, and JIT stat getters.
+//! - `new` / `with_string_heap_cap` bootstrap the heap, realm surfaces,
+//!   shape runtime, caches, and JIT state.
+//! - Introspection accessors expose property-IC and JIT counters.
 //!
 //! # Invariants
-//! Construction never allocates on the GC heap; intrinsics install later
-//! via bootstrap so a half-built interpreter is never observable.
+//! - Every partially built GC graph is owned by an RAII root scope until its
+//!   fields move into the completed interpreter.
+//! - Root providers are dropped before their stack slots move into the
+//!   interpreter, and no GC allocation occurs during that move.
+//! - A half-built interpreter is never observable outside this module.
 #![allow(unused_imports)]
 use crate::*;
+
+unsafe fn trace_bootstrap_well_known_symbols(
+    slot: *mut (),
+    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+) {
+    // SAFETY: the matching scope in `with_string_heap_cap` is nested inside
+    // the table's lifetime and is dropped before the table moves into the
+    // completed interpreter.
+    let table = unsafe { &*slot.cast::<WellKnownSymbols>() };
+    for symbol in table.entries() {
+        symbol.trace_value_slots(visitor);
+    }
+}
+
+unsafe fn trace_bootstrap_error_classes(
+    slot: *mut (),
+    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+) {
+    // SAFETY: same construction-scope contract as the well-known table above.
+    let registry = unsafe { &*slot.cast::<ErrorClassRegistry>() };
+    registry.trace_gc_roots(visitor);
+}
 
 impl Interpreter {
     /// Construct a fresh interpreter with its own interrupt flag,
@@ -29,14 +55,36 @@ impl Interpreter {
             .expect("GcHeap construction never fails on the default cage");
         object::register_gc_traceables(&mut gc_heap);
         startup_timer.mark("vm_gc_heap");
-        let well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
+        let mut well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
             .expect("well-known symbol descriptions + bodies fit within any positive cap");
+        let mut well_known_scope = otter_gc::RootScope::new(&mut gc_heap);
+        // SAFETY: the table precedes the scope and the scope is explicitly
+        // dropped before the table moves into `Interpreter`.
+        unsafe {
+            well_known_scope.add_erased(
+                (&mut well_known_symbols as *mut WellKnownSymbols).cast::<()>(),
+                trace_bootstrap_well_known_symbols,
+            );
+        }
         startup_timer.mark("vm_well_known_symbols");
-        let error_classes = ErrorClassRegistry::new(&mut gc_heap)
+        let mut error_classes = ErrorClassRegistry::new(&mut gc_heap)
             .expect("error class prototypes fit within any positive cap");
+        let mut error_scope = otter_gc::RootScope::new(&mut gc_heap);
+        // SAFETY: the registry precedes the scope and remains stationary until
+        // the scope is dropped immediately before the struct move.
+        unsafe {
+            error_scope.add_erased(
+                (&mut error_classes as *mut ErrorClassRegistry).cast::<()>(),
+                trace_bootstrap_error_classes,
+            );
+        }
         startup_timer.mark("vm_error_classes");
-        let global_this = bootstrap::build_global_this(&mut gc_heap, &well_known_symbols)
+        let mut global_this = bootstrap::build_global_this(&mut gc_heap, &well_known_symbols)
             .expect("global_this fits within any positive cap");
+        let mut global_scope = otter_gc::RootScope::new(&mut gc_heap);
+        // SAFETY: the global handle precedes the scope and stays stationary
+        // until the explicit drop below.
+        unsafe { crate::rooting::RootScopeExt::add_object(&mut global_scope, &mut global_this) };
         startup_timer.mark("vm_global_this");
         // §20.4.2 — install well-known symbols on the realm's
         // `Symbol` constructor + `Symbol.prototype[@@toPrimitive]`.
@@ -65,7 +113,10 @@ impl Interpreter {
                 &[&global_root],
             )
             .expect("Function.prototype[@@hasInstance] fits within any positive cap");
-            Some(function_proto)
+            // The installer can allocate and relocate the young prototype.
+            // Resolve it again through the rooted global graph instead of
+            // returning the pre-allocation copy.
+            resolve_ctor_prototype(&mut gc_heap, global_this, "Function")
         } else {
             None
         };
@@ -88,6 +139,13 @@ impl Interpreter {
         let shape_runtime = object::ShapeRuntime::new(&mut gc_heap)
             .expect("shape root fits within any positive cap");
         startup_timer.mark("vm_shape_runtime");
+        // No GC allocation occurs between these drops and the struct move.
+        // Dropping in reverse registration order keeps the frame-root stack
+        // strictly LIFO and prevents providers from pointing at moved-from
+        // stack values after the fields enter `Interpreter`.
+        drop(global_scope);
+        drop(error_scope);
+        drop(well_known_scope);
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
@@ -214,7 +272,7 @@ impl Interpreter {
             .realm_intrinsics
             .populate(&mut interp.gc_heap, global_this);
         let extra_roots = otter_gc::ExtraRoots::new(&interp);
-        let extra_root_depth = interp.gc_heap.push_extra_roots(extra_roots);
+        let extra_roots_guard = interp.gc_heap.register_extra_roots(extra_roots);
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
         // iterator prototypes once `%Iterator.prototype%` is wired
         // into the global. The bootstrap helper owns the install
@@ -242,7 +300,7 @@ impl Interpreter {
             interp.wrap_for_valid_iterator_prototype = Some(protos.wrap_for_valid_iterator);
         }
         interp.install_function_kind_prototypes_post_bootstrap();
-        interp.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        drop(extra_roots_guard);
         interp
     }
 
@@ -601,11 +659,11 @@ impl Interpreter {
         self.swap_active_realm_state(&mut realm);
         let was_extra = self.active_realm_is_extra;
         self.active_realm_is_extra = true;
-        let depth = self
+        let realm_roots_guard = self
             .gc_heap
-            .push_extra_roots(otter_gc::ExtraRoots::new(&realm));
+            .register_extra_roots(otter_gc::ExtraRoots::new(&realm));
         let result = body(self);
-        self.gc_heap.pop_extra_roots_to(depth - 1);
+        drop(realm_roots_guard);
         self.swap_active_realm_state(&mut realm);
         self.active_realm_is_extra = was_extra;
         self.extra_realms.insert(index, realm);

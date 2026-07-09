@@ -253,7 +253,7 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     };
 
     let buffer = ctx
-        .array_buffer_from_bytes_rooted(out, &[], &[])
+        .array_buffer_from_bytes(out)
         .map_err(|e| runtime_type_error("CompressionStream", e.to_string()))?;
     let ctor = ctx
         .global_value("Uint8Array")

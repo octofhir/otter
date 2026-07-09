@@ -141,7 +141,8 @@ mod tests {
                 for &slot in &roots {
                     visitor(slot);
                 }
-            });
+            })
+            .expect("minor GC");
     }
 
     #[test]

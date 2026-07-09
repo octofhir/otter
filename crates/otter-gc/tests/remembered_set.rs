@@ -58,8 +58,8 @@ fn old_to_young_pointer_survives_via_remembered_set() {
         let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let p = heap.alloc(Box1 { child: Gc::null() }).unwrap();
         let local = scope.local(p);
-        heap.collect_minor(otter_gc::EmptyRoots);
-        heap.collect_minor(otter_gc::EmptyRoots);
+        heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+        heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
         // p has been promoted to old space; its handle reflects
         // the new offset.
         let promoted = local.get();
@@ -97,7 +97,7 @@ fn old_to_young_pointer_survives_via_remembered_set() {
         });
     }
     // Run a scavenge.
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     // Re-acquire the parent (its offset is stable — old gen).
     let parent: Gc<Box1> = unsafe { Gc::from_offset(parent_offset_after_promotion) };
@@ -127,7 +127,7 @@ fn old_to_young_pointer_survives_via_remembered_set() {
             "remembered bit must track the child's generation"
         );
     }
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
     let child_promoted = unsafe {
         let payload =
             (parent_header as *mut u8).add(std::mem::size_of::<otter_gc::GcHeader>()) as *mut Box1;
@@ -179,7 +179,7 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
         let root = session.root(parent);
         std::mem::forget(root);
     });
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
     let child_after = heap.read_payload(parent, |body| *body.child);
     assert!(
         !child_after.is_null(),
@@ -204,7 +204,7 @@ fn old_to_young_pointer_behind_boxed_slot_survives_scavenge() {
         "promoted child leaves no old->young edge to re-remember"
     );
 
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
     let child_after_second = heap.read_payload(parent, |body| *body.child);
     assert!(
         !child_after_second.is_null(),
@@ -238,8 +238,8 @@ fn old_slot_already_rewritten_to_to_space_re_remembers_parent() {
         let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let p = heap.alloc(Box1 { child: Gc::null() }).unwrap();
         let local = scope.local(p);
-        heap.collect_minor(otter_gc::EmptyRoots);
-        heap.collect_minor(otter_gc::EmptyRoots);
+        heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+        heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
         let promoted = local.get();
         assert!(unsafe { (*promoted.as_header_ptr()).is_old() });
         parent_offset_after_promotion = promoted.offset();
@@ -268,7 +268,8 @@ fn old_slot_already_rewritten_to_to_space_re_remembers_parent() {
     let mut external = |visit: &mut dyn FnMut(*mut RawGc)| {
         visit(child_slot);
     };
-    heap.collect_minor_with_roots(&mut external);
+    heap.collect_minor_with_roots(&mut external)
+        .expect("minor GC");
 
     let parent: Gc<Box1> = unsafe { Gc::from_offset(parent_offset_after_promotion) };
     let child_after = heap.read_payload(parent, |body| body.child);
@@ -287,7 +288,7 @@ fn old_slot_already_rewritten_to_to_space_re_remembers_parent() {
         );
     }
 
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
     let child_after_second = heap.read_payload(parent, |body| body.child);
     assert!(
         !child_after_second.is_null(),

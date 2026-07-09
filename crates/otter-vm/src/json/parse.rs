@@ -711,7 +711,8 @@ fn finish_builder(
                 entries: &entries,
                 stack,
             };
-            let depth = gc_heap.push_extra_roots(otter_gc::ExtraRoots::new(&build_roots));
+            let _build_roots_guard =
+                gc_heap.register_extra_roots(otter_gc::ExtraRoots::new(&build_roots));
             for (k, v) in &entries {
                 crate::object::set(&mut obj, gc_heap, k, *v);
             }
@@ -722,7 +723,6 @@ fn finish_builder(
             if let Some(proto) = object_proto {
                 crate::object::set_prototype_value(obj, gc_heap, Some(proto));
             }
-            gc_heap.pop_extra_roots_to(depth - 1);
             Ok(Value::object(obj))
         }
     }

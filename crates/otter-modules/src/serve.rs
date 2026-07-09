@@ -220,22 +220,18 @@ fn serve(
     let slots = ServeSlots::resolve(ctx, slots_value)?;
     let deliver = {
         let registry = registry.clone();
-        ctx.native_value_with_captures(
+        ctx.native_value(
             "serve.deliver",
             smallvec::smallvec![],
-            &[],
-            &[],
             move |ctx, args, _captures| deliver_reply(ctx, &registry, slots, args),
         )
         .map_err(|err| crate::type_error("serve", err.to_string()))?
     };
     let deliver_error = {
         let registry = registry.clone();
-        ctx.native_value_with_captures(
+        ctx.native_value(
             "serve.deliverError",
             smallvec::smallvec![],
-            &[],
-            &[],
             move |ctx, args, _captures| deliver_error(ctx, &registry, args),
         )
         .map_err(|err| crate::type_error("serve", err.to_string()))?

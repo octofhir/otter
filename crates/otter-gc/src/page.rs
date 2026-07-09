@@ -255,6 +255,24 @@ impl Page {
         Some(page)
     }
 
+    /// Atomically carve and initialize several pages for one space.
+    pub(crate) fn new_many(space: SpaceKind, count: usize) -> Option<Vec<Self>> {
+        let cage_pages = Cage::alloc_pages(count)?;
+        Some(
+            cage_pages
+                .into_iter()
+                .map(|CagePage { base, offset }| {
+                    let page = Self {
+                        base,
+                        cage_offset: offset,
+                    };
+                    page.header_mut().init(space, offset);
+                    page
+                })
+                .collect(),
+        )
+    }
+
     /// Returns the page-base pointer.
     #[inline]
     pub fn base_ptr(&self) -> *mut u8 {

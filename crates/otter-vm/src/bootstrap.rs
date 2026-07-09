@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use crate::js_surface::{JsSurfaceError, NamespaceSpec};
 use crate::object::{self, JsObject};
+use crate::rooting::RootScopeExt;
 use crate::{
     Value, array_prototype, atomics, console, function_prototype, json, math, object_statics,
     reflect,
@@ -43,6 +44,19 @@ pub use crate::intrinsics::shared::{
     native_static_with_value_roots,
 };
 pub(crate) use crate::intrinsics::shared::{install_placeholder, native_new_target_prototype};
+
+unsafe fn trace_well_known_symbols(
+    slot: *mut (),
+    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+) {
+    // SAFETY: `build_global_this_impl` registers the caller-owned table for a
+    // scope strictly nested inside that borrow. `JsSymbol` exposes its handle
+    // slot specifically for collector rewriting.
+    let well_known = unsafe { &*slot.cast::<crate::symbol::WellKnownSymbols>() };
+    for symbol in well_known.entries() {
+        symbol.trace_value_slots(visitor);
+    }
+}
 
 /// Bootstrap feature/capability bitset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +399,21 @@ fn build_global_this_impl(
     // The realm global object is a permanent singleton root: pin it in
     // non-moving old space so every handle to it stays stable across young
     // scavenges and the large builtin-laden object is never copied.
-    let global = object::alloc_object_old(heap)?;
+    let mut global = object::alloc_object_old(heap)?;
+    let mut bootstrap_roots = otter_gc::RootScope::new(heap);
+    // SAFETY: `global` and the borrowed well-known-symbol table both outlive
+    // this scope. Keeping them registered for the whole install pass makes
+    // automatic major GC obey the same root contract as per-allocation minor
+    // GC, instead of relying on each installer to remember bootstrap globals.
+    unsafe {
+        bootstrap_roots.add_object(&mut global);
+        bootstrap_roots.add_erased(
+            (well_known as *const crate::symbol::WellKnownSymbols)
+                .cast_mut()
+                .cast::<()>(),
+            trace_well_known_symbols,
+        );
+    }
     // §19.1 `globalThis` is writable + configurable but NON-enumerable.
     object::define_own_property(
         global,

@@ -330,7 +330,7 @@ mod tests {
         let first = interp.shape_child(root, "x").expect("child");
         assert_eq!(interp.shape_offset_of(first, "x"), Some(0));
 
-        interp.force_gc();
+        interp.force_gc().expect("force GC");
 
         let root = interp.shape_root();
         let second = interp.shape_child(root, "x").expect("child after gc");

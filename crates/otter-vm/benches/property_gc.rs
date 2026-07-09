@@ -495,7 +495,7 @@ fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
 fn run_gc_measured_iters(context: &ExecutionContext, iters: u64) -> std::time::Duration {
     let mut interp = Interpreter::new();
     interp.run(context).expect("warm property GC loop");
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let mut runs_since_gc = 0_u32;
 
     let start = Instant::now();
@@ -505,7 +505,7 @@ fn run_gc_measured_iters(context: &ExecutionContext, iters: u64) -> std::time::D
         std::hint::black_box(interp.property_ic_stats());
         runs_since_gc += 1;
         if runs_since_gc == GC_CADENCE_RUNS {
-            interp.force_gc();
+            interp.force_gc().expect("force GC");
             runs_since_gc = 0;
             std::hint::black_box(interp.gc_heap_mut().gc_stats().gc_cycles);
         }

@@ -68,7 +68,7 @@ fn large_object_old_to_young_edge_survives_scavenge() {
 
     // Scavenge: the child must survive (and the slot must follow it)
     // purely via the LOS dirty-card scan.
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     let child_after = unsafe {
         let payload = (big.as_header_ptr() as *mut u8)

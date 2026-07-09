@@ -24,6 +24,7 @@
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::native_function::NativeFunction;
 use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::rooting::RootScopeExt;
 use crate::symbol;
 use crate::{NativeCall, NativeCtx, NativeError, Value, VmIntrinsicFunction};
 
@@ -48,28 +49,36 @@ pub static FUNCTION_PROTOTYPE_METHODS: &[MethodSpec] = &[
 /// `"[Symbol.hasInstance]"` and `length` of `1`.
 pub(crate) fn install_symbol_has_instance(
     heap: &mut otter_gc::GcHeap,
-    prototype: JsObject,
+    mut prototype: JsObject,
     well_known_has_instance: symbol::JsSymbol,
     value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let prototype_root = Value::object(prototype);
+    let mut value_root = Value::undefined();
+    let mut scope = otter_gc::RootScope::new(heap);
+    // SAFETY: both locals are declared before the scope and remain at stable
+    // addresses until it is dropped.
+    unsafe {
+        scope.add_object(&mut prototype);
+        scope.add_value(&mut value_root);
+    }
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
-    roots.push(&prototype_root);
     roots.extend_from_slice(value_roots);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         for value in &roots {
             value.trace_value_slots(visitor);
         }
     };
-    let value = NativeFunction::from_call_with_roots(
-        heap,
-        "[Symbol.hasInstance]",
-        1,
-        NativeCall::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance),
-        &mut external_visit,
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let descriptor = PropertyDescriptor::data(Value::native_function(value), false, false, false);
+    value_root = Value::native_function(
+        NativeFunction::from_call_with_roots(
+            heap,
+            "[Symbol.hasInstance]",
+            1,
+            NativeCall::VmIntrinsic(VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance),
+            &mut external_visit,
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let descriptor = PropertyDescriptor::data(value_root, false, false, false);
     if !object::define_own_symbol_property(prototype, heap, well_known_has_instance, descriptor) {
         return Err(JsSurfaceError::DefinePropertyFailed("[Symbol.hasInstance]"));
     }
@@ -95,26 +104,33 @@ const fn intrinsic_method(
 /// the realm's `%ThrowTypeError%` intrinsic.
 pub(crate) fn install_restricted_accessors(
     heap: &mut otter_gc::GcHeap,
-    prototype: JsObject,
+    mut prototype: JsObject,
     value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let prototype_root = Value::object(prototype);
+    let mut thrower = Value::undefined();
+    let mut scope = otter_gc::RootScope::new(heap);
+    // SAFETY: both locals are declared before the scope and remain at stable
+    // addresses until it is dropped. One canonical `thrower` slot is reused
+    // for both accessor descriptors and rewritten by every intervening GC.
+    unsafe {
+        scope.add_object(&mut prototype);
+        scope.add_value(&mut thrower);
+    }
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
-    roots.push(&prototype_root);
     roots.extend_from_slice(value_roots);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         for value in &roots {
             value.trace_value_slots(visitor);
         }
     };
-    let thrower = Value::native_function(NativeFunction::throw_type_error_with_roots(
+    thrower = Value::native_function(NativeFunction::throw_type_error_with_roots(
         heap,
         throw_restricted_function_property,
         &mut external_visit,
     )?);
     for name in ["caller", "arguments"] {
         let descriptor = PropertyDescriptor::accessor(Some(thrower), Some(thrower), false, true);
-        if !object::define_own_property(prototype, heap, name, descriptor) {
+        if !object::define_own_property_in_place(&mut prototype, heap, name, descriptor) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
     }

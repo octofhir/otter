@@ -21,6 +21,7 @@
 //! - <https://tc39.es/ecma262/#sec-generatorfunction-objects>
 //! - <https://tc39.es/ecma262/#sec-async-function-objects>
 
+use crate::rooting::RootScopeExt;
 use crate::{
     ExecutionContext, Interpreter, JsObject, JsString, Value, gc_trace::GcTrace,
     js_surface::JsSurfaceError, native_function::NativeFunction, object, symbol::WellKnown,
@@ -45,35 +46,78 @@ pub(crate) struct FunctionKindPrototypes {
 impl FunctionKindPrototypes {
     pub(crate) fn build_post_bootstrap(
         heap: &mut otter_gc::GcHeap,
-        shape_root: object::ShapeHandle,
+        mut shape_root: object::ShapeHandle,
         function_proto: JsObject,
         function_ctor: Option<Value>,
         well_known: &crate::symbol::WellKnownSymbols,
     ) -> Result<Self, JsSurfaceError> {
-        let function_proto_value = Value::object(function_proto);
+        let mut function_proto_value = Value::object(function_proto);
+        let mut function_ctor_value = function_ctor.unwrap_or_else(Value::undefined);
+        let mut generator_ctor_root = Value::undefined();
+        let mut generator_proto_root = Value::undefined();
+        let mut async_ctor_root = Value::undefined();
+        let mut async_proto_root = Value::undefined();
+        let mut async_generator_ctor_root = Value::undefined();
+        let mut async_generator_proto_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: every canonical slot is declared before the scope and stays
+        // stationary until the completed cache is returned.
+        unsafe {
+            roots.add_raw_slot(
+                (&mut shape_root as *mut object::ShapeHandle).cast::<otter_gc::raw::RawGc>(),
+            );
+            roots.add_value(&mut function_proto_value);
+            roots.add_value(&mut function_ctor_value);
+            roots.add_value(&mut generator_ctor_root);
+            roots.add_value(&mut generator_proto_root);
+            roots.add_value(&mut async_ctor_root);
+            roots.add_value(&mut async_proto_root);
+            roots.add_value(&mut async_generator_ctor_root);
+            roots.add_value(&mut async_generator_proto_root);
+        }
         let tag_sym = well_known.get(WellKnown::ToStringTag);
         let mut make = |tag: &'static str,
                         call: crate::native_function::NativeFastFn|
          -> Result<(JsObject, JsObject), JsSurfaceError> {
-            let mut proto = {
+            let mut proto_root = Value::undefined();
+            let mut ctor_root = Value::undefined();
+            let mut native_root = Value::undefined();
+            let mut name_root = Value::undefined();
+            let mut local_roots = otter_gc::RootScope::new(heap);
+            // SAFETY: all four slots precede the nested scope and remain live
+            // through the complete constructor/prototype build.
+            unsafe {
+                local_roots.add_value(&mut proto_root);
+                local_roots.add_value(&mut ctor_root);
+                local_roots.add_value(&mut native_root);
+                local_roots.add_value(&mut name_root);
+            }
+            proto_root = Value::object({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                 };
                 object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
-            };
+            });
+            let proto = proto_root
+                .as_object()
+                .expect("function-kind prototype stays rooted");
+            let function_proto = function_proto_value
+                .as_object()
+                .expect("Function.prototype stays rooted");
             object::set_prototype(proto, heap, Some(function_proto));
             let tag_sym_root = tag_sym;
             let tag_string = {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                     tag_sym_root.trace_value_slots(visitor);
-                    let p = &mut proto as *mut JsObject as *mut RawGc;
-                    visitor(p);
                 };
                 JsString::from_str_with_roots(tag, heap, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
             };
+            let proto = proto_root
+                .as_object()
+                .expect("function-kind prototype stays rooted after tag allocation");
             object::define_own_symbol_property_partial(
                 proto,
                 heap,
@@ -87,42 +131,49 @@ impl FunctionKindPrototypes {
                 },
             );
 
-            let proto_value = Value::object(proto);
-            let ctor = {
+            ctor_root = Value::object({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
-                    proto_value.trace_value_slots(visitor);
+                    proto_root.trace_value_slots(visitor);
                 };
                 object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
-            };
+            });
+            let mut ctor = ctor_root
+                .as_object()
+                .expect("function-kind constructor stays rooted");
+            let mut proto = proto_root
+                .as_object()
+                .expect("function-kind prototype stays rooted");
             // §27.4.2 / §27.3.2 / §27.7.2 — the constructor's
             // [[Prototype]] is %Function% itself (these are Function
             // subclasses), falling back to %Function.prototype% in a
             // pre-bootstrap realm without a global Function binding.
-            match function_ctor {
-                Some(ctor_value) => {
-                    object::set_prototype_value(ctor, heap, Some(ctor_value));
-                }
-                None => object::set_prototype(ctor, heap, Some(function_proto)),
+            if function_ctor_value.is_undefined() {
+                let function_proto = function_proto_value
+                    .as_object()
+                    .expect("Function.prototype stays rooted");
+                object::set_prototype(ctor, heap, Some(function_proto));
+            } else {
+                object::set_prototype_value(ctor, heap, Some(function_ctor_value));
             }
-            object::define_own_property(
-                ctor,
+            object::define_own_property_in_place(
+                &mut ctor,
                 heap,
                 "prototype",
-                object::PropertyDescriptor::data(proto_value, false, false, false),
+                object::PropertyDescriptor::data(proto_root, false, false, false),
             );
+            ctor_root = Value::object(ctor);
             // §27.3.3.1 / §27.4.3.1 / §27.7.3.1 — { [[Writable]]:
             // false, [[Enumerable]]: false, [[Configurable]]: true }.
-            object::define_own_property(
-                proto,
+            object::define_own_property_in_place(
+                &mut proto,
                 heap,
                 "constructor",
-                object::PropertyDescriptor::data(Value::object(ctor), false, false, true),
+                object::PropertyDescriptor::data(ctor_root, false, false, true),
             );
-            let ctor_root = Value::object(ctor);
-            let proto_root = Value::object(proto);
-            let native = {
+            proto_root = Value::object(proto);
+            native_root = Value::native_function({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                     ctor_root.trace_value_slots(visitor);
@@ -130,13 +181,16 @@ impl FunctionKindPrototypes {
                 };
                 NativeFunction::new_constructor_static_with_roots(heap, tag, 1, call, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
-            };
-            object::set_constructor_native(ctor, heap, Value::native_function(native));
+            });
+            ctor = ctor_root
+                .as_object()
+                .expect("function-kind constructor stays rooted");
+            object::set_constructor_native(ctor, heap, native_root);
             // §27.3.2 / §27.4.2 / §27.7.2 — the constructor carries
             // `length = 1` and `name = tag`, both non-writable,
             // non-enumerable, configurable. Defined on the carrier
             // object since property reads resolve against it.
-            let name_string = {
+            name_root = Value::string({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                     ctor_root.trace_value_slots(visitor);
@@ -144,41 +198,59 @@ impl FunctionKindPrototypes {
                 };
                 JsString::from_str_with_roots(tag, heap, &mut visit)
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
-            };
-            object::define_own_property(
-                ctor,
+            });
+            ctor = ctor_root
+                .as_object()
+                .expect("function-kind constructor stays rooted after name allocation");
+            object::define_own_property_in_place(
+                &mut ctor,
                 heap,
                 "length",
                 object::PropertyDescriptor::data(Value::number_i32(1), false, false, true),
             );
-            object::define_own_property(
-                ctor,
+            ctor_root = Value::object(ctor);
+            object::define_own_property_in_place(
+                &mut ctor,
                 heap,
                 "name",
-                object::PropertyDescriptor::data(Value::string(name_string), false, false, true),
+                object::PropertyDescriptor::data(name_root, false, false, true),
             );
-            Ok((ctor, proto))
+            ctor_root = Value::object(ctor);
+            Ok((
+                ctor_root
+                    .as_object()
+                    .expect("function-kind constructor stays rooted"),
+                proto_root
+                    .as_object()
+                    .expect("function-kind prototype stays rooted"),
+            ))
         };
 
         let (generator_constructor, generator_prototype) = make(
             "GeneratorFunction",
             crate::intrinsics::function::generator_function_ctor_call,
         )?;
+        generator_ctor_root = Value::object(generator_constructor);
+        generator_proto_root = Value::object(generator_prototype);
         let (async_constructor, async_prototype) = make(
             "AsyncFunction",
             crate::intrinsics::function::async_function_ctor_call,
         )?;
+        async_ctor_root = Value::object(async_constructor);
+        async_proto_root = Value::object(async_prototype);
         let (async_generator_constructor, async_generator_prototype) = make(
             "AsyncGeneratorFunction",
             crate::intrinsics::function::async_generator_function_ctor_call,
         )?;
+        async_generator_ctor_root = Value::object(async_generator_constructor);
+        async_generator_proto_root = Value::object(async_generator_prototype);
         Ok(Self {
-            generator_constructor: Some(generator_constructor),
-            generator_prototype: Some(generator_prototype),
-            async_constructor: Some(async_constructor),
-            async_prototype: Some(async_prototype),
-            async_generator_constructor: Some(async_generator_constructor),
-            async_generator_prototype: Some(async_generator_prototype),
+            generator_constructor: generator_ctor_root.as_object(),
+            generator_prototype: generator_proto_root.as_object(),
+            async_constructor: async_ctor_root.as_object(),
+            async_prototype: async_proto_root.as_object(),
+            async_generator_constructor: async_generator_ctor_root.as_object(),
+            async_generator_prototype: async_generator_proto_root.as_object(),
             generator_object_prototype: None,
             async_generator_object_prototype: None,
         })
@@ -259,14 +331,40 @@ impl Interpreter {
     /// function's own `.prototype` object inherits from it.
     fn install_shared_generator_object_prototypes(&mut self) {
         use crate::intrinsics::iterator as iter_natives;
-        let iterator_proto = self
+        let mut iterator_parent_root = self
             .constructor_prototype_value("Iterator")
             .ok()
-            .and_then(|v| v.as_object());
+            .unwrap_or_else(Value::undefined);
+        let mut async_iterator_parent_root = Value::undefined();
+        let mut sync_kind_root = self
+            .function_kind_prototypes
+            .generator_prototype
+            .map(Value::object)
+            .unwrap_or_else(Value::undefined);
+        let mut async_kind_root = self
+            .function_kind_prototypes
+            .async_generator_prototype
+            .map(Value::object)
+            .unwrap_or_else(Value::undefined);
+        let mut sync_shared_root = Value::undefined();
+        let mut async_shared_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: all construction slots precede the scope and remain live
+        // until the finished prototypes are installed in interpreter fields.
+        unsafe {
+            roots.add_value(&mut iterator_parent_root);
+            roots.add_value(&mut async_iterator_parent_root);
+            roots.add_value(&mut sync_kind_root);
+            roots.add_value(&mut async_kind_root);
+            roots.add_value(&mut sync_shared_root);
+            roots.add_value(&mut async_shared_root);
+        }
         // §27.1.3 %AsyncIteratorPrototype% — `[[Prototype]]` is
         // %Object.prototype%; carries `@@asyncIterator` returning the
         // receiver. %AsyncGeneratorPrototype% inherits from it.
-        let async_iterator_proto = self.build_async_iterator_prototype();
+        if let Some(proto) = self.build_async_iterator_prototype() {
+            async_iterator_parent_root = Value::object(proto);
+        }
         type Methods = [(&'static str, crate::native_function::NativeFastFn); 3];
         let sync_methods: Methods = [
             ("next", iter_natives::generator_proto_next),
@@ -278,30 +376,31 @@ impl Interpreter {
             ("return", iter_natives::async_generator_proto_return),
             ("throw", iter_natives::async_generator_proto_throw),
         ];
-        let pairs = [
-            (
-                self.function_kind_prototypes.generator_prototype,
-                "Generator",
-                iterator_proto,
-                sync_methods,
-            ),
-            (
-                self.function_kind_prototypes.async_generator_prototype,
-                "AsyncGenerator",
-                async_iterator_proto,
-                async_methods,
-            ),
-        ];
         let tag_sym = self.well_known_symbols.get(WellKnown::ToStringTag);
-        let mut built: [Option<JsObject>; 2] = [None, None];
-        for (slot, (kind_proto, tag, parent, methods)) in built.iter_mut().zip(pairs) {
-            let Some(kind_proto) = kind_proto else {
-                continue;
+        for index in 0..2 {
+            let (kind_root, parent_root, shared_root, tag, methods) = if index == 0 {
+                (
+                    &sync_kind_root,
+                    &iterator_parent_root,
+                    &mut sync_shared_root,
+                    "Generator",
+                    sync_methods,
+                )
+            } else {
+                (
+                    &async_kind_root,
+                    &async_iterator_parent_root,
+                    &mut async_shared_root,
+                    "AsyncGenerator",
+                    async_methods,
+                )
             };
-            let kind_proto_value = Value::object(kind_proto);
+            if kind_root.as_object().is_none() {
+                continue;
+            }
             let Ok(shared) = ({
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    kind_proto_value.trace_value_slots(visitor);
+                    kind_root.trace_value_slots(visitor);
                 };
                 object::alloc_object_with_shape_roots(
                     &mut self.gc_heap,
@@ -311,23 +410,26 @@ impl Interpreter {
             }) else {
                 continue;
             };
-            if let Some(parent) = parent {
+            *shared_root = Value::object(shared);
+            if let Some(parent) = parent_root.as_object() {
                 object::set_prototype(shared, &mut self.gc_heap, Some(parent));
             }
             // §27.5.1.2-5 / §27.6.1.2-4 — own `next` / `return` /
             // `throw`, each with `length = 1`, { [[Writable]]: true,
             // [[Enumerable]]: false, [[Configurable]]: true }.
-            let shared_root = Value::object(shared);
             for (name, call) in methods {
                 let Ok(native) = crate::intrinsics::shared::native_static_with_value_roots(
                     &mut self.gc_heap,
                     name,
                     1,
                     call,
-                    &[&kind_proto_value, &shared_root],
+                    &[kind_root, shared_root],
                 ) else {
                     continue;
                 };
+                let shared = shared_root
+                    .as_object()
+                    .expect("shared generator prototype stays rooted");
                 object::define_own_property(
                     shared,
                     &mut self.gc_heap,
@@ -343,6 +445,9 @@ impl Interpreter {
             let Ok(tag_string) = JsString::from_str(tag, &mut self.gc_heap) else {
                 continue;
             };
+            let shared = shared_root
+                .as_object()
+                .expect("shared generator prototype stays rooted");
             object::define_own_symbol_property_partial(
                 shared,
                 &mut self.gc_heap,
@@ -359,26 +464,40 @@ impl Interpreter {
                 shared,
                 &mut self.gc_heap,
                 "constructor",
-                object::PropertyDescriptor::data(kind_proto_value, false, false, true),
+                object::PropertyDescriptor::data(*kind_root, false, false, true),
             );
+            let kind_proto = kind_root
+                .as_object()
+                .expect("function-kind prototype stays rooted");
             object::define_own_property(
                 kind_proto,
                 &mut self.gc_heap,
                 "prototype",
-                object::PropertyDescriptor::data(Value::object(shared), false, false, true),
+                object::PropertyDescriptor::data(*shared_root, false, false, true),
             );
-            *slot = Some(shared);
         }
-        self.function_kind_prototypes.generator_object_prototype = built[0];
+        self.function_kind_prototypes.generator_object_prototype = sync_shared_root.as_object();
         self.function_kind_prototypes
-            .async_generator_object_prototype = built[1];
+            .async_generator_object_prototype = async_shared_root.as_object();
     }
 
     /// §27.1.3 — allocate `%AsyncIteratorPrototype%` with its
     /// `@@asyncIterator` self-returner.
     fn build_async_iterator_prototype(&mut self) -> Option<JsObject> {
-        let object_proto = self.object_prototype_object_opt();
-        let proto = {
+        let mut object_proto_root = self
+            .object_prototype_object_opt()
+            .map(Value::object)
+            .unwrap_or_else(Value::undefined);
+        let mut proto_root = Value::undefined();
+        let mut native_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: every slot precedes the scope and remains live until return.
+        unsafe {
+            roots.add_value(&mut object_proto_root);
+            roots.add_value(&mut proto_root);
+            roots.add_value(&mut native_root);
+        }
+        proto_root = Value::object({
             let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
             object::alloc_object_with_shape_roots(
                 &mut self.gc_heap,
@@ -386,33 +505,36 @@ impl Interpreter {
                 &mut visit,
             )
             .ok()?
-        };
-        if let Some(object_proto) = object_proto {
+        });
+        let proto = proto_root.as_object()?;
+        if let Some(object_proto) = object_proto_root.as_object() {
             object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
         }
-        let proto_root = Value::object(proto);
-        let native = crate::intrinsics::shared::native_static_with_value_roots(
-            &mut self.gc_heap,
-            "[Symbol.asyncIterator]",
-            0,
-            crate::intrinsics::iterator::async_iterator_proto_symbol_async_iterator,
-            &[&proto_root],
-        )
-        .ok()?;
+        native_root = Value::native_function(
+            crate::intrinsics::shared::native_static_with_value_roots(
+                &mut self.gc_heap,
+                "[Symbol.asyncIterator]",
+                0,
+                crate::intrinsics::iterator::async_iterator_proto_symbol_async_iterator,
+                &[&proto_root],
+            )
+            .ok()?,
+        );
         let async_iter_sym = self.well_known_symbols.get(WellKnown::AsyncIterator);
+        let proto = proto_root.as_object()?;
         object::define_own_symbol_property_partial(
             proto,
             &mut self.gc_heap,
             async_iter_sym,
             object::PartialPropertyDescriptor {
-                value: Some(Value::native_function(native)),
+                value: Some(native_root),
                 writable: Some(true),
                 enumerable: Some(false),
                 configurable: Some(true),
                 ..Default::default()
             },
         );
-        Some(proto)
+        proto_root.as_object()
     }
 
     /// Shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%` for

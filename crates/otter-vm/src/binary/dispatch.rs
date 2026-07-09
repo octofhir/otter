@@ -701,7 +701,10 @@ mod tests {
         // owns the `ExternalMemory` token is collected. After full
         // GC, the external reservation is released even if the
         // body's own heap page is retained.
-        interp.gc_heap_mut().collect_full(&mut |_| {});
+        interp
+            .gc_heap_mut()
+            .collect_full(&mut |_| {})
+            .expect("full GC");
         assert!(interp.gc_heap().tracked_bytes() <= after - 64);
     }
 
@@ -725,7 +728,10 @@ mod tests {
         let after = interp.gc_heap().tracked_bytes();
         assert!(after - before >= 8);
         let _ = value;
-        interp.gc_heap_mut().collect_full(&mut |_| {});
+        interp
+            .gc_heap_mut()
+            .collect_full(&mut |_| {})
+            .expect("full GC");
         assert!(interp.gc_heap().tracked_bytes() <= after - 8);
     }
 
@@ -761,7 +767,10 @@ mod tests {
         // `buffer` is a `Copy` GC handle; the body it points at is
         // unreachable from any root, so a full GC collects it and
         // releases the external reservation.
-        interp.gc_heap_mut().collect_full(&mut |_| {});
+        interp
+            .gc_heap_mut()
+            .collect_full(&mut |_| {})
+            .expect("full GC");
         assert!(interp.gc_heap().tracked_bytes() <= after - 64);
     }
 
@@ -802,7 +811,10 @@ mod tests {
         );
         let after = interp.gc_heap().tracked_bytes();
         assert!(after - before >= 128);
-        interp.gc_heap_mut().collect_full(&mut |_| {});
+        interp
+            .gc_heap_mut()
+            .collect_full(&mut |_| {})
+            .expect("full GC");
         assert!(interp.gc_heap().tracked_bytes() <= after - 128);
     }
 }

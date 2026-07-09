@@ -4,6 +4,7 @@
 //!
 //! - [`ExtraRootSource`] — safe trait implemented by runtime owners of roots.
 //! - [`ExtraRoots`] — raw-pointer trampoline stored by [`crate::heap::GcHeap`].
+//! - [`ExtraRootsGuard`] — RAII registration removed on return or unwind.
 //!
 //! # Invariants
 //!
@@ -18,9 +19,10 @@
 //!
 //! # See also
 //!
-//! - [`crate::heap::GcHeap::push_extra_roots`]
+//! - [`crate::heap::GcHeap::register_extra_roots`]
 
 use crate::compressed::RawGc;
+use crate::heap::GcHeap;
 
 /// Safe callback surface for owner-managed root slots not stored in the heap's
 /// handle stack or global handle table.
@@ -72,5 +74,58 @@ impl ExtraRoots {
     #[must_use]
     pub fn same_source(&self, other: &Self) -> bool {
         std::ptr::eq(self.data, other.data) && std::ptr::fn_addr_eq(self.thunk, other.thunk)
+    }
+}
+
+/// RAII registration for an owner-managed runtime root source.
+///
+/// The guard intentionally stores a raw heap pointer so the mutator can keep
+/// using `&mut GcHeap` while the registration is active. Dropping it truncates
+/// the registration stack to its entry depth, which also cleans up any leaked
+/// nested registrations during unwinding.
+#[must_use = "dropping the guard immediately unregisters the root source"]
+pub struct ExtraRootsGuard {
+    heap: *mut GcHeap,
+    depth: usize,
+}
+
+impl ExtraRootsGuard {
+    pub(crate) fn new(heap: &mut GcHeap, depth: usize) -> Self {
+        Self { heap, depth }
+    }
+}
+
+impl Drop for ExtraRootsGuard {
+    fn drop(&mut self) {
+        // SAFETY: `GcHeap::register_extra_roots` creates the guard from a live
+        // heap and the guard cannot outlive the owning VM turn. The source
+        // lifetime remains the caller's existing `ExtraRoots` contract.
+        unsafe { (*self.heap).pop_extra_roots_to(self.depth) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    struct EmptySource;
+
+    impl ExtraRootSource for EmptySource {
+        fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {}
+    }
+
+    #[test]
+    fn guard_unregisters_source_on_unwind() {
+        let mut heap = GcHeap::new().expect("heap");
+        let source = EmptySource;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = heap.register_extra_roots(ExtraRoots::new(&source));
+            assert!(heap.has_extra_roots());
+            panic!("exercise unwind cleanup");
+        }));
+        assert!(result.is_err());
+        assert!(!heap.has_extra_roots());
     }
 }

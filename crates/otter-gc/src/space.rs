@@ -198,6 +198,29 @@ impl OldSpace {
         Ok(offset)
     }
 
+    /// Atomically reserve empty promotion pages before a copying collection.
+    ///
+    /// Pages are first acquired into a temporary vector. If the cage cannot
+    /// satisfy the complete request, that vector drops and the old space stays
+    /// unchanged. The returned index identifies the first reserved page so
+    /// unused pages can be released after the scavenge.
+    pub(crate) fn reserve_promotion_pages(&mut self, count: usize) -> Result<usize, OutOfMemory> {
+        let reserved = Page::new_many(SpaceKind::Old, count).ok_or(OutOfMemory::CageExhausted)?;
+        let start = self.pages.len();
+        self.pages.extend(reserved);
+        Ok(start)
+    }
+
+    /// Return unused pages from the most recent promotion reservation.
+    pub(crate) fn release_unused_promotion_pages(&mut self, start: usize) {
+        let mut index = 0usize;
+        self.pages.retain(|page| {
+            let keep = index < start || page.header().allocated_bytes != 0;
+            index += 1;
+            keep
+        });
+    }
+
     /// Total old-space pages.
     pub fn page_count(&self) -> usize {
         self.pages.len()

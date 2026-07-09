@@ -1202,6 +1202,9 @@ mod tests {
             Some(11)
         );
         let _ = result;
-        interp.gc_heap_mut().collect_full(&mut |_| {});
+        interp
+            .gc_heap_mut()
+            .collect_full(&mut |_| {})
+            .expect("full GC");
     }
 }

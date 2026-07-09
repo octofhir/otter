@@ -60,6 +60,7 @@ use std::ptr::NonNull;
 use crate::compressed::{RawGc, cage_base};
 use crate::header::GcHeader;
 use crate::heap::RootSlotVisitor;
+use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, Page, SpaceKind, align_up};
 use crate::space::{NewSpace, OldSpace};
 use crate::trace::TraceTable;
@@ -163,7 +164,44 @@ pub unsafe fn scavenge(
     ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
     remembered_parents: &mut Vec<RawGc>,
-) -> ScavengeStats {
+) -> Result<ScavengeStats, OutOfMemory> {
+    // Reserve every page promotion/fallback can need before forwarding the
+    // first object. After a forwarding write, cage exhaustion cannot be
+    // reported safely because roots and semispaces would already be partially
+    // rewritten.
+    //
+    // Every nursery object is at most half a page. First-fit packing therefore
+    // uses at most twice the number of source pages: at most one destination
+    // page can finish half-empty. Pages selected by age (or all active pages
+    // when a remembered parent can reach any nursery page) need that 2× bound
+    // in old space. Non-promoted pages use to-space first; reserve only their
+    // possible overflow beyond the existing to-space page count.
+    let active_pages = new_space
+        .from_pages()
+        .iter()
+        .filter(|page| page.header().allocated_bytes != 0)
+        .count();
+    let promotion_pages = if remembered_parents.is_empty() {
+        new_space
+            .from_pages()
+            .iter()
+            .filter(|page| {
+                page.header().allocated_bytes != 0
+                    && page.header().survival_age >= PROMOTE_AFTER_SURVIVALS
+            })
+            .count()
+    } else {
+        active_pages
+    };
+    let copy_pages = active_pages.saturating_sub(promotion_pages);
+    let copy_overflow = copy_pages
+        .saturating_mul(2)
+        .saturating_sub(new_space.to_pages().len());
+    let reserve_count = promotion_pages
+        .saturating_mul(2)
+        .saturating_add(copy_overflow);
+    let promotion_reserve_start = old_space.reserve_promotion_pages(reserve_count)?;
+
     // Promotions can append survivors to old-space pages while processing
     // roots. Snapshot pre-scavenge watermarks so Cheney scans those newly
     // promoted payloads instead of starting at the post-promotion bump cursor.
@@ -249,7 +287,10 @@ pub unsafe fn scavenge(
     // 9) Flip from↔to.
     ctx.new_space().flip();
 
-    ctx.stats
+    let stats = ctx.stats;
+    ctx.old_space()
+        .release_unused_promotion_pages(promotion_reserve_start);
+    Ok(stats)
 }
 
 /// Run reclamation hooks for every young body that was not evacuated.
@@ -896,7 +937,8 @@ mod tests {
                 &[],
                 &mut remembered,
             )
-        };
+        }
+        .expect("promotion preflight");
 
         assert_eq!(stats.promoted_bytes, total);
         assert_eq!(stats.copied_bytes, 0);

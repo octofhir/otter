@@ -41,10 +41,10 @@ fn bench(c: &mut Criterion) {
                 }
                 // Promote everything to old-gen so the full GC
                 // does meaningful work.
-                heap.collect_minor(otter_gc::EmptyRoots);
-                heap.collect_minor(otter_gc::EmptyRoots);
+                heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+                heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
                 let start = std::time::Instant::now();
-                heap.collect_full(&mut |_| {});
+                heap.collect_full(&mut |_| {}).expect("full GC");
                 total += start.elapsed();
             }
             total

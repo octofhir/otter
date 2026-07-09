@@ -49,7 +49,7 @@ fn scavenge_keeps_rooted_objects_alive() {
         }
     }
     // Trigger scavenge.
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     // Each rooted local still resolves to a valid header whose
     // payload matches the original.
@@ -74,7 +74,8 @@ fn scavenge_with_external_root_survives() {
     let g = heap.alloc(Cell { payload: 42 }).unwrap();
     let mut slot = g.raw();
     // Run scavenge feeding `slot` as an external root.
-    heap.collect_minor_with_roots(&mut |v| v(&mut slot as *mut RawGc));
+    heap.collect_minor_with_roots(&mut |v| v(&mut slot as *mut RawGc))
+        .expect("minor GC");
     // Slot got rewritten to the new offset.
     assert!(!slot.is_null());
     let new_g: otter_gc::Gc<Cell> = unsafe { slot.cast() };
@@ -91,7 +92,7 @@ fn scavenge_drops_unreachable_young_bodies() {
     heap.register_traceable::<DropCell>();
 
     let _dead = heap.alloc(DropCell).expect("alloc young body");
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     assert_eq!(YOUNG_DROP_COUNT.load(Ordering::SeqCst), 1);
 }

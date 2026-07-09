@@ -47,14 +47,14 @@ fn force_gc_resets_live_count_when_no_roots() {
         "<gc-smoke>",
     )
     .expect("script ran");
-    rt.force_gc();
+    rt.force_gc().expect("force GC");
     let first_object = rt.heap_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
 
-    rt.force_gc();
+    rt.force_gc().expect("force GC");
     let baseline_object = rt.heap_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     let baseline_cycles = rt.heap_stats().gc_cycles;
 
-    rt.force_gc();
+    rt.force_gc().expect("force GC");
     let stats = rt.heap_stats();
     assert!(
         baseline_object <= first_object,

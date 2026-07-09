@@ -82,6 +82,18 @@ pub fn alloc_upvalue(
     heap.alloc_old(UpvalueCellBody { value })
 }
 
+/// [`alloc_upvalue`] with caller-owned roots exposed to any collection the
+/// allocation triggers (heap-cap emergency full GC). Use when the caller
+/// holds young handles in plain Rust locals across this call — e.g. a frame
+/// under construction that is not yet on any traced stack.
+pub fn alloc_upvalue_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    value: Value,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<UpvalueCell, otter_gc::OutOfMemory> {
+    heap.alloc_old_with_roots(UpvalueCellBody { value }, external_visit)
+}
+
 /// Read the captured value of `cell`.
 #[must_use]
 pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {

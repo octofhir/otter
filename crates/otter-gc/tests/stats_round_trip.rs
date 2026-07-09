@@ -45,7 +45,7 @@ fn live_count_returns_to_zero_after_full_gc() {
         assert!(stats.by_type[Cell::TYPE_TAG as usize].live_bytes > 0);
     }
 
-    heap.collect_full(&mut |_| {});
+    heap.collect_full(&mut |_| {}).expect("full GC");
 
     let stats = heap.gc_stats();
     assert_eq!(stats.live_objects, 0, "expected baseline after GC");

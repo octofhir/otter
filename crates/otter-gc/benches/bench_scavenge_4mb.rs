@@ -37,7 +37,7 @@ fn bench(c: &mut Criterion) {
                         roots.push(scope.local(g));
                     }
                 }
-                heap.collect_minor(otter_gc::EmptyRoots);
+                heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
             }
             start.elapsed()
         });

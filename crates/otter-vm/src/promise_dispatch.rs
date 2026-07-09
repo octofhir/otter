@@ -93,8 +93,7 @@ impl otter_gc::ExtraRootSource for CombinatorRoot {
 /// RAII heap registration for [`CombinatorRoot`]: unregisters on drop
 /// so early error returns leave the heap's extra-roots stack balanced.
 struct SlotsRootGuard {
-    heap: *mut otter_gc::GcHeap,
-    depth: usize,
+    _registration: otter_gc::ExtraRootsGuard,
     /// Boxed so the registered source address stays stable for the
     /// registration's lifetime.
     _root: Box<CombinatorRoot>,
@@ -115,23 +114,12 @@ fn register_combinator_root(
         slots: slots.map(Arc::clone),
         locals: pointers,
     });
-    let depth = interp
+    let registration = interp
         .gc_heap_mut()
-        .push_extra_roots(otter_gc::ExtraRoots::new(&*root));
+        .register_extra_roots(otter_gc::ExtraRoots::new(&*root));
     SlotsRootGuard {
-        heap: interp.gc_heap_mut() as *mut otter_gc::GcHeap,
-        depth,
+        _registration: registration,
         _root: root,
-    }
-}
-
-impl Drop for SlotsRootGuard {
-    fn drop(&mut self) {
-        // SAFETY: the heap outlives every combinator call (it is owned
-        // by the interpreter driving it), and registrations are popped
-        // LIFO — nested native calls always pair their own push/pop
-        // before this guard drops.
-        unsafe { (*self.heap).pop_extra_roots_to(self.depth - 1) };
     }
 }
 

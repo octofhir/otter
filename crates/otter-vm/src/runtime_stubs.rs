@@ -774,10 +774,10 @@ fn collection_map_set_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let key = roots.value(1);
         if let Some(string) = key.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -792,9 +792,7 @@ fn collection_map_set_alloc_inner(
             Ok(()) => RuntimeStubResult::ok_value(roots.value(0)),
             Err(_) => RuntimeStubResult::out_of_memory(),
         }
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn collection_set_add_alloc_inner(
@@ -825,10 +823,10 @@ fn collection_set_add_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let value = roots.value(1);
         if let Some(string) = value.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -842,9 +840,7 @@ fn collection_set_add_alloc_inner(
             Ok(()) => RuntimeStubResult::ok_value(roots.value(0)),
             Err(_) => RuntimeStubResult::out_of_memory(),
         }
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn collection_map_get_alloc_inner(
@@ -875,10 +871,10 @@ fn collection_map_get_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let key = roots.value(1);
         if let Some(string) = key.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -891,9 +887,7 @@ fn collection_map_get_alloc_inner(
         RuntimeStubResult::ok_value(
             collections::map_get(map, &interp.gc_heap, &key).unwrap_or_else(Value::undefined),
         )
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn collection_map_has_alloc_inner(
@@ -924,10 +918,10 @@ fn collection_map_has_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let key = roots.value(1);
         if let Some(string) = key.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -942,9 +936,7 @@ fn collection_map_has_alloc_inner(
             &interp.gc_heap,
             &key,
         )))
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn collection_set_has_alloc_inner(
@@ -975,10 +967,10 @@ fn collection_set_has_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let value = roots.value(1);
         if let Some(string) = value.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -993,9 +985,7 @@ fn collection_set_has_alloc_inner(
             &interp.gc_heap,
             &value,
         )))
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn collection_map_delete_alloc_inner(
@@ -1026,10 +1016,10 @@ fn collection_map_delete_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let key = roots.value(1);
         if let Some(string) = key.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -1044,9 +1034,7 @@ fn collection_map_delete_alloc_inner(
             &mut interp.gc_heap,
             &key,
         )))
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn collection_set_delete_alloc_inner(
@@ -1077,10 +1065,10 @@ fn collection_set_delete_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let value = roots.value(1);
         if let Some(string) = value.as_string(&interp.gc_heap) {
             let _ = string.flatten_in_place(&mut interp.gc_heap);
@@ -1095,9 +1083,7 @@ fn collection_set_delete_alloc_inner(
             &mut interp.gc_heap,
             &value,
         )))
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn string_concat_alloc_inner(
@@ -1141,10 +1127,10 @@ fn string_concat_alloc_inner(
     }) else {
         return RuntimeStubResult::miss();
     };
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let result = (|| {
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    (|| {
         let lhs = roots.value(0);
         let rhs = roots.value(1);
         if lhs.as_string(&interp.gc_heap).is_none() && rhs.as_string(&interp.gc_heap).is_none() {
@@ -1168,9 +1154,7 @@ fn string_concat_alloc_inner(
             Ok(result) => RuntimeStubResult::ok_value(Value::string(result)),
             Err(_) => RuntimeStubResult::out_of_memory(),
         }
-    })();
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    })()
 }
 
 fn heap_ref(heap: *const otter_gc::GcHeap) -> Option<&'static otter_gc::GcHeap> {
@@ -1429,7 +1413,8 @@ mod tests {
             frame_roots,
             [arg_value, Value::undefined(), Value::undefined()],
         );
-        heap.collect_minor_with_roots(&mut |visitor| roots.visit_extra_roots(visitor));
+        heap.collect_minor_with_roots(&mut |visitor| roots.visit_extra_roots(visitor))
+            .expect("minor GC");
 
         let frame_after = Value::from_abi_bits(slots[0])
             .as_raw_gc()

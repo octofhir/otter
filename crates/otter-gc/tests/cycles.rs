@@ -51,11 +51,11 @@ fn full_gc_reclaims_unreachable_cycle() {
         let _root_a = scope.local(a);
         let _root_b = scope.local(b);
         // Both roots survive collect_full while scope is open.
-        heap.collect_full(&mut |_| {});
+        heap.collect_full(&mut |_| {}).expect("full GC");
     }
     // Scope closed — cycle is unreachable. Run another full GC
     // and assert cycle is reclaimed (live objects = 0).
-    heap.collect_full(&mut |_| {});
+    heap.collect_full(&mut |_| {}).expect("full GC");
 
     // Count live objects via for_each_live_object.
     let mut live = 0usize;

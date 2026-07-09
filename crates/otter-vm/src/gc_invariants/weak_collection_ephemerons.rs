@@ -19,7 +19,7 @@ fn collect_with_roots(heap: &mut otter_gc::GcHeap, roots: &mut [&mut RawGc]) {
             sv(*root as *mut RawGc);
         }
     };
-    heap.mark_phase(&mut visit);
+    heap.mark_phase(&mut visit).expect("mark phase");
     run_ephemeron_fixpoint(heap);
     heap.sweep_phase();
 }
@@ -191,7 +191,7 @@ fn allocation_during_mark_phase_registers_ephemerons_after_active_snapshot() {
         sv(&mut existing_root as *mut RawGc);
     };
 
-    heap.mark_phase(&mut visit);
+    heap.mark_phase(&mut visit).expect("mark phase");
     let snapshot_before = heap.ephemeron_tables_snapshot();
     let late = alloc_weak_map(&mut heap).expect("late weak map");
     let key = crate::test_support::alloc_old_object(&mut heap).expect("late key");

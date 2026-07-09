@@ -1671,7 +1671,7 @@ mod tests {
             // assuming `key` is unchanged across the collection.
             visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
-        heap.collect_minor_with_roots(&mut roots);
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
 
         let after = key.as_raw_gc().unwrap();
         assert_ne!(after, before);
@@ -1693,7 +1693,7 @@ mod tests {
             visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
             visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
-        heap.collect_minor_with_roots(&mut roots);
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
 
         let after = key.as_raw_gc().unwrap();
         assert_ne!(after, before);
@@ -1736,7 +1736,7 @@ mod tests {
             visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
             visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
-        heap.collect_minor_with_roots(&mut roots);
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
 
         let key_after = key.as_raw_gc().unwrap();
         let value_after = weak_map_get(wm, &heap, &key)
@@ -1760,7 +1760,7 @@ mod tests {
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
         };
-        heap.collect_minor_with_roots(&mut roots);
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
 
         assert_eq!(weak_map_len(wm, &heap), 0);
     }
@@ -1778,7 +1778,7 @@ mod tests {
             visitor(std::ptr::addr_of_mut!(ws) as *mut RawGc);
             visitor(std::ptr::addr_of_mut!(key) as *mut RawGc);
         };
-        heap.collect_minor_with_roots(&mut roots);
+        heap.collect_minor_with_roots(&mut roots).expect("minor GC");
 
         let after = key.as_raw_gc().unwrap();
         assert_ne!(after, before);

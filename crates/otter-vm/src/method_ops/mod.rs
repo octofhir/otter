@@ -1421,21 +1421,22 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let key = args.first().copied().unwrap_or_else(Value::undefined);
         let roots = CollectionFastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
             recv,
             args,
         };
-        let depth = self
+        let _roots_guard = self
             .gc_heap
-            .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
         // Flatten the string key once so stored keys stay flat and lookups
         // compare flat-vs-flat instead of re-materializing a rope per probe.
+        let key = roots.args.first().copied().unwrap_or_else(Value::undefined);
         if let Some(s) = key.as_string(&self.gc_heap) {
             let _ = s.flatten_in_place(&mut self.gc_heap);
         }
-        let result = (|| -> Result<Value, VmError> {
+        (|| -> Result<Value, VmError> {
+            let key = roots.args.first().copied().unwrap_or_else(Value::undefined);
             match op {
                 CollectionFastOp::MapGet => {
                     let map = roots.recv.as_map().ok_or(VmError::InvalidOperand)?;
@@ -1460,7 +1461,7 @@ impl Interpreter {
                 }
                 CollectionFastOp::MapSet => {
                     let map = roots.recv.as_map().ok_or(VmError::InvalidOperand)?;
-                    let value = args.get(1).copied().unwrap_or_else(Value::undefined);
+                    let value = roots.args.get(1).copied().unwrap_or_else(Value::undefined);
                     crate::collections::map_set(map, &mut self.gc_heap, key, value)
                         .map_err(VmError::from)?;
                     Ok(roots.recv)
@@ -1488,9 +1489,7 @@ impl Interpreter {
                     Ok(roots.recv)
                 }
             }
-        })();
-        self.gc_heap.pop_extra_roots_to(depth - 1);
-        result
+        })()
     }
 
     /// Run a resolved `Array.prototype` builtin with the receiver and arguments
@@ -1541,12 +1540,10 @@ impl Interpreter {
             recv,
             args,
         };
-        let depth = self
+        let _roots_guard = self
             .gc_heap
-            .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.array_live_method_dispatch(context, tag, recv, args, &[args]);
-        self.gc_heap.pop_extra_roots_to(depth - 1);
-        result
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        self.array_live_method_dispatch(context, tag, roots.recv, roots.args, &[roots.args])
     }
 
     fn try_fast_primitive_string_char_code_at(

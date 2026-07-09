@@ -10,7 +10,8 @@
 //! A [`Scoped`] handle carries only an index into that store, never a cached
 //! payload, so every read resolves through the current slot and can never be
 //! stale. Handles are minted inside [`Interpreter::with_handle_scope`], which
-//! owns the arena range it opened and truncates back to it on return, so a
+//! owns the arena range it opened and truncates back to it on return or panic,
+//! so a
 //! `Scoped` cannot outlive the scope that created it (the `'s` lifetime pins
 //! it) and can never dangle.
 //!
@@ -142,6 +143,47 @@ impl HandleScope {
     }
 }
 
+/// RAII owner for one handle-arena range and its temporary runtime roots.
+///
+/// The raw interpreter pointer avoids holding a Rust borrow across the scope
+/// closure; the caller already owns the interpreter mutably for the complete
+/// frame lifetime. `Drop` makes both ordinary returns and panic unwinding
+/// restore the exact arena/provider depths captured on entry.
+pub(crate) struct HandleScopeFrame {
+    interp: *mut Interpreter,
+    base: usize,
+    roots_guard: Option<otter_gc::ExtraRootsGuard>,
+}
+
+impl HandleScopeFrame {
+    pub(crate) fn enter(interp: &mut Interpreter) -> Self {
+        let base = interp.handle_arena.len();
+        let roots_guard = interp.scope_runtime_roots_guard();
+        Self {
+            interp,
+            base,
+            roots_guard,
+        }
+    }
+
+    pub(crate) fn token(&self) -> HandleScope {
+        HandleScope::new(self.base)
+    }
+}
+
+impl Drop for HandleScopeFrame {
+    fn drop(&mut self) {
+        // SAFETY: `enter` receives the mutably borrowed interpreter owned by the
+        // surrounding scope call. The frame cannot escape that call, and no
+        // other code uses this pointer while cleanup runs.
+        drop(self.roots_guard.take());
+        unsafe {
+            let interp = &mut *self.interp;
+            interp.handle_arena.truncate(self.base);
+        }
+    }
+}
+
 /// A rooted, always-current handle into the [`HandleArena`].
 ///
 /// `Copy` and cheap: it carries only the arena index, never a payload. The `'s`
@@ -220,9 +262,8 @@ impl Interpreter {
     /// Handles minted inside `f` (via `scoped_*`) borrow the `&HandleScope`
     /// token, not the interpreter, so allocating calls interleave freely with
     /// live handles. The `'s` lifetime pins every [`Scoped`] to the closure, so
-    /// none can escape. Truncation happens before the closure's result is
-    /// returned; an early `?` inside `f` propagates through the returned `R`,
-    /// so the truncation still runs on the normal return path here.
+    /// none can escape. An RAII frame restores both the arena and temporary
+    /// runtime-root registration on ordinary return, early `?`, or panic.
     ///
     /// Interpreter-internal reflection paths (e.g.
     /// `Object.getOwnPropertyDescriptors`) drive this variant directly; the
@@ -232,13 +273,9 @@ impl Interpreter {
         &mut self,
         f: impl FnOnce(&mut Interpreter, &HandleScope) -> R,
     ) -> R {
-        let base = self.handle_arena.len();
-        let scope = HandleScope::new(base);
-        let roots_depth = self.push_scope_runtime_roots();
-        let r = f(self, &scope);
-        self.pop_scope_runtime_roots(roots_depth);
-        self.handle_arena.truncate(base);
-        r
+        let frame = HandleScopeFrame::enter(self);
+        let scope = frame.token();
+        f(self, &scope)
     }
 
     /// Register this interpreter's full runtime root set (which includes the
@@ -258,9 +295,8 @@ impl Interpreter {
     ///
     /// Gated on [`otter_gc::GcHeap::has_extra_roots`] so the dispatch hot path
     /// pays nothing: it already has a provider, so this is a no-op there. Returns
-    /// the registration depth to unwind, or `None` when a provider was already
-    /// present. Pair with [`Self::pop_scope_runtime_roots`].
-    pub(crate) fn push_scope_runtime_roots(&mut self) -> Option<usize> {
+    /// an RAII registration, or `None` when a provider was already present.
+    pub(crate) fn scope_runtime_roots_guard(&mut self) -> Option<otter_gc::ExtraRootsGuard> {
         if self.gc_heap.has_extra_roots() {
             return None;
         }
@@ -269,15 +305,7 @@ impl Interpreter {
         // it, so the closure's `&mut self` reborrow is sound (mirrors
         // `Interpreter::run_callable_sync`).
         let extra = otter_gc::ExtraRoots::new(self as &Interpreter);
-        Some(self.gc_heap.push_extra_roots(extra))
-    }
-
-    /// Unwind the registration [`Self::push_scope_runtime_roots`] installed, if
-    /// any.
-    pub(crate) fn pop_scope_runtime_roots(&mut self, depth: Option<usize>) {
-        if let Some(depth) = depth {
-            self.gc_heap.pop_extra_roots_to(depth - 1);
-        }
+        Some(self.gc_heap.register_extra_roots(extra))
     }
 
     /// Root an incoming raw `Value` in the current scope and hand back a
@@ -742,22 +770,6 @@ impl Interpreter {
             .map_err(VmError::from)
     }
 
-    /// Current scope-handle arena length — the truncation base a fresh scope
-    /// captures on entry. Used by the native-context [`crate::NativeCtx::scope`]
-    /// wrapper, which opens and closes a scope without threading through
-    /// [`Self::with_handle_scope`] (its closure hands back the interpreter, not
-    /// the native context).
-    pub(crate) fn handle_arena_len(&self) -> usize {
-        self.handle_arena.len()
-    }
-
-    /// Truncate the scope-handle arena back to `base`, dropping every slot a
-    /// scope opened. Paired with [`Self::handle_arena_len`] by the native-context
-    /// scope wrapper.
-    pub(crate) fn handle_arena_truncate(&mut self, base: usize) {
-        self.handle_arena.truncate(base);
-    }
-
     /// Read the current raw `Value` behind a scope handle for immediate
     /// hand-off across the scope boundary (returning to the VM, or storing into
     /// an already-rooted object). Valid until the next allocation.
@@ -781,11 +793,13 @@ impl Interpreter {
     /// inside a `NativeCtx::scope` closure with handles live.
     pub(crate) fn collect_minor_tracing_runtime_roots(&mut self) {
         let roots = self.collect_runtime_roots();
-        self.gc_heap.collect_minor_with_roots(&mut |visitor| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        });
+        self.gc_heap
+            .collect_minor_with_roots(&mut |visitor| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+            })
+            .expect("minor GC");
     }
 
     /// Force a minor collection that roots *only* `receiver`, exactly as
@@ -800,9 +814,11 @@ impl Interpreter {
             .get(receiver.index())
             .as_raw_gc()
             .expect("receiver is a heap cell");
-        self.gc_heap.collect_minor_with_roots(&mut |visitor| {
-            visitor(&mut raw as *mut RawGc);
-        });
+        self.gc_heap
+            .collect_minor_with_roots(&mut |visitor| {
+                visitor(&mut raw as *mut RawGc);
+            })
+            .expect("minor GC");
     }
 
     /// Force a full (mark-sweep) collection while tracing the full runtime root
@@ -811,11 +827,13 @@ impl Interpreter {
     /// keeps a handle live.
     fn collect_full_tracing_runtime_roots(&mut self) {
         let roots = self.collect_runtime_roots();
-        self.gc_heap.collect_full(&mut |visitor| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        });
+        self.gc_heap
+            .collect_full(&mut |visitor| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+            })
+            .expect("full GC");
     }
 }
 
@@ -877,6 +895,24 @@ mod tests {
         assert_eq!(out, Some(7));
         // The scope range is gone once the wrapper returns.
         assert_eq!(interp.handle_arena_len_for_test(), base);
+    }
+
+    #[test]
+    fn scope_truncates_and_unwinds_roots_on_panic() {
+        let mut interp = Interpreter::new();
+        let base = interp.handle_arena_len_for_test();
+        assert!(!interp.gc_heap().has_extra_roots());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            interp.with_handle_scope(|interp, scope| {
+                let _root = interp.scoped_value(scope, imm(7));
+                panic!("scope body");
+            });
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(interp.handle_arena_len_for_test(), base);
+        assert!(!interp.gc_heap().has_extra_roots());
     }
 
     #[test]

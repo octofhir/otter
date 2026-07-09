@@ -26,10 +26,8 @@ impl Interpreter {
         // scope, and settling can allocate reaction records — root
         // the runtime state for the duration.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
-        let settled = self.settle_dynamic_import_inner(token, outcome);
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
-        settled
+        let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
+        self.settle_dynamic_import_inner(token, outcome)
     }
 
     pub(crate) fn settle_dynamic_import_inner(
@@ -93,10 +91,10 @@ impl Interpreter {
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
         self.enter_sync_reentry()?;
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let result =
             self.run_module_init_inner(context, function_id, env, import_meta, hoist_phase);
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        drop(extra_roots_guard);
         self.leave_sync_reentry();
         result
     }

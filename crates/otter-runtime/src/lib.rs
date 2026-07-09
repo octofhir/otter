@@ -110,6 +110,7 @@ pub use otter_vm::CpuProfile;
 pub use otter_vm::{
     AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
     MethodSpec, NativeCall, ObjectBuilder, Value, array, bootstrap, intrinsic_install, object,
+    rooting,
 };
 // Unrenamed re-exports consumed by `#[js_class]`- and `couch!`-generated
 // glue, which must resolve the same `::otter_vm::…` paths whether they
@@ -3147,8 +3148,8 @@ impl Runtime {
     /// [`otter_vm::runtime_state::RuntimeState::trace_roots`]
     /// (task 75) via [`otter_vm::Interpreter::force_gc`], which
     /// owns the heap and does the split-borrow internally.
-    pub fn force_gc(&mut self) {
-        self.interp.force_gc();
+    pub fn force_gc(&mut self) -> Result<(), OtterError> {
+        self.interp.force_gc().map_err(Into::into)
     }
 
     /// Configured stack-depth cap.
@@ -3234,11 +3235,6 @@ impl Runtime {
         start: std::time::Instant,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
         let context = self.interp.link_module(module);
-        // Arm GC-stress mode (no-op unless OTTER_GC_STRESS is set) now
-        // that bootstrap + module linking are done, so forced collections
-        // exercise user code and hot native paths, not the not-yet-
-        // hardened engine setup code.
-        self.interp.gc_heap_mut().arm_gc_stress();
         // Run the script first; the script error wins if both the
         // script and the drain fail. On script success we still
         // drain so any `queueMicrotask` registered during script

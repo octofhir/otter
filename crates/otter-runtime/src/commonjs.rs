@@ -164,10 +164,9 @@ fn make_shim_require(ctx: &mut NativeCtx<'_>, deps: &[(&str, Value)]) -> Result<
             )),
         }
     };
-    // Use the root-aware `NativeCtx` method (not the free `native_value_with_captures`,
-    // which traces no roots): the closure allocation must keep the module-root
-    // stack reachable across the collection it may trigger.
-    ctx.native_value_with_captures("require", captures, &[], &[], closure)
+    // `NativeCtx::native_value` traces runtime state and captures itself; no
+    // caller-managed root slices are needed here.
+    ctx.native_value("require", captures, closure)
         .map_err(|e| e.to_string())
 }
 
@@ -252,8 +251,7 @@ fn make_require(
     // Root-aware native allocation (see `make_shim_require`): the closure
     // allocation traces the live RuntimeState roots — including the module-root
     // stack — rather than `no_roots`.
-    ctx.native_value_with_captures("require", captures, &[], &[], closure)
-        .map_err(oom)
+    ctx.native_value("require", captures, closure).map_err(oom)
 }
 
 /// Resolve and load a module by specifier from `dir`. Returns the module's

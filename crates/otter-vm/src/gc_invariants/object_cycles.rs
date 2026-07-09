@@ -34,7 +34,7 @@ fn proto_cycle_reaped() {
     // `Interpreter::new`. Anything reachable from globalThis
     // (which is itself a strong root per
     // `RuntimeState::trace_roots`) is part of the baseline.
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
 
@@ -64,7 +64,7 @@ fn proto_cycle_reaped() {
     // `b` reference each other through their `[[Prototype]]`
     // slots, neither is white-anchored to a root, so the
     // marker leaves them white and the sweep reclaims them.
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     assert!(
         after <= baseline,

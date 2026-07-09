@@ -46,7 +46,7 @@ fn counter_closure_no_leak_after_force_gc() {
     // The IIFE left no live reference, so every upvalue cell is
     // unreachable. Force a full GC and assert the per-type live byte
     // count returns to baseline.
-    rt.force_gc();
+    rt.force_gc().expect("force GC");
     let after = rt.heap_stats().by_type[UPVALUE_CELL_TYPE_TAG as usize].live_bytes;
     assert_eq!(
         after, baseline,

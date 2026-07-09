@@ -35,6 +35,7 @@ use std::marker::PhantomData;
 use crate::native_function::{NativeCall, NativeFunction};
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor, PropertyFlags};
+use crate::rooting::RootScopeExt;
 use crate::{ClassConstructor, NativeCtx, Value};
 
 /// Explicit JavaScript property attributes.
@@ -293,12 +294,6 @@ impl RootedObject {
         }
     }
 
-    /// The rooted slot to thread into an allocation's external root set. Passed
-    /// by reference so the collector can rewrite it in place across the alloc.
-    fn root(&self) -> &Value {
-        &self.slot
-    }
-
     /// The object's current location, resolved through the collector-tracked
     /// slot.
     fn get(&self) -> JsObject {
@@ -448,34 +443,23 @@ impl<'rt> ObjectBuilder<'rt> {
         }
     }
 
-    /// Allocate a static builtin native function, threading the builder's object
-    /// slot and carried roots so nothing the caller relies on can be swept.
-    ///
-    /// The single funnel every allocating builder method routes through: it
-    /// unconditionally roots [`RootedObject::root`], so the object slot is
-    /// rewritten in place across the allocation and a following
-    /// [`RootedObject::get`] read is never stale. `extra_roots` carries any
-    /// in-flight sibling (e.g. an accessor getter live across the setter
-    /// allocation).
+    /// Allocate a static builtin native function. The caller owns one
+    /// [`otter_gc::RootScope`] spanning the allocation and the subsequent
+    /// property definition, so this helper only has to publish audited raw
+    /// runtime slots that cannot be represented as `Value`s.
     fn alloc_native(
         &mut self,
         name: &'static str,
         length: u8,
         call: NativeCall,
-        extra_roots: &[&Value],
     ) -> Result<NativeFunction, JsSurfaceError> {
-        let mut roots: Vec<&Value> =
-            Vec::with_capacity(self.value_roots.len() + 1 + extra_roots.len());
-        roots.push(self.object.root());
-        roots.extend(extra_roots.iter().copied());
-        roots.extend(self.value_roots.iter());
         native_from_call_with_raw_roots(
             self.heap,
             name,
             length,
             call,
             self.raw_roots.as_slice(),
-            roots.as_slice(),
+            &[],
             &[],
         )
         .map_err(JsSurfaceError::from)
@@ -488,6 +472,15 @@ impl<'rt> ObjectBuilder<'rt> {
         value: Value,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
+        let mut value = value;
+        let mut roots = otter_gc::RootScope::new(self.heap);
+        // SAFETY: every registered field/local remains stationary until the
+        // property definition completes and the guard is dropped.
+        unsafe {
+            roots.add_value(&mut self.object.slot);
+            roots.add_value_vec(&mut self.value_roots);
+            roots.add_value(&mut value);
+        }
         let mut object = self.object.get();
         define_data_in_place(&mut object, self.heap, name, value, attrs)?;
         self.object.store(object);
@@ -507,20 +500,18 @@ impl<'rt> ObjectBuilder<'rt> {
         call: NativeCall,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
-        // Building the native function can drive a moving collection that
-        // relocates the builder object. `alloc_native` threads the object slot,
-        // so the collector rewrites it in place; the post-alloc `object()` read
-        // resolves the current location and the define never writes through a
-        // vacated cell.
-        let native = self.alloc_native(name, length, call, &[])?;
+        let mut native_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(self.heap);
+        // SAFETY: the builder fields and local root precede this guard and are
+        // not moved until both allocation and definition finish.
+        unsafe {
+            roots.add_value(&mut self.object.slot);
+            roots.add_value_vec(&mut self.value_roots);
+            roots.add_value(&mut native_root);
+        }
+        native_root = Value::native_function(self.alloc_native(name, length, call)?);
         let mut object = self.object.get();
-        define_data_in_place(
-            &mut object,
-            self.heap,
-            name,
-            Value::native_function(native),
-            attrs,
-        )?;
+        define_data_in_place(&mut object, self.heap, name, native_root, attrs)?;
         self.object.store(object);
         Ok(self)
     }
@@ -532,33 +523,28 @@ impl<'rt> ObjectBuilder<'rt> {
 
     /// Define an accessor property.
     pub fn accessor_from_spec(&mut self, spec: &AccessorSpec) -> Result<&mut Self, JsSurfaceError> {
-        let getter = match &spec.get {
-            Some(call) => Some(Value::native_function(self.alloc_native(
-                spec.get_name,
-                0,
-                call.clone(),
-                &[],
-            )?)),
-            None => None,
-        };
-        // The getter is live across the setter allocation; thread it as an extra
-        // root so `getter_root` is rewritten in place and stays current. The
-        // object slot is kept current by the funnel itself.
-        let getter_root = getter.unwrap_or_else(Value::undefined);
-        let setter = match &spec.set {
-            Some(call) => Some(Value::native_function(self.alloc_native(
-                spec.set_name,
-                1,
-                call.clone(),
-                &[&getter_root],
-            )?)),
-            None => None,
-        };
-        // `getter_root` tracked the setter allocation's relocation; `setter` is
-        // fresh (nothing allocates after it) and defining an accessor performs no
-        // GC allocation, so no handle is stale here. The object is resolved
-        // through its slot for the write.
-        let getter = getter.map(|_| getter_root);
+        let mut getter_root = Value::undefined();
+        let mut setter_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(self.heap);
+        // SAFETY: builder fields and both locals precede the guard and remain
+        // stationary across getter allocation, setter allocation, and the
+        // potentially allocating descriptor installation.
+        unsafe {
+            roots.add_value(&mut self.object.slot);
+            roots.add_value_vec(&mut self.value_roots);
+            roots.add_value(&mut getter_root);
+            roots.add_value(&mut setter_root);
+        }
+        if let Some(call) = &spec.get {
+            getter_root =
+                Value::native_function(self.alloc_native(spec.get_name, 0, call.clone())?);
+        }
+        if let Some(call) = &spec.set {
+            setter_root =
+                Value::native_function(self.alloc_native(spec.set_name, 1, call.clone())?);
+        }
+        let getter = spec.get.as_ref().map(|_| getter_root);
+        let setter = spec.set.as_ref().map(|_| setter_root);
         let descriptor = PropertyDescriptor::accessor(
             getter,
             setter,
@@ -623,76 +609,93 @@ impl<'rt> ConstructorBuilder<'rt> {
 
     /// Build a constructor object with `.prototype` and method bags.
     pub fn build(self) -> Result<JsObject, JsSurfaceError> {
-        let root_refs: Vec<&Value> = self.value_roots.iter().collect();
-        let ctor = alloc_object_with_raw_roots(
-            self.heap,
-            self.raw_roots.as_slice(),
-            root_refs.as_slice(),
+        let Self {
+            heap,
+            spec,
+            raw_roots,
+            mut value_roots,
+            _not_send_sync: _,
+        } = self;
+        let mut ctor_root = Value::undefined();
+        let mut proto_root = Value::undefined();
+        let mut function_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the owned root vector and canonical build slots all precede
+        // the guard and remain stationary until the constructor is complete.
+        unsafe {
+            roots.add_value_vec(&mut value_roots);
+            roots.add_value(&mut ctor_root);
+            roots.add_value(&mut proto_root);
+            roots.add_value(&mut function_root);
+        }
+        ctor_root = Value::object(alloc_object_with_raw_roots(
+            heap,
+            raw_roots.as_slice(),
             &[],
-        )?;
-        let ctor_root = Value::object(ctor);
-        let mut proto_roots = Vec::with_capacity(root_refs.len() + 1);
-        proto_roots.push(&ctor_root);
-        proto_roots.extend(root_refs.iter().copied());
-        let proto = alloc_object_with_raw_roots(
-            self.heap,
-            self.raw_roots.as_slice(),
-            proto_roots.as_slice(),
             &[],
-        )?;
-        let proto_root = Value::object(proto);
-        let mut function_roots = Vec::with_capacity(root_refs.len() + 2);
-        function_roots.push(&ctor_root);
-        function_roots.push(&proto_root);
-        function_roots.extend(root_refs.iter().copied());
-        let function = native_from_call_with_raw_roots(
-            self.heap,
-            self.spec.name,
-            self.spec.length,
-            self.spec.call.clone(),
-            self.raw_roots.as_slice(),
-            function_roots.as_slice(),
+        )?);
+        proto_root = Value::object(alloc_object_with_raw_roots(
+            heap,
+            raw_roots.as_slice(),
             &[],
-        )?;
-        let function_root = Value::native_function(function);
+            &[],
+        )?);
+        function_root = Value::native_function(native_from_call_with_raw_roots(
+            heap,
+            spec.name,
+            spec.length,
+            spec.call.clone(),
+            raw_roots.as_slice(),
+            &[],
+            &[],
+        )?);
         define_data(
-            ctor,
-            self.heap,
+            ctor_root
+                .as_object()
+                .expect("constructor object stays rooted"),
+            heap,
             "call",
             function_root,
             Attr::builtin_function(),
         )?;
         define_data(
-            ctor,
-            self.heap,
+            ctor_root
+                .as_object()
+                .expect("constructor object stays rooted"),
+            heap,
             "prototype",
-            Value::object(proto),
+            proto_root,
             Attr::data(),
         )?;
-        let mut builder_roots = Vec::with_capacity(self.value_roots.len() + 3);
-        builder_roots.push(ctor_root);
-        builder_roots.push(proto_root);
-        builder_roots.push(function_root);
-        builder_roots.extend(self.value_roots);
-        for method in self.spec.static_methods {
-            ObjectBuilder::from_object_with_raw_and_value_roots(
-                self.heap,
-                ctor,
-                self.raw_roots.clone(),
-                builder_roots.clone(),
-            )
-            .method_from_spec(method)?;
+
+        let mut ctor_builder = ObjectBuilder::from_object_with_raw_and_value_roots(
+            heap,
+            ctor_root
+                .as_object()
+                .expect("constructor object stays rooted"),
+            raw_roots.clone(),
+            Vec::new(),
+        );
+        for method in spec.static_methods {
+            ctor_builder.method_from_spec(method)?;
         }
-        for method in self.spec.prototype_methods {
-            ObjectBuilder::from_object_with_raw_and_value_roots(
-                self.heap,
-                proto,
-                self.raw_roots.clone(),
-                builder_roots.clone(),
-            )
-            .method_from_spec(method)?;
+        ctor_root = Value::object(ctor_builder.build());
+
+        let mut proto_builder = ObjectBuilder::from_object_with_raw_and_value_roots(
+            heap,
+            proto_root
+                .as_object()
+                .expect("constructor prototype stays rooted"),
+            raw_roots,
+            Vec::new(),
+        );
+        for method in spec.prototype_methods {
+            proto_builder.method_from_spec(method)?;
         }
-        Ok(ctor)
+        let _ = proto_builder.build();
+        Ok(ctor_root
+            .as_object()
+            .expect("constructor object stays rooted through build"))
     }
 }
 
@@ -738,94 +741,104 @@ impl<'rt> ClassBuilder<'rt> {
 
     /// Build the class constructor value.
     pub fn build(self) -> Result<Value, JsSurfaceError> {
-        let root_refs: Vec<&Value> = self.value_roots.iter().collect();
-        let prototype = alloc_object_with_raw_roots(
-            self.heap,
-            self.raw_roots.as_slice(),
-            root_refs.as_slice(),
+        let Self {
+            heap,
+            spec,
+            raw_roots,
+            mut value_roots,
+            _not_send_sync: _,
+        } = self;
+        let mut prototype_root = Value::undefined();
+        let mut statics_root = Value::undefined();
+        let mut constructor_root = Value::undefined();
+        let mut class_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the owned roots and all canonical build slots precede the
+        // guard and remain stationary until the class graph is complete.
+        unsafe {
+            roots.add_value_vec(&mut value_roots);
+            roots.add_value(&mut prototype_root);
+            roots.add_value(&mut statics_root);
+            roots.add_value(&mut constructor_root);
+            roots.add_value(&mut class_root);
+        }
+        prototype_root = Value::object(alloc_object_with_raw_roots(
+            heap,
+            raw_roots.as_slice(),
             &[],
-        )?;
-        let prototype_root = Value::object(prototype);
-        let mut statics_roots = Vec::with_capacity(root_refs.len() + 1);
-        statics_roots.push(&prototype_root);
-        statics_roots.extend(root_refs.iter().copied());
-        let statics = alloc_object_with_raw_roots(
-            self.heap,
-            self.raw_roots.as_slice(),
-            statics_roots.as_slice(),
-            &[],
-        )?;
-        let statics_root = Value::object(statics);
-        let mut constructor_roots = Vec::with_capacity(root_refs.len() + 2);
-        constructor_roots.push(&prototype_root);
-        constructor_roots.push(&statics_root);
-        constructor_roots.extend(root_refs.iter().copied());
-        let constructor = Value::native_function(native_from_call_with_raw_roots(
-            self.heap,
-            self.spec.constructor.name,
-            self.spec.constructor.length,
-            self.spec.constructor.call.clone(),
-            self.raw_roots.as_slice(),
-            constructor_roots.as_slice(),
             &[],
         )?);
-        let mut builder_roots = Vec::with_capacity(self.value_roots.len() + 3);
-        builder_roots.push(prototype_root);
-        builder_roots.push(statics_root);
-        builder_roots.push(constructor);
-        builder_roots.extend(self.value_roots);
+        statics_root = Value::object(alloc_object_with_raw_roots(
+            heap,
+            raw_roots.as_slice(),
+            &[],
+            &[],
+        )?);
+        constructor_root = Value::native_function(native_from_call_with_raw_roots(
+            heap,
+            spec.constructor.name,
+            spec.constructor.length,
+            spec.constructor.call.clone(),
+            raw_roots.as_slice(),
+            &[],
+            &[],
+        )?);
 
         {
             let mut static_builder = ObjectBuilder::from_object_with_raw_and_value_roots(
-                self.heap,
-                statics,
-                self.raw_roots.clone(),
-                builder_roots.clone(),
+                heap,
+                statics_root.as_object().expect("class statics stay rooted"),
+                raw_roots.clone(),
+                Vec::new(),
             );
-            for method in self.spec.constructor.static_methods {
+            for method in spec.constructor.static_methods {
                 static_builder.method_from_spec(method)?;
             }
+            statics_root = Value::object(static_builder.build());
         }
 
         {
             let mut prototype_builder = ObjectBuilder::from_object_with_raw_and_value_roots(
-                self.heap,
-                prototype,
-                self.raw_roots.clone(),
-                builder_roots.clone(),
+                heap,
+                prototype_root
+                    .as_object()
+                    .expect("class prototype stays rooted"),
+                raw_roots.clone(),
+                Vec::new(),
             );
-            for method in self.spec.constructor.prototype_methods {
+            for method in spec.constructor.prototype_methods {
                 prototype_builder.method_from_spec(method)?;
             }
-            for accessor in self.spec.prototype_accessors {
+            for accessor in spec.prototype_accessors {
                 prototype_builder.accessor_from_spec(accessor)?;
             }
+            prototype_root = Value::object(prototype_builder.build());
         }
 
-        let class_roots: Vec<&Value> = builder_roots.iter().collect();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            visit_raw_and_value_roots(
-                visitor,
-                self.raw_roots.as_slice(),
-                class_roots.as_slice(),
-                &[],
-            );
+            for &slot in &raw_roots {
+                visitor(slot);
+            }
         };
-        let class = Value::class_constructor(ClassConstructor::new_with_roots(
-            self.heap,
-            constructor,
-            prototype,
-            statics,
+        class_root = Value::class_constructor(ClassConstructor::new_with_roots(
+            heap,
+            constructor_root,
+            prototype_root
+                .as_object()
+                .expect("class prototype stays rooted"),
+            statics_root.as_object().expect("class statics stay rooted"),
             &mut external_visit,
         )?);
         define_data(
-            prototype,
-            self.heap,
+            prototype_root
+                .as_object()
+                .expect("class prototype stays rooted"),
+            heap,
             "constructor",
-            class,
+            class_root,
             Attr::builtin_function(),
         )?;
-        Ok(class)
+        Ok(class_root)
     }
 }
 

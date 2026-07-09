@@ -217,7 +217,7 @@ fn load_string_constant_reuses_traced_cache_entry() {
     assert!(interp.run(&context).unwrap().is_string());
     assert_eq!(interp.string_constant_cache_len_for_test(), 1);
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     assert!(interp.run(&context).unwrap().is_string());
     assert_eq!(interp.string_constant_cache_len_for_test(), 1);
@@ -301,7 +301,7 @@ fn load_bigint_constant_reuses_traced_cache_entry() {
     assert!(interp.run(&context).unwrap().is_big_int());
     assert_eq!(interp.bigint_constant_cache_len_for_test(), 1);
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
 
     assert!(interp.run(&context).unwrap().is_big_int());
     assert_eq!(interp.bigint_constant_cache_len_for_test(), 1);
@@ -3336,7 +3336,7 @@ fn direct_bytecode_async_call_window_populates_parameters() {
     // Result promises live in old space (bodies must not move under
     // handle copies held across allocations); the state must survive
     // a full collection.
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert_eq!(
         promise.state(interp.gc_heap()),
         crate::promise::PromiseState::Fulfilled(Value::number(NumberValue::Smi(144)))
@@ -3528,7 +3528,7 @@ fn promise_fulfilled_of_allocates_the_body_in_old_space() {
     // and a moving young body under a fixed copy was the
     // use-after-move family. The body must survive a full scavenge
     // untouched.
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert_eq!(
         promise.state(interp.gc_heap()),
         crate::promise::PromiseState::Fulfilled(Value::number(NumberValue::Smi(211)))

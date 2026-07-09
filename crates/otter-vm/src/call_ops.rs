@@ -79,11 +79,11 @@ fn invoke_native_call_with_roots(
     roots.value_roots.extend_from_slice(value_roots);
     // Pushed (not installed) so any outer scope's value/slice roots
     // stay visible to scavenges triggered inside this native.
-    let depth = interp
+    let _roots_guard = interp
         .gc_heap
-        .push_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let call_info = NativeCallInfo::call(this_root);
-    let result = if let Some(global) = realm_global {
+    if let Some(global) = realm_global {
         interp.with_host_realm_global(global, |interp| {
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
@@ -94,9 +94,7 @@ fn invoke_native_call_with_roots(
         let mut ctx = NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
         raw.map_err(|e| native_to_vm_error(interp, e))
-    };
-    interp.gc_heap.pop_extra_roots_to(depth - 1);
-    result
+    }
 }
 
 struct PreparedBytecodeFrame {
@@ -411,8 +409,23 @@ impl Interpreter {
         if function.is_async || function.is_generator || function.is_method {
             return Err(self.err_type(("function is not a constructor".to_string()).into()));
         }
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        // Everything read below lives in plain Rust locals while this frame
+        // is not yet on any traced stack: a collection triggered by the cell
+        // allocations must rewrite them in place or they go stale.
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            current.trace_value_slots(visitor);
+            new_target.trace_value_slots(visitor);
+            visitor(&receiver as *const JsObject as *mut RawGc);
+            for value in &args {
+                value.trace_value_slots(visitor);
+            }
+        };
+        let upvalues = Frame::build_upvalues_for_exec_with_roots(
+            &mut self.gc_heap,
+            function,
+            parent_upvalues,
+            &mut build_roots,
+        )?;
         // §10.2.2 — a derived constructor enters with `this` in the
         // TDZ; `super(...)` binds it via `Op::BindThisValue`. A base
         // constructor receives the freshly-allocated receiver as
@@ -431,7 +444,20 @@ impl Interpreter {
         );
         let callee_closure = current.as_closure(&self.gc_heap);
         let derived_this_cell = if is_derived {
-            Some(crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?)
+            let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                frame.trace_frame_slots(visitor);
+                current.trace_value_slots(visitor);
+                new_target.trace_value_slots(visitor);
+                visitor(&receiver as *const JsObject as *mut RawGc);
+                for value in &args {
+                    value.trace_value_slots(visitor);
+                }
+            };
+            Some(crate::alloc_upvalue_with_roots(
+                &mut self.gc_heap,
+                Value::hole(),
+                &mut frame_roots,
+            )?)
         } else {
             None
         };
@@ -469,8 +495,19 @@ impl Interpreter {
         if function.is_async || function.is_generator || function.is_method {
             return Err(self.err_type(("function is not a constructor".to_string()).into()));
         }
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
+        // See `build_construct_bytecode_frame`: the frame is not yet on a
+        // traced stack, so every local must ride through the allocations.
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            current.trace_value_slots(visitor);
+            new_target.trace_value_slots(visitor);
+            visitor(&receiver as *const JsObject as *mut RawGc);
+        };
+        let upvalues = Frame::build_upvalues_for_exec_with_roots(
+            &mut self.gc_heap,
+            function,
+            parent_upvalues,
+            &mut build_roots,
+        )?;
         let is_derived = function.is_derived_constructor;
         let this_value = if is_derived {
             Value::hole()
@@ -486,7 +523,23 @@ impl Interpreter {
         let callee_closure = current.as_closure(&self.gc_heap);
         let extras = args.bind_into(function, &mut frame)?;
         let derived_this_cell = if is_derived {
-            Some(crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?)
+            let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                frame.trace_frame_slots(visitor);
+                current.trace_value_slots(visitor);
+                new_target.trace_value_slots(visitor);
+                visitor(&receiver as *const JsObject as *mut RawGc);
+                for value in &extras.rest_args {
+                    value.trace_value_slots(visitor);
+                }
+                for value in &extras.incoming_args {
+                    value.trace_value_slots(visitor);
+                }
+            };
+            Some(crate::alloc_upvalue_with_roots(
+                &mut self.gc_heap,
+                Value::hole(),
+                &mut frame_roots,
+            )?)
         } else {
             None
         };
@@ -1312,7 +1365,14 @@ impl Interpreter {
             Some(proto) => proto,
             None => self.constructor_prototype_value("Object")?,
         };
-        let receiver = self.alloc_stack_rooted_object_with_extra_roots(stack, &[&proto])?;
+        // Root every local read after this allocation: a collection here
+        // moves young targets, and `current` / `effective_new_target` feed the
+        // frame build and the cold-frame `new_target` below — an unrooted copy
+        // would wire the constructor chain to a vacated cell.
+        let receiver = self.alloc_stack_rooted_object_with_extra_roots(
+            stack,
+            &[&proto, &current, &effective_new_target],
+        )?;
         crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         if is_direct_class_construct
             && let Some(function_id) = current
@@ -1400,8 +1460,14 @@ impl Interpreter {
             .map(|field| field.source.resolve(args))
             .collect::<Vec<_>>();
 
-        let shape =
-            self.simple_constructor_shape(function_id, stack, proto, values.as_slice(), &init)?;
+        let shape = self.simple_constructor_shape(
+            function_id,
+            stack,
+            &receiver,
+            proto,
+            values.as_slice(),
+            &init,
+        )?;
 
         crate::object::set_fresh_object_shape(receiver, &mut self.gc_heap, shape);
         crate::object::initialize_shaped_data_slots(receiver, &mut self.gc_heap, values.as_slice());
@@ -1416,6 +1482,7 @@ impl Interpreter {
         &mut self,
         function_id: u32,
         stack: &HoltStack,
+        receiver: &crate::object::JsObject,
         proto: Value,
         values: &[Value],
         init: &crate::constructor_fast_path::SimpleConstructorInit,
@@ -1430,6 +1497,10 @@ impl Interpreter {
             for &slot in &roots {
                 visitor(slot);
             }
+            // The receiver is not yet published to any register; the caller
+            // installs the shape into it right after this call, so it must
+            // survive (and follow) any collection the shape allocs trigger.
+            visitor(receiver as *const crate::object::JsObject as *mut RawGc);
             proto.trace_value_slots(visitor);
             for value in values {
                 value.trace_value_slots(visitor);
@@ -1970,9 +2041,9 @@ impl Interpreter {
         // `dispatch_loop` registers frame roots — so the runtime
         // roots must be registered for the whole call.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let result = self.run_callable_sync_inner(context, callee, this_value, args);
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        drop(extra_roots_guard);
         self.leave_sync_reentry();
         result
     }
@@ -2625,9 +2696,9 @@ impl Interpreter {
         self.enter_sync_reentry()?;
         // Same rooting contract as [`Self::run_callable_sync`].
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let result = self.run_construct_sync_inner(context, target, new_target, args);
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        drop(extra_roots_guard);
         self.leave_sync_reentry();
         result
     }

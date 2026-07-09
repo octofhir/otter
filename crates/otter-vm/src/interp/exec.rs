@@ -45,11 +45,11 @@ impl Interpreter {
     ///
     /// **Debug / test only** — production embedders let the GC
     /// trigger itself.
-    pub fn force_gc(&mut self) {
+    pub fn force_gc(&mut self) -> Result<(), otter_gc::OutOfMemory> {
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.gc_heap.mark_phase(&mut noop);
+        self.gc_heap.mark_phase(&mut noop)?;
         crate::collections::run_ephemeron_fixpoint(&mut self.gc_heap);
         let finalization_jobs =
             crate::weak_refs::process_weak_refs_and_finalizers(&mut self.gc_heap);
@@ -66,7 +66,7 @@ impl Interpreter {
             });
         }
         self.gc_heap.sweep_phase();
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
+        Ok(())
     }
 
     /// Link a freshly compiled module into this interpreter's code
@@ -93,20 +93,18 @@ impl Interpreter {
             self.code_space = std::sync::Arc::clone(context.space());
         }
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
         self.pending_uncaught_frames = None;
         self.ensure_property_ic_capacity(context);
-        let result = match self.run_inner(context) {
+        match self.run_inner(context) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError {
                 error,
                 frames,
                 detail: self.take_error_detail(),
             }),
-        };
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
-        result
+        }
     }
 
     /// Drain the microtask queue until empty (or
@@ -144,10 +142,8 @@ impl Interpreter {
         // the microtask queue itself, globalThis, module envs) and
         // free or move objects still reachable through them.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
-        let result = self.drain_microtasks_with_default_inner(default_context);
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
-        result
+        let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
+        self.drain_microtasks_with_default_inner(default_context)
     }
 
     pub(crate) fn drain_microtasks_with_default_inner(
@@ -285,18 +281,16 @@ impl Interpreter {
             this_value: &raw const effective_this,
             args: &raw const effective_args,
         };
-        let roots_depth = self
+        let _locals_guard = self
             .gc_heap
-            .push_extra_roots(otter_gc::ExtraRoots::new(&locals_root));
-        let result = self.invoke_microtask_rooted(
+            .register_extra_roots(otter_gc::ExtraRoots::new(&locals_root));
+        self.invoke_microtask_rooted(
             context,
             result_capability,
             &mut current,
             &mut effective_this,
             &mut effective_args,
-        );
-        self.gc_heap.pop_extra_roots_to(roots_depth - 1);
-        result
+        )
     }
 
     /// Body of [`Self::invoke_microtask`] running under the
@@ -688,9 +682,9 @@ impl Interpreter {
             trace_active_frame_roots,
         );
         let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-        let frame_root_depth = self
+        let frame_roots_guard = self
             .gc_heap
-            .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+            .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
         // Catch-all runtime-roots registration: every bytecode tick
         // can allocate, and some dispatch entries (generator
         // prologues spawned from host-driven drains, future embedder
@@ -698,7 +692,7 @@ impl Interpreter {
         // The heap dedupes same-source stack entries, so re-pushing
         // under `run` / `run_callable_sync` costs one Vec slot.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_root_depth = self.gc_heap.push_extra_roots(extra_roots);
+        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         // Nested dispatch must not leak its last-instruction byte length
         // into the caller's PC advance: helpers like Op::Eval invoke
         // dispatch_loop on a sub-stack and then expect
@@ -761,8 +755,8 @@ impl Interpreter {
                 }
             }
         })();
-        self.gc_heap.pop_extra_roots_to(extra_root_depth - 1);
-        self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
+        drop(extra_roots_guard);
+        drop(frame_roots_guard);
         self.finish_runtime_budget_turn();
         self.current_byte_len = saved_byte_len;
         result

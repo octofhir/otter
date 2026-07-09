@@ -7,6 +7,7 @@ use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
+use crate::rooting::RootScopeExt;
 use crate::{NativeCtx, NativeError, Value};
 
 pub struct Intrinsic;
@@ -17,10 +18,14 @@ impl BuiltinIntrinsic for Intrinsic {
 
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
         let global_root = Value::object(global);
-        let mut temporal =
+        let temporal =
             NamespaceBuilder::from_spec_with_value_roots(heap, &TEMPORAL_SPEC, vec![global_root])?
                 .build()?;
-        let temporal_value = Value::object(temporal);
+        let mut temporal_value = Value::object(temporal);
+        let mut temporal_scope = otter_gc::RootScope::new(heap);
+        // SAFETY: `temporal_value` is declared before the scope and remains the
+        // single canonical handle while the nested class installers allocate.
+        unsafe { temporal_scope.add_value(&mut temporal_value) };
         crate::bootstrap::define_global_value(global, heap, Self::NAME, temporal_value);
 
         crate::temporal::instant::InstantIntrinsic::install(heap, global)?;
@@ -38,6 +43,9 @@ impl BuiltinIntrinsic for Intrinsic {
             vec![global_root, temporal_value],
         )?
         .build()?;
+        let mut temporal = temporal_value
+            .as_object()
+            .expect("Temporal namespace stays rooted during bootstrap");
         object::set(&mut temporal, heap, NOW_SPEC.name, Value::object(now));
         Ok(())
     }

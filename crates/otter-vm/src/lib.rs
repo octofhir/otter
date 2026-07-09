@@ -131,7 +131,8 @@ pub mod realm_intrinsics;
 pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
-mod rooting;
+#[doc(hidden)]
+pub mod rooting;
 pub mod run_control;
 pub mod runtime_budget;
 pub mod runtime_cx;
@@ -297,7 +298,8 @@ pub use iterator_state::{
     MapIteratorKind, SetIteratorKind,
 };
 pub use upvalue::{
-    UPVALUE_CELL_TYPE_TAG, UpvalueCell, UpvalueCellBody, alloc_upvalue, read_upvalue, store_upvalue,
+    UPVALUE_CELL_TYPE_TAG, UpvalueCell, UpvalueCellBody, alloc_upvalue, alloc_upvalue_with_roots,
+    read_upvalue, store_upvalue,
 };
 
 pub use runtime_budget::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
@@ -1620,10 +1622,11 @@ pub(crate) fn trace_active_frame_roots(
 ) {
     for frame in stack.iter() {
         frame.trace_frame_slots(visitor);
-        if let Some(idx) = frame.cold {
-            pool.get(idx).trace_cold_slots(visitor);
-        }
     }
+    // The WHOLE pool, not just the entries stacked frames reference: a cold
+    // record acquired during frame construction holds `new.target` / rest
+    // args before its frame reaches any stack, and must move with the heap.
+    pool.trace_all(visitor);
 }
 
 /// Compile-time options for dynamic source text.

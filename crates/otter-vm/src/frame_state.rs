@@ -51,7 +51,7 @@ use otter_bytecode::Function;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    ExecutableFunction, JsPromiseHandle, UpvalueCell, Value, VmError, abstract_ops, alloc_upvalue,
+    ExecutableFunction, JsPromiseHandle, UpvalueCell, Value, VmError, abstract_ops,
     cold_frame::ColdFrameIdx,
 };
 
@@ -487,7 +487,13 @@ impl Frame {
         function: &Function,
         parent_upvalues: UpvalueSpine,
     ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        Self::build_upvalues_for_count(heap, function.own_upvalue_count, parent_upvalues)
+        let mut empty = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        Self::build_upvalues_for_count(
+            heap,
+            function.own_upvalue_count,
+            parent_upvalues,
+            &mut empty,
+        )
     }
 
     pub(crate) fn build_upvalues_for_exec(
@@ -495,13 +501,38 @@ impl Frame {
         function: &ExecutableFunction,
         parent_upvalues: UpvalueSpine,
     ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
-        Self::build_upvalues_for_count(heap, function.own_upvalue_count, parent_upvalues)
+        let mut empty = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        Self::build_upvalues_for_count(
+            heap,
+            function.own_upvalue_count,
+            parent_upvalues,
+            &mut empty,
+        )
+    }
+
+    /// [`Self::build_upvalues_for_exec`] with caller-owned roots exposed to
+    /// any collection the cell allocations trigger. Frame builders hold the
+    /// callee / receiver / `new.target` in plain Rust locals while the frame
+    /// is not yet on a traced stack; those locals must ride through here.
+    pub(crate) fn build_upvalues_for_exec_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        function: &ExecutableFunction,
+        parent_upvalues: UpvalueSpine,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
+        Self::build_upvalues_for_count(
+            heap,
+            function.own_upvalue_count,
+            parent_upvalues,
+            external_visit,
+        )
     }
 
     fn build_upvalues_for_count(
         heap: &mut otter_gc::GcHeap,
         own_upvalue_count: u16,
         parent_upvalues: UpvalueSpine,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
         let own = own_upvalue_count as usize;
         if own == 0 {
@@ -509,7 +540,11 @@ impl Frame {
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
         for _ in 0..own {
-            cells.push(alloc_upvalue(heap, Value::undefined())?);
+            cells.push(crate::alloc_upvalue_with_roots(
+                heap,
+                Value::undefined(),
+                external_visit,
+            )?);
         }
         cells.extend(parent_upvalues.iter().copied());
         Ok(cells.into_boxed_slice())

@@ -39,12 +39,13 @@ use std::time::Instant;
 use crate::compressed::{Cage, Gc, RawGc, cage_base, cage_size};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
-use crate::extra_roots::ExtraRoots;
+use crate::extra_roots::{ExtraRoots, ExtraRootsGuard};
 use crate::finalize::WeakFinalizationRegistry;
-use crate::frame_roots::{FrameRootProviders, FrameRoots};
+use crate::frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard};
 use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
+
 use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, align_up};
 use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, page_base_from_offset};
@@ -199,13 +200,9 @@ pub struct GcHeap {
     gc_stress_full: bool,
     /// Allocations since the last stress-triggered collection.
     gc_stress_counter: u32,
-    /// Stress fires only once armed. Engine bootstrap (global +
-    /// prototype setup) runs a large amount of native code that holds
-    /// freshly-allocated handles in Rust locals without rooting them —
-    /// not yet hardened against arbitrary GC — so forcing collections
-    /// there segfaults before user code runs. The runtime arms stress
-    /// after bootstrap completes, so the mode exercises user code and
-    /// the hot native paths (where the use-after-move bugs live).
+    /// Stress is active from heap construction. Bootstrap and user code obey
+    /// the same rooting contract; delaying stress would hide initialization
+    /// roots that are just as load-bearing as runtime roots.
     gc_stress_armed: bool,
     stats: HeapStats,
     gc_stats: GcStats,
@@ -291,7 +288,7 @@ impl GcHeap {
             gc_stress_stride,
             gc_stress_full,
             gc_stress_counter: 0,
-            gc_stress_armed: false,
+            gc_stress_armed: gc_stress_stride != 0,
             oom_flag: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -300,11 +297,19 @@ impl GcHeap {
     ///
     /// Returns the new provider depth; callers pass `depth - 1` to
     /// [`Self::pop_frame_roots_to`] when leaving the matching dispatch scope.
+    #[doc(hidden)]
     pub fn push_frame_roots(&mut self, provider: *const dyn FrameRoots) -> usize {
         self.frame_root_providers.push(provider)
     }
 
+    /// Register active interpreter/JIT frame roots until the guard drops.
+    pub fn register_frame_roots(&mut self, provider: *const dyn FrameRoots) -> FrameRootsGuard {
+        let depth = self.push_frame_roots(provider) - 1;
+        FrameRootsGuard::new(self, depth)
+    }
+
     /// Truncate active frame-root providers back to `depth`.
+    #[doc(hidden)]
     pub fn pop_frame_roots_to(&mut self, depth: usize) {
         self.frame_root_providers.pop_to(depth);
     }
@@ -543,7 +548,7 @@ impl GcHeap {
             self.tracked_bytes = projected;
             return Ok(());
         }
-        self.collect_full(external_visit);
+        self.collect_full(external_visit)?;
         self.tracked_bytes = self.live_bytes_total().saturating_add(self.reserved_bytes);
         let projected = self.tracked_bytes.saturating_add(bytes);
         if projected <= cap {
@@ -697,10 +702,20 @@ impl GcHeap {
     /// [`Self::pop_extra_roots_to`] when the source goes out of scope.
     /// Every live entry is traced during collection, so a nested
     /// registration never hides an outer scope's roots.
+    #[doc(hidden)]
     #[must_use]
     pub fn push_extra_roots(&mut self, roots: ExtraRoots) -> usize {
         self.extra_roots.push(roots);
         self.extra_roots.len()
+    }
+
+    /// Register an owner-managed root source until the returned guard drops.
+    ///
+    /// This is the standard API for VM/runtime root owners. It keeps cleanup
+    /// panic-safe while allowing normal mutable heap access inside the scope.
+    pub fn register_extra_roots(&mut self, roots: ExtraRoots) -> ExtraRootsGuard {
+        let depth = self.push_extra_roots(roots) - 1;
+        ExtraRootsGuard::new(self, depth)
     }
 
     /// Whether any extra-roots provider is registered. The interpreter installs
@@ -713,6 +728,7 @@ impl GcHeap {
     }
 
     /// Truncate the extra-roots stack back down to `depth`.
+    #[doc(hidden)]
     pub fn pop_extra_roots_to(&mut self, depth: usize) {
         debug_assert!(depth <= self.extra_roots.len());
         self.extra_roots.truncate(depth);
@@ -926,10 +942,11 @@ impl GcHeap {
                 self.gc_stress_counter = 0;
                 if self.gc_stress_full {
                     self.in_major_gc = true;
-                    self.collect_full(&mut allocation_roots);
+                    let collect_result = self.collect_full(&mut allocation_roots);
                     self.in_major_gc = false;
+                    collect_result?;
                 } else {
-                    self.collect_minor_internal(&mut allocation_roots);
+                    self.collect_minor_internal(&mut allocation_roots)?;
                 }
             }
         }
@@ -938,7 +955,7 @@ impl GcHeap {
         // cage exhausts — independent of (and complementary to) the byte
         // cap, whose default equals the cage size and so never protects
         // against page-level exhaustion. O(1) page-count check.
-        self.maybe_major_gc(&mut allocation_roots);
+        self.maybe_major_gc(&mut allocation_roots)?;
 
         if self.max_heap_bytes != 0 {
             self.account_or_collect_with_roots(aligned as u64, &mut allocation_roots)?;
@@ -962,7 +979,7 @@ impl GcHeap {
                     // Trigger scavenge with caller-supplied
                     // external roots; handle stack + globals are
                     // walked internally.
-                    self.collect_minor_internal(&mut allocation_roots);
+                    self.collect_minor_internal(&mut allocation_roots)?;
                     match self.new_space.alloc(aligned) {
                         Some(off) => off,
                         // Young-gen deadlock: the live survivor set fills
@@ -1254,17 +1271,23 @@ impl GcHeap {
     }
 
     /// Run a minor GC (Cheney scavenge).
-    pub fn collect_minor(&mut self, _roots: EmptyRoots) {
+    pub fn collect_minor(&mut self, _roots: EmptyRoots) -> Result<(), OutOfMemory> {
         let empty: fn(&mut dyn FnMut(*mut RawGc)) = |_| {};
-        self.collect_minor_internal(&mut |v| empty(v));
+        self.collect_minor_internal(&mut |v| empty(v))
     }
 
     /// Run a minor GC with caller-supplied root visitor.
-    pub fn collect_minor_with_roots(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
-        self.collect_minor_internal(external_visit);
+    pub fn collect_minor_with_roots(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        self.collect_minor_internal(external_visit)
     }
 
-    fn collect_minor_internal(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+    fn collect_minor_internal(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         // Combine the caller's external_visit with the heap's
         // own handle-stack and global-handles walk.
         let handle_stack: *const HandleStack = &*self.handle_stack;
@@ -1302,7 +1325,7 @@ impl GcHeap {
                 &weak_registry_slots,
                 &mut self.remembered_parents,
             )
-        };
+        }?;
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
         self.ephemerons.retain_non_null();
         self.weak_finalization.retain_non_null();
@@ -1316,24 +1339,20 @@ impl GcHeap {
         // hot path tight by not walking the live set just for
         // stats — see `bench_scavenge_4mb` for the cost of
         // adding a walk here.
+        Ok(())
     }
 
     /// Run a full GC (young-gen scavenge + old-gen mark-sweep).
     ///
     /// `external_visit` yields every external root slot.
-    pub fn collect_full(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+    pub fn collect_full(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         let pause_start = Instant::now();
-        self.mark_phase(external_visit);
+        self.mark_phase(external_visit)?;
         self.sweep_phase_with_pause_start(pause_start);
-    }
-
-    /// Arm GC-stress mode (no-op unless `OTTER_GC_STRESS` was set).
-    ///
-    /// Called by the runtime once engine bootstrap is complete, so the
-    /// forced collections exercise user code and hot native paths rather
-    /// than the not-yet-hardened global-setup code. Idempotent.
-    pub fn arm_gc_stress(&mut self) {
-        self.gc_stress_armed = true;
+        Ok(())
     }
 
     /// Whether GC-stress mode is configured (env-enabled), regardless of
@@ -1352,14 +1371,18 @@ impl GcHeap {
     /// `collect_full` is only ever reached via the cap path. No-op when
     /// a hard cap is configured (that path drives full GCs itself) or
     /// while a major GC is already in flight.
-    fn maybe_major_gc(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+    fn maybe_major_gc(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         if !self.major_gc_due() {
-            return;
+            return Ok(());
         }
         let occupancy = self.major_gc_occupancy_bytes();
         self.in_major_gc = true;
-        self.collect_full(external_visit);
+        let collect_result = self.collect_full(external_visit);
         self.in_major_gc = false;
+        collect_result?;
         // Recompute the next trigger from the surviving live set
         // (page-based, matching the occupancy metric above).
         let live_pages = (self.old_space.page_count() as u64)
@@ -1382,6 +1405,7 @@ impl GcHeap {
         };
         let target = live_pages.saturating_mul(num).saturating_div(den);
         self.next_major_gc_bytes = target.max(MAJOR_GC_FLOOR_BYTES).min(cage_hardcap);
+        Ok(())
     }
 
     fn major_gc_due(&self) -> bool {
@@ -1425,12 +1449,16 @@ impl GcHeap {
     /// [`Self::finish_incremental_mark_phase`]) splits the same work
     /// across multiple safepoints so the mutator can run between
     /// drain steps. Both paths leave the heap in identical states.
-    pub fn mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
-        self.start_incremental_mark_phase(external_visit);
+    pub fn mark_phase(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
+        self.start_incremental_mark_phase(external_visit)?;
         // SAFETY: STW pause; all pushed headers alive.
         unsafe {
             self.marking.drain_full(&self.trace_table);
         }
+        Ok(())
     }
 
     /// Begin an incremental old-gen mark cycle.
@@ -1458,9 +1486,12 @@ impl GcHeap {
     /// Uses a Dijkstra-style insertion barrier with a black-on-allocation
     /// new-object policy so the mutator can run between mark steps without
     /// losing a freshly published edge.
-    pub fn start_incremental_mark_phase(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
+    pub fn start_incremental_mark_phase(
+        &mut self,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(), OutOfMemory> {
         // Scavenge first so survivors are in old / to-space.
-        self.collect_minor_internal(external_visit);
+        self.collect_minor_internal(external_visit)?;
 
         // Reset old-space + LOS live counters; mark cycle.
         self.old_space.reset_live_bytes();
@@ -1490,6 +1521,7 @@ impl GcHeap {
 
         self.marking.start_cycle();
         self.shade_roots(external_visit);
+        Ok(())
     }
 
     /// Drain at most `budget` gray headers from the marking

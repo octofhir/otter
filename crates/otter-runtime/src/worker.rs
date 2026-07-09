@@ -232,174 +232,128 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
         let id = spawn_worker_record(&host, specifier)?;
-        let mut worker = ctx.alloc_object()?;
-        // The worker object is built up across many allocations (a listeners
-        // object plus five native methods), any of which can relocate the young
-        // `worker` body under a moving scavenge. `worker_value` is the rooted
-        // source of truth: it is resynced from `worker` before every allocation
-        // (so the alloc keeps it live) and `worker` is refreshed from it after,
-        // so no `set` ever writes through a vacated handle.
-        object::set(
-            &mut worker,
-            ctx.heap_mut(),
-            "__otterWorkerId",
-            Value::number_f64(id as f64),
-        );
-        object::set(&mut worker, ctx.heap_mut(), "onmessage", Value::null());
-        object::set(&mut worker, ctx.heap_mut(), "onerror", Value::null());
-        object::set(&mut worker, ctx.heap_mut(), "onmessageerror", Value::null());
-        let mut worker_value = Value::object(worker);
-        let listeners = ctx.alloc_object_with_roots(&[&worker_value], &[])?;
-        worker = worker_value
-            .as_object()
-            .expect("worker stays rooted across allocation");
-        object::set(
-            &mut worker,
-            ctx.heap_mut(),
-            "__otterListeners",
-            Value::object(listeners),
-        );
+        ctx.scope(|ctx, scope| {
+            let worker = ctx.scoped_object(scope)?;
+            let worker_id = ctx.scoped_number(scope, id as f64);
+            ctx.scoped_set(scope, worker, "__otterWorkerId", worker_id)?;
+            let null = ctx.scoped_null(scope);
+            ctx.scoped_set(scope, worker, "onmessage", null)?;
+            ctx.scoped_set(scope, worker, "onerror", null)?;
+            ctx.scoped_set(scope, worker, "onmessageerror", null)?;
+            let listeners = ctx.scoped_object(scope)?;
+            ctx.scoped_set(scope, worker, "__otterListeners", listeners)?;
 
-        worker_value = Value::object(worker);
-        let post_host = host.clone();
-        let post = ctx.native_value_with_captures(
-            "postMessage",
-            smallvec![],
-            &[&worker_value],
-            &[],
-            move |ctx, args, _captures| {
-                let id = worker_id_from_this(ctx, "Worker.postMessage")?;
-                let Some(record) = post_host.get(id) else {
-                    return Err(type_err(
-                        "Worker.postMessage",
-                        "worker is not running".to_string(),
-                    ));
-                };
-                if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(type_err(
-                        "Worker.postMessage",
-                        "worker has been terminated".to_string(),
-                    ));
-                }
-                let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
-                let payload = clone_worker_value(
-                    args.first().unwrap_or(&Value::undefined()),
-                    ctx.heap(),
-                    &transfers,
-                )?;
-                detach_worker_transfers(&transfers, ctx.heap_mut());
-                record
-                    .tx
-                    .send(WorkerCommand::Message(payload))
-                    .map_err(|_| {
-                        type_err("Worker.postMessage", "worker channel is closed".to_string())
+            let post_host = host.clone();
+            let post =
+                ctx.native_value("postMessage", smallvec![], move |ctx, args, _captures| {
+                    let id = worker_id_from_this(ctx, "Worker.postMessage")?;
+                    let Some(record) = post_host.get(id) else {
+                        return Err(type_err(
+                            "Worker.postMessage",
+                            "worker is not running".to_string(),
+                        ));
+                    };
+                    if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(type_err(
+                            "Worker.postMessage",
+                            "worker has been terminated".to_string(),
+                        ));
+                    }
+                    let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
+                    let payload = clone_worker_value(
+                        args.first().unwrap_or(&Value::undefined()),
+                        ctx.heap(),
+                        &transfers,
+                    )?;
+                    detach_worker_transfers(&transfers, ctx.heap_mut());
+                    record
+                        .tx
+                        .send(WorkerCommand::Message(payload))
+                        .map_err(|_| {
+                            type_err("Worker.postMessage", "worker channel is closed".to_string())
+                        })?;
+                    Ok(Value::undefined())
+                })?;
+            let post = ctx.scoped_value(scope, post);
+            ctx.scoped_set(scope, worker, "postMessage", post)?;
+
+            let terminate_host = host.clone();
+            let terminate =
+                ctx.native_value("terminate", smallvec![], move |ctx, _args, _captures| {
+                    let worker = ctx.this_value().as_object().ok_or_else(|| {
+                        type_err("Worker.terminate", "invalid receiver".to_string())
                     })?;
-                Ok(Value::undefined())
-            },
-        )?;
-        worker = worker_value
-            .as_object()
-            .expect("worker stays rooted across allocation");
-        object::set(&mut worker, ctx.heap_mut(), "postMessage", post);
+                    clear_worker_poll_timer(ctx, worker)?;
+                    let id = worker_id_from_object(ctx, worker, "Worker.terminate")?;
+                    if let Some(record) = terminate_host.remove(id) {
+                        record.terminate();
+                    }
+                    Ok(Value::undefined())
+                })?;
+            let terminate = ctx.scoped_value(scope, terminate);
+            ctx.scoped_set(scope, worker, "terminate", terminate)?;
 
-        worker_value = Value::object(worker);
-        let terminate_host = host.clone();
-        let terminate = ctx.native_value_with_captures(
-            "terminate",
-            smallvec![],
-            &[&worker_value, &post],
-            &[],
-            move |ctx, _args, _captures| {
-                let worker = ctx
-                    .this_value()
-                    .as_object()
-                    .ok_or_else(|| type_err("Worker.terminate", "invalid receiver".to_string()))?;
-                clear_worker_poll_timer(ctx, worker)?;
-                let id = worker_id_from_object(ctx, worker, "Worker.terminate")?;
-                if let Some(record) = terminate_host.remove(id) {
-                    record.terminate();
-                }
-                Ok(Value::undefined())
-            },
-        )?;
-        worker = worker_value
-            .as_object()
-            .expect("worker stays rooted across allocation");
-        object::set(&mut worker, ctx.heap_mut(), "terminate", terminate);
+            let dispatch =
+                ctx.native_value("dispatchEvent", smallvec![], move |ctx, args, _captures| {
+                    let worker = ctx.this_value().as_object().ok_or_else(|| {
+                        type_err("Worker.dispatchEvent", "invalid receiver".to_string())
+                    })?;
+                    let event = args.first().copied().unwrap_or(Value::undefined());
+                    let event_obj = event.as_object().ok_or_else(|| {
+                        type_err(
+                            "Worker.dispatchEvent",
+                            "event must be an object".to_string(),
+                        )
+                    })?;
+                    dispatch_event_object(ctx, worker, event_obj)?;
+                    Ok(Value::boolean(true))
+                })?;
+            let dispatch = ctx.scoped_value(scope, dispatch);
+            ctx.scoped_set(scope, worker, "dispatchEvent", dispatch)?;
 
-        worker_value = Value::object(worker);
-        let dispatch = ctx.native_value_with_captures(
-            "dispatchEvent",
-            smallvec![],
-            &[&worker_value, &post, &terminate],
-            &[],
-            move |ctx, args, _captures| {
-                let worker = ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.dispatchEvent", "invalid receiver".to_string())
-                })?;
-                let event = args.first().copied().unwrap_or(Value::undefined());
-                let event_obj = event.as_object().ok_or_else(|| {
-                    type_err(
-                        "Worker.dispatchEvent",
-                        "event must be an object".to_string(),
-                    )
-                })?;
-                dispatch_event_object(ctx, worker, event_obj)?;
-                Ok(Value::boolean(true))
-            },
-        )?;
-        worker = worker_value
-            .as_object()
-            .expect("worker stays rooted across allocation");
-        object::set(&mut worker, ctx.heap_mut(), "dispatchEvent", dispatch);
-        worker_value = Value::object(worker);
-        let add = ctx.native_value_with_captures(
-            "addEventListener",
-            smallvec![],
-            &[&worker_value, &post, &terminate, &dispatch],
-            &[],
-            move |ctx, args, _captures| {
-                let worker = ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.addEventListener", "invalid receiver".to_string())
-                })?;
-                let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-                if let Some(listener) = args.get(1)
-                    && listener.is_callable()
-                {
-                    add_worker_event_listener(ctx, worker, &ty, *listener)?;
-                }
-                Ok(Value::undefined())
-            },
-        )?;
-        worker = worker_value
-            .as_object()
-            .expect("worker stays rooted across allocation");
-        object::set(&mut worker, ctx.heap_mut(), "addEventListener", add);
-        worker_value = Value::object(worker);
-        let remove = ctx.native_value_with_captures(
-            "removeEventListener",
-            smallvec![],
-            &[&worker_value, &post, &terminate, &dispatch, &add],
-            &[],
-            move |ctx, args, _captures| {
-                let worker = ctx.this_value().as_object().ok_or_else(|| {
-                    type_err("Worker.removeEventListener", "invalid receiver".to_string())
-                })?;
-                let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-                if let Some(listener) = args.get(1) {
-                    remove_worker_event_listener(ctx, worker, &ty, *listener)?;
-                }
-                Ok(Value::undefined())
-            },
-        )?;
-        worker = worker_value
-            .as_object()
-            .expect("worker stays rooted across allocation");
-        object::set(&mut worker, ctx.heap_mut(), "removeEventListener", remove);
+            let add = ctx.native_value(
+                "addEventListener",
+                smallvec![],
+                move |ctx, args, _captures| {
+                    let worker = ctx.this_value().as_object().ok_or_else(|| {
+                        type_err("Worker.addEventListener", "invalid receiver".to_string())
+                    })?;
+                    let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+                    if let Some(listener) = args.get(1)
+                        && listener.is_callable()
+                    {
+                        add_worker_event_listener(ctx, worker, &ty, *listener)?;
+                    }
+                    Ok(Value::undefined())
+                },
+            )?;
+            let add = ctx.scoped_value(scope, add);
+            ctx.scoped_set(scope, worker, "addEventListener", add)?;
 
-        install_worker_poll_timer(ctx, host.clone(), &mut worker)?;
-        worker_value = Value::object(worker);
-        Ok(worker_value)
+            let remove = ctx.native_value(
+                "removeEventListener",
+                smallvec![],
+                move |ctx, args, _captures| {
+                    let worker = ctx.this_value().as_object().ok_or_else(|| {
+                        type_err("Worker.removeEventListener", "invalid receiver".to_string())
+                    })?;
+                    let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+                    if let Some(listener) = args.get(1) {
+                        remove_worker_event_listener(ctx, worker, &ty, *listener)?;
+                    }
+                    Ok(Value::undefined())
+                },
+            )?;
+            let remove = ctx.scoped_value(scope, remove);
+            ctx.scoped_set(scope, worker, "removeEventListener", remove)?;
+
+            let mut worker_object = ctx
+                .escape(worker)
+                .as_object()
+                .expect("scoped worker remains an object");
+            install_worker_poll_timer(ctx, host.clone(), &mut worker_object)?;
+            Ok(ctx.escape(worker))
+        })
     });
     NativeCall::Dynamic(call)
 }
@@ -547,11 +501,9 @@ fn install_worker_poll_timer(
     worker: &mut object::JsObject,
 ) -> Result<(), NativeError> {
     let worker_value = Value::object(*worker);
-    let poll = ctx.native_value_with_captures(
+    let poll = ctx.native_value(
         "__otter_worker_poll",
         smallvec![worker_value],
-        &[&worker_value],
-        &[],
         move |ctx, _args, captures| {
             let Some(worker) = captures.first().and_then(|value| value.as_object()) else {
                 return Ok(Value::undefined());
@@ -600,26 +552,32 @@ fn install_worker_poll_timer(
         .interp_mut_and_context()
         .1
         .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
-    // `run_callable_sync` enters JS (setInterval) which allocates; park the
-    // worker handle on the GC-traced scratch stack so the scavenge keeps it
-    // live, then read the relocated handle back before storing the timer token.
-    let wroot = ctx.push_scratch_root(worker_value);
-    let (interp, _) = ctx.interp_mut_and_context();
-    let token = interp
-        .run_callable_sync(
-            &exec,
-            &set_interval,
-            Value::undefined(),
-            smallvec![poll, Value::number_f64(1.0)],
-        )
-        .map_err(vm_error_to_native)?;
-    *worker = ctx
-        .scratch_root(wroot)
-        .as_object()
-        .expect("worker stays rooted across the timer install");
-    ctx.pop_scratch_root_to(wroot);
-    object::set(worker, ctx.heap_mut(), "__otterPoll", token);
-    Ok(())
+    ctx.scope(|ctx, scope| {
+        let worker_handle = ctx.scoped_value(scope, worker_value);
+        let poll_handle = ctx.scoped_value(scope, poll);
+        let interval_handle = ctx.scoped_value(scope, set_interval);
+        let interval_ms = ctx.scoped_number(scope, 1.0);
+        let interval = ctx.escape(interval_handle);
+        let poll = ctx.escape(poll_handle);
+        let interval_ms = ctx.escape(interval_ms);
+        let (interp, _) = ctx.interp_mut_and_context();
+        let token = interp
+            .run_callable_sync(
+                &exec,
+                &interval,
+                Value::undefined(),
+                smallvec![poll, interval_ms],
+            )
+            .map_err(vm_error_to_native)?;
+        let token = ctx.scoped_value(scope, token);
+        *worker = ctx
+            .escape(worker_handle)
+            .as_object()
+            .expect("worker stays rooted across the timer install");
+        let token = ctx.escape(token);
+        object::set(worker, ctx.heap_mut(), "__otterPoll", token);
+        Ok(())
+    })
 }
 
 fn dispatch_event_object(
@@ -627,31 +585,35 @@ fn dispatch_event_object(
     mut worker: object::JsObject,
     mut event: object::JsObject,
 ) -> Result<(), NativeError> {
-    let worker_root = ctx.push_scratch_root(Value::object(worker));
-    let event_root = ctx.push_scratch_root(Value::object(event));
-    let result = (|| {
+    ctx.scope(|ctx, scope| {
+        let worker_root = ctx.scoped_value(scope, Value::object(worker));
+        let event_root = ctx.scoped_value(scope, Value::object(event));
         let ty = object::get(event, ctx.heap(), "type")
             .and_then(|value| value.as_string(ctx.heap()))
             .map(|s| s.to_lossy_string(ctx.heap()))
             .unwrap_or_default();
         let handler_key = format!("on{ty}");
         let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
+        let handler = ctx.scoped_value(scope, handler);
         let listeners = worker_event_listeners(ctx, worker, &ty);
+        let listeners: Vec<_> = listeners
+            .into_iter()
+            .map(|listener| ctx.scoped_value(scope, listener))
+            .collect();
         let exec = ctx
             .interp_mut_and_context()
             .1
             .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
-        if handler.is_callable() {
-            let handler_root = ctx.push_scratch_root(handler);
+        if ctx.escape(handler).is_callable() {
             worker = ctx
-                .scratch_root(worker_root)
+                .escape(worker_root)
                 .as_object()
                 .expect("worker stays rooted across event dispatch");
             event = ctx
-                .scratch_root(event_root)
+                .escape(event_root)
                 .as_object()
                 .expect("event stays rooted across event dispatch");
-            let handler = ctx.scratch_root(handler_root);
+            let handler = ctx.escape(handler);
             let (interp, _) = ctx.interp_mut_and_context();
             let call_result = interp.run_callable_sync(
                 &exec,
@@ -659,30 +621,17 @@ fn dispatch_event_object(
                 Value::object(worker),
                 smallvec![Value::object(event)],
             );
-            worker = ctx
-                .scratch_root(worker_root)
-                .as_object()
-                .expect("worker stays rooted across event dispatch");
-            event = ctx
-                .scratch_root(event_root)
-                .as_object()
-                .expect("event stays rooted across event dispatch");
-            ctx.pop_scratch_root_to(handler_root);
             call_result.map_err(vm_error_to_native)?;
         }
-        let mut listener_roots = Vec::with_capacity(listeners.len());
-        for listener in listeners {
-            listener_roots.push(ctx.push_scratch_root(listener));
-        }
-        for listener_root in listener_roots {
-            let listener = ctx.scratch_root(listener_root);
+        for listener_root in listeners {
+            let listener = ctx.escape(listener_root);
             if listener.is_callable() {
                 worker = ctx
-                    .scratch_root(worker_root)
+                    .escape(worker_root)
                     .as_object()
                     .expect("worker stays rooted across event dispatch");
                 event = ctx
-                    .scratch_root(event_root)
+                    .escape(event_root)
                     .as_object()
                     .expect("event stays rooted across event dispatch");
                 let (interp, _) = ctx.interp_mut_and_context();
@@ -696,9 +645,7 @@ fn dispatch_event_object(
             }
         }
         Ok(())
-    })();
-    ctx.pop_scratch_root_to(worker_root);
-    result
+    })
 }
 
 fn worker_listener_store(
@@ -1259,16 +1206,7 @@ fn materialize_worker_payload(
             Ok(Value::set(set))
         }
         WorkerPayload::ArrayBuffer(bytes) => {
-            let Some(buffer) = ctx.alloc_array_buffer_zeroed(bytes.len(), &[], &[])? else {
-                return Err(type_err(
-                    "structuredClone",
-                    "ArrayBuffer allocation failed".to_string(),
-                ));
-            };
-            buffer.with_bytes_mut(ctx.heap_mut(), |target| {
-                target.clear();
-                target.extend_from_slice(bytes);
-            });
+            let buffer = ctx.array_buffer_from_bytes(bytes.to_vec())?;
             Ok(Value::array_buffer(buffer))
         }
         WorkerPayload::SharedArrayBuffer(body) => {

@@ -1113,6 +1113,37 @@ where
     )?))
 }
 
+/// Root-aware counterpart used by [`crate::NativeCtx`].
+///
+/// The closure remains `Send + Sync`; only the caller's runtime root walk is
+/// supplied separately. This keeps the public native-binding path on the safe
+/// dynamic-call representation instead of exposing the VM-internal
+/// `LocalDynamic` escape hatch.
+pub(crate) fn native_value_with_captures_and_roots<F>(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    captures: SmallVec<[Value; 4]>,
+    external_visit: &mut RootSlotVisitor<'_>,
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        + Send
+        + Sync
+        + 'static,
+{
+    Ok(Value::native_function(NativeFunction::allocate_with_roots(
+        heap,
+        name,
+        0,
+        NativeCallStorage::Dynamic(Arc::new(call)),
+        captures,
+        None,
+        NativeFunctionMetadata::BUILTIN,
+        external_visit,
+    )?))
+}
+
 pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,

@@ -29,6 +29,6 @@ fn miri_smoke_alloc_collect() {
     let a = heap.alloc(Cell { next: Gc::null() }).unwrap();
     let b = heap.alloc(Cell { next: a }).unwrap();
     let _l = scope.local(b);
-    heap.collect_minor(otter_gc::EmptyRoots);
-    heap.collect_full(&mut |_| {});
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+    heap.collect_full(&mut |_| {}).expect("full GC");
 }

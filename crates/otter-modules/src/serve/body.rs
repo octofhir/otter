@@ -102,7 +102,7 @@ fn bytes_to_uint8_array(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let buffer = ctx
-        .array_buffer_from_bytes_rooted(bytes, &[], &[])
+        .array_buffer_from_bytes(bytes)
         .map_err(|err| runtime_type_error(name, err.to_string()))?;
     let ctor = ctx
         .global_value("Uint8Array")

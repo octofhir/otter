@@ -29,9 +29,9 @@ fn objects_promote_after_one_survival() {
     // scavenger increments to 1 after this scavenge, the second
     // scavenge reads survival_age == 1 ≥ PROMOTE_AFTER_SURVIVALS
     // and promotes.
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
     // Second scavenge — survivors should land in old space.
-    heap.collect_minor(otter_gc::EmptyRoots);
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
 
     for l in &roots {
         let g = l.get();

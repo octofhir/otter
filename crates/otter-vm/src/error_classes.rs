@@ -44,6 +44,7 @@ use crate::gc_trace::GcRootVisitor;
 use crate::native_function::NativeFunction;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::rooting::RootScopeExt;
 use crate::string::JsString;
 use crate::{ExecutionContext, Value};
 use crate::{NativeCtx, NativeError};
@@ -168,6 +169,19 @@ impl ClassEntry {
     }
 }
 
+unsafe fn trace_class_entries(slot: *mut (), visitor: &mut dyn FnMut(*mut RawGc)) {
+    // SAFETY: `ErrorClassRegistry::new` registers the address of its live
+    // `Vec<(ErrorKind, ClassEntry)>` for exactly the lifetime of the enclosing
+    // `RootScope`. The vector value itself does not move while the scope is
+    // active; reallocating its backing buffer is fine because it is read here
+    // on every trace.
+    let entries = unsafe { &mut *slot.cast::<Vec<(ErrorKind, ClassEntry)>>() };
+    for (_, entry) in entries {
+        visitor(std::ptr::addr_of_mut!(entry.prototype).cast::<RawGc>());
+        visitor(std::ptr::addr_of_mut!(entry.constructor).cast::<RawGc>());
+    }
+}
+
 fn oom() -> otter_gc::OutOfMemory {
     otter_gc::OutOfMemory::HeapCapExceeded {
         requested_bytes: 0,
@@ -240,15 +254,6 @@ fn native_constructor_static_with_roots(
         &mut external_visit,
     )
     .map_err(|_| oom())
-}
-
-fn class_entry_roots(entries: &[(ErrorKind, ClassEntry)]) -> Vec<Value> {
-    let mut roots = Vec::with_capacity(entries.len() * 2);
-    for (_, entry) in entries {
-        roots.push(Value::object(entry.prototype));
-        roots.push(Value::object(entry.constructor));
-    }
-    roots
 }
 
 /// Per-interpreter registry of the seven canonical error classes.
@@ -496,21 +501,60 @@ impl ErrorClassRegistry {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
+    #[allow(unused_assignments)] // RootScope observes canonical slots through raw pointers.
     pub fn new(gc_heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
-        let error_proto = alloc_registry_object(gc_heap, &[])?;
-        let error_proto_root = Value::object(error_proto);
+        // Bootstrap allocations run under GC stress from the first allocation.
+        // Keep exactly one mutable slot for each value that can cross an
+        // allocation; the collector rewrites those slots in place. Completed
+        // class entries are rooted directly instead of copied into temporary
+        // `Vec<Value>` snapshots that become stale after a moving collection.
+        let mut error_proto_root = Value::undefined();
+        let mut error_name_root = Value::undefined();
+        let mut empty_root = Value::undefined();
+        let mut to_string_root = Value::undefined();
+        let mut stack_get_root = Value::undefined();
+        let mut stack_set_root = Value::undefined();
+        let mut error_ctor_root = Value::undefined();
+        let mut proto_root = Value::undefined();
+        let mut class_name_root = Value::undefined();
+        let mut ctor_root = Value::undefined();
+        let mut native_root = Value::undefined();
+        let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(8);
+        let mut roots = otter_gc::RootScope::new(gc_heap);
+        // SAFETY: every slot above is declared before `roots`, so it outlives
+        // the scope and remains at a stable stack address until construction
+        // completes (or unwinds).
+        unsafe {
+            roots.add_value(&mut error_proto_root);
+            roots.add_value(&mut error_name_root);
+            roots.add_value(&mut empty_root);
+            roots.add_value(&mut to_string_root);
+            roots.add_value(&mut stack_get_root);
+            roots.add_value(&mut stack_set_root);
+            roots.add_value(&mut error_ctor_root);
+            roots.add_value(&mut proto_root);
+            roots.add_value(&mut class_name_root);
+            roots.add_value(&mut ctor_root);
+            roots.add_value(&mut native_root);
+            roots.add_erased(
+                (&mut entries as *mut Vec<(ErrorKind, ClassEntry)>).cast::<()>(),
+                trace_class_entries,
+            );
+        }
+
+        error_proto_root = Value::object(alloc_registry_object(gc_heap, &[])?);
         // §20.5.3.{4,5} — `Error.prototype.name = "Error"` and
         // `Error.prototype.message = ""` are data properties with
         // attributes `{ writable: true, enumerable: false,
         // configurable: true }`. The plain `set` path leaves
         // `enumerable: true` which fails every `name`/`message`
         // descriptor test in `built-ins/{Error,NativeErrors}/prototype/*`.
-        let error_name = from_str_rooted("Error", gc_heap, &[&error_proto_root])?;
-        let empty = from_str_rooted(
+        error_name_root = Value::string(from_str_rooted("Error", gc_heap, &[&error_proto_root])?);
+        empty_root = Value::string(from_str_rooted(
             "",
             gc_heap,
-            &[&error_proto_root, &Value::string(error_name)],
-        )?;
+            &[&error_proto_root, &error_name_root],
+        )?);
         // The string allocations above may have relocated the young prototype;
         // take its current handle from the rooted Value, and write through
         // `_in_place` so each define reflects any further relocation.
@@ -521,14 +565,16 @@ impl ErrorClassRegistry {
             &mut error_proto,
             gc_heap,
             "name",
-            PropertyDescriptor::data(Value::string(error_name), true, false, true),
+            PropertyDescriptor::data(error_name_root, true, false, true),
         );
+        error_proto_root = Value::object(error_proto);
         let _ = object::define_own_property_in_place(
             &mut error_proto,
             gc_heap,
             "message",
-            PropertyDescriptor::data(Value::string(empty), true, false, true),
+            PropertyDescriptor::data(empty_root, true, false, true),
         );
+        error_proto_root = Value::object(error_proto);
 
         // §20.5.3.4 Error.prototype.toString — install as a real
         // function-valued data property so `Error.prototype.toString`
@@ -582,20 +628,23 @@ impl ErrorClassRegistry {
             })?;
             Ok(Value::string(s))
         }
-        let to_string_native = native_static_with_roots(
+        to_string_root = Value::native_function(native_static_with_roots(
             gc_heap,
             "toString",
             0,
             error_prototype_to_string,
             &[&error_proto_root],
-        )?;
-        let to_string_root = Value::native_function(to_string_native);
-        let _ = object::define_own_property(
-            error_proto,
+        )?);
+        let mut error_proto = error_proto_root
+            .as_object()
+            .expect("error prototype is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_proto,
             gc_heap,
             "toString",
             PropertyDescriptor::data(to_string_root, true, false, true),
         );
+        error_proto_root = Value::object(error_proto);
         // `get`/`set Error.prototype.stack` — the Error Stacks proposal
         // (`sec-get-error.prototype.stack`). `stack` is an accessor on
         // `%Error.prototype%` (non-enumerable, configurable). The getter
@@ -728,31 +777,30 @@ impl ErrorClassRegistry {
             }
             Ok(Value::undefined())
         }
-        let stack_get = native_static_with_roots(
+        stack_get_root = Value::native_function(native_static_with_roots(
             gc_heap,
             "get stack",
             0,
             error_stack_get,
             &[&error_proto_root],
-        )?;
-        let stack_set = native_static_with_roots(
+        )?);
+        stack_set_root = Value::native_function(native_static_with_roots(
             gc_heap,
             "set stack",
             1,
             error_stack_set,
             &[&error_proto_root],
-        )?;
-        let _ = object::define_own_property(
-            error_proto,
+        )?);
+        let mut error_proto = error_proto_root
+            .as_object()
+            .expect("error prototype is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_proto,
             gc_heap,
             "stack",
-            PropertyDescriptor::accessor(
-                Some(Value::native_function(stack_get)),
-                Some(Value::native_function(stack_set)),
-                false,
-                true,
-            ),
+            PropertyDescriptor::accessor(Some(stack_get_root), Some(stack_set_root), false, true),
         );
+        error_proto_root = Value::object(error_proto);
 
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
@@ -775,19 +823,28 @@ impl ErrorClassRegistry {
         // can't distinguish thrown constructors, breaking ~28+
         // strict-mode caller / arguments tests.
         fn install_ctor_metadata(
-            ctor: JsObject,
+            ctor: &mut JsObject,
             name: &str,
             length: i32,
             gc_heap: &mut otter_gc::GcHeap,
         ) -> Result<(), otter_gc::OutOfMemory> {
-            let name_str = JsString::from_str(name, gc_heap)?;
-            let _ = object::define_own_property(
+            let mut name_root = Value::undefined();
+            let mut roots = otter_gc::RootScope::new(gc_heap);
+            // SAFETY: `ctor` belongs to the caller and `name_root` is declared
+            // before the scope, so both slots remain live and stable until the
+            // guard is dropped.
+            unsafe {
+                roots.add_object(ctor);
+                roots.add_value(&mut name_root);
+            }
+            name_root = Value::string(JsString::from_str(name, gc_heap)?);
+            let _ = object::define_own_property_in_place(
                 ctor,
                 gc_heap,
                 "name",
-                PropertyDescriptor::data(Value::string(name_str), false, false, true),
+                PropertyDescriptor::data(name_root, false, false, true),
             );
-            let _ = object::define_own_property(
+            let _ = object::define_own_property_in_place(
                 ctor,
                 gc_heap,
                 "length",
@@ -1121,38 +1178,54 @@ impl ErrorClassRegistry {
             result.map_err(|e| map_err(interp, e))
         }
 
-        let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);
         // Error itself. §20.5.3 — `Error.prototype.constructor`
         // is the Error constructor, with attribute
         // `[[Configurable]]: true`, `[[Writable]]: true`,
         // `[[Enumerable]]: false`.
-        let error_ctor = alloc_registry_object(gc_heap, &[&error_proto_root, &to_string_root])?;
-        let error_ctor_root = Value::object(error_ctor);
+        error_ctor_root = Value::object(alloc_registry_object(
+            gc_heap,
+            &[&error_proto_root, &to_string_root],
+        )?);
         // §20.5.2 — `Error.prototype` lives on the constructor as
         // `{ writable: false, enumerable: false, configurable: false }`.
         // §20.5.3 — `Error.prototype.constructor` is
         // `{ writable: true, enumerable: false, configurable: true }`.
-        let _ = object::define_own_property(
-            error_ctor,
+        let mut error_ctor = error_ctor_root
+            .as_object()
+            .expect("Error constructor is an object");
+        let error_proto = error_proto_root
+            .as_object()
+            .expect("error prototype is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_ctor,
             gc_heap,
             "prototype",
             PropertyDescriptor::data(Value::object(error_proto), false, false, false),
         );
-        let _ = object::define_own_property(
-            error_proto,
+        error_ctor_root = Value::object(error_ctor);
+        let mut error_proto = error_proto_root
+            .as_object()
+            .expect("error prototype is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_proto,
             gc_heap,
             "constructor",
             PropertyDescriptor::data(Value::object(error_ctor), true, false, true),
         );
-        let error_call = native_constructor_static_with_roots(
+        error_proto_root = Value::object(error_proto);
+        native_root = Value::native_function(native_constructor_static_with_roots(
             gc_heap,
             "Error",
             1,
             ctor_error,
             &[&error_proto_root, &error_ctor_root],
-        )?;
-        object::set_constructor_native(error_ctor, gc_heap, Value::native_function(error_call));
-        install_ctor_metadata(error_ctor, "Error", 1, gc_heap)?;
+        )?);
+        error_ctor = error_ctor_root
+            .as_object()
+            .expect("Error constructor is an object");
+        object::set_constructor_native(error_ctor, gc_heap, native_root);
+        install_ctor_metadata(&mut error_ctor, "Error", 1, gc_heap)?;
+        error_ctor_root = Value::object(error_ctor);
         // §20.5.8.1 `Error.isError(arg)` — IsError(arg): an ordinary
         // Object carrying the `[[ErrorData]]` internal slot. Proxies and
         // plain objects shaped like errors return `false`; the marker is
@@ -1164,13 +1237,23 @@ impl ErrorClassRegistry {
                 .is_some_and(|obj| crate::object::has_error_data(obj, ctx.heap()));
             Ok(Value::boolean(is_error))
         }
-        let is_error_native = native_static_with_roots(gc_heap, "isError", 1, error_is_error, &[])?;
-        let _ = object::define_own_property(
-            error_ctor,
+        native_root = Value::native_function(native_static_with_roots(
             gc_heap,
             "isError",
-            PropertyDescriptor::data(Value::native_function(is_error_native), true, false, true),
+            1,
+            error_is_error,
+            &[],
+        )?);
+        error_ctor = error_ctor_root
+            .as_object()
+            .expect("Error constructor is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_ctor,
+            gc_heap,
+            "isError",
+            PropertyDescriptor::data(native_root, true, false, true),
         );
+        error_ctor_root = Value::object(error_ctor);
         // V8 extension `Error.captureStackTrace(target[, constructorOpt])`:
         // record the current call stack onto `target.stack`. When
         // `constructorOpt` is a function, every frame at or above the
@@ -1242,24 +1325,28 @@ impl ErrorClassRegistry {
             }
             Ok(Value::undefined())
         }
-        let capture_native = native_static_with_roots(
+        native_root = Value::native_function(native_static_with_roots(
             gc_heap,
             "captureStackTrace",
             2,
             error_capture_stack_trace,
             &[],
-        )?;
-        let _ = object::define_own_property(
-            error_ctor,
+        )?);
+        error_ctor = error_ctor_root
+            .as_object()
+            .expect("Error constructor is an object");
+        let _ = object::define_own_property_in_place(
+            &mut error_ctor,
             gc_heap,
             "captureStackTrace",
-            PropertyDescriptor::data(Value::native_function(capture_native), true, false, true),
+            PropertyDescriptor::data(native_root, true, false, true),
         );
+        error_ctor_root = Value::object(error_ctor);
         // V8 extension `Error.stackTraceLimit` (default 10): the maximum
         // number of frames captured for `Error.prototype.stack`. Writable
         // so user code can raise, lower, or disable (`0`) capture.
-        let _ = object::define_own_property(
-            error_ctor,
+        let _ = object::define_own_property_in_place(
+            &mut error_ctor,
             gc_heap,
             "stackTraceLimit",
             PropertyDescriptor::data(
@@ -1269,11 +1356,16 @@ impl ErrorClassRegistry {
                 true,
             ),
         );
+        error_ctor_root = Value::object(error_ctor);
         entries.push((
             ErrorKind::Error,
             ClassEntry {
-                prototype: error_proto,
-                constructor: error_ctor,
+                prototype: error_proto_root
+                    .as_object()
+                    .expect("error prototype is an object"),
+                constructor: error_ctor_root
+                    .as_object()
+                    .expect("Error constructor is an object"),
             },
         ));
 
@@ -1289,52 +1381,64 @@ impl ErrorClassRegistry {
             ErrorKind::EvalError,
             ErrorKind::AggregateError,
         ] {
-            let mut roots = class_entry_roots(&entries);
-            roots.push(Value::object(error_proto));
-            let root_refs: Vec<&Value> = roots.iter().collect();
-            let proto = alloc_registry_object(gc_heap, root_refs.as_slice())?;
-            let proto_root = Value::object(proto);
+            proto_root = Value::object(alloc_registry_object(gc_heap, &[])?);
+            let mut proto = proto_root
+                .as_object()
+                .expect("native error prototype is an object");
+            let error_proto = error_proto_root
+                .as_object()
+                .expect("error prototype is an object");
             object::set_prototype(proto, gc_heap, Some(error_proto));
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
-            let class_name = from_str_rooted(kind.class_name(), gc_heap, &[&proto_root])?;
-            let empty = from_str_rooted("", gc_heap, &[&proto_root, &Value::string(class_name)])?;
+            class_name_root =
+                Value::string(from_str_rooted(kind.class_name(), gc_heap, &[&proto_root])?);
+            empty_root = Value::string(from_str_rooted(
+                "",
+                gc_heap,
+                &[&proto_root, &class_name_root],
+            )?);
             // The string allocations may have relocated the young prototype;
             // refresh it from the rooted Value and write through `_in_place`.
-            let mut proto = proto_root
+            proto = proto_root
                 .as_object()
                 .expect("native error prototype is an object");
             let _ = object::define_own_property_in_place(
                 &mut proto,
                 gc_heap,
                 "name",
-                PropertyDescriptor::data(Value::string(class_name), true, false, true),
+                PropertyDescriptor::data(class_name_root, true, false, true),
             );
+            proto_root = Value::object(proto);
             let _ = object::define_own_property_in_place(
                 &mut proto,
                 gc_heap,
                 "message",
-                PropertyDescriptor::data(Value::string(empty), true, false, true),
+                PropertyDescriptor::data(empty_root, true, false, true),
             );
-            let mut roots = class_entry_roots(&entries);
-            roots.push(Value::object(error_proto));
-            roots.push(proto_root);
-            let root_refs: Vec<&Value> = roots.iter().collect();
-            let ctor = alloc_registry_object(gc_heap, root_refs.as_slice())?;
-            let ctor_root = Value::object(ctor);
+            proto_root = Value::object(proto);
+            ctor_root = Value::object(alloc_registry_object(gc_heap, &[])?);
             // §20.5.6.{2,3} — same prototype/constructor shape.
-            let _ = object::define_own_property(
-                ctor,
+            let mut ctor = ctor_root
+                .as_object()
+                .expect("native error constructor is an object");
+            proto = proto_root
+                .as_object()
+                .expect("native error prototype is an object");
+            let _ = object::define_own_property_in_place(
+                &mut ctor,
                 gc_heap,
                 "prototype",
                 PropertyDescriptor::data(Value::object(proto), false, false, false),
             );
-            let _ = object::define_own_property(
-                proto,
+            ctor_root = Value::object(ctor);
+            let _ = object::define_own_property_in_place(
+                &mut proto,
                 gc_heap,
                 "constructor",
                 PropertyDescriptor::data(Value::object(ctor), true, false, true),
             );
+            proto_root = Value::object(proto);
             // §20.5.7.2 — `AggregateError(errors, message?)` has
             // `length` 2; every other native error has `length` 1.
             let length = if kind == ErrorKind::AggregateError {
@@ -1352,25 +1456,28 @@ impl ErrorClassRegistry {
                 ErrorKind::EvalError => ctor_eval,
                 ErrorKind::AggregateError => ctor_aggregate,
             };
-            let mut roots = class_entry_roots(&entries);
-            roots.push(Value::object(error_proto));
-            roots.push(proto_root);
-            roots.push(ctor_root);
-            let root_refs: Vec<&Value> = roots.iter().collect();
-            let native = native_constructor_static_with_roots(
+            native_root = Value::native_function(native_constructor_static_with_roots(
                 gc_heap,
                 kind.class_name(),
                 length as u8,
                 dispatcher,
-                root_refs.as_slice(),
-            )?;
-            object::set_constructor_native(ctor, gc_heap, Value::native_function(native));
-            install_ctor_metadata(ctor, kind.class_name(), length, gc_heap)?;
+                &[],
+            )?);
+            ctor = ctor_root
+                .as_object()
+                .expect("native error constructor is an object");
+            object::set_constructor_native(ctor, gc_heap, native_root);
+            install_ctor_metadata(&mut ctor, kind.class_name(), length, gc_heap)?;
+            ctor_root = Value::object(ctor);
             entries.push((
                 kind,
                 ClassEntry {
-                    prototype: proto,
-                    constructor: ctor,
+                    prototype: proto_root
+                        .as_object()
+                        .expect("native error prototype is an object"),
+                    constructor: ctor_root
+                        .as_object()
+                        .expect("native error constructor is an object"),
                 },
             ));
         }

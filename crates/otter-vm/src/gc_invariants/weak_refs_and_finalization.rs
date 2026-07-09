@@ -27,7 +27,7 @@ fn full_gc_with_roots(
             visitor(*slot as *mut RawGc);
         }
     };
-    heap.mark_phase(&mut visit);
+    heap.mark_phase(&mut visit).expect("mark phase");
     crate::collections::run_ephemeron_fixpoint(heap);
     let jobs = process_weak_refs_and_finalizers(heap);
     heap.sweep_phase();
@@ -97,7 +97,7 @@ fn weak_ref_target_becomes_unavailable_after_force_gc() {
         Value::weak_ref(weak_ref),
     );
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert_eq!(
         weak_ref_deref(weak_ref, interp.gc_heap()),
         Value::undefined()
@@ -130,7 +130,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
     // but not yet collected. Force a GC so the baseline reflects the
     // actual reachable set, and the post-`register` GC can be
     // compared apples-to-apples.
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline_object_live_bytes =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
@@ -143,7 +143,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
     )
     .expect("register");
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert!(interp.microtasks().has_pending_sync());
     assert!(
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes
@@ -154,7 +154,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
     interp
         .drain_microtasks(&empty_context())
         .expect("drain cleanup");
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     interp
         .drain_microtasks(&empty_context())
         .expect("second drain");
@@ -230,7 +230,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
         Value::finalization_registry(registry),
     );
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert_eq!(
         calls.load(Ordering::Relaxed),
         0,
@@ -243,7 +243,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(seen_held.load(Ordering::Relaxed));
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     interp
         .drain_microtasks(&empty_context())
         .expect("second drain");
@@ -292,7 +292,7 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
         Value::finalization_registry(registry),
     );
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     interp
         .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
@@ -334,7 +334,7 @@ fn finalization_cleanup_job_carries_registry_context() {
         Value::finalization_registry(registry),
     );
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     interp
         .drain_microtasks_with_default(None)
         .expect("cleanup job should carry its own context");
@@ -379,9 +379,9 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
         Value::finalization_registry(registry),
     );
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert!(interp.microtasks().has_pending_sync());
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     interp
         .drain_microtasks(&empty_context())
         .expect("drain finalization callback");
@@ -419,7 +419,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         Value::finalization_registry(registry),
     );
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     assert!(
         !allocated_after_gc.load(Ordering::Relaxed),
         "raw GC must only enqueue cleanup and must not run user callback"

@@ -14,6 +14,7 @@ use crate::bootstrap::native_static_with_value_roots;
 use crate::holt_stack::HoltStack;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
+use crate::rooting::RootScopeExt;
 
 /// §27.1.1.1 `Iterator()` constructor — abstract base for the
 /// ES2025 iterator-helpers protocol. Direct calls / direct `new`
@@ -391,33 +392,67 @@ pub fn install_iterator_well_knowns_post_bootstrap(
 /// `%IteratorPrototype%` is reachable.
 pub fn build_builtin_iterator_prototypes_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    shape_root: object::ShapeHandle,
+    mut shape_root: object::ShapeHandle,
     parent: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<crate::bootstrap::BuiltinIteratorPrototypes, JsSurfaceError> {
     use crate::symbol::WellKnown;
-    let parent_value = Value::object(parent);
+    let mut parent_value = Value::object(parent);
+    let mut array_root = Value::undefined();
+    let mut map_root = Value::undefined();
+    let mut set_root = Value::undefined();
+    let mut string_root = Value::undefined();
+    let mut regexp_string_root = Value::undefined();
+    let mut helper_root = Value::undefined();
+    let mut wrap_root = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: every canonical slot is declared before the scope and remains
+    // stationary until the completed prototype set is returned.
+    unsafe {
+        roots.add_raw_slot(
+            (&mut shape_root as *mut object::ShapeHandle).cast::<otter_gc::raw::RawGc>(),
+        );
+        roots.add_value(&mut parent_value);
+        roots.add_value(&mut array_root);
+        roots.add_value(&mut map_root);
+        roots.add_value(&mut set_root);
+        roots.add_value(&mut string_root);
+        roots.add_value(&mut regexp_string_root);
+        roots.add_value(&mut helper_root);
+        roots.add_value(&mut wrap_root);
+    }
     let tag_sym = well_known.get(WellKnown::ToStringTag);
     let mut make = |tag: &'static str| -> Result<JsObject, JsSurfaceError> {
-        let mut proto = {
+        let proto = {
             let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                 parent_value.trace_value_slots(visitor);
             };
             object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?
         };
+        let mut proto_root = Value::object(proto);
+        let mut proto_scope = otter_gc::RootScope::new(heap);
+        // SAFETY: the canonical prototype slot precedes this nested scope.
+        unsafe { proto_scope.add_value(&mut proto_root) };
+        let proto = proto_root
+            .as_object()
+            .expect("iterator prototype stays rooted after allocation");
+        let parent = parent_value
+            .as_object()
+            .expect("Iterator.prototype stays rooted during bootstrap");
         object::set_prototype(proto, heap, Some(parent));
         let tag_sym_root = tag_sym;
         let tag_string = {
             let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                 parent_value.trace_value_slots(visitor);
                 tag_sym_root.trace_value_slots(visitor);
-                let p = &mut proto as *mut JsObject as *mut otter_gc::raw::RawGc;
-                visitor(p);
             };
             crate::string::JsString::from_str_with_roots(tag, heap, &mut visit)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?
         };
+        let proto = proto_root
+            .as_object()
+            .expect("iterator prototype stays rooted after tag allocation");
         object::define_own_symbol_property_partial(
             proto,
             heap,
@@ -430,25 +465,30 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
                 ..Default::default()
             },
         );
-        Ok(proto)
+        Ok(proto_root
+            .as_object()
+            .expect("iterator prototype stays rooted after tag definition"))
     };
-    let array = make("Array Iterator")?;
-    let map = make("Map Iterator")?;
-    let set = make("Set Iterator")?;
-    let string = make("String Iterator")?;
-    let regexp_string = make("RegExp String Iterator")?;
-    let helper = make("Iterator Helper")?;
+    array_root = Value::object(make("Array Iterator")?);
+    map_root = Value::object(make("Map Iterator")?);
+    set_root = Value::object(make("Set Iterator")?);
+    string_root = Value::object(make("String Iterator")?);
+    regexp_string_root = Value::object(make("RegExp String Iterator")?);
+    helper_root = Value::object(make("Iterator Helper")?);
     // §27.1.3.2 — `%WrapForValidIteratorPrototype%` carries no
     // `@@toStringTag` of its own.
-    let wrap_for_valid_iterator = {
+    wrap_root = Value::object({
         let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             parent_value.trace_value_slots(visitor);
         };
         let proto = object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let parent = parent_value
+            .as_object()
+            .expect("Iterator.prototype stays rooted during bootstrap");
         object::set_prototype(proto, heap, Some(parent));
         proto
-    };
+    });
     let install_method = |heap: &mut otter_gc::GcHeap,
                           proto: JsObject,
                           name: &'static str,
@@ -456,9 +496,15 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
                           call: crate::native_function::NativeFastFn,
                           label: &'static str|
      -> Result<(), JsSurfaceError> {
-        let proto_root = Value::object(proto);
+        let mut proto_root = Value::object(proto);
+        let mut scope = otter_gc::RootScope::new(heap);
+        // SAFETY: the canonical receiver slot precedes the nested scope.
+        unsafe { scope.add_value(&mut proto_root) };
         let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let proto = proto_root
+            .as_object()
+            .expect("iterator prototype stays rooted across method allocation");
         if !object::define_own_property(
             proto,
             heap,
@@ -471,7 +517,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     };
     install_method(
         heap,
-        regexp_string,
+        regexp_string_root
+            .as_object()
+            .expect("RegExp iterator prototype is rooted"),
         "next",
         0,
         regexp_string_iterator_proto_next,
@@ -481,7 +529,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     // built-in iterator prototype owns its `next`.
     install_method(
         heap,
-        array,
+        array_root
+            .as_object()
+            .expect("array iterator prototype is rooted"),
         "next",
         0,
         iterator_proto_next,
@@ -489,7 +539,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     )?;
     install_method(
         heap,
-        map,
+        map_root
+            .as_object()
+            .expect("map iterator prototype is rooted"),
         "next",
         0,
         iterator_proto_next,
@@ -497,7 +549,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     )?;
     install_method(
         heap,
-        set,
+        set_root
+            .as_object()
+            .expect("set iterator prototype is rooted"),
         "next",
         0,
         iterator_proto_next,
@@ -505,7 +559,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     )?;
     install_method(
         heap,
-        string,
+        string_root
+            .as_object()
+            .expect("string iterator prototype is rooted"),
         "next",
         0,
         iterator_proto_next,
@@ -514,7 +570,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     // §27.1.2.1 — `%IteratorHelperPrototype%` owns `next` and `return`.
     install_method(
         heap,
-        helper,
+        helper_root
+            .as_object()
+            .expect("iterator helper prototype is rooted"),
         "next",
         0,
         iterator_helper_proto_next,
@@ -522,7 +580,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     )?;
     install_method(
         heap,
-        helper,
+        helper_root
+            .as_object()
+            .expect("iterator helper prototype is rooted"),
         "return",
         1,
         iterator_helper_proto_return,
@@ -532,7 +592,9 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     // `return`, both forwarding to the wrapped iterator.
     install_method(
         heap,
-        wrap_for_valid_iterator,
+        wrap_root
+            .as_object()
+            .expect("wrap-for-valid iterator prototype is rooted"),
         "next",
         0,
         wrap_for_valid_iterator_next,
@@ -540,20 +602,36 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     )?;
     install_method(
         heap,
-        wrap_for_valid_iterator,
+        wrap_root
+            .as_object()
+            .expect("wrap-for-valid iterator prototype is rooted"),
         "return",
         1,
         iterator_proto_return,
         "WrapForValidIteratorPrototype.return",
     )?;
     Ok(crate::bootstrap::BuiltinIteratorPrototypes {
-        array,
-        map,
-        set,
-        string,
-        regexp_string,
-        helper,
-        wrap_for_valid_iterator,
+        array: array_root
+            .as_object()
+            .expect("array iterator prototype is rooted"),
+        map: map_root
+            .as_object()
+            .expect("map iterator prototype is rooted"),
+        set: set_root
+            .as_object()
+            .expect("set iterator prototype is rooted"),
+        string: string_root
+            .as_object()
+            .expect("string iterator prototype is rooted"),
+        regexp_string: regexp_string_root
+            .as_object()
+            .expect("RegExp iterator prototype is rooted"),
+        helper: helper_root
+            .as_object()
+            .expect("iterator helper prototype is rooted"),
+        wrap_for_valid_iterator: wrap_root
+            .as_object()
+            .expect("wrap-for-valid iterator prototype is rooted"),
     })
 }
 

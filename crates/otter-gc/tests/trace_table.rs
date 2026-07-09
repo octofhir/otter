@@ -36,9 +36,9 @@ fn full_gc_walks_through_registered_trace_fns() {
     let root = scope.local(node);
     // Promote both to old gen so the full mark phase walks
     // them.
-    heap.collect_minor(otter_gc::EmptyRoots);
-    heap.collect_minor(otter_gc::EmptyRoots);
-    heap.collect_full(&mut |_| {});
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+    heap.collect_minor(otter_gc::EmptyRoots).expect("minor GC");
+    heap.collect_full(&mut |_| {}).expect("full GC");
     // Both still reachable: leaf via node.next, node via root.
     let n_after = root.get();
     let leaf_after = unsafe {

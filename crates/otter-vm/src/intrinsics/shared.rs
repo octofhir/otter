@@ -10,6 +10,7 @@ use smallvec::SmallVec;
 
 use crate::js_surface::{Attr, JsSurfaceError};
 use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::rooting::RootScopeExt;
 use crate::{NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, descriptor_value};
 
 /// `pub` re-export of [`alloc_object_with_value_roots`] for use by
@@ -199,11 +200,26 @@ pub(crate) fn install_placeholder(
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
     let global_root = Value::object(global);
-    let mut placeholder = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let placeholder_root = Value::object(placeholder);
-    let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
-    object::set(&mut placeholder, heap, "prototype", Value::object(proto));
-    define_global(global, heap, name, Value::object(placeholder));
+    let mut placeholder_root = Value::undefined();
+    let mut proto_root = Value::undefined();
+    let mut scope = otter_gc::RootScope::new(heap);
+    // SAFETY: both canonical slots are declared before the scope and remain
+    // live until the placeholder has been attached to the global object.
+    unsafe {
+        scope.add_value(&mut placeholder_root);
+        scope.add_value(&mut proto_root);
+    }
+    placeholder_root = Value::object(alloc_object_with_value_roots(heap, &[&global_root])?);
+    proto_root = Value::object(alloc_object_with_value_roots(
+        heap,
+        &[&global_root, &placeholder_root],
+    )?);
+    let mut placeholder = placeholder_root
+        .as_object()
+        .expect("placeholder stays rooted across prototype allocation");
+    object::set(&mut placeholder, heap, "prototype", proto_root);
+    placeholder_root = Value::object(placeholder);
+    define_global(global, heap, name, placeholder_root);
     Ok(())
 }
 

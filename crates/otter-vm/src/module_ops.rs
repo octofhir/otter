@@ -540,15 +540,22 @@ impl Interpreter {
         let Some(function_id) = context.module_init_function_id(url) else {
             return Ok(());
         };
-        let Some(env) = self.module_environments.get(url_arc).copied() else {
+        if !self.module_environments.contains_key(url_arc) {
             return Ok(());
-        };
+        }
         // The hoist phase normally ran in the subtree sweep; keep the
         // pairing as a fallback for inits reached outside
         // `evaluate_module` (defensive — cells must exist before the
         // body binds against them).
         self.run_module_hoist_phase(context, url_arc)?;
         let meta = self.build_import_meta(url)?;
+        // Read the environment AFTER every allocation above: the registry
+        // entry is a traced root the collector forwards, while a bare copy
+        // taken earlier would go stale the moment `build_import_meta` (or a
+        // nested hoist) triggers a scavenge.
+        let Some(env) = self.module_environments.get(url_arc).copied() else {
+            return Ok(());
+        };
         self.run_module_init(context, function_id, Value::object(env), meta)?;
         Ok(())
     }
@@ -592,10 +599,16 @@ impl Interpreter {
         let Some(function_id) = context.module_init_function_id(url) else {
             return Ok(());
         };
+        if !self.module_environments.contains_key(url_arc) {
+            return Ok(());
+        }
+        let meta = self.build_import_meta(url)?;
+        // Environment read AFTER the import.meta allocation — see
+        // `run_module_body_sync` for why a pre-allocation copy is a
+        // use-after-move under a moving young generation.
         let Some(env) = self.module_environments.get(url_arc).copied() else {
             return Ok(());
         };
-        let meta = self.build_import_meta(url)?;
         self.run_module_init_hoist(context, function_id, Value::object(env), meta)
     }
 
@@ -612,12 +625,18 @@ impl Interpreter {
             self.async_module_execution_fulfilled(context, url_arc);
             return Ok(());
         };
+        if !self.module_environments.contains_key(url_arc) {
+            self.async_module_execution_fulfilled(context, url_arc);
+            return Ok(());
+        }
+        self.run_module_hoist_phase(context, url_arc)?;
+        let meta = self.build_import_meta(url)?;
+        // Environment read AFTER the hoist + import.meta allocations — a
+        // pre-allocation copy is a use-after-move under a moving young gen.
         let Some(env) = self.module_environments.get(url_arc).copied() else {
             self.async_module_execution_fulfilled(context, url_arc);
             return Ok(());
         };
-        self.run_module_hoist_phase(context, url_arc)?;
-        let meta = self.build_import_meta(url)?;
         match self.run_module_init(context, function_id, Value::object(env), meta) {
             Ok(Some(init_promise)) => {
                 self.attach_async_module_reactions(context, url_arc.clone(), init_promise)

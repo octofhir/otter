@@ -231,9 +231,9 @@ impl Interpreter {
             crate::trace_active_frame_roots,
         );
         let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-        let frame_root_depth = self
+        let frame_roots_guard = self
             .gc_heap
-            .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+            .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
         let result = (|| -> Result<(), RunError> {
             if !fulfilled {
                 if let Err(error) = self.unwind_throw(context, &mut stack, value) {
@@ -315,7 +315,7 @@ impl Interpreter {
                 }
             }
         })();
-        self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
+        drop(frame_roots_guard);
         self.pop_iteration_anchors_to(anchor_depth - 1);
         result
     }
@@ -380,9 +380,9 @@ impl Interpreter {
             crate::trace_active_frame_roots,
         );
         let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-        let frame_root_depth = self
+        let frame_roots_guard = self
             .gc_heap
-            .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+            .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
         let result = (|| -> Result<(), RunError> {
             if !fulfilled {
                 // Inject the rejection as a throw so the parked frame
@@ -414,7 +414,7 @@ impl Interpreter {
                 }
             }
         })();
-        self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
+        drop(frame_roots_guard);
         self.pop_iteration_anchors_to(anchor_depth - 1);
         result
     }

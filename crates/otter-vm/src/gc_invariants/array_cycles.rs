@@ -11,7 +11,7 @@ use crate::array::ARRAY_BODY_TYPE_TAG;
 fn assert_array_self_reference_reaped() {
     let mut interp = Interpreter::new();
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline = interp.gc_heap_mut().gc_stats().by_type[ARRAY_BODY_TYPE_TAG as usize].live_bytes;
 
     let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
@@ -25,7 +25,7 @@ fn assert_array_self_reference_reaped() {
     );
 
     let _ = arr;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[ARRAY_BODY_TYPE_TAG as usize].live_bytes;
     assert_eq!(
         after, baseline,

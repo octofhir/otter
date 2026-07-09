@@ -560,6 +560,33 @@ impl Cage {
         })
     }
 
+    /// Atomically acquire `count` page slots under one cage lock.
+    ///
+    /// If fewer slots are free, returns `None` without removing any. Promotion
+    /// preflight uses this all-or-nothing operation so a failed reservation
+    /// cannot perturb the cage or require rollback allocations.
+    pub(crate) fn alloc_pages(count: usize) -> Option<Vec<CagePage>> {
+        let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
+        let cage = guard.as_mut().expect("cage not initialised");
+        if cage.free_pages.len() < count {
+            return None;
+        }
+        let mut pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx = cage
+                .free_pages
+                .pop()
+                .expect("page count preflight guarantees a slot");
+            // SAFETY: every free-list index is inside the cage.
+            let page_ptr = unsafe { cage.base.add(idx as usize * PAGE_SIZE) };
+            pages.push(CagePage {
+                base: page_ptr,
+                offset: idx * (PAGE_SIZE as u32),
+            });
+        }
+        Some(pages)
+    }
+
     /// Return a page to the cage free-list.
     ///
     /// # Safety

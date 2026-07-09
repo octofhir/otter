@@ -157,7 +157,7 @@ fn clone_to_index(
         }
         let bytes = buf.with_bytes(ctx.heap(), |b| b.to_vec());
         let cloned = ctx
-            .array_buffer_from_bytes_rooted(bytes, &[], &[])
+            .array_buffer_from_bytes(bytes)
             .map_err(|e| type_error(e.to_string()))?;
         let idx = push_root(ctx, Value::array_buffer(cloned));
         memo.insert(raw, idx);
@@ -174,7 +174,7 @@ fn clone_to_index(
         let length = ta.length(ctx.heap());
         let bytes = ta.buffer(ctx.heap()).with_bytes(ctx.heap(), |b| b.to_vec());
         let buffer = ctx
-            .array_buffer_from_bytes_rooted(bytes, &[], &[])
+            .array_buffer_from_bytes(bytes)
             .map_err(|e| type_error(e.to_string()))?;
         let buffer_idx = push_root(ctx, Value::array_buffer(buffer));
         let ctor_val = ctor(ctx, typed_array_ctor_name(kind))?;
@@ -201,7 +201,7 @@ fn clone_to_index(
         let byte_length = dv.byte_length(ctx.heap());
         let bytes = dv.buffer(ctx.heap()).with_bytes(ctx.heap(), |b| b.to_vec());
         let buffer = ctx
-            .array_buffer_from_bytes_rooted(bytes, &[], &[])
+            .array_buffer_from_bytes(bytes)
             .map_err(|e| type_error(e.to_string()))?;
         let buffer_idx = push_root(ctx, Value::array_buffer(buffer));
         let ctor_val = ctor(ctx, "DataView")?;

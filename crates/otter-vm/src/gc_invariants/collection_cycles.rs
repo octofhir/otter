@@ -11,7 +11,7 @@ use crate::collections::{MAP_BODY_TYPE_TAG, SET_BODY_TYPE_TAG};
 fn assert_map_self_value_reaped() {
     let mut interp = Interpreter::new();
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline = interp.gc_heap_mut().gc_stats().by_type[MAP_BODY_TYPE_TAG as usize].live_bytes;
 
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
@@ -30,7 +30,7 @@ fn assert_map_self_value_reaped() {
     );
 
     let _ = map;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[MAP_BODY_TYPE_TAG as usize].live_bytes;
     assert_eq!(
         after, baseline,
@@ -41,7 +41,7 @@ fn assert_map_self_value_reaped() {
 fn assert_set_self_value_reaped() {
     let mut interp = Interpreter::new();
 
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let baseline = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;
 
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("alloc set");
@@ -55,7 +55,7 @@ fn assert_set_self_value_reaped() {
     );
 
     let _ = set;
-    interp.force_gc();
+    interp.force_gc().expect("force GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;
     assert_eq!(
         after, baseline,

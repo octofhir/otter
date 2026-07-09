@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`FrameRoots`] — safe trait implemented by VM-owned frame-stack tracers.
 //! - [`FrameRootProviders`] — LIFO registry of active dispatch-loop stacks.
+//! - [`FrameRootsGuard`] — RAII provider registration.
 //!
 //! # Invariants
 //! - Providers are pushed on dispatch-loop entry and popped before the
@@ -12,9 +13,10 @@
 //!   provider pointers.
 //!
 //! # See also
-//! - [`crate::heap::GcHeap::push_frame_roots`]
+//! - [`crate::heap::GcHeap::register_frame_roots`]
 
 use crate::compressed::RawGc;
+use crate::heap::GcHeap;
 
 /// Safe callback surface for VM-owned active frame stacks.
 pub trait FrameRoots {
@@ -101,5 +103,54 @@ impl<S, C> FrameRoots for RawFrameRoots<S, C> {
         // SAFETY: `RawFrameRoots::new` instances are registered only for scopes
         // where the pointed-to frame stack and cold-frame pool remain live.
         unsafe { (self.trace)(&*self.stack, &*self.cold_pool, visitor) };
+    }
+}
+
+/// RAII registration for an active interpreter/JIT frame-root provider.
+#[must_use = "dropping the guard immediately unregisters the frame roots"]
+pub struct FrameRootsGuard {
+    heap: *mut GcHeap,
+    depth: usize,
+}
+
+impl FrameRootsGuard {
+    pub(crate) fn new(heap: &mut GcHeap, depth: usize) -> Self {
+        Self { heap, depth }
+    }
+}
+
+impl Drop for FrameRootsGuard {
+    fn drop(&mut self) {
+        // SAFETY: the VM keeps the heap and provider alive for the complete
+        // guard scope. Truncation also removes leaked nested registrations.
+        unsafe { (*self.heap).pop_frame_roots_to(self.depth) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    struct EmptyFrames;
+
+    impl FrameRoots for EmptyFrames {
+        fn trace(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {}
+    }
+
+    #[test]
+    fn guard_unregisters_provider_on_unwind() {
+        let mut heap = GcHeap::new().expect("heap");
+        let frames = EmptyFrames;
+        let provider: &dyn FrameRoots = &frames;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = heap.register_frame_roots(provider as *const dyn FrameRoots);
+            panic!("exercise unwind cleanup");
+        }));
+        assert!(result.is_err());
+        let mut visits = 0usize;
+        heap.trace_frame_root_providers(&mut |_| visits += 1);
+        assert_eq!(visits, 0);
     }
 }

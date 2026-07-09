@@ -951,6 +951,13 @@ fn run_isolate(
         next_immediate_token: AtomicU64::new(FIRST_IMMEDIATE_TOKEN),
     });
     runtime.install_timer_scheduler(timer_scheduler);
+    runtime.install_host_completion_sink(Arc::new(
+        crate::runtime_activity::SpawnerCompletionSink {
+            spawner: runtime
+                .runtime_task_spawner()
+                .expect("isolate runner constructs the runtime with a task spawner"),
+        },
+    ));
     let dynamic_import_loader = Arc::new(InboxDynamicImportLoader {
         tx: scheduler_tx.clone(),
         counters: counters.clone(),

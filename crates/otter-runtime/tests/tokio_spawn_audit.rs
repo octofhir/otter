@@ -60,6 +60,17 @@ const SPAWN_PATTERNS: &[&str] = &[
 fn allowlist() -> BTreeMap<&'static str, &'static str> {
     let mut map = BTreeMap::new();
     map.insert(
+        "crates/otter-runtime/src/runtime_activity.rs",
+        "SpawnerCompletionSink::spawn — the async native-method protocol's executor hop. \
+         The spawned future is the marshalling layer's `drive(future, completer)`: the \
+         binding body's future captures only Send + 'static owned Rust data (the glue \
+         snapshots host data and extracts arguments before building it), and the \
+         PromiseCompleter carries only a PersistentRootId, an Arc sink, an owned \
+         ExecutionContext, and a keep-alive token. No Interpreter / Value / Local \
+         crosses: settlement re-enters through HostCompletionTask on the runtime \
+         scheduler, and the IntoJs conversion runs inside that isolate-thread job.",
+    );
+    map.insert(
         "crates/otter-runtime/src/event_loop.rs",
         "TokioEventLoop is the runtime's explicit Tokio boundary. Spawned work is limited \
          to timer sleeps and narrow host-service futures over owned data. Neither touches \

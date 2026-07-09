@@ -219,3 +219,58 @@ impl std::fmt::Debug for RuntimeKeepAlive {
             .finish()
     }
 }
+
+/// [`otter_vm::host_completion::HostCompletionSink`] over the task
+/// spawner: futures ride the shared Tokio runtime, completion jobs
+/// ride the inbox as [`RuntimeTask`]s, and liveness holds map to
+/// [`RuntimeKeepAlive`] so the event loop stays up until the settle
+/// arrives. Installed per isolate by the runner, like the timer
+/// scheduler.
+pub(crate) struct SpawnerCompletionSink {
+    pub(crate) spawner: RuntimeTaskSpawner,
+}
+
+struct HostCompletionTask {
+    job: otter_vm::host_completion::HostCompletionJob,
+}
+
+impl RuntimeTask for HostCompletionTask {
+    fn run(self: Box<Self>, runtime: &mut crate::Runtime) -> Result<(), OtterError> {
+        runtime.run_host_completion(self.job);
+        Ok(())
+    }
+}
+
+impl otter_vm::host_completion::HostCompletionSink for SpawnerCompletionSink {
+    fn spawn(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        if let Some(handle) = self.spawner.io_handle() {
+            handle.spawn(future);
+        }
+        // No event loop (direct-mode embedding): the future is dropped
+        // and its completer's Drop releases the promise root — the
+        // promise stays pending, matching the timers behavior in
+        // loop-less embeddings.
+    }
+
+    fn complete(&self, job: otter_vm::host_completion::HostCompletionJob) {
+        let _ = self
+            .spawner
+            .enqueue(HostCompletionTask { job }, RuntimeLiveness::Ref);
+    }
+
+    fn keep_alive(&self) -> otter_vm::host_completion::HostKeepAlive {
+        otter_vm::host_completion::HostKeepAlive::new(Box::new(
+            self.spawner.retain_keep_alive(RuntimeLiveness::Ref),
+        ))
+    }
+
+    fn with_executor_context(&self, f: &mut dyn FnMut()) {
+        match self.spawner.io_handle() {
+            Some(handle) => {
+                let _guard = handle.enter();
+                f();
+            }
+            None => f(),
+        }
+    }
+}

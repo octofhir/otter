@@ -46,6 +46,7 @@
 //!   rooting contract.
 //! - `EXTENSION_API_PLAN.md` (repo root) — the design this implements.
 
+mod completer;
 mod cx;
 mod error;
 mod from_js;
@@ -53,6 +54,7 @@ mod host_class;
 mod into_js;
 mod scoped_ext;
 
+pub use completer::PromiseCompleter;
 pub use cx::MarshalCx;
 pub use error::{JsError, ValueIdent};
 pub use from_js::{

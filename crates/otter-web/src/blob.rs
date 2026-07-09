@@ -172,18 +172,18 @@ impl Blob {
         )
     }
 
-    #[method(name = "arrayBuffer", promise)]
-    fn js_array_buffer(&self) -> ArrayBuffer {
+    #[method(name = "arrayBuffer")]
+    async fn js_array_buffer(self) -> ArrayBuffer {
         ArrayBuffer(self.bytes.to_vec())
     }
 
-    #[method(name = "bytes", promise)]
-    fn js_bytes(&self) -> Uint8Array {
+    #[method(name = "bytes")]
+    async fn js_bytes(self) -> Uint8Array {
         Uint8Array(self.bytes.to_vec())
     }
 
-    #[method(name = "text", promise)]
-    fn js_text(&self) -> String {
+    #[method(name = "text")]
+    async fn js_text(self) -> String {
         self.text()
     }
 }

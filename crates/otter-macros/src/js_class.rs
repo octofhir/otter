@@ -146,6 +146,7 @@ impl Parse for ClassArgs {
 enum ReceiverKind {
     Ref,
     RefMut,
+    Owned,
     None,
 }
 
@@ -177,6 +178,8 @@ struct Member {
     params: Vec<Type>,
     /// Whether the return type is literally `Result<…>`.
     returns_result: bool,
+    /// `async fn` — compiles to the promise protocol.
+    is_async: bool,
 }
 
 /// Extract and strip the single marker attribute of `item`, if any.
@@ -273,22 +276,33 @@ fn set_role(slot: &mut Option<Role>, role: Role, span: Span) -> Result<()> {
 }
 
 fn member_shape(item: &ImplItemFn, role: Role) -> Result<Member> {
+    let is_async = item.sig.asyncness.is_some();
     let mut receiver = ReceiverKind::None;
     let mut params = Vec::new();
     for input in &item.sig.inputs {
         match input {
             FnArg::Receiver(recv) => {
-                receiver = if recv.mutability.is_some() {
-                    ReceiverKind::RefMut
-                } else {
-                    ReceiverKind::Ref
-                };
                 if recv.reference.is_none() {
+                    if !is_async {
+                        return Err(Error::new(
+                            recv.span(),
+                            "sync js_class members take `&self` / `&mut self`; \
+                             an owned `self` receiver is the async-method shape",
+                        ));
+                    }
+                    receiver = ReceiverKind::Owned;
+                } else if is_async {
                     return Err(Error::new(
                         recv.span(),
-                        "js_class members take `&self` / `&mut self`; \
-                         owned receivers arrive with the async protocol",
+                        "async js_class methods take an owned `self` snapshot \
+                         (the future cannot borrow the instance across .await)",
                     ));
+                } else {
+                    receiver = if recv.mutability.is_some() {
+                        ReceiverKind::RefMut
+                    } else {
+                        ReceiverKind::Ref
+                    };
                 }
             }
             FnArg::Typed(arg) => params.push((*arg.ty).clone()),
@@ -304,6 +318,7 @@ fn member_shape(item: &ImplItemFn, role: Role) -> Result<Member> {
         receiver,
         params,
         returns_result,
+        is_async,
     })
 }
 
@@ -453,6 +468,12 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 "#[constructor] takes no receiver; it returns the instance data",
             ));
         }
+        if constructor.is_async {
+            return Err(Error::new(
+                constructor.fn_ident.span(),
+                "constructors are synchronous; async factories are statics",
+            ));
+        }
         let op = class_name;
         let extractions: Vec<_> = constructor
             .params
@@ -525,6 +546,73 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             continue;
         }
 
+        if member.is_async {
+            if !matches!(kind, Emitted::Method) {
+                return Err(Error::new(fn_ident.span(), "only methods can be async"));
+            }
+            if promise {
+                return Err(Error::new(
+                    fn_ident.span(),
+                    "async methods already return a promise; drop `promise`",
+                ));
+            }
+            if !matches!(member.receiver, ReceiverKind::Owned) {
+                return Err(Error::new(
+                    fn_ident.span(),
+                    "async methods take an owned `self` snapshot receiver",
+                ));
+            }
+            let op_string = format!("{}.prototype.{}", class_name.value(), js_name.value());
+            let op = LitStr::new(&op_string, js_name.span());
+            let glue_ident = format_ident!("__otter_js_class_{glue_prefix}_{fn_ident}");
+            let extractions: Vec<_> = member
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| arg_extraction(index, ty, &op))
+                .collect();
+            let arg_names = arg_idents(member.params.len());
+            // The future's output must be Result<R, JsError>; a plain
+            // return type wraps in Ok.
+            let future_expr = if member.returns_result {
+                quote!(__call)
+            } else {
+                quote!(async move {
+                    ::core::result::Result::<_, ::otter_vm::marshal::JsError>::Ok(__call.await)
+                })
+            };
+            glue.extend(quote! {
+                fn #glue_ident(
+                    ctx: &mut ::otter_vm::NativeCtx<'_>,
+                    args: &[::otter_vm::Value],
+                ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                    let __this_value = *ctx.this_value();
+                    ctx.scope(|ctx, __s| {
+                        let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                        let __this = __cx.park(__this_value);
+                        // Owned snapshot: nothing GC-touching crosses
+                        // the .await inside the future.
+                        let __recv: #self_ty = __cx
+                            .with_host_data::<#self_ty, #self_ty>(
+                                __this,
+                                ::core::clone::Clone::clone,
+                            )
+                            .map_err(|e| e.into_native(#op))?;
+                        #(#extractions)*
+                        let __call = <#self_ty>::#fn_ident(__recv #(, #arg_names)*);
+                        let __future = #future_expr;
+                        let __out = __cx
+                            .promise_from_future(__future)
+                            .map_err(|e| e.into_native(#op))?;
+                        ::core::result::Result::Ok(__cx.escape(__out))
+                    })
+                }
+            });
+            let length_lit = LitInt::new(&length.to_string(), Span::call_site());
+            method_rows.push(quote!(#js_name / #length_lit => #glue_ident));
+            continue;
+        }
+
         if matches!(kind, Emitted::Getter) && !member.params.is_empty() {
             return Err(Error::new(fn_ident.span(), "getters take no parameters"));
         }
@@ -559,10 +647,10 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 })
                 .map_err(|e| e.into_native(#op))?
             },
-            ReceiverKind::None => {
+            ReceiverKind::Owned | ReceiverKind::None => {
                 return Err(Error::new(
                     fn_ident.span(),
-                    "non-raw methods take `&self` or `&mut self`; \
+                    "non-raw sync methods take `&self` or `&mut self`; \
                      statics arrive with the namespace surface",
                 ));
             }

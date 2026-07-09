@@ -188,6 +188,7 @@ impl Interpreter {
             persistent_roots: persistent_roots::PersistentRoots::new(),
             console_sink: console::default_console_sink(),
             timer_scheduler: None,
+            host_completion_sink: None,
             timer_callbacks: timers::TimerCallbacks::new(),
             dynamic_import_loader: None,
             dynamic_import_registry: dynamic_import::DynamicImportRegistry::new(),

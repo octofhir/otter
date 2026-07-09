@@ -31,18 +31,14 @@ pub mod crypto;
 pub mod globals;
 pub mod url;
 
-use otter_runtime::{
-    GlobalClass, OtterBuilder, RuntimeBuilder, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_arg_to_string,
-    runtime_string_value, runtime_type_error,
-};
+use otter_runtime::{GlobalClass, OtterBuilder, RuntimeBuilder};
 
 /// Active Web API class globals in deterministic bootstrap order.
 /// Each entry is the `couch!`-generated `BuiltinIntrinsic` for one
 /// Web class. The runtime installs them via the same fn-pointer
 /// path as bootstrap registry entries.
 pub static WEB_API_CLASSES: &[GlobalClass] = &[
-    GlobalClass::from_intrinsic::<url::Intrinsic>(),
+    GlobalClass::from_intrinsic::<url::WebUrlIntrinsic>(),
     // File's install resolves Blob off the global, so Blob precedes it.
     GlobalClass::from_intrinsic::<blob::BlobIntrinsic>(),
     GlobalClass::from_intrinsic::<blob::FileIntrinsic>(),
@@ -88,41 +84,4 @@ impl WebApiBuilderExt for OtterBuilder {
     fn with_web_apis(self) -> Self {
         with_web_apis_for_otter(self)
     }
-}
-
-pub(crate) fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
-    runtime_type_error(name, reason)
-}
-
-pub(crate) fn arg_string(
-    args: &[Value],
-    index: usize,
-    heap: &otter_runtime::otter_gc::GcHeap,
-) -> String {
-    runtime_arg_to_string(args, index, heap)
-}
-
-pub(crate) fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
-    runtime_string_value(ctx, value)
-}
-
-/// Re-parent a native host instance to its class prototype.
-///
-/// Native host classes build and return their own instance object from the
-/// constructor, which bypasses the default `new.target.prototype` linkage the
-/// engine applies to ordinary `new` expressions. Without this the instance has
-/// a null prototype, so `instanceof` fails and prototype methods are invisible.
-///
-/// The class prototype is `globalThis[class_name].prototype`. Subclasses
-/// (e.g. `File extends Blob`) re-home their instance to the subclass prototype
-/// themselves in JS via `Object.setPrototypeOf`, since a name-based lookup here
-/// cannot see `new.target`.
-pub(crate) fn link_class_prototype(ctx: &mut NativeCtx<'_>, instance: Value, class_name: &str) {
-    let Some(object) = instance.as_object() else {
-        return;
-    };
-    let Some(prototype) = ctx.class_instance_prototype(class_name) else {
-        return;
-    };
-    otter_runtime::object::set_prototype_value(object, ctx.heap_mut(), Some(prototype));
 }

@@ -506,12 +506,13 @@ fn wintertc_partial_entries_document_their_gap() {
             try { fetch("http://example.invalid"); return false; }
             catch (e) { return String(e.message).includes("fetch is not implemented"); }
           },
-          // URL exposes snapshot data properties, not live spec accessors.
+          // URL parts are live prototype accessors now, but the
+          // searchParams URLSearchParams linkage is still missing.
           "URL": () => {
-            const u = new URL("https://e.com/p");
-            const d = Object.getOwnPropertyDescriptor(u, "href")
-              || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(u), "href");
-            return !!(d && "value" in d) && !(d && d.get);
+            const u = new URL("https://e.com/p?a=1");
+            const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(u), "href");
+            const live = !!(d && d.get && d.set);
+            return live && typeof u.searchParams === "undefined";
           },
           // Request bodies are default streams only; no BYOB byte reader yet.
           "Request": () => {

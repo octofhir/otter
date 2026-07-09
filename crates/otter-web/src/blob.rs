@@ -29,11 +29,8 @@
 
 use std::sync::Arc;
 
-use otter_macros::{HostClass, js_class};
-use otter_runtime::marshal::{
-    ArrayBuffer, BufferSource, FromJs, JsError, JsUnionProbe, JsValue, MarshalCx, Sequence,
-    USVString, Uint8Array, ValueIdent,
-};
+use otter_macros::{FromJs, HostClass, js_class};
+use otter_runtime::marshal::{ArrayBuffer, BufferSource, Sequence, USVString, Uint8Array};
 
 /// Owned Blob record: immutable bytes + normalized MIME type.
 #[derive(Debug, Clone, PartialEq, Eq, HostClass)]
@@ -44,7 +41,9 @@ pub struct Blob {
 
 /// One `BlobPart`: a nested Blob (its bytes), a `BufferSource` (the
 /// live byte range, copied), or anything else coerced to a string and
-/// UTF-8 encoded.
+/// UTF-8 encoded. Probe order is declaration order; the string
+/// coercion is the catch-all and stays last.
+#[derive(FromJs)]
 pub enum BlobPart {
     /// A nested `Blob` / `File` contributes its raw bytes.
     Blob(Blob),
@@ -52,22 +51,6 @@ pub enum BlobPart {
     Buffer(BufferSource),
     /// Everything else stringifies.
     Text(USVString),
-}
-
-impl<'s> FromJs<'s> for BlobPart {
-    fn from_js(
-        cx: &mut MarshalCx<'_, '_, 's>,
-        v: JsValue<'s>,
-        ident: ValueIdent<'_>,
-    ) -> Result<Self, JsError> {
-        if <Blob as JsUnionProbe>::probe(cx, v) {
-            return Blob::from_js(cx, v, ident).map(Self::Blob);
-        }
-        if <BufferSource as JsUnionProbe>::probe(cx, v) {
-            return BufferSource::from_js(cx, v, ident).map(Self::Buffer);
-        }
-        USVString::from_js(cx, v, ident).map(Self::Text)
-    }
 }
 
 impl BlobPart {
@@ -82,48 +65,19 @@ impl BlobPart {
 
 /// The Blob constructor options bag (`{ type }`; `endings` is
 /// "transparent"-only and therefore ignored).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, FromJs)]
 pub struct BlobPropertyBag {
+    #[js(name = "type", default)]
     content_type: USVString,
-}
-
-impl<'s> FromJs<'s> for BlobPropertyBag {
-    fn from_js(
-        cx: &mut MarshalCx<'_, '_, 's>,
-        v: JsValue<'s>,
-        _ident: ValueIdent<'_>,
-    ) -> Result<Self, JsError> {
-        let member = cx.get(v, "type")?;
-        let content_type = if cx.is_undefined(member) {
-            USVString::default()
-        } else {
-            USVString::from_js(cx, member, ValueIdent::Member("type"))?
-        };
-        Ok(Self { content_type })
-    }
 }
 
 /// The File constructor options bag (`{ type, lastModified }`).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, FromJs)]
 pub struct FilePropertyBag {
+    #[js(name = "type", default)]
     content_type: USVString,
+    #[js(name = "lastModified")]
     last_modified: Option<f64>,
-}
-
-impl<'s> FromJs<'s> for FilePropertyBag {
-    fn from_js(
-        cx: &mut MarshalCx<'_, '_, 's>,
-        v: JsValue<'s>,
-        ident: ValueIdent<'_>,
-    ) -> Result<Self, JsError> {
-        let content_type = BlobPropertyBag::from_js(cx, v, ident)?.content_type;
-        let member = cx.get(v, "lastModified")?;
-        let last_modified = Option::<f64>::from_js(cx, member, ValueIdent::Member("lastModified"))?;
-        Ok(Self {
-            content_type,
-            last_modified,
-        })
-    }
 }
 
 impl Blob {

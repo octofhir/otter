@@ -57,7 +57,10 @@
 //!   (wrap the converted return in a pre-fulfilled promise), `raw`
 //!   (the fn *is* the native entry: `fn(&mut NativeCtx, &[Value]) ->
 //!   Result<Value, NativeError>`; no glue).
-//! - `#[getter(name = "…")]` — prototype accessor getter.
+//! - `#[getter(name = "…")]` / `#[setter(name = "…")]` — prototype
+//!   accessor halves; same-name halves merge into one accessor. A
+//!   getter takes no parameters; a setter takes exactly one and its
+//!   JS completion value is `undefined`.
 //!
 //! `length` defaults to the number of leading non-`Option` parameters
 //! (the WebIDL rule); an explicit `length = N` wins. Fallible bodies
@@ -156,6 +159,9 @@ enum Role {
     Getter {
         js_name: LitStr,
     },
+    Setter {
+        js_name: LitStr,
+    },
 }
 
 /// One classified impl-block member.
@@ -227,20 +233,25 @@ fn classify(item: &mut ImplItemFn) -> Result<Option<Role>> {
                     attr.span(),
                 )?;
             }
-            Some("getter") => {
+            Some(kind @ ("getter" | "setter")) => {
                 let mut js_name: Option<LitStr> = None;
                 attr.parse_nested_meta(|meta| {
                     if meta.path.is_ident("name") {
                         js_name = Some(meta.value()?.parse()?);
                         Ok(())
                     } else {
-                        Err(meta.error("getter supports only `name = \"…\"`"))
+                        Err(meta.error("accessor markers support only `name = \"…\"`"))
                     }
                 })?;
                 let js_name = js_name.ok_or_else(|| {
-                    Error::new(attr.span(), "getter requires an explicit `name = \"…\"`")
+                    Error::new(attr.span(), "accessor markers require `name = \"…\"`")
                 })?;
-                set_role(&mut role, Role::Getter { js_name }, attr.span())?;
+                let parsed = if kind == "getter" {
+                    Role::Getter { js_name }
+                } else {
+                    Role::Setter { js_name }
+                };
+                set_role(&mut role, parsed, attr.span())?;
             }
             _ => keep.push(attr),
         }
@@ -395,6 +406,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
     let mut constructor: Option<&Member> = None;
     let mut methods: Vec<&Member> = Vec::new();
     let mut getters: Vec<&Member> = Vec::new();
+    let mut setters: Vec<&Member> = Vec::new();
     for member in &members {
         match &member.role {
             Role::Constructor { .. } => {
@@ -408,6 +420,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             }
             Role::Method { .. } => methods.push(member),
             Role::Getter { .. } => getters.push(member),
+            Role::Setter { .. } => setters.push(member),
         }
     }
     let constructor = constructor.ok_or_else(|| {
@@ -469,9 +482,16 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         });
     }
 
-    // Method + getter glue.
-    for member in methods.iter().chain(getters.iter()) {
-        let (js_name, length, promise, raw, is_getter) = match &member.role {
+    // Method + accessor glue. Getter/setter pairs merge into one
+    // accessor row per JS name, ordered by first appearance.
+    enum Emitted {
+        Method,
+        Getter,
+        Setter,
+    }
+    let mut accessor_slots: Vec<(String, LitStr, Option<Ident>, Option<Ident>)> = Vec::new();
+    for member in methods.iter().chain(getters.iter()).chain(setters.iter()) {
+        let (js_name, length, promise, raw, kind) = match &member.role {
             Role::Method {
                 js_name,
                 length,
@@ -482,22 +502,33 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 length.unwrap_or_else(|| default_length(&member.params)),
                 *promise,
                 *raw,
-                false,
+                Emitted::Method,
             ),
-            Role::Getter { js_name } => (js_name.clone(), 0, false, false, true),
+            Role::Getter { js_name } => (js_name.clone(), 0, false, false, Emitted::Getter),
+            Role::Setter { js_name } => (js_name.clone(), 1, false, false, Emitted::Setter),
             Role::Constructor { .. } => unreachable!("filtered above"),
         };
         let fn_ident = &member.fn_ident;
 
         if raw {
-            if is_getter {
-                return Err(Error::new(fn_ident.span(), "getters cannot be `raw`"));
+            if !matches!(kind, Emitted::Method) {
+                return Err(Error::new(fn_ident.span(), "accessors cannot be `raw`"));
             }
             let name_lit = js_name;
             let length_lit = LitInt::new(&length.to_string(), Span::call_site());
             let type_path = &self_path.path;
             method_rows.push(quote!(#name_lit / #length_lit => #type_path::#fn_ident));
             continue;
+        }
+
+        if matches!(kind, Emitted::Getter) && !member.params.is_empty() {
+            return Err(Error::new(fn_ident.span(), "getters take no parameters"));
+        }
+        if matches!(kind, Emitted::Setter) && member.params.len() != 1 {
+            return Err(Error::new(
+                fn_ident.span(),
+                "setters take exactly one parameter",
+            ));
         }
 
         let op_string = format!("{}.prototype.{}", class_name.value(), js_name.value());
@@ -537,14 +568,30 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         } else {
             body_result
         };
-        let promise_wrap = if promise {
+        // A setter's completion value is `undefined`; everything else
+        // converts the body result.
+        let output = if matches!(kind, Emitted::Setter) {
             quote! {
-                let __out = __cx
-                    .promise_fulfilled(__out)
-                    .map_err(|e| e.into_native(#op))?;
+                #normalized;
+                ::core::result::Result::Ok(::otter_vm::Value::undefined())
             }
         } else {
-            quote!()
+            let promise_wrap = if promise {
+                quote! {
+                    let __out = __cx
+                        .promise_fulfilled(__out)
+                        .map_err(|e| e.into_native(#op))?;
+                }
+            } else {
+                quote!()
+            };
+            quote! {
+                let __result = #normalized;
+                let __out = ::otter_vm::marshal::IntoJs::into_js(__result, &mut __cx)
+                    .map_err(|e| e.into_native(#op))?;
+                #promise_wrap
+                ::core::result::Result::Ok(__cx.escape(__out))
+            }
         };
         glue.extend(quote! {
             fn #glue_ident(
@@ -556,21 +603,48 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                     let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
                     let __this = __cx.park(__this_value);
                     #(#extractions)*
-                    let __result = #normalized;
-                    let __out = ::otter_vm::marshal::IntoJs::into_js(__result, &mut __cx)
-                        .map_err(|e| e.into_native(#op))?;
-                    #promise_wrap
-                    ::core::result::Result::Ok(__cx.escape(__out))
+                    #output
                 })
             }
         });
 
-        if is_getter {
-            accessor_rows.push(quote!((#js_name, get = #glue_ident)));
-        } else {
-            let length_lit = LitInt::new(&length.to_string(), Span::call_site());
-            method_rows.push(quote!(#js_name / #length_lit => #glue_ident));
+        match kind {
+            Emitted::Method => {
+                let length_lit = LitInt::new(&length.to_string(), Span::call_site());
+                method_rows.push(quote!(#js_name / #length_lit => #glue_ident));
+            }
+            Emitted::Getter | Emitted::Setter => {
+                let key = js_name.value();
+                let slot = match accessor_slots.iter_mut().find(|(name, ..)| *name == key) {
+                    Some(slot) => slot,
+                    None => {
+                        accessor_slots.push((key, js_name.clone(), None, None));
+                        accessor_slots.last_mut().expect("just pushed")
+                    }
+                };
+                let target = if matches!(kind, Emitted::Getter) {
+                    &mut slot.2
+                } else {
+                    &mut slot.3
+                };
+                if target.is_some() {
+                    return Err(Error::new(
+                        fn_ident.span(),
+                        format!("duplicate accessor half for '{}'", js_name.value()),
+                    ));
+                }
+                *target = Some(glue_ident);
+            }
         }
+    }
+    for (_, js_name, get, set) in &accessor_slots {
+        let row = match (get, set) {
+            (Some(get), Some(set)) => quote!((#js_name, get = #get, set = #set)),
+            (Some(get), None) => quote!((#js_name, get = #get)),
+            (None, Some(set)) => quote!((#js_name, set = #set)),
+            (None, None) => unreachable!("slot created with one half"),
+        };
+        accessor_rows.push(row);
     }
 
     // Marshalling impls: snapshot extraction, instance construction,

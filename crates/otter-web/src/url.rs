@@ -1,10 +1,28 @@
-//! WHATWG URL host-side record.
+//! WHATWG URL host class.
+//!
+//! Declared through `#[js_class]`: the URL record lives in Rust
+//! (`url::Url` under the hood), and every JS-visible part is a live
+//! prototype accessor over that record — reads serialize the current
+//! state, writes mutate it, so `u.pathname = "/x"` is immediately
+//! visible through `u.href`. Setter parse failures are silently
+//! ignored where the URL Standard says so (`protocol`, `host`);
+//! assigning an unparsable `href` throws `TypeError` per spec.
+//!
+//! # Contents
+//! - [`WebUrl`] — the owned URL record (also the Rust-side API).
+//! - [`UrlError`] — parse/mutation failures.
+//!
+//! # Invariants
+//! - The instance holds only host data; all members live on
+//!   `URL.prototype` (accessors + `toString`/`toJSON`).
+//! - Serialization always reflects the current record — there are no
+//!   snapshot properties to go stale.
+//!
+//! # See also
+//! - <https://url.spec.whatwg.org/#url-class>
 
-use otter_runtime::{
-    RuntimeAttr as Attr, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_optional_arg_to_string,
-    runtime_this_object, runtime_with_host_data,
-};
+use otter_macros::{HostClass, js_class};
+use otter_runtime::marshal::{JsError, USVString};
 use url::Url;
 
 /// Errors produced by URL parsing/mutation.
@@ -19,7 +37,7 @@ pub enum UrlError {
 pub type UrlResult<T> = Result<T, UrlError>;
 
 /// Owned URL record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, HostClass)]
 pub struct WebUrl {
     inner: Url,
 }
@@ -67,6 +85,21 @@ impl WebUrl {
         })
     }
 
+    /// Host without the port.
+    #[must_use]
+    pub fn hostname(&self) -> String {
+        self.inner.host_str().unwrap_or_default().to_string()
+    }
+
+    /// Explicit port, or empty string.
+    #[must_use]
+    pub fn port(&self) -> String {
+        self.inner
+            .port()
+            .map(|port| port.to_string())
+            .unwrap_or_default()
+    }
+
     /// Pathname.
     #[must_use]
     pub fn pathname(&self) -> String {
@@ -89,6 +122,41 @@ impl WebUrl {
             .fragment()
             .map(|hash| format!("#{hash}"))
             .unwrap_or_default()
+    }
+
+    /// Replace the whole record by reparsing `href`.
+    pub fn set_href(&mut self, href: &str) -> UrlResult<()> {
+        self.inner = Url::parse(href).map_err(|err| UrlError::Invalid(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Mutate the scheme. Accepts either `https` or `https:`; a
+    /// rejected scheme leaves the record unchanged (spec: basic URL
+    /// parse failure in the protocol setter is ignored).
+    pub fn set_protocol(&mut self, protocol: &str) {
+        let scheme = protocol.strip_suffix(':').unwrap_or(protocol);
+        let _ = self.inner.set_scheme(scheme);
+    }
+
+    /// Mutate host (and optional port). A rejected host is ignored
+    /// per the URL Standard's host-setter semantics.
+    pub fn set_host(&mut self, host: &str) {
+        if host.is_empty() {
+            let _ = self.inner.set_host(None);
+            return;
+        }
+        let (name, port) = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() => match port.parse::<u16>() {
+                Ok(port) => (name, Some(port)),
+                Err(_) => (host, None),
+            },
+            _ => (host, None),
+        };
+        if self.inner.set_host(Some(name)).is_ok()
+            && let Some(port) = port
+        {
+            let _ = self.inner.set_port(Some(port));
+        }
     }
 
     /// Mutate pathname.
@@ -117,88 +185,100 @@ impl WebUrl {
     }
 }
 
-otter_macros::couch! {
-    name = "URL",
-    feature = WEB,
-    constructor = (length = 1, call = url_constructor_native),
-    prototype = {
-        methods = {
-            "toString" / 0 => url_to_string_native,
-        },
-    },
-}
+#[js_class(name = "URL", feature = WEB)]
+impl WebUrl {
+    #[constructor]
+    fn js_new(input: USVString, base: Option<USVString>) -> Result<WebUrl, JsError> {
+        let base = base
+            .map(|base| WebUrl::parse(base.as_str(), None))
+            .transpose()
+            .map_err(|err| JsError::Type(err.to_string()))?;
+        WebUrl::parse(input.as_str(), base.as_ref()).map_err(|err| JsError::Type(err.to_string()))
+    }
 
-fn url_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let input = crate::arg_string(args, 0, ctx.heap());
-    let base = runtime_optional_arg_to_string(args, 1, ctx.heap())
-        .map(|value| WebUrl::parse(&value, None))
-        .transpose()
-        .map_err(|err| crate::type_error("URL", err.to_string()))?;
-    let url = WebUrl::parse(&input, base.as_ref())
-        .map_err(|err| crate::type_error("URL", err.to_string()))?;
-    url_object(ctx, url)
-}
+    #[getter(name = "href")]
+    fn js_href(&self) -> String {
+        self.href()
+    }
 
-fn url_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    runtime_this_object(ctx, name, "URL")
-}
+    #[setter(name = "href")]
+    fn js_set_href(&mut self, value: USVString) -> Result<(), JsError> {
+        self.set_href(value.as_str())
+            .map_err(|err| JsError::Type(err.to_string()))
+    }
 
-fn url_state<R>(
-    ctx: &NativeCtx<'_>,
-    name: &'static str,
-    f: impl FnOnce(&WebUrl) -> R,
-) -> Result<R, NativeError> {
-    let object = url_receiver(ctx, name)?;
-    runtime_with_host_data::<WebUrl, _>(ctx, object, f)
-        .map_err(|err| crate::type_error(name, err.to_string()))
-}
+    #[getter(name = "origin")]
+    fn js_origin(&self) -> String {
+        self.origin()
+    }
 
-fn url_to_string_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let href = url_state(ctx, "URL.prototype.toString", WebUrl::href)?;
-    crate::string_value(ctx, &href)
-}
+    #[getter(name = "protocol")]
+    fn js_protocol(&self) -> String {
+        self.protocol()
+    }
 
-pub(crate) fn url_object(ctx: &mut NativeCtx<'_>, state: WebUrl) -> Result<Value, NativeError> {
-    // Snapshot the string fields as Rust values before moving `state` into the
-    // host object; the JS strings are minted inside the scope, each right
-    // before its define, so no unrooted JsString local is held across another
-    // allocation.
-    let href = state.href();
-    let protocol = state.protocol();
-    let origin = state.origin();
-    let host = state.host();
-    let pathname = state.pathname();
-    let search = state.search();
-    let hash = state.hash();
-    ctx.scope(|ctx, s| {
-        let obj = ctx.scoped_host_object(s, state)?;
-        let to_string = ctx.scoped_native_method(s, "toString", 0, url_to_string_native)?;
-        ctx.scoped_define_data(
-            s,
-            obj,
-            "toString",
-            to_string,
-            Attr::builtin_function().to_flags(),
-        )?;
-        let data = Attr::data().to_flags();
-        for (name, text) in [
-            ("href", &href),
-            ("protocol", &protocol),
-            ("origin", &origin),
-            ("host", &host),
-            ("pathname", &pathname),
-            ("search", &search),
-            ("hash", &hash),
-        ] {
-            let value = ctx.scoped_string(s, text)?;
-            ctx.scoped_define_data(s, obj, name, value, data)?;
-        }
-        Ok::<Value, NativeError>(ctx.escape(obj))
-    })
-    .inspect(|value| {
-        // Link the instance to URL.prototype so `instanceof URL` holds and
-        // prototype methods are inherited. (The snapshot data properties above
-        // are replaced by live accessors in a later slice.)
-        crate::link_class_prototype(ctx, *value, "URL");
-    })
+    #[setter(name = "protocol")]
+    fn js_set_protocol(&mut self, value: USVString) {
+        self.set_protocol(value.as_str());
+    }
+
+    #[getter(name = "host")]
+    fn js_host(&self) -> String {
+        self.host()
+    }
+
+    #[setter(name = "host")]
+    fn js_set_host(&mut self, value: USVString) {
+        self.set_host(value.as_str());
+    }
+
+    #[getter(name = "hostname")]
+    fn js_hostname(&self) -> String {
+        self.hostname()
+    }
+
+    #[getter(name = "port")]
+    fn js_port(&self) -> String {
+        self.port()
+    }
+
+    #[getter(name = "pathname")]
+    fn js_pathname(&self) -> String {
+        self.pathname()
+    }
+
+    #[setter(name = "pathname")]
+    fn js_set_pathname(&mut self, value: USVString) {
+        self.set_pathname(value.as_str());
+    }
+
+    #[getter(name = "search")]
+    fn js_search(&self) -> String {
+        self.search()
+    }
+
+    #[setter(name = "search")]
+    fn js_set_search(&mut self, value: USVString) {
+        self.set_search(value.as_str());
+    }
+
+    #[getter(name = "hash")]
+    fn js_hash(&self) -> String {
+        self.hash()
+    }
+
+    #[setter(name = "hash")]
+    fn js_set_hash(&mut self, value: USVString) {
+        self.set_hash(value.as_str());
+    }
+
+    #[method(name = "toString")]
+    fn js_to_string(&self) -> String {
+        self.href()
+    }
+
+    #[method(name = "toJSON")]
+    fn js_to_json(&self) -> String {
+        self.href()
+    }
 }

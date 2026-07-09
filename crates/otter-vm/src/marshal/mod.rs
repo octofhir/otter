@@ -19,6 +19,9 @@
 //! - [`IntoJs`] and the construction newtypes ([`into_js`]):
 //!   [`ArrayBuffer`], [`Uint8Array`].
 //! - [`JsError`] / [`ValueIdent`] — the binding error model ([`error`]).
+//! - [`HostInstance`] / [`HostAncestry`] / [`construct_instance`] —
+//!   branded host-class cells with ancestry-aware data access and
+//!   prototype-correct construction ([`host_class`]).
 //! - Interpreter scope-arena builders backing the above
 //!   ([`scoped_ext`]): array-buffer / typed-array from bytes, settled
 //!   promises, iterable draining.
@@ -46,6 +49,7 @@
 mod cx;
 mod error;
 mod from_js;
+mod host_class;
 mod into_js;
 mod scoped_ext;
 
@@ -54,6 +58,7 @@ pub use error::{JsError, ValueIdent};
 pub use from_js::{
     BufferSource, Callback, DOMString, FromJs, HostRef, JsValue, Sequence, USVString,
 };
+pub use host_class::{HostAncestry, HostInstance, construct_instance};
 pub use into_js::{ArrayBuffer, IntoJs, Uint8Array};
 
 #[cfg(test)]

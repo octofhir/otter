@@ -57,6 +57,18 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         self.scope
     }
 
+    /// Borrow the GC heap immutably (non-allocating reads).
+    #[must_use]
+    pub fn heap(&self) -> &otter_gc::GcHeap {
+        self.ctx.heap()
+    }
+
+    /// Borrow the GC heap mutably.
+    #[must_use]
+    pub fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+        self.ctx.heap_mut()
+    }
+
     fn interp(&mut self) -> &mut crate::Interpreter {
         self.ctx.interp_mut()
     }
@@ -378,18 +390,15 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// Borrow the host data of a branded host object. Reports a
     /// `TypeError` when the handle is not an object, carries no host
-    /// data, or the data is of a different type.
+    /// data, or the data is of an unrelated type. Declared-class
+    /// instances resolve through their ancestry walk, so a base-class
+    /// read succeeds on a subclass instance.
     pub fn with_host_data<T: std::any::Any, R>(
         &self,
         v: Scoped<'_>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, JsError> {
-        let raw = self.ctx.escape(v);
-        let Some(object) = raw.as_object() else {
-            return Err(JsError::Type("value is not an object".to_string()));
-        };
-        crate::object::with_host_data::<T, R>(object, self.ctx.heap(), f)
-            .map_err(|err| JsError::Type(err.to_string()))
+        super::host_class::host_data_view::<T, R>(self, v, f)
     }
 
     /// Whether the handle currently holds a callable value.

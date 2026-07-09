@@ -224,6 +224,100 @@ fn host_ref_brand_checks() {
 }
 
 #[test]
+fn host_instance_ancestry_resolves_parent_data() {
+    use super::{HostAncestry, HostInstance, construct_instance};
+    use std::any::{Any, TypeId};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Base(u32);
+    impl HostAncestry for Base {}
+
+    #[derive(Debug, Clone)]
+    struct Derived {
+        base: Base,
+        extra: &'static str,
+    }
+    // What the declaration macro will emit for `extends = Base` +
+    // `#[js(parent)] base`.
+    impl HostAncestry for Derived {
+        fn ancestor(&self, target: TypeId) -> Option<&dyn Any> {
+            if target == TypeId::of::<Self>() {
+                Some(self)
+            } else {
+                self.base.ancestor(target)
+            }
+        }
+        fn ancestor_mut(&mut self, target: TypeId) -> Option<&mut dyn Any> {
+            if target == TypeId::of::<Self>() {
+                Some(self)
+            } else {
+                self.base.ancestor_mut(target)
+            }
+        }
+    }
+
+    with_cx(|cx| {
+        let instance = construct_instance(
+            cx,
+            "Derived",
+            Derived {
+                base: Base(11),
+                extra: "x",
+            },
+        )
+        .unwrap();
+
+        // Base-class access on a subclass instance resolves through the
+        // ancestry walk — this is what lets Blob.prototype methods run
+        // on a File.
+        let base = HostRef::<Base>::from_js(cx, instance, ValueIdent::This).unwrap();
+        assert_eq!(base.snapshot(cx).unwrap(), Base(11));
+
+        let derived = HostRef::<Derived>::from_js(cx, instance, ValueIdent::This).unwrap();
+        assert_eq!(derived.with(cx, |d| d.extra).unwrap(), "x");
+
+        // Unrelated class → brand failure with the dedicated message.
+        #[derive(Debug)]
+        struct Unrelated;
+        let err = HostRef::<Unrelated>::from_js(cx, instance, ValueIdent::This).unwrap_err();
+        let JsError::Type(message) = err else {
+            panic!("expected TypeError, got {err:?}");
+        };
+        assert!(message.contains("unrelated"), "message: {message}");
+    });
+
+    // Cell-level view/view_mut contract, independent of the VM.
+    let mut cell = HostInstance::new(
+        "Derived",
+        Derived {
+            base: Base(1),
+            extra: "y",
+        },
+    );
+    assert_eq!(cell.view::<Base>().unwrap(), &Base(1));
+    cell.view_mut::<Base>().unwrap().0 = 2;
+    assert_eq!(cell.view::<Base>().unwrap(), &Base(2));
+    assert_eq!(cell.class_name(), "Derived");
+}
+
+#[test]
+fn construct_instance_without_registered_class_yields_instance() {
+    use super::{HostAncestry, construct_instance};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Lone(u8);
+    impl HostAncestry for Lone {}
+
+    with_cx(|cx| {
+        // No global named "Lone" exists; the instance is still built and
+        // branded, just with no class prototype to link.
+        let instance = construct_instance(cx, "Lone", Lone(3)).unwrap();
+        let host = HostRef::<Lone>::from_js(cx, instance, ValueIdent::This).unwrap();
+        assert_eq!(host.snapshot(cx).unwrap(), Lone(3));
+    });
+}
+
+#[test]
 fn js_error_lowering_keeps_kinds() {
     let native = JsError::Range("too big".to_string()).into_native("Test.op");
     assert!(matches!(

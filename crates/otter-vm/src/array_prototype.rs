@@ -1747,7 +1747,15 @@ impl Interpreter {
                 }
                 let mut elems = Vec::with_capacity(cap);
                 for k in 0..cap {
-                    elems.push(body.elements.get(k).copied().unwrap_or(Value::hole()));
+                    let v = body.elements.get(k).copied().unwrap_or(Value::hole());
+                    // A hole is only join-equivalent to `undefined` when
+                    // no prototype supplies the index — `Get(O, k)` walks
+                    // the chain, so any gap sends us to the generic
+                    // per-index `[[Get]]` ladder below.
+                    if v.is_hole() {
+                        return None;
+                    }
+                    elems.push(v);
                 }
                 Some(elems)
             })

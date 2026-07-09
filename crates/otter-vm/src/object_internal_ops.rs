@@ -731,9 +731,9 @@ impl Interpreter {
             }
             return Ok(None);
         }
-        if target.is_map() || target.is_set() {
-            // Ordinary own properties on a Map/Set live in the lazy
-            // expando; size/keys/… are prototype accessors, not own.
+        if target.is_map() || target.is_set() || target.is_generator() {
+            // Ordinary own properties on a Map/Set/Generator live in the
+            // lazy expando; size/keys/… are prototype accessors, not own.
             if let Some(bag) = self.collection_expando(&target) {
                 if let Some(key) = key.string_name() {
                     if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
@@ -1066,9 +1066,9 @@ impl Interpreter {
     }
 
     /// Read the lazily-allocated expando bag carrying user-defined
-    /// own properties on a Map or Set instance, if one has been
-    /// materialised. Returns `None` for non-collection values or
-    /// collections that have never had a property written.
+    /// own properties on a Map, Set, or Generator instance, if one has
+    /// been materialised. Returns `None` for other values or instances
+    /// that have never had a property written.
     pub(crate) fn collection_expando(&self, value: &Value) -> Option<object::JsObject> {
         if let Some(m) = value.as_map() {
             return crate::collections::map_expando(m, &self.gc_heap);
@@ -1076,12 +1076,15 @@ impl Interpreter {
         if let Some(s) = value.as_set() {
             return crate::collections::set_expando(s, &self.gc_heap);
         }
+        if let Some(g) = value.as_generator() {
+            return g.expando(&self.gc_heap);
+        }
         None
     }
 
-    /// Materialise (or fetch) the expando bag for a Map or Set so a
-    /// user-defined own property can be stored on it. Caller must have
-    /// already established that `value` is a Map or Set.
+    /// Materialise (or fetch) the expando bag for a Map, Set, or
+    /// Generator so a user-defined own property can be stored on it.
+    /// Caller must have already established the receiver kind.
     pub(crate) fn collection_ensure_expando(
         &mut self,
         value: &Value,
@@ -1091,6 +1094,9 @@ impl Interpreter {
         }
         if let Some(s) = value.as_set() {
             return crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, s);
+        }
+        if let Some(g) = value.as_generator() {
+            return crate::property_dispatch::generator_ensure_expando_pub(&mut self.gc_heap, &g);
         }
         Err(self.err_type(("collection_ensure_expando on non-collection value".to_string()).into()))
     }
@@ -1631,7 +1637,7 @@ impl Interpreter {
                 self.define_own_property_partial(bag, k, descriptor)?
             });
         }
-        if target.is_map() || target.is_set() {
+        if target.is_map() || target.is_set() || target.is_generator() {
             let bag = self.collection_ensure_expando(target)?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
                 object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
@@ -2873,8 +2879,8 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        if target.is_map() || target.is_set() {
-            // Own keys on a Map/Set are exactly the lazy expando entries;
+        if target.is_map() || target.is_set() || target.is_generator() {
+            // Own keys on a Map/Set/Generator are exactly the lazy expando entries;
             // size and the iterator methods are prototype properties.
             let mut keys = Vec::new();
             if let Some(expando) = self.collection_expando(&target) {
@@ -3349,7 +3355,7 @@ impl Interpreter {
             regexp.prevent_extensions(&mut self.gc_heap);
             return Ok(true);
         }
-        if value.is_map() || value.is_set() {
+        if value.is_map() || value.is_set() || value.is_generator() {
             // Materialise the expando and mark it non-extensible so the
             // collection reports [[IsExtensible]] = false and rejects
             // further own-property additions.
@@ -4284,6 +4290,36 @@ impl Interpreter {
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
         if base.is_generator() || base.is_iterator() {
+            // A user-defined own property on a generator lives in the
+            // lazy expando and shadows the prototype (an own accessor
+            // fires with the generator as receiver).
+            if let Some(bag) = base.as_generator().and_then(|g| g.expando(&self.gc_heap)) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(g) if abstract_ops::is_callable(&g) => {
+                                VmGetOutcome::InvokeGetter { getter: g }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
+            }
             let proto = self.get_prototype_for_op(&base)?;
             if proto.is_nullish() {
                 return Ok(VmGetOutcome::Value(Value::undefined()));
@@ -5105,7 +5141,7 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        if target.is_map() || target.is_set() {
+        if target.is_map() || target.is_set() || target.is_generator() {
             let mut keys = Vec::new();
             if let Some(bag) = self.collection_expando(&target) {
                 keys.extend(object::with_properties(bag, &self.gc_heap, |p| {
@@ -5398,7 +5434,7 @@ impl Interpreter {
             }
             return Ok(true);
         }
-        if target.is_map() || target.is_set() {
+        if target.is_map() || target.is_set() || target.is_generator() {
             // Only ordinary expando entries are deletable; size and the
             // iterator methods are non-own prototype properties.
             if let Some(bag) = self.collection_expando(&target) {
@@ -5761,7 +5797,7 @@ impl Interpreter {
             }
             return self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1);
         }
-        if target.is_map() || target.is_set() {
+        if target.is_map() || target.is_set() || target.is_generator() {
             // OrdinarySet over the lazy expando: an own writable data
             // slot stores (same receiver) or lands on the receiver; an
             // own accessor invokes its setter; an own miss continues the
@@ -5772,6 +5808,11 @@ impl Interpreter {
                 receiver
                     .as_map()
                     .zip(target.as_map())
+                    .is_some_and(|(r, t)| r == t)
+            } else if target.is_generator() {
+                receiver
+                    .as_generator()
+                    .zip(target.as_generator())
                     .is_some_and(|(r, t)| r == t)
             } else {
                 receiver

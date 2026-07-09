@@ -107,6 +107,10 @@ struct PreparedBytecodeFrame {
     /// OrdinaryCreateFromConstructor, so parameter side effects on
     /// `fn.prototype` are observable).
     generator_function_id: u32,
+    /// Invoked closure instance — generator `[[Prototype]]` resolution
+    /// must read `fn.prototype` through the per-closure bag, not the
+    /// template bag, so identity matches later user reads.
+    callee_closure: Option<crate::closure::JsClosure>,
 }
 
 /// `(function_id, upvalues, this, new_target, derived_this_cell,
@@ -587,6 +591,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
+        callee_closure: Option<crate::closure::JsClosure>,
         function_id: u32,
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
@@ -696,6 +701,7 @@ impl Interpreter {
             self.resolve_generator_prototype_stack_rooted(
                 context,
                 stack,
+                callee_closure,
                 generator_function_id,
                 &gen_handle,
             )?;
@@ -775,6 +781,7 @@ impl Interpreter {
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
             generator_function_id: function_id,
+            callee_closure: None,
         })
     }
 
@@ -786,16 +793,18 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &HoltStack,
+        owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         gen_handle: &crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
-        // Generator `.prototype` flows only the template id this deep in
-        // dispatch; the per-instance owner is not threaded here (generator
-        // closures keep template-keyed prototype materialization).
+        // `owner` is the invoked closure instance: `fn.prototype`
+        // materializes per closure, so resolving through the template
+        // bag would hand the generator a parallel prototype object that
+        // fails `Object.getPrototypeOf(gen) === fn.prototype`.
         let proto = self.function_property_get_stack_rooted(
             context,
             stack,
-            None,
+            owner,
             function_id,
             "prototype",
         )?;
@@ -818,6 +827,7 @@ impl Interpreter {
             is_generator,
             is_async_generator,
             generator_function_id,
+            callee_closure,
         } = prepared;
         if is_generator {
             frame.return_register = None;
@@ -838,6 +848,7 @@ impl Interpreter {
             self.resolve_generator_prototype_stack_rooted(
                 context,
                 stack,
+                callee_closure,
                 generator_function_id,
                 &gen_handle,
             )?;
@@ -927,6 +938,7 @@ impl Interpreter {
         {
             self.frame_ensure_cold(&mut prepared.frame).callee_closure = Some(closure);
         }
+        prepared.callee_closure = current.as_closure(&self.gc_heap);
         self.push_prepared_bytecode_call_frame(stack, context, dst, prepared)?;
         Ok(true)
     }
@@ -1184,6 +1196,7 @@ impl Interpreter {
             return self.push_bytecode_call_frame(
                 stack,
                 context,
+                current.as_closure(&self.gc_heap),
                 function_id,
                 parent_upvalues,
                 this_for_callee,
@@ -1282,6 +1295,7 @@ impl Interpreter {
         self.push_bytecode_call_frame(
             stack,
             context,
+            current.as_closure(&self.gc_heap),
             function_id,
             parent_upvalues,
             this_for_callee,
@@ -2413,11 +2427,12 @@ impl Interpreter {
             prologue_stack.push(frame);
             self.dispatch_loop(context, &mut prologue_stack)?;
             // §27.5.1 step 3 — resolve [[Prototype]] after the
-            // prologue (FunctionDeclarationInstantiation) ran. Only the
-            // template id flows this deep; per-instance owner not threaded.
+            // prologue (FunctionDeclarationInstantiation) ran, through
+            // the invoked closure's bag so the generator's prototype is
+            // the same object later `fn.prototype` reads observe.
             let proto = self.function_property_get_runtime_rooted(
                 context,
-                None,
+                current.as_closure(&self.gc_heap),
                 function_id,
                 "prototype",
                 &[],

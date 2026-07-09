@@ -1841,8 +1841,8 @@ pub fn call(
                     )?)),
                     None => Ok(Value::undefined()),
                 }
-            } else if first.is_some_and(|v| v.is_map() || v.is_set()) {
-                // Map/Set instances are ordinary objects whose
+            } else if first.is_some_and(|v| v.is_map() || v.is_set() || v.is_generator()) {
+                // Map/Set/Generator instances are ordinary objects whose
                 // user-assigned own properties live in the lazy expando
                 // bag (size and the iterator methods are prototype
                 // properties, not own).
@@ -1853,6 +1853,7 @@ pub fn call(
                             v.as_set()
                                 .and_then(|s| crate::collections::set_expando(s, gc_heap))
                         })
+                        .or_else(|| v.as_generator().and_then(|g| g.expando(gc_heap)))
                 });
                 let desc = bag.and_then(|bag| match &key {
                     PropertyKey::String(key) => {

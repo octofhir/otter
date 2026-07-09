@@ -115,6 +115,10 @@ pub struct GeneratorBody {
     /// `[[Prototype]]` captured from the generator function's own
     /// `prototype` property at call time.
     pub prototype_override: Option<crate::Value>,
+    /// Lazily-allocated bag for ordinary user-defined own properties
+    /// (`gen.x = 1`, `Object.defineProperty(gen, …)`); generators are
+    /// ordinary extensible objects per §27.5.2.
+    pub expando: Option<crate::Value>,
     /// Pending Promise capability for an in-flight async-generator
     /// request queue.
     #[pelt(via = trace_async_generator_queue)]
@@ -194,6 +198,7 @@ impl JsGenerator {
                 delegating: false,
                 is_async: false,
                 prototype_override,
+                expando: None,
                 async_requests: VecDeque::new(),
                 async_state: AsyncGeneratorState::SuspendedStart,
             })?,
@@ -278,6 +283,22 @@ impl JsGenerator {
     #[must_use]
     pub fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
         heap.read_payload(self.inner, |body| body.prototype_override)
+    }
+
+    /// Ordinary own-property bag, if one has been materialised.
+    #[must_use]
+    pub fn expando(&self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.inner, |body| body.expando)
+            .and_then(|v| v.as_object())
+    }
+
+    /// Install the lazily-allocated own-property bag.
+    pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, bag: crate::object::JsObject) {
+        let value = crate::Value::object(bag);
+        heap.with_payload(self.inner, |body| {
+            body.expando = Some(value);
+        });
+        heap.record_write(self.inner, &value);
     }
 
     /// `true` when a frame is currently saved on the generator.

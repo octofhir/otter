@@ -849,6 +849,7 @@ fn iterator_proto_take(
     let state = crate::IteratorState::Take {
         source,
         remaining: n,
+        running: false,
     };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value], &[])
@@ -871,7 +872,11 @@ fn iterator_proto_drop(
     };
     let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
     let source_value = Value::iterator(source);
-    let state = crate::IteratorState::Drop { source, to_drop: n };
+    let state = crate::IteratorState::Drop {
+        source,
+        to_drop: n,
+        running: false,
+    };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value], &[])
         .map_err(|_| crate::NativeError::TypeError {

@@ -80,10 +80,12 @@ enum IteratorStateSnapshot {
     Take {
         source: IteratorHandle,
         remaining: u64,
+        running: bool,
     },
     Drop {
         source: IteratorHandle,
         to_drop: u64,
+        running: bool,
     },
     FlatMap {
         source: IteratorHandle,
@@ -325,13 +327,23 @@ impl Interpreter {
                     running: *running,
                     counter: *counter,
                 }),
-                IteratorState::Take { source, remaining } => Some(IteratorStateSnapshot::Take {
+                IteratorState::Take {
+                    source,
+                    remaining,
+                    running,
+                } => Some(IteratorStateSnapshot::Take {
                     source: *source,
                     remaining: *remaining,
+                    running: *running,
                 }),
-                IteratorState::Drop { source, to_drop } => Some(IteratorStateSnapshot::Drop {
+                IteratorState::Drop {
+                    source,
+                    to_drop,
+                    running,
+                } => Some(IteratorStateSnapshot::Drop {
                     source: *source,
                     to_drop: *to_drop,
+                    running: *running,
                 }),
                 IteratorState::FlatMap {
                     source,
@@ -557,7 +569,19 @@ impl Interpreter {
                     }
                 }
             }
-            IteratorStateSnapshot::Take { source, remaining } => {
+            IteratorStateSnapshot::Take {
+                source,
+                remaining,
+                running,
+            } => {
+                // §27.5.3.2 GeneratorValidate step 6 — the helper is
+                // "executing" for the whole step, including while the
+                // underlying iterator's `next` runs; re-entry throws.
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
+                }
                 if remaining == 0 {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     // §27.1.4.9 step 5.b.ii — the limit being reached
@@ -566,7 +590,26 @@ impl Interpreter {
                     self.iterator_close_value_sync(context, Value::iterator(source))?;
                     return Ok((Value::undefined(), true));
                 }
-                let (v, done) = self.iterator_next_full(context, &source)?;
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Take { running, .. } = state {
+                        *running = true;
+                    }
+                });
+                let step = self.iterator_next_full(context, &source);
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Take { running, .. } = state {
+                        *running = false;
+                    }
+                });
+                let (v, done) = match step {
+                    Ok(step) => step,
+                    Err(err) => {
+                        // Abrupt completion completes the helper
+                        // generator (§27.5.3.3 GeneratorResume).
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        return Err(err);
+                    }
+                };
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
@@ -578,25 +621,55 @@ impl Interpreter {
                 });
                 Ok((v, false))
             }
-            IteratorStateSnapshot::Drop { source, to_drop } => {
-                for _ in 0..to_drop {
-                    let (_, done) = self.iterator_next_full(context, &source)?;
-                    if done {
-                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                        return Ok((Value::undefined(), true));
-                    }
+            IteratorStateSnapshot::Drop {
+                source,
+                to_drop,
+                running,
+            } => {
+                // §27.5.3.2 GeneratorValidate step 6 — see Take above.
+                if running {
+                    return Err(
+                        self.err_type(("Iterator helper is already running".to_string()).into())
+                    );
                 }
                 self.gc_heap.with_payload(*iter, |state| {
-                    if let IteratorState::Drop { to_drop, .. } = state {
-                        *to_drop = 0;
+                    if let IteratorState::Drop { running, .. } = state {
+                        *running = true;
                     }
                 });
-                let (v, done) = self.iterator_next_full(context, &source)?;
-                if done {
-                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                    return Ok((Value::undefined(), true));
+                let step = (|| {
+                    for _ in 0..to_drop {
+                        let (_, done) = self.iterator_next_full(context, &source)?;
+                        if done {
+                            return Ok(None);
+                        }
+                    }
+                    self.gc_heap.with_payload(*iter, |state| {
+                        if let IteratorState::Drop { to_drop, .. } = state {
+                            *to_drop = 0;
+                        }
+                    });
+                    let (v, done) = self.iterator_next_full(context, &source)?;
+                    Ok(if done { None } else { Some(v) })
+                })();
+                self.gc_heap.with_payload(*iter, |state| {
+                    if let IteratorState::Drop { running, .. } = state {
+                        *running = false;
+                    }
+                });
+                match step {
+                    Ok(Some(v)) => Ok((v, false)),
+                    Ok(None) => {
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        Ok((Value::undefined(), true))
+                    }
+                    Err(err) => {
+                        // Abrupt completion completes the helper
+                        // generator (§27.5.3.3 GeneratorResume).
+                        self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                        Err(err)
+                    }
                 }
-                Ok((v, false))
             }
             IteratorStateSnapshot::FlatMap {
                 source,

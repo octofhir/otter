@@ -93,6 +93,7 @@ pub mod groom;
 pub mod handles;
 pub mod heap_number;
 mod holt_stack;
+pub mod host_completion;
 pub mod inspect;
 pub mod intl;
 pub mod intrinsic_install;
@@ -1256,6 +1257,10 @@ pub struct Interpreter {
     /// not install a scheduler — the natives raise a TypeError on
     /// call in that case.
     timer_scheduler: Option<timers::TimerSchedulerHandle>,
+    /// Host completion sink backing async native methods — installed
+    /// by the runtime layer like the timer scheduler; `None` in
+    /// host-less embeddings (unit tests, sync-only hosts).
+    host_completion_sink: Option<std::sync::Arc<dyn host_completion::HostCompletionSink>>,
     /// Per-isolate map from host-issued timer token to JS callback +
     /// extra arguments. Populated by `setTimeout` / `setInterval`,
     /// drained by the runtime layer when a `TimerFired` inbox

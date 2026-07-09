@@ -26,6 +26,26 @@ impl Interpreter {
         self.timer_scheduler.clone()
     }
 
+    /// Install the host completion sink backing async native methods.
+    /// Called by the runtime layer at construction time, exactly like
+    /// [`Self::set_timer_scheduler`].
+    pub fn set_host_completion_sink(
+        &mut self,
+        sink: std::sync::Arc<dyn crate::host_completion::HostCompletionSink>,
+    ) {
+        self.host_completion_sink = Some(sink);
+    }
+
+    /// Clone the installed host completion sink, if any. The
+    /// marshalling layer's pending-promise builders route async
+    /// results through it.
+    #[must_use]
+    pub fn host_completion_sink(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::host_completion::HostCompletionSink>> {
+        self.host_completion_sink.clone()
+    }
+
     /// Mutable handle to the timer-callback registry.
     pub fn timer_callbacks_mut(&mut self) -> &mut timers::TimerCallbacks {
         &mut self.timer_callbacks

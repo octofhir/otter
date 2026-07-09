@@ -2331,6 +2331,7 @@ dependencies = [
  "otter-compiler",
  "otter-gc",
  "otter-jit",
+ "otter-macros",
  "otter-pm-manifest",
  "otter-syntax",
  "otter-vm",

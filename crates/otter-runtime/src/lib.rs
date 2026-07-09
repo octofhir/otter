@@ -2047,6 +2047,27 @@ impl Runtime {
         self.interp.set_timer_scheduler(scheduler);
     }
 
+    /// Install the host completion sink backing async native methods.
+    /// Wired by the isolate runner alongside the timer scheduler;
+    /// direct-mode embedders never call this, and their async native
+    /// methods reject with a TypeError unless the future is
+    /// immediately ready.
+    pub fn install_host_completion_sink(
+        &mut self,
+        sink: std::sync::Arc<dyn otter_vm::host_completion::HostCompletionSink>,
+    ) {
+        self.interp.set_host_completion_sink(sink);
+    }
+
+    /// Run a host completion job posted by an async native method's
+    /// future. Executed on the isolate thread by the runner's inbox.
+    pub(crate) fn run_host_completion(
+        &mut self,
+        job: otter_vm::host_completion::HostCompletionJob,
+    ) {
+        job.run(&mut self.interp);
+    }
+
     /// Install the host-side dynamic-import scheduler. Wired by
     /// the isolate runner so `Op::ImportNamespaceDynamic` can
     /// reach the loader through the runtime inbox.

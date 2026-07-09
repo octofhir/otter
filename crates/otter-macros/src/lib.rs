@@ -148,8 +148,10 @@ use syn::{
 
 mod couch;
 mod derive_groom;
+mod derive_host_class;
 mod derive_pelt;
 mod holt;
+mod js_class;
 mod lodge;
 
 /// Generate a `NamespaceSpec` + `BuiltinIntrinsic` adapter for a
@@ -231,6 +233,58 @@ pub fn holt(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn couch(input: TokenStream) -> TokenStream {
     couch::expand(input)
+}
+
+/// Declarative host-class generator — the v2 class declaration form.
+///
+/// Goes on an ordinary inherent `impl` block; the signatures are the
+/// descriptor. Parameter types declare argument extraction
+/// (`marshal::FromJs`), return types declare result construction
+/// (`marshal::IntoJs`), `&self`/`&mut self` receivers declare brand
+/// checks, and marker attributes carry the explicit JS names.
+/// Expansion emits per-member glue plus a [`couch!`] invocation, so
+/// install and the `Intrinsic` handle are the proven machinery.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// #[js_class(name = "Blob", feature = WEB)]
+/// impl Blob {
+///     #[constructor]
+///     fn new(parts: Option<Sequence<BlobPart<'_>>>, options: Option<BlobPropertyBag>)
+///         -> Result<Blob, JsError> { /* … */ }
+///
+///     #[getter(name = "size")]
+///     fn size(&self) -> f64 { /* … */ }
+///
+///     #[method(name = "slice", length = 2)]
+///     fn slice(&self, start: Option<f64>, end: Option<f64>) -> Blob { /* … */ }
+///
+///     #[method(name = "arrayBuffer", promise)]
+///     fn array_buffer(&self) -> Result<marshal::ArrayBuffer, JsError> { /* … */ }
+/// }
+/// ```
+///
+/// Class options: `name = "…"` (required), `feature = …` (required),
+/// `extends = Base` (native inheritance; pair with
+/// `#[derive(HostClass)]` + `#[host_class(parent)]` on the data
+/// struct), `tag = "…"` (`Symbol.toStringTag` override, defaults to
+/// `name`). Member options are documented on the module
+/// (`crates/otter-macros/src/js_class.rs`).
+#[proc_macro_attribute]
+pub fn js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
+    js_class::expand(attr, item)
+}
+
+/// Derive `marshal::HostAncestry` for a host-class data struct.
+///
+/// Mark one field `#[host_class(parent)]` to chain the ancestry walk
+/// into a base class's data (`File` embedding `Blob`), letting
+/// base-class prototype methods resolve their data on subclass
+/// instances.
+#[proc_macro_derive(HostClass, attributes(host_class))]
+pub fn host_class_derive(input: TokenStream) -> TokenStream {
+    derive_host_class::expand(input)
 }
 
 /// Generate a hosted module installer + `HostedModule` row for an

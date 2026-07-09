@@ -111,6 +111,10 @@ pub use otter_vm::{
     AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
     MethodSpec, NativeCall, ObjectBuilder, Value, array, bootstrap, intrinsic_install, object,
 };
+// Unrenamed re-exports consumed by `#[js_class]`- and `couch!`-generated
+// glue, which must resolve the same `::otter_vm::…` paths whether they
+// expand inside `otter-vm` itself or in a binding crate that aliases
+// this crate as `otter_vm` (the established linking convention).
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{
     ExecutionContext as RuntimeExecutionContext, PersistentRootId as RuntimePersistentRootId,
@@ -118,6 +122,7 @@ pub use otter_vm::{
 pub use otter_vm::{
     JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,
 };
+pub use otter_vm::{NativeCtx, NativeError, marshal, string, symbol};
 pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 pub use structured_clone::{
@@ -432,6 +437,14 @@ enum GlobalClassInner {
             &mut otter_gc::GcHeap,
             otter_vm::JsObject,
         ) -> Result<(), otter_vm::js_surface::JsSurfaceError>,
+        /// Post-install hook for members keyed by per-realm well-known
+        /// symbols (`@@toStringTag`, `@@iterator`) — the same second
+        /// phase the bootstrap registry walk runs for every entry.
+        install_well_knowns: fn(
+            &mut otter_gc::GcHeap,
+            otter_vm::JsObject,
+            &otter_vm::WellKnownSymbols,
+        ) -> Result<(), otter_vm::js_surface::JsSurfaceError>,
         name: &'static str,
     },
 }
@@ -455,6 +468,7 @@ impl GlobalClass {
         Self {
             inner: GlobalClassInner::Intrinsic {
                 install: I::install,
+                install_well_knowns: I::install_well_knowns,
                 name: I::NAME,
             },
         }
@@ -1751,12 +1765,25 @@ impl Runtime {
                             message: err.to_string(),
                         })?;
                 }
-                GlobalClassInner::Intrinsic { install, .. } => {
+                GlobalClassInner::Intrinsic {
+                    install,
+                    install_well_knowns,
+                    ..
+                } => {
                     let global = *interp.global_this();
                     install(interp.gc_heap_mut(), global).map_err(|err| OtterError::Internal {
                         code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
                         message: err.to_string(),
                     })?;
+                    // Second phase, mirroring the bootstrap registry walk:
+                    // symbol-keyed members (@@toStringTag) resolve against
+                    // the realm's already-materialized well-known table.
+                    interp
+                        .run_install_well_knowns(install_well_knowns, global)
+                        .map_err(|err| OtterError::Internal {
+                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                            message: err.to_string(),
+                        })?;
                 }
             }
         }

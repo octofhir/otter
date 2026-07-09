@@ -202,6 +202,15 @@ impl<'rt> NativeCtx<'rt> {
         self.context
     }
 
+    /// The stored context reference, decoupled from the `&self` borrow
+    /// (the field is a `Copy` reference with the mutator-turn lifetime).
+    /// Lets the marshalling layer hold the context across a later
+    /// `interp_mut` borrow.
+    #[must_use]
+    pub(crate) fn context_ref(&self) -> Option<&'rt ExecutionContext> {
+        self.context
+    }
+
     /// Borrow the owning interpreter together with the current
     /// execution context. Use this when a native needs to re-enter VM
     /// code that also needs the caller context for observable coercions.

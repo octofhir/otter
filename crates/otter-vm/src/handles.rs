@@ -186,7 +186,7 @@ impl HandleScope {
 /// });
 /// let _ = leaked;
 /// ```
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Scoped<'s> {
     idx: u32,
     _scope: PhantomData<&'s HandleScope>,

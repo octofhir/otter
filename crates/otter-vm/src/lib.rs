@@ -103,6 +103,7 @@ pub mod jit;
 pub mod jit_feedback;
 pub mod js_surface;
 pub mod json;
+pub mod marshal;
 pub mod math;
 mod method_ops;
 pub mod microtask;

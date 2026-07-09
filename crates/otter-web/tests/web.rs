@@ -294,6 +294,8 @@ fn web_api_globals_install_and_run_through_runtime_builder() {
 const WINTERTC_LEDGER_JS: &str = r#"
     const SUPPORTED = [
       "globalThis",
+      "self",
+      "reportError",
       "atob",
       "btoa",
       "queueMicrotask",
@@ -351,8 +353,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "structuredClone",
     ];
     const NOT_YET = [
-      "self",
-      "reportError",
       "onerror",
       "onunhandledrejection",
       "onrejectionhandled",
@@ -510,6 +510,29 @@ fn wintertc_partial_entries_document_their_gap() {
         ),
     );
     assert_eq!(result, "");
+}
+
+#[test]
+fn global_scope_shell_self_and_report_error() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        out += (self === globalThis) + "|";
+        // `self` is a replaceable accessor: assigning shadows it with a data property.
+        const desc = Object.getOwnPropertyDescriptor(globalThis, "self");
+        out += (typeof desc.get === "function") + "|" + desc.enumerable + "|";
+        // `reportError` is a callable, non-enumerable global that does not throw.
+        out += typeof reportError + "|";
+        out += Object.getOwnPropertyDescriptor(globalThis, "reportError").enumerable + "|";
+        let threw = false;
+        try { reportError(new TypeError("boom")); } catch (e) { threw = true; }
+        out += threw;
+        out
+        "#,
+    );
+    assert_eq!(result, "true|true|true|function|false|false");
 }
 
 #[test]

@@ -30,6 +30,21 @@
     });
   }
 
+  // `self` is installed eagerly in Rust (see `install_self`) so it exists
+  // before any lazy Web global is touched.
+
+  // `reportError(e)` (HTML §report-the-exception). Otter's global object is not
+  // a Window/Worker EventTarget, so there is no global "error" event to
+  // dispatch; the documented alternative reporting mechanism routes the value
+  // to the console. Full ErrorEvent/uncaught-exception wiring is a later slice.
+  def('reportError', function reportError(e) {
+    try {
+      console.error(e);
+    } catch (_) {
+      /* console may be unavailable in a bare realm */
+    }
+  });
+
   // ---- DOMException (§ WebIDL) ----
   const DOMEXCEPTION_CODES = {
     IndexSizeError: 1,

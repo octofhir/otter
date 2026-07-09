@@ -58,6 +58,7 @@ const WEB_GLOBAL_NAMES: &[&str] = &[
     "MessagePort",
     "performance",
     "ProgressEvent",
+    "reportError",
     "TextDecoder",
     "TextEncoder",
     "URLSearchParams",
@@ -181,7 +182,33 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
     crate::crypto::install(runtime)?;
     install_navigator(runtime)?;
+    install_self(runtime)?;
     install_lazy_web_globals(runtime)?;
+    Ok(())
+}
+
+/// Install the `self` global (HTML §dom-self). Otter has no Window/Worker
+/// split, so `self` always resolves to `globalThis`. Modelled as a replaceable
+/// accessor (`[Replaceable]`): reading returns the global object, and assigning
+/// shadows it with a data property, matching platform semantics. Installed
+/// eagerly (not lazily) so `self` is present before any Web class is touched.
+fn install_self(runtime: &mut Runtime) -> Result<(), OtterError> {
+    let shim = "Object.defineProperty(globalThis, 'self', {\n\
+          get() { return globalThis; },\n\
+          set(value) {\n\
+            Object.defineProperty(globalThis, 'self', {\n\
+              value, writable: true, enumerable: true, configurable: true,\n\
+            });\n\
+          },\n\
+          enumerable: true,\n\
+          configurable: true,\n\
+        });";
+    runtime
+        .eval(SourceInput::from_javascript(shim))
+        .map_err(|err| OtterError::Internal {
+            code: "WEB_SELF_INSTALL".to_string(),
+            message: format!("self install failed: {err}"),
+        })?;
     Ok(())
 }
 

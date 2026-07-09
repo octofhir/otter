@@ -200,6 +200,14 @@ pub(crate) struct HoltInput {
     pub(crate) methods: Vec<MethodEntry>,
     pub(crate) constants: Vec<ConstantEntry>,
     pub(crate) accessors: Vec<AccessorEntry>,
+    /// Optional `string_tag = "Crypto"` — installs the namespace
+    /// object's `@@toStringTag` through
+    /// [`BuiltinIntrinsic::install_well_knowns`].
+    pub(crate) string_tag: Option<LitStr>,
+    /// Optional `js_glue = <expr>` — co-located JS surfaced as
+    /// [`BuiltinIntrinsic::JS_GLUE`] (the `js_namespace` `js = "…"`
+    /// channel).
+    pub(crate) js_glue: Option<syn::Expr>,
     /// When `true`, the generated `install` body links the
     /// namespace's `[[Prototype]]` to `%Object.prototype%`
     /// (looked up through `Object.prototype` on the global
@@ -219,6 +227,8 @@ impl Parse for HoltInput {
         let mut constants: Vec<ConstantEntry> = Vec::new();
         let mut accessors: Vec<AccessorEntry> = Vec::new();
         let mut link_object_prototype = false;
+        let mut string_tag: Option<LitStr> = None;
+        let mut js_glue: Option<syn::Expr> = None;
         let mut methods_seen = false;
 
         while !input.is_empty() {
@@ -264,13 +274,19 @@ impl Parse for HoltInput {
                     let lit: LitBool = input.parse()?;
                     link_object_prototype = lit.value;
                 }
+                "string_tag" => {
+                    string_tag = Some(input.parse()?);
+                }
+                "js_glue" => {
+                    js_glue = Some(input.parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `holt!` field `{other}` — expected `name`, `feature`, \
                              `spec`, `intrinsic`, `methods`, `constants`, `accessors`, \
-                             or `link_object_prototype`"
+                             `link_object_prototype`, `string_tag`, or `js_glue`"
                         ),
                     ));
                 }
@@ -317,6 +333,8 @@ impl Parse for HoltInput {
             constants,
             accessors,
             link_object_prototype,
+            string_tag,
+            js_glue,
         })
     }
 }
@@ -351,6 +369,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         constants,
         accessors,
         link_object_prototype,
+        string_tag,
+        js_glue,
     } = input;
 
     // Duplicate-name guards.
@@ -484,6 +504,49 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // for readability — `feature = BootstrapFeatures::CORE` would
     // be redundant in every invocation.
     let feature_path = quote! { ::otter_vm::bootstrap::BootstrapFeatures::#feature };
+    let js_glue_const = match &js_glue {
+        Some(expr) => quote! {
+            const JS_GLUE: ::core::option::Option<&'static str> =
+                ::core::option::Option::Some(#expr);
+        },
+        None => quote!(),
+    };
+    // `string_tag = "…"` — a namespace object carries its
+    // `@@toStringTag` on the object itself (there is no prototype),
+    // so `Object.prototype.toString.call(ns)` renders the brand.
+    let install_well_knowns_fn = match &string_tag {
+        Some(tag) => quote! {
+            fn install_well_knowns(
+                heap: &mut ::otter_gc::GcHeap,
+                global: ::otter_vm::JsObject,
+                well_known: &::otter_vm::symbol::WellKnownSymbols,
+            ) -> ::core::result::Result<(), ::otter_vm::JsSurfaceError> {
+                let ::core::option::Option::Some(namespace) =
+                    ::otter_vm::object::get(global, heap, #name)
+                        .and_then(|v| v.as_object())
+                else {
+                    return ::core::result::Result::Ok(());
+                };
+                let tag_sym = well_known.get(::otter_vm::symbol::WellKnown::ToStringTag);
+                let value = ::otter_vm::string::JsString::from_str(#tag, heap)
+                    .map_err(|_| ::otter_vm::JsSurfaceError::OutOfMemory)?;
+                ::otter_vm::object::define_own_symbol_property_partial(
+                    namespace,
+                    heap,
+                    tag_sym,
+                    ::otter_vm::object::PartialPropertyDescriptor {
+                        value: ::core::option::Option::Some(::otter_vm::Value::string(value)),
+                        writable: ::core::option::Option::Some(false),
+                        enumerable: ::core::option::Option::Some(false),
+                        configurable: ::core::option::Option::Some(true),
+                        ..::core::default::Default::default()
+                    },
+                );
+                ::core::result::Result::Ok(())
+            }
+        },
+        None => quote!(),
+    };
 
     quote! {
         #[allow(non_upper_case_globals)]
@@ -517,6 +580,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         impl ::otter_vm::intrinsic_install::BuiltinIntrinsic for #intrinsic_ident {
             const NAME: &'static str = #name;
             const FEATURE: ::otter_vm::bootstrap::BootstrapFeatures = #feature_path;
+            #js_glue_const
+            #install_well_knowns_fn
 
             fn install(
                 heap: &mut ::otter_gc::GcHeap,

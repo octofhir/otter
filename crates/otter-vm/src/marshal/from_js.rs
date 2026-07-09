@@ -266,6 +266,20 @@ impl std::ops::Deref for USVString {
     }
 }
 
+/// Plain `String` extraction: USVString semantics (spec `ToString`,
+/// lone surrogates replaced). The ergonomic default for bodies that
+/// just want owned text.
+impl<'s> FromJs<'s> for String {
+    fn from_js(
+        cx: &mut MarshalCx<'_, '_, 's>,
+        v: Scoped<'s>,
+        ident: ValueIdent<'_>,
+    ) -> Result<Self, JsError> {
+        cx.to_string_spec(v)
+            .map_err(|err| err.for_ident(ident, "a string"))
+    }
+}
+
 impl<'s> FromJs<'s> for USVString {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,

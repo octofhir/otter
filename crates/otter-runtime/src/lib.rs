@@ -122,7 +122,9 @@ pub use otter_vm::{
 pub use otter_vm::{
     JitRuntimeStats, RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats,
 };
-pub use otter_vm::{NativeCtx, NativeError, marshal, string, symbol};
+pub use otter_vm::{
+    NamespaceBuilder, NamespaceSpec, NativeCtx, NativeError, marshal, string, symbol,
+};
 pub use promise_registry::{HostSettleOutcome, PromiseId};
 pub use runtime_activity::{RuntimeKeepAlive, RuntimeTask, RuntimeTaskSpawner};
 pub use structured_clone::{

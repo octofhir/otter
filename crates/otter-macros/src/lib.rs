@@ -154,6 +154,7 @@ mod derive_into_js;
 mod derive_pelt;
 mod holt;
 mod js_class;
+mod js_namespace;
 mod lodge;
 mod romp;
 
@@ -317,6 +318,17 @@ pub fn into_js_derive(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn romp(input: TokenStream) -> TokenStream {
     romp::expand(input)
+}
+
+/// Declarative namespace generator — the v2 form of `holt!`. Goes on
+/// an inherent impl block of a marker type; members are static
+/// (`#[method(name = "…")]`, options `length`/`promise`/`raw`),
+/// `async fn` compiles to the promise protocol, and `js = "…"`
+/// attaches co-located JS glue. See
+/// `crates/otter-macros/src/js_namespace.rs` for the full surface.
+#[proc_macro_attribute]
+pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
+    js_namespace::expand(attr, item)
 }
 
 /// Generate a hosted module installer + `HostedModule` row for an

@@ -16,7 +16,7 @@ fn web_api_specs_are_static_and_ordered() {
     let specs = web_api_classes();
     assert_eq!(
         specs.iter().map(|spec| spec.name()).collect::<Vec<_>>(),
-        ["URL", "Blob", "File"]
+        ["URL", "Blob", "File", "crypto"]
     );
 }
 
@@ -721,24 +721,28 @@ fn crypto_subtle_digest_matches_known_vectors_and_rejects_unknowns() {
     let result = eval_string(
         &mut runtime,
         r#"
-        var out = "";
+        // Slot-indexed results: reaction ORDER between independent
+        // promises is not part of the contract (a真 async digest adds
+        // an adoption tick), only the values are.
+        var slots = ["", "", "", ""];
+        globalThis.slots = slots;
         function hex(buffer) {
           return Array.from(new Uint8Array(buffer))
             .map((byte) => ("0" + byte.toString(16)).slice(-2))
             .join("");
         }
-        out += (crypto.subtle === crypto.subtle) + "|";
+        slots[0] = String(crypto.subtle === crypto.subtle);
         crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc"))
-          .then((buffer) => { out += hex(buffer); });
+          .then((buffer) => { slots[1] = hex(buffer); });
         crypto.subtle.digest({ name: "sha-1" }, new ArrayBuffer(0))
-          .then((buffer) => { out += "|" + hex(buffer); });
+          .then((buffer) => { slots[2] = hex(buffer); });
         crypto.subtle.digest("MD5", new Uint8Array(0))
-          .catch((error) => { out += "|" + error.name; });
-        out
+          .catch((error) => { slots[3] = error.name; });
+        slots[0]
         "#,
     );
-    assert_eq!(result, "true|");
-    let after = eval_string(&mut runtime, "out");
+    assert_eq!(result, "true");
+    let after = eval_string(&mut runtime, "slots.join('|')");
     assert_eq!(
         after,
         "true|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|\

@@ -37,11 +37,16 @@ otter_macros::romp! {
     name = "web",
     ident = WEB_EXTENSION,
     // File's install resolves Blob off the global, so Blob precedes it.
-    classes = [url::WebUrlIntrinsic, blob::BlobIntrinsic, blob::FileIntrinsic],
+    classes = [
+        url::WebUrlIntrinsic,
+        blob::BlobIntrinsic,
+        blob::FileIntrinsic,
+        crypto::WebCryptoIntrinsic,
+    ],
     js = [
         (include_str!("web_bootstrap.js"), defines = [
             "AbortController", "AbortSignal", "BroadcastChannel", "CloseEvent",
-            "crypto", "CustomEvent", "DOMException", "ErrorEvent", "Event",
+            "CustomEvent", "DOMException", "ErrorEvent", "Event",
             "EventTarget", "FormData", "MessageChannel", "MessageEvent",
             "MessagePort", "performance", "ProgressEvent", "reportError",
             "TextDecoder", "TextEncoder", "URLSearchParams",

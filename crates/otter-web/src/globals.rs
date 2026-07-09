@@ -41,7 +41,6 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     runtime.install_native_global("fetch", 1, fetch)?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
-    crate::crypto::install(runtime)?;
     install_navigator(runtime)?;
     install_self(runtime)?;
     Ok(())

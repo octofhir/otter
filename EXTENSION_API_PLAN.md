@@ -1014,8 +1014,13 @@ dogfood proof.
 ### 11.4 Deliverables
 
 - "Writing an extension" guide on the docs site (mirrors the handle-scopes
-  page in tone: the safe path is the only documented path).
+  page in tone: the safe path is the only documented path). **Shipped:**
+  `docs/site/src/content/docs/extensions/embedding-extensions.md`.
 - A template crate (`examples/extension-template/`) with one class, one
-  namespace, one module, one test exercising `OTTER_GC_STRESS`.
+  namespace, one module, one test exercising `OTTER_GC_STRESS`. **Shipped**
+  (Counter class incl. attached JS + async + static factory, Acme namespace,
+  acme:util module with capabilities, romp! bundle, direct-mode + handle-mode
+  tests).
 - Compile-fail tests pinning the embedder-visible contracts (handle escape,
-  `.await` capture, non-`Send` async data).
+  `.await` capture, non-`Send` async data). Handle escape is already pinned by
+  the handle-scope compile-fail suite; async-capture pins remain open.

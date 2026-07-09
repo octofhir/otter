@@ -395,10 +395,10 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "TextEncoder",
       "TextEncoderStream",
       "URLSearchParams",
+      "URL",
     ];
     const PARTIAL = [
       "fetch",
-      "URL",
       "Request",
       "Response",
       "crypto.subtle",
@@ -505,14 +505,6 @@ fn wintertc_partial_entries_document_their_gap() {
           "fetch": () => {
             try { fetch("http://example.invalid"); return false; }
             catch (e) { return String(e.message).includes("fetch is not implemented"); }
-          },
-          // URL parts are live prototype accessors now, but the
-          // searchParams URLSearchParams linkage is still missing.
-          "URL": () => {
-            const u = new URL("https://e.com/p?a=1");
-            const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(u), "href");
-            const live = !!(d && d.get && d.set);
-            return live && typeof u.searchParams === "undefined";
           },
           // Request bodies are default streams only; no BYOB byte reader yet.
           "Request": () => {

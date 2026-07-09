@@ -97,6 +97,7 @@ pub(crate) struct ClassArgs {
     feature: Ident,
     extends: Option<Path>,
     tag: Option<LitStr>,
+    js: Option<LitStr>,
 }
 
 impl Parse for ClassArgs {
@@ -105,6 +106,7 @@ impl Parse for ClassArgs {
         let mut feature: Option<Ident> = None;
         let mut extends: Option<Path> = None;
         let mut tag: Option<LitStr> = None;
+        let mut js: Option<LitStr> = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -113,12 +115,13 @@ impl Parse for ClassArgs {
                 "feature" => feature = Some(input.parse()?),
                 "extends" => extends = Some(input.parse()?),
                 "tag" => tag = Some(input.parse()?),
+                "js" => js = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
                             "unknown js_class option `{other}`; expected \
-                             `name`, `feature`, `extends`, or `tag`"
+                             `name`, `feature`, `extends`, `tag`, or `js`"
                         ),
                     ));
                 }
@@ -134,6 +137,7 @@ impl Parse for ClassArgs {
                 .ok_or_else(|| Error::new(Span::call_site(), "js_class requires `feature = …`"))?,
             extends,
             tag,
+            js,
         })
     }
 }
@@ -757,6 +761,12 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
     // declarations coexist in one module (couch!'s default is the
     // shared name `Intrinsic`).
     let intrinsic_ident = format_ident!("{type_ident}Intrinsic");
+    // `include_str!` resolves relative to the declaring file, so the
+    // attached glue lives next to its class.
+    let js_glue_field = match &args.js {
+        Some(path) => quote!(js_glue = include_str!(#path),),
+        None => quote!(),
+    };
     glue.extend(quote! {
         ::otter_macros::couch! {
             name = #class_name,
@@ -766,6 +776,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             #couch_extras
             #prototype_block
             string_tag = #tag,
+            #js_glue_field
         }
     });
 

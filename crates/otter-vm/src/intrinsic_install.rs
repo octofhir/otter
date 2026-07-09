@@ -55,6 +55,12 @@ pub trait BuiltinIntrinsic {
     const NAME: &'static str;
     /// Feature/capability bits required at install time.
     const FEATURE: BootstrapFeatures;
+    /// Co-located JS glue attached to the declaration (`js_class`'s
+    /// `js = "…"`), evaluated by the host installer immediately after
+    /// the native surface exists — the two halves install as one unit,
+    /// so a JS-defined member can never be missing next to a live
+    /// native class. `None` for purely native surfaces.
+    const JS_GLUE: Option<&'static str> = None;
 
     /// Install the full surface (constructor, prototype, statics,
     /// constants, global binding) onto `global`.

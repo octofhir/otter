@@ -54,6 +54,7 @@ fn is_property_bearing_object(v: &Value) -> bool {
         || v.is_typed_array()
         || v.is_promise()
         || v.is_temporal()
+        || v.is_generator()
 }
 
 impl Interpreter {
@@ -879,6 +880,7 @@ impl Interpreter {
                     || target.is_temporal()
                     || target.is_map()
                     || target.is_set()
+                    || target.is_generator()
                 {
                     // §25.3 — a `DataView` is an ordinary object; its
                     // [[GetOwnProperty]] (expando-backed) is handled by
@@ -1507,6 +1509,7 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
         || target.is_map()
         || target.is_set()
         || target.is_temporal()
+        || target.is_generator()
         || target.as_weak_ref().is_some()
         || target.as_finalization_registry().is_some()
 }

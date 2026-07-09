@@ -69,19 +69,4 @@ ignored_tests = []
 # These are engine bugs to FIX, not permanent exclusions — each one
 # aborts the host process today and is listed only so a full run can
 # complete. Remove an entry as soon as the underlying guard lands.
-known_panics = [
-    # Iterator-helpers re-entry tests recurse into the underlying
-    # iterator from within the helper callback; the VM lacks a
-    # "generator-already-running" guard so they exhaust the
-    # native stack instead of throwing the spec TypeError.
-    "Iterator/prototype/filter/throws-typeerror-when-generator-is-running",
-    "Iterator/prototype/map/throws-typeerror-when-generator-is-running",
-    "Iterator/prototype/flatMap/throws-typeerror-when-generator-is-running",
-    "Iterator/prototype/take/throws-typeerror-when-generator-is-running",
-    "Iterator/prototype/drop/throws-typeerror-when-generator-is-running",
-    # Deep JS self-recursion through generator resumption overflows the
-    # native (main) thread stack — the per-frame bytecode depth guard
-    # does not bound the Rust frames added by generator resume / for-of
-    # dispatch. Needs a native-stack guard on that path.
-    "staging/sm/extensions/recursion",
-]
+known_panics = []

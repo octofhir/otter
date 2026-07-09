@@ -276,6 +276,10 @@ pub enum IteratorState {
         /// Steps still allowed before the wrapper reports `done`.
         #[pelt(skip)]
         remaining: u64,
+        /// True while a `next()` step is in flight — re-entry from the
+        /// underlying iterator throws per §27.5.3.2 GeneratorValidate.
+        #[pelt(skip)]
+        running: bool,
     },
     /// Lazy `Iterator.prototype.drop(n)` wrapper.
     Drop {
@@ -284,6 +288,10 @@ pub enum IteratorState {
         /// Elements still to discard before forwarding kicks in.
         #[pelt(skip)]
         to_drop: u64,
+        /// True while a `next()` step is in flight — re-entry from the
+        /// underlying iterator throws per §27.5.3.2 GeneratorValidate.
+        #[pelt(skip)]
+        running: bool,
     },
     /// `Value::Generator` driven through the iterator protocol.
     Generator {

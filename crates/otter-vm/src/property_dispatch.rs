@@ -424,9 +424,9 @@ impl Interpreter {
             } else {
                 true
             }
-        } else if receiver.is_map() || receiver.is_set() {
-            // Ordinary own properties on a Map/Set live in the lazy
-            // expando; a missing name deletes vacuously.
+        } else if receiver.is_map() || receiver.is_set() || receiver.is_generator() {
+            // Ordinary own properties on a Map/Set/Generator live in the
+            // lazy expando; a missing name deletes vacuously.
             if let Some(bag) = self.collection_expando(&receiver) {
                 crate::object::delete(bag, &mut self.gc_heap, name)
             } else {
@@ -1891,7 +1891,7 @@ impl Interpreter {
                 )?;
             }
             None
-        } else if receiver.is_map() || receiver.is_set() {
+        } else if receiver.is_map() || receiver.is_set() || receiver.is_generator() {
             // §10.1.9 OrdinarySet — a user-assigned own property
             // (`m.x = 5`) lands in the lazy expando; the prototype
             // walk first lets a getter-only accessor (`size`) reject
@@ -2967,7 +2967,7 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if recv.is_map() || recv.is_set() {
+        } else if recv.is_map() || recv.is_set() || recv.is_generator() {
             // §10.1.9 OrdinarySet — computed string/symbol writes land
             // in the lazy expando via the shared [[Set]] funnel.
             let vm_key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
@@ -6450,6 +6450,25 @@ pub(crate) fn map_ensure_expando_pub(
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     crate::collections::map_set_expando(m, heap, bag);
+    Ok(bag)
+}
+
+/// As [`map_ensure_expando_pub`] for a Generator object — generators
+/// are ordinary extensible objects (§27.5.2) whose user-defined own
+/// properties (`gen.return = fn`) live on this lazy bag.
+pub(crate) fn generator_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    g: &crate::generator::JsGenerator,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = g.expando(heap) {
+        return Ok(existing);
+    }
+    let recv = Value::generator(*g);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    g.set_expando(heap, bag);
     Ok(bag)
 }
 

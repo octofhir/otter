@@ -62,6 +62,10 @@ export default defineConfig({
 							label: 'Declarative Bindings: Classes, Namespaces, Extensions',
 							slug: 'extensions/declarative-bindings',
 						},
+						{
+							label: 'Embedding: Writing an Extension',
+							slug: 'extensions/embedding-extensions',
+						},
 						{ label: 'Hosted Modules', slug: 'extensions/hosted-modules' },
 						{ label: 'Native Bindings', slug: 'extensions/native-bindings' },
 						{ label: 'Handle Scopes: Building JS Values', slug: 'extensions/handle-scopes' },

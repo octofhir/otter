@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "examples/extension-template",
     "crates/otter-bytecode",
     "crates/otter-syntax",
     "crates/otter-compiler",

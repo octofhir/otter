@@ -246,8 +246,14 @@ fn fetch_internals_round_trip_for_server_glue() {
         result,
         "POST|http://h/echo|application/json%201%content-type,text/plain;charset=UTF-8,x-a,1%ok"
     );
+    // `request.json()` is a real promise, so its `.then` callback runs as a
+    // microtask after the synchronous script (which appends the `%` response
+    // parts) — the `|1` lands last, matching engine-independent spec ordering.
     let after = eval_string(&mut runtime, "out");
-    assert!(after.starts_with("POST|http://h/echo|application/json|1%"));
+    assert_eq!(
+        after,
+        "POST|http://h/echo|application/json%201%content-type,text/plain;charset=UTF-8,x-a,1%ok|1"
+    );
 }
 
 #[test]

@@ -9,9 +9,11 @@ use otter_gc::{GcHeap, HandleScope, SafeFinalize, SafeTraceable};
 
 static FINALIZE_COUNT_REGISTERED: AtomicU32 = AtomicU32::new(0);
 static FINALIZE_COUNT_UNREGISTERED: AtomicU32 = AtomicU32::new(0);
+static FINALIZE_COUNT_YOUNG: AtomicU32 = AtomicU32::new(0);
 
 const FINALIZER_REGISTERED_TYPE_TAG: u8 = 0xE2;
 const FINALIZER_UNREGISTERED_TYPE_TAG: u8 = 0xE3;
+const FINALIZER_YOUNG_TYPE_TAG: u8 = 0xE4;
 
 struct RegisteredFinalizerBody;
 
@@ -38,6 +40,20 @@ impl SafeTraceable for UnregisteredFinalizerBody {
 impl SafeFinalize for UnregisteredFinalizerBody {
     fn finalize_safe(&mut self) {
         FINALIZE_COUNT_UNREGISTERED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct YoungFinalizerBody;
+
+impl SafeTraceable for YoungFinalizerBody {
+    const TYPE_TAG: u8 = FINALIZER_YOUNG_TYPE_TAG;
+
+    fn trace_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
+}
+
+impl SafeFinalize for YoungFinalizerBody {
+    fn finalize_safe(&mut self) {
+        FINALIZE_COUNT_YOUNG.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -85,4 +101,18 @@ fn unregistered_body_skips_finalize_dispatch() {
         0,
         "unregistered finalize must not fire",
     );
+}
+
+#[test]
+fn scavenge_invokes_safe_finalize_for_dead_young_bodies() {
+    FINALIZE_COUNT_YOUNG.store(0, Ordering::SeqCst);
+
+    let mut heap = GcHeap::new().expect("heap");
+    heap.register_traceable::<YoungFinalizerBody>();
+    heap.register_finalize::<YoungFinalizerBody>();
+    let _dead = heap.alloc(YoungFinalizerBody).unwrap();
+
+    heap.collect_minor(otter_gc::EmptyRoots);
+
+    assert_eq!(FINALIZE_COUNT_YOUNG.load(Ordering::SeqCst), 1);
 }

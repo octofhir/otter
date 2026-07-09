@@ -47,6 +47,26 @@ fn root_walker_runs_with_empty_state() {
 }
 
 #[test]
+fn pending_uncaught_throw_is_enumerated_as_a_root() {
+    use otter_gc::raw::RawGc;
+
+    let mut interp = Interpreter::new();
+    let thrown = crate::object::alloc_object_with_roots(interp.gc_heap_mut(), &mut |_| {})
+        .expect("alloc object");
+    interp.set_pending_uncaught_throw(crate::Value::object(thrown));
+
+    let expected_slot = interp
+        .pending_uncaught_throw_for_trace()
+        .expect("pending throw") as *const crate::Value as *mut RawGc;
+    let mut found = false;
+    RuntimeState::new(&interp).trace_roots(&mut |slot| {
+        found |= slot == expected_slot;
+    });
+
+    assert!(found, "pending uncaught throw must be part of the root set");
+}
+
+#[test]
 fn upvalue_cell_root_survives_force_gc() {
     use crate::{
         UPVALUE_CELL_TYPE_TAG, UpvalueCellBody, Value, alloc_upvalue, read_upvalue, store_upvalue,

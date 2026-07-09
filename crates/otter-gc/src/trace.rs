@@ -108,11 +108,11 @@ pub trait Traceable: 'static {
     unsafe fn trace_ephemeron_slots(_this: *mut Self, _visitor: &mut EphemeronVisitor<'_>) {}
 }
 
-/// Sweep-time finalizer hook for GC bodies.
+/// Reclamation-time finalizer hook for GC bodies.
 ///
-/// The collector invokes [`Self::finalize_safe`] once on every
-/// dead body during the full-GC sweep, **before** the body's
-/// `Drop` impl runs and before its storage is reclaimed.
+/// The collector invokes [`Self::finalize_safe`] once on every dead body during
+/// nursery reclamation or the full-GC sweep, **before** the body's `Drop` impl
+/// runs and before its storage is reclaimed.
 ///
 /// Most heap-allocated bodies do not need a finalizer — Rust's
 /// `Drop` is enough to release per-field resources. Bodies impl

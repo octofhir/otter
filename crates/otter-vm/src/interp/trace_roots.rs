@@ -186,9 +186,7 @@ impl Interpreter {
 
 impl Interpreter {
     /// Borrow the pending-generator-throw side-channel slot.
-    /// Used by the GC root walker (task 75); the body of the
-    /// trace stays empty until task 76 (when `Value` carries
-    /// its first `Gc<…>`-shaped variant).
+    /// The GC root walker traces and rewrites the contained value.
     #[must_use]
     pub fn pending_generator_throw_for_trace(&self) -> Option<&Value> {
         self.pending_generator_throw.as_ref()

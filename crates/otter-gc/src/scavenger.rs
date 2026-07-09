@@ -21,9 +21,10 @@
 //! 3. Cheney scan: walk to-space pages and freshly-promoted
 //!    bytes in old-space pages; trace each newly-copied object
 //!    and evacuate children. Iterate until convergence.
-//! 4. Bump every from-space page's `survival_age` so the next
+//! 4. Finalize and drop every unforwarded from-space body.
+//! 5. Bump every from-space page's `survival_age` so the next
 //!    scavenge knows whether to promote.
-//! 5. Flip from↔to. The new from-space is recycled and starts
+//! 6. Flip from↔to. The new from-space is recycled and starts
 //!    fresh; the new to-space is the prior from-space.
 //!
 //! # Promotion
@@ -227,7 +228,13 @@ pub unsafe fn scavenge(
         unsafe { process_weak_registry_slot(&mut ctx, slot) };
     }
 
-    // 7) Bump survival ages on to-space pages — those are
+    // 7) Finalize and drop dead from-space bodies before recycling their
+    // pages. Forwarded bodies were byte-moved to to/old space, so their source
+    // payload is logically uninitialized and must never be dropped.
+    // SAFETY: every unforwarded header still precedes its original live body.
+    unsafe { finalize_and_drop_dead_from_space(&mut ctx) };
+
+    // 8) Bump survival ages on to-space pages — those are
     // the pages that received survivors during this scavenge.
     // After the flip below they become the new from-space; the
     // next scavenge reads their (now-bumped) survival_age and
@@ -239,10 +246,43 @@ pub unsafe fn scavenge(
         }
     }
 
-    // 8) Flip from↔to.
+    // 9) Flip from↔to.
     ctx.new_space().flip();
 
     ctx.stats
+}
+
+/// Run reclamation hooks for every young body that was not evacuated.
+///
+/// A copying collector transfers ownership of a survivor's payload with the
+/// byte copy in [`evacuate`]; only an unforwarded source remains a valid Rust
+/// value. Its finalizer follows the same ordering as old-space sweep, then its
+/// `Drop` implementation releases owned buffers and host resources before the
+/// semispace pages are reset.
+///
+/// # Safety
+///
+/// Must run under the scavenge STW pause after reachability has converged and
+/// before [`NewSpace::flip`] resets from-space.
+unsafe fn finalize_and_drop_dead_from_space(ctx: &mut ScavCtx) {
+    // SAFETY: per docstring; the trace table matches every allocated tag.
+    unsafe {
+        let trace_table = &*ctx.trace_table.as_ptr();
+        for page in ctx.new_space().from_pages() {
+            page.for_each_object(|header, _| {
+                if (*header).is_forwarded() {
+                    return;
+                }
+                let tag = (*header).type_tag();
+                if let Some(finalize) = trace_table.get_finalize(tag) {
+                    finalize(header);
+                }
+                if let Some(drop_fn) = trace_table.get_drop(tag) {
+                    drop_fn(header);
+                }
+            });
+        }
+    }
 }
 
 /// Evacuate the target of a single slot if it is in from-space.

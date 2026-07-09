@@ -819,112 +819,25 @@ mod arm64 {
         );
     }
 
-    /// Emit the inline generational write barrier for a pointer-valued slot
-    /// store: mark the parent object's card dirty when an old parent gains a
-    /// young child (the remembered set the scavenger reads on a young
-    /// collection). Mirrors `otter_gc::barrier::write_barrier`'s generational
-    /// arm. The insertion (marking) barrier is dormant under the Phase-1 STW
-    /// collector, so only the card-mark is emitted; it allocates nothing and
-    /// never moves GC, hence needs no safepoint.
+    /// Route a tagged GC pointer away from an inline store.
     ///
-    /// Clobbers only the reserved scratch (`x16`/`x17`, `d6`/`d7`); reads the
-    /// boxed parent/child from their SSA locations. All control flow funnels to
-    /// a single `done` label, so a non-pointer / young-parent / old-child store
-    /// falls straight through.
-    fn emit_generational_card_mark(
-        ops: &mut Assembler,
-        view: &JitFunctionView,
-        parent_loc: Location,
-        child_loc: Location,
-    ) -> Result<(), Unsupported> {
-        // The card-mark uses dynasm immediates, which require literal registers
-        // (`x16`/`x17` ≡ `MOVE_SCRATCH`/`BOX_SCRATCH`) and compile-time-const
-        // immediate operands. The stable GcHeader/card ABI bits are otter-jit
-        // consts; `debug_assert` pins them against the values otter-vm baked from
-        // the live `#[repr(C)]` layout so a layout change is caught in tests. The
-        // genuinely layout-variable offsets (cage base, page mask, card-bitmap
-        // offset) are loaded into registers.
-        const GC_FLAGS_BYTE: u32 = 1;
-        const GC_YOUNG_BIT: u32 = 2;
-        const GC_CARD_SHIFT: u32 = 9;
-        debug_assert_eq!(view.gc_barrier.header_flags_byte, GC_FLAGS_BYTE);
-        debug_assert_eq!(view.gc_barrier.young_flag.trailing_zeros(), GC_YOUNG_BIT);
-        debug_assert_eq!(view.gc_barrier.card_shift, GC_CARD_SHIFT);
-        let cage = view.cage_base as u64;
-        let page_mask = view.gc_barrier.page_mask;
-        let bitmap_off = view.gc_barrier.card_bitmap_byte as u64;
+    /// The collector currently records old-to-young edges in its
+    /// object-granular remembered set. Optimized code must therefore use the
+    /// Rust slow path for pointer stores until the shared JIT/GC barrier ABI can
+    /// insert into that same set. Numbers and immediates remain safe inline.
+    /// This guard runs before the store, so deoptimization can re-execute the
+    /// bytecode instruction without duplicating a mutation.
+    fn emit_branch_if_gc_pointer(ops: &mut Assembler, child_loc: Location, pointer: DynamicLabel) {
         let done = ops.new_dynamic_label();
-
-        // (1) Child cell test: a heap cell carries neither a `NUMBER_TAG` bit
-        // nor `OTHER_TAG`; a number or immediate child needs no barrier.
         load_loc(ops, MOVE_SCRATCH, child_loc);
         dynasm!(ops
             ; .arch aarch64
             ; tst x16, #value_tag::NUMBER_TAG
             ; b.ne =>done
             ; tst x16, #value_tag::OTHER_TAG
-            ; b.ne =>done
-        );
-
-        // (2) Child young? child_hdr = cage_base + low32(child). An old child
-        // needs no remembered-set entry, so a clear young bit skips.
-        load_loc(ops, BOX_SCRATCH, child_loc);
-        dynasm!(ops ; .arch aarch64 ; mov w16, w17);
-        emit_load_u64(ops, BOX_SCRATCH, cage);
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x16, x16, x17
-            ; ldrb w17, [x16, #GC_FLAGS_BYTE]
-            ; tbz w17, #GC_YOUNG_BIT, =>done
-        );
-
-        // (3) Parent young? parent_hdr = cage_base + low32(parent). Young parents
-        // are evacuated wholesale by the scavenger, so only an old parent records
-        // a card. x16 = parent_hdr afterwards.
-        load_loc(ops, BOX_SCRATCH, parent_loc);
-        dynasm!(ops ; .arch aarch64 ; mov w16, w17);
-        emit_load_u64(ops, BOX_SCRATCH, cage);
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x16, x16, x17
-            ; ldrb w17, [x16, #GC_FLAGS_BYTE]
-            ; tbnz w17, #GC_YOUNG_BIT, =>done
-        );
-
-        // (4) Mark the parent's card. page_base = parent_hdr & page_mask; card =
-        // (parent_hdr - page_base) >> card_shift; set bit (card & 7) in the byte
-        // at page_base + card_bitmap_off + (card >> 3). x16 = parent_hdr.
-        emit_load_u64(ops, BOX_SCRATCH, page_mask);
-        dynasm!(ops
-            ; .arch aarch64
-            ; and x17, x16, x17                  // x17 = page_base
-            ; sub x16, x16, x17                  // x16 = byte_off
-            ; lsr x16, x16, #GC_CARD_SHIFT       // x16 = card
-            ; fmov d7, x16                       // park card
-        );
-        emit_load_u64(ops, MOVE_SCRATCH, bitmap_off);
-        dynasm!(ops
-            ; .arch aarch64
-            ; add x17, x17, x16                  // x17 = bitmap base (page_base + off)
-            ; fmov x16, d7                       // x16 = card
-            ; add x17, x17, x16, lsr #3          // x17 = byte addr
-            ; and x16, x16, #7                   // x16 = bit index
-            // mask = 1 << bit, parking the byte address in d7 across the shift.
-            ; fmov d7, x17
-            ; movz w17, #1
-            ; lslv w17, w17, w16                 // x17 = mask
-            ; fmov x16, d7                       // x16 = byte addr
-            // [x16] |= mask, parking mask/addr in d6/d7 across the load.
-            ; fmov d7, x17                       // park mask
-            ; ldrb w17, [x16]                    // x17 = byte
-            ; fmov d6, x16                       // park addr
-            ; fmov x16, d7                       // x16 = mask
-            ; orr w17, w17, w16                  // x17 = byte | mask
-            ; fmov x16, d6                       // x16 = addr
-            ; strb w17, [x16]
+            ; b.eq =>pointer
             ; =>done
         );
-        Ok(())
     }
 
     fn emit_rematerialized_boxed(
@@ -3703,6 +3616,9 @@ mod arm64 {
                 let array_length_byte = view.ta_layout.array_length_byte;
                 let slow = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
+                if matches!(value_repr, Repr::Tagged) {
+                    emit_branch_if_gc_pointer(ops, value_loc, slow);
+                }
                 // The guard leaves the array body pointer in x0. The fast path uses
                 // only the caller-saved scratch x3..x9 (allocator homes live in
                 // x9..x15 / x21..x28) plus the reserved x16/x17/d6/d7 the barrier
@@ -3741,7 +3657,6 @@ mod arm64 {
                     );
                     store_loc(ops, loc, 9);
                 }
-                emit_generational_card_mark(ops, view, recv_loc, value_loc)?;
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>slow);
                 emit_frame_materialize(ops, graph, alloc, point, box_scratch)?;
                 box_into_gp(ops, 3, value_repr, value_loc, box_scratch);
@@ -4054,12 +3969,9 @@ mod arm64 {
             }
             NodeKind::StoreSlot(obj, value_byte, value) => {
                 // Write a value into the shape-guarded receiver's value slab. A
-                // primitive (int32 / f64) needs no write barrier. A `Tagged` value
-                // may be a heap pointer, so a generational card-mark is emitted
-                // inline after the store (parent old + child young → mark the
-                // parent's card). The insertion (marking) barrier is dormant under
-                // the Phase-1 STW collector, so only the card-mark is needed; it
-                // allocates nothing and never moves GC.
+                // primitive (int32 / f64) needs no write barrier. A `Tagged` GC
+                // pointer deopts before the write so the interpreter performs the
+                // mutation through the collector's canonical remembered-set path.
                 if *value_byte > 32760 {
                     return Err(Unsupported::Unlowered(
                         "property slot offset out of str range",
@@ -4123,6 +4035,9 @@ mod arm64 {
                         ));
                     }
                 }
+                if matches!(vrepr, Repr::Tagged) {
+                    emit_branch_if_gc_pointer(ops, vloc, exit);
+                }
                 // Compress to a 4-byte slot (a double / wide int / function id
                 // deopts — it would allocate a heap box). Park the slot in d7
                 // while the slab base is recomputed, since the compress and the
@@ -4142,9 +4057,6 @@ mod arm64 {
                     ; fmov x17, d7                      // restore compressed slot
                     ; str w17, [x16, slot_byte]         // 4-byte slot write
                 );
-                if matches!(vrepr, Repr::Tagged) {
-                    emit_generational_card_mark(ops, view, oloc, vloc)?;
-                }
                 Ok(())
             }
             NodeKind::LoadSlotPoly(obj, cases) => {
@@ -4214,7 +4126,7 @@ mod arm64 {
                 // compress the value once, read the receiver shape once, then store
                 // into the first matching case's slot; the final miss deopts before
                 // any write, so re-executing the store on the interpreter is
-                // correct. A tagged value carries the inline generational card-mark.
+                // correct. Tagged GC pointers take the same pre-write deopt path.
                 debug_assert_eq!(box_scratch, BOX_SCRATCH);
                 let oloc = require_loc(alloc, *obj)?;
                 let vloc = require_loc(alloc, *value)?;
@@ -4240,6 +4152,9 @@ mod arm64 {
                             "store-slot-poly value not int32/f64/tagged",
                         ));
                     }
+                }
+                if matches!(vrepr, Repr::Tagged) {
+                    emit_branch_if_gc_pointer(ops, vloc, exit);
                 }
                 emit_compress_slot(ops, exit);
                 dynasm!(ops ; .arch aarch64 ; fmov d7, x17);
@@ -4282,9 +4197,6 @@ mod arm64 {
                         ; fmov x17, d7                     // compressed slot
                         ; str w17, [x16, *slot_byte]       // 4-byte slot write
                     );
-                    if matches!(vrepr, Repr::Tagged) {
-                        emit_generational_card_mark(ops, view, oloc, vloc)?;
-                    }
                     dynasm!(ops ; .arch aarch64 ; b =>done);
                     if !is_last {
                         dynasm!(ops ; .arch aarch64 ; =>miss);

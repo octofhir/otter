@@ -25,7 +25,7 @@
 
 use crate::compressed::RawGc;
 use crate::oom::OutOfMemory;
-use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE};
+use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE};
 use crate::page::{LARGE_OBJECT_THRESHOLD, Page, SpaceKind, align_up};
 
 /// Young-gen pages per semispace by default. With 256 KiB pages
@@ -176,6 +176,12 @@ impl OldSpace {
     /// Bump-allocate `size_aligned` bytes in old-space, growing
     /// by one page if every existing page is full.
     pub fn alloc(&mut self, size_aligned: usize) -> Result<u32, OutOfMemory> {
+        if size_aligned > PAGE_PAYLOAD_SIZE {
+            return Err(OutOfMemory::AllocationTooLarge {
+                requested_bytes: size_aligned as u64,
+                max_bytes: PAGE_PAYLOAD_SIZE as u64,
+            });
+        }
         for page in self.pages.iter().rev() {
             if let Some(offset) = page.bump_alloc(size_aligned) {
                 return Ok(offset);
@@ -184,7 +190,10 @@ impl OldSpace {
         let page = Page::new(SpaceKind::Old).ok_or(OutOfMemory::CageExhausted)?;
         let offset = page
             .bump_alloc(size_aligned)
-            .expect("fresh old-space page cannot be full");
+            .ok_or(OutOfMemory::AllocationTooLarge {
+                requested_bytes: size_aligned as u64,
+                max_bytes: PAGE_PAYLOAD_SIZE as u64,
+            })?;
         self.pages.push(page);
         Ok(offset)
     }
@@ -251,10 +260,19 @@ impl LargeObjectSpace {
     /// allocation.
     pub fn alloc(&mut self, size_aligned: usize) -> Result<u32, OutOfMemory> {
         debug_assert!(size_aligned > LARGE_OBJECT_THRESHOLD);
+        if size_aligned > PAGE_PAYLOAD_SIZE {
+            return Err(OutOfMemory::AllocationTooLarge {
+                requested_bytes: size_aligned as u64,
+                max_bytes: PAGE_PAYLOAD_SIZE as u64,
+            });
+        }
         let page = Page::new(SpaceKind::Large).ok_or(OutOfMemory::CageExhausted)?;
         let offset = page
             .bump_alloc(size_aligned)
-            .expect("fresh LOS page cannot be full");
+            .ok_or(OutOfMemory::AllocationTooLarge {
+                requested_bytes: size_aligned as u64,
+                max_bytes: PAGE_PAYLOAD_SIZE as u64,
+            })?;
         self.pages.push(page);
         Ok(offset)
     }
@@ -312,3 +330,21 @@ pub type Slot = *mut RawGc;
 
 // Use PAGE_HEADER_SIZE so the import is not flagged as unused.
 const _: usize = PAGE_HEADER_SIZE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_large_object_returns_error() {
+        let mut space = LargeObjectSpace::new();
+        let requested = PAGE_PAYLOAD_SIZE + CELL_SIZE;
+        assert_eq!(
+            space.alloc(requested),
+            Err(OutOfMemory::AllocationTooLarge {
+                requested_bytes: requested as u64,
+                max_bytes: PAGE_PAYLOAD_SIZE as u64,
+            })
+        );
+    }
+}

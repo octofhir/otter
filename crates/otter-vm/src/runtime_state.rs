@@ -205,15 +205,14 @@ impl<'a> RuntimeState<'a> {
         for ic in interp.store_property_ics_for_trace() {
             ic.trace_roots(visitor);
         }
-        // 8) Pending throw side-channels. Phase 1 holds them as
-        //    `Value` (Rc-shared); the trace body in
-        //    `Value::trace_gc_roots` lands with task 76 alongside
-        //    the first real `Gc<…>`-bearing variant.
-        if interp.pending_generator_throw_for_trace().is_some() {
-            // No-op stub.
+        // 8) Pending throw side-channels retain arbitrary JS values. They are
+        //    roots even while no frame or job queue references the thrown
+        //    value, and a moving collection must rewrite their slots in place.
+        if let Some(value) = interp.pending_generator_throw_for_trace() {
+            value.trace_value_slots(visitor);
         }
-        if interp.pending_uncaught_throw_for_trace().is_some() {
-            // No-op stub.
+        if let Some(value) = interp.pending_uncaught_throw_for_trace() {
+            value.trace_value_slots(visitor);
         }
         // 8b) Iteration-anchor stack — handles for in-flight
         //     iterator drains live here so a GC triggered inside a

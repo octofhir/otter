@@ -5,6 +5,9 @@
 use otter_gc::raw::RawGc;
 use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{GcHeap, HandleScope};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static YOUNG_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 struct Cell {
@@ -14,6 +17,19 @@ struct Cell {
 impl Traceable for Cell {
     const TYPE_TAG: u8 = 0x40;
     unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
+}
+
+struct DropCell;
+
+impl Traceable for DropCell {
+    const TYPE_TAG: u8 = 0x41;
+    unsafe fn trace_slots(_this: *mut Self, _v: &mut SlotVisitor<'_>) {}
+}
+
+impl Drop for DropCell {
+    fn drop(&mut self) {
+        YOUNG_DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[test]
@@ -66,4 +82,16 @@ fn scavenge_with_external_root_survives() {
     let payload =
         unsafe { (header as *mut u8).add(std::mem::size_of::<otter_gc::GcHeader>()) as *mut Cell };
     assert_eq!(unsafe { (*payload).payload }, 42);
+}
+
+#[test]
+fn scavenge_drops_unreachable_young_bodies() {
+    YOUNG_DROP_COUNT.store(0, Ordering::SeqCst);
+    let mut heap = GcHeap::new().expect("heap");
+    heap.register_traceable::<DropCell>();
+
+    let _dead = heap.alloc(DropCell).expect("alloc young body");
+    heap.collect_minor(otter_gc::EmptyRoots);
+
+    assert_eq!(YOUNG_DROP_COUNT.load(Ordering::SeqCst), 1);
 }

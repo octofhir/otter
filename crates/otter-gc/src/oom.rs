@@ -49,6 +49,17 @@ pub enum OutOfMemory {
         /// that case).
         heap_limit_bytes: u64,
     },
+    /// A single allocation cannot fit in the collector's one-page large-object
+    /// layout. This is reported explicitly instead of panicking in `bump_alloc`.
+    #[error(
+        "out of memory: allocation too large ({requested_bytes} requested, maximum {max_bytes})"
+    )]
+    AllocationTooLarge {
+        /// Aligned bytes requested, including the GC header.
+        requested_bytes: u64,
+        /// Maximum bytes supported by one GC page.
+        max_bytes: u64,
+    },
 }
 
 impl OutOfMemory {
@@ -60,6 +71,9 @@ impl OutOfMemory {
             Self::CageExhausted => 0,
             Self::HeapCapExceeded {
                 requested_bytes, ..
+            }
+            | Self::AllocationTooLarge {
+                requested_bytes, ..
             } => *requested_bytes,
         }
     }
@@ -69,7 +83,7 @@ impl OutOfMemory {
     #[must_use]
     pub fn heap_limit_bytes(&self) -> u64 {
         match self {
-            Self::CageExhausted => 0,
+            Self::CageExhausted | Self::AllocationTooLarge { .. } => 0,
             Self::HeapCapExceeded {
                 heap_limit_bytes, ..
             } => *heap_limit_bytes,

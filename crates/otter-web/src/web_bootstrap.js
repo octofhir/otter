@@ -108,8 +108,9 @@
     class File extends global.Blob {
       constructor(fileBits = '', fileName = '', options = {}) {
         const opts = options || {};
-        const bits = Array.isArray(fileBits) ? fileBits.join('') : String(fileBits);
-        super(bits, opts.type || '');
+        // Forward the raw parts to the native Blob constructor so BufferSource
+        // and nested-Blob parts keep their bytes instead of being stringified.
+        super(fileBits, { type: opts.type });
         Object.defineProperty(this, 'name', {
           value: String(fileName),
           writable: false,

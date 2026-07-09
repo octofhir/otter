@@ -195,11 +195,10 @@ pub(crate) fn url_object(ctx: &mut NativeCtx<'_>, state: WebUrl) -> Result<Value
         }
         Ok::<Value, NativeError>(ctx.escape(obj))
     })
-    .map(|value| {
+    .inspect(|value| {
         // Link the instance to URL.prototype so `instanceof URL` holds and
         // prototype methods are inherited. (The snapshot data properties above
         // are replaced by live accessors in a later slice.)
-        crate::link_class_prototype(ctx, value, "URL");
-        value
+        crate::link_class_prototype(ctx, *value, "URL");
     })
 }

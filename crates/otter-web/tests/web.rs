@@ -16,7 +16,7 @@ fn web_api_specs_are_static_and_ordered() {
     let specs = web_api_classes();
     assert_eq!(
         specs.iter().map(|spec| spec.name()).collect::<Vec<_>>(),
-        ["URL", "Blob"]
+        ["URL", "Blob", "File"]
     );
 }
 
@@ -318,16 +318,16 @@ fn web_api_globals_install_and_run_through_runtime_builder() {
         const url = new URL("https://example.com/a?x=1");
         const headers = new Headers();
         headers.append("Content-Type", " text/plain ");
-        const blob = new Blob("hello", "TEXT/PLAIN");
+        const blob = new Blob(["hello"], { type: "TEXT/PLAIN" });
         const request = new Request("https://example.com/api", { method: "post" });
         const response = Response.json({ ok: true });
-        url.href + "|" + headers.get("content-type") + "|" + blob.text() + "|" +
+        url.href + "|" + headers.get("content-type") + "|" + blob.size + ":" + blob.type + "|" +
           request.method + "|" + response.status
         "#,
     );
     assert_eq!(
         result,
-        "https://example.com/a?x=1|text/plain|hello|POST|200"
+        "https://example.com/a?x=1|text/plain|5:text/plain|POST|200"
     );
 }
 

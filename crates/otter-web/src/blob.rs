@@ -1,24 +1,137 @@
-//! WHATWG Blob host-side bytes.
+//! WHATWG Blob / File host classes.
+//!
+//! Declared through `#[js_class]`: the impl signatures are the JS
+//! surface, argument extraction and return construction ride the
+//! marshalling layer, and prototype linkage / `instanceof` /
+//! `Symbol.toStringTag` / JS-subclass `new.target` handling come from
+//! the declaration. `File` is a native subclass — its data embeds the
+//! `Blob` record and the ancestry walk lets every `Blob.prototype`
+//! member run on `File` instances unmodified.
+//!
+//! # Contents
+//! - [`Blob`] — bytes + normalized MIME type; the Rust-side record is
+//!   also the JS instance data.
+//! - [`File`] — `File extends Blob` with `name` / `lastModified`.
+//! - [`BlobPart`] / [`BlobPropertyBag`] / [`FilePropertyBag`] — WebIDL
+//!   argument shapes for the constructors.
+//!
+//! # Invariants
+//! - Blob bytes are immutable snapshots (`Arc<[u8]>`): every part is
+//!   copied at construction time per the File API, and clones (async
+//!   reads, `slice`) share the buffer instead of copying again.
+//! - `type` normalization matches the spec: any byte outside
+//!   0x20–0x7E empties the type, otherwise it lowercases.
+//!
+//! # See also
+//! - <https://w3c.github.io/FileAPI/>
+//! - `EXTENSION_API_PLAN.md` §7 — this file is the design's worked
+//!   exemplar.
 
-use otter_runtime::{
-    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeValue as Value, array, object, runtime_arg_to_string, runtime_optional_arg_to_string,
-    runtime_this_object, runtime_with_host_data,
+use std::sync::Arc;
+
+use otter_macros::{HostClass, js_class};
+use otter_runtime::marshal::{
+    ArrayBuffer, BufferSource, FromJs, JsError, JsUnionProbe, JsValue, MarshalCx, Sequence,
+    USVString, Uint8Array, ValueIdent,
 };
 
-/// Owned Blob data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Owned Blob record: immutable bytes + normalized MIME type.
+#[derive(Debug, Clone, PartialEq, Eq, HostClass)]
 pub struct Blob {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     content_type: String,
 }
 
+/// One `BlobPart`: a nested Blob (its bytes), a `BufferSource` (the
+/// live byte range, copied), or anything else coerced to a string and
+/// UTF-8 encoded.
+pub enum BlobPart {
+    /// A nested `Blob` / `File` contributes its raw bytes.
+    Blob(Blob),
+    /// An `ArrayBuffer` or typed-array view contributes its bytes.
+    Buffer(BufferSource),
+    /// Everything else stringifies.
+    Text(USVString),
+}
+
+impl<'s> FromJs<'s> for BlobPart {
+    fn from_js(
+        cx: &mut MarshalCx<'_, '_, 's>,
+        v: JsValue<'s>,
+        ident: ValueIdent<'_>,
+    ) -> Result<Self, JsError> {
+        if <Blob as JsUnionProbe>::probe(cx, v) {
+            return Blob::from_js(cx, v, ident).map(Self::Blob);
+        }
+        if <BufferSource as JsUnionProbe>::probe(cx, v) {
+            return BufferSource::from_js(cx, v, ident).map(Self::Buffer);
+        }
+        USVString::from_js(cx, v, ident).map(Self::Text)
+    }
+}
+
+impl BlobPart {
+    fn append_to(self, out: &mut Vec<u8>) {
+        match self {
+            Self::Blob(blob) => out.extend_from_slice(&blob.bytes),
+            Self::Buffer(buffer) => out.extend_from_slice(buffer.as_ref()),
+            Self::Text(text) => out.extend_from_slice(text.as_str().as_bytes()),
+        }
+    }
+}
+
+/// The Blob constructor options bag (`{ type }`; `endings` is
+/// "transparent"-only and therefore ignored).
+#[derive(Debug, Default)]
+pub struct BlobPropertyBag {
+    content_type: USVString,
+}
+
+impl<'s> FromJs<'s> for BlobPropertyBag {
+    fn from_js(
+        cx: &mut MarshalCx<'_, '_, 's>,
+        v: JsValue<'s>,
+        _ident: ValueIdent<'_>,
+    ) -> Result<Self, JsError> {
+        let member = cx.get(v, "type")?;
+        let content_type = if cx.is_undefined(member) {
+            USVString::default()
+        } else {
+            USVString::from_js(cx, member, ValueIdent::Member("type"))?
+        };
+        Ok(Self { content_type })
+    }
+}
+
+/// The File constructor options bag (`{ type, lastModified }`).
+#[derive(Debug, Default)]
+pub struct FilePropertyBag {
+    content_type: USVString,
+    last_modified: Option<f64>,
+}
+
+impl<'s> FromJs<'s> for FilePropertyBag {
+    fn from_js(
+        cx: &mut MarshalCx<'_, '_, 's>,
+        v: JsValue<'s>,
+        ident: ValueIdent<'_>,
+    ) -> Result<Self, JsError> {
+        let content_type = BlobPropertyBag::from_js(cx, v, ident)?.content_type;
+        let member = cx.get(v, "lastModified")?;
+        let last_modified = Option::<f64>::from_js(cx, member, ValueIdent::Member("lastModified"))?;
+        Ok(Self {
+            content_type,
+            last_modified,
+        })
+    }
+}
+
 impl Blob {
-    /// Create a Blob from owned bytes and a MIME type.
+    /// Create a Blob from owned bytes and a MIME type (Rust-side API).
     #[must_use]
     pub fn new(bytes: Vec<u8>, content_type: impl Into<String>) -> Self {
         Self {
-            bytes,
+            bytes: bytes.into(),
             content_type: normalize_type(&content_type.into()),
         }
     }
@@ -29,210 +142,187 @@ impl Blob {
         self.bytes.len()
     }
 
-    /// MIME type.
+    /// Normalized MIME type.
     #[must_use]
     pub fn content_type(&self) -> &str {
         &self.content_type
     }
 
-    /// Copy bytes out.
+    /// Borrow the bytes.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Slice bytes using Web Blob semantics.
+    /// Slice with resolved (non-negative, clamped) bounds (Rust-side
+    /// API). See [`Blob::js_slice`] for the Web-facing variant with
+    /// relative-index semantics.
     #[must_use]
     pub fn slice(&self, start: usize, end: Option<usize>, content_type: Option<&str>) -> Self {
         let end = end.unwrap_or(self.bytes.len()).min(self.bytes.len());
         let start = start.min(end);
-        Self::new(
-            self.bytes[start..end].to_vec(),
-            content_type.unwrap_or(&self.content_type),
-        )
+        Self {
+            bytes: self.bytes[start..end].into(),
+            content_type: normalize_type(content_type.unwrap_or(&self.content_type)),
+        }
     }
 
-    /// Interpret bytes as UTF-8 with replacement.
+    /// Bytes as UTF-8 with replacement.
     #[must_use]
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
+
+    fn from_parts(parts: Option<Sequence<BlobPart>>, options: Option<BlobPropertyBag>) -> Self {
+        let mut bytes = Vec::new();
+        for part in parts.into_iter().flatten() {
+            part.append_to(&mut bytes);
+        }
+        let content_type = options.unwrap_or_default().content_type;
+        Self::new(bytes, content_type.into_string())
+    }
 }
 
+#[js_class(name = "Blob", feature = WEB)]
+impl Blob {
+    #[constructor]
+    fn js_new(parts: Option<Sequence<BlobPart>>, options: Option<BlobPropertyBag>) -> Blob {
+        Blob::from_parts(parts, options)
+    }
+
+    #[getter(name = "size")]
+    fn js_size(&self) -> f64 {
+        self.bytes.len() as f64
+    }
+
+    #[getter(name = "type")]
+    fn js_type(&self) -> String {
+        self.content_type.clone()
+    }
+
+    #[method(name = "slice", length = 2)]
+    fn js_slice(
+        &self,
+        start: Option<f64>,
+        end: Option<f64>,
+        content_type: Option<USVString>,
+    ) -> Blob {
+        let size = self.bytes.len();
+        let start = resolve_relative_index(start, size, 0);
+        let end = resolve_relative_index(end, size, size);
+        let span = end.saturating_sub(start);
+        self.slice(
+            start,
+            Some(start + span),
+            content_type.as_ref().map(|t| t.as_str()),
+        )
+    }
+
+    #[method(name = "arrayBuffer", promise)]
+    fn js_array_buffer(&self) -> ArrayBuffer {
+        ArrayBuffer(self.bytes.to_vec())
+    }
+
+    #[method(name = "bytes", promise)]
+    fn js_bytes(&self) -> Uint8Array {
+        Uint8Array(self.bytes.to_vec())
+    }
+
+    #[method(name = "text", promise)]
+    fn js_text(&self) -> String {
+        self.text()
+    }
+}
+
+/// Owned File record: the embedded [`Blob`] plus file metadata.
+#[derive(Debug, Clone, PartialEq, HostClass)]
+pub struct File {
+    #[host_class(parent)]
+    blob: Blob,
+    name: String,
+    last_modified: f64,
+}
+
+impl File {
+    /// File name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Milliseconds since the Unix epoch.
+    #[must_use]
+    pub fn last_modified(&self) -> f64 {
+        self.last_modified
+    }
+
+    /// The embedded Blob record.
+    #[must_use]
+    pub fn as_blob(&self) -> &Blob {
+        &self.blob
+    }
+}
+
+#[js_class(name = "File", feature = WEB, extends = Blob)]
+impl File {
+    #[constructor]
+    fn js_new(bits: Sequence<BlobPart>, name: USVString, options: Option<FilePropertyBag>) -> File {
+        let options = options.unwrap_or_default();
+        let blob = Blob::from_parts(
+            Some(bits),
+            Some(BlobPropertyBag {
+                content_type: options.content_type,
+            }),
+        );
+        File {
+            blob,
+            name: name.into_string(),
+            last_modified: options.last_modified.unwrap_or_else(unix_millis_now),
+        }
+    }
+
+    #[getter(name = "name")]
+    fn js_name(&self) -> String {
+        self.name.clone()
+    }
+
+    #[getter(name = "lastModified")]
+    fn js_last_modified(&self) -> f64 {
+        self.last_modified
+    }
+}
+
+/// §3 File API: relative index resolution for `Blob.prototype.slice`
+/// (negative counts from the end; NaN reads as 0; everything clamps
+/// to `[0, size]`).
+fn resolve_relative_index(index: Option<f64>, size: usize, default: usize) -> usize {
+    let Some(index) = index else { return default };
+    if index.is_nan() {
+        return 0;
+    }
+    let size_f = size as f64;
+    let resolved = if index < 0.0 {
+        (size_f + index.trunc()).max(0.0)
+    } else {
+        index.trunc().min(size_f)
+    };
+    resolved as usize
+}
+
+/// Milliseconds since the Unix epoch, the `lastModified` default.
+fn unix_millis_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// §3.1 File API `type` normalization: any byte outside 0x20–0x7E
+/// empties the type; otherwise it lowercases.
 fn normalize_type(value: &str) -> String {
     if value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
         value.to_ascii_lowercase()
     } else {
         String::new()
-    }
-}
-
-otter_macros::couch! {
-    name = "Blob",
-    feature = WEB,
-    constructor = (length = 0, call = blob_constructor_native),
-    prototype = {
-        methods = {
-            "arrayBuffer" / 0 => blob_array_buffer_native,
-            "slice"       / 2 => blob_slice_native,
-            "text"        / 0 => blob_text_native,
-        },
-        accessors = [
-            ("size", get = blob_size_native),
-            ("type", get = blob_type_native),
-        ],
-    },
-}
-
-fn blob_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let parts = args.first().copied().unwrap_or_else(Value::undefined);
-    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
-    let bytes = assemble_blob_parts(ctx, parts)?;
-    let content_type = blob_options_type(ctx, options);
-    blob_object(ctx, Blob::new(bytes, content_type))
-}
-
-/// Read the `type` member of the Blob/File options bag (a `USVString`). Absent,
-/// non-object, or `undefined` values yield an empty type, which `Blob::new`
-/// normalizes.
-fn blob_options_type(ctx: &NativeCtx<'_>, options: Value) -> String {
-    let Some(obj) = options.as_object() else {
-        return String::new();
-    };
-    match object::get(obj, ctx.heap(), "type") {
-        Some(value) if !value.is_undefined() => runtime_arg_to_string(&[value], 0, ctx.heap()),
-        _ => String::new(),
-    }
-}
-
-/// Assemble the concatenated bytes of a `sequence<BlobPart>`. Each part is a
-/// string (UTF-8 encoded), a `BufferSource` (ArrayBuffer or typed-array view,
-/// copied byte-for-byte), or another `Blob` (its bytes). A non-array argument is
-/// treated as a single part; `undefined` yields an empty Blob.
-fn assemble_blob_parts(ctx: &NativeCtx<'_>, parts: Value) -> Result<Vec<u8>, NativeError> {
-    let mut out = Vec::new();
-    if let Some(array) = parts.as_array() {
-        let elements: Vec<Value> = array::with_elements(array, ctx.heap(), <[Value]>::to_vec);
-        for element in elements {
-            append_blob_part(ctx, element, &mut out)?;
-        }
-    } else if !parts.is_undefined() {
-        append_blob_part(ctx, parts, &mut out)?;
-    }
-    Ok(out)
-}
-
-/// Append one BlobPart's bytes to `out`, dispatching on its runtime shape.
-fn append_blob_part(
-    ctx: &NativeCtx<'_>,
-    value: Value,
-    out: &mut Vec<u8>,
-) -> Result<(), NativeError> {
-    // A nested Blob (or File) contributes its raw bytes.
-    if let Some(object) = value.as_object()
-        && let Ok(mut bytes) =
-            runtime_with_host_data::<Blob, _>(ctx, object, |blob| blob.bytes().to_vec())
-    {
-        out.append(&mut bytes);
-        return Ok(());
-    }
-    // A typed-array view copies its live window.
-    if let Some(view) = value.as_typed_array(ctx.heap()) {
-        let offset = view.byte_offset(ctx.heap());
-        let length = view.byte_length(ctx.heap());
-        let bytes = view
-            .buffer(ctx.heap())
-            .with_bytes(ctx.heap(), |bytes| {
-                bytes.get(offset..offset + length).map(<[u8]>::to_vec)
-            })
-            .unwrap_or_default();
-        out.extend_from_slice(&bytes);
-        return Ok(());
-    }
-    // A bare ArrayBuffer copies all of its bytes.
-    if let Some(buffer) = value.as_array_buffer() {
-        let bytes = buffer.with_bytes(ctx.heap(), <[u8]>::to_vec);
-        out.extend_from_slice(&bytes);
-        return Ok(());
-    }
-    // Anything else is coerced to a string and UTF-8 encoded.
-    out.extend_from_slice(runtime_arg_to_string(&[value], 0, ctx.heap()).as_bytes());
-    Ok(())
-}
-
-fn blob_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
-    runtime_this_object(ctx, name, "Blob")
-}
-
-fn host_error(name: &'static str, err: otter_runtime::RuntimeHostObjectError) -> NativeError {
-    crate::type_error(name, err.to_string())
-}
-
-fn blob_snapshot(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Blob, NativeError> {
-    let object = blob_receiver(ctx, name)?;
-    runtime_with_host_data::<Blob, _>(ctx, object, Clone::clone)
-        .map_err(|err| host_error(name, err))
-}
-
-fn blob_array_buffer_native(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
-    const NAME: &str = "Blob.prototype.arrayBuffer";
-    let bytes = blob_snapshot(ctx, NAME)?.bytes().to_vec();
-    let buffer = ctx
-        .array_buffer_from_bytes_rooted(bytes, &[], &[])
-        .map_err(|err| crate::type_error(NAME, err.to_string()))?;
-    let value = Value::array_buffer(buffer);
-    let promise = ctx
-        .fulfilled_promise_with_roots(value, &[&value], &[])
-        .map_err(|err| crate::type_error(NAME, err.to_string()))?;
-    Ok(Value::promise(promise))
-}
-
-fn blob_slice_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let blob = blob_snapshot(ctx, "Blob.prototype.slice")?;
-    let start = arg_usize(args, 0).unwrap_or(0);
-    let end = arg_usize(args, 1);
-    let content_type = runtime_optional_arg_to_string(args, 2, ctx.heap());
-    blob_object(ctx, blob.slice(start, end, content_type.as_deref()))
-}
-
-fn blob_text_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let text = blob_snapshot(ctx, "Blob.prototype.text")?.text();
-    crate::string_value(ctx, &text)
-}
-
-fn blob_size_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let size = blob_snapshot(ctx, "Blob.prototype.size")?.size();
-    Ok(Value::number_f64(size as f64))
-}
-
-fn blob_type_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let content_type = blob_snapshot(ctx, "Blob.prototype.type")?
-        .content_type()
-        .to_string();
-    crate::string_value(ctx, &content_type)
-}
-
-pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value, NativeError> {
-    // The instance holds only the host bytes; `size`/`type` accessors and the
-    // `arrayBuffer`/`slice`/`text` methods are inherited from `Blob.prototype`
-    // once the prototype is linked below.
-    let value = ctx.scope(|ctx, s| {
-        let obj = ctx.scoped_host_object(s, state)?;
-        Ok::<Value, NativeError>(ctx.escape(obj))
-    })?;
-    crate::link_class_prototype(ctx, value, "Blob");
-    Ok(value)
-}
-
-fn arg_usize(args: &[Value], index: usize) -> Option<usize> {
-    let n = args.get(index)?.as_number()?;
-    let f = n.as_f64();
-    if f.is_finite() && f >= 0.0 {
-        Some(f as usize)
-    } else {
-        None
     }
 }

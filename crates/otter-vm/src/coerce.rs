@@ -119,6 +119,17 @@ pub(crate) fn to_string_or_throw(
     } else {
         interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
     };
+    primitive_to_string_lossy(interp, &primitive)
+}
+
+/// §7.1.17 `ToString` restricted to primitive operands — the re-entry-free
+/// tail of [`to_string_or_throw`]. Symbol operands surface as
+/// `VmError::TypeError`; the returned `String` is the lossy Rust rendering
+/// (lone surrogates become U+FFFD).
+pub(crate) fn primitive_to_string_lossy(
+    interp: &Interpreter,
+    primitive: &Value,
+) -> Result<String, VmError> {
     if primitive.is_symbol() {
         return Err(
             interp.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
@@ -143,6 +154,36 @@ pub(crate) fn to_string_or_throw(
         return Ok(b.to_decimal_string(&interp.gc_heap));
     }
     Ok(primitive.display_string(&interp.gc_heap))
+}
+
+/// §7.1.17 `ToString` returning WTF-16 code units (lone surrogates
+/// preserved). Non-primitive operands require the execution context for
+/// the `ToPrimitive` re-entry; a context-free call on an object reports
+/// a TypeError instead of guessing.
+pub(crate) fn to_js_string_units(
+    interp: &mut Interpreter,
+    context: Option<&ExecutionContext>,
+    input: &Value,
+) -> Result<Vec<u16>, VmError> {
+    let primitive = if abstract_ops::is_primitive(input) {
+        *input
+    } else if let Some(context) = context {
+        interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
+    } else {
+        return Err(interp.err_type(
+            ("cannot coerce an object to a string without an execution context".to_string()).into(),
+        ));
+    };
+    if primitive.is_symbol() {
+        return Err(
+            interp.err_type(("Cannot convert a Symbol value to a string".to_string()).into())
+        );
+    }
+    if let Some(s) = primitive.as_string(&interp.gc_heap) {
+        return Ok(s.with_utf16(&interp.gc_heap, <[u16]>::to_vec));
+    }
+    let rendered = primitive_to_string_lossy(interp, &primitive)?;
+    Ok(rendered.encode_utf16().collect())
 }
 
 /// §7.1.17 `ToString(argument)` returning a GC-backed JavaScript
@@ -196,6 +237,16 @@ pub(crate) fn to_number_or_throw(
     } else {
         interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
     };
+    primitive_to_number(interp, &primitive)
+}
+
+/// §7.1.4 `ToNumber` restricted to primitive operands — the
+/// re-entry-free tail of [`to_number_or_throw`]. Symbol and BigInt
+/// operands surface as `VmError::TypeError`.
+pub(crate) fn primitive_to_number(
+    interp: &Interpreter,
+    primitive: &Value,
+) -> Result<NumberValue, VmError> {
     if primitive.is_symbol() {
         return Err(
             interp.err_type(("Cannot convert a Symbol value to a number".to_string()).into())
@@ -207,7 +258,7 @@ pub(crate) fn to_number_or_throw(
         );
     }
     Ok(NumberValue::from_f64(
-        crate::number::parse::to_number_value(&primitive, &interp.gc_heap),
+        crate::number::parse::to_number_value(primitive, &interp.gc_heap),
     ))
 }
 

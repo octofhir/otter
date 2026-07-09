@@ -207,14 +207,135 @@ fn prototype_for_construction<'s>(
 ) -> Option<Scoped<'s>> {
     if let Some(new_target) = cx.ctx().new_target().copied() {
         let target_handle = cx.park(new_target);
-        if let Some(target_obj) = cx.escape(target_handle).as_object() {
-            let proto =
-                object::get(target_obj, cx.heap(), "prototype").unwrap_or_else(Value::undefined);
-            if proto.is_object_type() {
-                return Some(cx.park(proto));
-            }
+        if let Some(proto) = constructor_prototype_read(cx, target_handle)
+            && proto.is_object_type()
+        {
+            return Some(cx.park(proto));
         }
     }
     let proto = cx.ctx().class_instance_prototype(class_name)?;
     Some(cx.park(proto))
 }
+
+/// Read `<ctor>.prototype` off an arbitrary constructor-shaped value:
+/// an ordinary object, a builtin native function, or a JS
+/// `class`-declared constructor (the exotic representation
+/// `new.target` carries for user subclasses). The returned raw value
+/// is parked by the caller before any further allocation.
+fn constructor_prototype_read(cx: &mut MarshalCx<'_, '_, '_>, ctor: Scoped<'_>) -> Option<Value> {
+    let raw = cx.escape(ctor);
+    if let Some(class) = raw.as_class_constructor() {
+        return Some(Value::object(class.prototype(cx.heap())));
+    }
+    if let Some(object) = raw.as_object() {
+        return object::get(object, cx.heap(), "prototype");
+    }
+    if let Some(native) = raw.as_native_function() {
+        let descriptor = native
+            .own_property_descriptor(cx.heap_mut(), "prototype")
+            .ok()
+            .flatten()?;
+        if let object::DescriptorKind::Data { value } = descriptor.kind {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Build a host-class instance for a plain Rust-side return value —
+/// the `IntoJs` lowering for declared classes. Unlike
+/// [`construct_instance`] this never consults `new.target`: a method
+/// returning an auxiliary instance (`Blob.prototype.slice` returning a
+/// fresh `Blob`) must carry the class's own prototype even when it
+/// runs inside somebody else's construct call.
+pub fn class_instance<'s, T: HostAncestry>(
+    cx: &mut MarshalCx<'_, '_, 's>,
+    class_name: &'static str,
+    data: T,
+) -> Result<Scoped<'s>, JsError> {
+    let proto = cx
+        .ctx()
+        .class_instance_prototype(class_name)
+        .map(|proto| cx.park(proto));
+    let instance = cx
+        .ctx()
+        .alloc_host_object(HostInstance::new(class_name, data))
+        .map_err(|err| JsError::Type(err.to_string()))?;
+    let handle = cx.park(Value::object(instance));
+    if let Some(proto) = proto {
+        let raw_proto = cx.escape(proto);
+        let raw_instance = cx.escape(handle);
+        if let Some(object) = raw_instance.as_object() {
+            object::set_prototype_value(object, cx.heap_mut(), Some(raw_proto));
+        }
+    }
+    Ok(handle)
+}
+
+/// Mutable counterpart of [`host_data_view`]: brand-checked mutable
+/// access to host-class data of type `T`, ancestry-aware for declared
+/// classes with a bare-`T` fallback for legacy host objects.
+pub(super) fn host_data_view_mut<T: Any, R>(
+    cx: &mut MarshalCx<'_, '_, '_>,
+    v: Scoped<'_>,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R, JsError> {
+    let raw = cx.escape(v);
+    let Some(object) = raw.as_object() else {
+        return Err(JsError::Type("value is not an object".to_string()));
+    };
+    let heap = cx.heap_mut();
+    let mut f = Some(f);
+    let cell_result = object::with_host_data_mut::<HostInstance, _>(object, heap, |cell| {
+        cell.view_mut::<T>()
+            .map(|data| (f.take().expect("single call"))(data))
+    });
+    match cell_result {
+        Ok(Some(result)) => return Ok(result),
+        Ok(None) => {
+            return Err(JsError::Type(
+                "receiver is an instance of an unrelated class".to_string(),
+            ));
+        }
+        Err(_) => {}
+    }
+    let f = f.take().expect("closure unconsumed on the legacy path");
+    let heap = cx.heap_mut();
+    object::with_host_data_mut::<T, R>(object, heap, f)
+        .map_err(|err| JsError::Type(err.to_string()))
+}
+
+/// Compile-time metadata a class declaration pins on its data type.
+/// The declaration macro implements this; downstream declarations use
+/// it to resolve a parent class's JS name (`extends = Blob` reads
+/// `<Blob as HostClassMeta>::JS_NAME` instead of duplicating the
+/// string).
+pub trait HostClassMeta {
+    /// The declared JS class name.
+    const JS_NAME: &'static str;
+}
+
+/// Union-variant probe: a cheap, side-effect-free test for whether a
+/// JS value can convert to `Self` — WebIDL union distinguishability
+/// without trial coercion. The default accepts everything (a catch-all
+/// variant like a string coercion); brand- and buffer-shaped types
+/// override it.
+pub trait JsUnionProbe {
+    /// Whether `v` distinguishes as `Self`.
+    fn probe(cx: &MarshalCx<'_, '_, '_>, v: Scoped<'_>) -> bool {
+        let _ = (cx, v);
+        true
+    }
+}
+
+impl JsUnionProbe for super::BufferSource {
+    fn probe(cx: &MarshalCx<'_, '_, '_>, v: Scoped<'_>) -> bool {
+        let raw = cx.escape(v);
+        raw.as_typed_array(cx.heap()).is_some() || raw.as_array_buffer().is_some()
+    }
+}
+
+impl JsUnionProbe for super::USVString {}
+impl JsUnionProbe for super::DOMString {}
+impl JsUnionProbe for f64 {}
+impl JsUnionProbe for bool {}

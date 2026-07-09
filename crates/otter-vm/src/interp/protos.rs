@@ -360,6 +360,24 @@ impl Interpreter {
         &self.well_known_symbols
     }
 
+    /// Run an intrinsic's well-knowns install hook (the second phase of
+    /// the bootstrap registry walk) against this interpreter's heap and
+    /// well-known symbol table. Exists because host-side installers
+    /// (runtime-builder global classes) hold only `&mut Interpreter`
+    /// and the hook needs the heap mutably alongside the symbol table —
+    /// a split borrow only this impl can perform.
+    pub fn run_install_well_knowns(
+        &mut self,
+        install: fn(
+            &mut otter_gc::GcHeap,
+            crate::object::JsObject,
+            &WellKnownSymbols,
+        ) -> Result<(), crate::js_surface::JsSurfaceError>,
+        global: crate::object::JsObject,
+    ) -> Result<(), crate::js_surface::JsSurfaceError> {
+        install(&mut self.gc_heap, global, &self.well_known_symbols)
+    }
+
     /// Borrow the global symbol registry backing `Symbol.for` /
     /// `Symbol.keyFor`. Returns the same instance across calls.
     #[must_use]

@@ -58,7 +58,9 @@ pub use error::{JsError, ValueIdent};
 pub use from_js::{
     BufferSource, Callback, DOMString, FromJs, HostRef, JsValue, Sequence, USVString,
 };
-pub use host_class::{HostAncestry, HostInstance, construct_instance};
+pub use host_class::{
+    HostAncestry, HostClassMeta, HostInstance, JsUnionProbe, class_instance, construct_instance,
+};
 pub use into_js::{ArrayBuffer, IntoJs, Uint8Array};
 
 #[cfg(test)]

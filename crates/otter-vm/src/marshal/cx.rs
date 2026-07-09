@@ -401,6 +401,15 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         super::host_class::host_data_view::<T, R>(self, v, f)
     }
 
+    /// Mutable counterpart of [`Self::with_host_data`].
+    pub fn with_host_data_mut<T: std::any::Any, R>(
+        &mut self,
+        v: Scoped<'_>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, JsError> {
+        super::host_class::host_data_view_mut::<T, R>(self, v, f)
+    }
+
     /// Whether the handle currently holds a callable value.
     #[must_use]
     pub fn is_callable(&mut self, v: Scoped<'_>) -> bool {

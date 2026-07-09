@@ -16,155 +16,17 @@ use otter_runtime::{
     runtime_string_value, runtime_type_error,
 };
 
-/// Pure-JS Web Platform globals (Event/EventTarget/CustomEvent/DOMException,
-/// TextEncoder/TextDecoder, performance, URLSearchParams). Evaluated once at
-/// install over the already-bootstrapped intrinsics.
+/// Pure-JS Web Platform globals — the sources live in the `romp!`
+/// declaration ([`crate::WEB_EXTENSION`]); these test-only copies feed
+/// the def-scan honesty check below.
+#[cfg(test)]
 const WEB_BOOTSTRAP: &str = include_str!("web_bootstrap.js");
 
-/// WHATWG Streams globals (`ReadableStream` / `WritableStream` /
-/// `TransformStream` + encoding transform streams). Evaluated after
-/// [`WEB_BOOTSTRAP`] (depends on its `TextEncoder` / `TextDecoder`).
+#[cfg(test)]
 const WEB_STREAMS: &str = include_str!("web_streams.js");
 
-/// WHATWG Fetch classes (`Headers` / `Request` / `Response` + the hidden
-/// `__otterFetchInternals` server factory). Evaluated after [`WEB_STREAMS`]
-/// (the `body` getter wraps buffered bodies in a `ReadableStream`).
+#[cfg(test)]
 const WEB_FETCH: &str = include_str!("web_fetch.js");
-
-/// Every global the [`WEB_BOOTSTRAP`] + [`WEB_STREAMS`] sources attach to
-/// `globalThis` via their `def(name, value)` helper. Each name is installed
-/// as a lazy accessor so the ~52 KB of shim source is only parsed + compiled
-/// + executed when one of these globals is first touched — the common cold
-///   start (a script that never uses a Web class) skips it entirely.
-///
-/// This list must stay in lockstep with the `def('...')` calls in both shim
-/// files; [`tests::lazy_global_names_match_shim_def_calls`] enforces that.
-const WEB_GLOBAL_NAMES: &[&str] = &[
-    // web_bootstrap.js
-    "AbortController",
-    "AbortSignal",
-    "BroadcastChannel",
-    "CloseEvent",
-    "crypto",
-    "CustomEvent",
-    "DOMException",
-    "ErrorEvent",
-    "Event",
-    "EventTarget",
-    "FormData",
-    "MessageChannel",
-    "MessageEvent",
-    "MessagePort",
-    "performance",
-    "ProgressEvent",
-    "reportError",
-    "TextDecoder",
-    "TextEncoder",
-    "URLSearchParams",
-    // web_fetch.js
-    "Headers",
-    "Request",
-    "Response",
-    // web_streams.js
-    "ByteLengthQueuingStrategy",
-    "CompressionStream",
-    "CountQueuingStrategy",
-    "DecompressionStream",
-    "ReadableStream",
-    "ReadableStreamDefaultController",
-    "ReadableStreamDefaultReader",
-    "TextDecoderStream",
-    "TextEncoderStream",
-    "TransformStream",
-    "WritableStream",
-    "WritableStreamDefaultController",
-    "WritableStreamDefaultWriter",
-];
-
-/// Hidden native global that returns the concatenated shim source on demand.
-/// Registering a native function costs nothing at startup; the ~52 KB source
-/// string is only materialized into the JS heap when a lazy accessor first
-/// calls it, so a cold start that never touches a Web class never pays for it.
-const SOURCE_FN_GLOBAL: &str = "__otterWebGlobalsSource";
-
-/// `__otterWebGlobalsSource()` — return the concatenated [`WEB_BOOTSTRAP`] +
-/// [`WEB_STREAMS`] source as a string. Called at most once, on the first read
-/// of any lazy Web global.
-fn web_globals_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    // `web_streams.js` depends on `TextEncoder` / `TextDecoder` from
-    // `web_bootstrap.js`, and `web_fetch.js` depends on both; concatenating
-    // them keeps that ordering. The trailing `;` guards against a shim
-    // omitting its own statement terminator.
-    let mut source =
-        String::with_capacity(WEB_BOOTSTRAP.len() + WEB_STREAMS.len() + WEB_FETCH.len() + 12);
-    source.push_str(WEB_BOOTSTRAP);
-    source.push_str("\n;\n");
-    source.push_str(WEB_STREAMS);
-    source.push_str("\n;\n");
-    source.push_str(WEB_FETCH);
-    source.push_str("\n;\n");
-    runtime_string_value(ctx, &source)
-}
-
-/// Install the Web-platform class globals lazily.
-///
-/// A small installer shim registers one lazy accessor per [`WEB_GLOBAL_NAMES`]
-/// entry. The first read of any of those names pulls the shim source via the
-/// native [`web_globals_source`] function and evaluates it once — materializing
-/// the full set exactly as the previous eager path did — then the shim's `def`
-/// helper replaces every accessor with the real data property.
-fn install_lazy_web_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
-    runtime.install_native_global(SOURCE_FN_GLOBAL, 0, web_globals_source)?;
-
-    let names = WEB_GLOBAL_NAMES
-        .iter()
-        .map(|n| format!("'{n}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    // Indirect `(0, eval)` runs the source in global scope. The shim sources
-    // only mutate `globalThis` (via their own `def` helper), so re-evaluation
-    // needs no surrounding lexical environment.
-    //
-    // `ensure` removes *every* lazy accessor before evaluating the source: that
-    // reproduces the eager ordering exactly (a name reads as `undefined` until
-    // the source's `def` installs it) and guarantees a read during evaluation
-    // can never re-enter a lazy getter — without the upfront delete, a global
-    // referenced before its own `def` would loop forever.
-    let shim = format!(
-        "(function (g) {{\n\
-         'use strict';\n\
-         var NAMES = [{names}];\n\
-         var done = false;\n\
-         function ensure() {{\n\
-           if (done) return;\n\
-           done = true;\n\
-           var src = g.{SOURCE_FN_GLOBAL}();\n\
-           delete g.{SOURCE_FN_GLOBAL};\n\
-           for (var i = 0; i < NAMES.length; i++) delete g[NAMES[i]];\n\
-           (0, eval)(src);\n\
-         }}\n\
-         for (var i = 0; i < NAMES.length; i++) {{\n\
-           (function (name) {{\n\
-             Object.defineProperty(g, name, {{\n\
-               configurable: true,\n\
-               enumerable: false,\n\
-               get: function () {{ ensure(); return g[name]; }},\n\
-               set: function (v) {{\n\
-                 Object.defineProperty(g, name, {{ value: v, writable: true, enumerable: false, configurable: true }});\n\
-               }},\n\
-             }});\n\
-           }})(NAMES[i]);\n\
-         }}\n\
-         }})(globalThis);\n"
-    );
-    runtime
-        .eval(SourceInput::from_javascript(shim))
-        .map_err(|err| OtterError::Internal {
-            code: "WEB_LAZY_INSTALL".to_string(),
-            message: format!("web globals lazy install failed: {err}"),
-        })?;
-    Ok(())
-}
 
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
@@ -182,7 +44,6 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     crate::crypto::install(runtime)?;
     install_navigator(runtime)?;
     install_self(runtime)?;
-    install_lazy_web_globals(runtime)?;
     Ok(())
 }
 
@@ -403,7 +264,7 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 #[cfg(test)]
 mod tests {
-    use super::{WEB_BOOTSTRAP, WEB_FETCH, WEB_GLOBAL_NAMES, WEB_STREAMS};
+    use super::{WEB_BOOTSTRAP, WEB_FETCH, WEB_STREAMS};
     use std::collections::BTreeSet;
 
     /// Scan a shim source for the `def('<name>')` calls that attach a global.
@@ -428,15 +289,21 @@ mod tests {
         out
     }
 
+    /// The romp! declaration's `defines` lists must match the
+    /// `def('…')` globals each shim source actually installs — the
+    /// build-time honesty check for declaration-derived lazy names.
     #[test]
     fn lazy_global_names_match_shim_def_calls() {
         let mut from_shims = def_names(WEB_BOOTSTRAP);
         from_shims.extend(def_names(WEB_STREAMS));
         from_shims.extend(def_names(WEB_FETCH));
-        let listed: BTreeSet<String> = WEB_GLOBAL_NAMES.iter().map(|s| (*s).to_string()).collect();
+        let declared: BTreeSet<String> = crate::WEB_EXTENSION
+            .lazy_names()
+            .map(str::to_string)
+            .collect();
         assert_eq!(
-            from_shims, listed,
-            "WEB_GLOBAL_NAMES must match the def('...') globals installed by the shim sources"
+            from_shims, declared,
+            "romp! `defines` lists must match the def('...') globals installed by the shim sources"
         );
     }
 }

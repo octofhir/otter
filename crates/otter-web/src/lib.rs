@@ -33,28 +33,44 @@ pub mod url;
 
 use otter_runtime::{GlobalClass, OtterBuilder, RuntimeBuilder};
 
-/// Active Web API class globals in deterministic bootstrap order.
-/// Each entry is the `couch!`-generated `BuiltinIntrinsic` for one
-/// Web class. The runtime installs them via the same fn-pointer
-/// path as bootstrap registry entries.
-pub static WEB_API_CLASSES: &[GlobalClass] = &[
-    GlobalClass::from_intrinsic::<url::WebUrlIntrinsic>(),
+otter_macros::romp! {
+    name = "web",
+    ident = WEB_EXTENSION,
     // File's install resolves Blob off the global, so Blob precedes it.
-    GlobalClass::from_intrinsic::<blob::BlobIntrinsic>(),
-    GlobalClass::from_intrinsic::<blob::FileIntrinsic>(),
-];
+    classes = [url::WebUrlIntrinsic, blob::BlobIntrinsic, blob::FileIntrinsic],
+    js = [
+        (include_str!("web_bootstrap.js"), defines = [
+            "AbortController", "AbortSignal", "BroadcastChannel", "CloseEvent",
+            "crypto", "CustomEvent", "DOMException", "ErrorEvent", "Event",
+            "EventTarget", "FormData", "MessageChannel", "MessageEvent",
+            "MessagePort", "performance", "ProgressEvent", "reportError",
+            "TextDecoder", "TextEncoder", "URLSearchParams",
+        ]),
+        // Streams precede fetch: the fetch body getter wraps buffered
+        // bodies in a ReadableStream.
+        (include_str!("web_streams.js"), defines = [
+            "ByteLengthQueuingStrategy", "CompressionStream",
+            "CountQueuingStrategy", "DecompressionStream", "ReadableStream",
+            "ReadableStreamDefaultController", "ReadableStreamDefaultReader",
+            "TextDecoderStream", "TextEncoderStream", "TransformStream",
+            "WritableStream", "WritableStreamDefaultController",
+            "WritableStreamDefaultWriter",
+        ]),
+        (include_str!("web_fetch.js"), defines = ["Headers", "Request", "Response"]),
+    ],
+}
 
-/// Return active Web API specs.
+/// Return active Web API class specs (declaration order).
 #[must_use]
 pub const fn web_api_classes() -> &'static [GlobalClass] {
-    WEB_API_CLASSES
+    WEB_EXTENSION.classes
 }
 
 /// Register active Web API globals on a runtime builder.
 #[must_use]
 pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
     builder
-        .global_classes(WEB_API_CLASSES.iter().copied())
+        .extension(&WEB_EXTENSION)
         .global_installer(globals::web_globals_installer())
 }
 
@@ -62,7 +78,7 @@ pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
 #[must_use]
 pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
     builder
-        .global_classes(WEB_API_CLASSES.iter().copied())
+        .extension(&WEB_EXTENSION)
         .global_installer(globals::web_globals_installer())
 }
 

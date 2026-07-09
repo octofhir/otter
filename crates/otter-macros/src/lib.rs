@@ -155,6 +155,7 @@ mod derive_pelt;
 mod holt;
 mod js_class;
 mod lodge;
+mod romp;
 
 /// Generate a `NamespaceSpec` + `BuiltinIntrinsic` adapter for a
 /// non-constructible namespace intrinsic (`Math`, `JSON`, `Reflect`,
@@ -305,6 +306,17 @@ pub fn from_js_derive(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(IntoJs, attributes(js))]
 pub fn into_js_derive(input: TokenStream) -> TokenStream {
     derive_into_js::expand(input)
+}
+
+/// Declare an extension bundle: native classes plus the JS half as
+/// one static `Extension` descriptor. The runtime installs classes
+/// eagerly in declaration order and registers every `js` source
+/// under one native lazy-global group derived from its `defines`
+/// lists — no hand-maintained name registry. See
+/// `crates/otter-macros/src/romp.rs` for the full surface.
+#[proc_macro]
+pub fn romp(input: TokenStream) -> TokenStream {
+    romp::expand(input)
 }
 
 /// Generate a hosted module installer + `HostedModule` row for an

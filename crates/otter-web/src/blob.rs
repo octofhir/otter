@@ -2,8 +2,8 @@
 
 use otter_runtime::{
     RuntimeAttr as Attr, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value, runtime_optional_arg_to_string,
-    runtime_this_object, runtime_with_host_data,
+    RuntimeNativeError as NativeError, RuntimeValue as Value, array, object, runtime_arg_to_string,
+    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
 };
 
 /// Owned Blob data.
@@ -85,9 +85,79 @@ otter_macros::couch! {
 }
 
 fn blob_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let text = crate::arg_string(args, 0, ctx.heap());
-    let content_type = crate::arg_string(args, 1, ctx.heap());
-    blob_object(ctx, Blob::new(text.into_bytes(), content_type))
+    let parts = args.first().copied().unwrap_or_else(Value::undefined);
+    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
+    let bytes = assemble_blob_parts(ctx, parts)?;
+    let content_type = blob_options_type(ctx, options);
+    blob_object(ctx, Blob::new(bytes, content_type))
+}
+
+/// Read the `type` member of the Blob/File options bag (a `USVString`). Absent,
+/// non-object, or `undefined` values yield an empty type, which `Blob::new`
+/// normalizes.
+fn blob_options_type(ctx: &NativeCtx<'_>, options: Value) -> String {
+    let Some(obj) = options.as_object() else {
+        return String::new();
+    };
+    match object::get(obj, ctx.heap(), "type") {
+        Some(value) if !value.is_undefined() => runtime_arg_to_string(&[value], 0, ctx.heap()),
+        _ => String::new(),
+    }
+}
+
+/// Assemble the concatenated bytes of a `sequence<BlobPart>`. Each part is a
+/// string (UTF-8 encoded), a `BufferSource` (ArrayBuffer or typed-array view,
+/// copied byte-for-byte), or another `Blob` (its bytes). A non-array argument is
+/// treated as a single part; `undefined` yields an empty Blob.
+fn assemble_blob_parts(ctx: &NativeCtx<'_>, parts: Value) -> Result<Vec<u8>, NativeError> {
+    let mut out = Vec::new();
+    if let Some(array) = parts.as_array() {
+        let elements: Vec<Value> = array::with_elements(array, ctx.heap(), <[Value]>::to_vec);
+        for element in elements {
+            append_blob_part(ctx, element, &mut out)?;
+        }
+    } else if !parts.is_undefined() {
+        append_blob_part(ctx, parts, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Append one BlobPart's bytes to `out`, dispatching on its runtime shape.
+fn append_blob_part(
+    ctx: &NativeCtx<'_>,
+    value: Value,
+    out: &mut Vec<u8>,
+) -> Result<(), NativeError> {
+    // A nested Blob (or File) contributes its raw bytes.
+    if let Some(object) = value.as_object()
+        && let Ok(mut bytes) =
+            runtime_with_host_data::<Blob, _>(ctx, object, |blob| blob.bytes().to_vec())
+    {
+        out.append(&mut bytes);
+        return Ok(());
+    }
+    // A typed-array view copies its live window.
+    if let Some(view) = value.as_typed_array(ctx.heap()) {
+        let offset = view.byte_offset(ctx.heap());
+        let length = view.byte_length(ctx.heap());
+        let bytes = view
+            .buffer(ctx.heap())
+            .with_bytes(ctx.heap(), |bytes| {
+                bytes.get(offset..offset + length).map(<[u8]>::to_vec)
+            })
+            .unwrap_or_default();
+        out.extend_from_slice(&bytes);
+        return Ok(());
+    }
+    // A bare ArrayBuffer copies all of its bytes.
+    if let Some(buffer) = value.as_array_buffer() {
+        let bytes = buffer.with_bytes(ctx.heap(), <[u8]>::to_vec);
+        out.extend_from_slice(&bytes);
+        return Ok(());
+    }
+    // Anything else is coerced to a string and UTF-8 encoded.
+    out.extend_from_slice(runtime_arg_to_string(&[value], 0, ctx.heap()).as_bytes());
+    Ok(())
 }
 
 fn blob_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {
@@ -108,8 +178,16 @@ fn blob_array_buffer_native(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    let text = blob_snapshot(ctx, "Blob.prototype.arrayBuffer")?.text();
-    crate::string_value(ctx, &text)
+    const NAME: &str = "Blob.prototype.arrayBuffer";
+    let bytes = blob_snapshot(ctx, NAME)?.bytes().to_vec();
+    let buffer = ctx
+        .array_buffer_from_bytes_rooted(bytes, &[], &[])
+        .map_err(|err| crate::type_error(NAME, err.to_string()))?;
+    let value = Value::array_buffer(buffer);
+    let promise = ctx
+        .fulfilled_promise_with_roots(value, &[&value], &[])
+        .map_err(|err| crate::type_error(NAME, err.to_string()))?;
+    Ok(Value::promise(promise))
 }
 
 fn blob_slice_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

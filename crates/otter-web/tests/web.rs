@@ -42,6 +42,34 @@ fn blob_slices_and_decodes_text() {
 }
 
 #[test]
+fn blob_constructor_assembles_parts_and_async_reads() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        globalThis.out = "pending";
+        // Mixed BlobParts: string, typed-array bytes, ArrayBuffer, nested Blob.
+        const inner = new Blob(["cd"]);
+        const parts = ["ab", new Uint8Array([0x2d]), new Uint8Array([0x65, 0x66]).buffer, inner];
+        const blob = new Blob(parts, { type: "Text/Plain" });
+        let sync = blob.size + "|" + blob.type;
+        const ab = blob.arrayBuffer();
+        sync += "|" + (typeof ab.then === "function");
+        ab.then((buffer) => {
+          globalThis.out = sync + "|" + (buffer instanceof ArrayBuffer) + "|" + buffer.byteLength
+            + "|" + new TextDecoder().decode(new Uint8Array(buffer));
+        }, (err) => { globalThis.out = "ERR:" + err; });
+        sync
+        "#,
+    );
+    // Synchronous portion: size, normalized type, and a thenable arrayBuffer().
+    assert_eq!(result, "7|text/plain|true");
+    // "ab" + "-" + "ef" + "cd" = "ab-efcd" (7 bytes), read after microtasks drain.
+    let after = eval_string(&mut runtime, "out");
+    assert_eq!(after, "7|text/plain|true|true|7|ab-efcd");
+}
+
+#[test]
 fn headers_normalize_combine_and_iterate() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
@@ -314,6 +342,8 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "navigator.userAgent",
       "AbortController",
       "AbortSignal",
+      "Blob",
+      "File",
       "FormData",
       "ByteLengthQueuingStrategy",
       "CountQueuingStrategy",
@@ -343,8 +373,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
     ];
     const PARTIAL = [
       "fetch",
-      "Blob",
-      "File",
       "URL",
       "Request",
       "Response",
@@ -452,16 +480,6 @@ fn wintertc_partial_entries_document_their_gap() {
           "fetch": () => {
             try { fetch("http://example.invalid"); return false; }
             catch (e) { return String(e.message).includes("fetch is not implemented"); }
-          },
-          // Blob.arrayBuffer() returns text instead of Promise<ArrayBuffer>.
-          "Blob": () => {
-            const v = new Blob(["ab"]).arrayBuffer();
-            return !(v && typeof v.then === "function");
-          },
-          // File inherits the same unfinished Blob body surface.
-          "File": () => {
-            const v = new File(["ab"], "n.txt").arrayBuffer();
-            return !(v && typeof v.then === "function");
           },
           // URL exposes snapshot data properties, not live spec accessors.
           "URL": () => {

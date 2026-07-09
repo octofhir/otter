@@ -70,6 +70,31 @@ fn blob_constructor_assembles_parts_and_async_reads() {
 }
 
 #[test]
+fn native_host_instances_link_class_prototype() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        const b = new Blob(["hi"]);
+        out += (b instanceof Blob) + "|";
+        out += (Object.getPrototypeOf(b) === Blob.prototype) + "|";
+        // Instance carries only host data; size/type/methods come from the prototype.
+        out += (Object.getOwnPropertyNames(b).length === 0) + "|";
+        out += (b.size === 2) + "|" + (typeof b.arrayBuffer === "function") + "|";
+        // File honors new.target: instanceof File AND Blob.
+        const f = new File(["x"], "n.txt");
+        out += (f instanceof File) + "|" + (f instanceof Blob) + "|" + (f.name === "n.txt") + "|";
+        // URL links its prototype too.
+        const u = new URL("https://e.com/p");
+        out += (u instanceof URL) + "|" + (u.href === "https://e.com/p");
+        out
+        "#,
+    );
+    assert_eq!(result, "true|true|true|true|true|true|true|true|true|true");
+}
+
+#[test]
 fn headers_normalize_combine_and_iterate() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(

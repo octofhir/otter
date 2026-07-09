@@ -103,3 +103,24 @@ pub(crate) fn arg_string(
 pub(crate) fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
     runtime_string_value(ctx, value)
 }
+
+/// Re-parent a native host instance to its class prototype.
+///
+/// Native host classes build and return their own instance object from the
+/// constructor, which bypasses the default `new.target.prototype` linkage the
+/// engine applies to ordinary `new` expressions. Without this the instance has
+/// a null prototype, so `instanceof` fails and prototype methods are invisible.
+///
+/// The class prototype is `globalThis[class_name].prototype`. Subclasses
+/// (e.g. `File extends Blob`) re-home their instance to the subclass prototype
+/// themselves in JS via `Object.setPrototypeOf`, since a name-based lookup here
+/// cannot see `new.target`.
+pub(crate) fn link_class_prototype(ctx: &mut NativeCtx<'_>, instance: Value, class_name: &str) {
+    let Some(object) = instance.as_object() else {
+        return;
+    };
+    let Some(prototype) = ctx.class_instance_prototype(class_name) else {
+        return;
+    };
+    otter_runtime::object::set_prototype_value(object, ctx.heap_mut(), Some(prototype));
+}

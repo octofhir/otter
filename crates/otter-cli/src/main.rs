@@ -3,7 +3,8 @@
 //! Thin wrapper over [`otter_runtime`]. Implements the foundation-
 //! phase command surface from
 //! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
-//! `run`, `<file>` shorthand, `eval`, `-e`, `-p`, `check`, `test`,
+//! `run`, `<file>` shorthand, multi-file shell-style loading, `eval`,
+//! `-e`, `-p`, `check`, `test`,
 //! `install`, `add`, `remove`, `outdated`, `init`, `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
 //! behavior; this binary owns the argument parsing and exit-code
 //! mapping.
@@ -32,7 +33,7 @@ use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission};
+use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission, SourceInput};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
 
@@ -980,17 +981,41 @@ async fn run_target(
     });
     match resolve_run_target(&project_root, &args).await? {
         RunTarget::File(path) => {
-            run_file(
-                &path,
-                &target_args,
-                json,
-                dump_mode,
-                caps,
-                startup_timer,
-                cpu_profile.as_ref(),
-                max_heap_bytes,
-            )
-            .await
+            let sequence = resolve_script_file_sequence(&project_root, path, &target_args).await?;
+            if sequence.paths.len() > 1 {
+                if dump_mode.is_some() {
+                    return Err(pm_config_error(
+                        "--dump-bytecode only supports a single file target",
+                    ));
+                }
+                if cpu_profile.is_some() {
+                    return Err(pm_config_error(
+                        "--cpu-prof only supports a single file target",
+                    ));
+                }
+                run_script_file_sequence(
+                    &sequence.paths,
+                    &sequence.args,
+                    None,
+                    json,
+                    caps,
+                    startup_timer,
+                    max_heap_bytes,
+                )
+                .await
+            } else {
+                run_file(
+                    &sequence.paths[0],
+                    &sequence.args,
+                    json,
+                    dump_mode,
+                    caps,
+                    startup_timer,
+                    cpu_profile.as_ref(),
+                    max_heap_bytes,
+                )
+                .await
+            }
         }
         RunTarget::Script {
             project_root,
@@ -1027,6 +1052,126 @@ async fn run_target(
             .await
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptFileSequence {
+    paths: Vec<PathBuf>,
+    args: Vec<String>,
+}
+
+async fn resolve_script_file_sequence(
+    project_root: &Path,
+    first: PathBuf,
+    forwarded: &[String],
+) -> Result<ScriptFileSequence, OtterError> {
+    let mut paths = vec![first];
+    let mut split = 0usize;
+    for arg in forwarded {
+        let Some(path) = source_file_arg_path(project_root, arg).await? else {
+            break;
+        };
+        paths.push(path);
+        split += 1;
+    }
+    Ok(ScriptFileSequence {
+        paths,
+        args: forwarded.iter().skip(split).cloned().collect(),
+    })
+}
+
+async fn source_file_arg_path(
+    project_root: &Path,
+    arg: &str,
+) -> Result<Option<PathBuf>, OtterError> {
+    if !has_source_file_extension(arg) {
+        return Ok(None);
+    }
+    let path = PathBuf::from(arg);
+    let lookup = if path.is_absolute() {
+        path.clone()
+    } else {
+        project_root.join(&path)
+    };
+    if tokio::fs::try_exists(&lookup)
+        .await
+        .map_err(|err| pm_io_error(&lookup, err))?
+    {
+        Ok(Some(lookup))
+    } else {
+        Ok(None)
+    }
+}
+
+fn has_source_file_extension(path: &str) -> bool {
+    matches!(
+        Path::new(path).extension().and_then(|ext| ext.to_str()),
+        Some("js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx")
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_script_file_sequence(
+    paths: &[PathBuf],
+    args: &[String],
+    process_cwd: Option<&Path>,
+    json: bool,
+    caps: &CapabilitySet,
+    startup_timer: &CliStartupTimer,
+    max_heap_bytes: Option<u64>,
+) -> Result<ExitCode, OtterError> {
+    debug_assert!(!paths.is_empty());
+    let first = &paths[0];
+    let mut builder = cli_otter_builder(caps)
+        .process_argv(process_argv_for_file_sequence(paths, args))
+        .module_loader(cli_loader_config_for_entry(first).await);
+    if let Some(bytes) = max_heap_bytes {
+        builder = builder.max_heap_bytes(bytes);
+    }
+    if let Some(cwd) = process_cwd {
+        builder = builder.process_cwd(cwd.to_path_buf());
+    }
+    let otter = builder.build()?;
+    startup_timer.mark("runtime_build");
+
+    let mut final_result = None;
+    for path in paths {
+        let source = SourceInput::from_path(path)?;
+        let specifier = path.to_string_lossy().to_string();
+        let result = otter.run_script_source(source, &specifier).await?;
+        startup_timer.mark("runtime_run_script_file");
+        emit_otter_stats_if_requested(&result);
+        let exit_code = result.exit_code();
+        final_result = Some(result);
+        if exit_code != 0 {
+            break;
+        }
+    }
+
+    let result = final_result.expect("non-empty sequence produced a result");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "completion": result.completion_string(),
+                "exitCode": result.exit_code()
+            })
+        );
+    }
+    Ok(ExitCode::from(result.exit_code()))
+}
+
+fn process_argv_for_file_sequence(paths: &[PathBuf], args: &[String]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(args.len() + paths.len() + 1);
+    argv.push(
+        std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "otter".to_string()),
+    );
+    argv.extend(paths.iter().map(|path| path.to_string_lossy().to_string()));
+    argv.extend(args.iter().cloned());
+    argv
 }
 
 fn process_argv_for_file(path: &Path, args: &[String]) -> Vec<String> {

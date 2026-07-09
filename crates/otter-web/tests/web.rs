@@ -95,6 +95,26 @@ fn native_host_instances_link_class_prototype() {
 }
 
 #[test]
+fn url_statics_parse_and_can_parse() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        out += URL.canParse("https://ok.example/") + "|";
+        out += URL.canParse("not a url") + "|";
+        out += URL.canParse("/rel", "https://base.example") + "|";
+        const parsed = URL.parse("https://p.example/x");
+        out += (parsed instanceof URL) + "|" + parsed.pathname + "|";
+        out += (URL.parse("nope") === null) + "|";
+        out += URL.parse.length + "," + URL.canParse.length;
+        out
+        "#,
+    );
+    assert_eq!(result, "true|false|true|true|/x|true|1,1");
+}
+
+#[test]
 fn headers_normalize_combine_and_iterate() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(

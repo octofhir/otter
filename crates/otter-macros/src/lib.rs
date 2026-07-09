@@ -154,6 +154,7 @@ mod derive_into_js;
 mod derive_pelt;
 mod holt;
 mod js_class;
+mod js_module;
 mod js_namespace;
 mod lodge;
 mod romp;
@@ -329,6 +330,18 @@ pub fn romp(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn js_namespace(attr: TokenStream, item: TokenStream) -> TokenStream {
     js_namespace::expand(attr, item)
+}
+
+/// Declarative hosted-module generator — the v2 form of `lodge!`.
+/// Goes on an inherent impl block of a marker type; exports are
+/// static (`#[export(name = "…")]`, options `length`/`promise`/`raw`),
+/// `async fn` compiles to the promise protocol, and with
+/// `capabilities = true` an export may take `caps: &CapabilitySet`
+/// as its first parameter. See
+/// `crates/otter-macros/src/js_module.rs` for the full surface.
+#[proc_macro_attribute]
+pub fn js_module(attr: TokenStream, item: TokenStream) -> TokenStream {
+    js_module::expand(attr, item)
 }
 
 /// Generate a hosted module installer + `HostedModule` row for an

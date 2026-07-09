@@ -3879,6 +3879,22 @@ impl Otter {
             .await
     }
 
+    /// Run a source bundle with an explicit diagnostic specifier.
+    ///
+    /// This is the async handle equivalent of [`Runtime::run_script`], for
+    /// embedders that need to execute multiple script sources in the same
+    /// isolate while preserving the full hosted CLI/runtime wiring.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub async fn run_script_source(
+        &self,
+        source: SourceInput,
+        specifier: impl Into<String>,
+    ) -> Result<ExecutionResult, OtterError> {
+        self.handle.run_script(source, specifier).await
+    }
+
     /// Evaluate a snippet.
     ///
     /// # Errors

@@ -372,19 +372,19 @@ pub(crate) fn pre_declare_block_lexical_bindings(
         if cx.lookup_in_current_scope(name).is_some() {
             continue;
         }
-        // Same TDZ-hole protocol as the function-top-level pre-pass:
-        // a captured binding's cell is holed in place so a closure
-        // running before the declaration reads a ReferenceError.
+        // §14.2.3 — a captured block lexical gets a *fresh* hole cell
+        // on every block entry (`Op::FreshUpvalue`), not a hole
+        // written into the existing cell. The distinction is what
+        // gives loop-body lexicals per-iteration capture semantics:
+        // closures made during one entry keep that entry's cell, the
+        // next entry re-mints the slot, and the hole preserves the
+        // TDZ either way. Holing in place made every iteration's
+        // closures share one cell — all observing the last
+        // iteration's value.
         if let crate::scope::BindingStorage::Upvalue { idx } =
             cx.declare_binding_with_capture(name, *is_const, span, captured_names.contains(name))?
         {
-            let hole = cx.alloc_scratch();
-            cx.emit(Op::LoadHole, [Operand::Register(hole)], span);
-            cx.emit(
-                Op::StoreUpvalue,
-                [Operand::Register(hole), Operand::Imm32(idx as i32)],
-                span,
-            );
+            cx.emit(Op::FreshUpvalue, [Operand::Imm32(i32::from(idx))], span);
         }
     }
     Ok(())

@@ -98,12 +98,10 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
             }
         }
 
-        if osr_pc.is_some() {
-            return Ok(otter_vm::JitCompileStatus::Unsupported {
-                reason: format!("function {fid} has no optimizing OSR entry"),
-            });
-        }
-
+        // The baseline tier serves OSR requests too: it builds a loop-header
+        // OSR trampoline per back-edge target, so a hot loop the optimizing tier
+        // declined (an unsupported opcode or not-yet-int32 feedback in its
+        // region) still tiers up to a native loop body instead of interpreting.
         match baseline::compile(&request.function) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),

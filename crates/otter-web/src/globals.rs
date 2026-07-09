@@ -51,7 +51,6 @@ const WEB_GLOBAL_NAMES: &[&str] = &[
     "ErrorEvent",
     "Event",
     "EventTarget",
-    "File",
     "FormData",
     "MessageChannel",
     "MessageEvent",

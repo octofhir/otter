@@ -103,38 +103,6 @@
   }
   def('DOMException', DOMException);
 
-  // ---- File (§ File API) ----
-  if (typeof global.Blob === 'function' && typeof global.File !== 'function') {
-    class File extends global.Blob {
-      constructor(fileBits = '', fileName = '', options = {}) {
-        const opts = options || {};
-        // Forward the raw parts to the native Blob constructor so BufferSource
-        // and nested-Blob parts keep their bytes instead of being stringified.
-        super(fileBits, { type: opts.type });
-        // The native Blob constructor links the instance to Blob.prototype by
-        // name; re-home it to the (sub)class prototype so `instanceof File`
-        // holds and File.prototype members are inherited.
-        if (Object.getPrototypeOf(this) !== new.target.prototype) {
-          Object.setPrototypeOf(this, new.target.prototype);
-        }
-        Object.defineProperty(this, 'name', {
-          value: String(fileName),
-          writable: false,
-          enumerable: true,
-          configurable: true,
-        });
-        Object.defineProperty(this, 'lastModified', {
-          value: opts.lastModified === undefined ? Date.now() : Number(opts.lastModified),
-          writable: false,
-          enumerable: true,
-          configurable: true,
-        });
-      }
-    }
-    tagged(File.prototype, 'File');
-    def('File', File);
-  }
-
   // ---- Event / CustomEvent (DOM § Events) ----
   const kStop = Symbol('stopPropagation');
   const kStopImmediate = Symbol('stopImmediate');

@@ -43,7 +43,9 @@ use otter_runtime::{
 /// path as bootstrap registry entries.
 pub static WEB_API_CLASSES: &[GlobalClass] = &[
     GlobalClass::from_intrinsic::<url::Intrinsic>(),
-    GlobalClass::from_intrinsic::<blob::Intrinsic>(),
+    // File's install resolves Blob off the global, so Blob precedes it.
+    GlobalClass::from_intrinsic::<blob::BlobIntrinsic>(),
+    GlobalClass::from_intrinsic::<blob::FileIntrinsic>(),
 ];
 
 /// Return active Web API specs.

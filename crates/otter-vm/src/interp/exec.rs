@@ -272,6 +272,46 @@ impl Interpreter {
         let mut current = task.callee;
         let mut effective_this = task.this_value;
         let mut effective_args: SmallVec<[Value; 8]> = task.args.into_iter().collect();
+        // The task left the (traced) microtask queue; from here until
+        // the callee's own roots take over, these locals are the only
+        // owners of the callee/this/argument values. Everything below
+        // allocates before frame roots exist — the upvalue spine, the
+        // `this` box, bound-function unwrapping — and a moving
+        // scavenge in any of those would otherwise launder the
+        // argument values into foreign heap words. Register a live
+        // root over the locals for the whole invocation.
+        let locals_root = MicrotaskLocalsRoot {
+            current: &raw const current,
+            this_value: &raw const effective_this,
+            args: &raw const effective_args,
+        };
+        let roots_depth = self
+            .gc_heap
+            .push_extra_roots(otter_gc::ExtraRoots::new(&locals_root));
+        let result = self.invoke_microtask_rooted(
+            context,
+            result_capability,
+            &mut current,
+            &mut effective_this,
+            &mut effective_args,
+        );
+        self.gc_heap.pop_extra_roots_to(roots_depth - 1);
+        result
+    }
+
+    /// Body of [`Self::invoke_microtask`] running under the
+    /// locals-root registration (see there). `current` / `this` /
+    /// `args` are traced live through the caller's registration, so
+    /// the collector rewrites them in place across every allocation
+    /// this path performs.
+    fn invoke_microtask_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        result_capability: Option<crate::microtask::MicrotaskCapability>,
+        current: &mut Value,
+        effective_this: &mut Value,
+        effective_args: &mut SmallVec<[Value; 8]>,
+    ) -> Result<(), RunError> {
         let mut hops: u32 = 0;
         loop {
             if hops >= self.max_stack_depth {
@@ -289,13 +329,13 @@ impl Interpreter {
                 let mut combined: SmallVec<[Value; 8]> =
                     SmallVec::with_capacity(bound_args.len() + effective_args.len());
                 combined.extend(bound_args);
-                combined.extend(effective_args);
-                effective_this = bound_this;
-                effective_args = combined;
-                current = target;
+                combined.extend(effective_args.drain(..));
+                *effective_this = bound_this;
+                *effective_args = combined;
+                *current = target;
             } else if let Some(cc) = current.as_class_constructor() {
                 hops += 1;
-                current = cc.ctor(&self.gc_heap);
+                *current = cc.ctor(&self.gc_heap);
             } else {
                 break;
             }
@@ -309,8 +349,8 @@ impl Interpreter {
                 return match self.run_vm_intrinsic_sync(
                     context,
                     intrinsic,
-                    effective_this,
-                    effective_args,
+                    *effective_this,
+                    std::mem::take(effective_args),
                 ) {
                     Ok(value) => {
                         self.settle_microtask_capability(context, result_capability, Ok(value));
@@ -335,7 +375,7 @@ impl Interpreter {
                     }
                 };
             }
-            let call_info = NativeCallInfo::call(effective_this);
+            let call_info = NativeCallInfo::call(*effective_this);
             self.record_runtime_native_call();
             let mut ctx = NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
             return match call.invoke(&mut ctx, effective_args.as_slice()) {
@@ -379,7 +419,7 @@ impl Interpreter {
             _new_target_for_callee,
             _derived_this_cell,
             _callee_env,
-        ) = match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
+        ) = match Self::bytecode_call_target_parts(*current, *effective_this, &self.gc_heap) {
             Ok(parts) => parts,
             Err(error) => {
                 return Err(RunError {
@@ -430,7 +470,7 @@ impl Interpreter {
             upvalues,
             this_for_callee,
         );
-        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)
+        self.bind_bytecode_call_arguments(function, &mut new_frame, std::mem::take(effective_args))
             .map_err(|error| RunError {
                 error,
                 frames: Vec::new(),
@@ -726,5 +766,34 @@ impl Interpreter {
         self.finish_runtime_budget_turn();
         self.current_byte_len = saved_byte_len;
         result
+    }
+}
+
+/// Live root over [`Interpreter::invoke_microtask`]'s
+/// callee/this/argument locals: the values leave the traced microtask
+/// queue before any callee-side roots exist, and every allocation on
+/// the invocation path (upvalue spine, `this` boxing, bound-arg
+/// concatenation) can drive a moving scavenge that would otherwise
+/// launder them. Raw pointers because the locals are mutated
+/// (bound-function unwrapping) while registered; the registration is
+/// popped before the locals drop.
+struct MicrotaskLocalsRoot {
+    current: *const Value,
+    this_value: *const Value,
+    args: *const SmallVec<[Value; 8]>,
+}
+
+impl otter_gc::ExtraRootSource for MicrotaskLocalsRoot {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        // SAFETY: `invoke_microtask` pops this registration before the
+        // pointed-at locals go out of scope, so the reads always see
+        // the live locals.
+        unsafe {
+            (*self.current).trace_value_slots(visitor);
+            (*self.this_value).trace_value_slots(visitor);
+            for value in (*self.args).iter() {
+                value.trace_value_slots(visitor);
+            }
+        }
     }
 }

@@ -50,9 +50,89 @@ use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 struct PromiseSlots {
-    values: crate::array::JsArray,
-    keys: Option<crate::array::JsArray>,
+    /// `Value::array(values)` in a `Cell` so [`PromiseSlots::trace`]
+    /// rewrites the FIELD in place when the collector moves the array
+    /// body. A bare `JsArray` copy here goes stale across the very
+    /// first combinator-loop allocation (user iterators, capability
+    /// promises), and tracing a temporary `Value` copy updates the
+    /// temporary, not the field — exactly the Promise.all
+    /// use-after-move this replaces.
+    values: Cell<Value>,
+    keys: Option<Cell<Value>>,
     remaining: Cell<usize>,
+}
+
+/// Registration adapter: keeps a combinator's slot arrays AND its
+/// frame locals traced live for the duration of the iteration loop.
+/// The slot arrays' `Cell` fields are rewritten in place; the locals
+/// (`cap`, the constructor, the iterator record, `promise_resolve`)
+/// are plain `Value` stack slots that the collector rewrites through
+/// the recorded pointers — every allocation the loop performs (user
+/// iterator re-entry, per-element capability functions, downstream
+/// promises) would otherwise leave them pointing at vacated cells,
+/// which is exactly how a combinator ended up invoking a *different*
+/// promise's resolve function.
+struct CombinatorRoot {
+    slots: Option<Arc<PromiseSlots>>,
+    locals: Vec<*const Value>,
+}
+
+impl otter_gc::ExtraRootSource for CombinatorRoot {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        if let Some(slots) = &self.slots {
+            slots.trace(visitor);
+        }
+        // SAFETY: the guard is dropped before the locals go out of
+        // scope (it lives in the same frame, declared after them).
+        for &local in &self.locals {
+            unsafe { (*local).trace_value_slots(visitor) };
+        }
+    }
+}
+
+/// RAII heap registration for [`CombinatorRoot`]: unregisters on drop
+/// so early error returns leave the heap's extra-roots stack balanced.
+struct SlotsRootGuard {
+    heap: *mut otter_gc::GcHeap,
+    depth: usize,
+    /// Boxed so the registered source address stays stable for the
+    /// registration's lifetime.
+    _root: Box<CombinatorRoot>,
+}
+
+fn register_combinator_root(
+    interp: &mut Interpreter,
+    slots: Option<&Arc<PromiseSlots>>,
+    cap: &PromiseCapability,
+    locals: &[&Value],
+) -> SlotsRootGuard {
+    let mut pointers: Vec<*const Value> = Vec::with_capacity(locals.len() + 3);
+    pointers.push(&raw const cap.promise);
+    pointers.push(&raw const cap.resolve);
+    pointers.push(&raw const cap.reject);
+    pointers.extend(locals.iter().map(|value| *value as *const Value));
+    let root = Box::new(CombinatorRoot {
+        slots: slots.map(Arc::clone),
+        locals: pointers,
+    });
+    let depth = interp
+        .gc_heap_mut()
+        .push_extra_roots(otter_gc::ExtraRoots::new(&*root));
+    SlotsRootGuard {
+        heap: interp.gc_heap_mut() as *mut otter_gc::GcHeap,
+        depth,
+        _root: root,
+    }
+}
+
+impl Drop for SlotsRootGuard {
+    fn drop(&mut self) {
+        // SAFETY: the heap outlives every combinator call (it is owned
+        // by the interpreter driving it), and registrations are popped
+        // LIFO — nested native calls always pair their own push/pop
+        // before this guard drops.
+        unsafe { (*self.heap).pop_extra_roots_to(self.depth - 1) };
+    }
 }
 
 struct CapabilityExecutorState {
@@ -116,7 +196,7 @@ impl PromiseSlots {
             )
             .map_err(|_| oom_native("Promise combinator"))?;
         Ok(Arc::new(Self {
-            values,
+            values: Cell::new(Value::array(values)),
             keys: None,
             remaining: Cell::new(1),
         }))
@@ -146,25 +226,45 @@ impl PromiseSlots {
             )
             .map_err(|_| oom_native("Promise keyed combinator"))?;
         Ok(Arc::new(Self {
-            values,
-            keys: Some(keys),
+            values: Cell::new(Value::array(values)),
+            keys: Some(Cell::new(Value::array(keys))),
             remaining: Cell::new(1),
         }))
     }
 
     fn trace(&self, visitor: &mut SlotVisitor<'_>) {
-        self.array_value().trace_value_slots(visitor);
-        if let Some(keys) = self.keys {
-            Value::array(keys).trace_value_slots(visitor);
+        // Trace the fields in place: `Cell::as_ptr` reaches the stored
+        // `Value` itself, so a moving collection rewrites the handles
+        // this struct will read next, not a temporary copy.
+        unsafe {
+            (*self.values.as_ptr()).trace_value_slots(visitor);
+            if let Some(keys) = &self.keys {
+                (*keys.as_ptr()).trace_value_slots(visitor);
+            }
         }
     }
 
+    fn values_array(&self) -> crate::array::JsArray {
+        self.values
+            .get()
+            .as_array()
+            .expect("PromiseSlots::values always holds an array")
+    }
+
+    fn keys_array(&self) -> Option<crate::array::JsArray> {
+        self.keys.as_ref().map(|keys| {
+            keys.get()
+                .as_array()
+                .expect("PromiseSlots::keys always holds an array")
+        })
+    }
+
     fn array_value(&self) -> Value {
-        Value::array(self.values)
+        self.values.get()
     }
 
     fn keys_value(&self) -> Option<Value> {
-        self.keys.map(Value::array)
+        self.keys.as_ref().map(Cell::get)
     }
 
     fn reserve_slot(
@@ -178,7 +278,7 @@ impl PromiseSlots {
             visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
         };
         let len = crate::array::push_with_roots(
-            self.values,
+            self.values_array(),
             interp.gc_heap_mut(),
             Value::hole(),
             &mut external_visit,
@@ -195,7 +295,7 @@ impl PromiseSlots {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<usize, NativeError> {
-        let Some(keys) = self.keys else {
+        let Some(keys) = self.keys_array() else {
             return Err(NativeError::TypeError {
                 name: "Promise keyed combinator",
                 reason: "missing keyed slots".to_string(),
@@ -216,7 +316,7 @@ impl PromiseSlots {
         crate::array::push_with_roots(keys, interp.gc_heap_mut(), key, &mut external_visit)
             .map_err(|_| oom_native("Promise keyed combinator"))?;
         let len = crate::array::push_with_roots(
-            self.values,
+            self.values_array(),
             interp.gc_heap_mut(),
             Value::hole(),
             &mut external_visit,
@@ -227,7 +327,7 @@ impl PromiseSlots {
     }
 
     fn fill(&self, heap: &mut otter_gc::GcHeap, index: usize, value: Value) -> bool {
-        let did_fill = crate::array::with_elements_mut(self.values, heap, |elements| {
+        let did_fill = crate::array::with_elements_mut(self.values_array(), heap, |elements| {
             let Some(slot) = elements.get_mut(index) else {
                 return false;
             };
@@ -252,7 +352,7 @@ impl PromiseSlots {
     }
 
     fn collect_values(&self, heap: &otter_gc::GcHeap) -> Vec<Value> {
-        crate::array::with_elements(self.values, heap, |elements| {
+        crate::array::with_elements(self.values_array(), heap, |elements| {
             elements
                 .iter()
                 .map(|slot| {
@@ -267,7 +367,7 @@ impl PromiseSlots {
     }
 
     fn collect_keys(&self, heap: &otter_gc::GcHeap) -> Vec<Value> {
-        let Some(keys) = self.keys else {
+        let Some(keys) = self.keys_array() else {
             return Vec::new();
         };
         crate::array::with_elements(keys, heap, |elements| elements.to_vec())
@@ -700,6 +800,21 @@ where
         &mut external_visit,
         call,
     )
+}
+
+/// Rebuild an element function's capability from its LIVE captures.
+/// The captures live inside the native function's GC body and are
+/// traced (and rewritten on relocation) with it; the `cap` clones the
+/// body closure captured at build time are plain Rust copies that go
+/// stale on the first moving collection — reading them is the
+/// Promise-combinator use-after-move family.
+fn capability_from_captures(captures: &[Value], template: &PromiseCapability) -> PromiseCapability {
+    PromiseCapability {
+        promise: captures.first().copied().unwrap_or(template.promise),
+        resolve: captures.get(1).copied().unwrap_or(template.resolve),
+        reject: captures.get(2).copied().unwrap_or(template.reject),
+        context: template.context.clone(),
+    }
 }
 
 fn promise_element_function<F>(
@@ -1586,6 +1701,12 @@ fn static_all_keyed_generic(
         let keys_root = slots.keys_value().unwrap_or(Value::undefined());
         interp.push_iteration_anchor(slots_root);
         interp.push_iteration_anchor(keys_root);
+        let _slots_fields_root = register_combinator_root(
+            interp,
+            Some(&slots),
+            &cap,
+            &[&constructor, &promise_resolve, &promises],
+        );
         for key in all_keys {
             let Some(vm_key) = vm_property_key_from_value(&key, interp.gc_heap()) else {
                 continue;
@@ -1779,7 +1900,8 @@ fn keyed_element_function(
         trace_slots,
         value_roots,
         slice_roots,
-        move |ctx, args, _captures| {
+        move |ctx, args, captures| {
+            let cap = capability_from_captures(captures, &cap);
             let payload = args.first().cloned().unwrap_or(Value::undefined());
             let value = match variant {
                 KeyedVariant::All => payload,
@@ -1923,6 +2045,18 @@ fn static_all_generic(
         )?;
         let slots_root = slots.array_value();
         interp.push_iteration_anchor(slots_root);
+        let _slots_fields_root = register_combinator_root(
+            interp,
+            Some(&slots),
+            &cap,
+            &[
+                &constructor,
+                &promise_resolve,
+                &iterable,
+                &iterator,
+                &next_method,
+            ],
+        );
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
                 Ok(Some(value)) => value,
@@ -1986,21 +2120,18 @@ fn static_all_generic(
                     &slots_root,
                 ],
                 &[args],
-                move |ctx, args, _captures| {
+                move |ctx, args, captures| {
+                    let cap = capability_from_captures(captures, &cap_for_fulfill);
                     let v = args.first().cloned().unwrap_or(Value::undefined());
                     if slots_for_fulfill.fill(ctx.heap_mut(), i, v) {
                         let collected = slots_for_fulfill.collect_values(ctx.heap());
                         let arr = ctx.array_from_elements_with_roots(
                             collected.iter().cloned(),
-                            &[
-                                &cap_for_fulfill.promise,
-                                &cap_for_fulfill.resolve,
-                                &cap_for_fulfill.reject,
-                            ],
+                            &[&cap.promise, &cap.resolve, &cap.reject],
                             &[collected.as_slice()],
                         )?;
                         let interp = ctx.interp_mut();
-                        call_capability_resolve(interp, &cap_for_fulfill, Value::array(arr))?;
+                        call_capability_resolve(interp, &cap, Value::array(arr))?;
                     }
                     Ok(Value::undefined())
                 },
@@ -2036,6 +2167,7 @@ fn static_all_generic(
                 return reject_capability_error(interp, &cap, err);
             }
         }
+        {}
         Ok(cap.promise)
     })();
     interp.pop_iteration_anchors_to(anchor_base);
@@ -2067,6 +2199,18 @@ fn static_race_generic(
     };
     let anchor_base = interp.push_iteration_anchor(iterator) - 1;
     interp.push_iteration_anchor(next_method);
+    let _locals_root = register_combinator_root(
+        interp,
+        None,
+        &cap,
+        &[
+            &constructor,
+            &promise_resolve,
+            &iterable,
+            &iterator,
+            &next_method,
+        ],
+    );
     let outcome = (|| -> Result<Value, NativeError> {
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
@@ -2146,6 +2290,18 @@ fn static_all_settled_generic(
         )?;
         let slots_root = slots.array_value();
         interp.push_iteration_anchor(slots_root);
+        let _slots_fields_root = register_combinator_root(
+            interp,
+            Some(&slots),
+            &cap,
+            &[
+                &constructor,
+                &promise_resolve,
+                &iterable,
+                &iterator,
+                &next_method,
+            ],
+        );
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
                 Ok(Some(value)) => value,
@@ -2215,7 +2371,8 @@ fn static_all_settled_generic(
                         &slots_root,
                     ],
                     &[args],
-                    move |ctx, args, _captures| {
+                    move |ctx, args, captures| {
+                        let cap = capability_from_captures(captures, &cap);
                         let v = args.first().cloned().unwrap_or(Value::undefined());
                         let record = build_settled_record(true, v, ctx)?;
                         if slots.fill(ctx.heap_mut(), i, record) {
@@ -2265,7 +2422,8 @@ fn static_all_settled_generic(
                         &slots_root,
                     ],
                     &[args],
-                    move |ctx, args, _captures| {
+                    move |ctx, args, captures| {
+                        let cap = capability_from_captures(captures, &cap);
                         let r = args.first().cloned().unwrap_or(Value::undefined());
                         let record = build_settled_record(false, r, ctx)?;
                         if slots.fill(ctx.heap_mut(), i, record) {
@@ -2399,33 +2557,43 @@ fn make_aggregate_error_native_rooted(
     registry: &ErrorClassRegistry,
     errors: Vec<Value>,
 ) -> Result<Value, NativeError> {
-    let message = aggregate_error_message(ctx.heap_mut())?;
-    let obj = ctx
-        .alloc_object_with_roots(&[&message], &[&errors])
-        .map_err(|_| oom_native("Promise.any"))?;
-    {
-        let gc_heap = ctx.heap_mut();
-        crate::object::set_prototype(
-            obj,
-            gc_heap,
-            Some(registry.prototype(ErrorKind::AggregateError)),
-        );
-    }
-    ctx.set_property_with_roots(obj, "message", message, &[], &[&errors])
-        .map_err(|err| NativeError::TypeError {
-            name: "Promise",
-            reason: err.to_string(),
-        })?;
-    let obj_value = Value::object(obj);
-    let arr = ctx
-        .array_from_elements_with_roots(errors.iter().cloned(), &[&obj_value], &[errors.as_slice()])
-        .map_err(|_| oom_native("Promise.any"))?;
-    ctx.set_property(obj, "errors", Value::array(arr))
-        .map_err(|err| NativeError::TypeError {
-            name: "Promise",
-            reason: err.to_string(),
-        })?;
-    Ok(Value::object(obj))
+    // Handle-scope discipline: every intermediate (message string,
+    // error instance, errors array) is arena-parked, so the shape
+    // transitions each property define performs cannot strand a
+    // sibling. The prototype resolves through the registry at use
+    // time; the raw read is parked before the next allocation.
+    let proto = Value::object(registry.prototype(ErrorKind::AggregateError));
+    ctx.scope(|ctx, s| {
+        let mut cx = crate::marshal::MarshalCx::new(ctx, s);
+        let proto = cx.park(proto);
+        let errors_array = {
+            let array = cx
+                .array(errors.len())
+                .map_err(|err| err.into_native("Promise.any"))?;
+            for (index, error) in errors.iter().enumerate() {
+                let element = cx.park(*error);
+                cx.set_index(array, index, element)
+                    .map_err(|err| err.into_native("Promise.any"))?;
+            }
+            array
+        };
+        let message = cx
+            .string("All promises were rejected")
+            .map_err(|err| err.into_native("Promise.any"))?;
+        let instance = cx.object().map_err(|err| err.into_native("Promise.any"))?;
+        {
+            let raw_instance = cx.escape(instance);
+            let raw_proto = cx.escape(proto);
+            if let (Some(object), Some(proto)) = (raw_instance.as_object(), raw_proto.as_object()) {
+                crate::object::set_prototype(object, cx.heap_mut(), Some(proto));
+            }
+        }
+        cx.set(instance, "message", message)
+            .map_err(|err| err.into_native("Promise.any"))?;
+        cx.set(instance, "errors", errors_array)
+            .map_err(|err| err.into_native("Promise.any"))?;
+        Ok(cx.escape(instance))
+    })
 }
 
 fn aggregate_error_message(heap: &mut otter_gc::GcHeap) -> Result<Value, NativeError> {
@@ -2510,6 +2678,18 @@ fn static_any_generic(
         )?;
         let errors_root = errors.array_value();
         interp.push_iteration_anchor(errors_root);
+        let _errors_fields_root = register_combinator_root(
+            interp,
+            Some(&errors),
+            &cap,
+            &[
+                &constructor,
+                &promise_resolve,
+                &iterable,
+                &iterator,
+                &next_method,
+            ],
+        );
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
                 Ok(Some(value)) => value,
@@ -2580,7 +2760,8 @@ fn static_any_generic(
                         &errors_root,
                     ],
                     &[args],
-                    move |ctx, args, _captures| {
+                    move |ctx, args, captures| {
+                        let cap = capability_from_captures(captures, &cap);
                         let reason = args.first().cloned().unwrap_or(Value::undefined());
                         if errors.fill(ctx.heap_mut(), i, reason) {
                             let collected = errors.collect_values(ctx.heap());

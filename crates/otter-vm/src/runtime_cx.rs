@@ -414,6 +414,24 @@ impl<'rt> NativeCtx<'rt> {
         self.alloc_host_object_with_roots(data, &[], &[])
     }
 
+    /// Resolve the prototype that `new <constructor_name>()` installs on its
+    /// instances — i.e. `globalThis[constructor_name].prototype` — or `None`
+    /// when that is not an object.
+    ///
+    /// A native host constructor that builds and returns its own instance
+    /// object bypasses the engine's automatic `new.target.prototype` linkage,
+    /// leaving the instance with a null prototype. Such constructors call this
+    /// and re-parent the instance (`instanceof` and inherited prototype methods
+    /// then work). Subclass linkage that must honor `new.target` is left to the
+    /// JS subclass via `Object.setPrototypeOf`.
+    pub fn class_instance_prototype(&mut self, constructor_name: &str) -> Option<Value> {
+        self.cx
+            .interp
+            .constructor_prototype_value(constructor_name)
+            .ok()
+            .filter(|value| value.is_object_type())
+    }
+
     /// Allocate a host-data object while keeping additional local values alive.
     pub fn alloc_host_object_with_roots<T: object::HostObjectData>(
         &mut self,

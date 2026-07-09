@@ -1,9 +1,9 @@
 //! WHATWG Blob host-side bytes.
 
 use otter_runtime::{
-    RuntimeAttr as Attr, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value, array, object, runtime_arg_to_string,
-    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
+    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeValue as Value, array, object, runtime_arg_to_string, runtime_optional_arg_to_string,
+    runtime_this_object, runtime_with_host_data,
 };
 
 /// Owned Blob data.
@@ -216,27 +216,15 @@ fn blob_type_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 }
 
 pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value, NativeError> {
-    // Snapshot the fields as Rust values before moving `state` into the host
-    // object; each JS value is minted inside the scope right before its define.
-    let size = state.size() as f64;
-    let content_type = state.content_type().to_string();
-    ctx.scope(|ctx, s| {
+    // The instance holds only the host bytes; `size`/`type` accessors and the
+    // `arrayBuffer`/`slice`/`text` methods are inherited from `Blob.prototype`
+    // once the prototype is linked below.
+    let value = ctx.scope(|ctx, s| {
         let obj = ctx.scoped_host_object(s, state)?;
-        let read_only = Attr::read_only().to_flags();
-        let size_value = ctx.scoped_number(s, size);
-        ctx.scoped_define_data(s, obj, "size", size_value, read_only)?;
-        let type_value = ctx.scoped_string(s, &content_type)?;
-        ctx.scoped_define_data(s, obj, "type", type_value, read_only)?;
-        let builtin = Attr::builtin_function().to_flags();
-        let text = ctx.scoped_native_method(s, "text", 0, blob_text_native)?;
-        ctx.scoped_define_data(s, obj, "text", text, builtin)?;
-        let array_buffer =
-            ctx.scoped_native_method(s, "arrayBuffer", 0, blob_array_buffer_native)?;
-        ctx.scoped_define_data(s, obj, "arrayBuffer", array_buffer, builtin)?;
-        let slice = ctx.scoped_native_method(s, "slice", 2, blob_slice_native)?;
-        ctx.scoped_define_data(s, obj, "slice", slice, builtin)?;
         Ok::<Value, NativeError>(ctx.escape(obj))
-    })
+    })?;
+    crate::link_class_prototype(ctx, value, "Blob");
+    Ok(value)
 }
 
 fn arg_usize(args: &[Value], index: usize) -> Option<usize> {

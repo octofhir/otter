@@ -111,6 +111,12 @@
         // Forward the raw parts to the native Blob constructor so BufferSource
         // and nested-Blob parts keep their bytes instead of being stringified.
         super(fileBits, { type: opts.type });
+        // The native Blob constructor links the instance to Blob.prototype by
+        // name; re-home it to the (sub)class prototype so `instanceof File`
+        // holds and File.prototype members are inherited.
+        if (Object.getPrototypeOf(this) !== new.target.prototype) {
+          Object.setPrototypeOf(this, new.target.prototype);
+        }
         Object.defineProperty(this, 'name', {
           value: String(fileName),
           writable: false,

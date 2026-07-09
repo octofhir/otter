@@ -805,8 +805,11 @@
       },
       // The private slot symbols, handed to the native server so it can read a
       // Response's status/headers/body directly in Rust instead of round-tripping
-      // through `responseParts` + intermediate arrays. Exposed only on this
-      // hidden internals object, so user code never gains slot access.
+      // through `responseParts` + intermediate arrays, and build a Request's
+      // object graph directly in Rust instead of calling `makeRequest`. The
+      // `requestPrototype`/`headersPrototype` entries let the native builder mint
+      // instances with the correct prototype chain. Exposed only on this hidden
+      // internals object, so user code never gains slot access.
       slots: Object.freeze({
         status: kStatus,
         statusText: kStatusText,
@@ -816,6 +819,12 @@
         bodyBytes: kBodyBytes,
         bodyStream: kBodyStream,
         bodyUsed: kBodyUsed,
+        url: kUrl,
+        method: kMethod,
+        signal: kSignal,
+        guard: kGuard,
+        requestPrototype: Request.prototype,
+        headersPrototype: Headers.prototype,
       }),
       responseParts(response) {
         if (!(response instanceof Response)) return null;

@@ -1250,6 +1250,41 @@ impl<'rt> NativeCtx<'rt> {
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_define_data"))
     }
 
+    /// Allocate an ordinary object whose prototype is the object held by the
+    /// `proto` handle (e.g. a class's `.prototype`), and park it in scope `s`.
+    /// Use this to build a native instance that must carry a specific prototype
+    /// chain — the server request path builds `Request`/`Headers` instances
+    /// this way. A `proto` handle not holding an object yields a null prototype.
+    pub fn scoped_object_with_proto<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        proto: Scoped<'_>,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_object_with_proto(s, proto);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_object_with_proto"))
+    }
+
+    /// Define the symbol-keyed data property carried by the `key` handle on the
+    /// object handle `obj`, with explicit attribute `flags`. The symbol lives in
+    /// a scope handle so it survives the allocations that built `value`; all
+    /// handles resolve through the arena at call time. Mirrors
+    /// [`Self::scoped_define_data`] for the private-slot symbols that back the
+    /// Fetch classes.
+    pub fn scoped_define_symbol(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        key: Scoped<'_>,
+        value: Scoped<'_>,
+        flags: object::PropertyFlags,
+    ) -> Result<(), NativeError> {
+        let result = self
+            .cx
+            .interp
+            .scoped_define_symbol(s, obj, key, value, flags);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_define_symbol"))
+    }
+
     /// Store `value` at array index `index` on the array handle `arr`,
     /// resolving both handles through the arena at call time.
     pub fn scoped_set_index(

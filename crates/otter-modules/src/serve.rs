@@ -32,8 +32,9 @@ use otter_runtime::{
     CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
     RuntimeAttr as Attr, RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness,
     RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeFn, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
-    RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
+    RuntimeNativeFn, RuntimePersistentRootId, RuntimeScoped as Scoped, RuntimeTask,
+    RuntimeTaskSpawner, RuntimeValue as Value, SourceInput, object, runtime_this_object,
+    runtime_with_host_data,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -143,12 +144,9 @@ fn install_global_otter(runtime: &mut Runtime) -> Result<(), OtterError> {
               }
               Object.defineProperty(g, '__otterServeInternals', {
                 value: Object.freeze({
-                  makeRequest: function (method, url, flatHeaders, body) {
-                    var internals = fetchInternals || ensureFetch();
-                    return internals.makeRequest(method, url, flatHeaders, body);
-                  },
-                  // Hand the private Fetch slot symbols to the native server once,
-                  // so it reads a Response's status/headers/body directly in Rust.
+                  // Hand the private Fetch slot symbols and class prototypes to the
+                  // native server once, so it reads a Response's status/headers/body
+                  // and builds a Request's object graph directly in Rust.
                   fetchSlots: function () {
                     return ensureFetch().slots;
                   },
@@ -245,7 +243,6 @@ fn serve(
     let roots = ServeRoots {
         fetch: ctx.persistent_root_insert(options.fetch),
         internals: internals_root,
-        make_request: ctx.persistent_root_insert(options.fns.make_request),
         async_deliver: ctx.persistent_root_insert(options.fns.async_deliver),
         deliver: ctx.persistent_root_insert(deliver),
         deliver_error: ctx.persistent_root_insert(deliver_error),
@@ -281,7 +278,6 @@ fn serve(
 
 #[derive(Clone, Copy)]
 struct ServeFns {
-    make_request: Value,
     fetch_slots: Value,
     async_deliver: Value,
 }
@@ -294,10 +290,13 @@ struct ServeOptions {
     fns: ServeFns,
 }
 
-/// Persistent roots for the private Fetch slot symbols, resolved once at
-/// `serve()` time. The `deliver` native reads a Response's own symbol-keyed
-/// slots through these to build an [`HttpResponse`] in Rust — no `responseParts`
-/// JS round-trip, intermediate arrays, or header string per request.
+/// Persistent roots for the private Fetch slot symbols and the Fetch class
+/// prototypes, resolved once at `serve()` time. The `deliver` native reads a
+/// Response's own symbol-keyed slots through these to build an [`HttpResponse`]
+/// in Rust (no `responseParts` round-trip), and `make_request` writes a
+/// Request's slots through them to build its object graph in Rust (no
+/// `makeRequest` JS call). Both directions avoid intermediate arrays and a
+/// header string per request.
 #[derive(Clone, Copy)]
 struct ServeSlots {
     status: RuntimePersistentRootId,
@@ -306,6 +305,14 @@ struct ServeSlots {
     header_list: RuntimePersistentRootId,
     body_text: RuntimePersistentRootId,
     body_bytes: RuntimePersistentRootId,
+    body_stream: RuntimePersistentRootId,
+    body_used: RuntimePersistentRootId,
+    url: RuntimePersistentRootId,
+    method: RuntimePersistentRootId,
+    signal: RuntimePersistentRootId,
+    guard: RuntimePersistentRootId,
+    request_proto: RuntimePersistentRootId,
+    headers_proto: RuntimePersistentRootId,
 }
 
 impl ServeSlots {
@@ -313,19 +320,27 @@ impl ServeSlots {
         let obj = slots
             .as_object()
             .ok_or_else(|| crate::type_error("serve", "invalid Fetch slot table"))?;
-        let mut symbol_root = |name: &str| -> Result<RuntimePersistentRootId, NativeError> {
+        let mut root = |name: &str| -> Result<RuntimePersistentRootId, NativeError> {
             let value = object::get(obj, ctx.heap(), name).ok_or_else(|| {
                 crate::type_error("serve", format!("missing Fetch slot `{name}`"))
             })?;
             Ok(ctx.persistent_root_insert(value))
         };
         Ok(Self {
-            status: symbol_root("status")?,
-            status_text: symbol_root("statusText")?,
-            headers: symbol_root("headers")?,
-            header_list: symbol_root("headerList")?,
-            body_text: symbol_root("bodyText")?,
-            body_bytes: symbol_root("bodyBytes")?,
+            status: root("status")?,
+            status_text: root("statusText")?,
+            headers: root("headers")?,
+            header_list: root("headerList")?,
+            body_text: root("bodyText")?,
+            body_bytes: root("bodyBytes")?,
+            body_stream: root("bodyStream")?,
+            body_used: root("bodyUsed")?,
+            url: root("url")?,
+            method: root("method")?,
+            signal: root("signal")?,
+            guard: root("guard")?,
+            request_proto: root("requestPrototype")?,
+            headers_proto: root("headersPrototype")?,
         })
     }
 
@@ -337,6 +352,14 @@ impl ServeSlots {
             self.header_list,
             self.body_text,
             self.body_bytes,
+            self.body_stream,
+            self.body_used,
+            self.url,
+            self.method,
+            self.signal,
+            self.guard,
+            self.request_proto,
+            self.headers_proto,
         ] {
             let _ = ctx.persistent_root_remove(id);
         }
@@ -347,7 +370,6 @@ impl ServeSlots {
 struct ServeRoots {
     fetch: RuntimePersistentRootId,
     internals: RuntimePersistentRootId,
-    make_request: RuntimePersistentRootId,
     async_deliver: RuntimePersistentRootId,
     deliver: RuntimePersistentRootId,
     deliver_error: RuntimePersistentRootId,
@@ -407,7 +429,7 @@ impl RuntimeTask for ServeRequestTask {
         let registry_for_event = registry.clone();
         let result = runtime.run_native_event(&context, |ctx| {
             let options = ServeDispatchOptions::from_roots(ctx, roots)?;
-            let js_request = make_request(ctx, &options, &request)?;
+            let js_request = make_request(ctx, options.slots, &request)?;
             let outcome = call_js(
                 ctx,
                 "serve.fetch",
@@ -495,7 +517,6 @@ fn token_arg(args: &[Value]) -> Option<u64> {
 struct ServeDispatchOptions {
     fetch: Value,
     internals: Value,
-    make_request: Value,
     async_deliver: Value,
     deliver: Value,
     deliver_error: Value,
@@ -511,7 +532,6 @@ impl ServeDispatchOptions {
         Ok(Self {
             fetch: get(ctx, roots.fetch, "fetch")?,
             internals: get(ctx, roots.internals, "internals")?,
-            make_request: get(ctx, roots.make_request, "Request factory")?,
             async_deliver: get(ctx, roots.async_deliver, "asyncDeliver")?,
             deliver: get(ctx, roots.deliver, "deliver")?,
             deliver_error: get(ctx, roots.deliver_error, "deliverError")?,
@@ -630,11 +650,15 @@ async fn read_hyper_request(req: HyperRequest<Incoming>) -> Result<HttpRequest, 
             .to_str()
             .map_err(|_| "request header value is not valid UTF-8".to_string())?
             .to_string();
-        let lower = name.as_str().to_ascii_lowercase();
-        if lower == "host" {
+        // The `http` crate stores header field names lowercased (they are
+        // case-insensitive per RFC 9110 §5.1), so `name.as_str()` is already
+        // lowercase — no per-request re-lowercasing scan is needed, and the
+        // `Host` check is a cheap `HeaderName` equality rather than a string
+        // compare against a freshly folded copy.
+        if name == hyper::header::HOST {
             host = Some(value.clone());
         }
-        headers.push((lower, value));
+        headers.push((name.as_str().to_owned(), value));
     }
     let uri = req.uri();
     let url = if uri.authority().is_some() {
@@ -746,7 +770,6 @@ fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
     if let Some(roots) = control.roots.lock().expect("serve roots poisoned").take() {
         let _ = ctx.persistent_root_remove(roots.fetch);
         let _ = ctx.persistent_root_remove(roots.internals);
-        let _ = ctx.persistent_root_remove(roots.make_request);
         let _ = ctx.persistent_root_remove(roots.async_deliver);
         let _ = ctx.persistent_root_remove(roots.deliver);
         let _ = ctx.persistent_root_remove(roots.deliver_error);
@@ -807,9 +830,6 @@ fn parse_options(
     let internals_obj = internals
         .as_object()
         .ok_or_else(|| crate::type_error("serve", "invalid Otter serve internals"))?;
-    let make_request = object::get(internals_obj, ctx.heap(), "makeRequest")
-        .filter(|value| value.is_callable())
-        .ok_or_else(|| crate::type_error("serve", "missing Request factory"))?;
     let fetch_slots = object::get(internals_obj, ctx.heap(), "fetchSlots")
         .filter(|value| value.is_callable())
         .ok_or_else(|| crate::type_error("serve", "missing Fetch slot accessor"))?;
@@ -822,53 +842,94 @@ fn parse_options(
         fetch,
         internals,
         fns: ServeFns {
-            make_request,
             fetch_slots,
             async_deliver,
         },
     })
 }
 
+/// Build a WHATWG `Request` whose slots mirror `__otterFetchInternals.makeRequest`,
+/// but entirely in Rust: mint a `Request` and its `Headers` with the real
+/// prototype chains, write the private symbol slots directly, and skip the
+/// per-request JS call and its `Object.defineProperty` dance. The slot symbols
+/// and the two class prototypes were resolved once at `serve()` time.
+///
+/// The object graph and its property attributes match the JS factory exactly:
+/// - `Headers`: `kHeaderList` = `[[name, value], …]` (names pre-lowercased by
+///   `read_hyper_request`, insertion order), `kGuard` = `'none'`.
+/// - `Request`: `kUrl`/`kMethod`/`kHeaders`/`kSignal` are read-only, and the
+///   four body slots (`kBodyText`/`kBodyBytes`/`kBodyStream`/`kBodyUsed`) are
+///   writable and non-enumerable. A request body arrives as bytes, so only
+///   `kBodyBytes` carries data; the other three are the initial null/false.
 fn make_request(
     ctx: &mut NativeCtx<'_>,
-    options: &ServeDispatchOptions,
+    slots: ServeSlots,
     request: &HttpRequest,
 ) -> Result<Value, NativeError> {
-    let root_base = ctx.push_scratch_root(options.internals);
-    let make_request_root = ctx.push_scratch_root(options.make_request);
-    let method_root = push_string_root(ctx, &request.method)?;
-    let url_root = push_string_root(ctx, &request.url)?;
-    let mut header_roots = Vec::with_capacity(request.headers.len() * 2);
-    for (name, value) in &request.headers {
-        header_roots.push(push_string_root(ctx, name)?);
-        header_roots.push(push_string_root(ctx, value)?);
-    }
-    let flat_headers = header_roots
-        .iter()
-        .map(|idx| ctx.scratch_root(*idx))
-        .collect::<Vec<_>>();
-    let flat_headers = Value::array(
-        ctx.array_from_elements(flat_headers)
-            .map_err(|err| crate::type_error("serve", err.to_string()))?,
-    );
-    let flat_headers_root = ctx.push_scratch_root(flat_headers);
-    let body = request.body.to_js_body(ctx)?;
-    let body_root = ctx.push_scratch_root(body);
-    let args = smallvec::smallvec![
-        ctx.scratch_root(method_root),
-        ctx.scratch_root(url_root),
-        ctx.scratch_root(flat_headers_root),
-        ctx.scratch_root(body_root),
-    ];
-    let value = call_js(
-        ctx,
-        "serve.makeRequest",
-        ctx.scratch_root(make_request_root),
-        ctx.scratch_root(root_base),
-        args,
-    );
-    ctx.pop_scratch_root_to(root_base);
-    value
+    // Request bodies cross the worker boundary as bytes; build the JS body value
+    // (a `Uint8Array` or `null`) before opening the build scope so the escape
+    // hands a fully rooted graph back to the caller.
+    let body_value = request.body.to_js_body(ctx)?;
+    // Private slots are non-enumerable; value slots are read-only and the
+    // mutable body/guard slots stay writable, matching the JS `defineProperty`
+    // attributes so a handler observes an identical Request.
+    let read_only = Attr::new(false, false, false).to_flags();
+    let hidden_writable = Attr::new(true, false, false).to_flags();
+    ctx.scope(|ctx, s| {
+        // Park the incoming body value and every rooted slot symbol/prototype
+        // before the first allocation, so a scavenge can never strand them.
+        let body_h = ctx.scoped_value(s, body_value);
+        let park = |ctx: &mut NativeCtx<'_>, id| -> Result<Scoped<'_>, NativeError> {
+            let value = ctx
+                .persistent_root_get(id)
+                .ok_or_else(|| crate::type_error("serve", "Fetch slot root is closed"))?;
+            Ok(ctx.scoped_value(s, value))
+        };
+        let request_proto = park(ctx, slots.request_proto)?;
+        let headers_proto = park(ctx, slots.headers_proto)?;
+        let sym_header_list = park(ctx, slots.header_list)?;
+        let sym_guard = park(ctx, slots.guard)?;
+        let sym_url = park(ctx, slots.url)?;
+        let sym_method = park(ctx, slots.method)?;
+        let sym_headers = park(ctx, slots.headers)?;
+        let sym_signal = park(ctx, slots.signal)?;
+        let sym_body_text = park(ctx, slots.body_text)?;
+        let sym_body_bytes = park(ctx, slots.body_bytes)?;
+        let sym_body_stream = park(ctx, slots.body_stream)?;
+        let sym_body_used = park(ctx, slots.body_used)?;
+
+        // Headers: `kHeaderList` of `[name, value]` pairs + a mutable `kGuard`.
+        let headers_obj = ctx.scoped_object_with_proto(s, headers_proto)?;
+        let list = ctx.scoped_array(s, request.headers.len())?;
+        for (i, (name, value)) in request.headers.iter().enumerate() {
+            let pair = ctx.scoped_array(s, 2)?;
+            let name_v = ctx.scoped_string(s, name)?;
+            let value_v = ctx.scoped_string(s, value)?;
+            ctx.scoped_set_index(s, pair, 0, name_v)?;
+            ctx.scoped_set_index(s, pair, 1, value_v)?;
+            ctx.scoped_set_index(s, list, i, pair)?;
+        }
+        ctx.scoped_define_symbol(s, headers_obj, sym_header_list, list, read_only)?;
+        let guard_v = ctx.scoped_string(s, "none")?;
+        ctx.scoped_define_symbol(s, headers_obj, sym_guard, guard_v, hidden_writable)?;
+
+        // Request: value slots + body slots. Only `kBodyBytes` may carry data.
+        let request_obj = ctx.scoped_object_with_proto(s, request_proto)?;
+        let null_v = ctx.scoped_null(s);
+        let false_v = ctx.scoped_boolean(s, false);
+        ctx.scoped_define_symbol(s, request_obj, sym_body_text, null_v, hidden_writable)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_body_bytes, body_h, hidden_writable)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_body_stream, null_v, hidden_writable)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_body_used, false_v, hidden_writable)?;
+        let method_v = ctx.scoped_string(s, &request.method)?;
+        let url_v = ctx.scoped_string(s, &request.url)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_url, url_v, read_only)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_method, method_v, read_only)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_headers, headers_obj, read_only)?;
+        ctx.scoped_define_symbol(s, request_obj, sym_signal, null_v, read_only)?;
+
+        Ok(ctx.escape(request_obj))
+    })
 }
 
 /// Build an [`HttpResponse`] by reading a `Response`'s private Fetch slots
@@ -977,11 +1038,6 @@ fn call_js(
             }
         }
     }
-}
-
-fn push_string_root(ctx: &mut NativeCtx<'_>, value: &str) -> Result<usize, NativeError> {
-    let value = crate::string_value(ctx, value)?;
-    Ok(ctx.push_scratch_root(value))
 }
 
 fn header_is_managed(name: &str) -> bool {

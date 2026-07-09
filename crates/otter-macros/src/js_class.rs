@@ -161,6 +161,12 @@ enum Role {
         promise: bool,
         raw: bool,
     },
+    StaticMethod {
+        js_name: LitStr,
+        length: Option<u8>,
+        promise: bool,
+        raw: bool,
+    },
     Getter {
         js_name: LitStr,
     },
@@ -204,7 +210,7 @@ fn classify(item: &mut ImplItemFn) -> Result<Option<Role>> {
                 }
                 set_role(&mut role, Role::Constructor { length }, attr.span())?;
             }
-            Some("method") => {
+            Some(kind @ ("method" | "static_method")) => {
                 let mut js_name: Option<LitStr> = None;
                 let mut length: Option<u8> = None;
                 let mut promise = false;
@@ -229,16 +235,22 @@ fn classify(item: &mut ImplItemFn) -> Result<Option<Role>> {
                 let js_name = js_name.ok_or_else(|| {
                     Error::new(attr.span(), "method requires an explicit `name = \"…\"`")
                 })?;
-                set_role(
-                    &mut role,
+                let parsed = if kind == "method" {
                     Role::Method {
                         js_name,
                         length,
                         promise,
                         raw,
-                    },
-                    attr.span(),
-                )?;
+                    }
+                } else {
+                    Role::StaticMethod {
+                        js_name,
+                        length,
+                        promise,
+                        raw,
+                    }
+                };
+                set_role(&mut role, parsed, attr.span())?;
             }
             Some(kind @ ("getter" | "setter")) => {
                 let mut js_name: Option<LitStr> = None;
@@ -424,6 +436,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
 
     let mut constructor: Option<&Member> = None;
     let mut methods: Vec<&Member> = Vec::new();
+    let mut static_methods: Vec<&Member> = Vec::new();
     let mut getters: Vec<&Member> = Vec::new();
     let mut setters: Vec<&Member> = Vec::new();
     for member in &members {
@@ -438,6 +451,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 constructor = Some(member);
             }
             Role::Method { .. } => methods.push(member),
+            Role::StaticMethod { .. } => static_methods.push(member),
             Role::Getter { .. } => getters.push(member),
             Role::Setter { .. } => setters.push(member),
         }
@@ -451,6 +465,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
 
     let mut glue = proc_macro2::TokenStream::new();
     let mut method_rows = Vec::new();
+    let mut static_rows = Vec::new();
     let mut accessor_rows = Vec::new();
 
     // Constructor glue.
@@ -507,6 +522,104 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         });
     }
 
+    // Static methods: no receiver, own data properties on the
+    // constructor (couch! `statics` rows). Same glue shape as
+    // namespace members, including the async promise protocol.
+    for member in &static_methods {
+        let Role::StaticMethod {
+            js_name,
+            length,
+            promise,
+            raw,
+        } = &member.role
+        else {
+            unreachable!("bucketed above");
+        };
+        let length = length.unwrap_or_else(|| default_length(&member.params));
+        let length_lit = LitInt::new(&length.to_string(), Span::call_site());
+        let fn_ident = &member.fn_ident;
+        if !matches!(member.receiver, ReceiverKind::None) {
+            return Err(Error::new(
+                fn_ident.span(),
+                "static methods take no receiver",
+            ));
+        }
+        if *raw {
+            let type_path = &self_path.path;
+            static_rows.push(quote!(#js_name / #length_lit => #type_path::#fn_ident));
+            continue;
+        }
+        if *promise && member.is_async {
+            return Err(Error::new(
+                fn_ident.span(),
+                "async methods already return a promise; drop `promise`",
+            ));
+        }
+        let op_string = format!("{}.{}", class_name.value(), js_name.value());
+        let op = LitStr::new(&op_string, js_name.span());
+        let glue_ident = format_ident!("__otter_js_class_{glue_prefix}_static_{fn_ident}");
+        let extractions: Vec<_> = member
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| arg_extraction(index, ty, &op))
+            .collect();
+        let arg_names = arg_idents(member.params.len());
+        let output = if member.is_async {
+            let future_expr = if member.returns_result {
+                quote!(__call)
+            } else {
+                quote!(async move {
+                    ::core::result::Result::<_, ::otter_vm::marshal::JsError>::Ok(__call.await)
+                })
+            };
+            quote! {
+                let __call = <#self_ty>::#fn_ident(#(#arg_names),*);
+                let __future = #future_expr;
+                let __out = __cx
+                    .promise_from_future(__future)
+                    .map_err(|e| e.into_native(#op))?;
+                ::core::result::Result::Ok(__cx.escape(__out))
+            }
+        } else {
+            let body_call = quote!(<#self_ty>::#fn_ident(#(#arg_names),*));
+            let normalized = if member.returns_result {
+                quote!(#body_call.map_err(|e| e.into_native(#op))?)
+            } else {
+                body_call
+            };
+            let promise_wrap = if *promise {
+                quote! {
+                    let __out = __cx
+                        .promise_fulfilled(__out)
+                        .map_err(|e| e.into_native(#op))?;
+                }
+            } else {
+                quote!()
+            };
+            quote! {
+                let __result = #normalized;
+                let __out = ::otter_vm::marshal::IntoJs::into_js(__result, &mut __cx)
+                    .map_err(|e| e.into_native(#op))?;
+                #promise_wrap
+                ::core::result::Result::Ok(__cx.escape(__out))
+            }
+        };
+        glue.extend(quote! {
+            fn #glue_ident(
+                ctx: &mut ::otter_vm::NativeCtx<'_>,
+                args: &[::otter_vm::Value],
+            ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
+                ctx.scope(|ctx, __s| {
+                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                    #(#extractions)*
+                    #output
+                })
+            }
+        });
+        static_rows.push(quote!(#js_name / #length_lit => #glue_ident));
+    }
+
     // Method + accessor glue. Getter/setter pairs merge into one
     // accessor row per JS name, ordered by first appearance.
     enum Emitted {
@@ -531,7 +644,9 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             ),
             Role::Getter { js_name } => (js_name.clone(), 0, false, false, Emitted::Getter),
             Role::Setter { js_name } => (js_name.clone(), 1, false, false, Emitted::Setter),
-            Role::Constructor { .. } => unreachable!("filtered above"),
+            Role::Constructor { .. } | Role::StaticMethod { .. } => {
+                unreachable!("filtered above")
+            }
         };
         let fn_ident = &member.fn_ident;
 
@@ -855,6 +970,11 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         Some(path) => quote!(js_glue = include_str!(#path),),
         None => quote!(),
     };
+    let statics_block = if static_rows.is_empty() {
+        quote!()
+    } else {
+        quote!(statics = { #(#static_rows,)* },)
+    };
     glue.extend(quote! {
         ::otter_macros::couch! {
             name = #class_name,
@@ -862,6 +982,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             intrinsic = #intrinsic_ident,
             constructor = (length = #ctor_length_lit, call = #ctor_glue_ident),
             #couch_extras
+            #statics_block
             #prototype_block
             string_tag = #tag,
             #js_glue_field

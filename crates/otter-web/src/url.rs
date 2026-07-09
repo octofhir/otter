@@ -196,6 +196,26 @@ impl WebUrl {
         WebUrl::parse(input.as_str(), base.as_ref()).map_err(|err| JsError::Type(err.to_string()))
     }
 
+    /// §4.3 `URL.parse(url, base)` — parse-or-null, never throws.
+    #[static_method(name = "parse", length = 1)]
+    fn js_parse(input: USVString, base: Option<USVString>) -> Option<WebUrl> {
+        let base = base.and_then(|base| WebUrl::parse(base.as_str(), None).ok());
+        WebUrl::parse(input.as_str(), base.as_ref()).ok()
+    }
+
+    /// §4.3 `URL.canParse(url, base)`.
+    #[static_method(name = "canParse", length = 1)]
+    fn js_can_parse(input: USVString, base: Option<USVString>) -> bool {
+        let base = match base {
+            Some(base) => match WebUrl::parse(base.as_str(), None) {
+                Ok(base) => Some(base),
+                Err(_) => return false,
+            },
+            None => None,
+        };
+        WebUrl::parse(input.as_str(), base.as_ref()).is_ok()
+    }
+
     #[getter(name = "href")]
     fn js_href(&self) -> String {
         self.href()

@@ -3329,16 +3329,14 @@ fn direct_bytecode_async_call_window_populates_parameters() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let context = ExecutionContext::from_module(module);
     let Some(promise) = (interp.run(&context).unwrap()).as_promise() else {
         panic!("expected async function call to return a promise");
     };
-    let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-    assert!(
-        after > before,
-        "async bytecode calls should allocate their result promise in young space"
-    );
+    // Result promises live in old space (bodies must not move under
+    // handle copies held across allocations); the state must survive
+    // a full collection.
+    interp.force_gc();
     assert_eq!(
         promise.state(interp.gc_heap()),
         crate::promise::PromiseState::Fulfilled(Value::number(NumberValue::Smi(144)))
@@ -3454,7 +3452,7 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
 }
 
 #[test]
-fn top_level_async_entry_uses_stack_rooted_result_promise_allocation() {
+fn top_level_async_entry_returns_the_awaited_completion() {
     let mut main = test_function(
         0,
         "<main>",
@@ -3485,21 +3483,15 @@ fn top_level_async_entry_uses_stack_rooted_result_promise_allocation() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let context = ExecutionContext::from_module(module);
     assert_eq!(
         interp.run(&context).unwrap(),
         Value::number(NumberValue::Smi(512))
     );
-    let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-    assert!(
-        after > before,
-        "async entry promise should allocate through stack-rooted young allocation"
-    );
 }
 
 #[test]
-fn promise_fulfilled_of_uses_young_allocation_with_frame_roots() {
+fn promise_fulfilled_of_allocates_the_body_in_old_space() {
     let main_code = vec![
         Instruction {
             pc: 0,
@@ -3527,16 +3519,16 @@ fn promise_fulfilled_of_uses_young_allocation_with_frame_roots() {
         module_inits: Vec::new(),
     };
     let mut interp = Interpreter::new();
-    let before = interp.gc_heap_mut().stats().new_allocated_bytes;
     let context = ExecutionContext::from_module(module);
     let Some(promise) = (interp.run(&context).unwrap()).as_promise() else {
         panic!("expected promise");
     };
-    let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-    assert!(
-        after > before,
-        "PromiseFulfilledOf should allocate the promise body in young space"
-    );
+    // Promise bodies allocate in old space: handle copies escape into
+    // Rust locals across later allocations (combinators, reactions),
+    // and a moving young body under a fixed copy was the
+    // use-after-move family. The body must survive a full scavenge
+    // untouched.
+    interp.force_gc();
     assert_eq!(
         promise.state(interp.gc_heap()),
         crate::promise::PromiseState::Fulfilled(Value::number(NumberValue::Smi(211)))

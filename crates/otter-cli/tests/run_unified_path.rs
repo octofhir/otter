@@ -68,6 +68,32 @@ if (process.argv[2] !== "alpha") fail();
 }
 
 #[test]
+fn run_accepts_multiple_source_files_as_shell_sequence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("base.js"), "var shared = 40;\n").expect("write base");
+    std::fs::write(
+        tmp.path().join("suite.js"),
+        r#"
+function fail() { process.exit(45); }
+if (shared + 2 !== 42) fail();
+if (process.argv[1].indexOf("base.js") === -1) fail();
+if (process.argv[2].indexOf("suite.js") === -1) fail();
+if (process.argv[3] !== "tail-arg") fail();
+"#,
+    )
+    .expect("write suite");
+
+    let output = otter_command(tmp.path())
+        .arg("run")
+        .arg("base.js")
+        .arg("suite.js")
+        .arg("tail-arg")
+        .output()
+        .expect("run multi-file sequence");
+    assert_success(output);
+}
+
+#[test]
 fn run_fixture_covers_ts_imports_workspace_import_and_json_module() {
     let fixture = repo_root().join("tests/fixtures/pkg/development-loop");
 

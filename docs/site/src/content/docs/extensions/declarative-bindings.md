@@ -67,6 +67,7 @@ messages, WebIDL argument coercion, promise-returning async methods.
 | `#[constructor]` | Exactly one. No receiver; returns `Self` or `Result<Self, JsError>`. |
 | `#[method(name = "…")]` | Options: `length = N` (default: count of leading non-`Option` params), `promise` (wrap a sync result in a fulfilled promise), `raw` (see below). |
 | `#[getter(name = "…")]` / `#[setter(name = "…")]` | Prototype accessor halves; same-name halves merge. Getters take no params and return owned data; setters take exactly one param. |
+| `#[static_method(name = "…")]` | Own data property on the constructor (`URL.parse`, `URL.canParse`). No receiver; same `length`/`promise`/`raw`/`async` options as methods. |
 
 Receivers: `&self` for reads, `&mut self` for mutation (URL setters),
 owned `self` only on `async fn` (the glue clones a snapshot — nothing
@@ -173,6 +174,36 @@ impl WebCrypto {
 Members are static (no receiver); `raw`, `promise`, and `async` work
 exactly as on classes. `tag = "…"` pins `@@toStringTag` on the
 namespace object.
+
+## Hosted modules
+
+The module counterpart — same shape, `lodge!` machinery underneath:
+
+```rust
+pub struct MathModule;   // marker type
+
+#[js_module(prefix = "test", name = "math", capabilities = true)]
+impl MathModule {
+    #[export(name = "add")]
+    fn add(a: f64, b: f64) -> f64 { a + b }
+
+    #[export(name = "slowDouble")]
+    async fn slow_double(n: f64) -> f64 { /* Tokio await … */ }
+
+    #[export(name = "openStore")]
+    fn open_store(caps: &CapabilitySet, path: Option<USVString>)
+        -> Result<KvStore, JsError> { /* … */ }
+}
+
+// registration: builder.hosted_module(MATH_HOSTED_MODULE)
+// JS: import { add, slowDouble } from "test:math";
+```
+
+`prefix`/`specifier` and `name` are explicit. With `capabilities =
+true`, an export may declare `caps: &CapabilitySet` as its first
+parameter to receive the install-time snapshot; argument-derived
+checks (path allowlists against a real argument) stay in the body —
+the framework provides the snapshot, never guesses the check.
 
 ## Attached JS: the class's JS half
 

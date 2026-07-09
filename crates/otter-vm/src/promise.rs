@@ -306,6 +306,15 @@ pub struct PurePromise {
     inner: otter_gc::Gc<PurePromiseBody>,
 }
 
+impl PurePromise {
+    /// Debug: raw handle bits for identity tracing.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn raw_handle_debug(&self) -> String {
+        format!("{:?}", self.inner)
+    }
+}
+
 /// GC-allocated pure promise body.
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = PURE_PROMISE_BODY_TYPE_TAG)]
@@ -345,7 +354,7 @@ impl PurePromise {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
-            inner: heap.alloc_with_roots(
+            inner: heap.alloc_old_with_roots(
                 PurePromiseBody {
                     state: PromiseState::Pending,
                     fulfill_reactions: Vec::new(),
@@ -383,7 +392,7 @@ impl PurePromise {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
-            inner: heap.alloc_with_roots(
+            inner: heap.alloc_old_with_roots(
                 PurePromiseBody {
                     state: PromiseState::Fulfilled(value),
                     fulfill_reactions: Vec::new(),
@@ -421,7 +430,7 @@ impl PurePromise {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
-            inner: heap.alloc_with_roots(
+            inner: heap.alloc_old_with_roots(
                 PurePromiseBody {
                     state: PromiseState::Rejected(reason),
                     fulfill_reactions: Vec::new(),

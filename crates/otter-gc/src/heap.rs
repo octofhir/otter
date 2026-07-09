@@ -1202,6 +1202,17 @@ impl GcHeap {
     /// # Panics
     ///
     /// Panics in debug builds if `handle.is_null()`.
+    /// Diagnostic: read the header type tag behind a handle without
+    /// touching the payload. `None` for null handles.
+    pub fn debug_header_tag<T: Traceable>(&self, handle: Gc<T>) -> Option<u8> {
+        if handle.is_null() {
+            return None;
+        }
+        // SAFETY: header read only; single mutator.
+        unsafe { Some((*handle.as_header_ptr()).type_tag()) }
+    }
+
+    /// Immutable access to the payload of a heap-allocated value.
     #[inline]
     pub fn read_payload<T: Traceable, R>(&self, handle: Gc<T>, f: impl FnOnce(&T) -> R) -> R {
         debug_assert!(!handle.is_null(), "read_payload on null handle");

@@ -830,6 +830,7 @@ impl ObjectBody {
         match attr_shape {
             Some(shape) => {
                 debug_assert_object_shape_handle(shape, "slot attribute shape install");
+                debug_assert_object_shape_handle(shape, "shape-slot store");
                 self.shape = shape;
                 // A previously overridden object keeps reading from its
                 // materialized metadata, so keep that entry current; a
@@ -1306,6 +1307,7 @@ fn empty_object_body() -> ObjectBody {
 fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
     debug_assert_object_shape_handle(shape, "object allocation shape");
     let mut body = empty_object_body();
+    debug_assert_object_shape_handle(shape, "shape-slot store");
     body.shape = shape;
     body
 }
@@ -1420,6 +1422,7 @@ pub(crate) fn set_fresh_object_shape(obj: JsObject, heap: &mut GcHeap, shape: Sh
             "fast constructor shape install requires a shaped target"
         );
         debug_assert_object_shape_handle(shape, "fresh object shape install");
+        debug_assert_object_shape_handle(shape, "shape-slot store");
         body.shape = shape;
     });
 }
@@ -2918,6 +2921,7 @@ pub(crate) fn set_with_shape(
         shape_body::shape_property_count(heap, next_shape) as usize - 1
     );
     heap.with_payload(obj, |body| {
+        debug_assert_object_shape_handle(next_shape, "shape-slot store");
         body.shape = next_shape;
         body.push_slot(index, SlotMeta::data_default(), compressed);
     });
@@ -3322,6 +3326,7 @@ pub(crate) fn define_own_property_partial_with_shape(
             if !body.extensible {
                 return false;
             }
+            debug_assert_object_shape_handle(next_shape, "shape-slot store");
             body.shape = next_shape;
             body.push_slot(append_index, meta, stored);
             true
@@ -3759,6 +3764,7 @@ pub fn seal(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 pub(crate) fn seal_with_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, new_shape: ShapeHandle) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
+        debug_assert_object_shape_handle(new_shape, "shape-slot store");
         body.shape = new_shape;
         if let Some(exotic) = body.exotic.as_deref_mut() {
             for slot in exotic.slots.iter_mut() {
@@ -3813,6 +3819,7 @@ pub(crate) fn freeze_with_shape(
 ) {
     heap.with_payload(obj, |body| {
         body.extensible = false;
+        debug_assert_object_shape_handle(new_shape, "shape-slot store");
         body.shape = new_shape;
         if let Some(exotic) = body.exotic.as_deref_mut() {
             for slot in exotic.slots.iter_mut() {

@@ -278,96 +278,236 @@ fn web_api_globals_install_and_run_through_runtime_builder() {
     );
 }
 
-/// WinterTC Minimum Common API conformance ledger.
+/// The authoritative WinterTC / ECMA-429 Minimum Common API ledger.
 ///
-/// Every global (or dotted path) in the WinterTC minimum-common-API list
-/// appears in exactly one of the two ledgers below:
+/// Every path named by the ECMA-429 minimum-common-API snapshot appears in
+/// exactly one bucket:
 ///
-/// - `SUPPORTED` — must resolve to a defined value on `globalThis`.
-/// - `NOT_YET` — must be absent (`undefined`).
+/// - `SUPPORTED` — present on `globalThis` and spec-shaped for the common case.
+/// - `PARTIAL`   — present, but with a known, documented behavior gap. Each
+///   `PARTIAL` entry must also carry an executable smoke check in
+///   [`wintertc_partial_entries_document_their_gap`].
+/// - `NOT_YET`   — not yet installed; must be absent (`undefined`).
 ///
-/// Implementing one of the `NOT_YET` APIs makes this test fail with a
-/// "move to SUPPORTED" message; move the name between the lists as part of
-/// that change so the ledger always reflects the real runtime surface.
+/// Shared with the smoke test so a `PARTIAL` entry can never drift away from
+/// its documenting check.
+const WINTERTC_LEDGER_JS: &str = r#"
+    const SUPPORTED = [
+      "globalThis",
+      "atob",
+      "btoa",
+      "queueMicrotask",
+      "setTimeout",
+      "clearTimeout",
+      "setInterval",
+      "clearInterval",
+      "console",
+      "crypto",
+      "crypto.getRandomValues",
+      "crypto.randomUUID",
+      "performance",
+      "performance.now",
+      "performance.timeOrigin",
+      "navigator",
+      "navigator.userAgent",
+      "AbortController",
+      "AbortSignal",
+      "FormData",
+      "ByteLengthQueuingStrategy",
+      "CountQueuingStrategy",
+      "CompressionStream",
+      "DecompressionStream",
+      "CustomEvent",
+      "ErrorEvent",
+      "Event",
+      "EventTarget",
+      "MessageEvent",
+      "DOMException",
+      "Headers",
+      "MessageChannel",
+      "MessagePort",
+      "ReadableStream",
+      "ReadableStreamDefaultController",
+      "ReadableStreamDefaultReader",
+      "WritableStream",
+      "WritableStreamDefaultController",
+      "WritableStreamDefaultWriter",
+      "TransformStream",
+      "TextDecoder",
+      "TextDecoderStream",
+      "TextEncoder",
+      "TextEncoderStream",
+      "URLSearchParams",
+    ];
+    const PARTIAL = [
+      "fetch",
+      "Blob",
+      "File",
+      "URL",
+      "Request",
+      "Response",
+      "crypto.subtle",
+      "crypto.subtle.digest",
+      "structuredClone",
+    ];
+    const NOT_YET = [
+      "self",
+      "reportError",
+      "onerror",
+      "onunhandledrejection",
+      "onrejectionhandled",
+      "Crypto",
+      "CryptoKey",
+      "SubtleCrypto",
+      "Navigator",
+      "Performance",
+      "PromiseRejectionEvent",
+      "ReadableByteStreamController",
+      "ReadableStreamBYOBReader",
+      "ReadableStreamBYOBRequest",
+      "TransformStreamDefaultController",
+      "URLPattern",
+      "WebAssembly",
+      "WebAssembly.compile",
+      "WebAssembly.compileStreaming",
+      "WebAssembly.instantiate",
+      "WebAssembly.instantiateStreaming",
+      "WebAssembly.validate",
+      "WebAssembly.Module",
+      "WebAssembly.Instance",
+      "WebAssembly.Memory",
+      "WebAssembly.Table",
+      "WebAssembly.Global",
+      "WebAssembly.Tag",
+      "WebAssembly.Exception",
+      "WebAssembly.CompileError",
+      "WebAssembly.LinkError",
+      "WebAssembly.RuntimeError",
+      "WebAssembly.JSTag",
+    ];
+    function lookup(path) {
+      let value = globalThis;
+      for (const part of path.split(".")) {
+        if (value === undefined || value === null) return undefined;
+        value = value[part];
+      }
+      return value;
+    }
+"#;
+
+/// Each ECMA-429 path is classified exactly once, and the runtime surface
+/// matches its bucket: `SUPPORTED`/`PARTIAL` are present, `NOT_YET` is absent.
+///
+/// Implementing a `NOT_YET` API makes this fail with a "move" message; promote
+/// the name to `PARTIAL` (with a smoke check) or `SUPPORTED` in the same change
+/// so the ledger always mirrors reality.
 #[test]
 fn wintertc_minimum_common_api_ledger() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
         &mut runtime,
-        r#"
-        const SUPPORTED = [
-          "AbortController",
-          "AbortSignal",
-          "Blob",
-          "ByteLengthQueuingStrategy",
-          "clearInterval",
-          "clearTimeout",
-          "CompressionStream",
-          "CountQueuingStrategy",
-          "crypto",
-          "crypto.getRandomValues",
-          "crypto.randomUUID",
-          "crypto.subtle.digest",
-          "DecompressionStream",
-          "DOMException",
-          "Event",
-          "EventTarget",
-          "fetch",
-          "File",
-          "FormData",
-          "Headers",
-          "navigator.userAgent",
-          "performance.now",
-          "performance.timeOrigin",
-          "queueMicrotask",
-          "ReadableStream",
-          "ReadableStreamDefaultController",
-          "ReadableStreamDefaultReader",
-          "Request",
-          "Response",
-          "setInterval",
-          "setTimeout",
-          "structuredClone",
-          "TextDecoder",
-          "TextDecoderStream",
-          "TextEncoder",
-          "TextEncoderStream",
-          "TransformStream",
-          "URL",
-          "URLSearchParams",
-          "WritableStream",
-          "WritableStreamDefaultController",
-          "WritableStreamDefaultWriter",
-        ];
-        const NOT_YET = [
-          "Crypto",
-          "CryptoKey",
-          "ReadableByteStreamController",
-          "ReadableStreamBYOBReader",
-          "ReadableStreamBYOBRequest",
-          "SubtleCrypto",
-          "TransformStreamDefaultController",
-          "URLPattern",
-        ];
-        function lookup(path) {
-          let value = globalThis;
-          for (const part of path.split(".")) {
-            if (value === undefined || value === null) return undefined;
-            value = value[part];
-          }
-          return value;
-        }
+        &format!(
+            "{WINTERTC_LEDGER_JS}\n{}",
+            r#"
         const problems = [];
+        const seen = new Map();
+        for (const [bucket, list] of [["SUPPORTED", SUPPORTED], ["PARTIAL", PARTIAL], ["NOT_YET", NOT_YET]]) {
+          for (const name of list) {
+            if (seen.has(name)) problems.push("duplicate ledger entry: " + name + " in " + seen.get(name) + " and " + bucket);
+            seen.set(name, bucket);
+          }
+        }
         for (const name of SUPPORTED) {
           if (lookup(name) === undefined) problems.push("missing SUPPORTED API: " + name);
         }
+        for (const name of PARTIAL) {
+          if (lookup(name) === undefined) problems.push("missing PARTIAL API: " + name);
+        }
         for (const name of NOT_YET) {
           if (lookup(name) !== undefined) {
-            problems.push("implemented but listed NOT_YET (move to SUPPORTED): " + name);
+            problems.push("implemented but listed NOT_YET (promote it): " + name);
           }
         }
         problems.join("; ")
         "#,
+        ),
+    );
+    assert_eq!(result, "");
+}
+
+/// Every `PARTIAL` ledger entry carries an executable check that still observes
+/// its documented limitation. When a gap is closed, its check flips and this
+/// test fails, forcing the entry to be promoted to `SUPPORTED`.
+#[test]
+fn wintertc_partial_entries_document_their_gap() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        &format!(
+            "{WINTERTC_LEDGER_JS}\n{}",
+            r#"
+        // Each smoke check returns true while the documented gap is still open.
+        const GAPS = {
+          // fetch() is a placeholder that throws instead of performing a request.
+          "fetch": () => {
+            try { fetch("http://example.invalid"); return false; }
+            catch (e) { return String(e.message).includes("fetch is not implemented"); }
+          },
+          // Blob.arrayBuffer() returns text instead of Promise<ArrayBuffer>.
+          "Blob": () => {
+            const v = new Blob(["ab"]).arrayBuffer();
+            return !(v && typeof v.then === "function");
+          },
+          // File inherits the same unfinished Blob body surface.
+          "File": () => {
+            const v = new File(["ab"], "n.txt").arrayBuffer();
+            return !(v && typeof v.then === "function");
+          },
+          // URL exposes snapshot data properties, not live spec accessors.
+          "URL": () => {
+            const u = new URL("https://e.com/p");
+            const d = Object.getOwnPropertyDescriptor(u, "href")
+              || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(u), "href");
+            return !!(d && "value" in d) && !(d && d.get);
+          },
+          // Request bodies are default streams only; no BYOB byte reader yet.
+          "Request": () => {
+            const b = new Request("https://e.com", { method: "POST", body: "hi" }).body;
+            try { b.getReader({ mode: "byob" }); return false; }
+            catch (e) { return String(e.message).includes("byob"); }
+          },
+          // Response bodies are likewise default streams with no BYOB reader.
+          "Response": () => {
+            const b = new Response("x").body;
+            try { b.getReader({ mode: "byob" }); return false; }
+            catch (e) { return String(e.message).includes("byob"); }
+          },
+          // Only digest is wired on SubtleCrypto; keys/sign/encrypt are absent.
+          "crypto.subtle": () => typeof crypto.subtle.encrypt === "undefined"
+            && typeof crypto.subtle.importKey === "undefined",
+          "crypto.subtle.digest": () => typeof crypto.subtle.digest === "function"
+            && typeof crypto.subtle.sign === "undefined",
+          // structuredClone cannot transfer transferables such as MessagePort.
+          "structuredClone": () => {
+            const mc = new MessageChannel();
+            try { structuredClone({ p: mc.port1 }, { transfer: [mc.port1] }); return false; }
+            catch (e) { return true; }
+          },
+        };
+        const problems = [];
+        for (const name of PARTIAL) {
+          const check = GAPS[name];
+          if (!check) { problems.push("PARTIAL entry without smoke check: " + name); continue; }
+          let held;
+          try { held = check(); } catch (e) { problems.push("smoke check threw for " + name + ": " + e.message); continue; }
+          if (!held) problems.push("documented gap closed, promote to SUPPORTED: " + name);
+        }
+        for (const name of Object.keys(GAPS)) {
+          if (!PARTIAL.includes(name)) problems.push("smoke check for non-PARTIAL entry: " + name);
+        }
+        problems.join("; ")
+        "#,
+        ),
     );
     assert_eq!(result, "");
 }

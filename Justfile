@@ -47,21 +47,31 @@ run *args:
 clean:
     cargo clean
 
-# === OtterLab benchmark / differential harness (Phase 0) ===
+# === Standard JavaScript benchmark suites ===
 
-# Collect cross-runtime benchmark timings → benchmarks/results/latest.{md,json}.
-# Requires the release binary: `just release` first. Pass scripts/flags through.
-bench *args:
-    node benchmarks/bench.mjs {{args}}
+# Fast baseline: V8 v7 + a small Octane smoke selection.
+bench:
+    bash benchmarks/run-all.sh
 
-# Same, including the forced-early-OSR Otter tier alongside interp + jit.
-bench-osr *args:
-    node benchmarks/bench.mjs --only otter,otter-jit,otter-jit-osr {{args}}
+# Classic V8 v7 suite. Pass selected workload names as extra args.
+bench-v8 *args:
+    bash benchmarks/run-v8-v7.sh {{args}}
 
-# Prove every benchmarks/scripts/* is output-identical across Otter tiers
-# (interp = oracle vs jit vs forced-OSR). Non-zero exit on any mismatch.
-bench-diff *args:
-    node benchmarks/diff.mjs {{args}}
+# Google's Octane suite. Pass selected workload names as extra args.
+bench-octane *args:
+    bash benchmarks/run-octane.sh {{args}}
+
+# BrowserBench ARES-6. Pass selected workload keys: air basic babylon ml.
+bench-ares6 *args:
+    bash benchmarks/run-ares6.sh {{args}}
+
+# V8 Web Tooling Benchmark. Example: just bench-web-tooling --only babel
+bench-web-tooling *args:
+    bash benchmarks/run-web-tooling.sh {{args}}
+
+# yt-dlp/ejs real-world parser/transform workload.
+bench-ejs:
+    bash benchmarks/run-ejs.sh
 
 # === Examples ===
 

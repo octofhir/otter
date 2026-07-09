@@ -32,6 +32,7 @@ tests/test262-results/
 
 # Local/generated benchmark artifacts (harness + scripts are tracked)
 benchmarks/results/
+benchmarks/.suite-cache/
 test262_results/
 scratch/
 *.cpuprofile
@@ -45,9 +46,6 @@ timeout-dump*.txt
 tests/node-compat/node/
 tests/node-compat/reports/
 
-# profile.mjs scratch (auto-sized bench wrappers + sample dumps)
-benchmarks/.profile-tmp/
-
-# Local V8 benchmark suite (downloaded on first run)
+# Local benchmark suite checkouts (older scripts used these root paths)
 /v8-v7/
 /octane/

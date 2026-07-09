@@ -3760,9 +3760,24 @@ mod arm64 {
                 );
                 let resume = call_resume_frames.get(&nid).unwrap_or(point);
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
+                // The stub wrote its result to window slot `dst_reg`; pull it into
+                // this node's home. `emit_frame_reload` already loaded that slot into
+                // the home of whatever value the resume state maps to `dst_reg` — but
+                // that is only *this* node when the resume state actually names it
+                // there. When the destination register aliases a source register
+                // (e.g. `r0 = r0.prop`), a resume state that falls back to the
+                // pre-instruction deopt point still maps `dst_reg` to the source
+                // value, whose home differs from the result's under linear scan; the
+                // reload then fills the dead source's home and leaves the result's
+                // home stale. Require an exact `(dst_reg, nid)` match so the manual
+                // reload fires whenever the result's own home was not loaded.
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3864,7 +3879,11 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3893,7 +3912,11 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3922,7 +3945,11 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -3962,7 +3989,11 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4310,7 +4341,11 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4415,7 +4450,11 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4674,7 +4713,11 @@ mod arm64 {
                 emit_frame_reload(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);
@@ -4684,7 +4727,11 @@ mod arm64 {
                 emit_frame_reload_tagged(ops, graph, alloc, resume, None, box_scratch)?;
                 if value_is_used_after(graph, frames, call_resume_frames, nid)
                     && let Some(loc) = dst
-                    && !resume.top().registers.iter().any(|&(r, _)| r == dst_reg)
+                    && !resume
+                        .top()
+                        .registers
+                        .iter()
+                        .any(|&(r, v)| r == dst_reg && v == nid)
                 {
                     let off = u32::from(dst_reg) * 8;
                     dynasm!(ops ; .arch aarch64 ; ldr X(box_scratch), [x19, off]);

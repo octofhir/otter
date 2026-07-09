@@ -9,8 +9,8 @@ use otter_runtime::CapabilitySet;
 use otter_runtime::{
     RuntimeHandleScope, RuntimeHostObjectError, RuntimeJsObject as JsObject,
     RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeScoped, RuntimeValue as Value, runtime_this_object,
-    runtime_with_host_data_mut,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeScoped, RuntimeValue as Value,
+    runtime_this_object, runtime_with_host_data_mut,
 };
 use rusqlite::types::{ToSqlOutput, Value as SqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags};

@@ -453,6 +453,46 @@ enum GlobalClassInner {
     },
 }
 
+/// One JS source attached to an [`Extension`], with the global names
+/// it defines (`js_defines` in the declaration). The names feed the
+/// native lazy-accessor registration; a drift between `defines` and
+/// the source's actual definitions is caught by the extension's
+/// def-scan test.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtensionJs {
+    /// The JS source, evaluated in global scope on first touch of any
+    /// defined name.
+    pub source: &'static str,
+    /// Global names the source defines.
+    pub defines: &'static [&'static str],
+}
+
+/// A declared extension: native classes plus the JS half, installed
+/// as one unit. Built by `romp!`; consumed by
+/// [`RuntimeBuilder::extension`].
+#[derive(Debug, Clone, Copy)]
+pub struct Extension {
+    /// Extension name (diagnostics).
+    pub name: &'static str,
+    /// Native class intrinsics, installed eagerly in declaration
+    /// order (a subclass resolves its parent off the global, so
+    /// parents precede children).
+    pub classes: &'static [GlobalClass],
+    /// JS sources with their defined names. All sources of an
+    /// extension form one lazy group: first touch of any defined name
+    /// evaluates every source, in declaration order.
+    pub js: &'static [ExtensionJs],
+}
+
+impl Extension {
+    /// Every global name the JS half defines, in declaration order.
+    pub fn lazy_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.js
+            .iter()
+            .flat_map(|entry| entry.defines.iter().copied())
+    }
+}
+
 impl GlobalClass {
     /// Build a runtime global class handle from a runtime-owned static class
     /// spec.
@@ -1249,6 +1289,7 @@ pub(crate) struct RuntimeConfig {
     /// [`RuntimeBuilder::with_nodejs_modules`].
     commonjs_enabled: bool,
     global_classes: Vec<GlobalClass>,
+    extensions: Vec<&'static Extension>,
     global_installers: Vec<RuntimeGlobalInstaller>,
     allow_blocking_atomics_wait: bool,
     install_process_global: bool,
@@ -1434,6 +1475,7 @@ impl Default for RuntimeConfig {
             hosted_modules: Vec::new(),
             commonjs_enabled: false,
             global_classes: Vec::new(),
+            extensions: Vec::new(),
             global_installers: Vec::new(),
             allow_blocking_atomics_wait: false,
             install_process_global: true,
@@ -1570,6 +1612,15 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn global_classes(mut self, specs: impl IntoIterator<Item = GlobalClass>) -> Self {
         self.config.global_classes.extend(specs);
+        self
+    }
+
+    /// Register a declared extension: its native classes install
+    /// eagerly (with their attached JS glue), and its JS half
+    /// registers as one native lazy-global group.
+    #[must_use]
+    pub fn extension(mut self, extension: &'static Extension) -> Self {
+        self.config.extensions.push(extension);
         self
     }
 
@@ -1798,6 +1849,67 @@ impl Runtime {
                             message: err.to_string(),
                         })?;
                 }
+            }
+        }
+        // Declared extensions: native classes ride the identical
+        // install path (declaration order, parents before subclasses),
+        // then every JS source of the extension registers as one lazy
+        // group under its declared names.
+        let extensions = config.extensions.clone();
+        for extension in extensions {
+            for spec in extension.classes {
+                match spec.inner {
+                    GlobalClassInner::Spec(raw) => {
+                        interp
+                            .install_global_class(raw)
+                            .map_err(|err| OtterError::Internal {
+                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                                message: err.to_string(),
+                            })?;
+                    }
+                    GlobalClassInner::Intrinsic {
+                        install,
+                        install_well_knowns,
+                        js_glue,
+                        name,
+                    } => {
+                        if let Some(source) = js_glue {
+                            pending_class_js.push((name, source));
+                        }
+                        let global = *interp.global_this();
+                        install(interp.gc_heap_mut(), global).map_err(|err| {
+                            OtterError::Internal {
+                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                                message: err.to_string(),
+                            }
+                        })?;
+                        interp
+                            .run_install_well_knowns(install_well_knowns, global)
+                            .map_err(|err| OtterError::Internal {
+                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                                message: err.to_string(),
+                            })?;
+                    }
+                }
+            }
+            if !extension.js.is_empty() {
+                let names: Vec<&'static str> = extension.lazy_names().collect();
+                let mut source = String::new();
+                for entry in extension.js {
+                    source.push_str(entry.source);
+                    // Guard against a source omitting its own
+                    // statement terminator.
+                    source.push_str("\n;\n");
+                }
+                interp
+                    .register_lazy_global_group(names, source)
+                    .map_err(|err| OtterError::Internal {
+                        code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                        message: format!(
+                            "extension `{}` lazy globals failed: {err}",
+                            extension.name
+                        ),
+                    })?;
             }
         }
         if config.install_process_global {
@@ -3915,6 +4027,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn global_classes(mut self, specs: impl IntoIterator<Item = GlobalClass>) -> Self {
         self.runtime = self.runtime.global_classes(specs);
+        self
+    }
+
+    /// Register a declared extension (native classes + lazy JS half).
+    #[must_use]
+    pub fn extension(mut self, extension: &'static Extension) -> Self {
+        self.runtime = self.runtime.extension(extension);
         self
     }
 

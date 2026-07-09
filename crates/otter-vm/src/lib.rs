@@ -104,6 +104,7 @@ pub mod jit;
 pub mod jit_feedback;
 pub mod js_surface;
 pub mod json;
+pub mod lazy_globals;
 pub mod marshal;
 pub mod math;
 mod method_ops;
@@ -1261,6 +1262,9 @@ pub struct Interpreter {
     /// by the runtime layer like the timer scheduler; `None` in
     /// host-less embeddings (unit tests, sync-only hosts).
     host_completion_sink: Option<std::sync::Arc<dyn host_completion::HostCompletionSink>>,
+    /// Registered lazy global groups (extension JS halves awaiting
+    /// first touch). See [`lazy_globals`].
+    lazy_global_groups: Vec<lazy_globals::LazyGlobalGroup>,
     /// Per-isolate map from host-issued timer token to JS callback +
     /// extra arguments. Populated by `setTimeout` / `setInterval`,
     /// drained by the runtime layer when a `TimerFired` inbox

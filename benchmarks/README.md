@@ -1,84 +1,60 @@
-# benchmarks
+# Benchmarks
 
-Cross-runtime JS/TS performance baseline for **Otter** vs **Node**, **Deno**, **Bun**.
+Otter uses standard JavaScript benchmark suites here, not local microbenchmarks.
+The goal is to measure workloads other JS engines and papers already recognize:
+V8 v7, Octane, ARES-6, V8 Web Tooling Benchmark, and yt-dlp/ejs.
 
-Purpose: capture a baseline **before** perf work and the JIT, so every later
-change can be measured against it. The same scripts double as **debugging /
-dump** repros — where Otter fails or hangs today, that's recorded baseline truth.
+The old `benchmarks/scripts/*.js` microbench set was removed because it mostly
+measured hand-picked hot loops and process startup. Those numbers were useful
+while debugging early VM bugs, but they are a poor performance target.
 
-Pure-JavaScript workloads only — no `fs`/`net`/Node APIs. Just language + core
-builtins (Array, JSON, RegExp, TypedArray, Math, classes, strings).
+## Suites
 
-## Layout
+| Suite | Runner | Signal |
+| --- | --- | --- |
+| V8 v7 | `benchmarks/run-v8-v7.sh` | Classic language/runtime throughput; higher is better. |
+| Octane | `benchmarks/run-octane.sh` | Larger historical V8 workloads; higher is better. |
+| ARES-6 | `benchmarks/run-ares6.sh` | Modern compiler/parser/runtime workloads; lower ms is better. |
+| Web Tooling Benchmark | `benchmarks/run-web-tooling.sh` | Real JS tooling bundles such as Babel/Terser/Acorn; lower ms is better. |
+| yt-dlp/ejs | `benchmarks/run-ejs.sh` | Real TypeScript/ESM parser-transform workload over cached YouTube player JS fixtures; lower ms is better. |
 
-```
-benchmarks/
-  bench.mjs        harness (Node) — runs every script across every runtime, times it
-  scripts/         workloads (*.js / *.ts); files starting with _ are ignored
-  results/         latest.md + latest.json (overwritten each run)
-```
+Downloaded checkouts and generated bundles live under
+`benchmarks/.suite-cache/` and are ignored by git. Raw logs are written to
+`benchmarks/results/` and are also ignored. Curated current results belong in
+[`RESULTS.md`](RESULTS.md).
 
 ## Run
 
 ```bash
-# build the engine first (harness looks for target/{release,debug}/otter)
-cargo build --release -p otter-cli
+# Fast baseline: V8 v7 + a small Octane smoke selection.
+just bench
 
-# all scripts, all detected runtimes
-node benchmarks/bench.mjs
+# Full individual suites.
+benchmarks/run-v8-v7.sh
+benchmarks/run-octane.sh
+benchmarks/run-ares6.sh
+benchmarks/run-web-tooling.sh --only babel
+benchmarks/run-ejs.sh
 
-# subset of scripts (substring match) / runtimes
-node benchmarks/bench.mjs fib nbody
-node benchmarks/bench.mjs --only otter,node
-
-# knobs
-node benchmarks/bench.mjs --runs 20 --warmup 3 --timeout 30000
-node benchmarks/bench.mjs --json /tmp/run.json
+# Selected workloads.
+benchmarks/run-v8-v7.sh richards regexp
+benchmarks/run-octane.sh richards crypto splay
+benchmarks/run-ares6.sh air basic
 ```
 
-Runtimes are auto-detected from `PATH` (`node`, `deno`, `bun`) and the built
-`otter` binary. Missing ones are skipped.
+All runners build `target/release/otter` unless `OTTER_BIN=/path/to/otter` is
+set. `OTTER_JIT=1` is the default for benchmark runs.
 
-## Metric
+V8 v7 and Octane are run through Otter's shell-style multi-file CLI loading:
 
-**Min wall-clock ms** over N runs (default 10, 2 warmup), lower is better.
-Min is the cleanest single number — least polluted by OS scheduling noise.
+```bash
+otter run base.js richards.js run-driver.js
+```
 
-Timing **includes process startup**, deliberately: startup is part of real-world
-runtime cost. For compute-heavy scripts startup is a small fraction; for cheap
-scripts it dominates and that's worth seeing too.
+That mode executes each file as a global script in one runtime/realm, matching
+the shell model used by these suites.
 
-The `×` columns are the ratio vs Otter (`>1` = slower than Otter, `<1` = faster).
+## Updating Results
 
-## Adding a benchmark
-
-Drop a `*.js` / `*.ts` file in `scripts/`. Rules:
-
-- Pure JS/TS — no Node/Deno/Bun-specific APIs.
-- Print **one** final result line (a checksum) so output can be diffed across
-  runtimes for correctness.
-- Size it so the slowest runtime finishes in a few seconds, not minutes.
-- Prefix with `_` to exclude from runs.
-
-## Bugs this baseline surfaced (all fixed, 2026-06-14)
-
-Building these benchmarks exposed three real engine bugs, since fixed and
-verified against test262 (JSON, Object, Array, Map, class — no regressions):
-
-1. **`JSON.stringify` use-after-move** — the spec serializer held `Value`s
-   across GC-allocating calls. Fixed with a scratch GC-root stack
-   (`json_root_stack`, a manual HandleScope) plus a no-alloc fast path for
-   enumerable key reads.
-2. **Prototype-chain corruption** — object construction captured the
-   prototype handle *before* the allocation that could trigger a scavenge,
-   then wrote the stale (moved) pointer as `[[Prototype]]`. Corrupted
-   inheritance / `JSON` / `instanceof` for objects built across a GC. Fixed
-   in `Object.create` and the object-literal opcode (read the prototype
-   after the alloc).
-3. **Young-gen retention OOM** — retaining a nursery-sized live set
-   (~20–30k objects) deadlocked the copying scavenger and surfaced a
-   spurious out-of-memory while the cage was 95% free. Fixed by overflowing
-   such allocations into old-space.
-
-Pre-JIT, Otter runs ~10–190× slower than V8/JSC — that gap *is* the baseline
-this directory exists to measure and shrink.
+Run the suites you want to publish, then summarize the generated logs into
+`benchmarks/RESULTS.md`. Do not commit raw `benchmarks/results/*.log` files.

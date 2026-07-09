@@ -129,6 +129,22 @@ cargo test --all                         # run tests
 cargo run -p otter-cli -- run examples/basic.ts
 ```
 
+## Benchmarks
+
+Performance tracking uses standard JavaScript benchmark suites instead of local
+microbenchmarks:
+
+```bash
+just bench              # V8 v7 + Octane smoke selection
+just bench-v8           # classic V8 v7
+just bench-octane       # full Octane
+just bench-ares6        # BrowserBench ARES-6
+just bench-web-tooling --only babel
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md). Current curated scores live
+in [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+
 ## License
 
 MIT

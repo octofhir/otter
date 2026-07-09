@@ -147,8 +147,10 @@ use syn::{
 };
 
 mod couch;
+mod derive_from_js;
 mod derive_groom;
 mod derive_host_class;
+mod derive_into_js;
 mod derive_pelt;
 mod holt;
 mod js_class;
@@ -285,6 +287,24 @@ pub fn js_class(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_derive(HostClass, attributes(host_class))]
 pub fn host_class_derive(input: TokenStream) -> TokenStream {
     derive_host_class::expand(input)
+}
+
+/// Derive `marshal::FromJs` for a WebIDL dictionary (named-field
+/// struct) or union (enum of single-field variants). See
+/// `crates/otter-macros/src/derive_from_js.rs` for member semantics
+/// (`#[js(name = "…")]`, `#[js(default)]`, required members,
+/// lexicographic read order, probe-ordered union variants).
+#[proc_macro_derive(FromJs, attributes(js))]
+pub fn from_js_derive(input: TokenStream) -> TokenStream {
+    derive_from_js::expand(input)
+}
+
+/// Derive `marshal::IntoJs` for a named-field struct: builds a plain
+/// object with one property per field in declaration order
+/// (`#[js(name = "…")]` overrides the verbatim field name).
+#[proc_macro_derive(IntoJs, attributes(js))]
+pub fn into_js_derive(input: TokenStream) -> TokenStream {
+    derive_into_js::expand(input)
 }
 
 /// Generate a hosted module installer + `HostedModule` row for an

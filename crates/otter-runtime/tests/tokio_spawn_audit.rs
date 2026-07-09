@@ -65,6 +65,19 @@ fn allowlist() -> BTreeMap<&'static str, &'static str> {
          to timer sleeps and narrow host-service futures over owned data. Neither touches \
          Interpreter / Value / Local.",
     );
+    map.insert(
+        "crates/otter-modules/src/serve.rs",
+        "Otter.serve's accept loop and per-connection tasks. Both spawns capture only \
+         Send + 'static owned data: the std listener, a RuntimeTaskSpawner, an owned \
+         RuntimeExecutionContext handle, Arc control/registry, and ServeRoots (opaque \
+         RuntimePersistentRootId / symbol-root ids — never a Value/JsObject). No \
+         Interpreter / Value / Local is captured or touched on the Tokio threads: every \
+         VM re-entry is routed through RuntimeTaskSpawner::enqueue(ServeRequestTask), \
+         whose RuntimeTask::run executes on the isolate thread under the scheduler \
+         boundary. The hyper request is decoded into an owned HttpRequest (Strings + \
+         bytes) before enqueue; JS Request/Response values are built only inside \
+         ServeRequestTask::run.",
+    );
     map
 }
 

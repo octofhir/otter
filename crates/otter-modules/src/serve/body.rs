@@ -50,12 +50,13 @@ impl ServeBody {
         }
     }
 
-    /// Convert this request body into the JS value expected by
-    /// `__otterFetchInternals.makeRequest`.
+    /// Convert this request body into the JS value written to the native
+    /// `Request`'s `kBodyBytes` slot: a `Uint8Array` for a buffered body, or
+    /// `null` when the request carried no body.
     pub(crate) fn to_js_body(&self, ctx: &mut NativeCtx<'_>) -> Result<Value, NativeError> {
         match self {
             Self::Empty => Ok(Value::null()),
-            Self::Buffered(bytes) => bytes_to_uint8_array(ctx, bytes.clone(), "serve.makeRequest"),
+            Self::Buffered(bytes) => bytes_to_uint8_array(ctx, bytes.clone(), "serve.request"),
         }
     }
 

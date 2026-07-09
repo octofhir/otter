@@ -507,6 +507,66 @@ impl Interpreter {
         }
     }
 
+    /// Allocate an ordinary object whose prototype is the object held by the
+    /// `proto` handle, and park it in the current scope. Same rooting contract
+    /// as [`Self::scoped_object`]: the object is allocated first (the alloc may
+    /// relocate the still-young prototype), then the prototype is read back
+    /// through the arena and installed, so no stale offset can be baked in. A
+    /// `proto` handle that does not hold an object installs a `null` prototype.
+    pub(crate) fn scoped_object_with_proto<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        proto: Scoped<'_>,
+    ) -> Result<Scoped<'s>, VmError> {
+        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        let handle = self.scoped_value(scope, Value::object(object));
+        let proto_obj = self.handle_arena.get(proto.index()).as_object();
+        let object = self
+            .handle_arena
+            .get(handle.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        crate::object::set_prototype(object, &mut self.gc_heap, proto_obj);
+        Ok(handle)
+    }
+
+    /// Define the symbol-keyed data property `key` on the object handle `obj`
+    /// with explicit attribute `flags`. The symbol is carried in a scope handle
+    /// (`key`) so it stays live across the earlier allocations that built the
+    /// value being stored; all three handles resolve through the arena at call
+    /// time. A `key` handle that does not hold a symbol, or a rejected define
+    /// (non-extensible object), surfaces as [`VmError::TypeMismatch`].
+    pub(crate) fn scoped_define_symbol(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        key: Scoped<'_>,
+        value: Scoped<'_>,
+        flags: crate::object::PropertyFlags,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let symbol = self
+            .handle_arena
+            .get(key.index())
+            .as_symbol(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        let stored = self.handle_arena.get(value.index());
+        let descriptor = crate::object::PropertyDescriptor {
+            kind: crate::object::DescriptorKind::Data { value: stored },
+            flags,
+        };
+        if crate::object::define_own_symbol_property(object, &mut self.gc_heap, symbol, descriptor)
+        {
+            Ok(())
+        } else {
+            Err(VmError::TypeMismatch)
+        }
+    }
+
     /// Build a §6.2.5.4 FromPropertyDescriptor result object for `desc` and park
     /// it in the current scope.
     ///

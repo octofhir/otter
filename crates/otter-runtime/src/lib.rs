@@ -445,6 +445,10 @@ enum GlobalClassInner {
             otter_vm::JsObject,
             &otter_vm::WellKnownSymbols,
         ) -> Result<(), otter_vm::js_surface::JsSurfaceError>,
+        /// Co-located JS glue attached to the class declaration
+        /// (`BuiltinIntrinsic::JS_GLUE`), evaluated after every global
+        /// installer has run so the glue sees the full global surface.
+        js_glue: Option<&'static str>,
         name: &'static str,
     },
 }
@@ -469,6 +473,7 @@ impl GlobalClass {
             inner: GlobalClassInner::Intrinsic {
                 install: I::install,
                 install_well_knowns: I::install_well_knowns,
+                js_glue: I::JS_GLUE,
                 name: I::NAME,
             },
         }
@@ -1755,6 +1760,10 @@ impl Runtime {
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
+        // Attached class glue is deferred until the runtime is fully
+        // assembled: the sources may reference lazily installed
+        // globals, and evaluation needs the compile pipeline.
+        let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
         for spec in &config.global_classes {
             match spec.inner {
                 GlobalClassInner::Spec(raw) => {
@@ -1768,8 +1777,12 @@ impl Runtime {
                 GlobalClassInner::Intrinsic {
                     install,
                     install_well_knowns,
-                    ..
+                    js_glue,
+                    name,
                 } => {
+                    if let Some(source) = js_glue {
+                        pending_class_js.push((name, source));
+                    }
                     let global = *interp.global_this();
                     install(interp.gc_heap_mut(), global).map_err(|err| OtterError::Internal {
                         code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
@@ -1876,6 +1889,18 @@ impl Runtime {
         let global_installers = runtime.config.global_installers.clone();
         for installer in global_installers {
             installer.install(&mut runtime)?;
+        }
+        // Co-located class glue: the JS half of a declared class
+        // installs in the same build as its native half, in class
+        // declaration order, after every installer above — so the glue
+        // can reference any global (including lazy ones) safely.
+        for (name, source) in pending_class_js {
+            runtime
+                .eval(SourceInput::from_javascript(source))
+                .map_err(|err| OtterError::Internal {
+                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                    message: format!("class `{name}` attached JS glue failed: {err}"),
+                })?;
         }
         Ok(runtime)
     }

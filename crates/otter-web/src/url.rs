@@ -185,7 +185,7 @@ impl WebUrl {
     }
 }
 
-#[js_class(name = "URL", feature = WEB)]
+#[js_class(name = "URL", feature = WEB, js = "url.class.js")]
 impl WebUrl {
     #[constructor]
     fn js_new(input: USVString, base: Option<USVString>) -> Result<WebUrl, JsError> {

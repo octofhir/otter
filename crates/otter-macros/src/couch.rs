@@ -352,6 +352,12 @@ pub(crate) struct CouchInput {
     /// [`BuiltinIntrinsic::install_well_knowns`], avoiding a
     /// post-bootstrap fixup pass.
     pub(crate) string_tag: Option<LitStr>,
+    /// Optional `js_glue = <expr>` — a `&'static str` of JS source
+    /// attached to the class declaration, surfaced as
+    /// [`BuiltinIntrinsic::JS_GLUE`] for host installers to evaluate
+    /// right after the native install (the `js_class` `js = "…"`
+    /// co-located glue channel).
+    pub(crate) js_glue: Option<syn::Expr>,
 }
 
 impl Parse for CouchInput {
@@ -371,6 +377,7 @@ impl Parse for CouchInput {
         let mut install_on: Option<Path> = None;
         let mut post_install: Option<Path> = None;
         let mut string_tag: Option<LitStr> = None;
+        let mut js_glue: Option<syn::Expr> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -440,6 +447,9 @@ impl Parse for CouchInput {
                 "string_tag" => {
                     string_tag = Some(input.parse()?);
                 }
+                "js_glue" => {
+                    js_glue = Some(input.parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -447,7 +457,7 @@ impl Parse for CouchInput {
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
                              `spec`, `intrinsic`, `constructor`, `statics`, `static_method_specs`, \
                              `static_constants`, `prototype`, `no_prototype`, `ctor_parent`, \
-                             `install_on`, `post_install`, or `string_tag`"
+                             `install_on`, `post_install`, `string_tag`, or `js_glue`"
                         ),
                     ));
                 }
@@ -500,6 +510,7 @@ impl Parse for CouchInput {
             install_on,
             post_install,
             string_tag,
+            js_glue,
         })
     }
 }
@@ -522,6 +533,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         install_on,
         post_install,
         string_tag,
+        js_glue,
     } = input;
 
     let mut seen = BTreeSet::new();
@@ -720,6 +732,13 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let ctor_length = constructor.length;
     let ctor_call = &constructor.call;
     let feature_path = quote! { ::otter_vm::bootstrap::BootstrapFeatures::#feature };
+    let js_glue_const = match &js_glue {
+        Some(expr) => quote! {
+            const JS_GLUE: ::core::option::Option<&'static str> =
+                ::core::option::Option::Some(#expr);
+        },
+        None => quote!(),
+    };
     // Abstract ctors still wire their `call` field (for diagnostics
     // + name resolution), but the macro emits the same install
     // path; the user's call body is expected to throw a TypeError.
@@ -1030,6 +1049,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         impl ::otter_vm::intrinsic_install::BuiltinIntrinsic for #intrinsic_ident {
             const NAME: &'static str = #name;
             const FEATURE: ::otter_vm::bootstrap::BootstrapFeatures = #feature_path;
+            #js_glue_const
 
             fn install(
                 heap: &mut ::otter_gc::GcHeap,

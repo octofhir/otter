@@ -180,11 +180,31 @@ pub(crate) fn compile_finalizer(
     cx: &mut Compiler,
     finalizer: &oxc_ast::ast::BlockStatement<'_>,
 ) -> Result<(), CompileError> {
-    // §14.15.3 step 4 — a normal finalizer completion value is
-    // discarded; its statements must not touch the program
-    // completion register.
+    // §14.15.3 step 4 — a NORMAL finalizer completion value is
+    // discarded, but an abrupt one (break/continue leaving the
+    // finalizer) carries the finalizer's own statement values. Lower
+    // the body with completion tracking live, snapshot the completion
+    // register at entry, and restore it only on the normal fallthrough
+    // — abrupt exits skip the restore, keeping the finalizer's value.
+    let fin_span = (finalizer.span.start, finalizer.span.end);
+    let completion_restore = match cx.completion_reg {
+        Some(creg) if !cx.completion_suppressed => {
+            let snapshot = cx.top_mut().alloc_scratch();
+            cx.emit(
+                Op::StoreLocal,
+                [Operand::Register(creg), Operand::Imm32(snapshot as i32)],
+                fin_span,
+            );
+            // UpdateEmpty(F, undefined) — an abrupt finalizer exit
+            // with no own statement value must surface `undefined`,
+            // never the try block's value.
+            cx.emit(Op::LoadUndefined, [Operand::Register(creg)], fin_span);
+            Some((creg, snapshot))
+        }
+        _ => None,
+    };
     let saved = cx.completion_suppressed;
-    cx.top_mut().completion_suppressed = true;
+    cx.top_mut().finally_body_depth += 1;
     cx.enter_scope();
     let result: Result<(), CompileError> = (|| {
         // §14.2.3 — the finally Block's lexical names pre-declare
@@ -200,6 +220,14 @@ pub(crate) fn compile_finalizer(
         Ok(())
     })();
     cx.exit_scope();
+    cx.top_mut().finally_body_depth -= 1;
     cx.top_mut().completion_suppressed = saved;
+    if let Some((creg, snapshot)) = completion_restore {
+        cx.emit(
+            Op::StoreLocal,
+            [Operand::Register(snapshot), Operand::Imm32(creg as i32)],
+            fin_span,
+        );
+    }
     result
 }

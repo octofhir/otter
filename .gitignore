@@ -42,6 +42,9 @@ scratch/
 timeout-dump*.txt
 .claude/scheduled_tasks.lock
 
+# Internal architecture plans
+/JIT_REFACTOR_PLAN.md
+
 # Fetched Node.js test suite (scripts/fetch-node-tests.sh) and generated reports
 tests/node-compat/node/
 tests/node-compat/reports/

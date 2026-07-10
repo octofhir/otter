@@ -119,6 +119,19 @@ pub(crate) fn compile_tail_return(
 /// `handler_floor`); otherwise a plain [`Op::Jump`]. Returns the
 /// instruction pc so the caller can register it for back-patching.
 fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -> u32 {
+    // §14.15.3 — exiting a finally BODY abandons the completion that
+    // finally parked; discard one entry per crossed body before the
+    // jump so an enclosing EndFinally resumes the right completion.
+    let crossed_bodies = cx
+        .finally_body_depth
+        .saturating_sub(cx.loops[target_idx].finally_body_floor);
+    if crossed_bodies > 0 {
+        cx.emit(
+            Op::PopParkedFinally,
+            [Operand::Imm32(crossed_bodies as i32)],
+            span,
+        );
+    }
     let crossed_finally = cx
         .active_finally
         .saturating_sub(cx.loops[target_idx].finally_floor);
@@ -240,12 +253,23 @@ pub(crate) fn compile_statement(
                     );
                     return Ok(());
                 }
-                let info = cx.lookup_binding(name).ok_or(CompileError::Unsupported {
-                    node: format!("var `{name}` not pre-hoisted"),
-                    span,
-                })?;
+                let (info, depth) =
+                    cx.lookup_binding_with_depth(name)
+                        .ok_or(CompileError::Unsupported {
+                            node: format!("var `{name}` not pre-hoisted"),
+                            span,
+                        })?;
                 cx.emit_store_storage(init_reg, info.storage, span);
-                if cx.stack.len() == 1 && cx.module_state.is_none() && !cx.suppress_global_mirror {
+                // §B.3.5 — when an inner binding (a catch parameter)
+                // shadows the hoisted var, the initializer assigns THAT
+                // binding; the var-scope value (and its global/module
+                // mirror) stays untouched.
+                let shadowed = depth != 0;
+                if !shadowed
+                    && cx.stack.len() == 1
+                    && cx.module_state.is_none()
+                    && !cx.suppress_global_mirror
+                {
                     let name_idx = cx.intern_string_constant(name);
                     cx.emit(
                         Op::DefineGlobalVar,
@@ -253,7 +277,9 @@ pub(crate) fn compile_statement(
                         span,
                     );
                 }
-                cx.emit_module_export_mirror(name, init_reg, span);
+                if !shadowed {
+                    cx.emit_module_export_mirror(name, init_reg, span);
+                }
                 Ok(())
             }
             let is_const = matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Const);

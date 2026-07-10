@@ -2299,6 +2299,22 @@ impl Interpreter {
                     self.run_leave_try(frame)?;
                     continue;
                 }
+                Op::PopParkedFinally => {
+                    // §14.15.3 — a break/continue leaving `count`
+                    // finally bodies abandons the completions those
+                    // finallys parked (innermost on top).
+                    let count = context
+                        .exec_imm32(instr, 0)
+                        .ok_or_else(|| VmError::InvalidOperand)?
+                        .max(0) as usize;
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                        for _ in 0..count {
+                            cold.parked_finally.pop();
+                        }
+                    }
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 Op::JumpViaFinally => {
                     // §14.15.3 — `break`/`continue` crossing `finally`
                     // blocks: run them (down to `floor`), then jump.

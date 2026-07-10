@@ -156,6 +156,11 @@ pub(crate) struct FunctionContext {
     /// finalizer's completion value is discarded (§14.15.3 step 4),
     /// so its statements must not touch the completion register.
     pub(crate) completion_suppressed: bool,
+    /// Number of `finally` block BODIES currently being lowered. A
+    /// `break`/`continue` whose target lies outside `n` of them must
+    /// discard the `n` completions those finallys parked
+    /// ([`otter_bytecode::Op::PopParkedFinally`]).
+    pub(crate) finally_body_depth: u32,
 }
 
 impl FunctionContext {
@@ -195,6 +200,7 @@ impl FunctionContext {
             contains_direct_eval: false,
             completion_reg: None,
             completion_suppressed: false,
+            finally_body_depth: 0,
         }
     }
 
@@ -308,6 +314,7 @@ impl FunctionContext {
         }
         frame.handler_floor = self.active_handlers;
         frame.finally_floor = self.active_finally;
+        frame.finally_body_floor = self.finally_body_depth;
         self.loops.push(frame);
     }
 
@@ -416,6 +423,20 @@ impl FunctionContext {
         for scope in self.scopes.iter().rev() {
             if let Some(info) = scope.bindings.get(name) {
                 return Some(*info);
+            }
+        }
+        None
+    }
+
+    /// As [`Self::lookup_binding`], also reporting the 0-based scope
+    /// index the name resolved in (0 = the function/script top scope
+    /// where hoisted `var`s live). Lets `var` initializers detect a
+    /// shadowing inner binding (a catch parameter, §B.3.5) whose store
+    /// must not mirror to the global / module export.
+    pub(crate) fn lookup_binding_with_depth(&self, name: &str) -> Option<(BindingInfo, usize)> {
+        for (idx, scope) in self.scopes.iter().enumerate().rev() {
+            if let Some(info) = scope.bindings.get(name) {
+                return Some((*info, idx));
             }
         }
         None

@@ -616,7 +616,11 @@ impl crate::Interpreter {
     /// constructors.
     fn thrown_constructor_name(&self, obj: crate::object::JsObject) -> Option<String> {
         let ctor = crate::object::get(obj, &self.gc_heap, "constructor")?;
-        let function_id = ctor.as_function()?;
+        // The constructor may be interned (`Value::function`) or a
+        // closure instance — both carry the same template id.
+        let function_id = ctor
+            .as_function()
+            .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))?;
         let chunk = self.code_space.chunk_for(function_id)?;
         let local = function_id.checked_sub(chunk.function_base)? as usize;
         let name = chunk.module.functions.get(local)?.name.clone();

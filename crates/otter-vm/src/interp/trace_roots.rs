@@ -135,7 +135,8 @@ impl Interpreter {
         }
     }
 
-    /// Iterator over cached per-kind iterator prototypes.
+    /// Iterator over cached per-kind iterator prototypes, including the
+    /// never-swapped default-realm copies.
     pub fn iterator_prototypes_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         [
             self.array_iterator_prototype.as_ref(),
@@ -148,6 +149,7 @@ impl Interpreter {
         ]
         .into_iter()
         .flatten()
+        .chain(self.default_realm_iterator_prototypes.iter().flatten())
     }
 
     /// Iterator over non-GC exotic prototype override values.

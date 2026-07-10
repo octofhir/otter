@@ -256,6 +256,33 @@ pub(crate) fn compile_for_in_statement(
     let span = (s.span.start, s.span.end);
     cx.emit_completion_reset(span);
 
+    // §B.3.6 — `for (var x = init in expr)`: the legacy initializer
+    // evaluates and assigns the var binding BEFORE the enumerated
+    // expression (sloppy-only web-compat grammar).
+    if let oxc_ast::ast::ForStatementLeft::VariableDeclaration(decl) = &s.left
+        && matches!(decl.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+        && let Some(declarator) = decl.declarations.first()
+        && let Some(init) = &declarator.init
+        && let oxc_ast::ast::BindingPattern::BindingIdentifier(id) = &declarator.id
+    {
+        let name = id.name.as_str().to_string();
+        let init_reg = crate::expr::compile_expr_with_inferred_name(cx, init, &name, span)?;
+        if let Some(info) = cx.lookup_binding(&name) {
+            cx.emit_store_storage(init_reg, info.storage, span);
+        } else {
+            let name_idx = cx.intern_string_constant(&name);
+            cx.emit(
+                Op::StoreGlobalBinding,
+                [
+                    Operand::Register(init_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Imm32(0),
+                ],
+                span,
+            );
+        }
+    }
+
     // Lower through the VM's internal for-in enumerable-key snapshot
     // helper. It intentionally does not alias `Object.keys`: `keys`
     // is own-only, while `for-in` walks enumerable string keys across

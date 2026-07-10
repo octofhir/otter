@@ -832,7 +832,7 @@ where
 /// declaration still contributes to the surrounding CaseBlock.
 fn collect_lex_decl_names<'a, F>(stmts: &'a [Statement<'a>], emit: &mut F)
 where
-    F: FnMut(&'a str, oxc_span::Span),
+    F: FnMut(&'a str, oxc_span::Span, bool),
 {
     for stmt in stmts {
         match stmt {
@@ -847,18 +847,18 @@ where
             {
                 for declarator in &decl.declarations {
                     for_each_bound_identifier(&declarator.id, &mut |name, span| {
-                        emit(name, span);
+                        emit(name, span, false);
                     });
                 }
             }
             Statement::FunctionDeclaration(func) => {
                 if let Some(id) = &func.id {
-                    emit(id.name.as_str(), id.span);
+                    emit(id.name.as_str(), id.span, true);
                 }
             }
             Statement::ClassDeclaration(cls) => {
                 if let Some(id) = &cls.id {
-                    emit(id.name.as_str(), id.span);
+                    emit(id.name.as_str(), id.span, false);
                 }
             }
             Statement::LabeledStatement(labelled) => {
@@ -1081,7 +1081,7 @@ impl<'a> Visit<'a> for StrictValidator {
             collect_param_bound_names(&it.params, &mut |name, span| {
                 param_names.entry(name).or_insert(span);
             });
-            collect_lex_decl_names(&body.statements, &mut |name, span| {
+            collect_lex_decl_names(&body.statements, &mut |name, span, _is_fn| {
                 if param_names.contains_key(name) {
                     self.diagnostics.push(SyntaxDiagnostic {
                         code: "ASYNC_FUNCTION_PARAM_LEXICAL_REDECLARATION".to_string(),
@@ -1140,7 +1140,7 @@ impl<'a> Visit<'a> for StrictValidator {
         collect_param_bound_names(&it.params, &mut |name, span| {
             param_names.entry(name).or_insert(span);
         });
-        collect_lex_decl_names(&it.body.statements, &mut |name, span| {
+        collect_lex_decl_names(&it.body.statements, &mut |name, span, _is_fn| {
             if param_names.contains_key(name) {
                 self.diagnostics.push(SyntaxDiagnostic {
                     code: "ARROW_PARAM_LEXICAL_REDECLARATION".to_string(),
@@ -1309,15 +1309,22 @@ impl<'a> Visit<'a> for StrictValidator {
         //
         // Independent of strict mode — these are static errors for
         // every switch.
-        let mut lex_seen: BTreeMap<&str, ()> = BTreeMap::new();
+        let strict = self.is_strict();
+        let mut lex_seen: BTreeMap<&str, bool> = BTreeMap::new();
         let mut var_seen: BTreeMap<&str, ()> = BTreeMap::new();
         let mut duplicates: Vec<(String, oxc_span::Span)> = Vec::new();
         let mut lex_var_clash: Vec<(String, oxc_span::Span)> = Vec::new();
 
         for case in &it.cases {
-            collect_lex_decl_names(&case.consequent, &mut |name, span| {
-                if lex_seen.insert(name, ()).is_some() {
-                    duplicates.push((name.to_string(), span));
+            collect_lex_decl_names(&case.consequent, &mut |name, span, is_fn| {
+                match lex_seen.insert(name, is_fn) {
+                    // §B.3.3.5 — sloppy-mode duplicates bound only by
+                    // FunctionDeclarations are tolerated for web
+                    // compatibility.
+                    Some(prev_is_fn) if strict || !prev_is_fn || !is_fn => {
+                        duplicates.push((name.to_string(), span));
+                    }
+                    _ => {}
                 }
             });
             collect_var_decl_names(&case.consequent, &mut |name, _span| {
@@ -1325,8 +1332,11 @@ impl<'a> Visit<'a> for StrictValidator {
             });
         }
         for case in &it.cases {
-            collect_lex_decl_names(&case.consequent, &mut |name, span| {
-                if var_seen.contains_key(name) {
+            collect_lex_decl_names(&case.consequent, &mut |name, span, is_fn| {
+                // §B.3.3 — sloppy block-level function names are also
+                // var-scoped, so a clash with VarDeclaredNames is the
+                // web-compat norm rather than an early error.
+                if var_seen.contains_key(name) && (strict || !is_fn) {
                     lex_var_clash.push((name.to_string(), span));
                 }
             });
@@ -1468,7 +1478,7 @@ impl<'a> Visit<'a> for StrictValidator {
             let mut param_names: Vec<&str> = Vec::new();
             for_each_bound_identifier(&param.pattern, &mut |name, _| param_names.push(name));
             let mut conflicts: Vec<(String, Span)> = Vec::new();
-            collect_lex_decl_names(&it.body.body, &mut |name, span| {
+            collect_lex_decl_names(&it.body.body, &mut |name, span, _is_fn| {
                 if param_names.contains(&name) {
                     conflicts.push((name.to_string(), span));
                 }

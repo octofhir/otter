@@ -1968,11 +1968,12 @@ impl Interpreter {
                 )?;
             }
             None
-        } else if receiver.is_intl() {
-            // ECMA-402 service instances are ordinary objects with
-            // internal slots. User writes land in the non-GC exotic
-            // expando after the prototype chain has had a chance to
-            // reject through accessors or read-only descriptors.
+        } else if receiver.is_intl() || receiver.is_iterator() {
+            // ECMA-402 service instances and builtin iterators are
+            // ordinary objects with internal slots. User writes land in
+            // the non-GC exotic expando after the prototype chain has
+            // had a chance to reject through accessors or read-only
+            // descriptors.
             let vm_key = VmPropertyKey::OwnedString(name.to_string());
             if !self.ordinary_set_data_value(context, receiver, &vm_key, value, receiver, 0)? {
                 self.failed_set_result(

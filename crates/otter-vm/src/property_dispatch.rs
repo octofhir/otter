@@ -963,10 +963,41 @@ impl Interpreter {
                 // them from the ctor BEFORE the inherited
                 // %Function.prototype% walk, whose own `name`=""/
                 // `length`=0 would otherwise shadow the real values.
+                let ctor = c.ctor(&self.gc_heap);
+                let metadata_deleted = ctor
+                    .as_function()
+                    .or_else(|| {
+                        ctor.as_closure(&self.gc_heap)
+                            .map(|cl| cl.cached_function_id)
+                    })
+                    .is_some_and(|fid| {
+                        function_metadata::ordinary_function_metadata_key(name)
+                            .is_some_and(|k| self.function_deleted_metadata.contains(&(fid, k)))
+                    });
                 if (name == "name" || name == "length")
+                    && metadata_deleted
                     && object::get_own_descriptor(statics, &self.gc_heap, name).is_none()
                 {
-                    let ctor = c.ctor(&self.gc_heap);
+                    // Deleted virtual metadata — resolve through the
+                    // class's own [[Prototype]] (the PARENT CLASS
+                    // value), whose virtual name/length the
+                    // statics-object walk cannot see.
+                    let parent = self.get_prototype_for_op(&receiver)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        Value::undefined()
+                    } else {
+                        let key = VmPropertyKey::String(name);
+                        match self.ordinary_get_value(context, parent, receiver, &key, 1)? {
+                            VmGetOutcome::Value(v) => v,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                            }
+                        }
+                    }
+                } else if (name == "name" || name == "length")
+                    && !metadata_deleted
+                    && object::get_own_descriptor(statics, &self.gc_heap, name).is_none()
+                {
                     if ctor.is_function()
                         || ctor.is_closure()
                         || ctor.is_native_function()

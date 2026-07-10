@@ -11,11 +11,16 @@
 //! prototype alive across allocator GCs — same shape as RegExp's
 //! legacy static accessors).
 //!
+//! # Invariants
+//! - The constructor, global, prototype, getter, and setter occupy canonical
+//!   root-scope slots until the `__proto__` accessor cell is installed.
+//!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-object-constructor>
 
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::rooting::RootScopeExt;
 use crate::{NativeCtx, NativeError, Value, object_statics};
 
 otter_macros::couch! {
@@ -40,41 +45,60 @@ fn install_proto_proto_accessor(
     global: JsObject,
     ctor: crate::native_function::NativeFunction,
 ) -> Result<(), JsSurfaceError> {
+    let mut ctor_root = Value::native_function(ctor);
+    let mut global_root = Value::object(global);
+    let mut proto_root = Value::undefined();
+    let mut getter_root = Value::undefined();
+    let mut setter_root = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: every canonical slot precedes the scope and remains live through
+    // the complete accessor-pair installation.
+    unsafe {
+        roots.add_value(&mut ctor_root);
+        roots.add_value(&mut global_root);
+        roots.add_value(&mut proto_root);
+        roots.add_value(&mut getter_root);
+        roots.add_value(&mut setter_root);
+    }
+    let ctor = ctor_root
+        .as_native_function()
+        .expect("Object constructor remains rooted");
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data { value } => value.as_object(),
+    proto_root = match descriptor.and_then(|d| match d.kind {
+        crate::object::DescriptorKind::Data { value } => Some(value),
         _ => None,
     }) {
-        Some(p) => p,
+        Some(value) if value.as_object().is_some() => value,
         None => return Ok(()),
+        Some(_) => return Ok(()),
     };
 
-    let global_root = Value::object(global);
-    let proto_root = Value::object(prototype);
-    let getter = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "get __proto__",
-        0,
-        object_statics::native_prototype_proto_get,
-        &[&global_root, &proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let setter = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "set __proto__",
-        1,
-        object_statics::native_prototype_proto_set,
-        &[&global_root, &proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let desc = PropertyDescriptor::accessor(
-        Some(Value::native_function(getter)),
-        Some(Value::native_function(setter)),
-        false,
-        true,
+    getter_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "get __proto__",
+            0,
+            object_statics::native_prototype_proto_get,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
+    setter_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "set __proto__",
+            1,
+            object_statics::native_prototype_proto_set,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let desc = PropertyDescriptor::accessor(Some(getter_root), Some(setter_root), false, true);
+    let prototype = proto_root
+        .as_object()
+        .expect("Object.prototype remains rooted");
     if !object::define_own_property(prototype, heap, "__proto__", desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("__proto__"));
     }

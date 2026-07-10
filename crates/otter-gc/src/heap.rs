@@ -1792,6 +1792,10 @@ impl GcHeap {
         self.gc_stats.gc_cycles = self.gc_stats.gc_cycles.saturating_add(1);
         let elapsed = pause_start.elapsed();
         self.gc_stats.last_gc_pause_ms = elapsed.as_secs_f32() * 1000.0;
+        self.gc_stats.full_pause_ns_total = self
+            .gc_stats
+            .full_pause_ns_total
+            .saturating_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
         // Commit the per-tag counters gathered during the sweep
         // pass — replaces the standalone `reconcile_live_counts`
         // walk so the full GC pays for at most one heap walk.

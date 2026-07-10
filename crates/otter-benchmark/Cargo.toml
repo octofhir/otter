@@ -1,0 +1,42 @@
+[package]
+name = "otter-benchmark"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Machine-readable benchmark result schema and command recorder for Otter."
+default-run = "otter-benchmark"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+phase0 = [
+    "dep:otter-compiler",
+    "dep:otter-jit",
+    "dep:otter-runtime",
+    "dep:otter-syntax",
+    "dep:otter-vm",
+]
+rss = ["dep:sysinfo"]
+
+[dependencies]
+clap = { workspace = true }
+otter-compiler = { workspace = true, optional = true }
+otter-jit = { workspace = true, optional = true }
+otter-runtime = { workspace = true, optional = true }
+otter-syntax = { workspace = true, optional = true }
+otter-vm = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true, optional = true }
+
+[[bin]]
+name = "otter-benchmark"
+path = "src/main.rs"
+
+[[bin]]
+name = "otter-phase0"
+path = "src/bin/phase0.rs"
+required-features = ["phase0"]

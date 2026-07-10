@@ -7,25 +7,45 @@
 //! surface intact.
 //!
 //! # Contents
-//! - [`NativeFrameKind`] and [`NativeFrameHeader`] describe the frame shape every
-//!   execution tier should converge on.
+//! - [`VmThread`], [`NativeFrame`], and [`NativeFrameHeader`] describe the
+//!   machine-observed execution state every tier must converge on.
 //! - [`RuntimeStubClass`], [`RuntimeStubStatus`], and [`RuntimeStubResult`]
 //!   describe machine-callable runtime stubs without the generic `NativeCtx`
 //!   boundary.
-//! - [`SafepointRecord`] and [`TaggedLocation`] describe tagged `Value` liveness
-//!   for moving-GC safepoints and deopt exits.
+//! - [`SafepointEntry`], [`FrameMap`], [`SpillMap`], [`SafepointRecord`], and
+//!   [`TaggedLocation`] describe tagged `Value` liveness for moving-GC
+//!   safepoints and deopt exits.
+//! - [`CodeDependency`] and the ABI/build versions make code validity explicit.
 //!
 //! # Invariants
-//! - ABI-facing values are fixed-width integers or raw boxed `Value` bits.
+//! - Machine-observed records are C-layout and contain only fixed-width fields;
+//!   addresses are encoded as `u64` and must be zero-extended canonical target
+//!   addresses on supported 64-bit hosts.
 //! - Allocating or re-entrant stubs must name a safepoint record; leaf stubs must
-//!   not allocate, re-enter JS, or trigger GC.
+//!   not allocate, throw, re-enter JS, or trigger GC.
 //! - Safepoint locations describe only tagged GC-visible values. Unboxed machine
 //!   values belong to deopt frame-state metadata, not GC root maps.
+//! - Installed code is invalidated by epoch/version mismatch, unlinked before it
+//!   is retired, and retained until no active frame/code anchor can return to it.
 //!
 //! # See also
 //! - [`crate::jit`] for the current type-erased JIT entry surface.
 //! - [`crate::frame_state`] for the current interpreter frame.
-//! - `NATIVE_VM_ABI_PLAN.md` for the refactor roadmap.
+//! - `JIT_REFACTOR_PLAN.md` for the refactor roadmap.
+
+/// Native VM ABI layout version. Increment for any machine-observed field,
+/// offset, enum discriminant, or calling-convention change.
+pub const VM_LAYOUT_VERSION: u32 = 1;
+
+/// Runtime-stub table version. Increment when stable stub ids, signatures,
+/// classes, or effect contracts change.
+pub const RUNTIME_STUB_TABLE_VERSION: u32 = 1;
+
+/// Build identity folded into transient compiled-code/cache validity.
+///
+/// This is intentionally numeric and reproducible. Persistent CodeBlocks will
+/// replace it with a content/build hash in Phase 2.
+pub const VM_BUILD_VERSION: u64 = 0x4f54_5445_525f_0001;
 
 /// Dense identifier for one native ABI frame-state snapshot.
 pub type FrameStateId = u32;
@@ -44,6 +64,49 @@ pub const NO_FRAME_STATE: FrameStateId = u32::MAX;
 
 /// Runtime stub descriptor argument count for variadic call shapes.
 pub const VARIADIC_STUB_ARGUMENTS: u8 = u8::MAX;
+
+/// Stable VM-thread fields visible to native code.
+///
+/// This is a passive ABI shell, not the current Rust [`crate::Interpreter`].
+/// Phase 2 will make the interpreter own/populate one shell rather than expose
+/// its implementation layout to generated code.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmThread {
+    /// Address of the currently published [`NativeFrame`], or zero.
+    pub current_frame: u64,
+    /// Opaque stable heap/isolate context address.
+    pub heap_context: u64,
+    /// Address of the process-local runtime stub entry table.
+    pub runtime_stub_table: u64,
+    /// Address of the interrupt/budget cell.
+    pub interrupt_cell: u64,
+    /// Rooted pending exception as boxed `Value` bits, or zero when absent.
+    pub pending_exception_bits: u64,
+    /// Current code invalidation epoch.
+    pub code_epoch: u64,
+    /// [`VM_LAYOUT_VERSION`] observed by entered code.
+    pub layout_version: u32,
+    /// [`RUNTIME_STUB_TABLE_VERSION`] observed by entered code.
+    pub stub_table_version: u32,
+}
+
+impl VmThread {
+    /// Empty passive shell with current ABI versions.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            current_frame: 0,
+            heap_context: 0,
+            runtime_stub_table: 0,
+            interrupt_cell: 0,
+            pending_exception_bits: 0,
+            code_epoch: 0,
+            layout_version: VM_LAYOUT_VERSION,
+            stub_table_version: RUNTIME_STUB_TABLE_VERSION,
+        }
+    }
+}
 
 /// Execution tier that owns a frame.
 #[repr(u8)]
@@ -108,7 +171,7 @@ impl NativeFrameFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeFrameHeader {
     /// Previous frame link or `0` at the stack root.
-    pub previous_frame: usize,
+    pub previous_frame: u64,
     /// Global VM function id.
     pub function_id: u32,
     /// Linked code-block/chunk id.
@@ -125,6 +188,94 @@ pub struct NativeFrameHeader {
     pub argument_count: u16,
     /// Feedback vector base/index for IC and type-feedback metadata.
     pub feedback_index: u32,
+}
+
+/// Authoritative machine-observed synchronous frame shell.
+///
+/// Register and feedback storage are referenced by stable base addresses. No
+/// pointer into either storage may survive an allocating/reentrant safepoint;
+/// generated code retains the tagged slot and recomputes derived pointers.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeFrame {
+    /// Common tier-independent header.
+    pub header: NativeFrameHeader,
+    /// Base address of initialized tagged register slots.
+    pub register_base: u64,
+    /// Base address of the call's overflow argument area, or zero.
+    pub argument_base: u64,
+    /// Isolate-local feedback-vector base, or zero while not migrated.
+    pub feedback_base: u64,
+    /// Installed code-object identity/anchor, or zero for interpreter frames.
+    pub code_object_id: u64,
+    /// Boxed `this` value.
+    pub this_value_bits: u64,
+    /// Boxed `new.target` value.
+    pub new_target_bits: u64,
+    /// Caller destination register; `u32::MAX` at the stack root.
+    pub return_register: u32,
+    /// Index into cold async/generator/protocol state, or `u32::MAX`.
+    pub cold_state_index: u32,
+}
+
+/// Result of interpreter/compiled dispatch.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchStatus {
+    /// Function returned; `value_bits` is the completion value.
+    Return = 0,
+    /// Resume the interpreter at `payload` logical PC.
+    SideExit = 1,
+    /// A rooted pending exception is stored on [`VmThread`].
+    Throw = 2,
+    /// Interrupt/budget handling is required at `payload` logical PC.
+    Interrupt = 3,
+    /// Fatal allocation failure.
+    OutOfMemory = 4,
+}
+
+/// Fixed two-word dispatch result shared by interpreter and compiled entries.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchResult {
+    /// Dispatch action.
+    pub status: DispatchStatus,
+    /// Logical PC, reason id, or zero depending on [`Self::status`].
+    pub payload: u32,
+    /// Boxed completion value bits for [`DispatchStatus::Return`].
+    pub value_bits: u64,
+}
+
+impl DispatchResult {
+    /// Normal return.
+    #[must_use]
+    pub const fn returned(value_bits: u64) -> Self {
+        Self {
+            status: DispatchStatus::Return,
+            payload: 0,
+            value_bits,
+        }
+    }
+
+    /// Exact logical-PC side exit.
+    #[must_use]
+    pub const fn side_exit(logical_pc: u32) -> Self {
+        Self {
+            status: DispatchStatus::SideExit,
+            payload: logical_pc,
+            value_bits: 0,
+        }
+    }
+
+    /// Throw with the exception rooted in [`VmThread::pending_exception_bits`].
+    #[must_use]
+    pub const fn thrown() -> Self {
+        Self {
+            status: DispatchStatus::Throw,
+            payload: 0,
+            value_bits: 0,
+        }
+    }
 }
 
 /// Runtime-stub semantic class.
@@ -153,18 +304,81 @@ impl RuntimeStubClass {
     }
 }
 
+/// Runtime-stub observable effects. The descriptor verifier cross-checks these
+/// bits against [`RuntimeStubClass`] so leaf stubs cannot silently acquire a
+/// throwing, allocating, collecting, or reentrant implementation.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeStubEffects(u16);
+
+impl RuntimeStubEffects {
+    /// Stub may allocate managed or externally-accounted memory.
+    pub const MAY_ALLOCATE: u16 = 1 << 0;
+    /// Stub may trigger a moving collection.
+    pub const MAY_TRIGGER_GC: u16 = 1 << 1;
+    /// Stub may produce a JavaScript exception.
+    pub const MAY_THROW: u16 = 1 << 2;
+    /// Stub may call JavaScript, proxies, accessors, or coercion hooks.
+    pub const MAY_REENTER_JS: u16 = 1 << 3;
+    /// Stub may mutate a GC-managed object and must perform the write barrier.
+    pub const MAY_MUTATE_GC: u16 = 1 << 4;
+
+    /// No observable effects beyond reading passive state and returning a value.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    /// Effects for an allocating, non-reentrant stub.
+    #[must_use]
+    pub const fn allocating(may_throw: bool, may_mutate_gc: bool) -> Self {
+        let mut bits = Self::MAY_ALLOCATE | Self::MAY_TRIGGER_GC;
+        if may_throw {
+            bits |= Self::MAY_THROW;
+        }
+        if may_mutate_gc {
+            bits |= Self::MAY_MUTATE_GC;
+        }
+        Self(bits)
+    }
+
+    /// Effects for a reentrant stub.
+    #[must_use]
+    pub const fn reentrant(may_mutate_gc: bool) -> Self {
+        let mut bits =
+            Self::MAY_ALLOCATE | Self::MAY_TRIGGER_GC | Self::MAY_THROW | Self::MAY_REENTER_JS;
+        if may_mutate_gc {
+            bits |= Self::MAY_MUTATE_GC;
+        }
+        Self(bits)
+    }
+
+    /// Raw effect bits.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// Whether all `mask` bits are present.
+    #[must_use]
+    pub const fn contains(self, mask: u16) -> bool {
+        self.0 & mask == mask
+    }
+}
+
 /// Machine-callable runtime stub descriptor.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeStubDescriptor {
     /// Stable descriptor id.
     pub id: RuntimeStubId,
-    /// Human-readable symbol name for diagnostics and profiles.
-    pub name: &'static str,
     /// Stub semantic class.
     pub class: RuntimeStubClass,
     /// Fixed argument count for the fast ABI entry, or
     /// [`VARIADIC_STUB_ARGUMENTS`] when the call shape is argument-vector based.
     pub argument_count: u8,
+    /// Declared observable effects.
+    pub effects: RuntimeStubEffects,
 }
 
 /// VM-native allocation/rooting context passed to allocating runtime stubs.
@@ -270,18 +484,18 @@ impl RuntimeStubAllocContext {
 /// arbitrary JS or native callables.
 pub const STUB_JIT_RUNTIME_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 1,
-    name: "jit_runtime_call",
     class: RuntimeStubClass::Reentrant,
     argument_count: VARIADIC_STUB_ARGUMENTS,
+    effects: RuntimeStubEffects::reentrant(true),
 };
 
 /// Current compiled `CallMethodValue` bridge. Re-entrant because method
 /// resolution and invocation can run user code.
 pub const STUB_JIT_RUNTIME_CALL_METHOD: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 2,
-    name: "jit_runtime_call_method",
     class: RuntimeStubClass::Reentrant,
     argument_count: VARIADIC_STUB_ARGUMENTS,
+    effects: RuntimeStubEffects::reentrant(true),
 };
 
 /// Direct compiled-call frame preparation. It does not intentionally re-enter
@@ -289,27 +503,27 @@ pub const STUB_JIT_RUNTIME_CALL_METHOD: RuntimeStubDescriptor = RuntimeStubDescr
 /// allocating-stub safepoint in the target ABI.
 pub const STUB_JIT_PREPARE_DIRECT_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 3,
-    name: "jit_prepare_direct_call",
     class: RuntimeStubClass::Alloc,
     argument_count: VARIADIC_STUB_ARGUMENTS,
+    effects: RuntimeStubEffects::allocating(true, true),
 };
 
 /// Direct compiled method-call frame preparation. Same allocation contract as
 /// [`STUB_JIT_PREPARE_DIRECT_CALL`].
 pub const STUB_JIT_PREPARE_DIRECT_METHOD_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 4,
-    name: "jit_prepare_direct_method_call",
     class: RuntimeStubClass::Alloc,
     argument_count: VARIADIC_STUB_ARGUMENTS,
+    effects: RuntimeStubEffects::allocating(true, true),
 };
 
 /// Current compiled property/method runtime fallback bucket. Re-entrant until
 /// individual property operations are split into leaf/allocating stubs.
 pub const STUB_JIT_PROPERTY_FALLBACK: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 5,
-    name: "jit_property_fallback",
     class: RuntimeStubClass::Reentrant,
     argument_count: VARIADIC_STUB_ARGUMENTS,
+    effects: RuntimeStubEffects::reentrant(true),
 };
 
 /// Compiled-loop backedge poll for interrupts and runtime-budget enforcement.
@@ -318,9 +532,9 @@ pub const STUB_JIT_PROPERTY_FALLBACK: RuntimeStubDescriptor = RuntimeStubDescrip
 /// allocate, trigger GC, or re-enter JS.
 pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 6,
-    name: "jit_backedge_poll",
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 1,
+    effects: RuntimeStubEffects::none(),
 };
 
 /// Leaf `Map.prototype.get` probe used after method/prototype guards have
@@ -328,27 +542,27 @@ pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = RuntimeStubDescriptor 
 /// representation that does not require flattening/materialisation.
 pub const STUB_COLLECTION_MAP_GET_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 7,
-    name: "collection_map_get_leaf",
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 2,
+    effects: RuntimeStubEffects::none(),
 };
 
 /// Leaf `Map.prototype.has` probe with the same no-flatten/no-GC contract as
 /// [`STUB_COLLECTION_MAP_GET_LEAF`].
 pub const STUB_COLLECTION_MAP_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 8,
-    name: "collection_map_has_leaf",
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 2,
+    effects: RuntimeStubEffects::none(),
 };
 
 /// Leaf `Set.prototype.has` probe with the same no-flatten/no-GC contract as
 /// [`STUB_COLLECTION_MAP_GET_LEAF`].
 pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 9,
-    name: "collection_set_has_leaf",
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 2,
+    effects: RuntimeStubEffects::none(),
 };
 
 /// Allocating `Map.prototype.set` mutation stub.
@@ -358,9 +572,9 @@ pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescr
 /// safepoint id so a moving GC can trace and rewrite all live tagged values.
 pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 10,
-    name: "collection_map_set_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, true),
 };
 
 /// Allocating `Set.prototype.add` mutation stub.
@@ -371,9 +585,9 @@ pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// a per-builtin bridge shape.
 pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 11,
-    name: "collection_set_add_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, true),
 };
 
 /// Allocating `Map.prototype.get` lookup stub.
@@ -383,45 +597,45 @@ pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// must publish the same safepoint/root packet as mutation stubs.
 pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 12,
-    name: "collection_map_get_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, false),
 };
 
 /// Allocating `Map.prototype.has` lookup stub with the same materializing key
 /// contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 13,
-    name: "collection_map_has_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, false),
 };
 
 /// Allocating `Set.prototype.has` lookup stub with the same materializing key
 /// contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 14,
-    name: "collection_set_has_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, false),
 };
 
 /// Allocating `Map.prototype.delete` mutation stub with the same materializing
 /// key contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 15,
-    name: "collection_map_delete_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, true),
 };
 
 /// Allocating `Set.prototype.delete` mutation stub with the same materializing
 /// key contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 16,
-    name: "collection_set_delete_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, true),
 };
 
 /// Allocating primitive string-concat stub for `+`.
@@ -432,10 +646,56 @@ pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubD
 /// bytecode delegate.
 pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 17,
-    name: "string_concat_alloc",
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
+    effects: RuntimeStubEffects::allocating(true, false),
 };
+
+/// Human-readable symbol for a stable runtime-stub id.
+#[must_use]
+pub const fn runtime_stub_name(id: RuntimeStubId) -> &'static str {
+    match id {
+        1 => "jit_runtime_call",
+        2 => "jit_runtime_call_method",
+        3 => "jit_prepare_direct_call",
+        4 => "jit_prepare_direct_method_call",
+        5 => "jit_property_fallback",
+        6 => "jit_backedge_poll",
+        7 => "collection_map_get_leaf",
+        8 => "collection_map_has_leaf",
+        9 => "collection_set_has_leaf",
+        10 => "collection_map_set_alloc",
+        11 => "collection_set_add_alloc",
+        12 => "collection_map_get_alloc",
+        13 => "collection_map_has_alloc",
+        14 => "collection_set_has_alloc",
+        15 => "collection_map_delete_alloc",
+        16 => "collection_set_delete_alloc",
+        17 => "string_concat_alloc",
+        _ => "unknown_runtime_stub",
+    }
+}
+
+/// Checked inventory of every current machine-callable runtime-stub contract.
+pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
+    STUB_JIT_RUNTIME_CALL,
+    STUB_JIT_RUNTIME_CALL_METHOD,
+    STUB_JIT_PREPARE_DIRECT_CALL,
+    STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
+    STUB_JIT_PROPERTY_FALLBACK,
+    STUB_JIT_BACKEDGE_POLL,
+    STUB_COLLECTION_MAP_GET_LEAF,
+    STUB_COLLECTION_MAP_HAS_LEAF,
+    STUB_COLLECTION_SET_HAS_LEAF,
+    STUB_COLLECTION_MAP_SET_ALLOC,
+    STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_COLLECTION_MAP_GET_ALLOC,
+    STUB_COLLECTION_MAP_HAS_ALLOC,
+    STUB_COLLECTION_SET_HAS_ALLOC,
+    STUB_COLLECTION_MAP_DELETE_ALLOC,
+    STUB_COLLECTION_SET_DELETE_ALLOC,
+    STUB_STRING_CONCAT_ALLOC,
+];
 
 /// Status code returned by a runtime stub.
 #[repr(u8)]
@@ -636,6 +896,104 @@ impl TaggedLocation {
     }
 }
 
+/// Compact immutable frame-root map descriptor.
+///
+/// `bitmap_offset` and `bitmap_word_count` index a CodeObject-owned `u64`
+/// bitmap table. Bit `n` names tagged register slot `n`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMap {
+    /// Dense map id local to the owning CodeObject.
+    pub id: u32,
+    /// First bitmap word in the CodeObject frame-map table.
+    pub bitmap_offset: u32,
+    /// Number of bitmap words.
+    pub bitmap_word_count: u16,
+    /// Number of initialized frame slots covered by the map.
+    pub slot_count: u16,
+}
+
+/// Compact immutable native spill-root map descriptor.
+///
+/// Spill locations are signed byte offsets from the native spill-area base and
+/// use the CodeObject-owned `i32` location table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpillMap {
+    /// Dense map id local to the owning CodeObject.
+    pub id: u32,
+    /// First spill offset in the CodeObject spill-location table.
+    pub location_offset: u32,
+    /// Number of tagged spill locations.
+    pub location_count: u16,
+    /// Reserved; must be zero in layout version 1.
+    pub reserved: u16,
+}
+
+/// Machine-code return-PC safepoint entry.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SafepointEntry {
+    /// Native return offset within the owning CodeObject.
+    pub native_return_offset: u32,
+    /// Canonical logical bytecode PC published before the call.
+    pub logical_pc: u32,
+    /// [`FrameMap::id`].
+    pub frame_map_id: u32,
+    /// [`SpillMap::id`].
+    pub spill_map_id: u32,
+    /// Deopt/side-exit frame state or [`NO_FRAME_STATE`].
+    pub frame_state_id: FrameStateId,
+    /// Runtime stub invoked at this return PC.
+    pub stub_id: RuntimeStubId,
+}
+
+/// Kind of assumption that can invalidate installed native code.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeDependencyKind {
+    /// VM field layout/build compatibility.
+    VmLayout = 0,
+    /// Runtime-stub table ids/signatures compatibility.
+    RuntimeStubTable = 1,
+    /// Realm identity.
+    Realm = 2,
+    /// Global/prototype/array protector epoch.
+    Protector = 3,
+    /// Builtin identity epoch.
+    BuiltinIdentity = 4,
+    /// Shape/prototype dependency not represented by a live feedback guard.
+    ShapeEpoch = 5,
+}
+
+/// Explicit validity dependency owned by a CodeObject.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeDependency {
+    /// Dependency family.
+    pub kind: CodeDependencyKind,
+    /// Reserved flags; must be zero in layout version 1.
+    pub flags: u16,
+    /// Isolate-local stable identity.
+    pub identity: u32,
+    /// Expected version/value at code entry.
+    pub expected: u64,
+}
+
+/// Lifecycle state for installed code. Invalidation first transitions
+/// `Installed -> Invalid`, unlinks entry points, then transitions to `Retired`;
+/// executable memory can be reclaimed only after all active anchors are gone.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeLifetimeState {
+    /// Entry is valid and may be selected.
+    Installed = 0,
+    /// Entry is unlinked; active frames may still return through the code.
+    Invalid = 1,
+    /// No new or active entry; awaiting/finalizing reclamation.
+    Retired = 2,
+}
+
 /// Passive GC/deopt safepoint metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafepointRecord {
@@ -680,8 +1038,23 @@ impl SafepointRecord {
 #[must_use]
 pub const fn validate_stub_descriptor(desc: RuntimeStubDescriptor, safepoint: SafepointId) -> bool {
     match desc.class {
-        RuntimeStubClass::LeafNoAlloc => safepoint == NO_SAFEPOINT,
-        RuntimeStubClass::Alloc | RuntimeStubClass::Reentrant => safepoint != NO_SAFEPOINT,
+        RuntimeStubClass::LeafNoAlloc => safepoint == NO_SAFEPOINT && desc.effects.bits() == 0,
+        RuntimeStubClass::Alloc => {
+            safepoint != NO_SAFEPOINT
+                && desc
+                    .effects
+                    .contains(RuntimeStubEffects::MAY_ALLOCATE | RuntimeStubEffects::MAY_TRIGGER_GC)
+                && !desc.effects.contains(RuntimeStubEffects::MAY_REENTER_JS)
+        }
+        RuntimeStubClass::Reentrant => {
+            safepoint != NO_SAFEPOINT
+                && desc.effects.contains(
+                    RuntimeStubEffects::MAY_ALLOCATE
+                        | RuntimeStubEffects::MAY_TRIGGER_GC
+                        | RuntimeStubEffects::MAY_THROW
+                        | RuntimeStubEffects::MAY_REENTER_JS,
+                )
+        }
     }
 }
 
@@ -693,9 +1066,9 @@ mod tests {
     fn leaf_stub_must_not_name_safepoint() {
         let desc = RuntimeStubDescriptor {
             id: 1,
-            name: "map_has_leaf",
             class: RuntimeStubClass::LeafNoAlloc,
             argument_count: 2,
+            effects: RuntimeStubEffects::none(),
         };
         assert!(validate_stub_descriptor(desc, NO_SAFEPOINT));
         assert!(!validate_stub_descriptor(desc, 7));
@@ -753,11 +1126,51 @@ mod tests {
 
     #[test]
     fn abi_records_stay_small() {
-        assert!(std::mem::size_of::<NativeFrameHeader>() <= 40);
+        assert_eq!(std::mem::size_of::<VmThread>(), 56);
+        assert_eq!(std::mem::size_of::<NativeFrameHeader>(), 40);
+        assert_eq!(std::mem::size_of::<NativeFrame>(), 96);
+        assert_eq!(std::mem::size_of::<DispatchResult>(), 16);
+        assert_eq!(std::mem::size_of::<RuntimeStubDescriptor>(), 8);
         assert!(std::mem::size_of::<RuntimeStubAllocContext>() <= 72);
         assert!(std::mem::size_of::<RuntimeStubResult>() <= 24);
         assert_eq!(std::mem::size_of::<RuntimeStubResultPair>(), 16);
         assert!(std::mem::size_of::<TaggedLocation>() <= 4);
+        assert_eq!(std::mem::size_of::<FrameMap>(), 12);
+        assert_eq!(std::mem::size_of::<SpillMap>(), 12);
+        assert_eq!(std::mem::size_of::<SafepointEntry>(), 24);
+        assert_eq!(std::mem::size_of::<CodeDependency>(), 16);
+    }
+
+    #[test]
+    fn host_abi_offsets_are_golden() {
+        assert_eq!(std::mem::offset_of!(VmThread, current_frame), 0);
+        assert_eq!(std::mem::offset_of!(VmThread, pending_exception_bits), 32);
+        assert_eq!(std::mem::offset_of!(VmThread, layout_version), 48);
+        assert_eq!(std::mem::offset_of!(NativeFrameHeader, previous_frame), 0);
+        assert_eq!(std::mem::offset_of!(NativeFrameHeader, resume_pc), 16);
+        assert_eq!(std::mem::offset_of!(NativeFrameHeader, flags), 24);
+        assert_eq!(std::mem::offset_of!(NativeFrameHeader, feedback_index), 32);
+        assert_eq!(std::mem::offset_of!(NativeFrame, register_base), 40);
+        assert_eq!(std::mem::offset_of!(NativeFrame, code_object_id), 64);
+        assert_eq!(std::mem::offset_of!(NativeFrame, return_register), 88);
+    }
+
+    #[test]
+    fn runtime_stub_inventory_is_dense_and_classified() {
+        for (index, descriptor) in RUNTIME_STUB_DESCRIPTORS.iter().enumerate() {
+            assert_eq!(descriptor.id as usize, index + 1);
+            assert_ne!(runtime_stub_name(descriptor.id), "unknown_runtime_stub");
+            let safepoint = if descriptor.class == RuntimeStubClass::LeafNoAlloc {
+                NO_SAFEPOINT
+            } else {
+                0
+            };
+            assert!(
+                validate_stub_descriptor(*descriptor, safepoint),
+                "invalid descriptor {}",
+                runtime_stub_name(descriptor.id)
+            );
+        }
     }
 
     #[test]

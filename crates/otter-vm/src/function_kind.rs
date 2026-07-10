@@ -378,30 +378,36 @@ impl Interpreter {
         ];
         let tag_sym = self.well_known_symbols.get(WellKnown::ToStringTag);
         for index in 0..2 {
-            let (kind_root, parent_root, shared_root, tag, methods) = if index == 0 {
+            let (mut kind_value, mut parent_value, tag, methods) = if index == 0 {
                 (
-                    &sync_kind_root,
-                    &iterator_parent_root,
-                    &mut sync_shared_root,
+                    sync_kind_root,
+                    iterator_parent_root,
                     "Generator",
                     sync_methods,
                 )
             } else {
                 (
-                    &async_kind_root,
-                    &async_iterator_parent_root,
-                    &mut async_shared_root,
+                    async_kind_root,
+                    async_iterator_parent_root,
                     "AsyncGenerator",
                     async_methods,
                 )
             };
-            if kind_root.as_object().is_none() {
+            if kind_value.as_object().is_none() {
                 continue;
             }
+            let mut shared_value = Value::undefined();
+            let mut iteration_roots = otter_gc::RootScope::new(&mut self.gc_heap);
+            // SAFETY: these per-iteration canonical slots precede the scope and
+            // are never borrowed across a GC safepoint. The collector may
+            // rewrite them in place; each use below reloads the current value.
+            unsafe {
+                iteration_roots.add_value(&mut kind_value);
+                iteration_roots.add_value(&mut parent_value);
+                iteration_roots.add_value(&mut shared_value);
+            }
             let Ok(shared) = ({
-                let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    kind_root.trace_value_slots(visitor);
-                };
+                let mut visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
                 object::alloc_object_with_shape_roots(
                     &mut self.gc_heap,
                     self.shape_runtime.root(),
@@ -410,8 +416,8 @@ impl Interpreter {
             }) else {
                 continue;
             };
-            *shared_root = Value::object(shared);
-            if let Some(parent) = parent_root.as_object() {
+            shared_value = Value::object(shared);
+            if let Some(parent) = parent_value.as_object() {
                 object::set_prototype(shared, &mut self.gc_heap, Some(parent));
             }
             // §27.5.1.2-5 / §27.6.1.2-4 — own `next` / `return` /
@@ -423,11 +429,11 @@ impl Interpreter {
                     name,
                     1,
                     call,
-                    &[kind_root, shared_root],
+                    &[],
                 ) else {
                     continue;
                 };
-                let shared = shared_root
+                let shared = shared_value
                     .as_object()
                     .expect("shared generator prototype stays rooted");
                 object::define_own_property(
@@ -445,7 +451,7 @@ impl Interpreter {
             let Ok(tag_string) = JsString::from_str(tag, &mut self.gc_heap) else {
                 continue;
             };
-            let shared = shared_root
+            let shared = shared_value
                 .as_object()
                 .expect("shared generator prototype stays rooted");
             object::define_own_symbol_property_partial(
@@ -464,17 +470,22 @@ impl Interpreter {
                 shared,
                 &mut self.gc_heap,
                 "constructor",
-                object::PropertyDescriptor::data(*kind_root, false, false, true),
+                object::PropertyDescriptor::data(kind_value, false, false, true),
             );
-            let kind_proto = kind_root
+            let kind_proto = kind_value
                 .as_object()
                 .expect("function-kind prototype stays rooted");
             object::define_own_property(
                 kind_proto,
                 &mut self.gc_heap,
                 "prototype",
-                object::PropertyDescriptor::data(*shared_root, false, false, true),
+                object::PropertyDescriptor::data(shared_value, false, false, true),
             );
+            if index == 0 {
+                sync_shared_root = shared_value;
+            } else {
+                async_shared_root = shared_value;
+            }
         }
         self.function_kind_prototypes.generator_object_prototype = sync_shared_root.as_object();
         self.function_kind_prototypes

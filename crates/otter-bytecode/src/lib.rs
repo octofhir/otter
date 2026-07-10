@@ -29,6 +29,7 @@ pub mod disasm;
 pub mod dump;
 pub mod encoding;
 pub mod method_id;
+pub mod opcode_audit;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

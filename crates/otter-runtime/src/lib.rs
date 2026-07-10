@@ -808,6 +808,8 @@ pub struct RuntimeExecutionStats {
     pub gc_cycles: u64,
     /// Most recent full-GC pause in milliseconds.
     pub gc_last_pause_ms: f32,
+    /// Cumulative full-GC pause time, in nanoseconds.
+    pub gc_full_pause_ns_total: u64,
     /// Minor (young-gen scavenge) cycles executed.
     pub gc_minor_cycles: u64,
     /// Cumulative minor-GC pause time, in nanoseconds.
@@ -1359,6 +1361,23 @@ impl RuntimeModuleGraphState {
         self.last_module_count = linked.module.module_inits.len();
         Ok(linked)
     }
+
+    fn load_program_profiled(
+        &mut self,
+        loader: &module_loader::ModuleLoader,
+        entry_path: &Path,
+    ) -> Result<
+        (
+            module_graph::LinkedProgram,
+            module_graph::ModulePhaseTimings,
+        ),
+        module_graph::GraphError,
+    > {
+        let (linked, timings) = module_graph::load_program_profiled(loader, entry_path)?;
+        self.last_entry_url = Some(linked.entry_url.clone());
+        self.last_module_count = linked.module.module_inits.len();
+        Ok((linked, timings))
+    }
 }
 
 /// Per-runtime source-map table.
@@ -1814,176 +1833,189 @@ impl Runtime {
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
+        let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
         // Attached class glue is deferred until the runtime is fully
         // assembled: the sources may reference lazily installed
         // globals, and evaluation needs the compile pipeline.
-        let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
-        for spec in &config.global_classes {
-            match spec.inner {
-                GlobalClassInner::Spec(raw) => {
-                    interp
-                        .install_global_class(raw)
-                        .map_err(|err| OtterError::Internal {
-                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                            message: err.to_string(),
-                        })?;
-                }
-                GlobalClassInner::Intrinsic {
-                    install,
-                    install_well_knowns,
-                    js_glue,
-                    name,
-                } => {
-                    if let Some(source) = js_glue {
-                        pending_class_js.push((name, source));
-                    }
-                    let global = *interp.global_this();
-                    install(interp.gc_heap_mut(), global).map_err(|err| OtterError::Internal {
-                        code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                        message: err.to_string(),
-                    })?;
-                    // Second phase, mirroring the bootstrap registry walk:
-                    // symbol-keyed members (@@toStringTag) resolve against
-                    // the realm's already-materialized well-known table.
-                    interp
-                        .run_install_well_knowns(install_well_knowns, global)
-                        .map_err(|err| OtterError::Internal {
-                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                            message: err.to_string(),
-                        })?;
-                }
-            }
-        }
-        // Declared extensions: native classes ride the identical
-        // install path (declaration order, parents before subclasses),
-        // then every JS source of the extension registers as one lazy
-        // group under its declared names.
-        let extensions = config.extensions.clone();
-        for extension in extensions {
-            for spec in extension.classes {
-                match spec.inner {
-                    GlobalClassInner::Spec(raw) => {
-                        interp
-                            .install_global_class(raw)
-                            .map_err(|err| OtterError::Internal {
-                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                message: err.to_string(),
+        let pending_class_js = interp.with_runtime_roots(
+            |interp| -> Result<Vec<(&'static str, &'static str)>, OtterError> {
+                let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
+                for spec in &config.global_classes {
+                    match spec.inner {
+                        GlobalClassInner::Spec(raw) => {
+                            interp.install_global_class(raw).map_err(|err| {
+                                OtterError::Internal {
+                                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                                    message: err.to_string(),
+                                }
                             })?;
-                    }
-                    GlobalClassInner::Intrinsic {
-                        install,
-                        install_well_knowns,
-                        js_glue,
-                        name,
-                    } => {
-                        if let Some(source) = js_glue {
-                            pending_class_js.push((name, source));
                         }
-                        let global = *interp.global_this();
-                        install(interp.gc_heap_mut(), global).map_err(|err| {
-                            OtterError::Internal {
-                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                message: err.to_string(),
+                        GlobalClassInner::Intrinsic {
+                            install,
+                            install_well_knowns,
+                            js_glue,
+                            name,
+                        } => {
+                            if let Some(source) = js_glue {
+                                pending_class_js.push((name, source));
                             }
-                        })?;
+                            let global = *interp.global_this();
+                            install(interp.gc_heap_mut(), global).map_err(|err| {
+                                OtterError::Internal {
+                                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                                    message: err.to_string(),
+                                }
+                            })?;
+                            // Second phase, mirroring the bootstrap registry walk:
+                            // symbol-keyed members (@@toStringTag) resolve against
+                            // the realm's already-materialized well-known table.
+                            interp
+                                .run_install_well_knowns(install_well_knowns, global)
+                                .map_err(|err| OtterError::Internal {
+                                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                                    message: err.to_string(),
+                                })?;
+                        }
+                    }
+                }
+                // Declared extensions: native classes ride the identical
+                // install path (declaration order, parents before subclasses),
+                // then every JS source of the extension registers as one lazy
+                // group under its declared names.
+                let extensions = config.extensions.clone();
+                for extension in extensions {
+                    for spec in extension.classes {
+                        match spec.inner {
+                            GlobalClassInner::Spec(raw) => {
+                                interp.install_global_class(raw).map_err(|err| {
+                                    OtterError::Internal {
+                                        code: DiagnosticCode::GlobalClassBootstrap
+                                            .as_str()
+                                            .to_string(),
+                                        message: err.to_string(),
+                                    }
+                                })?;
+                            }
+                            GlobalClassInner::Intrinsic {
+                                install,
+                                install_well_knowns,
+                                js_glue,
+                                name,
+                            } => {
+                                if let Some(source) = js_glue {
+                                    pending_class_js.push((name, source));
+                                }
+                                let global = *interp.global_this();
+                                install(interp.gc_heap_mut(), global).map_err(|err| {
+                                    OtterError::Internal {
+                                        code: DiagnosticCode::GlobalClassBootstrap
+                                            .as_str()
+                                            .to_string(),
+                                        message: err.to_string(),
+                                    }
+                                })?;
+                                interp
+                                    .run_install_well_knowns(install_well_knowns, global)
+                                    .map_err(|err| OtterError::Internal {
+                                        code: DiagnosticCode::GlobalClassBootstrap
+                                            .as_str()
+                                            .to_string(),
+                                        message: err.to_string(),
+                                    })?;
+                            }
+                        }
+                    }
+                    if !extension.js.is_empty() {
+                        let names: Vec<&'static str> = extension.lazy_names().collect();
+                        let mut source = String::new();
+                        for entry in extension.js {
+                            source.push_str(entry.source);
+                            // Guard against a source omitting its own
+                            // statement terminator.
+                            source.push_str("\n;\n");
+                        }
                         interp
-                            .run_install_well_knowns(install_well_knowns, global)
+                            .register_lazy_global_group(names, source)
                             .map_err(|err| OtterError::Internal {
                                 code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                message: err.to_string(),
+                                message: format!(
+                                    "extension `{}` lazy globals failed: {err}",
+                                    extension.name
+                                ),
                             })?;
                     }
                 }
-            }
-            if !extension.js.is_empty() {
-                let names: Vec<&'static str> = extension.lazy_names().collect();
-                let mut source = String::new();
-                for entry in extension.js {
-                    source.push_str(entry.source);
-                    // Guard against a source omitting its own
-                    // statement terminator.
-                    source.push_str("\n;\n");
+                if config.install_process_global {
+                    process::install_global(
+                        &mut *interp,
+                        &config.process_argv,
+                        &config.process_cwd,
+                        &config.capabilities,
+                    )?;
                 }
-                interp
-                    .register_lazy_global_group(names, source)
-                    .map_err(|err| OtterError::Internal {
-                        code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                        message: format!(
-                            "extension `{}` lazy globals failed: {err}",
-                            extension.name
-                        ),
-                    })?;
-            }
-        }
-        if config.install_process_global {
-            process::install_global(
-                &mut interp,
-                &config.process_argv,
-                &config.process_cwd,
-                &config.capabilities,
-            )?;
-        }
-        // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
-        // `new Function(...)` reach a real parse + compile path.
-        // The closure is reusable across calls; each invocation
-        // builds a fresh `BytecodeModule`.
-        let hook: otter_vm::EvalHook =
-            std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
-                // §16.1.6 ScriptEvaluation — host-requested script
-                // execution ($262.evalScript) compiles under script
-                // GDI semantics, not eval semantics.
-                if options.script_goal {
-                    return otter_compiler::compile_script_source(
-                        source,
-                        SourceKind::JavaScript,
-                        "<evalScript>",
-                    )
-                    .map_err(|e| format!("compile error: {e:?}"));
-                }
-                // §19.2.1.3 — a direct eval inside a function carries
-                // its caller variable environment binding list.
-                let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
-                    options.caller_scope.map(|bindings| {
-                        bindings
-                            .into_iter()
-                            .map(|binding| otter_compiler::EvalCallerBinding {
-                                name: binding.name,
-                                lexical: binding.lexical,
-                                captured: binding.captured,
-                                is_const: binding.is_const,
-                                fn_self_name: binding.fn_self_name,
-                            })
-                            .collect()
+                // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
+                // `new Function(...)` reach a real parse + compile path.
+                // The closure is reusable across calls; each invocation
+                // builds a fresh `BytecodeModule`.
+                let hook: otter_vm::EvalHook =
+                    std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
+                        // §16.1.6 ScriptEvaluation — host-requested script
+                        // execution ($262.evalScript) compiles under script
+                        // GDI semantics, not eval semantics.
+                        if options.script_goal {
+                            return otter_compiler::compile_script_source(
+                                source,
+                                SourceKind::JavaScript,
+                                "<evalScript>",
+                            )
+                            .map_err(|e| format!("compile error: {e:?}"));
+                        }
+                        // §19.2.1.3 — a direct eval inside a function carries
+                        // its caller variable environment binding list.
+                        let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
+                            options.caller_scope.map(|bindings| {
+                                bindings
+                                    .into_iter()
+                                    .map(|binding| otter_compiler::EvalCallerBinding {
+                                        name: binding.name,
+                                        lexical: binding.lexical,
+                                        captured: binding.captured,
+                                        is_const: binding.is_const,
+                                        fn_self_name: binding.fn_self_name,
+                                    })
+                                    .collect()
+                            });
+                        otter_compiler::compile_eval_source(
+                            source,
+                            SourceKind::JavaScript,
+                            "<eval>",
+                            options.force_strict,
+                            options.forbid_var_arguments,
+                            caller_scope.as_deref(),
+                            options.new_target_allowed,
+                            options.in_class_field_initializer,
+                            options.super_property_allowed,
+                        )
+                        .map_err(|e| format!("compile error: {e:?}"))
                     });
-                otter_compiler::compile_eval_source(
-                    source,
-                    SourceKind::JavaScript,
-                    "<eval>",
-                    options.force_strict,
-                    options.forbid_var_arguments,
-                    caller_scope.as_deref(),
-                    options.new_target_allowed,
-                    options.in_class_field_initializer,
-                    options.super_property_allowed,
-                )
-                .map_err(|e| format!("compile error: {e:?}"))
-            });
-        interp.set_eval_hook(Some(hook));
-        // The JIT is the default execution path: functions start in the
-        // interpreter and tier up through the baseline/optimizing JIT.
-        // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
-        if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
-            interp.set_jit_compiler(Some(std::sync::Arc::new(
-                otter_jit::BaselineJitCompiler::new(),
-            )));
-        }
-        if let Some(factory) = &config.tracer_factory {
-            interp.set_tracer(Some(factory.build()));
-        }
-        let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
-        interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
-            queue: layer_a_dynamic_imports.clone(),
-        }));
+                interp.set_eval_hook(Some(hook));
+                // The JIT is the default execution path: functions start in the
+                // interpreter and tier up through the baseline/optimizing JIT.
+                // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
+                if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
+                    interp.set_jit_compiler(Some(std::sync::Arc::new(
+                        otter_jit::BaselineJitCompiler::new(),
+                    )));
+                }
+                if let Some(factory) = &config.tracer_factory {
+                    interp.set_tracer(Some(factory.build()));
+                }
+                interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
+                    queue: layer_a_dynamic_imports.clone(),
+                }));
+                Ok(pending_class_js)
+            },
+        )?;
         let mut runtime = Runtime {
             interp,
             config,
@@ -3051,6 +3083,7 @@ impl Runtime {
             gc_live_bytes: gc.live_bytes,
             gc_cycles: gc.gc_cycles,
             gc_last_pause_ms: gc.last_gc_pause_ms,
+            gc_full_pause_ns_total: gc.full_pause_ns_total,
             gc_minor_cycles: gc.minor_gc_cycles,
             gc_minor_pause_ns_total: gc.minor_pause_ns_total,
             gc_minor_dirty_cards_scanned: gc.minor_dirty_cards_scanned,
@@ -3430,6 +3463,24 @@ impl Runtime {
             .map(|(result, _)| result)
     }
 
+    /// Load, link, and execute a module graph with opt-in phase timings.
+    ///
+    /// Ordinary [`Self::run_module`] calls do not read the clock at phase
+    /// boundaries or accumulate telemetry. This surface is intended for
+    /// benchmark evidence and explicit diagnostics.
+    ///
+    /// # Errors
+    /// See [`OtterError`] variants.
+    pub fn run_module_profiled(
+        &mut self,
+        entry_path: impl AsRef<Path>,
+    ) -> Result<(ExecutionResult, module_graph::ModulePhaseTimings), OtterError> {
+        let mut timings = module_graph::ModulePhaseTimings::default();
+        let (result, _) =
+            self.run_module_with_context_inner(entry_path.as_ref(), Some(&mut timings))?;
+        Ok((result, timings))
+    }
+
     /// Register every linked module's §16.2.1.6 ResolveExport table with
     /// the interpreter so the Module Namespace Exotic Object reads and
     /// `Op::LoadImportBinding` resolve re-exported / star-exported names
@@ -3475,14 +3526,30 @@ impl Runtime {
         &mut self,
         entry_path: impl AsRef<Path>,
     ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
-        let start = std::time::Instant::now();
-        let entry_path = entry_path.as_ref();
-        let loader = self.module_loader_for_entry(entry_path);
-        let linked = self
-            .module_graph
-            .load_program(&loader, entry_path)
-            .map_err(map_graph_error)?;
+        self.run_module_with_context_inner(entry_path.as_ref(), None)
+    }
 
+    fn run_module_with_context_inner(
+        &mut self,
+        entry_path: &Path,
+        mut timings: Option<&mut module_graph::ModulePhaseTimings>,
+    ) -> Result<(ExecutionResult, ExecutionContext), OtterError> {
+        let start = std::time::Instant::now();
+        let loader = self.module_loader_for_entry(entry_path);
+        let linked = if timings.is_some() {
+            let (linked, graph_timings) = self
+                .module_graph
+                .load_program_profiled(&loader, entry_path)
+                .map_err(map_graph_error)?;
+            *timings.as_deref_mut().expect("checked timing sink") = graph_timings;
+            linked
+        } else {
+            self.module_graph
+                .load_program(&loader, entry_path)
+                .map_err(map_graph_error)?
+        };
+
+        let runtime_link_started = timings.is_some().then(std::time::Instant::now);
         let mut module = linked.module;
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
@@ -3528,7 +3595,19 @@ impl Runtime {
             });
 
         self.module_records.mark_evaluating();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), runtime_link_started) {
+            timings.link_time_ns = timings
+                .link_time_ns
+                .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+        let codeblock_started = timings.is_some().then(std::time::Instant::now);
         let context = self.interp.link_module(module);
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), codeblock_started) {
+            timings.compile_time_ns = timings
+                .compile_time_ns
+                .saturating_add(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+        let execute_started = timings.is_some().then(std::time::Instant::now);
         let script_outcome = self.interp.run(&context);
         let drain_outcome = self.interp.drain_microtasks(&context);
         let value = match (script_outcome, drain_outcome) {
@@ -3547,6 +3626,10 @@ impl Runtime {
                 }),
             ) => {
                 self.module_records.mark_evaluated();
+                if let (Some(timings), Some(started)) = (timings.as_deref_mut(), execute_started) {
+                    timings.execute_time_ns =
+                        started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+                }
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
                 return Ok((self.attach_execution_stats(result), context));
             }
@@ -3567,6 +3650,9 @@ impl Runtime {
             (Ok(v), Ok(())) => v,
         };
         self.pump_layer_a_dynamic_imports(&context)?;
+        if let (Some(timings), Some(started)) = (timings, execute_started) {
+            timings.execute_time_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        }
         self.module_records.mark_evaluated();
         let result =
             ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())

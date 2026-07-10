@@ -47,6 +47,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use otter_bytecode::{
     BytecodeModule, Constant, Function, Instruction, ModuleInit, ModuleResolution, Op, Operand,
@@ -66,6 +67,31 @@ use crate::module_loader::{LoaderError, ModuleLoader};
 /// trees both surface here as a catchable `RangeError`-shaped
 /// diagnostic before exhausting the host stack.
 pub const MODULE_DEPTH_LIMIT: usize = 256;
+
+/// Opt-in phase timings for one module-graph load and execution.
+///
+/// Graph construction fills resolve, load, parse, compile, and link. The
+/// runtime adds module instantiation to link time and records execute time.
+/// Every value is cumulative across all modules in the graph.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModulePhaseTimings {
+    /// Canonical specifier resolution time.
+    pub resolve_time_ns: u64,
+    /// Source read/fetch time.
+    pub load_time_ns: u64,
+    /// OXC parse time.
+    pub parse_time_ns: u64,
+    /// Bytecode lowering and CodeBlock construction time.
+    pub compile_time_ns: u64,
+    /// Graph validation, merge, and runtime instantiation time.
+    pub link_time_ns: u64,
+    /// Interpreter/JIT execution and microtask-drain time.
+    pub execute_time_ns: u64,
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 /// Error variants for [`load_program`].
 #[derive(Debug, Clone, thiserror::Error)]
@@ -180,6 +206,7 @@ struct ModuleGraphBuilder<'a> {
     queue: Vec<(String, SourceKind, String, bool)>,
     load_count: usize,
     module_sources: BTreeMap<String, String>,
+    timings: Option<ModulePhaseTimings>,
 }
 
 impl<'a> ModuleGraphBuilder<'a> {
@@ -196,10 +223,89 @@ impl<'a> ModuleGraphBuilder<'a> {
             queue: vec![(entry_url, entry_kind, entry_text, false)],
             load_count: 0,
             module_sources: BTreeMap::new(),
+            timings: None,
         }
     }
 
-    fn build(mut self) -> Result<ModuleGraph, GraphError> {
+    fn new_profiled(
+        loader: &'a ModuleLoader,
+        entry_url: String,
+        entry_kind: SourceKind,
+        entry_text: String,
+        timings: ModulePhaseTimings,
+    ) -> Self {
+        let mut builder = Self::new(loader, entry_url, entry_kind, entry_text);
+        builder.timings = Some(timings);
+        builder
+    }
+
+    fn add_resolve_time(&mut self, elapsed: Duration) {
+        if let Some(timings) = &mut self.timings {
+            timings.resolve_time_ns = timings.resolve_time_ns.saturating_add(duration_ns(elapsed));
+        }
+    }
+
+    fn add_load_time(&mut self, elapsed: Duration) {
+        if let Some(timings) = &mut self.timings {
+            timings.load_time_ns = timings.load_time_ns.saturating_add(duration_ns(elapsed));
+        }
+    }
+
+    fn add_parse_time(&mut self, elapsed: Duration) {
+        if let Some(timings) = &mut self.timings {
+            timings.parse_time_ns = timings.parse_time_ns.saturating_add(duration_ns(elapsed));
+        }
+    }
+
+    fn add_compile_time(&mut self, elapsed: Duration) {
+        if let Some(timings) = &mut self.timings {
+            timings.compile_time_ns = timings.compile_time_ns.saturating_add(duration_ns(elapsed));
+        }
+    }
+
+    fn resolve(&mut self, specifier: &str, referrer: Option<&str>) -> Result<String, LoaderError> {
+        if self.timings.is_none() {
+            return self.loader.resolve(specifier, referrer);
+        }
+        let started = Instant::now();
+        let result = self.loader.resolve(specifier, referrer);
+        self.add_resolve_time(started.elapsed());
+        result
+    }
+
+    fn load_resolved(
+        &mut self,
+        url: String,
+    ) -> Result<crate::module_loader::ResolvedSource, LoaderError> {
+        if self.timings.is_none() {
+            return self.loader.load_resolved(url);
+        }
+        let started = Instant::now();
+        let result = self.loader.load_resolved(url);
+        self.add_load_time(started.elapsed());
+        result
+    }
+
+    fn read_text_file(&mut self, url: &str) -> Result<String, LoaderError> {
+        let path = url.strip_prefix("file://").unwrap_or(url);
+        if self.timings.is_none() {
+            return std::fs::read_to_string(path).map_err(|error| LoaderError::Load {
+                url: url.to_string(),
+                message: error.to_string(),
+            });
+        }
+        let started = Instant::now();
+        let result = std::fs::read_to_string(path).map_err(|error| LoaderError::Load {
+            url: url.to_string(),
+            message: error.to_string(),
+        });
+        self.add_load_time(started.elapsed());
+        result
+    }
+
+    fn build_with_timings(
+        mut self,
+    ) -> Result<(ModuleGraph, Option<ModulePhaseTimings>), GraphError> {
         while let Some((url, kind, text, dynamic)) = self.queue.pop() {
             let url_for_error = url.clone();
             if let Err(err) = self.load_one(url, kind, text, dynamic) {
@@ -210,11 +316,14 @@ impl<'a> ModuleGraphBuilder<'a> {
                 return Err(err);
             }
         }
-        Ok(ModuleGraph {
-            entry_url: self.entry_url,
-            nodes: self.nodes,
-            module_sources: self.module_sources,
-        })
+        Ok((
+            ModuleGraph {
+                entry_url: self.entry_url,
+                nodes: self.nodes,
+                module_sources: self.module_sources,
+            },
+            self.timings,
+        ))
     }
 
     fn load_one(
@@ -249,7 +358,8 @@ impl<'a> ModuleGraphBuilder<'a> {
         // `with_program` consumes `text`.
         self.module_sources.insert(url.clone(), text.clone());
 
-        let (compiled, deps, queued) = with_program(text, kind, |program| {
+        let timing_enabled = self.timings.is_some();
+        let compile_program = |program: &Program<'_>| {
             let requests = collect_module_requests(program);
             let mut resolved_imports: HashMap<String, String> = HashMap::new();
             let mut deps: Vec<ModuleEdge> = Vec::with_capacity(requests.len());
@@ -264,7 +374,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                 // accepts extension-less fixture paths the normal
                 // probing resolver would reject.
                 if request.attr_type.as_deref() == Some("text") {
-                    let base = match self.loader.resolve(&request.specifier, Some(&url)) {
+                    let base = match self.resolve(&request.specifier, Some(&url)) {
                         Ok(target) => target,
                         Err(_) => resolve_plain_relative_file(&request.specifier, &url)
                             .ok_or_else(|| {
@@ -285,11 +395,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                         deferred: request.deferred,
                     });
                     if !self.nodes.contains_key(&target) {
-                        let path = base.strip_prefix("file://").unwrap_or(&base);
-                        let raw = std::fs::read_to_string(path).map_err(|e| LoaderError::Load {
-                            url: base.clone(),
-                            message: e.to_string(),
-                        })?;
+                        let raw = self.read_text_file(&base)?;
                         let escaped = serde_json::to_string(&raw).unwrap_or_default();
                         let shim = format!("export default ({escaped});\n");
                         queued.push((
@@ -301,7 +407,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                     }
                     continue;
                 }
-                let target = self.loader.resolve(&request.specifier, Some(&url))?;
+                let target = self.resolve(&request.specifier, Some(&url))?;
                 resolved_imports.insert(request.specifier.clone(), target.clone());
                 if request.dynamic {
                     dynamic_specs.insert(request.specifier.clone());
@@ -313,7 +419,7 @@ impl<'a> ModuleGraphBuilder<'a> {
                     deferred: request.deferred,
                 });
                 if !self.nodes.contains_key(&target) {
-                    let loaded = self.loader.load(&request.specifier, Some(&url))?;
+                    let loaded = self.load_resolved(target)?;
                     queued.push((
                         loaded.url,
                         loaded.kind,
@@ -326,13 +432,15 @@ impl<'a> ModuleGraphBuilder<'a> {
                 module_url: url.clone(),
                 resolved_imports,
             };
-            let mut compiled =
-                compile_module_program_to_module(program, kind, &host).map_err(|e| {
-                    GraphError::Compile {
-                        url: url.clone(),
-                        error: e,
-                    }
-                })?;
+            let compile_started = timing_enabled.then(Instant::now);
+            let compiled = compile_module_program_to_module(program, kind, &host);
+            if let Some(started) = compile_started {
+                self.add_compile_time(started.elapsed());
+            }
+            let mut compiled = compiled.map_err(|e| GraphError::Compile {
+                url: url.clone(),
+                error: e,
+            })?;
             for edge in &mut compiled.bytecode.module_resolutions {
                 if dynamic_specs.contains(&edge.specifier)
                     && !eager_static_specs.contains(&edge.specifier)
@@ -363,11 +471,24 @@ impl<'a> ModuleGraphBuilder<'a> {
                     .unwrap_or(usize::MAX)
             });
             Ok::<_, GraphError>((compiled, deps, queued))
-        })
-        .map_err(|e| GraphError::Parse {
-            url: url.clone(),
-            error: e,
-        })??;
+        };
+        let parsed = if timing_enabled {
+            let (parsed, parse_time) =
+                otter_syntax::with_program_timing(text, kind, compile_program).map_err(
+                    |error| GraphError::Parse {
+                        url: url.clone(),
+                        error,
+                    },
+                )?;
+            self.add_parse_time(parse_time);
+            parsed
+        } else {
+            with_program(text, kind, compile_program).map_err(|error| GraphError::Parse {
+                url: url.clone(),
+                error,
+            })?
+        };
+        let (compiled, deps, queued) = parsed?;
 
         self.queue.extend(queued);
         self.nodes.insert(
@@ -1083,9 +1204,34 @@ pub struct LinkedProgram {
 /// - <https://tc39.es/ecma262/#sec-link>
 /// - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedProgram, GraphError> {
+    load_program_inner(loader, entry_path, None).map(|(linked, _)| linked)
+}
+
+/// Load, compile, and link a module graph while recording phase timings.
+///
+/// This is an explicit benchmark/diagnostic path. [`load_program`] performs the
+/// same work without clock reads or timing accumulation.
+///
+/// # Errors
+/// See [`GraphError`].
+pub fn load_program_profiled(
+    loader: &ModuleLoader,
+    entry_path: &Path,
+) -> Result<(LinkedProgram, ModulePhaseTimings), GraphError> {
+    let (linked, timings) =
+        load_program_inner(loader, entry_path, Some(ModulePhaseTimings::default()))?;
+    Ok((linked, timings.expect("profiled graph carries timings")))
+}
+
+fn load_program_inner(
+    loader: &ModuleLoader,
+    entry_path: &Path,
+    mut timings: Option<ModulePhaseTimings>,
+) -> Result<(LinkedProgram, Option<ModulePhaseTimings>), GraphError> {
     // Read the entry directly so the user sees clear errors when
     // the entry path is malformed before any specifier-resolution
     // logic runs.
+    let resolve_started = timings.is_some().then(Instant::now);
     let entry_kind =
         otter_syntax::detect_source_kind(entry_path).ok_or_else(|| LoaderError::Extension {
             url: format!("file://{}", entry_path.display()),
@@ -1105,14 +1251,31 @@ pub fn load_program(loader: &ModuleLoader, entry_path: &Path) -> Result<LinkedPr
             })?
             .display()
     );
+    if let (Some(timings), Some(started)) = (&mut timings, resolve_started) {
+        timings.resolve_time_ns = duration_ns(started.elapsed());
+    }
+    let load_started = timings.is_some().then(Instant::now);
     let entry_text = std::fs::read_to_string(entry_path).map_err(|e| LoaderError::Load {
         url: entry_url.clone(),
         message: e.to_string(),
     })?;
+    if let (Some(timings), Some(started)) = (&mut timings, load_started) {
+        timings.load_time_ns = duration_ns(started.elapsed());
+    }
 
-    ModuleGraphBuilder::new(loader, entry_url, entry_kind, entry_text)
-        .build()?
-        .link()
+    let builder = match timings {
+        Some(timings) => {
+            ModuleGraphBuilder::new_profiled(loader, entry_url, entry_kind, entry_text, timings)
+        }
+        None => ModuleGraphBuilder::new(loader, entry_url, entry_kind, entry_text),
+    };
+    let (graph, mut timings) = builder.build_with_timings()?;
+    let link_started = timings.is_some().then(Instant::now);
+    let linked = graph.link()?;
+    if let (Some(timings), Some(started)) = (&mut timings, link_started) {
+        timings.link_time_ns = duration_ns(started.elapsed());
+    }
+    Ok((linked, timings))
 }
 
 /// Merge fragments into one `BytecodeModule`, prepending a
@@ -1568,15 +1731,16 @@ mod tests {
         );
         let entry_text = std::fs::read_to_string(&entry_path).unwrap();
 
-        let graph = ModuleGraphBuilder::new(
+        let (graph, timings) = ModuleGraphBuilder::new(
             &loader,
             entry_url.clone(),
             SourceKind::TypeScript,
             entry_text,
         )
-        .build()
+        .build_with_timings()
         .expect("build graph");
 
+        assert_eq!(timings, None);
         assert_eq!(graph.entry_url, entry_url);
         assert_eq!(graph.nodes.len(), 2);
         assert!(graph.nodes.contains_key(&entry_url));
@@ -1588,5 +1752,29 @@ mod tests {
         assert_eq!(linked.module.functions[0].name, "<entry>");
         assert_eq!(linked.module.module_inits.len(), 2);
         assert_eq!(linked.metadata.len(), 2);
+    }
+
+    #[test]
+    fn profiled_load_reports_all_graph_phases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry_path = dir.path().join("entry.mjs");
+        let dep_path = dir.path().join("dep.mjs");
+        std::fs::write(
+            &entry_path,
+            "import { value } from './dep.mjs'; export const out = value;",
+        )
+        .expect("write entry");
+        std::fs::write(&dep_path, "export const value = 7;").expect("write dep");
+
+        let loader = ModuleLoader::new(dir.path().to_path_buf());
+        let (linked, timings) = load_program_profiled(&loader, &entry_path).expect("profile graph");
+
+        assert_eq!(linked.module.module_inits.len(), 2);
+        assert!(timings.resolve_time_ns > 0);
+        assert!(timings.load_time_ns > 0);
+        assert!(timings.parse_time_ns > 0);
+        assert!(timings.compile_time_ns > 0);
+        assert!(timings.link_time_ns > 0);
+        assert_eq!(timings.execute_time_ns, 0);
     }
 }

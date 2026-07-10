@@ -12,6 +12,7 @@
 //!   interpreter, and no GC allocation occurs during that move.
 //! - A half-built interpreter is never observable outside this module.
 #![allow(unused_imports)]
+use crate::rooting::RootScopeExt;
 use crate::*;
 
 unsafe fn trace_bootstrap_well_known_symbols(
@@ -251,14 +252,16 @@ impl Interpreter {
             timer_callbacks: timers::TimerCallbacks::new(),
             dynamic_import_loader: None,
             dynamic_import_registry: dynamic_import::DynamicImportRegistry::new(),
-            array_iterator_prototype: None,
-            map_iterator_prototype: None,
-            set_iterator_prototype: None,
-            string_iterator_prototype: None,
-            regexp_string_iterator_prototype: None,
-            iterator_helper_prototype: None,
-            wrap_for_valid_iterator_prototype: None,
-            default_realm_iterator_prototypes: [None; 7],
+            array_iterator_prototype: crate::gc_trace::RootCell::new(None),
+            map_iterator_prototype: crate::gc_trace::RootCell::new(None),
+            set_iterator_prototype: crate::gc_trace::RootCell::new(None),
+            string_iterator_prototype: crate::gc_trace::RootCell::new(None),
+            regexp_string_iterator_prototype: crate::gc_trace::RootCell::new(None),
+            iterator_helper_prototype: crate::gc_trace::RootCell::new(None),
+            wrap_for_valid_iterator_prototype: crate::gc_trace::RootCell::new(None),
+            default_realm_iterator_prototypes: std::array::from_fn(|_| {
+                crate::gc_trace::RootCell::new(None)
+            }),
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
@@ -274,6 +277,16 @@ impl Interpreter {
             .populate(&mut interp.gc_heap, global_this);
         let extra_roots = otter_gc::ExtraRoots::new(&interp);
         let extra_roots_guard = interp.gc_heap.register_extra_roots(extra_roots);
+        let mut iterator_roots = [Value::undefined(); 7];
+        let mut iterator_scope = otter_gc::RootScope::new(&mut interp.gc_heap);
+        // SAFETY: the fixed array stays in this stack frame until every
+        // post-bootstrap allocation completes and the final handles are
+        // published into the interpreter's stable root cells below.
+        unsafe {
+            for value in &mut iterator_roots {
+                iterator_scope.add_value(value);
+            }
+        }
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
         // iterator prototypes once `%Iterator.prototype%` is wired
         // into the global. The bootstrap helper owns the install
@@ -292,27 +305,45 @@ impl Interpreter {
                     &interp.well_known_symbols,
                 )
                 .expect("per-kind iterator prototypes fit within any positive cap");
-            interp.array_iterator_prototype = Some(protos.array);
-            interp.map_iterator_prototype = Some(protos.map);
-            interp.set_iterator_prototype = Some(protos.set);
-            interp.string_iterator_prototype = Some(protos.string);
-            interp.regexp_string_iterator_prototype = Some(protos.regexp_string);
-            interp.iterator_helper_prototype = Some(protos.helper);
-            interp.wrap_for_valid_iterator_prototype = Some(protos.wrap_for_valid_iterator);
-            // Never-swapped default-realm copies — bare (override-less)
-            // iterators resolve against these while an extra realm is
-            // active.
-            interp.default_realm_iterator_prototypes = [
-                Some(protos.array),
-                Some(protos.map),
-                Some(protos.set),
-                Some(protos.string),
-                Some(protos.regexp_string),
-                Some(protos.helper),
-                Some(protos.wrap_for_valid_iterator),
+            let built = [
+                Value::object(protos.array),
+                Value::object(protos.map),
+                Value::object(protos.set),
+                Value::object(protos.string),
+                Value::object(protos.regexp_string),
+                Value::object(protos.helper),
+                Value::object(protos.wrap_for_valid_iterator),
             ];
+            for (slot, value) in iterator_roots.iter_mut().zip(built) {
+                *slot = value;
+            }
         }
         interp.install_function_kind_prototypes_post_bootstrap();
+        drop(iterator_scope);
+        let completed: [Option<JsObject>; 7] = iterator_roots.map(|value| value.as_object());
+        for (slot, value) in [
+            &interp.array_iterator_prototype,
+            &interp.map_iterator_prototype,
+            &interp.set_iterator_prototype,
+            &interp.string_iterator_prototype,
+            &interp.regexp_string_iterator_prototype,
+            &interp.iterator_helper_prototype,
+            &interp.wrap_for_valid_iterator_prototype,
+        ]
+        .into_iter()
+        .zip(completed)
+        {
+            slot.set(value);
+        }
+        // Never-swapped default-realm copies — bare (override-less) iterators
+        // resolve against these while an extra realm is active.
+        for (slot, value) in interp
+            .default_realm_iterator_prototypes
+            .iter()
+            .zip(completed)
+        {
+            slot.set(value);
+        }
         drop(extra_roots_guard);
         interp
     }
@@ -321,32 +352,38 @@ impl Interpreter {
         std::mem::swap(&mut self.global_this, &mut state.global_this);
         std::mem::swap(&mut self.error_classes, &mut state.error_classes);
         std::mem::swap(&mut self.realm_intrinsics, &mut state.realm_intrinsics);
-        std::mem::swap(
-            &mut self.array_iterator_prototype,
+        let swap_root = |cell: &crate::gc_trace::RootCell<Option<JsObject>>,
+                         slot: &mut Option<JsObject>| {
+            let current = cell.get();
+            cell.set(*slot);
+            *slot = current;
+        };
+        swap_root(
+            &self.array_iterator_prototype,
             &mut state.array_iterator_prototype,
         );
-        std::mem::swap(
-            &mut self.map_iterator_prototype,
+        swap_root(
+            &self.map_iterator_prototype,
             &mut state.map_iterator_prototype,
         );
-        std::mem::swap(
-            &mut self.set_iterator_prototype,
+        swap_root(
+            &self.set_iterator_prototype,
             &mut state.set_iterator_prototype,
         );
-        std::mem::swap(
-            &mut self.string_iterator_prototype,
+        swap_root(
+            &self.string_iterator_prototype,
             &mut state.string_iterator_prototype,
         );
-        std::mem::swap(
-            &mut self.regexp_string_iterator_prototype,
+        swap_root(
+            &self.regexp_string_iterator_prototype,
             &mut state.regexp_string_iterator_prototype,
         );
-        std::mem::swap(
-            &mut self.iterator_helper_prototype,
+        swap_root(
+            &self.iterator_helper_prototype,
             &mut state.iterator_helper_prototype,
         );
-        std::mem::swap(
-            &mut self.wrap_for_valid_iterator_prototype,
+        swap_root(
+            &self.wrap_for_valid_iterator_prototype,
             &mut state.wrap_for_valid_iterator_prototype,
         );
     }
@@ -697,7 +734,8 @@ impl Interpreter {
         // default-realm iterator observed from `$262.createRealm()` code
         // would claim the foreign realm's prototypes.
         if self.active_realm_is_extra {
-            return self.default_realm_iterator_prototypes[Self::iterator_origin_index(origin)];
+            return self.default_realm_iterator_prototypes[Self::iterator_origin_index(origin)]
+                .get();
         }
         self.active_realm_iterator_prototype_for(origin)
     }
@@ -710,13 +748,15 @@ impl Interpreter {
         origin: BuiltinIteratorOrigin,
     ) -> Option<JsObject> {
         match origin {
-            BuiltinIteratorOrigin::Array => self.array_iterator_prototype,
-            BuiltinIteratorOrigin::Map => self.map_iterator_prototype,
-            BuiltinIteratorOrigin::Set => self.set_iterator_prototype,
-            BuiltinIteratorOrigin::String => self.string_iterator_prototype,
-            BuiltinIteratorOrigin::RegExpString => self.regexp_string_iterator_prototype,
-            BuiltinIteratorOrigin::Helper => self.iterator_helper_prototype,
-            BuiltinIteratorOrigin::WrapForValidIterator => self.wrap_for_valid_iterator_prototype,
+            BuiltinIteratorOrigin::Array => self.array_iterator_prototype.get(),
+            BuiltinIteratorOrigin::Map => self.map_iterator_prototype.get(),
+            BuiltinIteratorOrigin::Set => self.set_iterator_prototype.get(),
+            BuiltinIteratorOrigin::String => self.string_iterator_prototype.get(),
+            BuiltinIteratorOrigin::RegExpString => self.regexp_string_iterator_prototype.get(),
+            BuiltinIteratorOrigin::Helper => self.iterator_helper_prototype.get(),
+            BuiltinIteratorOrigin::WrapForValidIterator => {
+                self.wrap_for_valid_iterator_prototype.get()
+            }
         }
     }
 

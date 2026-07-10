@@ -23,6 +23,8 @@
 //! - Prototype accessor getters throw `TypeError` when `this` is
 //!   not a RegExp (exception: `RegExp.prototype` itself returns
 //!   `"(?:)"` for `source` and `""` for `flags`).
+//! - Legacy static accessor constructors, captures, getters, and setters stay
+//!   in one canonical root scope across every paired native allocation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp-constructor>
@@ -31,6 +33,7 @@
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::regexp::{JsRegExp, RegExpFlags};
+use crate::rooting::RootScopeExt;
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
@@ -84,22 +87,34 @@ fn install_regexp_legacy_accessors(
 
     fn install_get_only(
         heap: &mut otter_gc::GcHeap,
-        ctor: NativeFunction,
+        ctor: Value,
         name: &'static str,
         getter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
-        let ctor_value = Value::native_function(ctor);
-        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
-        let getter = NativeFunction::with_length_and_captures(
-            heap,
-            getter_name,
-            0,
-            legacy_accessor_getter,
-            captures,
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc =
-            PropertyDescriptor::accessor(Some(Value::native_function(getter)), None, false, true);
+        let mut ctor_root = ctor;
+        let mut getter_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: both canonical slots precede the scope and are reloaded
+        // after the getter allocation before descriptor installation.
+        unsafe {
+            roots.add_value(&mut ctor_root);
+            roots.add_value(&mut getter_root);
+        }
+        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_root];
+        getter_root = Value::native_function(
+            NativeFunction::with_length_and_captures(
+                heap,
+                getter_name,
+                0,
+                legacy_accessor_getter,
+                captures,
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        );
+        let ctor = ctor_root
+            .as_native_function()
+            .expect("RegExp constructor remains rooted");
+        let desc = PropertyDescriptor::accessor(Some(getter_root), None, false, true);
         if !ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
@@ -108,61 +123,78 @@ fn install_regexp_legacy_accessors(
 
     fn install_get_set(
         heap: &mut otter_gc::GcHeap,
-        ctor: NativeFunction,
+        ctor: Value,
         name: &'static str,
         getter_name: &'static str,
         setter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
-        let ctor_value = Value::native_function(ctor);
-        let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
-        let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
-        let getter = NativeFunction::with_length_and_captures(
-            heap,
-            getter_name,
-            0,
-            legacy_accessor_getter,
-            g_captures,
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let setter = NativeFunction::with_length_and_captures(
-            heap,
-            setter_name,
-            1,
-            legacy_accessor_setter,
-            s_captures,
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc = PropertyDescriptor::accessor(
-            Some(Value::native_function(getter)),
-            Some(Value::native_function(setter)),
-            false,
-            true,
+        let mut ctor_root = ctor;
+        let mut getter_root = Value::undefined();
+        let mut setter_root = Value::undefined();
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the canonical slots precede the scope and no references to
+        // them are retained across the getter/setter allocation safepoints.
+        unsafe {
+            roots.add_value(&mut ctor_root);
+            roots.add_value(&mut getter_root);
+            roots.add_value(&mut setter_root);
+        }
+        let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_root];
+        getter_root = Value::native_function(
+            NativeFunction::with_length_and_captures(
+                heap,
+                getter_name,
+                0,
+                legacy_accessor_getter,
+                g_captures,
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
         );
+        let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_root];
+        setter_root = Value::native_function(
+            NativeFunction::with_length_and_captures(
+                heap,
+                setter_name,
+                1,
+                legacy_accessor_setter,
+                s_captures,
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        );
+        let ctor = ctor_root
+            .as_native_function()
+            .expect("RegExp constructor remains rooted");
+        let desc = PropertyDescriptor::accessor(Some(getter_root), Some(setter_root), false, true);
         if !ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
         Ok(())
     }
 
-    install_get_set(heap, ctor, "input", "get input", "set input")?;
-    install_get_set(heap, ctor, "$_", "get $_", "set $_")?;
-    install_get_only(heap, ctor, "lastMatch", "get lastMatch")?;
-    install_get_only(heap, ctor, "$&", "get $&")?;
-    install_get_only(heap, ctor, "lastParen", "get lastParen")?;
-    install_get_only(heap, ctor, "$+", "get $+")?;
-    install_get_only(heap, ctor, "leftContext", "get leftContext")?;
-    install_get_only(heap, ctor, "$`", "get $`")?;
-    install_get_only(heap, ctor, "rightContext", "get rightContext")?;
-    install_get_only(heap, ctor, "$'", "get $'")?;
-    install_get_only(heap, ctor, "$1", "get $1")?;
-    install_get_only(heap, ctor, "$2", "get $2")?;
-    install_get_only(heap, ctor, "$3", "get $3")?;
-    install_get_only(heap, ctor, "$4", "get $4")?;
-    install_get_only(heap, ctor, "$5", "get $5")?;
-    install_get_only(heap, ctor, "$6", "get $6")?;
-    install_get_only(heap, ctor, "$7", "get $7")?;
-    install_get_only(heap, ctor, "$8", "get $8")?;
-    install_get_only(heap, ctor, "$9", "get $9")?;
+    let mut ctor_root = Value::native_function(ctor);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the constructor slot precedes the scope and stays live until all
+    // legacy accessor pairs have been installed.
+    unsafe { roots.add_value(&mut ctor_root) };
+    install_get_set(heap, ctor_root, "input", "get input", "set input")?;
+    install_get_set(heap, ctor_root, "$_", "get $_", "set $_")?;
+    install_get_only(heap, ctor_root, "lastMatch", "get lastMatch")?;
+    install_get_only(heap, ctor_root, "$&", "get $&")?;
+    install_get_only(heap, ctor_root, "lastParen", "get lastParen")?;
+    install_get_only(heap, ctor_root, "$+", "get $+")?;
+    install_get_only(heap, ctor_root, "leftContext", "get leftContext")?;
+    install_get_only(heap, ctor_root, "$`", "get $`")?;
+    install_get_only(heap, ctor_root, "rightContext", "get rightContext")?;
+    install_get_only(heap, ctor_root, "$'", "get $'")?;
+    install_get_only(heap, ctor_root, "$1", "get $1")?;
+    install_get_only(heap, ctor_root, "$2", "get $2")?;
+    install_get_only(heap, ctor_root, "$3", "get $3")?;
+    install_get_only(heap, ctor_root, "$4", "get $4")?;
+    install_get_only(heap, ctor_root, "$5", "get $5")?;
+    install_get_only(heap, ctor_root, "$6", "get $6")?;
+    install_get_only(heap, ctor_root, "$7", "get $7")?;
+    install_get_only(heap, ctor_root, "$8", "get $8")?;
+    install_get_only(heap, ctor_root, "$9", "get $9")?;
     Ok(())
 }
 
@@ -248,58 +280,87 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     // install native functions so user calls like
     // `re[Symbol.match]("…")` resolve through the spec-mandated
     // algorithm.
-    let prototype_root = Value::object(prototype);
+    let mut prototype_root = Value::object(prototype);
+    let mut match_root = Value::undefined();
+    let mut search_root = Value::undefined();
+    let mut replace_root = Value::undefined();
+    let mut split_root = Value::undefined();
+    let mut match_all_root = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: all canonical slots precede the scope and remain stationary until
+    // every native is allocated and installed on the prototype.
+    unsafe {
+        roots.add_value(&mut prototype_root);
+        roots.add_value(&mut match_root);
+        roots.add_value(&mut search_root);
+        roots.add_value(&mut replace_root);
+        roots.add_value(&mut split_root);
+        roots.add_value(&mut match_all_root);
+    }
     let match_sym = well_known.get(WellKnown::Match);
     let search_sym = well_known.get(WellKnown::Search);
     let replace_sym = well_known.get(WellKnown::Replace);
     let split_sym = well_known.get(WellKnown::Split);
     let match_all_sym = well_known.get(WellKnown::MatchAll);
-    let match_fn = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "[Symbol.match]",
-        1,
-        crate::regexp_prototype::native_regexp_symbol_match,
-        &[&prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let search_fn = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "[Symbol.search]",
-        1,
-        crate::regexp_prototype::native_regexp_symbol_search,
-        &[&prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let replace_fn = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "[Symbol.replace]",
-        2,
-        crate::regexp_prototype::native_regexp_symbol_replace,
-        &[&prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let split_fn = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "[Symbol.split]",
-        2,
-        crate::regexp_prototype::native_regexp_symbol_split,
-        &[&prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let match_all_fn = crate::bootstrap::native_static_with_value_roots(
-        heap,
-        "[Symbol.matchAll]",
-        1,
-        crate::regexp_prototype::native_regexp_symbol_match_all,
-        &[&prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    match_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "[Symbol.match]",
+            1,
+            crate::regexp_prototype::native_regexp_symbol_match,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    search_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "[Symbol.search]",
+            1,
+            crate::regexp_prototype::native_regexp_symbol_search,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    replace_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "[Symbol.replace]",
+            2,
+            crate::regexp_prototype::native_regexp_symbol_replace,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    split_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "[Symbol.split]",
+            2,
+            crate::regexp_prototype::native_regexp_symbol_split,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    match_all_root = Value::native_function(
+        crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "[Symbol.matchAll]",
+            1,
+            crate::regexp_prototype::native_regexp_symbol_match_all,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let prototype = prototype_root
+        .as_object()
+        .expect("RegExp.prototype remains rooted during symbol bootstrap");
     object::define_own_symbol_property_partial(
         prototype,
         heap,
         match_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::native_function(match_fn)),
+            value: Some(match_root),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -311,7 +372,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         search_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::native_function(search_fn)),
+            value: Some(search_root),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -323,7 +384,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         replace_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::native_function(replace_fn)),
+            value: Some(replace_root),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -335,7 +396,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         split_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::native_function(split_fn)),
+            value: Some(split_root),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -347,7 +408,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         match_all_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::native_function(match_all_fn)),
+            value: Some(match_all_root),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),

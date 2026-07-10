@@ -1294,13 +1294,13 @@ pub struct Interpreter {
     /// `intrinsic_prototype_object_for` (iterator family) to
     /// route `[[GetPrototypeOf]]` per ECMA-262
     /// §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5.
-    array_iterator_prototype: Option<JsObject>,
-    map_iterator_prototype: Option<JsObject>,
-    set_iterator_prototype: Option<JsObject>,
-    string_iterator_prototype: Option<JsObject>,
-    regexp_string_iterator_prototype: Option<JsObject>,
-    iterator_helper_prototype: Option<JsObject>,
-    wrap_for_valid_iterator_prototype: Option<JsObject>,
+    array_iterator_prototype: gc_trace::RootCell<Option<JsObject>>,
+    map_iterator_prototype: gc_trace::RootCell<Option<JsObject>>,
+    set_iterator_prototype: gc_trace::RootCell<Option<JsObject>>,
+    string_iterator_prototype: gc_trace::RootCell<Option<JsObject>>,
+    regexp_string_iterator_prototype: gc_trace::RootCell<Option<JsObject>>,
+    iterator_helper_prototype: gc_trace::RootCell<Option<JsObject>>,
+    wrap_for_valid_iterator_prototype: gc_trace::RootCell<Option<JsObject>>,
     /// Default-realm copies of the per-kind iterator prototypes above,
     /// captured at bootstrap and NEVER swapped on a realm switch. A
     /// builtin iterator with no stored prototype override belongs to
@@ -1312,7 +1312,7 @@ pub struct Interpreter {
     /// Indexed by [`iterator_state::BuiltinIteratorOrigin`] discriminant
     /// order: array, map, set, string, regexp-string, helper,
     /// wrap-for-valid-iterator.
-    default_realm_iterator_prototypes: [Option<JsObject>; 7],
+    default_realm_iterator_prototypes: [gc_trace::RootCell<Option<JsObject>>; 7],
     function_kind_prototypes: function_kind::FunctionKindPrototypes,
     /// Pool of cold-frame side records (try handlers, async parking,
     /// in-flight ToPrimitive/bind/iterator ladders, module URL, …).

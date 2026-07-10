@@ -82,6 +82,8 @@ pub struct GcStats {
     /// Wall-clock duration of the most recent full GC pause, in
     /// milliseconds. `0.0` until the first full GC fires.
     pub last_gc_pause_ms: f32,
+    /// Cumulative full-GC pause time, in nanoseconds.
+    pub full_pause_ns_total: u64,
     /// Bytes reclaimed by the most recent full GC sweep.
     pub last_gc_reclaimed_bytes: usize,
     /// Number of full GC cycles executed since the heap was
@@ -112,6 +114,7 @@ impl Default for GcStats {
             by_type: [TypeStats::DEFAULT; TYPE_TAG_COUNT],
             alloc_bytes_total: 0,
             last_gc_pause_ms: 0.0,
+            full_pause_ns_total: 0,
             last_gc_reclaimed_bytes: 0,
             gc_cycles: 0,
             minor_gc_cycles: 0,
@@ -139,6 +142,7 @@ impl std::fmt::Debug for GcStats {
             .field("live_bytes", &self.live_bytes)
             .field("alloc_bytes_total", &self.alloc_bytes_total)
             .field("last_gc_pause_ms", &self.last_gc_pause_ms)
+            .field("full_pause_ns_total", &self.full_pause_ns_total)
             .field("last_gc_reclaimed_bytes", &self.last_gc_reclaimed_bytes)
             .field("gc_cycles", &self.gc_cycles)
             .field("minor_gc_cycles", &self.minor_gc_cycles)

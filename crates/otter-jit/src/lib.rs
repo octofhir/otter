@@ -3,8 +3,8 @@
 //! A Sparkplug-style template macro-assembler that lowers Otter register
 //! bytecode to native machine code with **no IR, no register allocation, and no
 //! deopt**. It deletes the interpreter dispatch envelope for hot functions while
-//! reusing the interpreter's own frame array for GC rooting, so the moving
-//! collector needs **no stack maps** in this tier. Backend chosen by the
+//! reusing the interpreter's own frame array and explicit safepoint records for
+//! moving-GC rooting. Backend chosen by the
 //! `JIT_DESIGN.md` §3.2 prototype gate (dynasm-rs template assembler).
 //!
 //! # Contents
@@ -17,11 +17,15 @@
 //!   machine code requires W^X mappings and fn-pointer transmutes. All `unsafe`
 //!   stays behind this crate's safe API; `otter-vm` keeps the ban and reaches
 //!   the JIT through a runtime-wired trait hook (no dependency cycle).
-//! - **No GC stack maps (this tier).** Compiled code keeps live JS values in the
-//!   reused interpreter frame array (already a `FrameRoots` provider) and
-//!   reloads object pointers from their slots after every safepoint
-//!   (allocation/call). A value cached in a machine register across a safepoint
-//!   would be a use-after-move bug; the emitter must not do that in v1.
+//! - **Canonical GC roots.** Compiled code keeps live JS values in the reused
+//!   interpreter frame array (already a `FrameRoots` provider), publishes an
+//!   explicit safepoint record for allocating calls, and reloads derived object
+//!   pointers after every safepoint. A value cached only in a machine register
+//!   across a safepoint would be a use-after-move bug.
+//! - **Baseline is the production ceiling.** The pre-refactor optimizing tier is
+//!   compiled only with `experimental-optimizer` and is selected only when
+//!   `OTTER_EXPERIMENTAL_OPTIMIZER=1`; it exists for measurements and regression
+//!   extraction, not normal execution.
 //! - **JIT is runtime-optional.** When executable memory cannot be obtained
 //!   (missing macOS `allow-jit` entitlement, locked sandbox, etc.) the engine
 //!   falls back to the interpreter; the JIT never hard-fails execution.
@@ -33,6 +37,7 @@
 
 mod baseline;
 mod code;
+#[cfg(feature = "experimental-optimizer")]
 pub mod optimizing;
 
 pub use baseline::{BaselineCode, Unsupported, compile};
@@ -62,38 +67,38 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.function.function_id;
+        #[cfg(feature = "experimental-optimizer")]
         let osr_pc = request.osr_pc;
+        #[cfg(feature = "experimental-optimizer")]
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
-        // Try the optimizing tier (register allocation, representation
-        // selection, exact-PC deopt) first; it covers the int32 arithmetic /
-        // control-flow / loop subset. Anything it declines falls through to the
-        // baseline template tier, which serves the broader opcode surface.
-        match optimizing::compile(&request.function, osr_pc) {
-            Ok(code) => {
-                // A function-entry compile (`osr_pc == None`) that came back
-                // OSR-only has no runnable PC-0 entry — it bails straight to the
-                // interpreter — so serving it on the direct-call path would run
-                // the whole function interpreted. Fall through to the baseline
-                // whole-function body instead; the hot loop still tiers up
-                // through its own `osr_pc = Some(..)` compile cached separately.
-                // OSR requests keep the optimizing code.
-                if osr_pc.is_some() || !code.osr_only() {
+        // The old optimizer is deliberately outside normal tier selection. It
+        // can still be measured in an explicitly experimental build/run without
+        // expanding its opcode coverage or preserving its contracts in the new
+        // VM ABI.
+        #[cfg(feature = "experimental-optimizer")]
+        if std::env::var("OTTER_EXPERIMENTAL_OPTIMIZER").as_deref() == Ok("1") {
+            match optimizing::compile(&request.function, osr_pc) {
+                Ok(code) if osr_pc.is_some() || !code.osr_only() => {
                     if trace {
-                        eprintln!("[otter-jit] optimizing tier compiled fid {fid} osr={osr_pc:?}");
+                        eprintln!(
+                            "[otter-jit] experimental optimizing tier compiled fid {fid} osr={osr_pc:?}"
+                        );
                     }
                     return Ok(otter_vm::JitCompileStatus::Compiled { code });
                 }
-                if trace {
-                    eprintln!(
-                        "[otter-jit] optimizing fid {fid} osr-only at entry; using baseline body"
-                    );
+                Ok(_) => {
+                    if trace {
+                        eprintln!(
+                            "[otter-jit] experimental optimizer produced OSR-only entry for fid {fid}; using baseline"
+                        );
+                    }
                 }
-            }
-            Err(reason) => {
-                if trace {
-                    eprintln!(
-                        "[otter-jit] optimizing tier declined fid {fid} osr={osr_pc:?}: {reason:?}"
-                    );
+                Err(reason) => {
+                    if trace {
+                        eprintln!(
+                            "[otter-jit] experimental optimizer declined fid {fid} osr={osr_pc:?}: {reason:?}"
+                        );
+                    }
                 }
             }
         }

@@ -39,10 +39,12 @@ use otter_bytecode::{Op, Operand};
 pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
     ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext, RuntimeStubResult,
-    RuntimeStubResultPair, RuntimeStubStatus, SafepointRecord, Value, VmError,
+    JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext, SafepointRecord, Value,
+    VmError,
     runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
 };
+#[cfg(feature = "experimental-optimizer")]
+use otter_vm::{RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus};
 
 use crate::CompiledCode;
 
@@ -275,24 +277,34 @@ pub(crate) const COLLECTION_METHOD_IC_SLOT_SIZE: u32 =
 /// base) and the flat slot layout the optimizing tier reads.
 pub(crate) const DIRECT_METHOD_INLINE_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, direct_method_inline) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DIRECT_METHOD_INLINE_SLOT_SIZE: u32 =
     std::mem::size_of::<otter_vm::JitDirectMethodInline>() as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_ENTRY_ADDR_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, entry_addr) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_REGISTER_COUNT_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, register_count) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_RECV_SHAPE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, recv_shape_offset) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_PROTO_SHAPE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, proto_shape_offset) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_METHOD_ON_RECEIVER_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_on_receiver) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_METHOD_VALUE_BYTE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_value_byte) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_METHOD_FID_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_fid) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_SELF_CLOSURE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, self_closure_bits) as u32;
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) const DMI_UPVALUES_PTR_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitDirectMethodInline, upvalues_ptr) as u32;
 pub(crate) const COLLECTION_METHOD_IC_STATE_OFFSET: u32 =
@@ -591,6 +603,7 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
 /// the compiled caller, so the interpreter frame is rebuilt from the method's
 /// own value (`callee_bits`, the inline link's SELF bits) and the bound
 /// receiver (`this_bits`) rather than from the caller frame.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_direct_method_bail_stub(
     ctx: *mut JitCtx,
     bail_pc: u64,
@@ -1074,6 +1087,7 @@ extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
 /// allocation, bulk-initializes its slots, and installs `%Object.prototype%`.
 /// Returns `0` on success, `1` when the allocation threw (OOM, parked in `ctx`).
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_alloc_object_literal_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -1113,6 +1127,7 @@ pub(crate) extern "C" fn jit_alloc_object_literal_stub(
 /// the receiver from `frame[recv_reg]`, appends `value` (rooted across any
 /// growth scavenge), and writes the new length to `frame[dst]`. Returns `0` on
 /// success, `1` when the push threw (error parked in `ctx`).
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_array_push_optimizing_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -1161,6 +1176,7 @@ pub(crate) extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u
 /// Bridge stub: run a full `StoreProperty` (transition / accessor / polymorphic)
 /// for a site the optimizing tier could not inline, decoding operands at
 /// `byte_pc`. Returns `0` on success, `1` when the store threw.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_store_property_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -1180,6 +1196,7 @@ pub(crate) extern "C" fn jit_store_property_stub_optimizing(ctx: *mut JitCtx, by
 /// miss, prototype walk, accessor) for a site the optimizing tier could not
 /// inline, decoding operands at `byte_pc`. The VM writes the result into the
 /// destination frame slot. Returns `0` on success, `1` when the load threw.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_load_property_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -1198,6 +1215,7 @@ pub(crate) extern "C" fn jit_load_property_stub_optimizing(ctx: *mut JitCtx, byt
 /// Bridge stub: materialize a string literal for `LoadString` from compiled
 /// code. The VM decodes the constant index at `byte_pc` and serves it from the
 /// traced per-context constant cache.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_load_string_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -1219,6 +1237,7 @@ pub(crate) extern "C" fn jit_load_string_stub(ctx: *mut JitCtx, byte_pc: u64) ->
 /// matching the `LoadString` / `NewArray` bridges (no baseline register-window
 /// assumptions). Returns `0` on success, `1` when the read threw (unbound
 /// identifier / throwing accessor; error parked in `ctx`).
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_load_global_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -1239,6 +1258,7 @@ pub(crate) extern "C" fn jit_load_global_stub_optimizing(ctx: *mut JitCtx, byte_
 /// remainder with the sign of the dividend — exactly JavaScript `%` (including
 /// the `NaN` / `±Infinity` / zero-divisor edge cases). Allocates nothing and
 /// makes no reentry into the VM, so it needs no `JitCtx`.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn otter_jit_fmod(a: f64, b: f64) -> f64 {
     a % b
 }
@@ -1248,6 +1268,7 @@ pub(crate) extern "C" fn otter_jit_fmod(a: f64, b: f64) -> f64 {
 /// `f64` method the interpreter's `Math` uses (`crates/otter-vm/src/math`), so a
 /// compiled `Math.sin(x)` is bit-identical to the interpreted result. Each
 /// allocates nothing and makes no VM reentry, so it needs no `JitCtx`.
+#[cfg(feature = "experimental-optimizer")]
 macro_rules! otter_jit_math_leaf {
     ($($name:ident => $method:ident),* $(,)?) => {
         $(
@@ -1258,6 +1279,7 @@ macro_rules! otter_jit_math_leaf {
         )*
     };
 }
+#[cfg(feature = "experimental-optimizer")]
 otter_jit_math_leaf! {
     otter_jit_sin => sin,
     otter_jit_cos => cos,
@@ -1290,6 +1312,7 @@ extern "C" fn otter_jit_math_random() -> u64 {
 /// (materialized by the caller), and performs the global write. Returns `0` on
 /// success, `1` when the write threw (const / TDZ / strict-unbound; error parked
 /// in `ctx`).
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_store_global_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -1336,6 +1359,7 @@ pub(crate) extern "C" fn jit_call_method_stub(
 /// Optimizing-tier variant of [`jit_call_method_stub`] used only to split
 /// migration stats while preserving the same runtime bridge semantics.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_call_method_stub_optimizing(
     ctx: *mut JitCtx,
     dst: u64,
@@ -1364,6 +1388,7 @@ pub(crate) extern "C" fn jit_call_method_stub_optimizing(
 /// deopt exit just wrote — `[callee_fid, callee_pc, return_register, register_
 /// count, this_bits, registers_ptr]` per frame, outermost first. Return status:
 /// `Ok` and `value_bits` carries the result, or `Throw` with the error parked.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
     ctx: *mut JitCtx,
     descs_ptr: *const u64,
@@ -1423,6 +1448,7 @@ pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
 ///
 /// Return status: `Ok` = hit and `value_bits` carries the result, `Throw` =
 /// throw parked in ctx, `Miss` = continue to the generic method bridge.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_string_char_code_at_leaf_stub(
     ctx: *mut JitCtx,
     recv_bits: u64,
@@ -1451,6 +1477,7 @@ pub(crate) extern "C" fn jit_string_char_code_at_leaf_stub(
 
 /// Primitive `String.prototype.charCodeAt` bridge used after generated code
 /// has already validated the prototype builtin identity.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_string_char_code_at_guarded_leaf_stub(
     ctx: *mut JitCtx,
     recv_bits: u64,
@@ -1481,6 +1508,7 @@ pub(crate) extern "C" fn jit_string_char_code_at_guarded_leaf_stub(
 ///
 /// Return status: `0` = hit and `dst` written, `1` = throw parked in ctx,
 /// `2` = miss, continue to the generic method bridge.
+#[cfg(feature = "experimental-optimizer")]
 pub(crate) extern "C" fn jit_number_to_string_fast_stub(
     ctx: *mut JitCtx,
     dst: u64,

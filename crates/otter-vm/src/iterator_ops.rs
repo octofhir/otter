@@ -15,6 +15,8 @@
 //! - Helpers advance the current frame PC exactly once on success.
 //! - Iterator helper callbacks never hold a GC payload borrow across VM
 //!   dispatch; state is snapshotted first.
+//! - Iterator records are reloaded from traced anchors after every property
+//!   lookup or callback that may move the young generation.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -904,51 +906,65 @@ impl Interpreter {
         context: &ExecutionContext,
         iterable: &Value,
     ) -> Result<(Value, Value), VmError> {
-        let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
-        let method = match self.ordinary_get_value(
-            context,
-            *iterable,
-            *iterable,
-            &VmPropertyKey::Symbol(iterator_sym),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, *iterable, SmallVec::new())?
+        let anchor_base = self.module_root_depth();
+        let iterable_anchor = self.push_iteration_anchor(*iterable) - 1;
+        let result = (|interp: &mut Self| -> Result<(Value, Value), VmError> {
+            let iterator_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
+            let iterable = interp.iteration_anchor(iterable_anchor);
+            let method = match interp.ordinary_get_value(
+                context,
+                iterable,
+                iterable,
+                &VmPropertyKey::Symbol(iterator_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let getter_anchor = interp.push_iteration_anchor(getter) - 1;
+                    let getter = interp.iteration_anchor(getter_anchor);
+                    let iterable = interp.iteration_anchor(iterable_anchor);
+                    interp.run_callable_sync(context, &getter, iterable, SmallVec::new())?
+                }
+            };
+            if method.is_undefined() || method.is_null() || !interp.is_callable_runtime(&method) {
+                return Err(interp.err_type(("iterator method is not callable".to_string()).into()));
             }
-        };
-        if method.is_undefined() || method.is_null() {
-            return Err(self.err_type(("iterator method is not callable".to_string()).into()));
-        }
-        if !self.is_callable_runtime(&method) {
-            return Err(self.err_type(("iterator method is not callable".to_string()).into()));
-        }
-        let iterator = self.run_callable_sync(context, &method, *iterable, SmallVec::new())?;
-        if !(iterator.is_object()
-            || iterator.is_proxy()
-            || iterator.is_array()
-            || iterator.is_iterator()
-            || iterator.is_map()
-            || iterator.is_set()
-            || iterator.is_generator())
-        {
-            return Err(
-                self.err_type(("iterator method did not return an object".to_string()).into())
-            );
-        }
-        let next_method = match self.ordinary_get_value(
-            context,
-            iterator,
-            iterator,
-            &VmPropertyKey::String("next"),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, iterator, SmallVec::new())?
+            let method_anchor = interp.push_iteration_anchor(method) - 1;
+            let method = interp.iteration_anchor(method_anchor);
+            let iterable = interp.iteration_anchor(iterable_anchor);
+            let iterator = interp.run_callable_sync(context, &method, iterable, SmallVec::new())?;
+            if !(iterator.is_object()
+                || iterator.is_proxy()
+                || iterator.is_array()
+                || iterator.is_iterator()
+                || iterator.is_map()
+                || iterator.is_set()
+                || iterator.is_generator())
+            {
+                return Err(interp
+                    .err_type(("iterator method did not return an object".to_string()).into()));
             }
-        };
-        Ok((iterator, next_method))
+            let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
+            let iterator = interp.iteration_anchor(iterator_anchor);
+            let next_method = match interp.ordinary_get_value(
+                context,
+                iterator,
+                iterator,
+                &VmPropertyKey::String("next"),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let getter_anchor = interp.push_iteration_anchor(getter) - 1;
+                    let getter = interp.iteration_anchor(getter_anchor);
+                    let iterator = interp.iteration_anchor(iterator_anchor);
+                    interp.run_callable_sync(context, &getter, iterator, SmallVec::new())?
+                }
+            };
+            Ok((interp.iteration_anchor(iterator_anchor), next_method))
+        })(self);
+        self.pop_iteration_anchors_to(anchor_base);
+        result
     }
 
     /// §7.4.6 IteratorStep — invoke `next` and read the result.

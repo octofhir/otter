@@ -53,6 +53,34 @@ use otter_gc::raw::RawGc;
 /// can rewrite the slot in place when an object moves.
 pub type GcRootVisitor<'a> = dyn FnMut(*mut RawGc) + 'a;
 
+/// Stable-address interior-mutable storage for interpreter-owned root slots.
+///
+/// Some root walks process slots immediately, while fallback allocation paths
+/// retain their pointers until the walk returns. `UnsafeCell` makes collector
+/// rewrites through `&Interpreter` legal without moving the slot off-owner.
+pub(crate) struct RootCell<T: Copy>(std::cell::UnsafeCell<T>);
+
+impl<T: Copy> RootCell<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self(std::cell::UnsafeCell::new(value))
+    }
+
+    pub(crate) fn get(&self) -> T {
+        // SAFETY: `T: Copy`; each isolate has one mutator and root rewrites run
+        // only during a stop-the-world collection.
+        unsafe { *self.0.get() }
+    }
+
+    pub(crate) fn set(&self, value: T) {
+        // SAFETY: same single-mutator/STW invariant as [`Self::get`].
+        unsafe { *self.0.get() = value };
+    }
+
+    pub(crate) fn as_mut_ptr(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
 /// Walked by the GC during full collection. Implementations
 /// emit one slot pointer per outgoing `Gc<…>` reference held
 /// by `self`.

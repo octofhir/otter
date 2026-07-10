@@ -23,6 +23,82 @@ Downloaded checkouts and generated bundles live under
 `benchmarks/results/` and are also ignored. Curated current results belong in
 [`RESULTS.md`](RESULTS.md).
 
+Phase 0 VM/JIT refactor evidence, correctness blockers, and reproduction
+commands are tracked in [`PHASE0_BASELINE.md`](PHASE0_BASELINE.md).
+
+## Machine-readable result envelope
+
+Use `otter-benchmark` to wrap new benchmark commands. Its versioned JSON record
+always includes environment/mode/cache/correctness fields and explicit `null`
+values for counters that the wrapped command cannot yet provide. A missing
+validation marker makes the result non-scoreable.
+
+```bash
+cargo run -p otter-benchmark -- \
+  --name smoke --runtime-mode cli --jit-mode baseline \
+  --gc-mode normal --cache-state cold --validation-marker ok -- \
+  target/release/otter -p '"ok"'
+```
+
+The active opcode-effect/support inventory is emitted with:
+
+```bash
+cargo run -p otter-bytecode --bin opcode-audit
+```
+
+Focused Phase 0 call and baseline-emitter measurements use `otter-phase0`.
+Both subcommands emit the same schema-v1 JSON envelope and refuse to score a
+sample whose expected result was not observed:
+
+```bash
+cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
+  call --kind bytecode --arity 4 --jit-mode baseline \
+  --iterations 100000 --samples 20 --warmup 3
+
+cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
+  jit-compile --source benchmarks/fixtures/phase0/jit-compile.js \
+  --function phase0JitTarget --expected 3300 --samples 100 --warmup 10
+
+cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
+  memory --iterations 1000000 --samples 5
+
+cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
+  module --entry benchmarks/fixtures/phase0/module-entry.mjs \
+  --cache-state cold --samples 20 --warmup 0
+
+cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
+  module --entry benchmarks/fixtures/phase0/module-entry.mjs \
+  --cache-state warm --samples 20 --warmup 5
+```
+
+Direct calls wider than the current bytecode format should be recorded as
+failures, not rewritten into a different spread-call workload and not assigned
+a performance score.
+
+The `memory` workload uses fresh interpreter isolates. Its execution timer
+covers JS only; wall time additionally includes one post-run forced full GC.
+Allocation and cumulative pause deltas exclude bootstrap, and `heap_bytes` is
+sampled after that full reconciliation so it represents retained live heap
+rather than allocation-accounting bytes awaiting collection.
+
+For the `module` workload, `cold` means a fresh `Runtime` for every measured
+graph execution. `warm` means one persistent `Runtime`, five validated
+pre-executions by default, then repeated measured executions. Both modes still
+resolve, read, parse, compile, and link a fresh graph: Otter has no persistent
+CodeBlock or module cache yet. The warm label therefore describes runtime and
+host filesystem state, not a module-cache hit.
+
+Peak RSS sampling is opt-in on the generic recorder and therefore adds no
+polling overhead to ordinary runs:
+
+```bash
+cargo run --release -p otter-benchmark --features rss -- \
+  --name memory-rss --runtime-mode vm --jit-mode interpreter-only \
+  --gc-mode forced-full --rss-sample-ms 5 \
+  --validation-marker 'return=500000500000' -- \
+  target/release/otter-phase0 memory --iterations 1000000 --samples 5
+```
+
 ## Run
 
 ```bash

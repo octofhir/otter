@@ -13,6 +13,12 @@
 //!   accessor pair on the prototype (both routed to
 //!   `%ThrowTypeError%`).
 //!
+//! # Invariants
+//! - Bootstrap allocations publish `global`, constructor, and prototype roots;
+//!   raw object handles are reloaded after every allocation that may move them.
+//! - Sequential prototype writes use the in-place property API so receiver
+//!   relocation is reflected before the next write.
+//!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-function-objects>
 
@@ -141,15 +147,34 @@ fn install_function_prototype_callable_and_accessors(
         &[&global_root, &prototype_root, &ctor_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    // `native_static_with_value_roots` may move every rooted bootstrap object.
+    // Reload the receiver from its rewritten root slot; the raw `prototype`
+    // captured before the allocation is no longer valid.
+    let mut prototype = prototype_root
+        .as_object()
+        .expect("Function.prototype root must remain an object");
     object::set_call_native(prototype, heap, Value::native_function(prototype_call));
 
     let prototype_length = PropertyDescriptor::data(Value::number_i32(0), false, false, true);
-    object::define_own_property(prototype, heap, "length", prototype_length);
+    object::define_own_property_in_place(&mut prototype, heap, "length", prototype_length);
+
+    // String allocation is another moving-GC boundary. Publish the updated
+    // receiver and reload it before the next property write.
+    let prototype_root = Value::object(prototype);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        global_root.trace_value_slots(visitor);
+        prototype_root.trace_value_slots(visitor);
+        ctor_root.trace_value_slots(visitor);
+    };
     let prototype_name_value = Value::string(
-        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
+        crate::string::JsString::from_str_with_roots("", heap, &mut external_visit)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
+    let mut prototype = prototype_root
+        .as_object()
+        .expect("Function.prototype root must remain an object");
     let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
-    object::define_own_property(prototype, heap, "name", prototype_name);
+    object::define_own_property_in_place(&mut prototype, heap, "name", prototype_name);
 
     function_prototype::install_restricted_accessors(heap, prototype, &[&global_root, &ctor_root])
 }

@@ -2133,6 +2133,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "otter-benchmark"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "otter-compiler",
+ "otter-jit",
+ "otter-runtime",
+ "otter-syntax",
+ "otter-vm",
+ "serde",
+ "serde_json",
+ "sysinfo",
+]
+
+[[package]]
 name = "otter-bytecode"
 version = "0.1.0"
 dependencies = [
@@ -2177,6 +2192,15 @@ dependencies = [
  "oxc_syntax",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "otter-difftest"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

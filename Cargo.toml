@@ -11,6 +11,8 @@ members = [
     "crates/otter-vm",
     "crates/otter-vm-codegen",
     "crates/otter-jit",
+    "crates/otter-benchmark",
+    "crates/otter-difftest",
     "crates/otter-runtime",
     "crates/otter-pm-manifest",
     "crates/otter-pm-lockfile",
@@ -102,6 +104,7 @@ otter-syntax    = { path = "crates/otter-syntax" }
 otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
 otter-jit       = { path = "crates/otter-jit" }
+otter-benchmark = { path = "crates/otter-benchmark" }
 otter-regex     = { path = "crates/otter-regex" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }

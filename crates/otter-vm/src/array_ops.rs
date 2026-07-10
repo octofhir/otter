@@ -12,6 +12,8 @@
 //! - The current frame PC is advanced before running `Array.from` so any
 //!   synchronous iterator/property callbacks observe the post-call PC.
 //! - Arguments are read from executable operands, not cloned bytecode DTOs.
+//! - `Array.from` roots its copied arguments for the complete observable
+//!   iterator/property/callback sequence and reloads them after GC safepoints.
 //!
 //! # See also
 //! - [`crate::array_statics`]
@@ -23,7 +25,8 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array,
-    operand_decode::register_operand, read_register, symbol, to_length, write_register,
+    operand_decode::register_operand, read_register, rooting::RootScopeExt, symbol, to_length,
+    write_register,
 };
 
 const MAX_DENSE_ARRAY_CONSTRUCT_HOLES: u32 = 1_048_576;
@@ -146,9 +149,21 @@ impl Interpreter {
         constructor: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let items = args.first().cloned().unwrap_or(Value::undefined());
-        let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
-        let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
+        let mut constructor = constructor;
+        let mut items = args.first().cloned().unwrap_or(Value::undefined());
+        let mut map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
+        let mut this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: the canonical argument slots precede the scope and stay live
+        // until the complete Array.from algorithm returns. Every later use
+        // reads these slots anew, so a moving scavenge cannot leave the copied
+        // opcode/native arguments stale.
+        unsafe {
+            roots.add_value(&mut constructor);
+            roots.add_value(&mut items);
+            roots.add_value(&mut map_fn);
+            roots.add_value(&mut this_arg);
+        }
         let has_map = !map_fn.is_undefined();
         if has_map && !self.is_callable_runtime(&map_fn) {
             return Err(self.err_type(("Array.from mapFn must be callable".to_string()).into()));

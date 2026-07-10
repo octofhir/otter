@@ -373,9 +373,21 @@ unsafe fn verify_child_slot(
     } else {
         "root (out-of-cage: register/anchor/handle stack)"
     };
+    let (parent_offset, parent_size, parent_tag) = parent_header.map_or((0, 0, 0), |parent| {
+        // SAFETY: a parent supplied by the tracer points at the live object
+        // whose side-storage slot is being visited.
+        unsafe {
+            (
+                (parent as usize).wrapping_sub(cage_base() as usize) as u32,
+                (*parent).size_bytes(),
+                (*parent).type_tag(),
+            )
+        }
+    });
     eprintln!(
         "OTTER_GC_VERIFY: corrupt slot -> raw_offset={raw:#x} target_size={size} target_tag={tag} \
-         slot={slot:p} region={region} parent={parent_header:?}"
+         slot={slot:p} region={region} parent_offset={parent_offset:#x} \
+         parent_size={parent_size} parent_tag={parent_tag}"
     );
 }
 

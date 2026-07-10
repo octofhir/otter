@@ -4,11 +4,28 @@
 //! Timer scheduler and dynamic-import loader wiring, console sink,
 //! microtask queue accessors, stack-depth limit, eval hook, tracer,
 //! CPU profiler, IC/shape/heap snapshots, interrupt handle, and
-//! `global_this`/`set_global`.
+//! `global_this`/`set_global`, plus rooted host-construction scopes.
 #![allow(unused_imports)]
 use crate::*;
 
 impl Interpreter {
+    /// Run host/runtime construction work while the complete interpreter root
+    /// set is registered with its heap.
+    ///
+    /// Runtime builders install classes, extensions, and globals after
+    /// [`Interpreter::new`] but before the dispatch loop installs its normal
+    /// root provider. Any allocation in that interval may collect, so the
+    /// interpreter must remain stationary and visible for the entire setup
+    /// closure. Keeping the registration internal to this closure makes that
+    /// address-stability contract enforceable by the mutable borrow.
+    pub fn with_runtime_roots<R>(&mut self, build: impl FnOnce(&mut Self) -> R) -> R {
+        let roots = otter_gc::ExtraRoots::new(&*self);
+        let guard = self.gc_heap.register_extra_roots(roots);
+        let result = build(self);
+        drop(guard);
+        result
+    }
+
     /// Install the host-side timer scheduler. Called by the
     /// runtime layer at construction time so the JS-visible
     /// `setTimeout` / `setInterval` natives can route through the

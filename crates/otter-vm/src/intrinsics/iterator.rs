@@ -299,83 +299,112 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     let Some(prototype) = prototype else {
         return Ok(());
     };
-    let proto_root = Value::object(prototype);
-    let symbol_iter_fn = native_static_with_value_roots(
-        heap,
-        "[Symbol.iterator]",
-        0,
-        iterator_proto_symbol_iterator,
-        &[&proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let mut proto_root = Value::object(prototype);
+    let mut symbol_iter_root = Value::undefined();
+    let mut tag_get_root = Value::undefined();
+    let mut tag_set_root = Value::undefined();
+    let mut ctor_get_root = Value::undefined();
+    let mut ctor_set_root = Value::undefined();
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: all canonical slots precede the scope and remain stationary until
+    // the complete Iterator.prototype surface is installed.
+    unsafe {
+        roots.add_value(&mut proto_root);
+        roots.add_value(&mut symbol_iter_root);
+        roots.add_value(&mut tag_get_root);
+        roots.add_value(&mut tag_set_root);
+        roots.add_value(&mut ctor_get_root);
+        roots.add_value(&mut ctor_set_root);
+    }
+    symbol_iter_root = Value::native_function(
+        native_static_with_value_roots(
+            heap,
+            "[Symbol.iterator]",
+            0,
+            iterator_proto_symbol_iterator,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    // §27.1.2.4 / §27.1.2.2 — `@@toStringTag` and `constructor` are
+    // accessor properties whose setters write own properties on the
+    // receiver (SetterThatIgnoresPrototypeProperties).
+    let tag_sym = well_known.get(WellKnown::ToStringTag);
+    tag_get_root = Value::native_function(
+        native_static_with_value_roots(
+            heap,
+            "get [Symbol.toStringTag]",
+            0,
+            iterator_proto_to_string_tag_get,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    tag_set_root = Value::native_function(
+        native_static_with_value_roots(
+            heap,
+            "set [Symbol.toStringTag]",
+            1,
+            iterator_proto_to_string_tag_set,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    ctor_get_root = Value::native_function(
+        native_static_with_value_roots(
+            heap,
+            "get constructor",
+            0,
+            iterator_proto_constructor_get,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    ctor_set_root = Value::native_function(
+        native_static_with_value_roots(
+            heap,
+            "set constructor",
+            1,
+            iterator_proto_constructor_set,
+            &[],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let prototype = proto_root
+        .as_object()
+        .expect("Iterator.prototype remains rooted during symbol bootstrap");
     let iter_sym = well_known.get(WellKnown::Iterator);
     object::define_own_symbol_property_partial(
         prototype,
         heap,
         iter_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::native_function(symbol_iter_fn)),
+            value: Some(symbol_iter_root),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
             ..Default::default()
         },
     );
-    // §27.1.2.4 / §27.1.2.2 — `@@toStringTag` and `constructor` are
-    // accessor properties whose setters write own properties on the
-    // receiver (SetterThatIgnoresPrototypeProperties).
-    let tag_sym = well_known.get(WellKnown::ToStringTag);
-    let tag_get = native_static_with_value_roots(
-        heap,
-        "get [Symbol.toStringTag]",
-        0,
-        iterator_proto_to_string_tag_get,
-        &[&proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let tag_set = native_static_with_value_roots(
-        heap,
-        "set [Symbol.toStringTag]",
-        1,
-        iterator_proto_to_string_tag_set,
-        &[&proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
         heap,
         tag_sym,
         crate::object::PartialPropertyDescriptor {
-            get: Some(Value::native_function(tag_get)),
-            set: Some(Value::native_function(tag_set)),
+            get: Some(tag_get_root),
+            set: Some(tag_set_root),
             enumerable: Some(false),
             configurable: Some(true),
             ..Default::default()
         },
     );
-    let ctor_get = native_static_with_value_roots(
-        heap,
-        "get constructor",
-        0,
-        iterator_proto_constructor_get,
-        &[&proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_set = native_static_with_value_roots(
-        heap,
-        "set constructor",
-        1,
-        iterator_proto_constructor_set,
-        &[&proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_property_partial(
         prototype,
         heap,
         "constructor",
         crate::object::PartialPropertyDescriptor {
-            get: Some(Value::native_function(ctor_get)),
-            set: Some(Value::native_function(ctor_set)),
+            get: Some(ctor_get_root),
+            set: Some(ctor_set_root),
             enumerable: Some(false),
             configurable: Some(true),
             ..Default::default()
@@ -422,18 +451,31 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         roots.add_value(&mut wrap_root);
     }
     let tag_sym = well_known.get(WellKnown::ToStringTag);
-    let mut make = |tag: &'static str| -> Result<JsObject, JsSurfaceError> {
-        let proto = {
-            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                parent_value.trace_value_slots(visitor);
-            };
-            object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?
-        };
-        let mut proto_root = Value::object(proto);
+    for (index, tag) in [
+        "Array Iterator",
+        "Map Iterator",
+        "Set Iterator",
+        "String Iterator",
+        "RegExp String Iterator",
+        "Iterator Helper",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut proto_root = Value::undefined();
+        let mut tag_root = Value::undefined();
         let mut proto_scope = otter_gc::RootScope::new(heap);
-        // SAFETY: the canonical prototype slot precedes this nested scope.
-        unsafe { proto_scope.add_value(&mut proto_root) };
+        // SAFETY: both per-prototype canonical slots precede this nested scope
+        // and are reloaded after every allocation.
+        unsafe {
+            proto_scope.add_value(&mut proto_root);
+            proto_scope.add_value(&mut tag_root);
+        }
+        let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        proto_root = Value::object(
+            object::alloc_object_with_shape_roots(heap, shape_root, &mut no_extra_roots)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        );
         let proto = proto_root
             .as_object()
             .expect("iterator prototype stays rooted after allocation");
@@ -441,46 +483,44 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
             .as_object()
             .expect("Iterator.prototype stays rooted during bootstrap");
         object::set_prototype(proto, heap, Some(parent));
-        let tag_sym_root = tag_sym;
-        let tag_string = {
-            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                parent_value.trace_value_slots(visitor);
-                tag_sym_root.trace_value_slots(visitor);
-            };
-            crate::string::JsString::from_str_with_roots(tag, heap, &mut visit)
-                .map_err(|_| JsSurfaceError::OutOfMemory)?
-        };
+        tag_root = Value::string(
+            crate::string::JsString::from_str(tag, heap)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        );
         let proto = proto_root
             .as_object()
             .expect("iterator prototype stays rooted after tag allocation");
         object::define_own_symbol_property_partial(
             proto,
             heap,
-            tag_sym_root,
+            tag_sym,
             object::PartialPropertyDescriptor {
-                value: Some(Value::string(tag_string)),
+                value: Some(tag_root),
                 writable: Some(false),
                 enumerable: Some(false),
                 configurable: Some(true),
                 ..Default::default()
             },
         );
-        Ok(proto_root
-            .as_object()
-            .expect("iterator prototype stays rooted after tag definition"))
-    };
-    array_root = Value::object(make("Array Iterator")?);
-    map_root = Value::object(make("Map Iterator")?);
-    set_root = Value::object(make("Set Iterator")?);
-    string_root = Value::object(make("String Iterator")?);
-    regexp_string_root = Value::object(make("RegExp String Iterator")?);
-    helper_root = Value::object(make("Iterator Helper")?);
+        let completed = Value::object(
+            proto_root
+                .as_object()
+                .expect("iterator prototype stays rooted after tag definition"),
+        );
+        match index {
+            0 => array_root = completed,
+            1 => map_root = completed,
+            2 => set_root = completed,
+            3 => string_root = completed,
+            4 => regexp_string_root = completed,
+            5 => helper_root = completed,
+            _ => unreachable!(),
+        }
+    }
     // §27.1.3.2 — `%WrapForValidIteratorPrototype%` carries no
     // `@@toStringTag` of its own.
     wrap_root = Value::object({
-        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            parent_value.trace_value_slots(visitor);
-        };
+        let mut visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         let proto = object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let parent = parent_value
@@ -497,11 +537,19 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
                           label: &'static str|
      -> Result<(), JsSurfaceError> {
         let mut proto_root = Value::object(proto);
+        let mut function_root = Value::undefined();
         let mut scope = otter_gc::RootScope::new(heap);
-        // SAFETY: the canonical receiver slot precedes the nested scope.
-        unsafe { scope.add_value(&mut proto_root) };
-        let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        // SAFETY: both canonical slots precede the nested scope. Defining the
+        // property may allocate descriptor/shape storage after the native
+        // function allocation, so the function itself must remain rooted too.
+        unsafe {
+            scope.add_value(&mut proto_root);
+            scope.add_value(&mut function_root);
+        }
+        function_root = Value::native_function(
+            native_static_with_value_roots(heap, name, length, call, &[])
+                .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        );
         let proto = proto_root
             .as_object()
             .expect("iterator prototype stays rooted across method allocation");
@@ -509,7 +557,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
             proto,
             heap,
             name,
-            object::PropertyDescriptor::data(Value::native_function(f), true, false, true),
+            object::PropertyDescriptor::data(function_root, true, false, true),
         ) {
             return Err(JsSurfaceError::DefinePropertyFailed(label));
         }

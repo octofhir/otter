@@ -9,6 +9,7 @@
 //! - [`SourceKind`] — JavaScript / TypeScript / JSX flavor selector.
 //! - [`detect_source_kind`] — decide kind from file extension.
 //! - [`with_program`] — parse once and consume the AST inside a callback.
+//! - [`with_program_timing`] — the opt-in Phase 0 parse measurement surface.
 //! - [`SyntaxError`] — concrete error returned when OXC reports
 //!   parser diagnostics.
 //!
@@ -24,6 +25,7 @@
 mod diagnostic;
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Program;
@@ -182,6 +184,24 @@ pub fn with_program<R>(
     with_program_goal(source, kind, SourceGoal::Module, f)
 }
 
+/// Parse `source` once and return both the callback result and parser time.
+///
+/// This opt-in surface exists for phase-level benchmark evidence. The duration
+/// covers allocator/source setup and OXC parsing, ending before the callback
+/// performs AST analysis or bytecode lowering. Ordinary compilation continues
+/// to use [`with_program`] and does not read the clock.
+///
+/// # Errors
+/// Returns a [`SyntaxError`] when OXC reports parse diagnostics.
+pub fn with_program_timing<R>(
+    source: impl Into<String>,
+    kind: SourceKind,
+    f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
+) -> Result<(R, Duration), SyntaxError> {
+    let started = Instant::now();
+    with_program_goal_after_parse(source, kind, SourceGoal::Module, || started.elapsed(), f)
+}
+
 /// Parse `source` once under an explicit [`SourceGoal`] and pass the
 /// AST to `f`.
 ///
@@ -199,6 +219,16 @@ pub fn with_program_goal<R>(
     goal: SourceGoal,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<R, SyntaxError> {
+    with_program_goal_after_parse(source, kind, goal, || (), f).map(|(result, ())| result)
+}
+
+fn with_program_goal_after_parse<R, T>(
+    source: impl Into<String>,
+    kind: SourceKind,
+    goal: SourceGoal,
+    after_parse: impl FnOnce() -> T,
+    f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
+) -> Result<(R, T), SyntaxError> {
     let allocator = Allocator::default();
     let source = source.into();
     let parser =
@@ -207,10 +237,11 @@ pub fn with_program_goal<R>(
             ..Default::default()
         });
     let ret = parser.parse();
+    let parse_metadata = after_parse();
     if !ret.diagnostics.is_empty() {
         return Err(SyntaxError::from_oxc(&ret.diagnostics));
     }
-    Ok(f(&ret.program))
+    Ok((f(&ret.program), parse_metadata))
 }
 
 #[cfg(test)]
@@ -294,6 +325,16 @@ mod tests {
         })
         .unwrap();
         assert!(is_empty);
+    }
+
+    #[test]
+    fn timed_parse_keeps_callback_outside_parse_duration() {
+        let (statements, _duration) =
+            with_program_timing("const value = 1;", SourceKind::JavaScript, |program| {
+                program.body.len()
+            })
+            .expect("parse");
+        assert_eq!(statements, 1);
     }
 
     #[test]

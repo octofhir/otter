@@ -135,21 +135,32 @@ impl Interpreter {
         }
     }
 
-    /// Iterator over cached per-kind iterator prototypes, including the
-    /// never-swapped default-realm copies.
-    pub fn iterator_prototypes_for_trace(&self) -> impl Iterator<Item = &JsObject> {
-        [
-            self.array_iterator_prototype.as_ref(),
-            self.map_iterator_prototype.as_ref(),
-            self.set_iterator_prototype.as_ref(),
-            self.string_iterator_prototype.as_ref(),
-            self.regexp_string_iterator_prototype.as_ref(),
-            self.iterator_helper_prototype.as_ref(),
-            self.wrap_for_valid_iterator_prototype.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .chain(self.default_realm_iterator_prototypes.iter().flatten())
+    /// Trace cached per-kind iterator prototypes, including the never-swapped
+    /// default-realm copies, through legal interior-mutable root cells.
+    pub fn trace_iterator_prototypes(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+        let trace = |cell: &crate::gc_trace::RootCell<Option<JsObject>>,
+                     visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            // SAFETY: `RootCell` owns a stable slot inside `Interpreter`; root
+            // tracing is STW and fallback paths may retain this pointer until
+            // the collection starts immediately after the walk.
+            if let Some(object) = unsafe { (&mut *cell.as_mut_ptr()).as_mut() } {
+                visitor((object as *mut JsObject).cast::<otter_gc::raw::RawGc>());
+            }
+        };
+        for cell in [
+            &self.array_iterator_prototype,
+            &self.map_iterator_prototype,
+            &self.set_iterator_prototype,
+            &self.string_iterator_prototype,
+            &self.regexp_string_iterator_prototype,
+            &self.iterator_helper_prototype,
+            &self.wrap_for_valid_iterator_prototype,
+        ] {
+            trace(cell, visitor);
+        }
+        for cell in &self.default_realm_iterator_prototypes {
+            trace(cell, visitor);
+        }
     }
 
     /// Iterator over non-GC exotic prototype override values.

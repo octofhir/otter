@@ -56,6 +56,7 @@ fn is_property_bearing_object(v: &Value) -> bool {
         || v.is_temporal()
         || v.is_generator()
         || v.is_intl()
+        || v.is_iterator()
 }
 
 impl Interpreter {
@@ -1512,6 +1513,7 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
         || target.is_temporal()
         || target.is_generator()
         || target.is_intl()
+        || target.is_iterator()
         || target.as_weak_ref().is_some()
         || target.as_finalization_registry().is_some()
 }

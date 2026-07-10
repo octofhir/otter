@@ -778,7 +778,7 @@ impl Interpreter {
             }
             return Ok(None);
         }
-        if target.is_intl() {
+        if target.is_intl() || target.is_iterator() {
             if let Some(bag) = self.non_gc_exotic_user_props(&target) {
                 if let Some(name) = key.string_name() {
                     if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, name) {
@@ -1692,7 +1692,7 @@ impl Interpreter {
                 self.define_own_property_partial(bag, k, descriptor)?
             });
         }
-        if target.is_intl() {
+        if target.is_intl() || target.is_iterator() {
             let Some(bag) = self.ensure_non_gc_exotic_user_props(target)? else {
                 return Ok(false);
             };
@@ -2917,10 +2917,10 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        if target.is_intl() {
-            // ECMA-402 service instances are ordinary objects; own keys
-            // are exactly the user-props side-table entries (resolved
-            // options live in internal slots, not own properties).
+        if target.is_intl() || target.is_iterator() {
+            // ECMA-402 service instances and builtin iterators are
+            // ordinary objects; own keys are exactly the user-props
+            // side-table entries.
             let mut keys = Vec::new();
             if let Some(bag) = self.non_gc_exotic_user_props(&target) {
                 let (strings, mut symbols): (Vec<String>, Vec<Value>) =
@@ -4349,10 +4349,20 @@ impl Interpreter {
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
         if base.is_generator() || base.is_iterator() {
-            // A user-defined own property on a generator lives in the
-            // lazy expando and shadows the prototype (an own accessor
-            // fires with the generator as receiver).
-            if let Some(bag) = base.as_generator().and_then(|g| g.expando(&self.gc_heap)) {
+            // A user-defined own property on a generator/iterator lives
+            // in its lazy expando (generator body slot / non-GC side
+            // table) and shadows the prototype.
+            let expando = base
+                .as_generator()
+                .and_then(|g| g.expando(&self.gc_heap))
+                .or_else(|| {
+                    if base.is_iterator() {
+                        self.non_gc_exotic_user_props(&base)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(bag) = expando {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
                         object::lookup_own_symbol(bag, &self.gc_heap, *sym)
@@ -5200,9 +5210,12 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        if target.is_map() || target.is_set() || target.is_generator() {
+        if target.is_map() || target.is_set() || target.is_generator() || target.is_iterator() {
             let mut keys = Vec::new();
-            if let Some(bag) = self.collection_expando(&target) {
+            let bag = self
+                .collection_expando(&target)
+                .or_else(|| self.non_gc_exotic_user_props(&target));
+            if let Some(bag) = bag {
                 keys.extend(object::with_properties(bag, &self.gc_heap, |p| {
                     p.enumerable_keys().map(str::to_string).collect::<Vec<_>>()
                 }));
@@ -5942,6 +5955,71 @@ impl Interpreter {
             let same_receiver = receiver
                 .as_temporal(&self.gc_heap)
                 .is_some_and(|r| r.ptr_eq(t));
+            let lookup = match key {
+                VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(bag, &self.gc_heap, *sym),
+                _ => object::lookup_own(
+                    bag,
+                    &self.gc_heap,
+                    key.string_name()
+                        .expect("non-symbol key has string spelling"),
+                ),
+            };
+            match lookup {
+                object::PropertyLookup::Data { flags, .. } => {
+                    if !flags.writable() {
+                        return Ok(false);
+                    }
+                    if !same_receiver {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    if let VmPropertyKey::Symbol(sym) = key {
+                        object::set_symbol(bag, &mut self.gc_heap, *sym, value);
+                    } else {
+                        object::set(
+                            &mut bag,
+                            &mut self.gc_heap,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            value,
+                        );
+                    }
+                    return Ok(true);
+                }
+                object::PropertyLookup::Accessor { setter, .. } => {
+                    let Some(setter) = setter else {
+                        return Ok(false);
+                    };
+                    let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                    self.run_callable_sync(context, &setter, receiver, argv)?;
+                    return Ok(true);
+                }
+                object::PropertyLookup::Absent => {
+                    let parent = self.get_prototype_for_op(&target)?;
+                    if parent.is_null() || parent.is_undefined() {
+                        return self.ordinary_set_on_receiver(context, key, value, &receiver);
+                    }
+                    return self.ordinary_set_data_value(
+                        context,
+                        parent,
+                        key,
+                        value,
+                        receiver,
+                        hops + 1,
+                    );
+                }
+            }
+        }
+        if target.is_iterator() {
+            // Builtin iterator objects — ordinary objects whose user
+            // properties live in the non-GC side-table bag; the
+            // prototype walk stays ordinary (§10.1.9).
+            let Some(mut bag) = self.ensure_non_gc_exotic_user_props(&target)? else {
+                return Ok(false);
+            };
+            let same_receiver = receiver
+                .as_iterator()
+                .zip(target.as_iterator())
+                .is_some_and(|(r, t)| r.as_header_ptr() == t.as_header_ptr());
             let lookup = match key {
                 VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(bag, &self.gc_heap, *sym),
                 _ => object::lookup_own(

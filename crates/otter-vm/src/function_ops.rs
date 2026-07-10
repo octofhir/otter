@@ -220,6 +220,20 @@ impl Interpreter {
             statics,
             &mut external_visit,
         )?;
+        // §15.7.14 — a static member named `name`/`length` suppresses
+        // the constructor's virtual metadata property entirely (the
+        // class never receives the implicit own `name`): mark it
+        // deleted so removing the static later does not resurrect it.
+        if let Some(fid) = ctor
+            .as_function()
+            .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
+        {
+            for key in ["name", "length"] {
+                if crate::object::get_own_descriptor(statics, &self.gc_heap, key).is_some() {
+                    self.function_deleted_metadata.insert((fid, key));
+                }
+            }
+        }
         // §15.7.14 step 6.b — preserve the parent class IDENTITY for
         // [[GetPrototypeOf]]; the statics object's own prototype
         // keeps the parallel walk-able static-inheritance chain.
@@ -1199,6 +1213,20 @@ impl Interpreter {
         }
 
         let statics = class.statics(&self.gc_heap);
+        // §15.7.14 — a static `name`/`length` member REDEFINES the
+        // constructor's implicit property, so it keeps the implicit
+        // slot's creation position (length, then name, before
+        // `prototype`), not the statics-bag insertion position.
+        for key in ["name", "length"] {
+            if !keys.iter().any(|existing| existing == key)
+                && crate::object::get_own_descriptor(statics, &self.gc_heap, key).is_some()
+            {
+                // "length" always heads the list; "name" follows any
+                // existing "length".
+                let pos = usize::from(key == "name" && keys.first().is_some_and(|k| k == "length"));
+                keys.insert(pos, key.to_string());
+            }
+        }
         for key in crate::object::with_properties(statics, &self.gc_heap, |p| {
             p.keys().map(str::to_string).collect::<Vec<_>>()
         }) {

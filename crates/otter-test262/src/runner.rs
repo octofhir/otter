@@ -386,6 +386,7 @@ pub fn run_one(
         let outcome = run_script_with_fresh_runtime(
             exec,
             allow_blocking_atomics_wait,
+            "",
             &source,
             &rel_path,
             test_path,
@@ -397,13 +398,11 @@ pub fn run_one(
         let mut ran_variant = false;
         if !frontmatter.is_only_strict() {
             ran_variant = true;
-            let mut sloppy = String::with_capacity(preamble.len() + body.len());
-            sloppy.push_str(&preamble);
-            sloppy.push_str(body);
             let outcome = run_script_with_fresh_runtime(
                 exec,
                 allow_blocking_atomics_wait,
-                &sloppy,
+                &preamble,
+                body,
                 &rel_path,
                 test_path,
                 stage_script,
@@ -421,14 +420,13 @@ pub fn run_one(
         }
         if !frontmatter.is_no_strict() {
             ran_variant = true;
-            let mut strict =
-                String::with_capacity("\"use strict\";\n".len() + preamble.len() + body.len());
+            let mut strict = String::with_capacity("\"use strict\";\n".len() + body.len());
             strict.push_str("\"use strict\";\n");
-            strict.push_str(&preamble);
             strict.push_str(body);
             let outcome = run_script_with_fresh_runtime(
                 exec,
                 allow_blocking_atomics_wait,
+                &preamble,
                 &strict,
                 &rel_path,
                 test_path,
@@ -460,7 +458,8 @@ pub fn run_one(
 fn run_script_with_fresh_runtime(
     exec: &ExecConfig,
     allow_blocking_atomics_wait: bool,
-    source: &str,
+    preamble: &str,
+    body: &str,
     rel_path: &str,
     test_path: &Path,
     stage_on_disk: bool,
@@ -478,9 +477,28 @@ fn run_script_with_fresh_runtime(
         }
     };
     crate::agent::reset_for_next_test();
+    // INTERPRETING.md — harness includes evaluate as separate classic
+    // scripts BEFORE the test. Concatenating them would put the strict
+    // variant's `"use strict"` prologue in front of the harness too,
+    // wrongly making harness helpers (and their direct `eval`s) strict.
+    if !preamble.is_empty() {
+        let outcome = run_with_watchdog(&mut runtime, exec.timeout, |rt| {
+            rt.run_script(
+                SourceInput::from_javascript(preamble.to_string()),
+                "test262-harness.js",
+            )
+        });
+        if let mapped @ (Outcome::Fail { .. }
+        | Outcome::Crash { .. }
+        | Outcome::Timeout { .. }
+        | Outcome::OutOfMemory { .. }) = map_watchdog_outcome(outcome)
+        {
+            return mapped;
+        }
+    }
     run_script_test(
         &mut runtime,
-        source,
+        body,
         rel_path,
         test_path,
         stage_on_disk,

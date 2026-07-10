@@ -1301,6 +1301,18 @@ pub struct Interpreter {
     regexp_string_iterator_prototype: Option<JsObject>,
     iterator_helper_prototype: Option<JsObject>,
     wrap_for_valid_iterator_prototype: Option<JsObject>,
+    /// Default-realm copies of the per-kind iterator prototypes above,
+    /// captured at bootstrap and NEVER swapped on a realm switch. A
+    /// builtin iterator with no stored prototype override belongs to
+    /// the default realm (extra-realm iterators are stamped at
+    /// creation), so its dynamic `[[GetPrototypeOf]]` must resolve
+    /// here even while an extra realm is active — otherwise a
+    /// default-realm iterator observed from `$262.createRealm()` code
+    /// would claim the foreign realm's prototypes.
+    /// Indexed by [`iterator_state::BuiltinIteratorOrigin`] discriminant
+    /// order: array, map, set, string, regexp-string, helper,
+    /// wrap-for-valid-iterator.
+    default_realm_iterator_prototypes: [Option<JsObject>; 7],
     function_kind_prototypes: function_kind::FunctionKindPrototypes,
     /// Pool of cold-frame side records (try handlers, async parking,
     /// in-flight ToPrimitive/bind/iterator ladders, module URL, …).

@@ -3616,6 +3616,14 @@ impl Interpreter {
         function_id: u32,
         byte_pc: u32,
     ) -> Result<(), VmError> {
+        // Resolve the chunk OWNING `function_id` before decoding anything:
+        // a compiled function from another script's chunk (multi-script
+        // runtime) must have its instruction operands and constant pools
+        // read from its own tables, not the caller's ambient chunk.
+        let resolved = context
+            .for_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -3811,6 +3819,12 @@ impl Interpreter {
         byte_pc: u32,
     ) -> Result<(), VmError> {
         let fid = stack[frame_index].function_id;
+        // Decode against the chunk OWNING `fid` — in a multi-script
+        // runtime the executing frame may belong to another script's
+        // chunk, whose operand/constant tables differ from the ambient
+        // context's.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)
@@ -3844,6 +3858,12 @@ impl Interpreter {
         byte_pc: u32,
     ) -> Result<(), VmError> {
         let fid = stack[frame_index].function_id;
+        // Decode against the chunk OWNING `fid` — in a multi-script
+        // runtime the executing frame may belong to another script's
+        // chunk, whose operand/constant tables differ from the ambient
+        // context's.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)
@@ -3895,6 +3915,12 @@ impl Interpreter {
         byte_pc: u32,
     ) -> Result<(), VmError> {
         let fid = stack[frame_index].function_id;
+        // Decode against the chunk OWNING `fid` — in a multi-script
+        // runtime the executing frame may belong to another script's
+        // chunk, whose operand/constant tables differ from the ambient
+        // context's.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)
@@ -3940,6 +3966,12 @@ impl Interpreter {
         byte_pc: u32,
     ) -> Result<(), VmError> {
         let fid = stack[frame_index].function_id;
+        // Decode against the chunk OWNING `fid` — in a multi-script
+        // runtime the executing frame may belong to another script's
+        // chunk, whose operand/constant tables differ from the ambient
+        // context's.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)
@@ -3981,6 +4013,12 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
         let fid = stack[frame_index].function_id;
+        // Decode against the chunk OWNING `fid` — in a multi-script
+        // runtime the executing frame may belong to another script's
+        // chunk, whose operand/constant tables differ from the ambient
+        // context's.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)
@@ -4021,6 +4059,12 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
         let fid = stack[frame_index].function_id;
+        // Decode against the chunk OWNING `fid` — in a multi-script
+        // runtime the executing frame may belong to another script's
+        // chunk, whose operand/constant tables differ from the ambient
+        // context's.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let context = &*resolved;
         let func = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instr = func
             .instr_at_byte_pc(byte_pc)

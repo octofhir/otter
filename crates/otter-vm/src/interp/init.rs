@@ -258,6 +258,7 @@ impl Interpreter {
             regexp_string_iterator_prototype: None,
             iterator_helper_prototype: None,
             wrap_for_valid_iterator_prototype: None,
+            default_realm_iterator_prototypes: [None; 7],
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
@@ -298,6 +299,18 @@ impl Interpreter {
             interp.regexp_string_iterator_prototype = Some(protos.regexp_string);
             interp.iterator_helper_prototype = Some(protos.helper);
             interp.wrap_for_valid_iterator_prototype = Some(protos.wrap_for_valid_iterator);
+            // Never-swapped default-realm copies — bare (override-less)
+            // iterators resolve against these while an extra realm is
+            // active.
+            interp.default_realm_iterator_prototypes = [
+                Some(protos.array),
+                Some(protos.map),
+                Some(protos.set),
+                Some(protos.string),
+                Some(protos.regexp_string),
+                Some(protos.helper),
+                Some(protos.wrap_for_valid_iterator),
+            ];
         }
         interp.install_function_kind_prototypes_post_bootstrap();
         drop(extra_roots_guard);
@@ -465,7 +478,7 @@ impl Interpreter {
     ) -> Option<Value> {
         state
             .builtin_origin()
-            .and_then(|origin| self.builtin_iterator_prototype_for(origin))
+            .and_then(|origin| self.active_realm_iterator_prototype_for(origin))
             .map(Value::object)
     }
 
@@ -474,27 +487,18 @@ impl Interpreter {
         handle: IteratorHandle,
         prototype: Option<Value>,
     ) {
-        // Record the override only when it differs from the ACTIVE realm's
-        // default for this iterator kind — i.e. only for iterators minted
-        // while a non-default realm is active. Same-realm iterators (the
-        // overwhelming majority: every for-of / spread / apply drain mints
-        // one) resolve through the realm's builtin prototype cache anyway,
-        // and unconditionally inserting them into
+        // Stamp the override only for iterators minted while a
+        // non-default realm is active, mirroring the array policy: a
+        // bare iterator then uniquely means "default realm", and
+        // resolution routes it through the never-swapped default-realm
+        // prototype copies. Same-realm iterators (the overwhelming
+        // majority: every for-of / spread / apply drain mints one) stay
+        // bare, because unconditionally inserting them into
         // `non_gc_exotic_prototype_overrides` grew a GC-traced map by one
         // entry per iterator ever created: entries never die (the key is a
         // reusable header address), every scavenge re-traced the whole map,
         // and v8-v7 raytrace degraded ~200x.
-        let default_prototype = self
-            .gc_heap
-            .read_payload(handle, |state| state.builtin_origin())
-            .and_then(|origin| self.builtin_iterator_prototype_for(origin))
-            .map(Value::object);
-        let same = match (&prototype, &default_prototype) {
-            (Some(a), Some(b)) => a.to_bits() == b.to_bits(),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
+        if !self.active_realm_is_extra {
             return;
         }
         self.set_non_gc_exotic_prototype_override(&Value::iterator(handle), prototype);
@@ -685,6 +689,26 @@ impl Interpreter {
         &self,
         origin: BuiltinIteratorOrigin,
     ) -> Option<JsObject> {
+        // A bare (override-less) builtin iterator always belongs to the
+        // DEFAULT realm — extra-realm iterators get a stored override at
+        // creation. While an extra realm is active its own prototype set
+        // lives in the swapped fields below, so bare iterators must
+        // resolve through the never-swapped default-realm copies or a
+        // default-realm iterator observed from `$262.createRealm()` code
+        // would claim the foreign realm's prototypes.
+        if self.active_realm_is_extra {
+            return self.default_realm_iterator_prototypes[Self::iterator_origin_index(origin)];
+        }
+        self.active_realm_iterator_prototype_for(origin)
+    }
+
+    /// The ACTIVE realm's per-kind iterator prototype (the swapped
+    /// fields) — creation-side accessor: a fresh iterator adopts the
+    /// realm it is minted in.
+    pub(crate) fn active_realm_iterator_prototype_for(
+        &self,
+        origin: BuiltinIteratorOrigin,
+    ) -> Option<JsObject> {
         match origin {
             BuiltinIteratorOrigin::Array => self.array_iterator_prototype,
             BuiltinIteratorOrigin::Map => self.map_iterator_prototype,
@@ -693,6 +717,19 @@ impl Interpreter {
             BuiltinIteratorOrigin::RegExpString => self.regexp_string_iterator_prototype,
             BuiltinIteratorOrigin::Helper => self.iterator_helper_prototype,
             BuiltinIteratorOrigin::WrapForValidIterator => self.wrap_for_valid_iterator_prototype,
+        }
+    }
+
+    /// Index into [`Self::default_realm_iterator_prototypes`].
+    fn iterator_origin_index(origin: BuiltinIteratorOrigin) -> usize {
+        match origin {
+            BuiltinIteratorOrigin::Array => 0,
+            BuiltinIteratorOrigin::Map => 1,
+            BuiltinIteratorOrigin::Set => 2,
+            BuiltinIteratorOrigin::String => 3,
+            BuiltinIteratorOrigin::RegExpString => 4,
+            BuiltinIteratorOrigin::Helper => 5,
+            BuiltinIteratorOrigin::WrapForValidIterator => 6,
         }
     }
 

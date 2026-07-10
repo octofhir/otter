@@ -388,6 +388,23 @@ fn to_duration_record(ctx: &mut NativeCtx<'_>, arg: Value) -> Result<[f64; 10], 
             sign = -1;
         }
     }
+    // §IsValidDuration — calendar units are bounded by 2^32 and the
+    // normalized day-plus-time total by 2^53 seconds.
+    for &(idx, name) in &[(0usize, "years"), (1, "months"), (2, "weeks")] {
+        if record[idx].abs() >= 4_294_967_296.0 {
+            return Err(range_err(&format!("{name} out of range")));
+        }
+    }
+    let total_seconds = record[3].abs() * 86_400.0
+        + record[4].abs() * 3_600.0
+        + record[5].abs() * 60.0
+        + record[6].abs()
+        + record[7].abs() / 1e3
+        + record[8].abs() / 1e6
+        + record[9].abs() / 1e9;
+    if total_seconds >= 9_007_199_254_740_992.0 {
+        return Err(range_err("duration time total out of range"));
+    }
     Ok(record)
 }
 
@@ -459,6 +476,11 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                 if value == 0.0 && any_negative {
                     value = -0.0;
                 }
+            } else {
+                // §1.1.9 PartitionDurationFormatPattern — only the first
+                // displayed component carries the sign; later components
+                // render their absolute value.
+                value = value.abs();
             }
 
             let (min_frac, max_frac) = if fractional {
@@ -490,7 +512,14 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                     numbering_system: "latn".to_string(),
                     style: "decimal".to_string(),
                     currency: None,
-                    minimum_integer_digits: 1,
+                    // Digital "2-digit" pads to two digits ("0:00:01"),
+                    // and any unit appended after a ":" separator pads
+                    // likewise ("1 hr, 2:03").
+                    minimum_integer_digits: if style == "2-digit" || need_separator {
+                        2
+                    } else {
+                        1
+                    },
                     minimum_significant_digits: None,
                     maximum_significant_digits: None,
                     minimum_fraction_digits: min_frac,
@@ -626,6 +655,11 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                 if value == 0.0 && any_negative {
                     value = -0.0;
                 }
+            } else {
+                // §1.1.9 PartitionDurationFormatPattern — only the first
+                // displayed component carries the sign; later components
+                // render their absolute value.
+                value = value.abs();
             }
             let (min_frac, max_frac) = if fractional {
                 (
@@ -642,7 +676,14 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                     numbering_system: "latn".to_string(),
                     style: "decimal".to_string(),
                     currency: None,
-                    minimum_integer_digits: 1,
+                    // Digital "2-digit" pads to two digits ("0:00:01"),
+                    // and any unit appended after a ":" separator pads
+                    // likewise ("1 hr, 2:03").
+                    minimum_integer_digits: if style == "2-digit" || need_separator {
+                        2
+                    } else {
+                        1
+                    },
                     minimum_significant_digits: None,
                     maximum_significant_digits: None,
                     minimum_fraction_digits: min_frac,
@@ -717,14 +758,15 @@ pub(crate) fn format_to_parts(
     let record = to_duration_record(ctx, arg)?;
     let groups = partition_parts(&payload, &record);
 
-    // Join the element groups; `type: "unit"` list formatting uses a
-    // plain `", "` separator between elements.
+    // Join the element groups with the CLDR `unit` list separator —
+    // narrow joins with a bare space, everything else with ", ".
+    let separator = if payload.style == "narrow" { " " } else { ", " };
     let mut flat: Vec<DurationPart> = Vec::new();
     for (gi, group) in groups.into_iter().enumerate() {
         if gi > 0 {
             flat.push(DurationPart {
                 ty: "literal",
-                value: ", ".to_string(),
+                value: separator.to_string(),
                 unit: None,
             });
         }

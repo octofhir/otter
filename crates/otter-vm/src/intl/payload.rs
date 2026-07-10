@@ -103,6 +103,16 @@ pub struct NumberFormatPayload {
     /// `compactDisplay` option (`"short"` / `"long"`) — meaningful only
     /// when `notation == "compact"`.
     pub compact_display: String,
+    /// `roundingMode` option (§15.1.2 — `"halfExpand"` default).
+    pub rounding_mode: String,
+    /// `roundingIncrement` option (1 unless one of the sanctioned
+    /// increments was requested).
+    pub rounding_increment: u16,
+    /// `trailingZeroDisplay` option (`"auto"` / `"stripIfInteger"`).
+    pub trailing_zero_display: String,
+    /// `roundingPriority` option (`"auto"` / `"morePrecision"` /
+    /// `"lessPrecision"`).
+    pub rounding_priority: String,
 }
 
 /// Text-component width (`weekday`, `era`, `dayPeriod`).
@@ -326,6 +336,7 @@ pub struct LocalePayload {
 
 /// One [`crate::Value::Intl`] instance.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // one payload per Intl instance; boxing would only add indirection
 pub enum IntlPayload {
     /// `new Intl.Collator(...)` instance.
     Collator(CollatorPayload),

@@ -271,7 +271,7 @@ pub fn resolve_ctx(
             "invalid roundingIncrement {rounding_increment}"
         )));
     }
-    let _rounding_mode = get_string_option(
+    let rounding_mode = get_string_option(
         ctx,
         options,
         "roundingMode",
@@ -288,23 +288,35 @@ pub fn resolve_ctx(
             "halfEven",
         ],
         Some("halfExpand"),
-    )?;
-    let _rounding_priority = get_string_option(
+    )?
+    .unwrap_or_else(|| "halfExpand".to_string());
+    let rounding_priority = get_string_option(
         ctx,
         options,
         "roundingPriority",
         CLASS,
         &["auto", "morePrecision", "lessPrecision"],
         Some("auto"),
-    )?;
-    let _trailing_zero = get_string_option(
+    )?
+    .unwrap_or_else(|| "auto".to_string());
+    // §15.1.6 SetNumberFormatDigitOptions — a non-auto roundingPriority
+    // keeps BOTH digit families live, defaulting significant digits to
+    // 1..21 when unset (format-time position comparison picks a side).
+    let (minimum_significant_digits, maximum_significant_digits) =
+        if rounding_priority != "auto" && minimum_significant_digits.is_none() {
+            (Some(1u8), Some(21u8))
+        } else {
+            (minimum_significant_digits, maximum_significant_digits)
+        };
+    let trailing_zero_display = get_string_option(
         ctx,
         options,
         "trailingZeroDisplay",
         CLASS,
         &["auto", "stripIfInteger"],
         Some("auto"),
-    )?;
+    )?
+    .unwrap_or_else(|| "auto".to_string());
 
     let compact_display = get_string_option(
         ctx,
@@ -356,6 +368,10 @@ pub fn resolve_ctx(
         unit,
         unit_display,
         compact_display,
+        rounding_mode,
+        rounding_increment,
+        trailing_zero_display,
+        rounding_priority,
     })
 }
 
@@ -710,7 +726,7 @@ pub(crate) fn partition_number(
         // a minus-sign part.
         let accounting_negative = sign == SignKind::Minus && payload.currency_sign == "accounting";
         let full = currency_string(n.abs(), payload);
-        let core = format_decimal(n.abs(), payload);
+        let core = format_decimal_signed(n.abs(), is_neg, payload);
         if let Some(idx) = full.find(&core) {
             if accounting_negative {
                 parts.push(("literal", "(".to_string()));
@@ -742,7 +758,7 @@ pub(crate) fn partition_number(
     // (whitespace adjacent to the number stays a `literal`).
     if payload.style == "unit" && n.is_finite() {
         let full = unit_string(n.abs(), payload);
-        let core = format_decimal(n.abs(), payload);
+        let core = format_decimal_signed(n.abs(), is_neg, payload);
         if let Some(idx) = full.find(&core) {
             push_sign(&mut parts, sign);
             push_unit_affix(&mut parts, &full[..idx], false);
@@ -1063,8 +1079,13 @@ pub(crate) fn format_number(n: f64, payload: &NumberFormatPayload) -> String {
         match payload.style.as_str() {
             "currency" => currency_string(n.abs(), payload),
             "unit" => unit_string(n.abs(), payload),
-            "percent" => format!("{}%", format_decimal(n.abs() * 100.0, payload)),
-            _ => format_decimal(n.abs(), payload),
+            "percent" => {
+                format!(
+                    "{}%",
+                    format_decimal_signed(n.abs() * 100.0, is_neg, payload)
+                )
+            }
+            _ => format_decimal_signed(n.abs(), is_neg, payload),
         }
     };
     format!("{sign}{magnitude}")
@@ -1423,9 +1444,223 @@ fn unit_string(magnitude: f64, payload: &NumberFormatPayload) -> String {
     format!("{} {unit}", format_decimal(abs, payload))
 }
 
+/// Exact decimal rounding of `abs` to `frac_digits` fraction digits by
+/// multiples of `increment`, honoring the §15.1.2 roundingMode. Works
+/// on the shortest decimal representation so binary-float artifacts
+/// ("1.15" stored as 1.1499…) never leak into rounding decisions.
+/// `None` when the value exceeds the exact integer domain (caller
+/// falls back to the binary path).
+fn round_decimal_exact(
+    abs: f64,
+    is_negative: bool,
+    frac_digits: usize,
+    increment: u16,
+    mode: &str,
+) -> Option<String> {
+    round_decimal_exact_scaled(abs, is_negative, frac_digits as i32, increment, mode)
+}
+
+/// As [`round_decimal_exact`] with a possibly NEGATIVE fraction-digit
+/// count (rounding at integer positions — the significant-digit path
+/// needs it for values >= 10^maxSig).
+fn round_decimal_exact_scaled(
+    abs: f64,
+    is_negative: bool,
+    frac_digits: i32,
+    increment: u16,
+    mode: &str,
+) -> Option<String> {
+    if !abs.is_finite() {
+        return None;
+    }
+    // Shortest round-trip repr; expand any scientific notation.
+    let repr = format!("{abs}");
+    let (mantissa, exp) = match repr.split_once(['e', 'E']) {
+        Some((m, e)) => (m.to_string(), e.parse::<i32>().ok()?),
+        None => (repr, 0),
+    };
+    let (int_raw, frac_raw) = match mantissa.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (mantissa, String::new()),
+    };
+    let mut digits: Vec<u8> = int_raw
+        .bytes()
+        .chain(frac_raw.bytes())
+        .map(|b| b - b'0')
+        .collect();
+    // Decimal point position from the left, shifted by the exponent.
+    let mut point = int_raw.len() as i32 + exp;
+    while digits.len() > 1 && digits[0] == 0 && point > 1 {
+        digits.remove(0);
+        point -= 1;
+    }
+    while point <= 0 {
+        digits.insert(0, 0);
+        point += 1;
+    }
+    while (point as usize) > digits.len() {
+        digits.push(0);
+    }
+    let scale_len = point + frac_digits;
+    if scale_len < 0 {
+        return Some("0".to_string());
+    }
+    // Consume EVERY available digit so the remainder comparison below
+    // is exact — trailing digits contribute real distance, not just a
+    // tie-break (1.750 at one fraction digit by increments of 5 is an
+    // exact tie, not "below half").
+    if scale_len > 30 {
+        return None;
+    }
+    let ext_len = (digits.len() as i32).min(30).max(scale_len);
+    let extra = (ext_len - scale_len) as u32;
+    let mut n: i128 = 0;
+    for i in 0..ext_len as usize {
+        n = n * 10 + i128::from(*digits.get(i).unwrap_or(&0));
+    }
+    let leftover_beyond_ext = digits
+        .get(ext_len as usize..)
+        .unwrap_or(&[])
+        .iter()
+        .any(|&d| d != 0);
+    let inc_ext = i128::from(increment).checked_mul(10i128.checked_pow(extra)?)?;
+    let div = n / inc_ext;
+    let rem = n % inc_ext;
+    let round_up = if rem == 0 && !leftover_beyond_ext {
+        false
+    } else {
+        match mode {
+            "trunc" => false,
+            "expand" => true,
+            "ceil" => !is_negative,
+            "floor" => is_negative,
+            _ => {
+                let twice = rem.checked_mul(2)?;
+                if twice < inc_ext {
+                    false
+                } else if twice > inc_ext || leftover_beyond_ext {
+                    true
+                } else {
+                    match mode {
+                        "halfTrunc" => false,
+                        "halfCeil" => !is_negative,
+                        "halfFloor" => is_negative,
+                        "halfEven" => (div % 2) != 0,
+                        // halfExpand
+                        _ => true,
+                    }
+                }
+            }
+        }
+    };
+    let q = (div + i128::from(round_up)).checked_mul(i128::from(increment))?;
+    let mut out = q.to_string();
+    if frac_digits > 0 {
+        let frac = frac_digits as usize;
+        while out.len() <= frac {
+            out.insert(0, '0');
+        }
+        out.insert(out.len() - frac, '.');
+    } else {
+        // Negative fraction digits round at integer positions — pad the
+        // dropped places back with zeros.
+        for _ in 0..(-frac_digits) {
+            out.push('0');
+        }
+    }
+    Some(out)
+}
+
+/// Significant-digit rounding with an explicit roundingMode: derive
+/// the fraction-digit position from the value's decimal exponent and
+/// reuse the exact rounding core.
+fn round_significant_exact(
+    abs: f64,
+    is_negative: bool,
+    max_sig: u8,
+    min_sig: u8,
+    mode: &str,
+) -> Option<String> {
+    if abs == 0.0 {
+        return Some("0".to_string());
+    }
+    let repr = format!("{abs}");
+    let (mantissa, exp) = match repr.split_once(['e', 'E']) {
+        Some((m, e)) => (m.to_string(), e.parse::<i32>().ok()?),
+        None => (repr, 0),
+    };
+    let (int_raw, frac_raw) = match mantissa.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (mantissa, String::new()),
+    };
+    let digits: Vec<u8> = int_raw
+        .bytes()
+        .chain(frac_raw.bytes())
+        .map(|b| b - b'0')
+        .collect();
+    let point = int_raw.len() as i32 + exp;
+    let first_sig = digits.iter().position(|&d| d != 0)? as i32;
+    // value = digits[first_sig].… × 10^e
+    let e = point - 1 - first_sig;
+    let frac = i32::from(max_sig) - 1 - e;
+    let rounded = round_decimal_exact_scaled(abs, is_negative, frac, 1, mode)?;
+    // A round-up can gain an integer digit (9.99 → 10), which shifts
+    // the significant window by one; re-round once at the wider scale.
+    let rounded = match rounded.parse::<f64>() {
+        Ok(v)
+            if v != 0.0
+                && (v.abs().log10().floor() as i32) > e
+                && i32::from(max_sig) - 1 - (e + 1) != frac =>
+        {
+            round_decimal_exact_scaled(abs, is_negative, frac - 1, 1, mode)?
+        }
+        _ => rounded,
+    };
+    Some(trim_significant(&rounded, min_sig))
+}
+
+/// Strip trailing fractional zeros while keeping at least `min_sig`
+/// significant digits (and drop a bare trailing point).
+fn trim_significant(s: &str, min_sig: u8) -> String {
+    let Some((int_part, frac_part)) = s.split_once('.') else {
+        return s.to_string();
+    };
+    let int_sig = if int_part.chars().all(|c| c == '0') {
+        0
+    } else {
+        int_part.trim_start_matches('0').len()
+    };
+    let mut frac: Vec<char> = frac_part.chars().collect();
+    loop {
+        let frac_sig: usize = if int_sig > 0 {
+            frac.len()
+        } else {
+            let leading = frac.iter().take_while(|&&c| c == '0').count();
+            frac.len().saturating_sub(leading)
+        };
+        if frac.last() == Some(&'0') && int_sig + frac_sig > usize::from(min_sig) {
+            frac.pop();
+        } else {
+            break;
+        }
+    }
+    if frac.is_empty() {
+        int_part.to_string()
+    } else {
+        format!("{int_part}.{}", frac.iter().collect::<String>())
+    }
+}
+
 /// Format a number through ICU's `DecimalFormatter`. Falls back to
 /// the Rust-side `format!` rendering when ICU instantiation fails.
 fn format_decimal(n: f64, payload: &NumberFormatPayload) -> String {
+    format_decimal_signed(n, n.is_sign_negative(), payload)
+}
+
+/// As [`format_decimal`] with the ORIGINAL sign threaded separately —
+/// callers pass `n.abs()`, but ceil/floor/halfCeil/halfFloor rounding
+/// direction depends on the pre-abs sign.
+fn format_decimal_signed(n: f64, is_negative: bool, payload: &NumberFormatPayload) -> String {
     let locale = Locale::from_str(&payload.locale)
         .or_else(|_| Locale::from_str(DEFAULT_LOCALE))
         .expect("default locale parses");
@@ -1443,16 +1678,64 @@ fn format_decimal(n: f64, payload: &NumberFormatPayload) -> String {
     // start with `minimumFractionDigits`, round to
     // `maximumFractionDigits`, and trim any trailing zeros above
     // the minimum so `1234567` doesn't surface as `1,234,567.000`.
-    let trimmed = if let Some(max_sig) = payload.maximum_significant_digits {
-        format_significant(
+    let use_significant = match payload.maximum_significant_digits {
+        None => false,
+        Some(mxsd) => {
+            if payload.rounding_priority == "auto" {
+                true
+            } else {
+                // §15.5.3 — compare rounding positions: significant
+                // rounds at e - mxsd + 1, fraction at -mxfd; the more
+                // fractional (smaller) position is the more precise
+                // side, ties go to significant.
+                let e = if n == 0.0 {
+                    0
+                } else {
+                    n.abs().log10().floor() as i32
+                };
+                let s_pos = e - i32::from(mxsd) + 1;
+                let f_pos = -i32::from(payload.maximum_fraction_digits);
+                if payload.rounding_priority == "morePrecision" {
+                    s_pos <= f_pos
+                } else {
+                    s_pos >= f_pos
+                }
+            }
+        }
+    };
+    let trimmed = if use_significant {
+        let max_sig = payload
+            .maximum_significant_digits
+            .expect("use_significant implies a bound");
+        let min_sig = payload.minimum_significant_digits.unwrap_or(1);
+        round_significant_exact(
             n.abs(),
+            is_negative,
             max_sig,
-            payload.minimum_significant_digits.unwrap_or(1),
+            min_sig,
+            &payload.rounding_mode,
         )
+        .unwrap_or_else(|| format_significant(n.abs(), max_sig, min_sig))
     } else {
         let max = payload.maximum_fraction_digits as usize;
-        let formatted = format!("{:.max$}", n.abs(), max = max);
+        let formatted = round_decimal_exact(
+            n.abs(),
+            is_negative,
+            max,
+            payload.rounding_increment,
+            &payload.rounding_mode,
+        )
+        .unwrap_or_else(|| format!("{:.max$}", n.abs(), max = max));
         trim_trailing_zero_fraction(&formatted, payload.minimum_fraction_digits as usize)
+    };
+    let trimmed = if payload.trailing_zero_display == "stripIfInteger"
+        && trimmed
+            .split_once('.')
+            .is_some_and(|(_, f)| f.bytes().all(|b| b == b'0'))
+    {
+        trimmed.split_once('.').map(|(i, _)| i.to_string()).unwrap()
+    } else {
+        trimmed
     };
     let mut decimal = match Decimal::from_str(&trimmed) {
         Ok(d) => d,

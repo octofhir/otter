@@ -532,6 +532,10 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                     unit: None,
                     unit_display: "short".to_string(),
                     compact_display: "short".to_string(),
+                    rounding_mode: "halfExpand".to_string(),
+                    rounding_increment: 1,
+                    trailing_zero_display: "auto".to_string(),
+                    rounding_priority: "auto".to_string(),
                 }
             } else {
                 NumberFormatPayload {
@@ -552,6 +556,10 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
                     unit: Some(SINGULAR[i].to_string()),
                     unit_display: style.to_string(),
                     compact_display: "short".to_string(),
+                    rounding_mode: "halfExpand".to_string(),
+                    rounding_increment: 1,
+                    trailing_zero_display: "auto".to_string(),
+                    rounding_priority: "auto".to_string(),
                 }
             };
             let rendered = crate::intl::number_format::format_number(value, &np);
@@ -696,6 +704,10 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                     unit: None,
                     unit_display: "short".to_string(),
                     compact_display: "short".to_string(),
+                    rounding_mode: "halfExpand".to_string(),
+                    rounding_increment: 1,
+                    trailing_zero_display: "auto".to_string(),
+                    rounding_priority: "auto".to_string(),
                 }
             } else {
                 NumberFormatPayload {
@@ -716,6 +728,10 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
                     unit: Some(unit.to_string()),
                     unit_display: style.to_string(),
                     compact_display: "short".to_string(),
+                    rounding_mode: "halfExpand".to_string(),
+                    rounding_increment: 1,
+                    trailing_zero_display: "auto".to_string(),
+                    rounding_priority: "auto".to_string(),
                 }
             };
             let number_parts = crate::intl::number_format::partition_number(value, &np);

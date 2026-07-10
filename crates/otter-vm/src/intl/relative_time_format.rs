@@ -10,7 +10,7 @@
 use otter_gc::raw::RawGc;
 
 use crate::intl::helpers::{
-    DEFAULT_LOCALE, get_numbering_system_option, get_string_option, require_options_object,
+    DEFAULT_LOCALE, coerce_options_object, get_numbering_system_option, get_string_option,
 };
 use crate::intl::payload::{IntlPayload, RelativeTimeFormatPayload};
 use crate::string::JsString;
@@ -31,7 +31,7 @@ pub fn resolve_ctx(
         .into_iter()
         .next()
         .unwrap_or_else(|| DEFAULT_LOCALE.to_string());
-    let options = require_options_object(options, CLASS)?;
+    let options = coerce_options_object(options, CLASS)?;
     let _matcher = get_string_option(
         ctx,
         options,
@@ -117,7 +117,95 @@ fn unit_label(unit: &str, plural: bool, style: &str) -> &'static str {
     }
 }
 
+/// Build the icu relative-time formatter for the payload's locale,
+/// style, and numeric option, keyed by the singular unit name.
+fn icu_formatter(
+    unit: &str,
+    payload: &RelativeTimeFormatPayload,
+) -> Option<icu_experimental::relativetime::RelativeTimeFormatter> {
+    use icu_experimental::relativetime::options::Numeric;
+    use icu_experimental::relativetime::{
+        RelativeTimeFormatter as F, RelativeTimeFormatterOptions,
+    };
+    let locale: icu_locale::Locale = payload.locale.parse().ok()?;
+    let prefs = (&locale).into();
+    let mut options = RelativeTimeFormatterOptions::default();
+    options.numeric = if payload.numeric == "auto" {
+        Numeric::Auto
+    } else {
+        Numeric::Always
+    };
+    let ctor = match (payload.style.as_str(), singular_unit(unit)) {
+        ("long", "second") => F::try_new_long_second,
+        ("long", "minute") => F::try_new_long_minute,
+        ("long", "hour") => F::try_new_long_hour,
+        ("long", "day") => F::try_new_long_day,
+        ("long", "week") => F::try_new_long_week,
+        ("long", "month") => F::try_new_long_month,
+        ("long", "quarter") => F::try_new_long_quarter,
+        ("long", "year") => F::try_new_long_year,
+        ("short", "second") => F::try_new_short_second,
+        ("short", "minute") => F::try_new_short_minute,
+        ("short", "hour") => F::try_new_short_hour,
+        ("short", "day") => F::try_new_short_day,
+        ("short", "week") => F::try_new_short_week,
+        ("short", "month") => F::try_new_short_month,
+        ("short", "quarter") => F::try_new_short_quarter,
+        ("short", "year") => F::try_new_short_year,
+        ("narrow", "second") => F::try_new_narrow_second,
+        ("narrow", "minute") => F::try_new_narrow_minute,
+        ("narrow", "hour") => F::try_new_narrow_hour,
+        ("narrow", "day") => F::try_new_narrow_day,
+        ("narrow", "week") => F::try_new_narrow_week,
+        ("narrow", "month") => F::try_new_narrow_month,
+        ("narrow", "quarter") => F::try_new_narrow_quarter,
+        ("narrow", "year") => F::try_new_narrow_year,
+        _ => return None,
+    };
+    ctor(prefs, options).ok()
+}
+
+/// The singular spelling of a sanctioned relative-time unit.
+fn singular_unit(unit: &str) -> &str {
+    unit.strip_suffix('s')
+        .filter(|u| !u.is_empty())
+        .unwrap_or(unit)
+}
+
+fn value_to_decimal(value: f64) -> Option<fixed_decimal::Decimal> {
+    use std::str::FromStr as _;
+    let rendered = if value == 0.0 && value.is_sign_negative() {
+        "-0".to_string()
+    } else {
+        value.to_string()
+    };
+    fixed_decimal::Decimal::from_str(&rendered).ok()
+}
+
 fn render_format(value: f64, unit: &str, payload: &RelativeTimeFormatPayload) -> String {
+    if let (Some(formatter), Some(decimal)) =
+        (icu_formatter(unit, payload), value_to_decimal(value))
+    {
+        return writeable::Writeable::write_to_string(&formatter.format(decimal)).into_owned();
+    }
+    render_format_fallback(value, unit, payload)
+}
+
+/// The locale-formatted bare number for the value, matching the digits
+/// the relative-time pattern interpolates (used to split parts).
+fn render_number(value: f64, payload: &RelativeTimeFormatPayload) -> Option<String> {
+    let locale: icu_locale::Locale = payload.locale.parse().ok()?;
+    let formatter = icu_decimal::DecimalFormatter::try_new(
+        (&locale).into(),
+        icu_decimal::options::DecimalFormatterOptions::default(),
+    )
+    .ok()?;
+    let decimal = value_to_decimal(value.abs())?.with_sign(fixed_decimal::Sign::None);
+    Some(writeable::Writeable::write_to_string(&formatter.format(&decimal)).into_owned())
+}
+
+/// Pre-icu fallback used when the locale/unit has no bundled data.
+fn render_format_fallback(value: f64, unit: &str, payload: &RelativeTimeFormatPayload) -> String {
     if value.is_nan() {
         return "NaN".to_string();
     }
@@ -225,27 +313,93 @@ pub(crate) fn relative_time_format_format(
 }
 
 /// §18.4.4 `Intl.RelativeTimeFormat.prototype.formatToParts(value, unit)`
-/// — foundation returns a single `{ type: "literal", value: <full
-/// string> }` part. The shape is spec-compatible; per-token splitting
-/// arrives with the full ICU integration.
+/// — §18.5.3 PartitionRelativeTimePattern: the interpolated number's
+/// integer/group/decimal/fraction segments carry a `unit` property; the
+/// surrounding pattern text surfaces as `literal` parts.
 pub(crate) fn relative_time_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let s = relative_time_format_format(ctx, args)?;
-    let literal = Value::string(JsString::from_str("literal", ctx.heap_mut())?);
-    let mut part = ctx.alloc_object_with_roots(&[&literal, &s], &[])?;
-    crate::object::set(&mut part, ctx.heap_mut(), "type", literal);
-    crate::object::set(&mut part, ctx.heap_mut(), "value", s);
-    let elements = vec![Value::object(part)];
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
+    let payload = require_payload(ctx, "formatToParts")?;
+    let first = args.first().copied().unwrap_or_else(Value::undefined);
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "formatToParts",
+            reason: "missing execution context".to_string(),
+        })?;
+    let value = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &first)
+        .map(|n| n.as_f64())
+        .map_err(|e| {
+            crate::native_function::vm_to_native_error(ctx.cx.interp, e, "formatToParts")
+        })?;
+    if !value.is_finite() {
+        return Err(NativeError::RangeError {
+            name: "formatToParts",
+            reason: "value must be a finite number".to_string(),
+        });
+    }
+    let unit = {
+        let unit_v = args.get(1).copied().unwrap_or_else(Value::undefined);
+        crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &unit_v).map_err(|e| {
+            crate::native_function::vm_to_native_error(ctx.cx.interp, e, "formatToParts")
+        })?
+    };
+    if !is_valid_unit(&unit) {
+        return Err(NativeError::RangeError {
+            name: "formatToParts",
+            reason: format!("invalid unit: {unit}"),
+        });
+    }
+    let full = render_format(value, &unit, &payload);
+    let number = render_number(value, &payload);
+    // (type, value, carries-unit)
+    let mut triples: Vec<(&'static str, String, bool)> = Vec::new();
+    match number.as_deref().and_then(|n| full.find(n).map(|i| (i, n))) {
+        Some((idx, num)) => {
+            if idx > 0 {
+                triples.push(("literal", full[..idx].to_string(), false));
+            }
+            push_number_segments(&mut triples, num, value.fract() != 0.0);
+            let rest = &full[idx + num.len()..];
+            if !rest.is_empty() {
+                triples.push(("literal", rest.to_string(), false));
+            }
+        }
+        // numeric:"auto" relatives ("now", "yesterday") interpolate no
+        // number — a single literal part.
+        None => triples.push(("literal", full.clone(), false)),
+    }
+
+    let singular = singular_unit(&unit).to_string();
+    let mut elements: Vec<Value> = Vec::with_capacity(triples.len());
+    for (ty, val, has_unit) in &triples {
+        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
+        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
+        let unit_s = if *has_unit {
+            Some(Value::string(JsString::from_str(
+                &singular,
+                ctx.heap_mut(),
+            )?))
+        } else {
+            None
+        };
+        let snapshot = elements.clone();
+        let mut roots = vec![&ty_s, &val_s];
+        if let Some(u) = &unit_s {
+            roots.push(u);
+        }
+        let mut part = ctx.alloc_object_with_roots(&roots, &[&snapshot])?;
+        crate::object::set(&mut part, ctx.heap_mut(), "type", ty_s);
+        crate::object::set(&mut part, ctx.heap_mut(), "value", val_s);
+        if let Some(u) = unit_s {
+            crate::object::set(&mut part, ctx.heap_mut(), "unit", u);
+        }
+        elements.push(Value::object(part));
+    }
     let element_roots = elements.clone();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for &slot in &roots {
-            visitor(slot);
-        }
-        this_value.trace_value_slots(visitor);
         for v in &element_roots {
             v.trace_value_slots(visitor);
         }
@@ -253,6 +407,51 @@ pub(crate) fn relative_time_format_format_to_parts(
     let arr =
         crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
     Ok(Value::array(arr))
+}
+
+/// Split a locale-formatted number into ECMA-402 numeric part types.
+/// Digit runs become `integer`, single non-digit separators between
+/// digit runs become `group`, and a final separator + digits pair
+/// becomes `decimal` + `fraction` when the separator differs from the
+/// grouping character (heuristic sufficient for grouped integers).
+fn push_number_segments(
+    parts: &mut Vec<(&'static str, String, bool)>,
+    num: &str,
+    has_fraction: bool,
+) {
+    // With a fractional value the LAST separator is the decimal point
+    // and everything after it the fraction; all earlier separators are
+    // grouping characters.
+    let decimal_at = if has_fraction {
+        num.char_indices()
+            .filter(|(_, c)| !c.is_numeric())
+            .map(|(i, _)| i)
+            .next_back()
+    } else {
+        None
+    };
+    let mut current = String::new();
+    for (i, ch) in num.char_indices() {
+        if ch.is_numeric() {
+            current.push(ch);
+        } else {
+            if !current.is_empty() {
+                parts.push(("integer", std::mem::take(&mut current), true));
+            }
+            if Some(i) == decimal_at {
+                parts.push(("decimal", ch.to_string(), true));
+            } else {
+                parts.push(("group", ch.to_string(), true));
+            }
+        }
+    }
+    if !current.is_empty() {
+        if decimal_at.is_some() {
+            parts.push(("fraction", current, true));
+        } else {
+            parts.push(("integer", current, true));
+        }
+    }
 }
 
 /// §18.4.5 `Intl.RelativeTimeFormat.prototype.resolvedOptions()`.

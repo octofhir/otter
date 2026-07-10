@@ -429,6 +429,11 @@ pub enum Op {
     /// to `floor`), then jumps to `pc + 1 + offset`. `offset` is
     /// patched like an ordinary branch target.
     JumpViaFinally,
+    /// Discard the innermost `count` completions parked by enclosing
+    /// `finally` blocks (§14.15.3 — a `break`/`continue` that exits a
+    /// finally body abandons the completion that finally had parked).
+    /// Operands: `Imm32(count)`.
+    PopParkedFinally,
     /// `r<dst> = ClassConstructor { ctor, prototype, statics }`.
     /// Operands: `Register(dst), Register(ctor), Register(prototype),
     /// Register(statics)`. Used by class lowering to package the
@@ -1310,6 +1315,7 @@ impl Op {
             Op::SetSuperProperty => "SET_SUPER_PROPERTY",
             Op::SetSuperElement => "SET_SUPER_ELEMENT",
             Op::JumpViaFinally => "JUMP_VIA_FINALLY",
+            Op::PopParkedFinally => "POP_PARKED_FINALLY",
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
             Op::MathLoad => "MATH_LOAD",
@@ -1578,6 +1584,7 @@ impl Op {
             Op::LoadSuperProperty | Op::LoadSuperElement => 3,
             Op::SetSuperProperty | Op::SetSuperElement => 3,
             Op::JumpViaFinally => 2,
+            Op::PopParkedFinally => 1,
             // dst, name_const, src, scratch_dst.
             Op::StoreProperty => 4,
             // `NewArray` is variadic: `dst, count, elems...`. The

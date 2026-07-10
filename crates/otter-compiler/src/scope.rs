@@ -107,6 +107,10 @@ pub(crate) struct LoopFrame {
     /// `active_finally` exceeds this needs the finally-routing
     /// `break`/`continue` opcode.
     pub(crate) finally_floor: u32,
+    /// [`crate::function_context::FunctionContext::finally_body_depth`]
+    /// at entry; an exit jump discards one parked completion per
+    /// finally BODY it abandons.
+    pub(crate) finally_body_floor: u32,
 }
 
 impl LoopFrame {
@@ -119,6 +123,7 @@ impl LoopFrame {
             iterator_close_reg: None,
             handler_floor: 0,
             finally_floor: 0,
+            finally_body_floor: 0,
         }
     }
 
@@ -131,6 +136,7 @@ impl LoopFrame {
             iterator_close_reg: None,
             handler_floor: 0,
             finally_floor: 0,
+            finally_body_floor: 0,
         }
     }
 }

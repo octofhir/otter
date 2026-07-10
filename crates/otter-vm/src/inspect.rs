@@ -900,6 +900,7 @@ mod tests {
         Op::SetSuperProperty,
         Op::SetSuperElement,
         Op::JumpViaFinally,
+        Op::PopParkedFinally,
         Op::MakeClass,
         Op::MathLoad,
         Op::MathCall,

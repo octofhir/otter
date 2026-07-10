@@ -412,7 +412,11 @@ impl Interpreter {
         let mut stack: HoltStack = HoltStack::new();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
-        let entry_this = if main.is_module || main.is_strict {
+        // §19.2.1.3 — eval code evaluated at global scope (direct at
+        // the top level or indirect) binds `this` to globalThis even
+        // when the eval source itself is strict; only module code gets
+        // an undefined top-level `this`.
+        let entry_this = if main.is_module {
             Value::undefined()
         } else {
             Value::object(self.global_this)

@@ -347,7 +347,21 @@ impl<'rt> NativeCtx<'rt> {
                 slice_roots,
             );
         };
-        object::alloc_object_with_shape_roots(self.heap_mut(), shape_root, &mut external_visit)
+        let object = object::alloc_object_with_shape_roots(
+            self.heap_mut(),
+            shape_root,
+            &mut external_visit,
+        )?;
+        // OrdinaryObjectCreate(%Object.prototype%) — natives building
+        // JS-visible objects (resolvedOptions, formatToParts entries, …)
+        // expect `hasOwnProperty` & friends to resolve. Install the
+        // prototype only after the allocation (which can scavenge and
+        // relocate a still-young realm prototype); the realm-intrinsic
+        // table is always traced, so a post-alloc read is current.
+        if let Some(proto) = self.cx.interp.object_prototype_object_opt() {
+            object::set_prototype(object, self.heap_mut(), Some(proto));
+        }
+        Ok(object)
     }
 
     /// Set an ordinary string-keyed property while keeping the native-call

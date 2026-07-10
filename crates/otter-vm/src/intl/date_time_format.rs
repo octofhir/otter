@@ -480,12 +480,41 @@ pub fn resolve_ctx(
         &["lookup", "best fit"],
         None,
     )?;
-    let calendar = get_string_option(ctx, options, "calendar", CLASS, &[], None)?
-        .filter(|cal| crate::intl::supported::is_supported_calendar(cal))
+    // §11.1.2 — the calendar option (or the locale's `-u-ca-`
+    // extension) is canonicalized (lowercase + BCP47 aliases); a
+    // malformed identifier is a RangeError, an unknown-but-well-formed
+    // one falls back to the locale default.
+    let calendar_option = match get_string_option(ctx, options, "calendar", CLASS, &[], None)? {
+        Some(cal) => Some(
+            crate::intl::supported::canonicalize_calendar(&cal).ok_or_else(|| {
+                NativeError::RangeError {
+                    name: CLASS,
+                    reason: format!("invalid calendar: {cal}"),
+                }
+            })?,
+        ),
+        None => None,
+    };
+    let supported_calendar = |v: &str| {
+        crate::intl::supported::canonicalize_calendar(v)
+            .is_some_and(|c| crate::intl::supported::is_supported_calendar(&c))
+    };
+    let (calendar, locale) = crate::intl::helpers::resolve_unicode_keyword(
+        &locale,
+        "ca",
+        calendar_option,
+        &supported_calendar,
+        "gregory",
+    );
+    let calendar = crate::intl::supported::canonicalize_calendar(&calendar)
         .unwrap_or_else(|| "gregory".to_string());
-    let numbering_system = get_numbering_system_option(ctx, options, CLASS)?
-        .filter(|ns| crate::intl::supported::is_supported_numbering_system(ns))
-        .unwrap_or_else(|| "latn".to_string());
+    let (numbering_system, locale) = crate::intl::helpers::resolve_unicode_keyword(
+        &locale,
+        "nu",
+        get_numbering_system_option(ctx, options, CLASS)?,
+        &crate::intl::supported::is_supported_numbering_system,
+        "latn",
+    );
 
     let hour12 = get_bool_option(ctx, options, "hour12", CLASS, None)?;
     let hour_cycle_option = enum_opt!("hourCycle", HC, parse_hour_cycle);

@@ -392,7 +392,7 @@ fn to_duration_record(ctx: &mut NativeCtx<'_>, arg: Value) -> Result<[f64; 10], 
     // normalized day-plus-time total by 2^53 seconds.
     for &(idx, name) in &[(0usize, "years"), (1, "months"), (2, "weeks")] {
         if record[idx].abs() >= 4_294_967_296.0 {
-            return Err(range_err(&format!("{name} out of range")));
+            return Err(range_err(format!("{name} out of range")));
         }
     }
     let total_seconds = record[3].abs() * 86_400.0

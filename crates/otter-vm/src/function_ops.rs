@@ -530,9 +530,41 @@ impl Interpreter {
                 // §20.2.3.2 / §10.4.1.3 — name and length come from
                 // spec-observable [[Get]]s on the target, so a Proxy get
                 // trap (Function.prototype.bind.call(proxy)) is honoured.
-                let target_name = self.get_property_value_for_call(context, this_value, "name")?;
-                let target_length =
-                    self.get_property_value_for_call(context, this_value, "length")?;
+                let target_name = {
+                    let key = VmPropertyKey::String("name");
+                    let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                        context,
+                        this_value,
+                        &key,
+                        0,
+                        &[&this_value],
+                        &[],
+                    )?;
+                    if own.is_some() {
+                        self.get_property_value_for_call(context, this_value, "name")?
+                    } else {
+                        Value::undefined()
+                    }
+                };
+                // §20.2.3.2 step 5 — the length transfer keys off
+                // HasOwnProperty(Target, "length"): an inherited
+                // `length` (mutated [[Prototype]]) leaves L = 0.
+                let target_length = {
+                    let key = VmPropertyKey::String("length");
+                    let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                        context,
+                        this_value,
+                        &key,
+                        0,
+                        &[&this_value],
+                        &[],
+                    )?;
+                    if own.is_some() {
+                        self.get_property_value_for_call(context, this_value, "length")?
+                    } else {
+                        Value::undefined()
+                    }
+                };
                 let metadata = function_metadata::bound_create_metadata_from_values(
                     &target_name,
                     &target_length,
@@ -1883,6 +1915,20 @@ impl Interpreter {
                 function_id,
                 name,
             );
+        }
+        // A user-mutated [[Prototype]] replaces the intrinsic chain:
+        // continue the ordinary walk from the override.
+        if let Some(over) = self.function_prototype_overrides.get(&function_id).copied() {
+            if over.is_null() {
+                return Ok(Value::undefined());
+            }
+            let key = VmPropertyKey::OwnedString(name.to_string());
+            return match self.ordinary_get_value(context, over, over, &key, 0)? {
+                VmGetOutcome::Value(v) => Ok(v),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, over, SmallVec::new())
+                }
+            };
         }
         if let Some(proto) = self.function_kind_prototype_for(context, function_id)
             && let Some(value) = object::get(proto, &self.gc_heap, name)

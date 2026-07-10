@@ -1652,6 +1652,7 @@ impl Interpreter {
             let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
                 context, owner, fid, name,
             )?;
+
             if matches!(name, "name" | "length") {
                 let own = self.ordinary_function_own_property_descriptor(
                     Some(context),
@@ -1717,6 +1718,38 @@ impl Interpreter {
                     format!("Cannot add property '{name}' to non-extensible function"),
                 )?;
                 None
+            } else if !has_own {
+                // §10.1.9 OrdinarySet — an inherited accessor (e.g. the
+                // §B.2.2.1 `__proto__` setter on %Object.prototype%) or
+                // read-only data slot on the prototype chain intercepts
+                // the write before an own property is created.
+                match self.callable_metadata_proto_set(context, receiver, name)? {
+                    MetadataProtoSet::Reject => {
+                        self.failed_set_result(
+                            strict,
+                            format!("Cannot assign to read-only property '{name}' of function"),
+                        )?;
+                        None
+                    }
+                    MetadataProtoSet::InvokeSetter(setter) => {
+                        self.run_callable_sync(
+                            context,
+                            &setter,
+                            receiver,
+                            smallvec::smallvec![value],
+                        )?;
+                        None
+                    }
+                    MetadataProtoSet::Create => {
+                        let bag = self.function_user_bag_with_stack_roots(
+                            stack,
+                            owner,
+                            fid,
+                            &[&receiver, &value],
+                        )?;
+                        Some(bag)
+                    }
+                }
             } else {
                 let bag = self.function_user_bag_with_stack_roots(
                     stack,
@@ -5981,6 +6014,19 @@ impl Interpreter {
                     None => return Ok(false),
                     Some(_) => {}
                 }
+            }
+            // An own bag hit may overwrite in place; a miss falls to
+            // the slow store funnel, whose §10.1.9 OrdinarySet walk
+            // honours inherited accessors (the §B.2.2.1 `__proto__`
+            // setter) before creating an own property.
+            let own_in_bag = self.callable_bag_read(owner, fid).is_some_and(|bag| {
+                !matches!(
+                    object::lookup_own(bag, &self.gc_heap, name),
+                    object::PropertyLookup::Absent
+                )
+            });
+            if !own_in_bag {
+                return Ok(false);
             }
             match self.callable_bag_read(owner, fid) {
                 Some(bag) => bag,

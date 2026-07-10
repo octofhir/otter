@@ -40,7 +40,13 @@ pub fn resolve_ctx(
         &["lookup", "best fit"],
         None,
     )?;
-    let numbering_system = get_numbering_system_option(ctx, options, CLASS)?;
+    let (numbering_system, locale) = crate::intl::helpers::resolve_unicode_keyword(
+        &locale,
+        "nu",
+        get_numbering_system_option(ctx, options, CLASS)?,
+        &crate::intl::supported::is_supported_numbering_system,
+        "latn",
+    );
     let style = get_string_option(
         ctx,
         options,
@@ -63,9 +69,7 @@ pub fn resolve_ctx(
         locale,
         style,
         numeric,
-        numbering_system: numbering_system
-            .filter(|ns| crate::intl::supported::is_supported_numbering_system(ns))
-            .unwrap_or_else(|| "latn".to_string()),
+        numbering_system,
     })
 }
 

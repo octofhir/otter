@@ -1,13 +1,13 @@
 {
   "test262_commit": "7e115f46ac64340827d505fa928ad436cb7ba5a6",
-  "engine_commit": "1ddab8e8dcaeeb5686402f75d7ebd3438386f655",
-  "ran_at": "2026-07-10T00:48:46.962120+00:00",
+  "engine_commit": "d1aaa674e5f88a110ef047b683f66ffb96b50500",
+  "ran_at": "2026-07-10T03:30:26.639365+00:00",
   "totals": {
     "total": 53173,
-    "passed": 51332,
-    "failed": 628,
+    "passed": 51450,
+    "failed": 526,
     "skipped": 1185,
-    "crashed": 16,
+    "crashed": 0,
     "timed_out": 11,
     "oom": 1
   },
@@ -16952,10 +16952,10 @@
     },
     "built-ins/TypedArray/prototype": {
       "total": 1404,
-      "passed": 1376,
-      "failed": 4,
+      "passed": 1396,
+      "failed": 0,
       "skipped": 8,
-      "crashed": 16,
+      "crashed": 0,
       "timed_out": 0,
       "oom": 0
     },
@@ -18545,11 +18545,11 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js": {
       "total": 1,
-      "passed": 1,
+      "passed": 0,
       "failed": 0,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 0,
+      "timed_out": 1,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A3_T1.js": {
@@ -21227,8 +21227,8 @@
     },
     "intl402/DateTimeFormat/canonicalize-calendar.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21281,8 +21281,8 @@
     },
     "intl402/DateTimeFormat/constructor-invalid-offset-timezone.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21308,8 +21308,8 @@
     },
     "intl402/DateTimeFormat/constructor-options-calendar-invalid.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21560,8 +21560,8 @@
     },
     "intl402/DateTimeFormat/offset-timezone-no-unicode-minus-sign.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21587,8 +21587,8 @@
     },
     "intl402/DateTimeFormat/prototype": {
       "total": 180,
-      "passed": 128,
-      "failed": 52,
+      "passed": 143,
+      "failed": 37,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21677,8 +21677,8 @@
     },
     "intl402/DateTimeFormat/test-option-hour12.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21704,8 +21704,8 @@
     },
     "intl402/DateTimeFormat/timezone-case-insensitive.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21713,8 +21713,8 @@
     },
     "intl402/DateTimeFormat/timezone-invalid.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21722,8 +21722,8 @@
     },
     "intl402/DateTimeFormat/timezone-legacy-non-iana.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -21740,8 +21740,8 @@
     },
     "intl402/DateTimeFormat/timezone-utc.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -22271,8 +22271,8 @@
     },
     "intl402/DurationFormat/prototype": {
       "total": 81,
-      "passed": 47,
-      "failed": 34,
+      "passed": 75,
+      "failed": 6,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23333,8 +23333,8 @@
     },
     "intl402/NumberFormat/prototype": {
       "total": 179,
-      "passed": 128,
-      "failed": 51,
+      "passed": 155,
+      "failed": 24,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23414,8 +23414,8 @@
     },
     "intl402/NumberFormat/test-option-roundingPriority-mixed-options.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23648,8 +23648,8 @@
     },
     "intl402/RelativeTimeFormat/constructor": {
       "total": 34,
-      "passed": 31,
-      "failed": 2,
+      "passed": 32,
+      "failed": 1,
       "skipped": 1,
       "crashed": 0,
       "timed_out": 0,
@@ -23666,8 +23666,8 @@
     },
     "intl402/RelativeTimeFormat/prototype": {
       "total": 44,
-      "passed": 30,
-      "failed": 14,
+      "passed": 44,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23783,8 +23783,8 @@
     },
     "intl402/Temporal/PlainDateTime": {
       "total": 483,
-      "passed": 471,
-      "failed": 12,
+      "passed": 472,
+      "failed": 11,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -23801,8 +23801,8 @@
     },
     "intl402/Temporal/PlainTime": {
       "total": 12,
-      "passed": 8,
-      "failed": 4,
+      "passed": 9,
+      "failed": 3,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40046,11 +40046,11 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 77,
+      "passed": 78,
       "failed": 18,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 0,
       "oom": 0
     },
     "staging/sm/WeakMap": {
@@ -40118,8 +40118,8 @@
     },
     "staging/sm/extensions": {
       "total": 64,
-      "passed": 53,
-      "failed": 11,
+      "passed": 54,
+      "failed": 10,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40262,6 +40262,11 @@
     }
   },
   "failing_tests": [
+    {
+      "path": "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js",
+      "outcome": "timeout",
+      "reason": "timeout after 10000 ms"
+    },
     {
       "path": "built-ins/Proxy/revocable/tco-fn-realm.js",
       "esid": "sec-tail-position-calls",
@@ -41010,126 +41015,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: String: TypeError"
     },
     {
-      "path": "built-ins/TypedArray/prototype/every/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.every",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/filter/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.filter",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/filter/speciesctor-get-ctor-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.filter",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/filter/speciesctor-get-species-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.filter",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/filter/speciesctor-get-species-custom-ctor-length-throws.js",
-      "esid": "sec-%typedarray%.prototype.filter",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/filter/speciesctor-get-species-custom-ctor-throws.js",
-      "esid": "sec-%typedarray%.prototype.filter",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/filter/speciesctor-get-species-returns-throws.js",
-      "esid": "sec-%typedarray%.prototype.filter",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/forEach/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.foreach",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/map/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.map",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/map/speciesctor-get-species-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.map",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/map/speciesctor-get-species-custom-ctor-length-throws.js",
-      "esid": "sec-%typedarray%.prototype.map",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/map/speciesctor-get-species-custom-ctor-throws.js",
-      "esid": "sec-%typedarray%.prototype.map",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/map/speciesctor-get-species-returns-throws.js",
-      "esid": "sec-%typedarray%.prototype.map",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/reduce/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.reduce",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/reduceRight/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.reduceright",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/some/callbackfn-returns-abrupt.js",
-      "esid": "sec-%typedarray%.prototype.some",
-      "outcome": "crash",
-      "reason": "sloppy: engine internal error (VM_BYTECODE_INVARIANT): invalid operand"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-firstelement-tostring.js",
-      "esid": "sec-%typedarray%.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error but got a TypeError (Testing with Uint8ClampedArray and makeArrayBuffer.)"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-firstelement-valueof.js",
-      "esid": "sec-%typedarray%.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error but got a TypeError (Testing with Uint8ClampedArray and makeArrayBuffer.)"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-nextelement-tostring.js",
-      "esid": "sec-%typedarray%.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error but got a TypeError (Testing with Uint8ClampedArray and makeArrayBuffer.)"
-    },
-    {
-      "path": "built-ins/TypedArray/prototype/toLocaleString/return-abrupt-from-nextelement-valueof.js",
-      "esid": "sec-%typedarray%.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a Test262Error but got a TypeError (Testing with Uint8ClampedArray and makeArrayBuffer.)"
-    },
-    {
       "path": "language/destructuring/binding/keyed-destructuring-property-reference-target-evaluation-order-with-bindings.js",
       "esid": "sec-destructuring-binding-patterns-runtime-semantics-propertybindinginitialization",
       "outcome": "fail",
@@ -41446,31 +41331,31 @@
       "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10004 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10011 ms"
+      "reason": "timeout after 10010 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10007 ms"
+      "reason": "timeout after 10010 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-4-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10004 ms"
+      "reason": "timeout after 10010 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-5-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10007 ms"
+      "reason": "timeout after 10010 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
@@ -41852,8 +41737,9 @@
     },
     {
       "path": "staging/sm/String/replace-math.js",
+      "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10000 ms"
+      "reason": "timeout after 10895 ms"
     },
     {
       "path": "staging/sm/Symbol/conversions.js",
@@ -41974,11 +41860,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2143289344», «2139095041») to be true"
-    },
-    {
-      "path": "staging/sm/TypedArray/sort_large_countingsort.js",
-      "outcome": "timeout",
-      "reason": "timeout after 10000 ms"
     },
     {
       "path": "staging/sm/TypedArray/with.js",
@@ -42203,12 +42084,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected 'arguments' property access to throw on method() {} Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "staging/sm/extensions/quote-string-for-nul-character.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: cookie Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "staging/sm/extensions/recursion.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42368,7 +42243,7 @@
       "path": "staging/sm/regress/regress-1507322-deep-weakmap.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10001 ms"
+      "reason": "timeout after 10009 ms"
     },
     {
       "path": "staging/sm/regress/regress-469625-02.js",
@@ -42518,35 +42393,17 @@
       "path": "intl402/BigInt/prototype/toLocaleString/en-US.js",
       "esid": "sec-bigint.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"90,071,992,547,409,904\"», «\"90,071,992,547,409,910\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"90,071,992,547,409,900\"», «\"90,071,992,547,409,910\"») to be true"
     },
     {
       "path": "intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Fri Jul 10 2026 03:48:37 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [7/10/2026, 3:48:37 AM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Fri Jul 10 2026 06:30:16 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [7/10/2026, 6:30:16 AM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
     },
     {
       "path": "intl402/Date/prototype/throws-same-exceptions-as-DateTimeFormat.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Date.prototype.toLocaleString didn't throw exception for locales null. Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/DateTimeFormat/canonicalize-calendar.js",
-      "esid": "sec-intl.datetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: calendar ID is canonicalized (option) Expected SameValue(«\"gregory\"», «\"islamic-civil\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/constructor-invalid-offset-timezone.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: +3: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/DateTimeFormat/constructor-options-calendar-invalid.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: new Intl.DateTimeFormat(\"en\", {calendar: \"\"}) throws RangeError Expected a RangeError to be thrown but no exception was thrown at all"
     },
     {
       "path": "intl402/DateTimeFormat/constructor-options-invalid-explicit-components.js",
@@ -42569,36 +42426,12 @@
     {
       "path": "intl402/DateTimeFormat/date-time-options.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 7/10/2026, 3:48:37 AM,Fri, 7/10/2026, 3:48:37 AM, got Fri Jul 10 2026 03:48:37 GMT+0300. Expected SameValue(«-1», «-1») to be false"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 7/10/2026, 6:30:16 AM,Fri, 7/10/2026, 6:30:16 AM, got Fri Jul 10 2026 06:30:16 GMT+0300. Expected SameValue(«-1», «-1») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/ignore-invalid-unicode-ext-values.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Locale ja-JP-u-cu-usd is affected by key cu; value USD. Expected SameValue(«\"ja-JP-u-cu-usd\"», «\"ja-JP\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/offset-timezone-no-unicode-minus-sign.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/format/dayPeriod-long-en.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [, , , , , , , , , , , , , , , , , , , , , , , ] and expected [] should have the same contents. unexpected dayPeriods: ,,,,,,,,,,,,,,,,,,,,,,,"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/format/dayPeriod-narrow-en.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [, , , , , , , , , , , , , , , , , , , , , , , ] and expected [] should have the same contents. unexpected dayPeriods: ,,,,,,,,,,,,,,,,,,,,,,,"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/format/dayPeriod-short-en.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [, , , , , , , , , , , , , , , , , , , , , , , ] and expected [] should have the same contents. unexpected dayPeriods: ,,,,,,,,,,,,,,,,,,,,,,,"
     },
     {
       "path": "intl402/DateTimeFormat/prototype/format/proleptic-gregorian-calendar.js",
@@ -42627,7 +42460,7 @@
       "path": "intl402/DateTimeFormat/prototype/format/temporal-objects-not-overlapping-options.js",
       "esid": "sec-datetime-format-functions",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with hour Expected SameValue(«\"12 PM\"», «\"07 PM\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with timeStyle should not throw but time zone is omitted Expected SameValue(«\"12:23:37 PM\"», «\"12:23:37 PM\"») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/prototype/format/temporal-plainmonthday-formatting-datetime-style.js",
@@ -42669,7 +42502,7 @@
       "path": "intl402/DateTimeFormat/prototype/formatRange/temporal-objects-not-overlapping-options.js",
       "esid": "sec-datetime-format-functions",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with hour Expected SameValue(«\"12 PM\"», «\"07 PM\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with timeStyle should not throw but time zone is omitted Expected SameValue(«\"12:23:37 PM\"», «\"12:23:37 PM\"») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/prototype/formatRange/temporal-objects-resolved-time-zone.js",
@@ -42735,7 +42568,7 @@
       "path": "intl402/DateTimeFormat/prototype/formatRangeToParts/temporal-objects-not-overlapping-options.js",
       "esid": "sec-datetime-format-functions",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with hour Expected SameValue(«\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"12\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\",\\\"source\\\":\\\"shared\\\"}]\"», «\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"7\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\",\\\"source\\\":\\\"shared\\\"}]\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with timeStyle should not throw but time zone is omitted Expected SameValue(«\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"12\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"minute\\\",\\\"value\\\":\\\"23\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"second\\\",\\\"value\\\":\\\"37\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\",\\\"source\\\":\\\"shared\\\"}]\"», «\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"12\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"minute\\\",\\\"value\\\":\\\"23\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"second\\\",\\\"value\\\":\\\"37\\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\",\\\"source\\\":\\\"shared\\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\",\\\"source\\\":\\\"shared\\\"}]\"») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/prototype/formatRangeToParts/temporal-objects-resolved-time-zone.js",
@@ -42786,34 +42619,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: month component of 2000-01-01T00:00Z formatted in dangi has unexpected value"
     },
     {
-      "path": "intl402/DateTimeFormat/prototype/formatToParts/dayPeriod-long-en.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: part type is dayPeriod. dayPeriod-only formatting for Tue Dec 12 2017 00:00:00 GMT+0300 Expected SameValue(«\"literal\"», «\"dayPeriod\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/formatToParts/dayPeriod-narrow-en.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: part type is dayPeriod. dayPeriod-only formatting for Tue Dec 12 2017 00:00:00 GMT+0300 Expected SameValue(«\"literal\"», «\"dayPeriod\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/formatToParts/dayPeriod-short-en.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: part type is dayPeriod. dayPeriod-only formatting for Tue Dec 12 2017 00:00:00 GMT+0300 Expected SameValue(«\"literal\"», «\"dayPeriod\"») to be true"
-    },
-    {
       "path": "intl402/DateTimeFormat/prototype/formatToParts/era.js",
       "esid": "sec-intl.datetimeformat.prototype.formattoparts",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: islamic-civil eras (AD,AD) should be unique Expected SameValue(«1», «2») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/formatToParts/offset-timezone-correct.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour in +0301 time zone: Expected SameValue(«\"3\"», «\"6\"») to be true"
     },
     {
       "path": "intl402/DateTimeFormat/prototype/formatToParts/temporal-objects-no-time-clip-weekday.js",
@@ -42831,49 +42640,7 @@
       "path": "intl402/DateTimeFormat/prototype/formatToParts/temporal-objects-not-overlapping-options.js",
       "esid": "sec-datetime-format-functions",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with hour Expected SameValue(«\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"12\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\"}]\"», «\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"7\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\"}]\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/calendar.js",
-      "esid": "sec-intl.datetimeformat.prototype.resolvedoptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Resolved alias ethiopic-amete-alem Expected SameValue(«\"gregory\"», «\"ethioaa\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/hourCycle-default.js",
-      "esid": "sec-Intl.DateTimeFormat.prototype.resolvedOptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour12 is one of [h11, h12]"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/hourCycle-timeStyle.js",
-      "esid": "sec-Intl.DateTimeFormat.prototype.resolvedOptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"h23\"», «\"h11\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/hourCycle.js",
-      "esid": "sec-Intl.DateTimeFormat.prototype.resolvedOptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"h23\"», «\"h11\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/offset-timezone-basic.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: +03 Expected SameValue(«\"+03\"», «\"+03:00\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/offset-timezone-change.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: -00 Expected SameValue(«\"-00\"», «\"+00:00\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/resolved-calendar-unicode-extensions-and-options.js",
-      "esid": "sec-intl.datetimeformat.prototype.resolvedoptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Resolved calendar for locale=en-u-ca-iso8601 with calendar=invalid Expected SameValue(«\"gregory\"», «\"iso8601\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime with timeStyle should not throw but time zone is omitted Expected SameValue(«\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"12\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\"},{\\\"type\\\":\\\"minute\\\",\\\"value\\\":\\\"23\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\"},{\\\"type\\\":\\\"second\\\",\\\"value\\\":\\\"37\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\"}]\"», «\"[{\\\"type\\\":\\\"hour\\\",\\\"value\\\":\\\"12\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\"},{\\\"type\\\":\\\"minute\\\",\\\"value\\\":\\\"23\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\":\\\"},{\\\"type\\\":\\\"second\\\",\\\"value\\\":\\\"37\\\"},{\\\"type\\\":\\\"literal\\\",\\\"value\\\":\\\" \\\"},{\\\"type\\\":\\\"dayPeriod\\\",\\\"value\\\":\\\"PM\\\"}]\"») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/prototype/resolvedOptions/resolved-hour-cycle-unicode-extensions-and-options.js",
@@ -42888,133 +42655,22 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: hour12 and hourCycle options and hc Unicode extension value are present. (With hour option.) Expected SameValue(«\"en-US-u-hc-h11\"», «\"en-US\"») to be true"
     },
     {
-      "path": "intl402/DateTimeFormat/prototype/resolvedOptions/resolved-numbering-system-unicode-extensions-and-options.js",
-      "esid": "sec-intl.datetimeformat.prototype.resolvedoptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Resolved numberingSystem for locale=en-u-nu-arab with numberingSystem=invalid Expected SameValue(«\"latn\"», «\"arab\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/test-option-hour12.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Option value true for property hour12 was not accepted; got false instead."
-    },
-    {
-      "path": "intl402/DateTimeFormat/timezone-case-insensitive.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Time zone created from string \"AFRICA/ABIDJAN\" Expected SameValue(«\"AFRICA/ABIDJAN\"», «\"Africa/Abidjan\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/timezone-invalid.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Invalid time zone name  was not rejected. Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/DateTimeFormat/timezone-legacy-non-iana.js",
-      "esid": "sec-createdatetimeformat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Time zone: ACT Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
       "path": "intl402/DateTimeFormat/timezone-not-canonicalized.js",
       "esid": "sec-createdatetimeformat",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"January 1, 1970 at 12:00 AM, Asia/Calcutta\"», «\"January 1, 1970 at 12:00 AM, Asia/Kolkata\"») to be true"
-    },
-    {
-      "path": "intl402/DateTimeFormat/timezone-utc.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Time zone name utc was not correctly accepted. Expected SameValue(«\"utc\"», «\"UTC\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/digital-style-with-hours-display-auto-with-zero-hour.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration is {\"hours\":0,\"minutes\":0,\"seconds\":2} Expected SameValue(«\"0:2\"», «\"00:02\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/duration-out-of-range-1.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration \"years\" throws when value is 4294967296 Expected a RangeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/duration-out-of-range-2.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration \"days\" throws when value is 104249991375 Expected a RangeError to be thrown but no exception was thrown at all"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"January 1, 1970 at 5:30 AM, Asia/Calcutta\"», «\"January 1, 1970 at 5:30 AM, Asia/Kolkata\"») to be true"
     },
     {
       "path": "intl402/DurationFormat/prototype/format/duration-out-of-range-3.js",
       "esid": "sec-Intl.DurationFormat.prototype.format",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration \"{\"days\":104249991374,\"hours\":7,\"minutes\":36,\"seconds\":31,\"milliseconds\":999,\"microseconds\":999,\"nanoseconds\":1000}\" throws Expected a RangeError to be thrown but no exception was thrown at all"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: DurationFormat: duration time total out of range"
     },
     {
-      "path": "intl402/DurationFormat/prototype/format/mixed-short-and-numeric.js",
+      "path": "intl402/DurationFormat/prototype/format/duration-out-of-range-4.js",
       "esid": "sec-Intl.DurationFormat.prototype.format",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"5 days, 1 hr, 2:3\"», «\"5 days, 1 hr, 2:03\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-style-default-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using default style option Expected SameValue(«\"-1 yr, -2 mths, -3 wks, -3 days, -4 hr, -5 min, -6 sec, -7 ms, -8 μs, -9 ns\"», «\"-1 yr, 2 mths, 3 wks, 3 days, 4 hr, 5 min, 6 sec, 7 ms, 8 μs, 9 ns\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-style-short-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using short style option Expected SameValue(«\"-1 yr, -2 mths, -3 wks, -3 days, -4 hr, -5 min, -6 sec, -7 ms, -8 μs, -9 ns\"», «\"-1 yr, 2 mths, 3 wks, 3 days, 4 hr, 5 min, 6 sec, 7 ms, 8 μs, 9 ns\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-with-leading-zero-style-default-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using default style option Expected SameValue(«\"-0 hr, -1 sec\"», «\"-0 hr, 1 sec\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-with-leading-zero-style-digital-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using digital style option Expected SameValue(«\"-0:0:-1\"», «\"-0:00:01\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-with-leading-zero-style-long-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using long style option Expected SameValue(«\"-0 hours, -1 second\"», «\"-0 hours, 1 second\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-with-leading-zero-style-narrow-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using narrow style option Expected SameValue(«\"-0h -1s\"», «\"-0h 1s\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-duration-with-leading-zero-style-short-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using short style option Expected SameValue(«\"-0 hr, -1 sec\"», «\"-0 hr, 1 sec\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-durationstyle-digital-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using digital style option Expected SameValue(«\"-1 yr, -2 mths, -3 wks, -3 days, -4:-5:-6.007008009\"», «\"-1 yr, 2 mths, 3 wks, 3 days, 4:05:06.007008009\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-durationstyle-long-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using long style option Expected SameValue(«\"-1 year, -2 months, -3 weeks, -3 days, -4 hours, -5 minutes, -6 seconds, -7 milliseconds, -8 microseconds, -9 nanoseconds\"», «\"-1 year, 2 months, 3 weeks, 3 days, 4 hours, 5 minutes, 6 seconds, 7 milliseconds, 8 microseconds, 9 nanoseconds\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/negative-durationstyle-narrow-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: DurationFormat format output using narrow style option Expected SameValue(«\"-1y -2m -3w -3d -4h -5m -6s -7ms -8μs -9ns\"», «\"-1y 2m 3w 3d 4h 5m 6s 7ms 8μs 9ns\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: RangeError: DurationFormat: duration time total out of range"
     },
     {
       "path": "intl402/DurationFormat/prototype/format/negative-zero.js",
@@ -43023,106 +42679,16 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: -0 years produces the same output as +0 years when display is \"always\" Expected SameValue(«\"-0 yrs\"», «\"0 yrs\"») to be true"
     },
     {
-      "path": "intl402/DurationFormat/prototype/format/numeric-hour-with-zero-minutes-and-non-zero-seconds-with-auto-display-and-zero-fractional.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration is {\"hours\":0,\"minutes\":0,\"seconds\":1} Expected SameValue(«\"0:0:1\"», «\"0:00:01\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/numeric-hour-with-zero-minutes-and-non-zero-seconds-with-auto-display.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration is {\"hours\":0,\"minutes\":0,\"seconds\":1} Expected SameValue(«\"0:0:1\"», «\"0:00:01\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/format/numeric-hour-with-zero-minutes-and-non-zero-seconds.js",
-      "esid": "sec-Intl.DurationFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration is {\"hours\":0,\"minutes\":0,\"seconds\":1} Expected SameValue(«\"0:0:1\"», «\"0:00:01\"») to be true"
-    },
-    {
       "path": "intl402/DurationFormat/prototype/format/precision-exact-mathematical-values.js",
       "esid": "sec-Intl.DurationFormat.prototype.format",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration is {\"seconds\":10000000,\"nanoseconds\":1} Expected SameValue(«\"0:0:10000000\"», «\"0:00:10000000.000000002\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Duration is {\"seconds\":10000000,\"nanoseconds\":1} Expected SameValue(«\"0:00:10000000\"», «\"0:00:10000000.000000002\"») to be true"
     },
     {
-      "path": "intl402/DurationFormat/prototype/format/style-digital-en.js",
+      "path": "intl402/DurationFormat/prototype/format/rounding-mode-trunc-for-seconds.js",
       "esid": "sec-Intl.DurationFormat.prototype.format",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Assert DurationFormat format output using digital style option Expected SameValue(«\"1 yr, 2 mths, 3 wks, 3 days, 4:5:6.007008009\"», «\"1 yr, 2 mths, 3 wks, 3 days, 4:05:06.007008009\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/formatToParts-style-digital-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: value for entry 2 Expected SameValue(«\"8\"», «\"08\"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/formatToParts-style-narrow-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: value for entry 2 Expected SameValue(«\", \"», «\" \"») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-formatToParts-style-default-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : default: length Expected SameValue(«49», «40») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-formatToParts-style-digital-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : digital: length Expected SameValue(«30», «24») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-formatToParts-style-long-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : long: length Expected SameValue(«49», «40») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-formatToParts-style-narrow-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : narrow: length Expected SameValue(«39», «30») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-formatToParts-style-short-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : short: length Expected SameValue(«49», «40») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-with-leading-zero-style-default-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : default: length Expected SameValue(«9», «8») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-with-leading-zero-style-digital-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : digital: length Expected SameValue(«7», «6») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-with-leading-zero-style-long-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : long: length Expected SameValue(«9», «8») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-with-leading-zero-style-narrow-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : narrow: length Expected SameValue(«7», «6») to be true"
-    },
-    {
-      "path": "intl402/DurationFormat/prototype/formatToParts/negative-duration-with-leading-zero-style-short-en.js",
-      "esid": "sec-Intl.DurationFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Using style : short: length Expected SameValue(«9», «8») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Intl.DurationFormat should format seconds, milliseconds and microseconds with `roundingMode: \"trunc\"` Expected SameValue(«\"2\"», «\"1\"») to be true"
     },
     {
       "path": "intl402/DurationFormat/prototype/resolvedOptions/resolved-numbering-system-unicode-extensions-and-options.js",
@@ -43192,162 +42758,12 @@
     {
       "path": "intl402/NumberFormat/prototype/format/format-fraction-digits-precision.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 12344501000000000000000000000000000, en-US-u-nu-latn and options {\"useGrouping\":false,\"minimumIntegerDigits\":3,\"minimumFractionDigits\":1,\"maximumFractionDigits\":3} is 12344501000000000487815444678311936.0; expected 12344501000000000000000000000000000.0."
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 12344501000000000000000000000000000, en-US-u-nu-arab and options {\"useGrouping\":false,\"minimumIntegerDigits\":3,\"minimumFractionDigits\":1,\"maximumFractionDigits\":3} is ١٢٣٤٤٥٠١٠٠٠٠٠٠٠٠٠٤٨٧٨١٥٤٤٤٦٧٨٣١١٩٣٦.٠; expected ١٢٣٤٤٥٠١٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠٠.٠."
     },
     {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-1.js",
-      "esid": "sec-intl.numberformat.prototype.format",
+      "path": "intl402/NumberFormat/prototype/format/format-significant-digits.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.150, en-US-u-nu-latn and options {\"roundingIncrement\":1,\"maximumFractionDigits\":1} is 1.1; expected 1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-10.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.125, en-US-u-nu-latn and options {\"roundingIncrement\":10,\"maximumFractionDigits\":2,\"minimumFractionDigits\":2} is 1.12; expected 1.10."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-100.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.125, en-US-u-nu-latn and options {\"roundingIncrement\":100,\"maximumFractionDigits\":3,\"minimumFractionDigits\":3} is 1.125; expected 1.100."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-1000.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.125, en-US-u-nu-latn and options {\"roundingIncrement\":1000,\"maximumFractionDigits\":4,\"minimumFractionDigits\":4} is 1.1250; expected 1.1000."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-2.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.30, en-US-u-nu-latn and options {\"roundingIncrement\":2,\"maximumFractionDigits\":1,\"minimumFractionDigits\":1} is 1.3; expected 1.4."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-20.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.25, en-US-u-nu-latn and options {\"roundingIncrement\":20,\"maximumFractionDigits\":2,\"minimumFractionDigits\":2} is 1.25; expected 1.20."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-200.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.25, en-US-u-nu-latn and options {\"roundingIncrement\":200,\"maximumFractionDigits\":3,\"minimumFractionDigits\":3} is 1.250; expected 1.200."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-2000.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.25, en-US-u-nu-latn and options {\"roundingIncrement\":2000,\"maximumFractionDigits\":4,\"minimumFractionDigits\":4} is 1.2500; expected 1.2000."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-25.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.3125, en-US-u-nu-latn and options {\"roundingIncrement\":25,\"maximumFractionDigits\":2,\"minimumFractionDigits\":2} is 1.31; expected 1.25."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-250.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.3125, en-US-u-nu-latn and options {\"roundingIncrement\":250,\"maximumFractionDigits\":3,\"minimumFractionDigits\":3} is 1.312; expected 1.250."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-2500.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.3125, en-US-u-nu-latn and options {\"roundingIncrement\":2500,\"maximumFractionDigits\":4,\"minimumFractionDigits\":4} is 1.3125; expected 1.2500."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-5.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.625, en-US-u-nu-latn and options {\"roundingIncrement\":5,\"maximumFractionDigits\":1,\"minimumFractionDigits\":1} is 1.6; expected 1.5."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-50.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.625, en-US-u-nu-latn and options {\"roundingIncrement\":50,\"maximumFractionDigits\":2,\"minimumFractionDigits\":2} is 1.62; expected 1.50."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-500.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.625, en-US-u-nu-latn and options {\"roundingIncrement\":500,\"maximumFractionDigits\":3,\"minimumFractionDigits\":3} is 1.625; expected 1.500."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-increment-5000.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.625, en-US-u-nu-latn and options {\"roundingIncrement\":5000,\"maximumFractionDigits\":4,\"minimumFractionDigits\":4} is 1.6250; expected 1.5000."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-ceil.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.101, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"ceil\",\"maximumSignificantDigits\":2} is 1.1; expected 1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-expand.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.101, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"expand\",\"maximumSignificantDigits\":2} is 1.1; expected 1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-floor.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.1999, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"floor\",\"maximumSignificantDigits\":2} is 1.2; expected 1.1."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-half-ceil.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.15, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"halfCeil\",\"maximumSignificantDigits\":2} is 1.1; expected 1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-half-even.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.15, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"halfEven\",\"maximumSignificantDigits\":2} is 1.1; expected 1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-half-expand.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.15, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"halfExpand\",\"maximumSignificantDigits\":2} is 1.1; expected 1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-half-floor.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for -1.15, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"halfFloor\",\"maximumSignificantDigits\":2} is -1.1; expected -1.2."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-mode-trunc.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.1999, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingMode\":\"trunc\",\"maximumSignificantDigits\":2} is 1.2; expected 1.1."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-priority-less-precision.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingPriority\":\"lessPrecision\",\"minimumSignificantDigits\":2,\"minimumFractionDigits\":2} is 1.0; expected 1.00."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-rounding-priority-more-precision.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.23, en-US-u-nu-latn and options {\"useGrouping\":false,\"roundingPriority\":\"morePrecision\",\"maximumSignificantDigits\":2,\"maximumFractionDigits\":2} is 1.2; expected 1.23."
-    },
-    {
-      "path": "intl402/NumberFormat/prototype/format/format-significant-digits-precision.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 123.44500, en-US-u-nu-latn and options {\"useGrouping\":false,\"minimumSignificantDigits\":3,\"maximumSignificantDigits\":5} is 123.44; expected 123.45."
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 0, en-US-u-nu-arab and options {\"useGrouping\":false,\"minimumSignificantDigits\":3,\"maximumSignificantDigits\":5} is ٠; expected ٠.٠٠."
     },
     {
       "path": "intl402/NumberFormat/prototype/format/numbering-systems.js",
@@ -43434,12 +42850,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: 0.000345 - scientific: parts[1].type Expected SameValue(«\"group\"», «\"decimal\"») to be true"
     },
     {
-      "path": "intl402/NumberFormat/prototype/formatToParts/notation-compact-de-DE.js",
-      "esid": "sec-intl.numberformat.prototype.formattoparts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Compact short: 98765: parts[1].type Expected SameValue(«\"decimal\"», «\"group\"») to be true"
-    },
-    {
       "path": "intl402/NumberFormat/prototype/formatToParts/signDisplay-currency-de-DE.js",
       "esid": "sec-intl.numberformat.prototype.formattoparts",
       "outcome": "fail",
@@ -43481,12 +42891,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «\"auto\"») to be true"
     },
     {
-      "path": "intl402/NumberFormat/prototype/resolvedOptions/resolved-numbering-system-unicode-extensions-and-options.js",
-      "esid": "sec-intl.numberformat.prototype.resolvedoptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Resolved numberingSystem for locale=en-u-nu-arab with numberingSystem=invalid Expected SameValue(«\"latn\"», «\"arab\"») to be true"
-    },
-    {
       "path": "intl402/NumberFormat/prototype/resolvedOptions/roundingMode.js",
       "esid": "sec-intl.numberformat.prototype.resolvedoptions",
       "outcome": "fail",
@@ -43496,12 +42900,6 @@
       "path": "intl402/NumberFormat/test-option-currency.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Invalid currency value undefined was not rejected. Expected a RangeError but got a TypeError"
-    },
-    {
-      "path": "intl402/NumberFormat/test-option-roundingPriority-mixed-options.js",
-      "esid": "sec-intl.numberformat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Formatted value for 1.625, en-US-u-nu-latn and options {\"maximumSignificantDigits\":2,\"maximumFractionDigits\":2,\"roundingPriority\":\"morePrecision\",\"userGrouping\":false} is 1.6; expected 1.63."
     },
     {
       "path": "intl402/NumberFormat/test-option-roundingPriority.js",
@@ -43596,97 +42994,7 @@
       "path": "intl402/RelativeTimeFormat/constructor/constructor/options-toobject-prototype.js",
       "esid": "sec-Intl.RelativeTimeFormat",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: RelativeTimeFormat: options must be an object"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/constructor/constructor/options-toobject.js",
-      "esid": "sec-Intl.RelativeTimeFormat",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: RelativeTimeFormat: options must be an object"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/format/en-us-numbering-systems.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: locale: en-US-u-nu-arab Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/format/en-us-numeric-auto.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"in 0 seconds\"», «\"now\"») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/format/en-us-style-short.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"in 1,000 sec\"», «\"in 1,000 sec.\"») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/format/pl-pl-style-long.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"in 1,000 seconds\"», «\"za 1000 sekund\"») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/format/pl-pl-style-narrow.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"in 1,000 sec\"», «\"za 1000 s\"») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/format/pl-pl-style-short.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"in 1,000 sec\"», «\"za 1000 sek.\"») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/en-us-numeric-always.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: formatToParts(1000, second): length Expected SameValue(«1», «5») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/en-us-numeric-auto.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: formatToParts(1000, second): length Expected SameValue(«1», «5») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/en-us-style-short.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: formatToParts(1000, second): length Expected SameValue(«1», «5») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-long.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: formatToParts(1000, second): length Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-narrow.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: formatToParts(1000, second): length Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/pl-pl-style-short.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.format",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: formatToParts(1000, second): length Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/formatToParts/result-type.js",
-      "esid": "sec-Intl.RelativeTimeFormat.prototype.formatToParts",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: parts: length Expected SameValue(«1», «3») to be true"
-    },
-    {
-      "path": "intl402/RelativeTimeFormat/prototype/resolvedOptions/resolved-numbering-system-unicode-extensions-and-options.js",
-      "esid": "sec-intl.relativetimeformat.prototype.resolvedoptions",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Resolved numberingSystem for locale=en-u-nu-arab with numberingSystem=invalid Expected SameValue(«\"latn\"», «\"arab\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: options argument true should yield the correct value for \"style\" Expected SameValue(«\"long\"», «\"short\"») to be true"
     },
     {
       "path": "intl402/Segmenter/prototype/segment/containing/unbreakable-input.js",
@@ -43722,7 +43030,7 @@
       "path": "intl402/Temporal/Instant/prototype/toLocaleString/hourcycle.js",
       "esid": "sec-temporal.instant.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "intl402/Temporal/Instant/prototype/toLocaleString/lone-options-accepted.js",
@@ -43734,7 +43042,7 @@
       "path": "intl402/Temporal/Instant/prototype/toLocaleString/respect-timezone-after-formatting-plaindatetime.js",
       "esid": "sec-temporal.instant.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"1:30:15 AM\"», «\"Sun Mar 29 2026 04:30:15 GMT+0300\"») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"6:30:15 PM\"», «\"Sun Mar 29 2026 04:30:15 GMT+0300\"») to be true"
     },
     {
       "path": "intl402/Temporal/PlainDate/from/calendar-invalid-era.js",
@@ -43848,19 +43156,13 @@
       "path": "intl402/Temporal/PlainDateTime/prototype/toLocaleString/hourcycle.js",
       "esid": "sec-temporal.plaindatetime.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "intl402/Temporal/PlainDateTime/prototype/toLocaleString/lone-options-accepted.js",
       "esid": "sec-temporal.plaindatetime.prototype.tolocalestring",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainDateTime.toLocaleString should format lone option {\"year\":\"numeric\"} Expected SameValue(«\"2024\"», «\"Thu Dec 26 2024 11:46:40 GMT+0300\"») to be true"
-    },
-    {
-      "path": "intl402/Temporal/PlainDateTime/prototype/toLocaleString/resolved-time-zone.js",
-      "esid": "sec-temporal.plaindatetime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"8/4/2021, 12:30:45 AM\"», «\"8/4/2021, 00:30:45\"») to be true"
     },
     {
       "path": "intl402/Temporal/PlainDateTime/prototype/toZonedDateTime/order-of-operations.js",
@@ -43932,19 +43234,13 @@
       "path": "intl402/Temporal/PlainTime/prototype/toLocaleString/hourcycle.js",
       "esid": "sec-temporal.plaintime.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "intl402/Temporal/PlainTime/prototype/toLocaleString/lone-options-accepted.js",
       "esid": "sec-temporal.plaintime.prototype.tolocalestring",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: PlainTime.toLocaleString should format lone option {\"hour\":\"numeric\"} Expected SameValue(«\"11 AM\"», «\"Thu Dec 26 2024 11:46:40 GMT+0300\"») to be true"
-    },
-    {
-      "path": "intl402/Temporal/PlainTime/prototype/toLocaleString/resolved-time-zone.js",
-      "esid": "sec-temporal.plaintime.prototype.tolocalestring",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"12:30:45 AM\"», «\"00:30:45\"») to be true"
     },
     {
       "path": "intl402/Temporal/PlainYearMonth/from/calendar-not-supporting-eras.js",
@@ -44076,7 +43372,7 @@
       "path": "intl402/Temporal/ZonedDateTime/prototype/toLocaleString/hourcycle.js",
       "esid": "sec-temporal.zoneddatetime.prototype.tolocalestring",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hour12: false should include 00:00:00 Expected SameValue(«false», «true») to be true"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: output for hourCycle: h24 should include 24:00:00 Expected SameValue(«false», «true») to be true"
     },
     {
       "path": "intl402/Temporal/ZonedDateTime/prototype/toLocaleString/locales-undefined.js",

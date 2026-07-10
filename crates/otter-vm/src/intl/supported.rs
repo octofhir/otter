@@ -481,6 +481,27 @@ const TIME_ZONES: &[&str] = &[
     "UTC",
 ];
 
+/// Canonicalize a calendar identifier per ECMA-402: lowercase, apply
+/// the sanctioned BCP47 aliases, and reject anything that is not a
+/// well-formed Unicode `type` nonterminal.
+pub(crate) fn canonicalize_calendar(code: &str) -> Option<String> {
+    let lower = code.to_ascii_lowercase();
+    // `type` nonterminal: one or more 3..8-char alphanumeric segments
+    // joined by `-`.
+    let well_formed = !lower.is_empty()
+        && lower.split('-').all(|seg| {
+            (3..=8).contains(&seg.len()) && seg.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    if !well_formed {
+        return None;
+    }
+    Some(match lower.as_str() {
+        "islamicc" => "islamic-civil".to_string(),
+        "ethiopic-amete-alem" => "ethioaa".to_string(),
+        _ => lower,
+    })
+}
+
 pub(crate) fn is_supported_calendar(code: &str) -> bool {
     CALENDARS.contains(&code)
 }

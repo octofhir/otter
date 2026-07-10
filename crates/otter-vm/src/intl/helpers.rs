@@ -201,6 +201,73 @@ fn option_get(
     crate::temporal::helpers::get_option_value(ctx, options, name, class)
 }
 
+/// Remove one `-u-` extension keyword (and its values) from `locale`,
+/// dropping the whole `-u-` section when it becomes empty.
+pub fn strip_unicode_extension_key(locale: &str, key: &str) -> String {
+    let Some(u_start) = locale.find("-u-") else {
+        return locale.to_string();
+    };
+    if let Some(private) = locale.find("-x-")
+        && private < u_start
+    {
+        return locale.to_string();
+    }
+    let head = &locale[..u_start];
+    let tail = &locale[u_start + 3..];
+    // The `-u-` section ends at the next singleton subtag.
+    let mut u_end = tail.len();
+    let mut offset = 0usize;
+    for seg in tail.split('-') {
+        if seg.len() == 1 {
+            u_end = offset.saturating_sub(1);
+            break;
+        }
+        offset += seg.len() + 1;
+    }
+    let (u_section, rest) = tail.split_at(u_end);
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for seg in u_section.split('-') {
+        if seg.len() == 2 && seg.chars().all(|c| c.is_ascii_alphanumeric()) {
+            skipping = seg == key;
+            if !skipping {
+                kept.push(seg);
+            }
+        } else if !skipping {
+            kept.push(seg);
+        }
+    }
+    if kept.is_empty() {
+        format!("{}{}", head, rest)
+    } else {
+        format!("{}-u-{}{}", head, kept.join("-"), rest)
+    }
+}
+
+/// ECMA-402 ResolveLocale for one `-u-` keyword: a SUPPORTED options
+/// value wins, else a supported extension value, else `default_value`.
+/// Returns the resolved value plus the locale with the extension
+/// keyword kept only when it supplied the winning value.
+pub fn resolve_unicode_keyword(
+    locale: &str,
+    key: &str,
+    option: Option<String>,
+    supported: &dyn Fn(&str) -> bool,
+    default_value: &str,
+) -> (String, String) {
+    let ext = unicode_extension_value(locale, key);
+    let option_ok = option.as_deref().filter(|v| supported(v));
+    let ext_ok = ext.as_deref().filter(|v| supported(v));
+    let value = option_ok.or(ext_ok).unwrap_or(default_value).to_string();
+    let keep_ext = ext.as_deref() == Some(value.as_str());
+    let adjusted = if ext.is_some() && !keep_ext {
+        strip_unicode_extension_key(locale, key)
+    } else {
+        locale.to_string()
+    };
+    (value, adjusted)
+}
+
 /// The value of one Unicode `-u-` extension keyword in `locale`
 /// (e.g. `unicode_extension_value("en-u-hc-h23", "hc") == Some("h23")`);
 /// a keyword present without a value yields `"true"`.

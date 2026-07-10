@@ -1176,8 +1176,6 @@ fn displayed_sign(sign_display: &str, is_negative: bool, is_zero: bool, is_nan: 
     }
 }
 
-/// The literal string for a [`SignKind`].
-
 /// One CLDR compact-decimal magnitude bucket.
 struct CompactBucket {
     /// Magnitude threshold (the CLDR `10^n` type).
@@ -1319,6 +1317,7 @@ fn nan_symbol(locale: &str) -> &'static str {
     }
 }
 
+/// The literal string for a [`SignKind`].
 fn sign_prefix(kind: SignKind) -> &'static str {
     match kind {
         SignKind::Minus => "-",

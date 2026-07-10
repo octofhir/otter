@@ -5,7 +5,11 @@
 //! `Vec<u8>` byte buffer that the VM dispatch loop reads opcode-by-
 //! opcode. The format is self-describing per operand (a kind byte
 //! precedes each operand), so the decoder does not need a per-opcode
-//! schema. A schema-driven decoder is a future optimization. The
+//! schema. The declarative opcode schema records that executable format, while
+//! exact load/local/arithmetic/property/upvalue/iterator/variadic shapes are
+//! schema-verified. Whole-function decoding validates authoritative branch and
+//! handler targets against instruction boundaries. Remaining roles stay
+//! consumer-decoded. The
 //! encoder and decoder ship in the same binary build — bytecode is
 //! never persisted across versions, so no wire-format version is
 //! carried in the stream.
@@ -24,7 +28,13 @@
 //!     Imm32:       i32 little-endian
 //! ```
 
-use crate::{Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList, SpanEntry};
+use crate::{
+    Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList, SpanEntry,
+    opcode_schema::{
+        ExceptionSuccessorSpec, OperandShapeError, RelativeTargetBase, SuccessorSpec,
+        opcode_schema, verify_operand_shape,
+    },
+};
 
 const OPERAND_KIND_REGISTER: u8 = 0;
 const OPERAND_KIND_CONST_INDEX: u8 = 1;
@@ -52,6 +62,29 @@ pub enum DecodeError {
         /// Raw operand kind byte value.
         kind: u8,
     },
+    /// A schema-authoritative fixed instruction has an invalid shape.
+    InvalidOperandShape {
+        /// Byte offset of the instruction opcode.
+        offset: usize,
+        /// Exact count or wire-kind mismatch.
+        error: OperandShapeError,
+    },
+    /// A schema-authoritative branch targets an invalid byte position.
+    InvalidControlFlowTarget {
+        /// Byte offset of the branch instruction.
+        offset: usize,
+        /// Resolved signed target byte position.
+        target: i64,
+    },
+    /// A schema-authoritative control-flow operand has an invalid value.
+    InvalidControlFlowOperand {
+        /// Byte offset of the instruction.
+        offset: usize,
+        /// Operand position.
+        operand_index: usize,
+        /// Invalid signed immediate.
+        value: i32,
+    },
 }
 
 impl std::fmt::Display for DecodeError {
@@ -69,6 +102,21 @@ impl std::fmt::Display for DecodeError {
             Self::UnknownOperandKind { offset, kind } => {
                 write!(f, "unknown operand kind 0x{kind:02X} at offset {offset}")
             }
+            Self::InvalidOperandShape { offset, error } => {
+                write!(f, "invalid operand shape at byte offset {offset}: {error}")
+            }
+            Self::InvalidControlFlowTarget { offset, target } => write!(
+                f,
+                "invalid control-flow target {target} at byte offset {offset}"
+            ),
+            Self::InvalidControlFlowOperand {
+                offset,
+                operand_index,
+                value,
+            } => write!(
+                f,
+                "invalid control-flow operand {operand_index} value {value} at byte offset {offset}"
+            ),
         }
     }
 }
@@ -285,7 +333,9 @@ fn resolve_jump_fixup(
 /// delta. Non-branch opcodes return an empty slice.
 fn branch_imm32_operand_slots(op: Op) -> &'static [usize] {
     match op {
-        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
+        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish | Op::JumpViaFinally => {
+            &[0]
+        }
         Op::EnterTry => &[0, 1],
         _ => &[],
     }
@@ -325,8 +375,8 @@ pub fn translate_spans_to_byte_pcs(
 ///
 /// # Errors
 ///
-/// Propagates any [`DecodeError`] from the underlying
-/// [`decode_instruction`] call.
+/// Propagates any [`DecodeError`] from instruction decoding or schema-derived
+/// control-flow target verification.
 pub fn decode_function(code: &[u8]) -> Result<Vec<Instruction>, DecodeError> {
     let mut out: Vec<Instruction> = Vec::new();
     let mut pc = 0usize;
@@ -335,7 +385,93 @@ pub fn decode_function(code: &[u8]) -> Result<Vec<Instruction>, DecodeError> {
         out.push(instr);
         pc = next;
     }
+    verify_control_flow_targets(&out, code.len())?;
     Ok(out)
+}
+
+fn verify_control_flow_targets(
+    instructions: &[Instruction],
+    code_len: usize,
+) -> Result<(), DecodeError> {
+    let boundaries: Vec<u32> = instructions.iter().map(|instr| instr.pc).collect();
+    for instr in instructions {
+        let schema = opcode_schema(instr.op);
+        for successor in schema.successor_shape.exact() {
+            let SuccessorSpec::RelativeTarget {
+                operand_index,
+                base,
+            } = successor
+            else {
+                continue;
+            };
+            verify_relative_target(instr, *operand_index, *base, None, &boundaries, code_len)?;
+        }
+        for successor in schema.exception_successor_shape.exact() {
+            match successor {
+                ExceptionSuccessorSpec::OptionalRelativeTarget {
+                    operand_index,
+                    base,
+                    absent_value,
+                } => verify_relative_target(
+                    instr,
+                    *operand_index,
+                    *base,
+                    Some(*absent_value),
+                    &boundaries,
+                    code_len,
+                )?,
+                ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
+                    floor_operand_index,
+                } => {
+                    let Operand::Imm32(floor) = instr.operands.as_slice()[*floor_operand_index]
+                    else {
+                        unreachable!("schema operand verification precedes successor verification")
+                    };
+                    if floor < 0 {
+                        return Err(DecodeError::InvalidControlFlowOperand {
+                            offset: instr.pc as usize,
+                            operand_index: *floor_operand_index,
+                            value: floor,
+                        });
+                    }
+                }
+                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller
+                | ExceptionSuccessorSpec::ResumeParkedAbruptCompletion => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_relative_target(
+    instr: &Instruction,
+    operand_index: usize,
+    base: RelativeTargetBase,
+    absent_value: Option<i32>,
+    boundaries: &[u32],
+    code_len: usize,
+) -> Result<(), DecodeError> {
+    let Operand::Imm32(delta) = instr.operands.as_slice()[operand_index] else {
+        unreachable!("schema operand verification precedes successor verification")
+    };
+    if absent_value == Some(delta) {
+        return Ok(());
+    }
+    let base = match base {
+        RelativeTargetBase::AfterOpcode => i64::from(instr.pc) + 1,
+    };
+    let target = base + i64::from(delta);
+    let valid = target == code_len as i64
+        || (target >= 0
+            && target < code_len as i64
+            && boundaries.binary_search(&(target as u32)).is_ok());
+    if !valid {
+        return Err(DecodeError::InvalidControlFlowTarget {
+            offset: instr.pc as usize,
+            target,
+        });
+    }
+    Ok(())
 }
 
 /// Decode the next instruction from `code` starting at byte offset
@@ -369,6 +505,8 @@ pub fn decode_instruction(code: &[u8], pc: usize) -> Result<(Instruction, usize)
         op,
         operands: OperandList::from(operands.as_slice()),
     };
+    verify_operand_shape(instr.op, instr.operands.as_slice())
+        .map_err(|error| DecodeError::InvalidOperandShape { offset: pc, error })?;
     Ok((instr, cursor))
 }
 
@@ -424,183 +562,11 @@ pub fn op_from_byte(byte: u8) -> Option<Op> {
     OP_BYTE_TABLE.get(byte as usize).map(|(op, _)| *op)
 }
 
-/// Byte assignments for every [`Op`] variant. The encoder and
-/// decoder ship in the same binary build, so the assignments only
-/// need to be dense (the table is indexed by byte) and unique.
-pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
-    (Op::Nop, 0x00),
-    (Op::LoadUndefined, 0x01),
-    (Op::LoadHole, 0x02),
-    (Op::Return, 0x03),
-    (Op::LoadString, 0x04),
-    (Op::LoadNumber, 0x05),
-    (Op::LoadInt32, 0x06),
-    (Op::LoadBigInt, 0x07),
-    (Op::LoadRegExp, 0x08),
-    (Op::QueueMicrotask, 0x09),
-    (Op::PromiseNew, 0x0A),
-    (Op::PromiseCall, 0x0B),
-    (Op::LoadTrue, 0x0C),
-    (Op::LoadFalse, 0x0D),
-    (Op::LoadLength, 0x0E),
-    (Op::GetStringIndex, 0x0F),
-    (Op::CallMethodValue, 0x10),
-    (Op::Add, 0x11),
-    (Op::Sub, 0x12),
-    (Op::Mul, 0x13),
-    (Op::Div, 0x14),
-    (Op::Rem, 0x15),
-    (Op::Neg, 0x16),
-    (Op::Pow, 0x17),
-    (Op::BitwiseAnd, 0x18),
-    (Op::BitwiseOr, 0x19),
-    (Op::BitwiseXor, 0x1A),
-    (Op::BitwiseNot, 0x1B),
-    (Op::Shl, 0x1C),
-    (Op::Shr, 0x1D),
-    (Op::Ushr, 0x1E),
-    (Op::ToNumber, 0x1F),
-    (Op::Equal, 0x20),
-    (Op::NotEqual, 0x21),
-    (Op::LessThan, 0x22),
-    (Op::LessEq, 0x23),
-    (Op::GreaterThan, 0x24),
-    (Op::GreaterEq, 0x25),
-    (Op::LoadNull, 0x26),
-    (Op::LogicalNot, 0x27),
-    (Op::ToBoolean, 0x28),
-    (Op::Jump, 0x29),
-    (Op::JumpIfTrue, 0x2A),
-    (Op::JumpIfFalse, 0x2B),
-    (Op::JumpIfNullish, 0x2C),
-    (Op::LoadLocal, 0x2D),
-    (Op::StoreLocal, 0x2E),
-    (Op::TdzError, 0x2F),
-    (Op::MakeFunction, 0x30),
-    (Op::MakeClosure, 0x31),
-    (Op::LoadUpvalue, 0x32),
-    (Op::StoreUpvalue, 0x33),
-    (Op::Call, 0x34),
-    (Op::CallWithThis, 0x35),
-    (Op::BindFunction, 0x36),
-    (Op::LoadThis, 0x37),
-    (Op::LoadNewTarget, 0x38),
-    (Op::Throw, 0x39),
-    (Op::EnterTry, 0x3A),
-    (Op::LeaveTry, 0x3B),
-    (Op::EndFinally, 0x3C),
-    (Op::NewError, 0x3D),
-    (Op::GetIterator, 0x3E),
-    (Op::IteratorNext, 0x3F),
-    (Op::ArrayPush, 0x40),
-    (Op::CallSpread, 0x41),
-    (Op::New, 0x42),
-    (Op::NewSpread, 0x43),
-    (Op::SuperConstructSpread, 0x44),
-    (Op::MakeClass, 0x45),
-    (Op::MathLoad, 0x46),
-    (Op::CollectRest, 0x47),
-    (Op::ReturnValue, 0x48),
-    (Op::ReturnUndefined, 0x49),
-    (Op::NewObject, 0x4A),
-    (Op::LoadProperty, 0x4B),
-    (Op::StoreProperty, 0x4C),
-    (Op::DeleteProperty, 0x4D),
-    (Op::GetPrototype, 0x4E),
-    (Op::SetPrototype, 0x4F),
-    (Op::NewArray, 0x50),
-    (Op::LoadElement, 0x51),
-    (Op::StoreElement, 0x52),
-    (Op::ArrayLength, 0x53),
-    (Op::HasProperty, 0x54),
-    (Op::Instanceof, 0x55),
-    (Op::Eval, 0x56),
-    (Op::NewFunction, 0x57),
-    (Op::LoadGlobalThis, 0x58),
-    (Op::LoadGlobalOrThrow, 0x59),
-    (Op::CollectArguments, 0x5A),
-    (Op::LoadGlobalOrUndefined, 0x5B),
-    (Op::DefineGlobalVar, 0x5C),
-    (Op::ImportMetaResolve, 0x5D),
-    (Op::ImportNamespaceDynamic, 0x5E),
-    (Op::ImportNamespace, 0x5F),
-    (Op::PromiseFulfilledOf, 0x60),
-    (Op::TemporalLoad, 0x61),
-    (Op::NewCollection, 0x62),
-    (Op::NewWeakRef, 0x63),
-    (Op::NewFinalizationRegistry, 0x64),
-    (Op::SymbolLoad, 0x65),
-    (Op::TypeOf, 0x66),
-    (Op::DeleteElement, 0x67),
-    (Op::Await, 0x68),
-    (Op::SameValue, 0x69),
-    (Op::IsArray, 0x6A),
-    (Op::LooseEqual, 0x6B),
-    (Op::LooseNotEqual, 0x6C),
-    (Op::NewBuiltinError, 0x6D),
-    (Op::LoadBuiltinError, 0x6E),
-    (Op::BigIntCall, 0x6F),
-    (Op::ArrayConstruct, 0x70),
-    (Op::ArrayFrom, 0x71),
-    (Op::ArrayOf, 0x72),
-    (Op::ArrayBufferCall, 0x73),
-    (Op::DataViewCall, 0x74),
-    (Op::Yield, 0x75),
-    (Op::SharedArrayBufferCall, 0x76),
-    (Op::ToPrimitive, 0x77),
-    (Op::ForInKeys, 0x78),
-    (Op::CopyDataProperties, 0x79),
-    (Op::DefineOwnProperty, 0x7A),
-    (Op::IteratorClose, 0x7B),
-    (Op::IteratorCloseStart, 0x7C),
-    (Op::IteratorCloseEnd, 0x7D),
-    (Op::GeneratorStart, 0x7E),
-    (Op::GetAsyncIterator, 0x7F),
-    (Op::BindThisValue, 0x80),
-    (Op::LoadSuperProperty, 0x81),
-    (Op::LoadSuperElement, 0x82),
-    (Op::SetSuperProperty, 0x83),
-    (Op::SetSuperElement, 0x84),
-    (Op::JumpViaFinally, 0x85),
-    (Op::FreshUpvalue, 0x86),
-    (Op::ImportNamespaceDeferred, 0x87),
-    (Op::EvaluateModule, 0x88),
-    (Op::MarkModuleEvaluated, 0x89),
-    (Op::StarReexport, 0x8A),
-    (Op::ModuleNamespaceObject, 0x8B),
-    (Op::LoadImportBinding, 0x8C),
-    (Op::StoreUpvalueChecked, 0x8D),
-    (Op::DeclareGlobalVar, 0x8E),
-    (Op::LoadDynamic, 0x8F),
-    (Op::StoreDynamic, 0x90),
-    (Op::TypeofDynamic, 0x91),
-    (Op::DefineGlobalFunction, 0x92),
-    (Op::DeclareGlobalLex, 0x93),
-    (Op::StoreGlobalBinding, 0x94),
-    (Op::InitGlobalLex, 0x95),
-    (Op::ValidateGlobalDecl, 0x96),
-    (Op::ToObject, 0x97),
-    (Op::ToNumeric, 0x98),
-    (Op::PrivateGet, 0x99),
-    (Op::PrivateSet, 0x9A),
-    (Op::YieldDelegate, 0x9B),
-    (Op::DefineDataProperty, 0x9C),
-    (Op::SetFunctionName, 0x9D),
-    (Op::ClassCheck, 0x9E),
-    (Op::ToPropertyKey, 0x9F),
-    (Op::Increment, 0xA0),
-    (Op::PrivateBrandCheck, 0xA1),
-    (Op::LoadShadowedUpvalue, 0xA2),
-    (Op::GetTemplateObject, 0xA3),
-    (Op::DeleteDynamic, 0xA4),
-    (Op::NewPrivateName, 0xA5),
-    (Op::MathCall, 0xA6),
-    (Op::TailCall, 0xA7),
-    (Op::IsEvalIntrinsic, 0xA8),
-    (Op::PopParkedFinally, 0xA9),
-    (Op::GlobalBindingExists, 0xAA),
-    (Op::StoreGlobalChecked, 0xAB),
-];
+/// Generated byte assignments for every [`Op`] variant.
+///
+/// The declarative schema owns the rows; this re-export preserves the current
+/// encoder/decoder API while preventing a second byte-assignment table.
+pub use crate::opcode_schema::OP_BYTE_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -695,6 +661,214 @@ mod tests {
             Err(DecodeError::UnknownOpcode { byte: 0xFF, .. }) => {}
             other => panic!("expected UnknownOpcode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn authoritative_shape_rejects_wrong_operand_count() {
+        let bytes = [0x01u8, 0]; // LoadUndefined requires one write register.
+        assert!(matches!(
+            decode_instruction(&bytes, 0),
+            Err(DecodeError::InvalidOperandShape {
+                error: OperandShapeError::Count {
+                    expected: 1,
+                    actual: 0
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authoritative_shape_rejects_wrong_operand_kind() {
+        let bytes = [0x06u8, 2, 0, 0, 0, 1, 0, 0, 0, 0];
+        assert!(matches!(
+            decode_instruction(&bytes, 0),
+            Err(DecodeError::InvalidOperandShape {
+                error: OperandShapeError::Kind {
+                    index: 1,
+                    expected: crate::opcode_schema::OperandKind::Imm32,
+                    actual: crate::opcode_schema::OperandKind::ConstIndex,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authoritative_variadic_shape_rejects_count_mismatch() {
+        let mut writer = BytecodeWriter::new();
+        writer.write(&make_instr(
+            Op::Call,
+            &[
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::ConstIndex(2),
+                Operand::Register(2),
+            ],
+        ));
+        let bytes = writer.into_bytes();
+        assert!(matches!(
+            decode_instruction(&bytes, 0),
+            Err(DecodeError::InvalidOperandShape {
+                error: OperandShapeError::Count {
+                    expected: 5,
+                    actual: 4
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authoritative_variadic_shape_rejects_wrong_tail_kind() {
+        let mut writer = BytecodeWriter::new();
+        writer.write(&make_instr(
+            Op::TailCall,
+            &[
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::ConstIndex(1),
+                Operand::Imm32(2),
+            ],
+        ));
+        let bytes = writer.into_bytes();
+        assert!(matches!(
+            decode_instruction(&bytes, 0),
+            Err(DecodeError::InvalidOperandShape {
+                error: OperandShapeError::Kind {
+                    index: 3,
+                    expected: crate::opcode_schema::OperandKind::Register,
+                    actual: crate::opcode_schema::OperandKind::Imm32,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn authoritative_variadic_shape_round_trips() {
+        let instr = make_instr(
+            Op::CallWithThis,
+            &[
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::Register(2),
+                Operand::ConstIndex(2),
+                Operand::Register(3),
+                Operand::Register(4),
+            ],
+        );
+        assert_eq!(roundtrip(&instr), instr);
+    }
+
+    #[test]
+    fn authoritative_jump_rejects_target_inside_instruction() {
+        let mut writer = BytecodeWriter::new();
+        // Jump byte PC is 0 and relative deltas use base PC+1. Nop starts at
+        // byte 7, so delta 7 resolves to byte 8: the Nop operand-count byte.
+        writer.write(&make_instr(Op::Jump, &[Operand::Imm32(7)]));
+        writer.write(&make_instr(Op::Nop, &[]));
+        let bytes = writer.into_bytes();
+        assert!(matches!(
+            decode_function(&bytes),
+            Err(DecodeError::InvalidControlFlowTarget {
+                offset: 0,
+                target: 8
+            })
+        ));
+    }
+
+    #[test]
+    fn authoritative_jump_accepts_instruction_and_end_boundaries() {
+        let instructions = [
+            make_instr(Op::Jump, &[Operand::Imm32(0)]),
+            make_instr(Op::Nop, &[]),
+        ];
+        let encoded = encode_function(&instructions);
+        assert!(decode_function(&encoded.code).is_ok());
+
+        let end_jump = encode_function(&[make_instr(Op::Jump, &[Operand::Imm32(0)])]);
+        assert!(decode_function(&end_jump.code).is_ok());
+    }
+
+    #[test]
+    fn authoritative_enter_try_rejects_handler_inside_instruction() {
+        let mut writer = BytecodeWriter::new();
+        // EnterTry occupies bytes 0..15 and Nop begins at 15. Base PC+1 plus
+        // delta 15 resolves to byte 16, inside the Nop encoding.
+        writer.write(&make_instr(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(15),
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Register(0),
+            ],
+        ));
+        writer.write(&make_instr(Op::Nop, &[]));
+        let bytes = writer.into_bytes();
+        assert!(matches!(
+            decode_function(&bytes),
+            Err(DecodeError::InvalidControlFlowTarget {
+                offset: 0,
+                target: 16
+            })
+        ));
+    }
+
+    #[test]
+    fn authoritative_enter_try_accepts_absent_handler_sentinels() {
+        let instructions = [
+            make_instr(
+                Op::EnterTry,
+                &[
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Register(0),
+                ],
+            ),
+            make_instr(Op::EndFinally, &[]),
+            make_instr(Op::ReturnUndefined, &[]),
+        ];
+        let encoded = encode_function(&instructions);
+        assert!(decode_function(&encoded.code).is_ok());
+    }
+
+    #[test]
+    fn jump_via_finally_uses_the_shared_branch_fixup() {
+        let instructions = [
+            make_instr(Op::JumpViaFinally, &[Operand::Imm32(1), Operand::Imm32(0)]),
+            make_instr(Op::Nop, &[]),
+            make_instr(Op::ReturnUndefined, &[]),
+        ];
+        let encoded = encode_function(&instructions);
+        let (jump, _) = decode_instruction(&encoded.code, 0).expect("decode jump-via-finally");
+        let Operand::Imm32(delta) = jump.operands.as_slice()[0] else {
+            panic!("target must remain Imm32")
+        };
+        assert_eq!(
+            (i64::from(jump.pc) + 1 + i64::from(delta)) as u32,
+            encoded.instr_to_byte_pc[2]
+        );
+        assert!(decode_function(&encoded.code).is_ok());
+    }
+
+    #[test]
+    fn jump_via_finally_rejects_negative_handler_floor() {
+        let mut writer = BytecodeWriter::new();
+        // A single instruction is 12 bytes, so delta 11 targets end-of-stream.
+        writer.write(&make_instr(
+            Op::JumpViaFinally,
+            &[Operand::Imm32(11), Operand::Imm32(-1)],
+        ));
+        let bytes = writer.into_bytes();
+        assert!(matches!(
+            decode_function(&bytes),
+            Err(DecodeError::InvalidControlFlowOperand {
+                offset: 0,
+                operand_index: 1,
+                value: -1
+            })
+        ));
     }
 
     #[test]

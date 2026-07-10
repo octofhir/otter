@@ -17,18 +17,6 @@ missing_docs = "deny"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 
-[features]
-default = []
-# The pre-refactor optimizing tier is retained only for comparative evidence.
-# Normal builds and runtime tier selection exclude it completely.
-experimental-optimizer = [
-    "dep:cranelift-codegen",
-    "dep:cranelift-frontend",
-    "dep:cranelift-jit",
-    "dep:cranelift-module",
-    "dep:cranelift-native",
-]
-
 [dependencies]
 otter-bytecode = { workspace = true }
 otter-vm = { workspace = true }
@@ -37,17 +25,5 @@ rustc-hash = { workspace = true }
 # toolchain + latency + codegen on arm64). x86_64 emitter follows arm64.
 dynasm = "3"
 dynasmrt = "3"
-# Cranelift optimizing backend: a second emit path lowering the same typed SSA
-# graph the dynasm tier consumes. Cranelift owns instruction selection and
-# register allocation; the typed SSA graph, deopt frame states, and OSR entries
-# stay Otter-owned. Pinned to an exact version because codegen output can shift
-# between Cranelift releases, so an upgrade is a gated change
-# (CRANELIFT_TIER2.md §9). These are otter-jit-only deps — no new edge into the
-# parked compatibility shims (CLAUDE.md rule).
-cranelift-codegen = { version = "=0.133.1", optional = true }
-cranelift-frontend = { version = "=0.133.1", optional = true }
-cranelift-jit = { version = "=0.133.1", optional = true }
-cranelift-module = { version = "=0.133.1", optional = true }
-cranelift-native = { version = "=0.133.1", optional = true }
 
 [dev-dependencies]

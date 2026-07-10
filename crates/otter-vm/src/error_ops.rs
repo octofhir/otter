@@ -457,13 +457,17 @@ pub(crate) fn snapshot_frames(
             let function_name = function
                 .map(|fun| fun.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string());
+            let byte_pc = exec_function
+                .and_then(|fun| fun.instr_at_index(f.pc as usize))
+                .map(|instr| instr.byte_pc())
+                .unwrap_or(0);
             // `byte_spans` is sorted by `pc`. `partition_point` finds
-            // the predecessor entry (largest `pc <= f.pc`), so
+            // the predecessor entry (largest `pc <= byte_pc`), so
             // `idx - 1` is the matching span.
             let span = exec_function
                 .and_then(|fun| {
                     let spans = fun.byte_spans();
-                    let idx = spans.partition_point(|s| s.pc <= f.pc);
+                    let idx = spans.partition_point(|s| s.pc <= byte_pc);
                     if idx == 0 {
                         spans.first().map(|s| s.span)
                     } else {

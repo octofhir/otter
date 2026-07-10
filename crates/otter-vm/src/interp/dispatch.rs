@@ -42,29 +42,25 @@ impl Interpreter {
         // instruction: chunk resolution, an `exec_function` table lookup, and a
         // `byte_pc` → index map probe. This caches them keyed on `(function_id,
         // depth)`, which together pin the exact live frame: a straight-line tick
-        // reuses the context + function pointer and advances the instruction
-        // index by one (`pc == next_pc`), reducing per-op resolution to nothing.
-        // Branches inside the frame still re-probe `byte_pc` → index (one O(1)
-        // map lookup); only frame transitions pay the full re-resolution.
+        // reuses the context + function pointer. `frame.pc` is already the
+        // dense instruction index, so straight-line execution and branches both
+        // fetch directly from the CodeBlock without a byte-PC lookup.
         //
         // SAFETY: `function` is a raw pointer into the chunk's `Arc`-owned
         // executable. Compiled code is never GC-managed and never moves, and the
         // owning context (`entry_context`, a borrow that outlives the loop, or
         // `foreign_context`, kept live below) stays alive while `function_id` is
         // unchanged — so the pointer is valid for every reuse.
-        // Held as flat register-resident locals rather than an `Option<struct>`
-        // so a cache hit rewrites only the two fields that actually change
-        // (`cache_idx` / `cache_next_pc`); the chunk selection and function
-        // pointer are touched only on a miss. `cache_function` is null until the
+        // Held as flat register-resident locals rather than an `Option<struct>`;
+        // the chunk selection and function pointer are touched only on a miss.
+        // `cache_function` is null until the
         // first resolution and is dereferenced solely on the hit path, which the
         // `(function_id, depth)` guard gates.
         let mut cache_valid = false;
         let mut cache_function_id: u32 = u32::MAX;
         let mut cache_depth: usize = 0;
         let mut cache_foreign = false;
-        let mut cache_function: *const ExecutableFunction = std::ptr::null();
-        let mut cache_idx: usize = 0;
-        let mut cache_next_pc: u32 = u32::MAX;
+        let mut cache_function: *const CodeBlock = std::ptr::null();
         loop {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
@@ -93,10 +89,9 @@ impl Interpreter {
             // Reuse the cached frame state when the top frame is the same one as
             // the previous tick (same id *and* depth pin the exact live frame —
             // tail-call keeps the depth but swaps the id, recursion keeps the id
-            // but changes the depth, so both guards are needed). On a hit the
-            // sequential fast path (`pc == next_pc`) costs an integer increment;
-            // an in-frame branch re-probes the index map.
-            let (context, function, idx): (&ExecutionContext, &ExecutableFunction, usize) =
+            // but changes the depth, so both guards are needed). The instruction
+            // index is canonical and needs no coordinate conversion.
+            let (context, function, idx): (&ExecutionContext, &CodeBlock, usize) =
                 if cache_valid && cache_function_id == function_id && cache_depth == depth {
                     let context: &ExecutionContext = if cache_foreign {
                         foreign_context
@@ -108,14 +103,8 @@ impl Interpreter {
                     // SAFETY: the pointer addresses never-moving compiled code in
                     // a still-live chunk context (see the cache comment); the
                     // `(function_id, depth)` guard proves it was filled.
-                    let function: &ExecutableFunction = unsafe { &*cache_function };
-                    let idx = if pc == cache_next_pc {
-                        cache_idx + 1
-                    } else {
-                        function
-                            .instr_index_at_byte_pc(pc)
-                            .ok_or(VmError::MissingReturn)?
-                    };
+                    let function: &CodeBlock = unsafe { &*cache_function };
+                    let idx = usize::try_from(pc).map_err(|_| VmError::MissingReturn)?;
                     (context, function, idx)
                 } else {
                     let mut foreign = false;
@@ -145,9 +134,7 @@ impl Interpreter {
                     let function = context
                         .exec_function(function_id)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let idx = function
-                        .instr_index_at_byte_pc(pc)
-                        .ok_or(VmError::MissingReturn)?;
+                    let idx = usize::try_from(pc).map_err(|_| VmError::MissingReturn)?;
                     // The frame depth changes only across a frame transition,
                     // which is exactly what misses the cache (push deepens,
                     // return shallows, and the deepest frame is always freshly
@@ -163,14 +150,11 @@ impl Interpreter {
                     cache_function_id = function_id;
                     cache_depth = depth;
                     cache_foreign = foreign;
-                    cache_function = function as *const ExecutableFunction;
+                    cache_function = function as *const CodeBlock;
                     (context, function, idx)
                 };
             let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
             let op = instr.op();
-            // Per-tick fields: on a hit these are the only cache writes.
-            cache_idx = idx;
-            cache_next_pc = pc.wrapping_add(instr.byte_len());
             self.current_byte_len = instr.byte_len();
             // `current_function_id` / `current_byte_pc` exist only to key the
             // optimizing-tier arithmetic type-feedback cell (`note_arith`),
@@ -179,7 +163,7 @@ impl Interpreter {
             // per-instruction stores entirely on the interpreter-only path.
             if jit_installed {
                 self.current_function_id = function_id;
-                self.current_byte_pc = pc;
+                self.current_byte_pc = instr.byte_pc();
             }
             // Per-instruction reduction metering. Reductions accumulate exactly
             // as before; the max-stack-depth sample moved to the frame-resolution

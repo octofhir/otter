@@ -25,15 +25,6 @@ use crate::*;
 /// Foundation lowering uses two existing opcodes — `LoadUndefined`
 /// and `Equal` followed by `JumpIfFalse` — to avoid introducing a
 /// dedicated "is-undefined" branch.
-pub(crate) fn apply_default_into(
-    parent: &mut Compiler,
-    value_reg: u16,
-    default_expr: &Expression<'_>,
-    span: (u32, u32),
-) -> Result<(), CompileError> {
-    apply_default_into_with_name(parent, value_reg, default_expr, None, span)
-}
-
 pub(crate) fn apply_default_into_with_name(
     parent: &mut Compiler,
     value_reg: u16,

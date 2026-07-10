@@ -1,6 +1,6 @@
 //! Sparkplug-style baseline emitter (arm64).
 //!
-//! Lowers a [`otter_vm::JitFunctionView`] to native arm64 with **no IR, no
+//! Lowers a [`otter_vm::JitCompileSnapshot`] to native arm64 with **no IR, no
 //! register allocation, and no deopt** — one linear pass, one emit routine per
 //! supported opcode, branch fixups via dynasm dynamic labels. Operands and
 //! results flow through the executing frame's register window; compiled code
@@ -38,13 +38,11 @@
 use otter_bytecode::{Op, Operand};
 pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
-    ExecutionContext, Interpreter, JitExecOutcome, JitFrameStack, JitFunctionCode, JitFunctionView,
-    JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext, SafepointRecord, Value,
-    VmError,
+    ExecutionContext, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFrameStack,
+    JitFunctionCode, JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext,
+    SafepointRecord, Value, VmError,
     runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
 };
-#[cfg(feature = "experimental-optimizer")]
-use otter_vm::{RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus};
 
 use crate::CompiledCode;
 
@@ -277,36 +275,6 @@ pub(crate) const COLLECTION_METHOD_IC_SLOT_SIZE: u32 =
 /// base) and the flat slot layout the optimizing tier reads.
 pub(crate) const DIRECT_METHOD_INLINE_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, direct_method_inline) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DIRECT_METHOD_INLINE_SLOT_SIZE: u32 =
-    std::mem::size_of::<otter_vm::JitDirectMethodInline>() as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_ENTRY_ADDR_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, entry_addr) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_REGISTER_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, register_count) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_RECV_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, recv_shape_offset) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_PROTO_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, proto_shape_offset) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_METHOD_ON_RECEIVER_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_on_receiver) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_METHOD_VALUE_BYTE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_value_byte) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_METHOD_FID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_fid) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_SELF_CLOSURE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, self_closure_bits) as u32;
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) const DMI_UPVALUES_PTR_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, upvalues_ptr) as u32;
 pub(crate) const COLLECTION_METHOD_IC_STATE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, state) as u32;
 pub(crate) const COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET: u32 =
@@ -583,46 +551,6 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
         ctx.frame_index,
         bail_pc as u32,
         regcount as usize,
-    ) {
-        Ok(value) => JitRet {
-            value: value.to_bits(),
-            status: STATUS_RETURNED,
-        },
-        Err(err) => {
-            park_jit_error(ctx, err);
-            JitRet {
-                value: 0,
-                status: STATUS_THREW,
-            }
-        }
-    }
-}
-
-/// Bridge stub for a bridge-free *direct-method* callee that bailed: like
-/// [`jit_self_call_bail_stub`], but the callee is a different function from
-/// the compiled caller, so the interpreter frame is rebuilt from the method's
-/// own value (`callee_bits`, the inline link's SELF bits) and the bound
-/// receiver (`this_bits`) rather than from the caller frame.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_direct_method_bail_stub(
-    ctx: *mut JitCtx,
-    bail_pc: u64,
-    regcount: u64,
-    callee_bits: u64,
-    this_bits: u64,
-) -> JitRet {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_direct_method_call_bail(
-        context,
-        stack,
-        bail_pc as u32,
-        regcount as usize,
-        Value::from_bits(callee_bits),
-        Value::from_bits(this_bits),
     ) {
         Ok(value) => JitRet {
             value: value.to_bits(),
@@ -1080,81 +1008,6 @@ extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
     }
 }
 
-/// Bridge stub: allocate an object literal directly in its baked final hidden
-/// class for the optimizing tier's `AllocObjectLiteral`. The property values are
-/// passed by value (already NaN-boxed) in `v0..v3`; `count` selects how many are
-/// live. The VM allocates the shaped object, roots the values across the
-/// allocation, bulk-initializes its slots, and installs `%Object.prototype%`.
-/// Returns `0` on success, `1` when the allocation threw (OOM, parked in `ctx`).
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_alloc_object_literal_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    shape_offset: u64,
-    count: u64,
-    v0: u64,
-    v1: u64,
-    v2: u64,
-    v3: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let all = [v0, v1, v2, v3];
-    let count = (count as usize).min(all.len());
-    match vm.jit_runtime_alloc_object_literal(
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        shape_offset as u32,
-        &all[..count],
-    ) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Optimizing-tier stub: dense-array `push(value)` from compiled code.
-///
-/// The call site guarded the receiver is an ordinary dense array with the
-/// original builtin and materialized the frame for the safepoint, so this
-/// delegates to the rooted [`Interpreter::jit_runtime_array_push`], which reads
-/// the receiver from `frame[recv_reg]`, appends `value` (rooted across any
-/// growth scavenge), and writes the new length to `frame[dst]`. Returns `0` on
-/// success, `1` when the push threw (error parked in `ctx`).
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_array_push_optimizing_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    recv_reg: u64,
-    value: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_array_push(
-        context,
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        recv_reg as u16,
-        value,
-    ) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
 /// Bridge stub: allocate an array literal for `NewArray` from compiled code.
 /// The VM decodes the variable source-register list at `byte_pc` and uses the
 /// stack-rooted array allocator, matching interpreter GC semantics.
@@ -1173,159 +1026,8 @@ pub(crate) extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u
     }
 }
 
-/// Bridge stub: run a full `StoreProperty` (transition / accessor / polymorphic)
-/// for a site the optimizing tier could not inline, decoding operands at
-/// `byte_pc`. Returns `0` on success, `1` when the store threw.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_store_property_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_store_property_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Bridge stub: run a full `LoadProperty` (cold / polymorphic / megamorphic
-/// miss, prototype walk, accessor) for a site the optimizing tier could not
-/// inline, decoding operands at `byte_pc`. The VM writes the result into the
-/// destination frame slot. Returns `0` on success, `1` when the load threw.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_load_property_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_load_property_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Bridge stub: materialize a string literal for `LoadString` from compiled
-/// code. The VM decodes the constant index at `byte_pc` and serves it from the
-/// traced per-context constant cache.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_load_string_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_load_string(context, stack, ctx.frame_index, byte_pc as u32) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Bridge stub: perform a `LoadGlobalOrThrow` from optimizing-tier code. The VM
-/// decodes the destination register and name-constant index from the bytecode at
-/// `byte_pc` and writes the resolved global into the interpreter frame slot,
-/// matching the `LoadString` / `NewArray` bridges (no baseline register-window
-/// assumptions). Returns `0` on success, `1` when the read threw (unbound
-/// identifier / throwing accessor; error parked in `ctx`).
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_load_global_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_load_global_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Leaf math helper for the optimizing tier's `Float64Rem` (`a % b`). arm64 has
-/// no float-remainder instruction; Rust's `f64` remainder is the truncated
-/// remainder with the sign of the dividend — exactly JavaScript `%` (including
-/// the `NaN` / `±Infinity` / zero-divisor edge cases). Allocates nothing and
-/// makes no reentry into the VM, so it needs no `JitCtx`.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn otter_jit_fmod(a: f64, b: f64) -> f64 {
-    a % b
-}
-
-/// Leaf libm helpers for the optimizing tier's transcendental `Math.*` unaries
-/// ([`crate::optimizing::ir::Float64MathCall`]). Each forwards to the exact
-/// `f64` method the interpreter's `Math` uses (`crates/otter-vm/src/math`), so a
-/// compiled `Math.sin(x)` is bit-identical to the interpreted result. Each
-/// allocates nothing and makes no VM reentry, so it needs no `JitCtx`.
-#[cfg(feature = "experimental-optimizer")]
-macro_rules! otter_jit_math_leaf {
-    ($($name:ident => $method:ident),* $(,)?) => {
-        $(
-            #[doc = concat!("Leaf `f64::", stringify!($method), "` for the optimizing tier.")]
-            pub(crate) extern "C" fn $name(x: f64) -> f64 {
-                x.$method()
-            }
-        )*
-    };
-}
-#[cfg(feature = "experimental-optimizer")]
-otter_jit_math_leaf! {
-    otter_jit_sin => sin,
-    otter_jit_cos => cos,
-    otter_jit_tan => tan,
-    otter_jit_asin => asin,
-    otter_jit_acos => acos,
-    otter_jit_atan => atan,
-    otter_jit_sinh => sinh,
-    otter_jit_cosh => cosh,
-    otter_jit_tanh => tanh,
-    otter_jit_asinh => asinh,
-    otter_jit_acosh => acosh,
-    otter_jit_atanh => atanh,
-    otter_jit_exp => exp,
-    otter_jit_expm1 => exp_m1,
-    otter_jit_log => ln,
-    otter_jit_log2 => log2,
-    otter_jit_log10 => log10,
-    otter_jit_log1p => ln_1p,
-    otter_jit_cbrt => cbrt,
-}
-
 extern "C" fn otter_jit_math_random() -> u64 {
     Value::number(otter_vm::math::random_number()).to_bits()
-}
-
-/// Bridge stub: perform a `StoreGlobalBinding` from optimizing-tier code. The VM
-/// decodes the value register, name-constant index, and strict flag from the
-/// bytecode at `byte_pc`, reads the stored value from the interpreter frame slot
-/// (materialized by the caller), and performs the global write. Returns `0` on
-/// success, `1` when the write threw (const / TDZ / strict-unbound; error parked
-/// in `ctx`).
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_store_global_stub_optimizing(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_store_global_at_pc(context, stack, ctx.frame_index, byte_pc as u32) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
 }
 
 /// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
@@ -1354,189 +1056,6 @@ pub(crate) extern "C" fn jit_call_method_stub(
         packed_args,
         JitRuntimeMethodStubSource::Baseline,
     )
-}
-
-/// Optimizing-tier variant of [`jit_call_method_stub`] used only to split
-/// migration stats while preserving the same runtime bridge semantics.
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_call_method_stub_optimizing(
-    ctx: *mut JitCtx,
-    dst: u64,
-    recv: u64,
-    name_and_site: u64,
-    argc: u64,
-    packed_args: u64,
-) -> u64 {
-    jit_call_method_stub_impl(
-        ctx,
-        dst,
-        recv,
-        name_and_site,
-        argc,
-        packed_args,
-        JitRuntimeMethodStubSource::Optimizing,
-    )
-}
-
-/// Slow path for a guard inside a *nested* (recursively spliced) callee body:
-/// resume the whole inline frame stack in the interpreter and return the
-/// outermost frame's completion value (the caller stays compiled — see
-/// [`Interpreter::jit_resume_inline_callee_stack`]).
-///
-/// `descs_ptr` addresses `frame_count` fixed 6-`u64` descriptors the emitted
-/// deopt exit just wrote — `[callee_fid, callee_pc, return_register, register_
-/// count, this_bits, registers_ptr]` per frame, outermost first. Return status:
-/// `Ok` and `value_bits` carries the result, or `Throw` with the error parked.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_resume_inline_callee_stack_stub(
-    ctx: *mut JitCtx,
-    descs_ptr: *const u64,
-    frame_count: u64,
-) -> RuntimeStubResultPair {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    let k = frame_count as usize;
-    let mut frames: Vec<otter_vm::jit::JitResumeFrame> = Vec::with_capacity(k);
-    for j in 0..k {
-        let base = j * 7;
-        // SAFETY: emitted code wrote `frame_count` 7-u64 descriptors at `descs_ptr`.
-        let fid = unsafe { *descs_ptr.add(base) } as u32;
-        let pc = unsafe { *descs_ptr.add(base + 1) } as u32;
-        let ret = unsafe { *descs_ptr.add(base + 2) } as u16;
-        let rc = unsafe { *descs_ptr.add(base + 3) } as usize;
-        let this_bits = unsafe { *descs_ptr.add(base + 4) };
-        // Field 5 is the register window's byte offset from the descriptor base.
-        let regs_off = unsafe { *descs_ptr.add(base + 5) } as usize;
-        let closure_bits = unsafe { *descs_ptr.add(base + 6) };
-        // SAFETY: the emitted deopt exit placed the windows after the descriptor
-        // array in the same stack allocation `descs_ptr` addresses.
-        let regs_ptr = unsafe { (descs_ptr as *const u8).add(regs_off) as *const u64 };
-        let mut registers: Vec<Value> = Vec::with_capacity(rc);
-        for i in 0..rc {
-            // SAFETY: emitted code wrote `rc` boxed register Values at `regs_ptr`.
-            registers.push(Value::from_bits(unsafe { *regs_ptr.add(i) }));
-        }
-        frames.push(otter_vm::jit::JitResumeFrame {
-            callee_fid: fid,
-            callee_pc: pc,
-            return_register: ret,
-            this: Value::from_bits(this_bits),
-            closure: Value::from_bits(closure_bits),
-            registers,
-        });
-    }
-    match vm.jit_resume_inline_callee_stack(context, stack, &frames) {
-        Ok(value) => {
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
-        }
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult {
-                status: RuntimeStubStatus::Throw,
-                value_bits: 0,
-                payload: 0,
-            })
-        }
-    }
-}
-
-/// Fast primitive `String.prototype.charCodeAt` bridge returning a value pair.
-///
-/// Return status: `Ok` = hit and `value_bits` carries the result, `Throw` =
-/// throw parked in ctx, `Miss` = continue to the generic method bridge.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_string_char_code_at_leaf_stub(
-    ctx: *mut JitCtx,
-    recv_bits: u64,
-    arg_bits: u64,
-) -> RuntimeStubResultPair {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let recv = Value::from_bits(recv_bits);
-    let arg = Value::from_bits(arg_bits);
-    match vm.jit_runtime_try_string_char_code_at_value(recv, arg) {
-        Ok(Some(value)) => {
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
-        }
-        Ok(None) => RuntimeStubResultPair::from_result(RuntimeStubResult::miss()),
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult {
-                status: RuntimeStubStatus::Throw,
-                value_bits: 0,
-                payload: 0,
-            })
-        }
-    }
-}
-
-/// Primitive `String.prototype.charCodeAt` bridge used after generated code
-/// has already validated the prototype builtin identity.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_string_char_code_at_guarded_leaf_stub(
-    ctx: *mut JitCtx,
-    recv_bits: u64,
-    arg_bits: u64,
-) -> RuntimeStubResultPair {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let recv = Value::from_bits(recv_bits);
-    let arg = Value::from_bits(arg_bits);
-    match vm.jit_runtime_string_char_code_at_value_guarded(recv, arg) {
-        Ok(Some(value)) => {
-            RuntimeStubResultPair::from_result(RuntimeStubResult::ok_bits(value.to_bits()))
-        }
-        Ok(None) => RuntimeStubResultPair::from_result(RuntimeStubResult::miss()),
-        Err(err) => {
-            park_jit_error(ctx, err);
-            RuntimeStubResultPair::from_result(RuntimeStubResult {
-                status: RuntimeStubStatus::Throw,
-                value_bits: 0,
-                payload: 0,
-            })
-        }
-    }
-}
-
-/// Fast primitive `Number.prototype.toString` bridge for optimizing code.
-///
-/// Return status: `0` = hit and `dst` written, `1` = throw parked in ctx,
-/// `2` = miss, continue to the generic method bridge.
-#[cfg(feature = "experimental-optimizer")]
-pub(crate) extern "C" fn jit_number_to_string_fast_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    recv_bits: u64,
-    arg_bits: u64,
-    has_arg: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let recv = Value::from_bits(recv_bits);
-    let arg = Value::from_bits(arg_bits);
-    match vm.jit_runtime_try_number_to_string(
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        recv,
-        arg,
-        has_arg != 0,
-    ) {
-        Ok(true) => 0,
-        Ok(false) => 2,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1926,7 +1445,7 @@ pub(crate) mod arm64 {
     use otter_vm::Interpreter;
     use otter_vm::{
         JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLeafMethod,
-        JitFunctionView, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout, NO_FRAME_STATE,
+        JitCompileSnapshot, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout, NO_FRAME_STATE,
         STUB_COLLECTION_SET_ADD_ALLOC, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
         jit::{JIT_COLLECTION_METHOD_IC_COLLECTION, JIT_COLLECTION_METHOD_IC_NO_STUB},
         runtime_stubs::alloc_value_stub_by_id,
@@ -2571,7 +2090,7 @@ pub(crate) mod arm64 {
         );
     }
 
-    pub(super) fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
+    pub(super) fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
         if let Some(instr) = view.instructions.iter().find(|instr| {
             matches!(
                 instr.op,
@@ -2594,17 +2113,17 @@ pub(crate) mod arm64 {
         let bail = ops.new_dynamic_label();
         let threw = ops.new_dynamic_label();
 
-        // A dynamic label per instruction byte-PC, so branches resolve to exact
-        // instruction boundaries. BTreeMap keeps emission deterministic.
+        // A dynamic label per canonical instruction PC. Byte PCs remain side
+        // metadata for bailout/OSR records only.
         let mut labels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for instr in &view.instructions {
-            labels.insert(instr.byte_pc, ops.new_dynamic_label());
+            labels.insert(instr.instruction_pc, ops.new_dynamic_label());
         }
-        let target_label = |byte_pc: i64| -> Result<DynamicLabel, Unsupported> {
-            u32::try_from(byte_pc)
+        let target_label = |instruction_pc: i64| -> Result<DynamicLabel, Unsupported> {
+            u32::try_from(instruction_pc)
                 .ok()
                 .and_then(|pc| labels.get(&pc).copied())
-                .ok_or(Unsupported::BranchTarget(byte_pc))
+                .ok_or(Unsupported::BranchTarget(instruction_pc))
         };
 
         // Set when an unsupported opcode is emitted as a bail (see the catch-all
@@ -2653,17 +2172,18 @@ pub(crate) mod arm64 {
         // live registers match what compiled code expects (the baseline keeps
         // all live values in the frame array between ops). Collect them here so
         // a trampoline is emitted for each after the body.
-        let mut loop_headers: BTreeMap<u32, ()> = BTreeMap::new();
+        let mut loop_headers: BTreeMap<u32, u32> = BTreeMap::new();
         for instr in &view.instructions {
             if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = imm32(instr.operands.as_slice(), 0)?;
+                let rel = imm32(instr.operands(), 0)?;
                 let target = branch_target(instr, rel);
                 if target >= 0
-                    && target < i64::from(instr.byte_pc)
-                    && let Ok(pc) = u32::try_from(target)
-                    && labels.contains_key(&pc)
+                    && target < i64::from(instr.instruction_pc)
+                    && let Ok(target_pc) = u32::try_from(target)
+                    && labels.contains_key(&target_pc)
                 {
-                    loop_headers.insert(pc, ());
+                    let byte_pc = view.instructions[target_pc as usize].byte_pc;
+                    loop_headers.insert(byte_pc, target_pc);
                 }
             }
         }
@@ -2674,7 +2194,7 @@ pub(crate) mod arm64 {
         let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
         for instr in &view.instructions {
             if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = imm32(instr.operands.as_slice(), 0)?;
+                let rel = imm32(instr.operands(), 0)?;
                 let target = branch_target(instr, rel);
                 if let Ok(pc) = u32::try_from(target) {
                     branch_targets.insert(pc);
@@ -2735,12 +2255,12 @@ pub(crate) mod arm64 {
         let ta_layout = view.ta_layout;
 
         for instr in &view.instructions {
-            dynasm!(ops ; .arch aarch64 ; =>labels[&instr.byte_pc]);
+            dynasm!(ops ; .arch aarch64 ; =>labels[&instr.instruction_pc]);
             // A branch target is a block boundary: control can arrive here from
             // elsewhere with unknown register state (and OSR enters loop headers
             // with values freshly loaded from memory), so no FP register can be
             // assumed to hold a slot's value.
-            if enable_fres && branch_targets.contains(&instr.byte_pc) {
+            if enable_fres && branch_targets.contains(&instr.instruction_pc) {
                 fres.clear();
             }
             // Stamp this op's byte-PC into the context so any bail (guard
@@ -2748,7 +2268,7 @@ pub(crate) mod arm64 {
             // exact instruction, preserving committed side effects.
             emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
-            let ops_ref = instr.operands.as_slice();
+            let ops_ref = instr.operands();
             match instr.op {
                 Op::LoadInt32 => {
                     let dst = reg(ops_ref, 0)?;
@@ -2869,7 +2389,7 @@ pub(crate) mod arm64 {
                     let rel = imm32(ops_ref, 0)?;
                     let target = branch_target(instr, rel);
                     let tgt = target_label(target)?;
-                    if target <= i64::from(instr.byte_pc) {
+                    if target <= i64::from(instr.instruction_pc) {
                         emit_backedge_interrupt_check(&mut ops, threw);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>tgt);
@@ -2888,7 +2408,7 @@ pub(crate) mod arm64 {
                         ; b.hi =>bail
                         ; cmp x9, #(VALUE_TRUE as u32)                // eq iff true
                     );
-                    if target <= i64::from(instr.byte_pc) {
+                    if target <= i64::from(instr.instruction_pc) {
                         let taken = ops.new_dynamic_label();
                         let fallthrough = ops.new_dynamic_label();
                         if matches!(instr.op, Op::JumpIfFalse) {
@@ -3753,10 +3273,10 @@ pub(crate) mod arm64 {
         // (set up x19/x20 from the ctx arg) then branches to the header's body
         // label, so the VM can re-enter mid-loop with the live frame registers.
         let mut osr_entries: BTreeMap<u32, usize> = BTreeMap::new();
-        for (&pc, ()) in &loop_headers {
+        for (&pc, &instruction_pc) in &loop_headers {
             let off = ops.offset().0;
             emit_prologue(&mut ops);
-            let tgt = labels[&pc];
+            let tgt = labels[&instruction_pc];
             dynasm!(ops ; .arch aarch64 ; b =>tgt);
             osr_entries.insert(pc, off);
         }
@@ -3801,7 +3321,7 @@ pub(crate) mod arm64 {
     /// out-of-line allocation, so its base is loaded from `values_ptr`.
     pub(crate) fn emit_slab_base(
         ops: &mut Assembler,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         reg: u32,
         scratch: u32,
     ) {
@@ -3939,7 +3459,7 @@ pub(crate) mod arm64 {
         )
     }
 
-    fn inline_plain_op_allowed(instr: &otter_vm::JitInstrView) -> bool {
+    fn inline_plain_op_allowed(instr: &otter_vm::JitInstructionMetadata) -> bool {
         is_inline_pure_op(instr.op)
             || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
     }
@@ -3948,7 +3468,7 @@ pub(crate) mod arm64 {
         let mut pending = Vec::<u16>::new();
 
         for instr in &callee.instructions {
-            let operands = instr.operands.as_slice();
+            let operands = instr.operands();
             let mut ok = true;
             match instr.op {
                 Op::LoadLocal | Op::StoreLocal => {}
@@ -4130,7 +3650,7 @@ pub(crate) mod arm64 {
         let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
         let mut store_seen = false;
         for instr in &callee.instructions {
-            let operands = instr.operands.as_slice();
+            let operands = instr.operands();
             let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
                 regs.get(regn as usize).copied()
             };
@@ -4251,13 +3771,13 @@ pub(crate) mod arm64 {
     /// label per callee byte-PC).
     fn emit_inline_pure_op(
         ops: &mut Assembler,
-        instr: &otter_vm::JitInstrView,
+        instr: &otter_vm::JitInstructionMetadata,
         bail: DynamicLabel,
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
         cage_base: usize,
     ) -> Result<(), Unsupported> {
-        let ops_ref = instr.operands.as_slice();
+        let ops_ref = instr.operands();
         let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
             let t = branch_target(instr, rel);
             u32::try_from(t)
@@ -4507,7 +4027,7 @@ pub(crate) mod arm64 {
         // One private label per callee byte-PC for internal branches.
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &callee.instructions {
-            clabels.insert(i.byte_pc, ops.new_dynamic_label());
+            clabels.insert(i.instruction_pc, ops.new_dynamic_label());
         }
         let inline_done = ops.new_dynamic_label();
         let inline_bail = ops.new_dynamic_label();
@@ -4572,7 +4092,7 @@ pub(crate) mod arm64 {
         dynasm!(ops ; .arch aarch64 ; add x19, sp, #0);
 
         for i in &callee.instructions {
-            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.byte_pc]);
+            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.instruction_pc]);
             emit_inline_pure_op(ops, i, inline_bail, inline_done, &clabels, cage_base)?;
         }
 
@@ -4654,7 +4174,7 @@ pub(crate) mod arm64 {
     #[allow(clippy::too_many_arguments)]
     fn emit_inline_method_op(
         ops: &mut Assembler,
-        instr: &otter_vm::JitInstrView,
+        instr: &otter_vm::JitInstructionMetadata,
         this_slot: u16,
         prop_offsets: &rustc_hash::FxHashMap<u32, u32>,
         cage_base: usize,
@@ -4665,7 +4185,7 @@ pub(crate) mod arm64 {
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
     ) -> Result<(), Unsupported> {
-        let ops_ref = instr.operands.as_slice();
+        let ops_ref = instr.operands();
         match instr.op {
             Op::LoadThis => {
                 let dst = reg(ops_ref, 0)?;
@@ -4819,7 +4339,7 @@ pub(crate) mod arm64 {
 
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &method.instructions {
-            clabels.insert(i.byte_pc, ops.new_dynamic_label());
+            clabels.insert(i.instruction_pc, ops.new_dynamic_label());
         }
         let inline_done = ops.new_dynamic_label();
         let inline_bail = ops.new_dynamic_label();
@@ -4944,7 +4464,7 @@ pub(crate) mod arm64 {
         dynasm!(ops ; .arch aarch64 ; add x19, sp, #0);
 
         for i in &method.instructions {
-            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.byte_pc]);
+            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.instruction_pc]);
             emit_inline_method_op(
                 ops,
                 i,
@@ -5258,7 +4778,7 @@ pub(crate) mod arm64 {
     /// registers through `JitCtx.frame_index` (a runtime stub: property/element
     /// access, array/object literals, non-self closures, …) needs a real frame
     /// and disqualifies the function.
-    fn is_self_call_safe(view: &JitFunctionView) -> bool {
+    fn is_self_call_safe(view: &JitCompileSnapshot) -> bool {
         view.instructions.iter().all(|instr| {
             is_inline_pure_op(instr.op)
                 || instr.op == Op::Call
@@ -5489,7 +5009,7 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         leaf: &JitCollectionLeafMethod,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
         done: DynamicLabel,
     ) -> Result<bool, Unsupported> {
@@ -5595,7 +5115,7 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         recv: u16,
         am: &JitArrayMethod,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let cage_base = view.cage_base as u64;
@@ -5696,7 +5216,7 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         am: &JitArrayMethod,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
         done: DynamicLabel,
     ) -> Result<bool, Unsupported> {
@@ -5759,7 +5279,7 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         am: &JitArrayMethod,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
         done: DynamicLabel,
         threw: DynamicLabel,
@@ -5842,7 +5362,7 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         site: u64,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
         done: DynamicLabel,
     ) -> Result<bool, Unsupported> {
@@ -5953,7 +5473,7 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         operands: &[Operand],
         alloc: &JitCollectionAllocMethod,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
         done: DynamicLabel,
     ) -> Result<bool, Unsupported> {
@@ -6107,7 +5627,7 @@ pub(crate) mod arm64 {
         operands: &[Operand],
         site: u64,
         safepoint: SafepointId,
-        view: &JitFunctionView,
+        view: &JitCompileSnapshot,
         miss: DynamicLabel,
         done: DynamicLabel,
     ) -> Result<bool, Unsupported> {
@@ -6286,7 +5806,7 @@ pub(crate) mod arm64 {
         site: u64,
         leaf: Option<&JitCollectionLeafMethod>,
         alloc: Option<&JitCollectionAllocMethod>,
-        view: Option<&JitFunctionView>,
+        view: Option<&JitCompileSnapshot>,
         live_alloc_safepoint: Option<SafepointId>,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
@@ -7087,11 +6607,9 @@ pub(crate) mod arm64 {
         );
     }
 
-    /// Target byte-PC of a relative branch. The interpreter computes
-    /// `frame.pc + 1 + offset` (relative to the byte after the branch opcode,
-    /// `operand_decode::apply_branch`), so byte_len is irrelevant here.
-    fn branch_target(instr: &otter_vm::JitInstrView, rel: i32) -> i64 {
-        i64::from(instr.byte_pc) + 1 + i64::from(rel)
+    /// Target canonical instruction PC of a relative branch.
+    fn branch_target(instr: &otter_vm::JitInstructionMetadata, rel: i32) -> i64 {
+        i64::from(instr.instruction_pc) + 1 + i64::from(rel)
     }
 
     fn reg(operands: &[Operand], i: usize) -> Result<u16, Unsupported> {
@@ -7128,13 +6646,13 @@ pub(crate) mod arm64 {
 
 /// Compile a function view to baseline arm64 code, or report why not.
 #[cfg(target_arch = "aarch64")]
-pub fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
+pub fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
     arm64::compile(view)
 }
 
 /// Non-arm64 stub: the emitter is arm64-only for now.
 #[cfg(not(target_arch = "aarch64"))]
-pub fn compile(view: &JitFunctionView) -> Result<BaselineCode, Unsupported> {
+pub fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
     let _ = view;
     Err(Unsupported::OperandShape("baseline emitter is arm64-only"))
 }
@@ -7152,7 +6670,7 @@ mod tests {
         VALUE_UNDEFINED, compile, value_tag,
     };
     use otter_bytecode::{Op, Operand};
-    use otter_vm::{JitFunctionView, JitInstrView};
+    use otter_vm::{JitCompileSnapshot, JitInstructionMetadata};
 
     const STRIDE: u32 = 4;
 
@@ -7168,30 +6686,21 @@ mod tests {
         bits as u32 as i32
     }
 
-    fn view(instrs: &[(Op, Vec<Operand>)]) -> JitFunctionView {
+    fn view(instrs: &[(Op, Vec<Operand>)]) -> JitCompileSnapshot {
         let instructions = instrs
             .iter()
             .enumerate()
-            .map(|(idx, (op, operands))| JitInstrView {
-                op: *op,
-                byte_pc: idx as u32 * STRIDE,
-                byte_len: STRIDE,
-                property_ic_site: None,
-                operands: operands.clone(),
-                make_self: false,
-                load_array_length: false,
-                method_hint: otter_vm::jit::JitMethodHint::None,
-                load_number: None,
-                property_feedback: None,
-                property_feedback_poly: Vec::new(),
-                property_proto_feedback: None,
-                object_literal: None,
-                element_load_kind: otter_vm::jit::JitElementLoadKind::Any,
-                global_lex_cell: None,
-                arith_feedback: 0,
+            .map(|(idx, (op, operands))| {
+                JitInstructionMetadata::without_feedback(
+                    *op,
+                    idx as u32,
+                    idx as u32 * STRIDE,
+                    STRIDE,
+                    operands.clone(),
+                )
             })
             .collect();
-        JitFunctionView {
+        JitCompileSnapshot {
             function_id: 0,
             param_count: 1,
             register_count: 8,
@@ -7250,13 +6759,12 @@ mod tests {
         assert_eq!(read_word(len_off), v.len(), "probe len word");
     }
 
-    // Branch encoding: target = branch_byte_pc + 1 + rel (see `branch_target`),
-    // with branch_byte_pc = from*STRIDE and target = to*STRIDE.
+    // CodeBlock branch encoding: target instruction = current + 1 + rel.
     fn rel(from: usize, to: usize) -> i32 {
-        (to as i32 - from as i32) * STRIDE as i32 - 1
+        to as i32 - from as i32 - 1
     }
 
-    fn run(view: &JitFunctionView, regs: &mut [u64]) -> Exit {
+    fn run(view: &JitCompileSnapshot, regs: &mut [u64]) -> Exit {
         let code = compile(view).expect("compiles");
         let mut error = None;
         let array_index_accessor_protector = false;
@@ -7306,14 +6814,14 @@ mod tests {
         }
     }
 
-    fn expect_int(view: &JitFunctionView, regs: &mut [u64], expected: i32) {
+    fn expect_int(view: &JitCompileSnapshot, regs: &mut [u64], expected: i32) {
         match run(view, regs) {
             Exit::Returned(bits) => assert_eq!(unbox_i32(bits), expected),
             Exit::Bailed => panic!("expected Returned({expected}), got Bailed"),
         }
     }
 
-    fn expect_f64(view: &JitFunctionView, regs: &mut [u64], expected: f64) {
+    fn expect_f64(view: &JitCompileSnapshot, regs: &mut [u64], expected: f64) {
         match run(view, regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), expected),
             Exit::Bailed => panic!("expected Returned({expected}), got Bailed"),
@@ -7578,7 +7086,7 @@ mod tests {
     fn unbox_f64(bits: u64) -> f64 {
         f64::from_bits(value_tag::unbox_double(bits))
     }
-    fn add_view() -> JitFunctionView {
+    fn add_view() -> JitCompileSnapshot {
         view(&[
             (
                 Op::Add,

@@ -22,10 +22,9 @@
 //!   explicit safepoint record for allocating calls, and reloads derived object
 //!   pointers after every safepoint. A value cached only in a machine register
 //!   across a safepoint would be a use-after-move bug.
-//! - **Baseline is the production ceiling.** The pre-refactor optimizing tier is
-//!   compiled only with `experimental-optimizer` and is selected only when
-//!   `OTTER_EXPERIMENTAL_OPTIMIZER=1`; it exists for measurements and regression
-//!   extraction, not normal execution.
+//! - **One production compiler.** The template baseline is the only native
+//!   compiler; the pre-refactor experimental optimizer and its parallel IR were
+//!   deleted rather than carried across the CodeBlock migration.
 //! - **JIT is runtime-optional.** When executable memory cannot be obtained
 //!   (missing macOS `allow-jit` entitlement, locked sandbox, etc.) the engine
 //!   falls back to the interpreter; the JIT never hard-fails execution.
@@ -37,8 +36,6 @@
 
 mod baseline;
 mod code;
-#[cfg(feature = "experimental-optimizer")]
-pub mod optimizing;
 
 pub use baseline::{BaselineCode, Unsupported, compile};
 pub use code::CompiledCode;
@@ -66,48 +63,12 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
-        let fid = request.function.function_id;
-        #[cfg(feature = "experimental-optimizer")]
-        let osr_pc = request.osr_pc;
-        #[cfg(feature = "experimental-optimizer")]
-        let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
-        // The old optimizer is deliberately outside normal tier selection. It
-        // can still be measured in an explicitly experimental build/run without
-        // expanding its opcode coverage or preserving its contracts in the new
-        // VM ABI.
-        #[cfg(feature = "experimental-optimizer")]
-        if std::env::var("OTTER_EXPERIMENTAL_OPTIMIZER").as_deref() == Ok("1") {
-            match optimizing::compile(&request.function, osr_pc) {
-                Ok(code) if osr_pc.is_some() || !code.osr_only() => {
-                    if trace {
-                        eprintln!(
-                            "[otter-jit] experimental optimizing tier compiled fid {fid} osr={osr_pc:?}"
-                        );
-                    }
-                    return Ok(otter_vm::JitCompileStatus::Compiled { code });
-                }
-                Ok(_) => {
-                    if trace {
-                        eprintln!(
-                            "[otter-jit] experimental optimizer produced OSR-only entry for fid {fid}; using baseline"
-                        );
-                    }
-                }
-                Err(reason) => {
-                    if trace {
-                        eprintln!(
-                            "[otter-jit] experimental optimizer declined fid {fid} osr={osr_pc:?}: {reason:?}"
-                        );
-                    }
-                }
-            }
-        }
-
+        let fid = request.snapshot.function_id;
         // The baseline tier serves OSR requests too: it builds a loop-header
         // OSR trampoline per back-edge target, so a hot loop the optimizing tier
         // declined (an unsupported opcode or not-yet-int32 feedback in its
         // region) still tiers up to a native loop body instead of interpreting.
-        match baseline::compile(&request.function) {
+        match baseline::compile(&request.snapshot) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),

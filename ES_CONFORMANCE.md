@@ -1,22 +1,22 @@
 # Test262 conformance baseline
 
-- **Engine commit:** `7c00a748b6b5353d4d5150c6af9dace315348d2e`
+- **Engine commit:** `56bc0e56b86c668a919a302b5496063ecf3eab97`
 - **Test262 commit:** `7e115f46ac64340827d505fa928ad436cb7ba5a6`
-- **Captured:** 2026-07-10T13:31:21.965310+00:00
+- **Captured:** 2026-07-10T18:55:58.738303+00:00
 
 ## Totals
 
 | Bucket | Count |
 |---|---|
 | total      | 53173 |
-| passed     | 51471 |
-| failed     | 507 |
+| passed     | 51480 |
+| failed     | 498 |
 | skipped    | 1185 |
 | crashed    | 0 |
 | timed_out  | 10 |
 | oom        | 0 |
 
-**Pass rate (excl. skipped):** 99.01%
+**Pass rate (excl. skipped):** 99.02%
 
 ## Top failing sections (top 50)
 
@@ -27,12 +27,12 @@
 | built-ins/Temporal/Duration | 540 | 510 | 30 | 94.4% |
 | intl402/Temporal/ZonedDateTime | 583 | 556 | 27 | 95.4% |
 | intl402/NumberFormat/prototype | 179 | 155 | 24 | 86.6% |
-| staging/sm/Function | 53 | 36 | 17 | 67.9% |
-| staging/sm/class | 94 | 78 | 16 | 83.0% |
-| staging/sm/TypedArray | 96 | 83 | 13 | 86.5% |
-| staging/sm/regress | 106 | 92 | 13 | 86.8% |
+| staging/sm/class | 94 | 79 | 15 | 84.0% |
+| staging/sm/regress | 106 | 91 | 14 | 85.8% |
 | intl402/Temporal/PlainDate | 493 | 481 | 12 | 97.6% |
+| staging/sm/Function | 53 | 41 | 12 | 77.4% |
 | staging/sm/RegExp | 91 | 79 | 12 | 86.8% |
+| staging/sm/TypedArray | 96 | 84 | 12 | 87.5% |
 | intl402/Temporal/PlainDateTime | 483 | 472 | 11 | 97.7% |
 | built-ins/Temporal/PlainDateTime | 773 | 763 | 10 | 98.7% |
 | staging/sm/extensions | 64 | 54 | 10 | 84.4% |
@@ -41,7 +41,6 @@
 | staging/sm/Array | 90 | 81 | 9 | 90.0% |
 | staging/sm/lexical-environment | 34 | 25 | 9 | 73.5% |
 | built-ins/Temporal/PlainDate | 652 | 644 | 8 | 98.8% |
-| staging/sm/Proxy | 24 | 16 | 8 | 66.7% |
 | annexB/language/expressions | 26 | 19 | 7 | 73.1% |
 | built-ins/Temporal/PlainYearMonth | 509 | 502 | 7 | 98.6% |
 | intl402/Temporal/PlainMonthDay | 90 | 83 | 7 | 92.2% |
@@ -49,6 +48,7 @@
 | staging/sm/expressions | 42 | 35 | 7 | 83.3% |
 | built-ins/Temporal/PlainTime | 493 | 487 | 6 | 98.8% |
 | intl402/DurationFormat/prototype | 81 | 75 | 6 | 92.6% |
+| staging/sm/Proxy | 24 | 18 | 6 | 75.0% |
 | built-ins/Temporal/PlainMonthDay | 199 | 194 | 5 | 97.5% |
 | intl402/PluralRules/prototype | 34 | 29 | 5 | 85.3% |
 | intl402/Temporal/Instant | 17 | 12 | 5 | 70.6% |
@@ -61,7 +61,6 @@
 | staging/sm/strict | 51 | 47 | 4 | 92.2% |
 | built-ins/RegExp/lookBehind | 17 | 14 | 3 | 82.4% |
 | intl402/Temporal/PlainTime | 12 | 9 | 3 | 75.0% |
-| language/expressions/assignment | 485 | 482 | 3 | 99.4% |
 | staging/sm/Date | 28 | 17 | 3 | 60.7% |
 | staging/sm/Reflect | 17 | 14 | 3 | 82.4% |
 | staging/sm/Symbol | 30 | 27 | 3 | 90.0% |
@@ -70,6 +69,7 @@
 | intl402/Array/prototype | 2 | 0 | 2 | 0.0% |
 | intl402/BigInt/prototype | 11 | 9 | 2 | 81.8% |
 | intl402/Date/prototype | 12 | 10 | 2 | 83.3% |
+| language/expressions/assignment | 485 | 483 | 2 | 99.6% |
 | language/expressions/tagged-template | 27 | 24 | 2 | 92.3% |
 | staging/sm/BigInt | 5 | 3 | 2 | 60.0% |
 

@@ -506,7 +506,7 @@ fn run_jit_compile(
         }
     };
     let context = ExecutionContext::from_module(module);
-    let view = match context.jit_function_view(function_id) {
+    let view = match context.jit_compile_snapshot(function_id) {
         Some(view) => view,
         None => {
             return result(

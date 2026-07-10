@@ -66,25 +66,8 @@ fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
     }
 }
 
-fn jit_instr(op: Op, byte_pc: u32, operands: Vec<Operand>) -> JitInstrView {
-    JitInstrView {
-        op,
-        byte_pc,
-        byte_len: 1,
-        property_ic_site: None,
-        operands,
-        make_self: false,
-        load_array_length: false,
-        method_hint: jit::JitMethodHint::None,
-        load_number: None,
-        arith_feedback: 0,
-        property_feedback: None,
-        property_feedback_poly: Vec::new(),
-        property_proto_feedback: None,
-        object_literal: None,
-        element_load_kind: jit::JitElementLoadKind::Any,
-        global_lex_cell: None,
-    }
+fn jit_instr(op: Op, byte_pc: u32, operands: Vec<Operand>) -> JitInstructionMetadata {
+    JitInstructionMetadata::without_feedback(op, byte_pc, byte_pc, 1, operands)
 }
 
 #[test]
@@ -5004,7 +4987,7 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
 
     // Baking copies each site's bits into the matching instruction by
     // byte-PC; unobserved instructions stay 0.
-    let mut view = jit::JitFunctionView {
+    let mut view = jit::JitCompileSnapshot {
         function_id: 5,
         param_count: 0,
         register_count: 4,
@@ -5031,23 +5014,14 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
         native_static_fn_byte: 0,
         instructions: vec![16u32, 32, 48]
             .into_iter()
-            .map(|byte_pc| jit::JitInstrView {
-                op: Op::Add,
-                byte_pc,
-                byte_len: 16,
-                property_ic_site: None,
-                operands: Vec::new(),
-                make_self: false,
-                load_array_length: false,
-                method_hint: jit::JitMethodHint::None,
-                load_number: None,
-                arith_feedback: 0,
-                property_feedback: None,
-                property_feedback_poly: Vec::new(),
-                property_proto_feedback: None,
-                object_literal: None,
-                element_load_kind: jit::JitElementLoadKind::Any,
-                global_lex_cell: None,
+            .map(|byte_pc| {
+                jit::JitInstructionMetadata::without_feedback(
+                    Op::Add,
+                    byte_pc / 16,
+                    byte_pc,
+                    16,
+                    Vec::new(),
+                )
             })
             .collect(),
         inline_callees: rustc_hash::FxHashMap::default(),

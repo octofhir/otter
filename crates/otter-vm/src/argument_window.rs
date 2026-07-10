@@ -24,9 +24,7 @@
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
-use crate::{
-    ExecutableFunction, Frame, Value, VmError, operand_decode::register_operand, read_register,
-};
+use crate::{CodeBlock, Frame, Value, VmError, operand_decode::register_operand, read_register};
 
 /// Borrowed view over an opcode's argument-register operands.
 pub(crate) struct BytecodeArgumentWindow<'a> {
@@ -101,7 +99,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
     /// window call site.
     pub(crate) fn bind_into(
         &self,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         frame: &mut Frame,
     ) -> Result<BoundExtras, VmError> {
         let bind_count = (function.param_count as usize).min(self.len);

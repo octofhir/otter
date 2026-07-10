@@ -26,7 +26,7 @@
 //!   execution never touches these cells.
 //!
 //! # See also
-//! - [`crate::jit::JitInstrView::arith_feedback`] — the baked per-instruction
+//! - [`crate::jit::JitInstructionMetadata::arith_feedback`] — baked per-instruction
 //!   copy the optimizing tier consumes at compile time.
 
 use crate::Value;

@@ -96,7 +96,7 @@ enum ArrayCallbackFastPath {
 
 fn is_numeric_sub_sort_comparator_function(
     context: &ExecutionContext,
-    function: &crate::executable::ExecutableFunction,
+    function: &crate::executable::CodeBlock,
 ) -> bool {
     if function.param_count != 2
         || function.has_rest
@@ -193,7 +193,7 @@ fn array_callback_fast_path(
 
 fn match_map_mul_add_callback(
     context: &ExecutionContext,
-    function: &crate::executable::ExecutableFunction,
+    function: &crate::executable::CodeBlock,
 ) -> Option<ArrayCallbackFastPath> {
     if function.param_count != 1 || function.code.len() != 9 {
         return None;
@@ -243,7 +243,7 @@ fn match_map_mul_add_callback(
 
 fn match_filter_rem_eq_zero_callback(
     context: &ExecutionContext,
-    function: &crate::executable::ExecutableFunction,
+    function: &crate::executable::CodeBlock,
 ) -> Option<ArrayCallbackFastPath> {
     if function.param_count != 1 || function.code.len() != 9 {
         return None;
@@ -293,7 +293,7 @@ fn match_filter_rem_eq_zero_callback(
 
 fn match_reduce_add_callback(
     context: &ExecutionContext,
-    function: &crate::executable::ExecutableFunction,
+    function: &crate::executable::CodeBlock,
 ) -> Option<ArrayCallbackFastPath> {
     if function.param_count != 2 || function.code.len() != 8 {
         return None;
@@ -336,7 +336,7 @@ fn match_reduce_add_callback(
 
 fn match_for_each_add_bitand_upvalue_callback(
     context: &ExecutionContext,
-    function: &crate::executable::ExecutableFunction,
+    function: &crate::executable::CodeBlock,
 ) -> Option<ArrayCallbackFastPath> {
     if function.param_count != 1 || function.code.len() != 12 {
         return None;

@@ -15,6 +15,30 @@
 use crate::*;
 
 impl Interpreter {
+    pub(crate) fn instruction_pc_for_byte_pc(
+        context: &ExecutionContext,
+        fid: u32,
+        byte_pc: u32,
+    ) -> Result<u32, VmError> {
+        let index = context
+            .exec_function(fid)
+            .and_then(|function| function.instr_index_at_byte_pc(byte_pc))
+            .ok_or(VmError::InvalidOperand)?;
+        u32::try_from(index).map_err(|_| VmError::InvalidOperand)
+    }
+
+    pub(crate) fn byte_pc_for_instruction_pc(
+        context: &ExecutionContext,
+        fid: u32,
+        instruction_pc: u32,
+    ) -> Result<u32, VmError> {
+        context
+            .exec_function(fid)
+            .and_then(|function| function.instr_at_index(instruction_pc as usize))
+            .map(|instr| instr.byte_pc())
+            .ok_or(VmError::InvalidOperand)
+    }
+
     /// After a call pushed a fresh bytecode callee frame as the new top of
     /// `stack`, try to run it as compiled baseline code instead of interpreting.
     ///
@@ -62,7 +86,7 @@ impl Interpreter {
             jit::JitExecOutcome::Bailed(pc) => {
                 let fid = stack[top_idx].function_id;
                 Self::trace_jit_bail(context, fid, "entry", None, pc);
-                stack[top_idx].pc = pc;
+                stack[top_idx].pc = Self::instruction_pc_for_byte_pc(context, fid, pc)?;
                 if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     self.note_jit_entry_bail(fid);
                 }
@@ -138,7 +162,10 @@ impl Interpreter {
             return Ok(None);
         }
         let frame = &stack[top_idx];
-        let key = (frame.function_id, frame.pc);
+        let key = (
+            frame.function_id,
+            Self::byte_pc_for_instruction_pc(context, frame.function_id, frame.pc)?,
+        );
         // A header that already proved un-tierable, or a whole uncompilable
         // function, never counts again.
         if self.jit_osr_disabled.contains(&key)
@@ -188,7 +215,7 @@ impl Interpreter {
         if self.jit_osr_disabled.contains(&(fid, u32::MAX)) {
             return Ok(None);
         }
-        let osr_pc = frame.pc;
+        let osr_pc = Self::byte_pc_for_instruction_pc(context, fid, frame.pc)?;
         // This specific loop header already proved un-tierable (bailed / no
         // trampoline). The caller re-arms the counter, so a different hot loop
         // in the same function still gets a tier-up shot.
@@ -236,7 +263,7 @@ impl Interpreter {
                 // there; that should not permanently suppress the header on the
                 // next hot iteration.
                 Self::trace_jit_bail(context, fid, "osr", Some(osr_pc), pc);
-                stack[top_idx].pc = pc;
+                stack[top_idx].pc = Self::instruction_pc_for_byte_pc(context, fid, pc)?;
                 if self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     return Ok(None);
                 }
@@ -259,14 +286,14 @@ impl Interpreter {
         osr_pc: u32,
         bail_pc: u32,
     ) -> bool {
-        let Some(view) = context.jit_function_view(fid) else {
+        let Some(view) = context.jit_compile_snapshot(fid) else {
             return true;
         };
         Self::osr_bail_inside_target_loop_instructions(&view.instructions, osr_pc, bail_pc)
     }
 
     pub(crate) fn osr_bail_inside_target_loop_instructions(
-        instructions: &[JitInstrView],
+        instructions: &[JitInstructionMetadata],
         osr_pc: u32,
         bail_pc: u32,
     ) -> bool {
@@ -622,7 +649,7 @@ impl Interpreter {
     }
 
     pub(crate) fn jit_direct_call_plan_for(
-        function: &crate::executable::ExecutableFunction,
+        function: &crate::executable::CodeBlock,
         code: &dyn jit::JitFunctionCode,
     ) -> Option<jit::JitDirectCallPlan> {
         let (safepoint_records, safepoint_count) = code.safepoint_table();
@@ -692,7 +719,7 @@ impl Interpreter {
         _context: &ExecutionContext,
         stack: &mut jit::JitFrameStack,
         frame_index: usize,
-        function: &crate::executable::ExecutableFunction,
+        function: &crate::executable::CodeBlock,
         parent_upvalues: crate::frame_state::UpvalueSpine,
         this0: Value,
         plan: jit::JitDirectCallPlan,
@@ -844,7 +871,7 @@ impl Interpreter {
 
         self.enter_sync_reentry()?;
         // Op::Call reaches here only from a framed caller (a frameless callee
-        // makes no plain call — see ExecutableFunction::is_leaf), so the caller's
+        // makes no plain call — see CodeBlock::is_leaf), so the caller's
         // register window is its HoltStack frame's register array.
         let caller_regs = stack
             .get(frame_index)
@@ -1443,7 +1470,7 @@ impl Interpreter {
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let mut frame =
             Frame::with_exec_registers(function, None, upvalues, Value::undefined(), registers);
-        frame.pc = bail_pc;
+        frame.pc = Self::instruction_pc_for_byte_pc(context, fid, bail_pc)?;
         stack.push(frame);
         self.dispatch_loop(context, stack)
     }
@@ -1489,7 +1516,7 @@ impl Interpreter {
         self.note_jit_entry_bail(fid);
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let mut frame = Frame::with_exec_registers(function, None, upvalues, this, registers);
-        frame.pc = bail_pc;
+        frame.pc = Self::instruction_pc_for_byte_pc(context, fid, bail_pc)?;
         stack.push(frame);
         self.dispatch_loop(context, stack)
     }
@@ -1550,7 +1577,7 @@ impl Interpreter {
             };
             let mut frame =
                 Frame::with_exec_registers(function, return_register, upvalues, f.this, registers);
-            frame.pc = f.callee_pc;
+            frame.pc = Self::instruction_pc_for_byte_pc(context, f.callee_fid, f.callee_pc)?;
             built.push(frame);
         }
         self.enter_sync_reentry()?;
@@ -1714,7 +1741,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut jit::JitFrameStack,
         frame_index: usize,
-        function: &crate::executable::ExecutableFunction,
+        function: &crate::executable::CodeBlock,
         parent_upvalues: crate::frame_state::UpvalueSpine,
         this0: Value,
         direct_plan: jit::JitDirectCallPlan,

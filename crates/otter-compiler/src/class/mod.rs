@@ -730,7 +730,15 @@ fn compile_class_strict(
                                     .to_string(),
                                 span: method_span,
                             })?;
-                    let r = compile_expr(cx, key_expr, method_span)?;
+                    let raw = compile_expr(cx, key_expr, method_span)?;
+                    // §13.2.5.4 — canonical property key before
+                    // SetFunctionName ("get /a/") and the define.
+                    let r = cx.alloc_scratch();
+                    cx.emit(
+                        Op::ToPropertyKey,
+                        [Operand::Register(r), Operand::Register(raw)],
+                        method_span,
+                    );
                     if m.r#static {
                         // §15.7.14 — static computed key must not be
                         // "prototype".
@@ -842,7 +850,16 @@ fn compile_class_strict(
                         node: "ClassDeclaration: non-expression computed key".to_string(),
                         span: method_span,
                     })?;
-                let r = compile_expr(cx, key_expr, method_span)?;
+                let raw = compile_expr(cx, key_expr, method_span)?;
+                // §13.2.5.4 ComputedPropertyName — canonicalize before
+                // SetFunctionName / the define so a RegExp key names
+                // the method "/a/", not "[object RegExp]".
+                let r = cx.alloc_scratch();
+                cx.emit(
+                    Op::ToPropertyKey,
+                    [Operand::Register(r), Operand::Register(raw)],
+                    method_span,
+                );
                 if m.r#static {
                     // §15.7.14 — static computed key must not be
                     // "prototype".

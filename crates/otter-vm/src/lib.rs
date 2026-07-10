@@ -194,11 +194,11 @@ pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use handles::{HandleArena, HandleScope, Scoped};
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLayout,
-    JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError, JitCompileRequest,
-    JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack, JitFunctionCode,
-    JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView, JitPrimitiveMethodGuard,
-    JitReentryPtrs, JitStringLayout, JitTypedArrayLayout,
+    JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
+    JitCollectionLayout, JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError,
+    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack,
+    JitFunctionCode, JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView,
+    JitPrimitiveMethodGuard, JitReentryPtrs, JitStringLayout, JitTypedArrayLayout,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,

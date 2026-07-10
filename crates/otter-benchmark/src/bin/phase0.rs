@@ -7,6 +7,8 @@
 //!   median emitter latency plus finalized executable bytes.
 //! - `module` records cumulative resolve/load/parse/compile/link/execute times
 //!   for validated cold-runtime or warm-runtime module graph runs.
+//! - `macro-memory` runs an ordered, unmodified multi-file macro workload in a
+//!   CLI-equivalent runtime, forces full GC, and records retained heap/GC/RSS.
 //!
 //! # Invariants
 //! - Parsing and bytecode lowering are outside call execution samples.
@@ -15,8 +17,13 @@
 //!   failures emit a non-scoreable JSON record and exit non-zero.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+#[cfg(feature = "rss")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "rss")]
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use otter_benchmark::{
@@ -25,9 +32,15 @@ use otter_benchmark::{
 };
 use otter_compiler::compile_script_source;
 use otter_jit::{BaselineJitCompiler, compile};
-use otter_runtime::{Runtime, module_graph::ModulePhaseTimings};
+use otter_modules::OtterModulesBuilderExt;
+use otter_node::NodeApiBuilderExt;
+use otter_runtime::{
+    ConsoleLevel, ConsoleSink, Runtime, RuntimeExecutionStats, SourceInput,
+    module_graph::ModulePhaseTimings,
+};
 use otter_syntax::SourceKind;
 use otter_vm::{ExecutionContext, Interpreter, JitFunctionCode};
+use otter_web::WebApiBuilderExt;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CallKind {
@@ -48,6 +61,41 @@ enum ModuleCacheState {
     /// Reuse and pre-execute one runtime before measured graph executions.
     Warm,
 }
+
+#[derive(Debug, Default)]
+struct CapturingConsoleSink {
+    lines: Mutex<Vec<String>>,
+}
+
+impl CapturingConsoleSink {
+    fn matching_line(&self, marker: &str) -> Option<String> {
+        self.lines
+            .lock()
+            .expect("console capture lock")
+            .iter()
+            .rev()
+            .find(|line| line.contains(marker))
+            .cloned()
+    }
+}
+
+impl ConsoleSink for CapturingConsoleSink {
+    fn write(&self, _level: ConsoleLevel, fields: &[String]) {
+        self.lines
+            .lock()
+            .expect("console capture lock")
+            .push(fields.join(" "));
+    }
+}
+
+#[cfg(feature = "rss")]
+struct RssSampler {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<u64>,
+}
+
+#[cfg(not(feature = "rss"))]
+struct RssSampler;
 
 impl From<ModuleCacheState> for CacheState {
     fn from(value: ModuleCacheState) -> Self {
@@ -121,6 +169,20 @@ enum Command {
         samples: u32,
         #[arg(long, default_value_t = 3)]
         warmup: u32,
+    },
+    /// Measure retained managed heap and RSS for a validated macro workload.
+    MacroMemory {
+        #[arg(long)]
+        name: String,
+        #[arg(long, required = true, num_args = 1..)]
+        source: Vec<PathBuf>,
+        #[arg(long)]
+        validation_marker: String,
+        #[arg(long, default_value_t = 5)]
+        samples: u32,
+        /// Opt-in self-RSS sampling interval; requires the `rss` feature.
+        #[arg(long, default_value_t = 0)]
+        rss_sample_ms: u64,
     },
 }
 
@@ -838,6 +900,215 @@ fn module_failure(
     record
 }
 
+#[cfg(feature = "rss")]
+fn start_rss_sampler(interval_ms: u64) -> Result<Option<RssSampler>, String> {
+    if interval_ms == 0 {
+        return Ok(None);
+    }
+    let pid = sysinfo::get_current_pid().map_err(|error| format!("current pid: {error}"))?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let interval = Duration::from_millis(interval_ms);
+    let thread = std::thread::spawn(move || {
+        let mut system = sysinfo::System::new();
+        let mut peak = 0u64;
+        while !thread_stop.load(Ordering::Relaxed) {
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(process) = system.process(pid) {
+                peak = peak.max(process.memory());
+            }
+            std::thread::sleep(interval);
+        }
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if let Some(process) = system.process(pid) {
+            peak = peak.max(process.memory());
+        }
+        peak
+    });
+    Ok(Some(RssSampler { stop, thread }))
+}
+
+#[cfg(not(feature = "rss"))]
+fn start_rss_sampler(interval_ms: u64) -> Result<Option<RssSampler>, String> {
+    if interval_ms == 0 {
+        Ok(None)
+    } else {
+        Err("--rss-sample-ms requires building otter-phase0 with feature `rss`".into())
+    }
+}
+
+#[cfg(feature = "rss")]
+fn finish_rss_sampler(sampler: Option<RssSampler>) -> Option<u64> {
+    sampler.map(|sampler| {
+        sampler.stop.store(true, Ordering::Relaxed);
+        sampler.thread.join().unwrap_or(0)
+    })
+}
+
+#[cfg(not(feature = "rss"))]
+fn finish_rss_sampler(_sampler: Option<RssSampler>) -> Option<u64> {
+    None
+}
+
+fn gc_pause_ns(stats: RuntimeExecutionStats) -> u64 {
+    stats
+        .gc_minor_pause_ns_total
+        .saturating_add(stats.gc_full_pause_ns_total)
+}
+
+struct MacroMemorySample {
+    wall_time_ns: u64,
+    execution_time_ns: u64,
+    runtime_build_time_ns: u64,
+    gc_time_ns: u64,
+    heap_bytes: u64,
+    code_memory_bytes: u64,
+    peak_rss_bytes: Option<u64>,
+    validation_line: String,
+}
+
+fn run_macro_memory_sample(
+    sources: &[PathBuf],
+    validation_marker: &str,
+    rss_sample_ms: u64,
+) -> Result<MacroMemorySample, String> {
+    let sampler = start_rss_sampler(rss_sample_ms)?;
+    let outcome = (|| {
+        let sink = Arc::new(CapturingConsoleSink::default());
+        let build_started = Instant::now();
+        let mut runtime = Runtime::builder()
+            .with_node_apis()
+            .with_otter_modules()
+            .with_web_apis()
+            .console_sink(sink.clone())
+            .build()
+            .map_err(|error| format!("runtime build failed: {error}"))?;
+        let runtime_build_time_ns = elapsed_ns(build_started);
+        let before = runtime.execution_stats();
+        let wall_started = Instant::now();
+        let mut execution_time_ns = 0u64;
+        for source in sources {
+            let input = SourceInput::from_path(source)
+                .map_err(|error| format!("{}: {error}", source.display()))?;
+            let specifier = source.to_string_lossy();
+            let execution = runtime
+                .run_script(input, &specifier)
+                .map_err(|error| format!("{}: {error}", source.display()))?;
+            if execution.exit_code() != 0 {
+                return Err(format!(
+                    "{} requested exit code {}",
+                    source.display(),
+                    execution.exit_code()
+                ));
+            }
+            execution_time_ns = execution_time_ns
+                .saturating_add(execution.duration.as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
+        let validation_line = sink
+            .matching_line(validation_marker)
+            .ok_or_else(|| format!("validation marker {validation_marker:?} was not emitted"))?;
+        runtime
+            .force_gc()
+            .map_err(|error| format!("post-workload full GC failed: {error}"))?;
+        let wall_time_ns = elapsed_ns(wall_started);
+        let after = runtime.execution_stats();
+        let code_residency = runtime.jit_code_residency();
+        Ok(MacroMemorySample {
+            wall_time_ns,
+            execution_time_ns,
+            runtime_build_time_ns,
+            gc_time_ns: gc_pause_ns(after).saturating_sub(gc_pause_ns(before)),
+            heap_bytes: u64::try_from(after.gc_live_bytes).unwrap_or(u64::MAX),
+            code_memory_bytes: code_residency.code_bytes,
+            peak_rss_bytes: None,
+            validation_line,
+        })
+    })();
+    let peak_rss_bytes = finish_rss_sampler(sampler);
+    outcome.map(|mut sample| {
+        sample.peak_rss_bytes = peak_rss_bytes;
+        sample
+    })
+}
+
+fn run_macro_memory(
+    name: String,
+    sources: Vec<PathBuf>,
+    validation_marker: String,
+    samples: u32,
+    rss_sample_ms: u64,
+) -> BenchmarkResult {
+    let jit_mode = configured_runtime_jit_mode();
+    if samples == 0 {
+        return macro_memory_failure(name, jit_mode, "samples must be greater than zero".into());
+    }
+    let mut wall_times = Vec::with_capacity(samples as usize);
+    let mut execution_times = Vec::with_capacity(samples as usize);
+    let mut runtime_build_times = Vec::with_capacity(samples as usize);
+    let mut gc_times = Vec::with_capacity(samples as usize);
+    let mut heap_bytes = Vec::with_capacity(samples as usize);
+    let mut code_memory_bytes = Vec::with_capacity(samples as usize);
+    let mut peak_rss_bytes = Vec::with_capacity(samples as usize);
+    let mut observed_marker = None;
+    for _ in 0..samples {
+        let sample = match run_macro_memory_sample(&sources, &validation_marker, rss_sample_ms) {
+            Ok(sample) => sample,
+            Err(error) => return macro_memory_failure(name, jit_mode, error),
+        };
+        wall_times.push(sample.wall_time_ns);
+        execution_times.push(sample.execution_time_ns);
+        runtime_build_times.push(sample.runtime_build_time_ns);
+        gc_times.push(sample.gc_time_ns);
+        heap_bytes.push(sample.heap_bytes);
+        code_memory_bytes.push(sample.code_memory_bytes);
+        if let Some(rss) = sample.peak_rss_bytes {
+            peak_rss_bytes.push(rss);
+        }
+        observed_marker = Some(sample.validation_line);
+    }
+    let code_memory_bytes = median(code_memory_bytes);
+    let mut record = result(
+        name,
+        RuntimeMode::Package,
+        jit_mode,
+        ExecutionMetrics {
+            wall_time_ns: median(wall_times),
+            execution_time_ns: Some(median(execution_times)),
+            runtime_build_time_ns: Some(median(runtime_build_times)),
+            code_bytes: Some(code_memory_bytes),
+            ..ExecutionMetrics::default()
+        },
+        true,
+        observed_marker,
+        None,
+    );
+    record.cache_state = CacheState::Cold;
+    record.gc_mode = GcMode::ForcedFull;
+    record.memory = MemoryMetrics {
+        gc_time_ns: Some(median(gc_times)),
+        peak_rss_bytes: (!peak_rss_bytes.is_empty()).then(|| median(peak_rss_bytes)),
+        heap_bytes: Some(median(heap_bytes)),
+        code_memory_bytes: Some(code_memory_bytes),
+        ..MemoryMetrics::default()
+    };
+    record
+}
+
+fn macro_memory_failure(name: String, jit_mode: JitMode, error: String) -> BenchmarkResult {
+    let mut record = result(
+        name,
+        RuntimeMode::Package,
+        jit_mode,
+        ExecutionMetrics::default(),
+        false,
+        None,
+        Some(error),
+    );
+    record.cache_state = CacheState::Cold;
+    record.gc_mode = GcMode::ForcedFull;
+    record
+}
+
 fn main() {
     let args = Args::parse();
     let result = match args.command {
@@ -866,6 +1137,13 @@ fn main() {
             samples,
             warmup,
         } => run_module(entry, cache_state, samples, warmup),
+        Command::MacroMemory {
+            name,
+            source,
+            validation_marker,
+            samples,
+            rss_sample_ms,
+        } => run_macro_memory(name, source, validation_marker, samples, rss_sample_ms),
     };
     emit_and_exit(result);
 }
@@ -885,5 +1163,16 @@ mod tests {
     fn median_handles_even_and_odd_samples() {
         assert_eq!(median(vec![9, 1, 4]), 4);
         assert_eq!(median(vec![8, 2, 4, 6]), 5);
+    }
+
+    #[test]
+    fn console_capture_returns_the_latest_validation_line() {
+        let sink = CapturingConsoleSink::default();
+        sink.write(ConsoleLevel::Log, &["Score (version 7): 10".into()]);
+        sink.write(ConsoleLevel::Log, &["Score (version 7): 20".into()]);
+        assert_eq!(
+            sink.matching_line("Score (version 7):").as_deref(),
+            Some("Score (version 7): 20")
+        );
     }
 }

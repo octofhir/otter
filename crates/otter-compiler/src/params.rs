@@ -47,14 +47,23 @@ pub(crate) fn compile_formal_parameter(
         {
             apply_default_syntax_error_into(parent, ordinal, name, span)?;
         } else {
-            apply_default_into(parent, ordinal, default_expr, span)?;
+            // §13.15.2 NamedEvaluation — `param = AnonymousFunction`
+            // takes the parameter's name.
+            crate::destructuring::apply_default_into_with_name(
+                parent,
+                ordinal,
+                default_expr,
+                simple_binding_name(pattern),
+                span,
+            )?;
         }
     }
     if let oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) = pattern {
-        apply_default_into(
+        crate::destructuring::apply_default_into_with_name(
             parent,
             ordinal,
             &asgn.right,
+            simple_binding_name(&asgn.left),
             (asgn.span.start, asgn.span.end),
         )?;
         return destructure_assign(parent, ordinal, &asgn.left, span);

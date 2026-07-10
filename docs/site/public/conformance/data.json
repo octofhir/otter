@@ -1,15 +1,15 @@
 {
   "test262_commit": "7e115f46ac64340827d505fa928ad436cb7ba5a6",
-  "engine_commit": "d1aaa674e5f88a110ef047b683f66ffb96b50500",
-  "ran_at": "2026-07-10T03:30:26.639365+00:00",
+  "engine_commit": "7c00a748b6b5353d4d5150c6af9dace315348d2e",
+  "ran_at": "2026-07-10T13:31:21.965310+00:00",
   "totals": {
     "total": 53173,
-    "passed": 51450,
-    "failed": 526,
+    "passed": 51471,
+    "failed": 507,
     "skipped": 1185,
     "crashed": 0,
-    "timed_out": 11,
-    "oom": 1
+    "timed_out": 10,
+    "oom": 0
   },
   "by_section": {
     "annexB/built-ins/Array": {
@@ -113,8 +113,8 @@
     },
     "annexB/language/expressions": {
       "total": 26,
-      "passed": 17,
-      "failed": 9,
+      "passed": 19,
+      "failed": 7,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -122,8 +122,8 @@
     },
     "annexB/language/function-code": {
       "total": 159,
-      "passed": 157,
-      "failed": 2,
+      "passed": 158,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -149,8 +149,8 @@
     },
     "annexB/language/statements": {
       "total": 22,
-      "passed": 19,
-      "failed": 3,
+      "passed": 22,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -16142,12 +16142,12 @@
     },
     "built-ins/String/prototype": {
       "total": 1073,
-      "passed": 1070,
+      "passed": 1071,
       "failed": 0,
       "skipped": 2,
       "crashed": 0,
       "timed_out": 0,
-      "oom": 1
+      "oom": 0
     },
     "built-ins/String/raw": {
       "total": 30,
@@ -18545,11 +18545,11 @@
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js": {
       "total": 1,
-      "passed": 0,
+      "passed": 1,
       "failed": 0,
       "skipped": 0,
       "crashed": 0,
-      "timed_out": 1,
+      "timed_out": 0,
       "oom": 0
     },
     "built-ins/decodeURIComponent/S15.1.3.2_A3_T1.js": {
@@ -23729,8 +23729,8 @@
     },
     "intl402/Segmenter/prototype": {
       "total": 36,
-      "passed": 34,
-      "failed": 2,
+      "passed": 36,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -31352,8 +31352,8 @@
     },
     "language/identifier-resolution/assign-to-global-undefined.js": {
       "total": 1,
-      "passed": 0,
-      "failed": 1,
+      "passed": 1,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -38489,8 +38489,8 @@
     },
     "language/statements/try": {
       "total": 201,
-      "passed": 200,
-      "failed": 1,
+      "passed": 201,
+      "failed": 0,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -39920,8 +39920,8 @@
     },
     "staging/sm/Function": {
       "total": 53,
-      "passed": 34,
-      "failed": 19,
+      "passed": 36,
+      "failed": 17,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40046,8 +40046,8 @@
     },
     "staging/sm/TypedArray": {
       "total": 96,
-      "passed": 78,
-      "failed": 18,
+      "passed": 83,
+      "failed": 13,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40136,8 +40136,8 @@
     },
     "staging/sm/generators": {
       "total": 27,
-      "passed": 25,
-      "failed": 2,
+      "passed": 26,
+      "failed": 1,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40208,8 +40208,8 @@
     },
     "staging/sm/statements": {
       "total": 17,
-      "passed": 14,
-      "failed": 3,
+      "passed": 15,
+      "failed": 2,
       "skipped": 0,
       "crashed": 0,
       "timed_out": 0,
@@ -40263,11 +40263,6 @@
   },
   "failing_tests": [
     {
-      "path": "built-ins/decodeURIComponent/S15.1.3.2_A2.5_T1.js",
-      "outcome": "timeout",
-      "reason": "timeout after 10000 ms"
-    },
-    {
       "path": "built-ins/Proxy/revocable/tco-fn-realm.js",
       "esid": "sec-tail-position-calls",
       "outcome": "fail",
@@ -40318,11 +40313,6 @@
       "esid": "sec-compileatom",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: \\P{Lu} should match A (ignores case)"
-    },
-    {
-      "path": "built-ins/String/prototype/repeat/repeat-string-n-times.js",
-      "outcome": "oom",
-      "reason": "oom: 738172 bytes requested"
     },
     {
       "path": "built-ins/Temporal/Duration/compare/order-of-operations.js",
@@ -41102,12 +41092,6 @@
       "reason": "strict: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
     },
     {
-      "path": "language/identifier-resolution/assign-to-global-undefined.js",
-      "esid": "sec-initializeboundname",
-      "outcome": "fail",
-      "reason": "strict: negative phase=Runtime expected ReferenceError but execution completed normally"
-    },
-    {
       "path": "language/literals/regexp/S7.8.5_A1.1_T2.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"�\"», «\"\\ud800\"») to be true"
@@ -41134,12 +41118,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [b, a] and expected [a, b] should have the same contents. "
     },
     {
-      "path": "language/statements/try/completion-values.js",
-      "esid": "sec-try-statement-runtime-semantics-evaluation",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«39», «42») to be true"
-    },
-    {
       "path": "annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"\\\\�\"», «\"\\\\\\ud800\"») to be true"
@@ -41148,18 +41126,6 @@
       "path": "annexB/built-ins/RegExp/RegExp-trailing-escape-BMP.js",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Code unit: d800 Expected SameValue(«\"a\\\\�\"», «\"a\\\\\\ud800\"») to be true"
-    },
-    {
-      "path": "annexB/language/expressions/assignment/dstr/array-pattern-emulates-undefined.js",
-      "esid": "sec-destructuring-binding-patterns-runtime-semantics-bindinginitialization",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «function __otter_is_htmldda() { [native code] }») to be true"
-    },
-    {
-      "path": "annexB/language/expressions/assignment/dstr/object-pattern-emulates-undefined.js",
-      "esid": "sec-destructuring-binding-patterns-runtime-semantics-bindinginitialization",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «function __otter_is_htmldda() { [native code] }») to be true"
     },
     {
       "path": "annexB/language/expressions/assignmenttargettype/callexpression-as-for-in-lhs.js",
@@ -41210,32 +41176,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«2», «1») to be true"
     },
     {
-      "path": "annexB/language/function-code/function-redeclaration-switch.js",
-      "esid": "sec-switch-duplicates-allowed-static-semantics",
-      "outcome": "fail",
-      "reason": "sloppy: compile: codes=[SWITCH_DUPLICATE_LEXICAL_DECL] messages=[SyntaxError: `a` already lexically declared earlier in this switch (§13.12.1 LexicallyDeclaredNames of CaseBlock must be unique)]"
-    },
-    {
       "path": "annexB/language/literals/regexp/class-escape.js",
       "esid": "sec-regular-expressions-patterns",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined"
-    },
-    {
-      "path": "annexB/language/statements/for-in/nonstrict-initializer.js",
-      "esid": "sec-initializers-in-forin-statement-heads",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«0», «1») to be true"
-    },
-    {
-      "path": "annexB/language/statements/try/catch-redeclared-var-statement-captured.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"initializer in catch\"», «\"prior to throw\"») to be true"
-    },
-    {
-      "path": "annexB/language/statements/try/catch-redeclared-var-statement.js",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"initializer in catch\"», «\"prior to throw\"») to be true"
     },
     {
       "path": "staging/sm/Array/for_of_2.js",
@@ -41331,49 +41275,49 @@
       "path": "staging/sm/Date/dst-offset-caching-1-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10004 ms"
+      "reason": "timeout after 10002 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-2-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10002 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-3-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10004 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-4-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-5-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-6-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-7-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/Date/dst-offset-caching-8-of-8.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10010 ms"
+      "reason": "timeout after 10002 ms"
     },
     {
       "path": "staging/sm/Date/non-iso.js",
@@ -41490,12 +41434,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"\"», «\"5\"») to be true"
     },
     {
-      "path": "staging/sm/Function/function-name-for.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot read property of null or undefined"
-    },
-    {
       "path": "staging/sm/Function/function-name-method.js",
       "esid": "pending",
       "outcome": "fail",
@@ -41518,12 +41456,6 @@
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a SyntaxError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/Function/return-finally.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«43», «42») to be true"
     },
     {
       "path": "staging/sm/Function/strict-arguments.js",
@@ -41739,7 +41671,7 @@
       "path": "staging/sm/String/replace-math.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10895 ms"
+      "reason": "timeout after 11991 ms"
     },
     {
       "path": "staging/sm/Symbol/conversions.js",
@@ -41772,22 +41704,10 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a ExpectedError but got a Error"
     },
     {
-      "path": "staging/sm/TypedArray/every-and-some.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«NaN», «6») to be true"
-    },
-    {
       "path": "staging/sm/TypedArray/fill-detached.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected a TypeError to be thrown but no exception was thrown at all"
-    },
-    {
-      "path": "staging/sm/TypedArray/forEach.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«NaN», «6») to be true"
     },
     {
       "path": "staging/sm/TypedArray/from_constructor.js",
@@ -41802,12 +41722,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
     },
     {
-      "path": "staging/sm/TypedArray/from_this.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «2») to be true"
-    },
-    {
       "path": "staging/sm/TypedArray/iterator-next-with-detached.js",
       "esid": "pending",
       "outcome": "fail",
@@ -41820,22 +41734,10 @@
       "reason": "strict: runtime: TypeError (UNCAUGHT) uncaught exception: TypeError: Cannot set property 'next' on iterator"
     },
     {
-      "path": "staging/sm/TypedArray/map-and-filter.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«undefined», «15») to be true"
-    },
-    {
       "path": "staging/sm/TypedArray/of.js",
       "esid": "pending",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«false», «true») to be true"
-    },
-    {
-      "path": "staging/sm/TypedArray/reduce-and-reduceRight.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«NaN», «4») to be true"
     },
     {
       "path": "staging/sm/TypedArray/seal-and-freeze.js",
@@ -42120,12 +42022,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«true», «false») to be true"
     },
     {
-      "path": "staging/sm/generators/return-finally.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«43», «42») to be true"
-    },
-    {
       "path": "staging/sm/global/eval-02.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42243,7 +42139,7 @@
       "path": "staging/sm/regress/regress-1507322-deep-weakmap.js",
       "esid": "pending",
       "outcome": "timeout",
-      "reason": "timeout after 10009 ms"
+      "reason": "timeout after 10005 ms"
     },
     {
       "path": "staging/sm/regress/regress-469625-02.js",
@@ -42330,12 +42226,6 @@
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"\"», «\"y\"») to be true"
     },
     {
-      "path": "staging/sm/statements/try-completion.js",
-      "esid": "pending",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"try\"», «\"finally\"») to be true"
-    },
-    {
       "path": "staging/sm/strict/15.3.5.2.js",
       "esid": "pending",
       "outcome": "fail",
@@ -42398,7 +42288,7 @@
     {
       "path": "intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Fri Jul 10 2026 06:30:16 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [7/10/2026, 6:30:16 AM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Actual [Fri Jul 10 2026 16:30:48 GMT+0300, Thu Jan 01 1970 03:00:00 GMT+0300, Thu Nov 09 1989 20:57:00 GMT+0300] and expected [7/10/2026, 4:30:48 PM, 1/1/1970, 3:00:00 AM, 11/9/1989, 8:57:00 PM] should have the same contents. (Testing with locales undefined; options undefined.)"
     },
     {
       "path": "intl402/Date/prototype/throws-same-exceptions-as-DateTimeFormat.js",
@@ -42426,7 +42316,7 @@
     {
       "path": "intl402/DateTimeFormat/date-time-options.js",
       "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 7/10/2026, 6:30:16 AM,Fri, 7/10/2026, 6:30:16 AM, got Fri Jul 10 2026 06:30:16 GMT+0300. Expected SameValue(«-1», «-1») to be false"
+      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Function toLocaleString did not return expected string for locales , options undefined; expected one of 7/10/2026, 4:30:48 PM,Fri, 7/10/2026, 4:30:48 PM, got Fri Jul 10 2026 16:30:48 GMT+0300. Expected SameValue(«-1», «-1») to be false"
     },
     {
       "path": "intl402/DateTimeFormat/ignore-invalid-unicode-ext-values.js",
@@ -42995,18 +42885,6 @@
       "esid": "sec-Intl.RelativeTimeFormat",
       "outcome": "fail",
       "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: options argument true should yield the correct value for \"style\" Expected SameValue(«\"long\"», «\"short\"») to be true"
-    },
-    {
-      "path": "intl402/Segmenter/prototype/segment/containing/unbreakable-input.js",
-      "esid": "sec-%segmentsprototype%.containing",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"낶ᆩ\"», «undefined») to be true"
-    },
-    {
-      "path": "intl402/Segmenter/prototype/segment/containing/zero-index.js",
-      "esid": "sec-%segmentsprototype%.containing",
-      "outcome": "fail",
-      "reason": "sloppy: runtime: TypeError (UNCAUGHT) uncaught exception: Test262Error: Expected SameValue(«\"a b c\"», «undefined») to be true"
     },
     {
       "path": "intl402/Temporal/Duration/prototype/toLocaleString/returns-same-results-as-DurationFormat.js",

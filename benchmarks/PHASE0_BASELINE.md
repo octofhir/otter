@@ -1,10 +1,9 @@
 # JIT refactor Phase 0/1 evidence
 
 Captured 2026-07-10. The required differential and GC-slot-verification gate is
-now green. Phase 0 remains incomplete because the representative macro
-workload managed-heap/RSS and whole-runtime executable-residency measurements,
-macro suite reruns, and fresh full Test262 matrix below are still outstanding;
-failed workloads still receive no performance score.
+now green. Phase 0 remains incomplete because macro suite reruns and the fresh
+full Test262 matrix below are still outstanding; failed workloads still receive
+no performance score.
 
 ## Environment
 
@@ -111,6 +110,20 @@ outside module wall time: the cold per-sample build median was 441.645 µs. The
 warm command observed a single 704.333 µs build before warmup; that one noisy
 setup observation is recorded in JSON but is not a cold/warm comparison.
 
+The package-backed two-module fixture resolves `#phase0-dep` through a
+checked-in `package.json#imports` map. It uses the same measurement boundaries
+and correctness contract as the relative-module fixture while adding package
+scope/manifest resolution. Each row is the median of 20 release samples.
+
+| Package runtime state | Wall | Resolve | Load | Parse | Compile/CodeBlock | Link/instantiate | Execute |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cold (fresh runtime/sample) | 297.812 µs | 135.250 µs | 40.083 µs | 11.854 µs | 38.375 µs | 22.250 µs | 24.875 µs |
+| warm (persistent runtime, 5 warmups) | 213.062 µs | 92.521 µs | 33.749 µs | 2.479 µs | 17.833 µs | 18.125 µs | 13.333 µs |
+
+Runtime construction remains outside package wall time: the cold build median
+was 555.145 µs. The warm command's one pre-warmup build was 1,073.334 µs and is
+not used as a comparative result.
+
 Focused call measurements below are sequential release runs, 20 medians after
 three warmups. Each timed sample executes 100,000 calls from already parsed and
 lowered bytecode in one persistent interpreter and checks the returned sum.
@@ -152,6 +165,32 @@ peak RSS**. A new cumulative full-pause counter is updated only on the full-GC
 slow path; RSS polling is out of process and opt-in, and no additional
 allocation/dispatch hot-path counter was introduced.
 
+Representative macro managed-memory/RSS measurements use the exact ordered V8
+v7 source files and generated driver used by the CLI runner. They execute as
+classic scripts in one CLI-equivalent runtime, capture the suite score marker,
+then force a full GC. Each row is the median of five fresh-runtime release
+samples with opt-in 5 ms self-RSS polling. Retained heap includes the full
+runtime bootstrap graph and live benchmark state; GC time is the cumulative
+minor+full pause delta after runtime construction, including the final forced
+collection. Execution and GC times are not additive because in-workload GC
+pauses are already inside execution time.
+
+| V8 v7 workload | Wall incl. final GC | Execution | GC pause | Retained heap | Peak RSS | JIT buffers | Validation |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Richards (call/object/control) | 2,012.090 ms | 2,011.479 ms | 0.392 ms | 403,728 B | 36,798,464 B | 104,492 B | `Score (version 7): 377` |
+| Splay (allocation/data structures) | 2,755.802 ms | 2,701.203 ms | 537.367 ms | 2,292,296 B | 502,251,520 B | 70,948 B | `Score (version 7): 1034` |
+
+These are memory-residency observations, not same-commit performance
+comparisons against another tier or runtime. The varying V8 scores are retained
+only as semantic success markers; they are not used to claim a speedup.
+
+Whole-runtime executable-code residency is queried only after each workload.
+The snapshot deduplicates code-object identity across canonical entry/OSR maps,
+the monomorphic entry cache, active direct-call anchors, and direct-method
+caches. The byte count sums finalized native buffer lengths; it excludes Rust
+metadata and executable mapping page-rounding overhead. This closes the former
+single-buffer-only evidence gap without adding compilation/dispatch counters.
+
 Post-GC-fix startup guard (same Criterion configuration): default runtime build
 was 385.61–391.01 µs and an isolated rerun of production sandbox build was
 392.22–408.23 µs, versus the pre-fix 383.29–403.96 µs and 393.40–407.25 µs
@@ -186,6 +225,24 @@ target/release/otter-phase0 module \
 target/release/otter-phase0 module \
   --entry benchmarks/fixtures/phase0/module-entry.mjs \
   --cache-state warm --samples 20 --warmup 5
+target/release/otter-phase0 module \
+  --entry benchmarks/fixtures/phase0/package/entry.mjs \
+  --cache-state cold --samples 20 --warmup 0
+target/release/otter-phase0 module \
+  --entry benchmarks/fixtures/phase0/package/entry.mjs \
+  --cache-state warm --samples 20 --warmup 5
+target/release/otter-phase0 macro-memory \
+  --name v8-v7-richards-memory \
+  --source benchmarks/.suite-cache/v8-v7/base.js \
+           benchmarks/.suite-cache/v8-v7/richards.js \
+           benchmarks/.suite-cache/v8-v7/driver.js \
+  --validation-marker 'Score (version 7):' --samples 5 --rss-sample-ms 5
+target/release/otter-phase0 macro-memory \
+  --name v8-v7-splay-memory \
+  --source benchmarks/.suite-cache/v8-v7/base.js \
+           benchmarks/.suite-cache/v8-v7/splay.js \
+           benchmarks/.suite-cache/v8-v7/driver.js \
+  --validation-marker 'Score (version 7):' --samples 5 --rss-sample-ms 5
 hyperfine --warmup 5 --runs 30 --export-json /tmp/otter-phase0-startup.json \
   'OTTER_JIT=0 target/release/otter benchmarks/fixtures/phase0/tiny.js' \
   'OTTER_JIT=1 target/release/otter benchmarks/fixtures/phase0/tiny.js'
@@ -206,11 +263,10 @@ failed workload is scored:
 | Octane Box2D | fail | dynasm relocation panic in documented run |
 
 Full V8/Octane, ARES, Web Tooling, and ejs have not yet been rerun after the GC
-fixes. Package-script timing, managed heap/RSS under representative macro
-workloads, and whole-runtime executable-code residency remain unmeasured Phase
-0 gaps. Detailed module graph phase timing plus focused managed allocation,
-retained-heap, GC-pause, peak-RSS, and JIT buffer-size evidence is now available
-above.
+fixes. Detailed relative/package module graph phases, representative macro
+managed heap/RSS, focused managed allocation, retained heap, GC pause, peak RSS,
+single-buffer JIT size, and whole-runtime executable-code residency evidence is
+now available above.
 
 ## Machine-readable results and telemetry overhead
 
@@ -231,8 +287,11 @@ No hot-path telemetry counter was added in this patch. The recorder is an
 out-of-process wrapper and the opcode inventory is offline, so their disabled
 runtime overhead is structurally zero. Module phase clocks and accumulation run
 only through `Runtime::run_module_profiled`; ordinary `run_module` retains a
-clock-free graph path. Existing bootstrap/profiling telemetry remains opt-in. A
-measured below-1% dispatch/V8 proof is still required before adding
+clock-free graph path. Macro memory reuses existing GC stats, invokes full GC
+explicitly after validation, and starts its separate RSS sampler only when a
+non-zero interval is requested. Whole-runtime JIT residency walks cold ownership
+tables only on explicit request. Existing bootstrap/profiling telemetry remains
+opt-in. A measured below-1% dispatch/V8 proof is still required before adding
 opcode/stub/IC counters to the VM hot path.
 
 ## Opcode and VM/JIT ABI audit

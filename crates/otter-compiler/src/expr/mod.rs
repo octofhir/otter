@@ -29,7 +29,7 @@ mod import_meta;
 mod jsx;
 pub(crate) mod literal;
 mod member;
-mod object_array;
+pub(crate) mod object_array;
 mod unary;
 
 use crate::*;

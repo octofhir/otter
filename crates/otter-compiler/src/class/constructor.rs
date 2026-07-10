@@ -441,8 +441,25 @@ fn emit_instance_field_inits_inner(
         // within the u16 register window.
         let scratch_mark = cx.scratch;
         let pspan = (p.span.start, p.span.end);
+        // §15.7.10 / §13.15.2 NamedEvaluation — a static-key field's
+        // anonymous initializer takes the field name.
+        let static_key_name = if p.computed {
+            None
+        } else {
+            match &p.key {
+                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
+                    Some(id.name.as_str().to_string())
+                }
+                oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => Some(lit.value.to_string()),
+                _ => None,
+            }
+        };
         let value_reg = match &p.value {
-            Some(expr) => compile_expr(cx, expr, pspan)?,
+            Some(expr) => match &static_key_name {
+                Some(name) => crate::expr::compile_expr_with_inferred_name(cx, expr, name, pspan)?,
+                None => compile_expr(cx, expr, pspan)?,
+            },
             None => {
                 let dst = cx.alloc_scratch();
                 cx.emit(Op::LoadUndefined, [Operand::Register(dst)], pspan);
@@ -458,6 +475,23 @@ fn emit_instance_field_inits_inner(
             // of re-evaluating the expression per instance.
             let binding = crate::class::field_key_binding_name(idx);
             let key_reg = load_synthetic_capture(cx, &binding, pspan)?;
+            // §15.7.10 step 4 — `[key] = AnonymousFunctionDefinition`
+            // names the function from the (already canonical) key.
+            if p.value
+                .as_ref()
+                .is_some_and(crate::expr::object_array::expression_is_anonymous_function)
+            {
+                let empty_idx = cx.intern_string_constant("");
+                cx.emit(
+                    Op::SetFunctionName,
+                    [
+                        Operand::Register(value_reg),
+                        Operand::Register(key_reg),
+                        Operand::ConstIndex(empty_idx),
+                    ],
+                    pspan,
+                );
+            }
             emit_public_field_define(cx, this_reg, key_reg, value_reg, pspan);
             cx.scratch = scratch_mark;
             continue;

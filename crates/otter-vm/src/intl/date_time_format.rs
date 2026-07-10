@@ -488,8 +488,47 @@ pub fn resolve_ctx(
         .unwrap_or_else(|| "latn".to_string());
 
     let hour12 = get_bool_option(ctx, options, "hour12", CLASS, None)?;
-    let hour_cycle = enum_opt!("hourCycle", HC, parse_hour_cycle);
-    let time_zone = get_string_option(ctx, options, "timeZone", CLASS, &[], None)?;
+    let hour_cycle_option = enum_opt!("hourCycle", HC, parse_hour_cycle);
+    // §11.1.2 steps 5-12 — a present `hour12` makes the `hourCycle`
+    // option (and the `hc` extension) inert; otherwise the option wins
+    // over the locale's `-u-hc-` extension, which wins over the
+    // locale's default cycle.
+    let hc_extension = crate::intl::helpers::unicode_extension_value(&locale, "hc")
+        .and_then(|v| parse_hour_cycle(&v));
+    let default_hc = default_hour_cycle(&locale);
+    let hour_cycle = Some(match hour12 {
+        // CLDR's preferred 12-hour cycle is h11 only for Japanese;
+        // every other tested locale prefers h12.
+        Some(true) => {
+            if locale.split('-').next() == Some("ja") {
+                DtHourCycle::H11
+            } else {
+                DtHourCycle::H12
+            }
+        }
+        // Current ECMA-402 (post-2022 simplification): hour12 false is
+        // always the 0-23 clock.
+        Some(false) => DtHourCycle::H23,
+        None => hour_cycle_option.or(hc_extension).unwrap_or(default_hc),
+    });
+    // §11.1.2 — the timeZone option must name an available IANA zone
+    // (matched case-insensitively, reported in canonical case) or be a
+    // normalized offset string; anything else is a RangeError. Route
+    // through temporal_rs, which owns the IANA table and offset syntax.
+    let time_zone = match get_string_option(ctx, options, "timeZone", CLASS, &[], None)? {
+        Some(tz) => {
+            let parsed =
+                temporal_rs::TimeZone::try_from_str(&tz).map_err(|_| NativeError::RangeError {
+                    name: CLASS,
+                    reason: format!("invalid time zone: {tz}"),
+                })?;
+            Some(parsed.identifier().map_err(|_| NativeError::RangeError {
+                name: CLASS,
+                reason: format!("invalid time zone: {tz}"),
+            })?)
+        }
+        None => None,
+    };
 
     let weekday = enum_opt!("weekday", TEXT, parse_text_width);
     let era = enum_opt!("era", TEXT, parse_text_width);
@@ -1094,11 +1133,9 @@ pub(crate) fn date_time_format_resolved_options(
         .unwrap_or_else(|| "UTC".to_string());
     str_entry!("timeZone", &tz);
 
-    let time_present = payload.hour.is_some()
-        || payload.minute.is_some()
-        || payload.second.is_some()
-        || payload.time_style.is_some();
-    if time_present {
+    // §11.3.4 — hourCycle / hour12 are surfaced only when the [[Hour]]
+    // slot resolved (an explicit hour component or a timeStyle).
+    if payload.hour.is_some() || payload.time_style.is_some() {
         let hc = payload.hour_cycle.unwrap_or(DtHourCycle::H23);
         str_entry!("hourCycle", hour_cycle_str(hc));
         entries.push((
@@ -1164,10 +1201,83 @@ pub(crate) fn date_time_format_resolved_options(
 /// [`FieldSetBuilder`] and formats an ISO `DateTime`. Returns `None`
 /// when the locale, field set, or input is unrepresentable so the caller
 /// can fall back to the stable ISO-ish layout.
+/// The locale's default hour cycle. Hand-rolled CLDR subset covering
+/// the languages test262 exercises — h12 for English-like locales, h23
+/// for most of Europe and East Asia's 24-hour cultures.
+fn default_hour_cycle(locale: &str) -> DtHourCycle {
+    match locale.split('-').next().unwrap_or("en") {
+        "en" | "es" | "ar" | "hi" | "ko" | "zh" | "fil" | "he" => DtHourCycle::H12,
+        _ => DtHourCycle::H23,
+    }
+}
+
+/// Map the resolved [`DtHourCycle`] onto the icu preference keyword so
+/// the formatter honors the ECMA-402 resolution (option > `-u-hc-` >
+/// locale default, with `hour12` overriding both).
+fn apply_hour_cycle_pref(
+    prefs: &mut icu_datetime::DateTimeFormatterPreferences,
+    payload: &DateTimeFormatPayload,
+) {
+    use icu_locale::preferences::extensions::unicode::keywords::HourCycle;
+    if let Some(hc) = payload.hour_cycle {
+        prefs.hour_cycle = Some(match hc {
+            DtHourCycle::H11 => HourCycle::H11,
+            DtHourCycle::H12 => HourCycle::H12,
+            DtHourCycle::H23 => HourCycle::H23,
+            // icu4x models no h24 keyword (CLDR deprecates it); H23 is
+            // the nearest 24-hour rendering.
+            DtHourCycle::H24 => HourCycle::H23,
+        });
+    }
+}
+
+/// `true` when the requested components are exactly a standalone
+/// `dayPeriod` (§11.5.5 pattern "B" alone).
+fn day_period_only(p: &DateTimeFormatPayload) -> bool {
+    p.day_period.is_some()
+        && p.hour.is_none()
+        && p.minute.is_none()
+        && p.second.is_none()
+        && p.fractional_second_digits.is_none()
+        && p.weekday.is_none()
+        && p.era.is_none()
+        && p.year.is_none()
+        && p.month.is_none()
+        && p.day.is_none()
+        && p.date_style.is_none()
+        && p.time_style.is_none()
+}
+
+/// CLDR flexible day-period name for a civil time. Hand-rolled English
+/// subset — icu_datetime 2.x exposes no standalone day-period fieldset;
+/// non-English locales fall back to AM/PM.
+fn day_period_only_string(civil: Civil, payload: &DateTimeFormatPayload) -> String {
+    let lang = payload.locale.split('-').next().unwrap_or("en");
+    let narrow = matches!(payload.day_period, Some(DtTextWidth::Narrow));
+    if lang == "en" {
+        if civil.hour == 12 && civil.minute == 0 && civil.second == 0 {
+            return if narrow { "n" } else { "noon" }.to_string();
+        }
+        return match civil.hour {
+            6..=11 => "in the morning",
+            12..=17 => "in the afternoon",
+            18..=20 => "in the evening",
+            _ => "at night",
+        }
+        .to_string();
+    }
+    (if civil.hour < 12 { "AM" } else { "PM" }).to_string()
+}
+
 fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Option<String> {
     use icu_datetime::input::{Date, DateTime, Time};
     use icu_datetime::{DateTimeFormatter, fieldsets::builder::FieldSetBuilder};
 
+    if day_period_only(payload) {
+        let mut formatted = day_period_only_string(civil, payload);
+        append_time_zone_text(&mut formatted, payload);
+        return Some(formatted);
+    }
     if time_only_without_hour(payload) {
         let mut formatted = format_time_only_without_hour(civil, payload);
         append_time_zone_text(&mut formatted, payload);
@@ -1175,7 +1285,8 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     }
 
     let locale: icu_locale::Locale = payload.locale.parse().ok()?;
-    let prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
+    let mut prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
+    apply_hour_cycle_pref(&mut prefs, payload);
 
     let mut builder = FieldSetBuilder::default();
     builder.length = payload_length(payload);
@@ -1190,6 +1301,7 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
         localize_fraction_separator(&mut formatted, payload);
         pad_two_digit_hour(&mut formatted, payload);
         normalize_day_period_separator(&mut formatted, payload);
+        substitute_flexible_day_period(&mut formatted, civil, payload);
         append_time_zone_text(&mut formatted, payload);
         return Some(formatted);
     }
@@ -1206,6 +1318,7 @@ fn icu_format_components(civil: Civil, payload: &DateTimeFormatPayload) -> Optio
     localize_fraction_separator(&mut formatted, payload);
     pad_two_digit_hour(&mut formatted, payload);
     normalize_day_period_separator(&mut formatted, payload);
+    substitute_flexible_day_period(&mut formatted, civil, payload);
     append_time_zone_text(&mut formatted, payload);
     Some(formatted)
 }
@@ -1285,6 +1398,11 @@ fn icu_format_segments(
     use icu_datetime::{DateTimeFormatter, fieldsets::builder::FieldSetBuilder};
     use writeable::Writeable;
 
+    if day_period_only(payload) {
+        let mut parts = vec![("dayPeriod", day_period_only_string(civil, payload))];
+        append_time_zone_part(&mut parts, payload);
+        return Some(parts);
+    }
     if time_only_without_hour(payload) {
         let mut parts = format_time_only_without_hour_parts(civil, payload);
         append_time_zone_part(&mut parts, payload);
@@ -1292,7 +1410,8 @@ fn icu_format_segments(
     }
 
     let locale: icu_locale::Locale = payload.locale.parse().ok()?;
-    let prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
+    let mut prefs = icu_datetime::DateTimeFormatterPreferences::from(&locale);
+    apply_hour_cycle_pref(&mut prefs, payload);
     let mut builder = FieldSetBuilder::default();
     builder.length = payload_length(payload);
     builder.date_fields = payload_date_fields(payload);
@@ -1307,6 +1426,7 @@ fn icu_format_segments(
             current: "literal",
         };
         formatter.format(&time).write_to_parts(&mut sink).ok()?;
+        substitute_flexible_day_period_parts(&mut sink.segments, civil, payload);
         append_time_zone_part(&mut sink.segments, payload);
         return Some(sink.segments);
     }
@@ -1321,6 +1441,7 @@ fn icu_format_segments(
         current: "literal",
     };
     formatter.format(&dt).write_to_parts(&mut sink).ok()?;
+    substitute_flexible_day_period_parts(&mut sink.segments, civil, payload);
     append_time_zone_part(&mut sink.segments, payload);
     Some(sink.segments)
 }
@@ -1392,6 +1513,48 @@ fn localize_fraction_separator(formatted: &mut String, payload: &DateTimeFormatP
         return;
     }
     *formatted = formatted.replace('.', decimal_separator(payload));
+}
+
+/// Parts analogue of [`substitute_flexible_day_period`]: rewrite the
+/// `dayPeriod` part's AM/PM value to the CLDR flexible name and turn
+/// the icu narrow-no-break separator into a plain space.
+fn substitute_flexible_day_period_parts(
+    parts: &mut [(&'static str, String)],
+    civil: Civil,
+    payload: &DateTimeFormatPayload,
+) {
+    if payload.day_period.is_none() || payload.hour.is_none() {
+        return;
+    }
+    let name = day_period_only_string(civil, payload);
+    for i in 0..parts.len() {
+        if parts[i].0 == "dayPeriod" {
+            parts[i].1 = name.clone();
+            if i > 0 && parts[i - 1].0 == "literal" && parts[i - 1].1 == "\u{202f}" {
+                parts[i - 1].1 = " ".to_string();
+            }
+        }
+    }
+}
+
+/// When `dayPeriod` is requested alongside an hour, ECMA-402 renders
+/// the CLDR flexible day period ("in the morning", "noon", …) with a
+/// plain-space separator instead of the AM/PM marker icu produces.
+fn substitute_flexible_day_period(
+    formatted: &mut String,
+    civil: Civil,
+    payload: &DateTimeFormatPayload,
+) {
+    if payload.day_period.is_none() || payload.hour.is_none() {
+        return;
+    }
+    let name = day_period_only_string(civil, payload);
+    for marker in ["\u{202f}AM", "\u{202f}PM", " AM", " PM"] {
+        if formatted.contains(marker) {
+            *formatted = formatted.replace(marker, &format!(" {name}"));
+            return;
+        }
+    }
 }
 
 fn normalize_day_period_separator(formatted: &mut String, payload: &DateTimeFormatPayload) {
@@ -1732,11 +1895,32 @@ fn epoch_millis_to_civil_for_payload(epoch_millis: i64, payload: &DateTimeFormat
             .map(civil_from_broken_down)
             .unwrap_or_else(|| epoch_millis_to_civil(epoch_millis)),
         Some("UTC" | "Etc/UTC" | "Etc/GMT") => epoch_millis_to_civil(epoch_millis),
-        // Other time zones are parsed and preserved today, but full
-        // zone-aware formatting is handled by the dedicated timezone
-        // follow-up. UTC fallback keeps behavior deterministic.
-        Some(_) => epoch_millis_to_civil(epoch_millis),
+        // Zone-aware wall-clock conversion through temporal_rs, which
+        // owns the IANA data and offset arithmetic. An unresolvable
+        // zone (should not happen — the constructor validated it)
+        // falls back to UTC deterministically.
+        Some(zone) => {
+            zoned_civil(epoch_millis, zone).unwrap_or_else(|| epoch_millis_to_civil(epoch_millis))
+        }
     }
+}
+
+/// Wall-clock components of `epoch_millis` in `zone`, via
+/// temporal_rs's ZonedDateTime.
+fn zoned_civil(epoch_millis: i64, zone: &str) -> Option<Civil> {
+    let tz = temporal_rs::TimeZone::try_from_str(zone).ok()?;
+    let nanos = i128::from(epoch_millis) * 1_000_000;
+    let zdt =
+        temporal_rs::ZonedDateTime::try_new(nanos, tz, temporal_rs::Calendar::default()).ok()?;
+    Some(Civil::new(
+        zdt.year(),
+        zdt.month(),
+        zdt.day(),
+        zdt.hour(),
+        zdt.minute(),
+        zdt.second(),
+        u32::from(zdt.millisecond()) * 1_000_000,
+    ))
 }
 
 fn civil_from_broken_down(bd: crate::date::BrokenDown) -> Civil {

@@ -1796,7 +1796,13 @@ impl Interpreter {
         let frame = stack
             .get_mut(frame_index)
             .ok_or_else(|| VmError::InvalidOperand)?;
-        self.run_make_function_reg(context, frame, dst, idx)
+        // `idx` is a constant-pool index of the COMPILED function's chunk;
+        // in a multi-script runtime the ambient context may belong to a
+        // different chunk, so resolve the owner before decoding.
+        let resolved = context
+            .for_function(frame.function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        self.run_make_function_reg(&resolved, frame, dst, idx)
     }
 
     /// JIT bridge — boxed `Value` bits of frame `frame_index`'s `this` binding,

@@ -100,6 +100,9 @@ pub struct NumberFormatPayload {
     /// `unitDisplay` option (`"short"` / `"narrow"` / `"long"`) — set
     /// only when `style == "unit"`.
     pub unit_display: String,
+    /// `compactDisplay` option (`"short"` / `"long"`) — meaningful only
+    /// when `notation == "compact"`.
+    pub compact_display: String,
 }
 
 /// Text-component width (`weekday`, `era`, `dayPeriod`).

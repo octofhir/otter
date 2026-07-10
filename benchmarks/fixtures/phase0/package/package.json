@@ -1,0 +1,8 @@
+{
+  "name": "otter-phase0-package-fixture",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#phase0-dep": "./dep.mjs"
+  }
+}

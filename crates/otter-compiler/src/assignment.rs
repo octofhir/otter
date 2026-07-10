@@ -312,8 +312,15 @@ pub(crate) fn compile_assignment(
         return Ok(value_reg);
     }
     // `name = value` — local or captured-upvalue store.
-    let name = match &a.left {
-        AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.as_str().to_string(),
+    let (name, direct_identifier) = match &a.left {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => (
+            id.name.as_str().to_string(),
+            // §13.15.2 NamedEvaluation applies only to a DIRECT
+            // IdentifierReference target — a parenthesized cover
+            // (`(x) = fn`) starts before the identifier's own span
+            // and must not name the function.
+            id.span.start == a.span.start,
+        ),
         _ => {
             return Err(CompileError::Unsupported {
                 node: "AssignmentTarget (non-identifier)".to_string(),
@@ -493,7 +500,10 @@ pub(crate) fn compile_assignment(
     let value = match compound_op {
         // §13.15.2 — plain `IdentifierRef = AnonymousFunctionDefinition`
         // performs NamedEvaluation, inferring the target's name.
-        None => crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?,
+        None if direct_identifier => {
+            crate::expr::compile_expr_with_inferred_name(cx, &a.right, &name, span)?
+        }
+        None => compile_expr(cx, &a.right, span)?,
         Some(op) => {
             let current = cx.alloc_scratch();
             let mut with_done = None;

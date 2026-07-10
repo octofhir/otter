@@ -204,7 +204,19 @@ pub(crate) fn compile_object_literal(
                                     span: key_span,
                                 }
                                 })?;
-                                compile_expr(cx, expr, key_span)?
+                                let raw = compile_expr(cx, expr, key_span)?;
+                                // §13.2.5.4 ComputedPropertyName —
+                                // ToPropertyKey before the accessor value
+                                // exists; SetFunctionName then sees the
+                                // canonical string/symbol ("get /a/"), not
+                                // the raw object.
+                                let canon = cx.alloc_scratch();
+                                cx.emit(
+                                    Op::ToPropertyKey,
+                                    [Operand::Register(canon), Operand::Register(raw)],
+                                    key_span,
+                                );
+                                canon
                             }
                         };
                     // §15.4.1 — a getter's parameter list is empty
@@ -587,7 +599,7 @@ fn object_literal_uses_super_in_methods(obj: &ObjectExpression<'_>) -> bool {
 /// §13.2.5.5 — an unnamed function / generator / async function
 /// expression, an arrow, or an unnamed class expression (possibly
 /// parenthesized).
-fn expression_is_anonymous_function(expr: &Expression<'_>) -> bool {
+pub(crate) fn expression_is_anonymous_function(expr: &Expression<'_>) -> bool {
     match expr {
         Expression::ParenthesizedExpression(p) => expression_is_anonymous_function(&p.expression),
         Expression::FunctionExpression(f) => f.id.is_none(),

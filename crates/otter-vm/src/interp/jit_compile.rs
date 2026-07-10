@@ -1,10 +1,10 @@
 //! Optimizing-tier compile requests and profile-feedback baking.
 //!
 //! # Contents
-//! `compile_jit_function`, feedback baking into the instruction view
-//! (arith/element/property/global-cell/object-literal/inline-callee
-//! tables), call/method target profiling (`note_call_target`,
-//! `note_method_target`), and reoptimization eviction.
+//! - `jit_code_residency` — opt-in whole-isolate executable-code snapshot.
+//! - `compile_jit_function` and feedback baking into the instruction view
+//!   (arith/element/property/global-cell/object-literal/inline-callee tables).
+//! - Call/method target profiling and reoptimization eviction.
 //!
 //! # Invariants
 //! Baked pointers (shape ids, global cells, prototype slots) must only
@@ -14,6 +14,49 @@
 use crate::*;
 
 impl Interpreter {
+    /// Snapshot all executable code objects currently retained by this isolate.
+    ///
+    /// This walks cold JIT ownership/cache tables only when explicitly called;
+    /// ordinary dispatch, compilation, and stats collection do no residency
+    /// accounting.
+    #[must_use]
+    pub fn jit_code_residency(&self) -> jit::JitCodeResidency {
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut code_bytes = 0u64;
+        let mut record = |code: &std::sync::Arc<dyn jit::JitFunctionCode>| {
+            let identity = std::sync::Arc::as_ptr(code) as *const () as usize;
+            if seen.insert(identity) {
+                code_bytes =
+                    code_bytes.saturating_add(u64::try_from(code.code_len()).unwrap_or(u64::MAX));
+            }
+        };
+
+        for code in self.jit_code.values().flatten() {
+            record(code);
+        }
+        for code in self.jit_osr_code.values().flatten() {
+            record(code);
+        }
+        if let Some((_, code)) = &self.jit_code_cache {
+            record(code);
+        }
+        for (_, code) in &self.jit_direct_code_anchors {
+            record(code);
+        }
+        for cache_set in &self.jit_direct_method_cache {
+            for entry in cache_set {
+                record(&entry.code);
+            }
+        }
+
+        jit::JitCodeResidency {
+            installed_entry_bodies: self.jit_code.values().flatten().count() as u64,
+            installed_osr_bodies: self.jit_osr_code.values().flatten().count() as u64,
+            unique_code_objects: seen.len() as u64,
+            code_bytes,
+        }
+    }
+
     /// Build a compile request for `fid` and run the installed hook. Returns the
     /// installed code, or `None` when the hook declines (unsupported subset or
     /// executable memory unavailable) — either way execution stays correct on
@@ -1122,5 +1165,17 @@ impl Interpreter {
             view.collection_alloc_methods
                 .insert(instr.byte_pc, feedback);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Interpreter;
+
+    #[test]
+    fn fresh_interpreter_has_no_executable_code_residency() {
+        let interpreter = Interpreter::new();
+        assert_eq!(interpreter.jit_code_residency().code_bytes, 0);
+        assert_eq!(interpreter.jit_code_residency().unique_code_objects, 0);
     }
 }

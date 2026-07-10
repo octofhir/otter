@@ -3093,6 +3093,15 @@ impl Runtime {
         }
     }
 
+    /// Snapshot executable code retained by this runtime's JIT caches.
+    ///
+    /// This is an explicit diagnostics/benchmark query and performs no
+    /// accounting on ordinary execution paths.
+    #[must_use]
+    pub fn jit_code_residency(&self) -> otter_vm::JitCodeResidency {
+        self.interp.jit_code_residency()
+    }
+
     fn attach_execution_stats(&mut self, result: ExecutionResult) -> ExecutionResult {
         let stats = self.execution_stats();
         result.with_stats(stats)

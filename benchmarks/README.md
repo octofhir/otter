@@ -69,6 +69,17 @@ cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
 cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
   module --entry benchmarks/fixtures/phase0/module-entry.mjs \
   --cache-state warm --samples 20 --warmup 5
+
+cargo run --release -p otter-benchmark --features phase0 --bin otter-phase0 -- \
+  module --entry benchmarks/fixtures/phase0/package/entry.mjs \
+  --cache-state cold --samples 20 --warmup 0
+
+cargo run --release -p otter-benchmark --features phase0,rss --bin otter-phase0 -- \
+  macro-memory --name v8-v7-richards-memory \
+  --source benchmarks/.suite-cache/v8-v7/base.js \
+           benchmarks/.suite-cache/v8-v7/richards.js \
+           benchmarks/.suite-cache/v8-v7/driver.js \
+  --validation-marker 'Score (version 7):' --samples 5 --rss-sample-ms 5
 ```
 
 Direct calls wider than the current bytecode format should be recorded as
@@ -87,6 +98,19 @@ pre-executions by default, then repeated measured executions. Both modes still
 resolve, read, parse, compile, and link a fresh graph: Otter has no persistent
 CodeBlock or module cache yet. The warm label therefore describes runtime and
 host filesystem state, not a module-cache hit.
+
+The package-backed fixture resolves `#phase0-dep` through its checked-in
+`package.json#imports` map, so the same `module` command also captures package
+scope/manifest resolution without a generated `node_modules` tree.
+
+`macro-memory` preserves the CLI multi-file script semantics: every input is
+compiled as a classic script in one CLI-equivalent runtime, in source order.
+Each sample must emit the requested suite marker, then the runner forces a full
+GC and records retained managed heap, cumulative workload/GC pause time, and
+the deduplicated finalized bytes reachable from all JIT entry/OSR/direct-call
+caches. RSS polling is opt-in and runs on a separate sampler thread only when
+`--rss-sample-ms` is non-zero. Prepare the V8 v7 cache/driver with
+`benchmarks/run-v8-v7.sh richards` before invoking the command directly.
 
 Peak RSS sampling is opt-in on the generic recorder and therefore adds no
 polling overhead to ordinary runs:

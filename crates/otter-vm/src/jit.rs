@@ -864,6 +864,23 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     }
 }
 
+/// On-demand snapshot of executable code retained by one interpreter.
+///
+/// Code objects are deduplicated by allocation identity across the canonical
+/// entry/OSR maps and auxiliary direct-call caches. `code_bytes` sums finalized
+/// native buffer lengths, not Rust metadata or page-rounding overhead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitCodeResidency {
+    /// Installed non-OSR function bodies.
+    pub installed_entry_bodies: u64,
+    /// Installed OSR-target bodies.
+    pub installed_osr_bodies: u64,
+    /// Unique executable code objects reachable from all runtime caches.
+    pub unique_code_objects: u64,
+    /// Sum of finalized executable buffer lengths.
+    pub code_bytes: u64,
+}
+
 /// Result of a JIT compile attempt.
 #[derive(Debug, Clone)]
 pub enum JitCompileStatus {

@@ -473,6 +473,23 @@ pub(crate) fn compile_assignment(
     };
     let active_with_envs = cx.active_with_envs.clone();
     let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+    // §6.2.5.6 — a strict assignment to an unresolvable identifier
+    // throws off the reference resolved BEFORE the RHS runs: snapshot
+    // the global binding's existence now so a RHS side effect that
+    // creates the property cannot legitimize the store.
+    let strict_global_probe =
+        if storage.is_none() && cx.is_strict && with_ref.is_none() && compound_op.is_none() {
+            let exists = cx.alloc_scratch();
+            let name_idx = cx.intern_string_constant(&name);
+            cx.emit(
+                Op::GlobalBindingExists,
+                [Operand::Register(exists), Operand::ConstIndex(name_idx)],
+                span,
+            );
+            Some(exists)
+        } else {
+            None
+        };
     let value = match compound_op {
         // §13.15.2 — plain `IdentifierRef = AnonymousFunctionDefinition`
         // performs NamedEvaluation, inferring the target's name.
@@ -563,16 +580,28 @@ pub(crate) fn compile_assignment(
             // (script lexicals) first, then the object record;
             // strict stores re-check the binding still exists.
             let name_idx = cx.intern_string_constant(&name);
-            let strict = i32::from(cx.is_strict);
-            cx.emit(
-                Op::StoreGlobalBinding,
-                [
-                    Operand::Register(value),
-                    Operand::ConstIndex(name_idx),
-                    Operand::Imm32(strict),
-                ],
-                span,
-            );
+            if let Some(exists) = strict_global_probe {
+                cx.emit(
+                    Op::StoreGlobalChecked,
+                    [
+                        Operand::Register(value),
+                        Operand::ConstIndex(name_idx),
+                        Operand::Register(exists),
+                    ],
+                    span,
+                );
+            } else {
+                let strict = i32::from(cx.is_strict);
+                cx.emit(
+                    Op::StoreGlobalBinding,
+                    [
+                        Operand::Register(value),
+                        Operand::ConstIndex(name_idx),
+                        Operand::Imm32(strict),
+                    ],
+                    span,
+                );
+            }
         }
     }
     if let Some(done) = with_store_done {
@@ -1369,30 +1398,18 @@ pub(crate) fn apply_default_with_name(
     inferred_name: Option<&str>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
-    // Test `value_reg !== undefined` and pick.
-    let tag_reg = cx.alloc_scratch();
-    cx.emit(
-        Op::TypeOf,
-        [Operand::Register(tag_reg), Operand::Register(value_reg)],
-        span,
-    );
-    let undef_str_reg = cx.alloc_scratch();
-    let undef_const = cx.intern_string_constant("undefined");
-    cx.emit(
-        Op::LoadString,
-        vec![
-            Operand::Register(undef_str_reg),
-            Operand::ConstIndex(undef_const),
-        ],
-        span,
-    );
+    // Test `value_reg !== undefined` and pick. Strict identity, not
+    // `typeof` — the Annex B IsHTMLDDA host object reports typeof
+    // "undefined" yet must NOT trigger destructuring defaults.
+    let undef_reg = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(undef_reg)], span);
     let is_undef = cx.alloc_scratch();
     cx.emit(
         Op::Equal,
         vec![
             Operand::Register(is_undef),
-            Operand::Register(tag_reg),
-            Operand::Register(undef_str_reg),
+            Operand::Register(value_reg),
+            Operand::Register(undef_reg),
         ],
         span,
     );

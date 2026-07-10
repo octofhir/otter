@@ -2299,6 +2299,23 @@ impl Interpreter {
                     self.run_leave_try(frame)?;
                     continue;
                 }
+                Op::GlobalBindingExists => {
+                    let dst = register_operand(context.exec_operand(instr, 0))?;
+                    let name_idx = const_operand(context.exec_operand(instr, 1))?;
+                    let frame = &mut stack[top_idx];
+                    self.run_global_binding_exists_reg(context, frame, dst, name_idx)?;
+                    continue;
+                }
+                Op::StoreGlobalChecked => {
+                    let value_reg = register_operand(context.exec_operand(instr, 0))?;
+                    let name_idx = const_operand(context.exec_operand(instr, 1))?;
+                    let exists_reg = register_operand(context.exec_operand(instr, 2))?;
+                    let frame = &mut stack[top_idx];
+                    self.run_store_global_checked_reg(
+                        context, frame, value_reg, name_idx, exists_reg,
+                    )?;
+                    continue;
+                }
                 Op::PopParkedFinally => {
                     // §14.15.3 — a break/continue leaving `count`
                     // finally bodies abandons the completions those

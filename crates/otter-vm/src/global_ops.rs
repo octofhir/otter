@@ -560,6 +560,51 @@ impl Interpreter {
     /// `Op::StoreGlobalBinding` — §9.1.1.4 global-environment
     /// SetMutableBinding: declarative record first, then the object
     /// record.
+    /// `Op::GlobalBindingExists` — snapshot whether the global
+    /// environment can currently resolve `name` (script lexicals, then
+    /// the global object including its prototype chain).
+    pub(crate) fn run_global_binding_exists_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        name_idx: u32,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let exists = self.global_lexicals.contains_key(name)
+            || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
+            || crate::object::get(self.global_this, &self.gc_heap, name).is_some();
+        crate::write_register(frame, dst, Value::boolean(exists))?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// `Op::StoreGlobalChecked` — §6.2.5.6 PutValue over a strict
+    /// unresolvable reference: the ReferenceError keys off the
+    /// existence snapshot taken BEFORE the RHS ran, so a RHS side
+    /// effect creating the property does not legitimize the store.
+    pub(crate) fn run_store_global_checked_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        value_reg: u16,
+        name_idx: u32,
+        exists_reg: u16,
+    ) -> Result<(), VmError> {
+        let existed = crate::read_register(frame, exists_reg)?
+            .as_boolean()
+            .unwrap_or(false);
+        if !existed {
+            let name = context
+                .string_constant_str(name_idx)
+                .ok_or(VmError::InvalidOperand)?;
+            return Err(self.err_undefined_ident((name.to_string()).into()));
+        }
+        self.run_store_global_binding_reg(context, frame, value_reg, name_idx, true)
+    }
+
     pub(crate) fn run_store_global_binding_reg(
         &mut self,
         context: &ExecutionContext,

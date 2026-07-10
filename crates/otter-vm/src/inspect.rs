@@ -901,6 +901,8 @@ mod tests {
         Op::SetSuperElement,
         Op::JumpViaFinally,
         Op::PopParkedFinally,
+        Op::GlobalBindingExists,
+        Op::StoreGlobalChecked,
         Op::MakeClass,
         Op::MathLoad,
         Op::MathCall,

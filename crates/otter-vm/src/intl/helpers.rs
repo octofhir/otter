@@ -201,6 +201,44 @@ fn option_get(
     crate::temporal::helpers::get_option_value(ctx, options, name, class)
 }
 
+/// The value of one Unicode `-u-` extension keyword in `locale`
+/// (e.g. `unicode_extension_value("en-u-hc-h23", "hc") == Some("h23")`);
+/// a keyword present without a value yields `"true"`.
+pub fn unicode_extension_value(locale: &str, key: &str) -> Option<String> {
+    let unicode = locale.find("-u-")?;
+    if let Some(private) = locale.find("-x-")
+        && private < unicode
+    {
+        return None;
+    }
+    let extension = &locale[(unicode + 3)..];
+    let subtags: Vec<&str> = extension.split('-').collect();
+    let mut i = 0;
+    while i < subtags.len() {
+        let subtag = subtags[i];
+        if subtag.len() == 1 {
+            break;
+        }
+        if subtag.len() == 2 {
+            let current_key = subtag;
+            i += 1;
+            let start = i;
+            while i < subtags.len() && subtags[i].len() > 2 {
+                i += 1;
+            }
+            if current_key == key {
+                if start == i {
+                    return Some("true".to_string());
+                }
+                return Some(subtags[start..i].join("-"));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// `ToString(value)` for an option — fires `toString`/`valueOf`/
 /// `@@toPrimitive` and throws a `TypeError` on a Symbol.
 pub fn option_to_string(

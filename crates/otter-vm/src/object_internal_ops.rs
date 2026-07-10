@@ -3288,6 +3288,29 @@ impl Interpreter {
             array::set_prototype_override(arr, &mut self.gc_heap, proto_opt);
             return Ok(true);
         }
+        // §10.1.2 OrdinarySetPrototypeOf for interned functions and
+        // closures — the override rides the per-template side table
+        // every prototype walk consults (a stored `null` means an
+        // explicit null [[Prototype]], distinct from "no override").
+        let fid = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
+        if let Some(function_id) = fid {
+            let current = self.get_prototype_for_op(target)?;
+            if abstract_ops::same_value(proto, &current, &self.gc_heap) {
+                return Ok(true);
+            }
+            if !self.ordinary_function_is_extensible(function_id) {
+                return Ok(false);
+            }
+            if abstract_ops::same_value(proto, target, &self.gc_heap) {
+                return Ok(false);
+            }
+            self.set_function_prototype_override(target, Some(*proto));
+            return Ok(true);
+        }
         Ok(true)
     }
 
@@ -3723,43 +3746,59 @@ impl Interpreter {
             .or_else(|| base.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let owner = base.as_closure(&self.gc_heap);
-            let lookup = match key {
-                VmPropertyKey::Symbol(sym) => {
-                    match self
-                        .callable_bag_read(owner, function_id)
-                        .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym))
-                    {
-                        Some(desc) => descriptor_to_lookup(desc),
-                        None => self
-                            .function_kind_prototype_for(context, function_id)
-                            .and_then(|proto| {
-                                match object::lookup_symbol(proto, &self.gc_heap, *sym) {
-                                    object::PropertyLookup::Absent => None,
-                                    lookup => Some(lookup),
-                                }
-                            })
-                            .or_else(|| {
-                                self.function_prototype_object()
-                                    .ok()
-                                    .map(|proto| object::lookup_symbol(proto, &self.gc_heap, *sym))
-                            })
-                            .unwrap_or(object::PropertyLookup::Absent),
-                    }
-                }
+            // A user-mutated [[Prototype]] (`fn.__proto__ = obj` /
+            // Object.setPrototypeOf) replaces the intrinsic chain: after
+            // the own properties miss, continue the ordinary walk from
+            // the override instead of %Function.prototype%.
+            let proto_override = self.function_prototype_overrides.get(&function_id).copied();
+            let own_lookup = match key {
+                VmPropertyKey::Symbol(sym) => self
+                    .callable_bag_read(owner, function_id)
+                    .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym))
+                    .map(descriptor_to_lookup),
                 _ => {
                     let key_name = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    let own = self.ordinary_function_own_property_descriptor(
+                    self.ordinary_function_own_property_descriptor(
                         Some(context),
                         owner,
                         function_id,
                         key_name,
-                    )?;
-                    match own {
-                        Some(desc) => descriptor_to_lookup(desc),
-                        None => self
-                            .function_kind_prototype_for(context, function_id)
+                    )?
+                    .map(descriptor_to_lookup)
+                }
+            };
+            if own_lookup.is_none()
+                && let Some(over) = proto_override
+            {
+                if over.is_null() {
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
+                }
+                return self.ordinary_get_value(context, over, receiver, key, hops + 1);
+            }
+            let lookup = match own_lookup {
+                Some(lookup) => lookup,
+                None => match key {
+                    VmPropertyKey::Symbol(sym) => self
+                        .function_kind_prototype_for(context, function_id)
+                        .and_then(
+                            |proto| match object::lookup_symbol(proto, &self.gc_heap, *sym) {
+                                object::PropertyLookup::Absent => None,
+                                lookup => Some(lookup),
+                            },
+                        )
+                        .or_else(|| {
+                            self.function_prototype_object()
+                                .ok()
+                                .map(|proto| object::lookup_symbol(proto, &self.gc_heap, *sym))
+                        })
+                        .unwrap_or(object::PropertyLookup::Absent),
+                    _ => {
+                        let key_name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        self.function_kind_prototype_for(context, function_id)
                             .and_then(|proto| {
                                 match object::lookup(proto, &self.gc_heap, key_name) {
                                     object::PropertyLookup::Absent => None,
@@ -3771,9 +3810,9 @@ impl Interpreter {
                                     .ok()
                                     .map(|proto| object::lookup(proto, &self.gc_heap, key_name))
                             })
-                            .unwrap_or(object::PropertyLookup::Absent),
+                            .unwrap_or(object::PropertyLookup::Absent)
                     }
-                }
+                },
             };
             let value = match lookup {
                 object::PropertyLookup::Data { value, .. } => value,

@@ -18,7 +18,7 @@
 
 use otter_bytecode::Op;
 
-use crate::executable::ExecutableFunction;
+use crate::executable::CodeBlock;
 use crate::{ExecutionContext, NumberValue, Value};
 
 #[derive(Clone, Debug)]
@@ -60,7 +60,7 @@ impl SimpleConstructorSource {
 
 pub(crate) fn match_simple_constructor_init(
     context: &ExecutionContext,
-    function: &ExecutableFunction,
+    function: &CodeBlock,
 ) -> Option<SimpleConstructorInit> {
     if function.is_derived_constructor
         || function.is_method

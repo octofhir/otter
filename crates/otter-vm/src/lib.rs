@@ -180,7 +180,7 @@ use arithmetic_dispatch::{
 pub(crate) use error_ops::{
     native_to_vm_error, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
 };
-use executable::ExecutableFunction;
+pub use executable::{CodeBlock, CodeBlockInstruction};
 use operand_decode::{apply_branch, const_operand, register_operand};
 
 pub use array::JsArray;
@@ -196,8 +196,8 @@ pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
     JitCollectionLayout, JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError,
-    JitCompileRequest, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFrameStack,
-    JitFunctionCode, JitFunctionView, JitInlineCallee, JitInlineMethod, JitInstrView,
+    JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
+    JitFrameStack, JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
     JitPrimitiveMethodGuard, JitReentryPtrs, JitStringLayout, JitTypedArrayLayout,
 };
 pub use js_surface::{
@@ -984,7 +984,7 @@ pub struct Interpreter {
     /// type speculation, keyed `(function_id, byte_pc)`. Recorded by the
     /// interpreter arithmetic / relational arms during the warmup runs that
     /// precede tier-up, and baked into the compile snapshot
-    /// (`JitInstrView::arith_feedback`) so the optimizing tier can choose an
+    /// (`JitInstructionMetadata::arith_feedback`) so the compiler can choose an
     /// unboxed `Int32` / `Float64` lowering and insert the matching guard. Only
     /// mutated when a JIT hook is installed.
     jit_arith_feedback: rustc_hash::FxHashMap<(u32, u32), jit_feedback::ArithFeedback>,
@@ -993,7 +993,7 @@ pub struct Interpreter {
     /// `Float64Array` / `Int32Array` records that kind; any other receiver
     /// (dense array, mixed typed-array kinds, object) demotes it to
     /// [`jit::JitElementLoadKind::Any`]. Baked into
-    /// `JitInstrView::element_load_kind` so the optimizing tier can lower the
+    /// `JitInstructionMetadata::element_load_kind` so the compiler can lower the
     /// site to a kind-guarded native-representation load (no box/unbox).
     jit_element_load_kind: rustc_hash::FxHashMap<(u32, u32), jit::JitElementLoadKind>,
     /// Arithmetic bytecode sites that already overflow-deoptimized once and

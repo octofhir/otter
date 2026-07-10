@@ -562,7 +562,7 @@ impl Interpreter {
 
     pub(crate) fn this_for_bytecode_call_runtime_rooted(
         &mut self,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
@@ -582,7 +582,7 @@ impl Interpreter {
 
     pub(crate) fn this_for_bytecode_call_stack_rooted(
         &mut self,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         stack: &HoltStack,
         this_value: Value,
         slice_roots: &[&[Value]],

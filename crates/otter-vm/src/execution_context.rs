@@ -34,7 +34,7 @@ use otter_bytecode::{BytecodeModule, Constant, Function, ModuleInit, Operand};
 use std::sync::Arc;
 
 use crate::code_space::{ChunkTables, CodeSpace, ResolvedCtx};
-use crate::executable::{ExecInstr, ExecutableFunction, ExecutableModule};
+use crate::executable::{CodeBlock, CodeBlockInstruction, ExecutableModule};
 use crate::property_atom::{AtomTable, AtomizedPropertyKey};
 
 /// Cloneable dispatch context for VM-owned JS jobs.
@@ -185,7 +185,7 @@ impl ExecutionContext {
 
     /// Entry executable function for a script/module turn.
     #[must_use]
-    pub(crate) fn exec_main(&self) -> &ExecutableFunction {
+    pub(crate) fn exec_main(&self) -> &CodeBlock {
         self.executable
             .function(0)
             .expect("bytecode modules always carry main function 0")
@@ -226,7 +226,7 @@ impl ExecutionContext {
     /// before decoding constant-pool operands — only the function
     /// body itself is chunk-portable.
     #[must_use]
-    pub(crate) fn exec_function(&self, function_id: u32) -> Option<&ExecutableFunction> {
+    pub(crate) fn exec_function(&self, function_id: u32) -> Option<&CodeBlock> {
         if let Some(local) = self.local_function_index(function_id) {
             return self.executable.function(local);
         }
@@ -236,16 +236,24 @@ impl ExecutionContext {
             .function(function_id - tables.function_base)
     }
 
+    fn code_block_arc(&self, function_id: u32) -> Option<std::sync::Arc<CodeBlock>> {
+        if let Some(local) = self.local_function_index(function_id) {
+            return self.executable.function_arc(local);
+        }
+        let tables = self.sibling_tables(function_id)?;
+        tables
+            .executable
+            .function_arc(function_id - tables.function_base)
+    }
+
     /// Build an owned JIT compile-input snapshot for a global VM function id.
     ///
     /// The returned DTO carries rewritten byte-PC branch deltas and dense
     /// property-IC site ids, matching the interpreter's executable view without
-    /// exposing private [`ExecutableFunction`] / `ExecInstr` layout.
+    /// exposing mutable VM execution state.
     #[must_use]
-    pub fn jit_function_view(&self, function_id: u32) -> Option<crate::jit::JitFunctionView> {
-        let mut view = self
-            .exec_function(function_id)
-            .map(ExecutableFunction::jit_view)?;
+    pub fn jit_compile_snapshot(&self, function_id: u32) -> Option<crate::jit::JitCompileSnapshot> {
+        let mut view = self.code_block_arc(function_id)?.jit_compile_snapshot();
         // Mark each self-binding maker whose constant resolves to the function
         // being compiled: it materializes the named-function SELF binding, which
         // the emitter can read straight from the frame's own closure instead of
@@ -289,7 +297,7 @@ impl ExecutionContext {
 
     /// Return an executable instruction's operands in declaration order.
     #[must_use]
-    pub(crate) fn exec_operands<'a>(&'a self, instr: &'a ExecInstr) -> &'a [Operand] {
+    pub(crate) fn exec_operands<'a>(&'a self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
         self.executable.operands(instr)
     }
 
@@ -297,7 +305,7 @@ impl ExecutionContext {
     #[must_use]
     pub(crate) fn exec_operand<'a>(
         &'a self,
-        instr: &'a ExecInstr,
+        instr: &'a CodeBlockInstruction,
         index: usize,
     ) -> Option<&'a Operand> {
         self.executable.operand(instr, index)
@@ -305,13 +313,13 @@ impl ExecutionContext {
 
     /// Decode one executable register operand.
     #[must_use]
-    pub(crate) fn exec_register(&self, instr: &ExecInstr, index: usize) -> Option<u16> {
+    pub(crate) fn exec_register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
         self.executable.register(instr, index)
     }
 
     /// Decode the common `dst, lhs, rhs` register triple.
     #[must_use]
-    pub(crate) fn exec_register3(&self, instr: &ExecInstr) -> Option<(u16, u16, u16)> {
+    pub(crate) fn exec_register3(&self, instr: &CodeBlockInstruction) -> Option<(u16, u16, u16)> {
         Some((
             self.exec_register(instr, 0)?,
             self.exec_register(instr, 1)?,
@@ -321,13 +329,17 @@ impl ExecutionContext {
 
     /// Decode one executable constant-pool index operand.
     #[must_use]
-    pub(crate) fn exec_const_index(&self, instr: &ExecInstr, index: usize) -> Option<u32> {
+    pub(crate) fn exec_const_index(
+        &self,
+        instr: &CodeBlockInstruction,
+        index: usize,
+    ) -> Option<u32> {
         self.executable.const_index(instr, index)
     }
 
     /// Decode one executable signed immediate operand.
     #[must_use]
-    pub(crate) fn exec_imm32(&self, instr: &ExecInstr, index: usize) -> Option<i32> {
+    pub(crate) fn exec_imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
         self.executable.imm32(instr, index)
     }
 
@@ -340,11 +352,11 @@ impl ExecutionContext {
     }
 
     /// Dense property IC site for a named property instruction at the
-    /// given byte-offset PC.
+    /// given canonical instruction-index PC.
     #[must_use]
     pub(crate) fn property_ic_site(&self, function_id: u32, pc: u32) -> Option<usize> {
         self.exec_function(function_id)?
-            .instr_at_byte_pc(pc)?
+            .instr_at_index(pc as usize)?
             .property_ic_site()
     }
 
@@ -607,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_view_marks_array_length_loads() {
+    fn jit_snapshot_marks_array_length_loads() {
         let context = ExecutionContext::from_module(module_with(
             vec![
                 instr(
@@ -633,14 +645,14 @@ mod tests {
             3,
         ));
 
-        let view = context.jit_function_view(0).expect("function exists");
+        let view = context.jit_compile_snapshot(0).expect("function exists");
 
         assert!(view.instructions[0].load_array_length);
         assert!(!view.instructions[1].load_array_length);
     }
 
     #[test]
-    fn jit_view_marks_primitive_method_hints() {
+    fn jit_snapshot_marks_primitive_method_hints() {
         let context = ExecutionContext::from_module(module_with(
             vec![
                 instr(
@@ -673,7 +685,7 @@ mod tests {
             4,
         ));
 
-        let view = context.jit_function_view(0).expect("function exists");
+        let view = context.jit_compile_snapshot(0).expect("function exists");
 
         assert_eq!(
             view.instructions[0].method_hint,

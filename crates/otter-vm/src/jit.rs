@@ -8,8 +8,8 @@
 //! `otter-vm` back to `otter-jit`.
 //!
 //! # Contents
-//! - [`JitFunctionView`] and [`JitInstrView`] — owned snapshots of the frozen
-//!   executable bytecode stream.
+//! - [`JitCompileSnapshot`] and [`JitInstructionMetadata`] — immutable
+//!   CodeBlock plus per-tier feedback/layout metadata.
 //! - [`JitCompilerHook`] — runtime-installed compile hook implemented outside
 //!   `otter-vm`.
 //! - [`JitFunctionCode`] and [`JitCompileStatus`] — type-erased compiled-code
@@ -17,7 +17,7 @@
 //!
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
-//!   into `ExecutionContext`, `ExecutableFunction`, or interpreter frames.
+//!   into `ExecutionContext`, `CodeBlock`, or interpreter frames.
 //! - No unsafe is required here. Native entry pointers, executable mappings, and
 //!   call ABI details remain encapsulated by the JIT implementation crate.
 //! - Baseline v1 uses the interpreter frame register array as its precise root
@@ -33,13 +33,16 @@ use std::sync::Arc;
 
 use otter_bytecode::{Op, Operand};
 
-use crate::native_abi::{SafepointId, SafepointRecord};
+use crate::{
+    CodeBlockInstruction,
+    native_abi::{SafepointId, SafepointRecord},
+};
 
 /// Owned compile request for one bytecode function.
 #[derive(Debug, Clone)]
 pub struct JitCompileRequest {
-    /// Function snapshot to compile.
-    pub function: JitFunctionView,
+    /// Code and feedback snapshot to compile.
+    pub snapshot: JitCompileSnapshot,
     /// Loop-header byte-PC for an OSR-target compile. `None` means normal
     /// function-entry compilation.
     pub osr_pc: Option<u32>,
@@ -47,7 +50,7 @@ pub struct JitCompileRequest {
 
 /// Owned snapshot of one executable function body.
 #[derive(Debug, Clone)]
-pub struct JitFunctionView {
+pub struct JitCompileSnapshot {
     /// Global VM function id.
     pub function_id: u32,
     /// Number of parameter registers at the start of the frame.
@@ -142,11 +145,11 @@ pub struct JitFunctionView {
     /// machine-readable static builtin identity.
     pub native_static_fn_byte: u32,
     /// Instruction stream in byte-PC order.
-    pub instructions: Vec<JitInstrView>,
+    pub instructions: Vec<JitInstructionMetadata>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
     /// caller's `Op::Call` byte-PC. Populated only for sites the interpreter
     /// observed resolving to a single plain synchronous bytecode callee; baked
-    /// by `Interpreter::bake_inline_callees`. Empty in the raw `jit_view()`
+    /// by `Interpreter::bake_inline_callees`. Empty in the raw compile snapshot
     /// snapshot. The emitter applies the final pure-leaf / size / arity test and
     /// either splices the body under an identity guard or — for a site absent
     /// here, or one whose candidate fails the test — emits the normal
@@ -370,7 +373,7 @@ pub struct JitInlineCallee {
     /// of this many slots.
     pub register_count: u16,
     /// Callee instruction stream in byte-PC order, emitted inline.
-    pub instructions: Vec<JitInstrView>,
+    pub instructions: Vec<JitInstructionMetadata>,
 }
 
 /// A method the baseline may splice into a caller's `Op::CallMethodValue` site.
@@ -406,7 +409,7 @@ pub struct JitInlineMethod {
     /// many slots plus one for `this`.
     pub register_count: u16,
     /// Method instruction stream, emitted inline.
-    pub instructions: Vec<JitInstrView>,
+    pub instructions: Vec<JitInstructionMetadata>,
     /// Body `LoadProperty`/`StoreProperty` byte-PC → value slab byte offset. A
     /// receiver-shape property is baked from the identity-guarded receiver shape;
     /// a non-receiver property is baked from its own monomorphic site feedback,
@@ -570,18 +573,9 @@ pub struct JitGcBarrierLayout {
 
 /// Owned snapshot of one executable instruction.
 #[derive(Debug, Clone)]
-pub struct JitInstrView {
-    /// Opcode.
-    pub op: Op,
-    /// Byte-offset PC in the encoded function stream.
-    pub byte_pc: u32,
-    /// Encoded instruction length in bytes.
-    pub byte_len: u32,
-    /// Dense property-IC site id for named property ops.
-    pub property_ic_site: Option<usize>,
-    /// Operands in declaration order. Branch immediates are already rewritten
-    /// to byte-offset deltas in VM dispatch coordinates.
-    pub operands: Vec<Operand>,
+pub struct JitInstructionMetadata {
+    /// Shared instruction owned by [`JitCompileSnapshot::code_block`].
+    pub instruction: Arc<CodeBlockInstruction>,
     /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
     /// being compiled (the named-function SELF binding). The emitter
     /// materializes it as a direct read of the frame's own closure (carried in
@@ -604,7 +598,7 @@ pub struct JitInstrView {
     /// and for sites the interpreter never observed; the optimizing tier reads
     /// it to choose an unboxed `Int32` / `Float64` lowering and emit the
     /// matching speculation guard. Populated by
-    /// `Interpreter::bake_arith_feedback` at tier-up; the raw `jit_view()`
+    /// `Interpreter::bake_arith_feedback` at tier-up; the raw compile snapshot
     /// snapshot leaves it `0`.
     pub arith_feedback: u8,
     /// Monomorphic own-data property feedback for a `LoadProperty` /
@@ -662,6 +656,53 @@ pub struct JitInstrView {
     /// `global_lexicals`, so the baked offset stays valid for the code's life.
     /// Baked by `Interpreter::bake_global_lex_cells`.
     pub global_lex_cell: Option<u32>,
+}
+
+impl JitInstructionMetadata {
+    /// Build a feedback-free metadata record around one verified instruction.
+    ///
+    /// Production snapshots reuse the exact instruction `Arc` owned by the
+    /// interpreter's `CodeBlock`; this constructor exists for backend unit
+    /// tests that exercise lowering without constructing a whole VM isolate.
+    #[must_use]
+    pub fn without_feedback(
+        op: Op,
+        instruction_pc: u32,
+        byte_pc: u32,
+        byte_len: u32,
+        operands: Vec<Operand>,
+    ) -> Self {
+        let byte_len = u16::try_from(byte_len).expect("instruction byte length exceeds u16");
+        Self {
+            instruction: Arc::new(CodeBlockInstruction::from_operands(
+                op,
+                operands,
+                instruction_pc,
+                crate::executable::NO_PROPERTY_IC_SITE,
+                byte_pc,
+                byte_len,
+            )),
+            make_self: false,
+            load_array_length: false,
+            method_hint: JitMethodHint::None,
+            load_number: None,
+            arith_feedback: 0,
+            property_feedback: None,
+            property_feedback_poly: Vec::new(),
+            property_proto_feedback: None,
+            object_literal: None,
+            element_load_kind: JitElementLoadKind::Any,
+            global_lex_cell: None,
+        }
+    }
+}
+
+impl std::ops::Deref for JitInstructionMetadata {
+    type Target = CodeBlockInstruction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instruction
+    }
 }
 
 /// Native representation an observed `LoadElement` site can produce unboxed.

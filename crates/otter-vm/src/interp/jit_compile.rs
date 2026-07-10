@@ -67,7 +67,7 @@ impl Interpreter {
         fid: u32,
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        let mut view = context.jit_function_view(fid)?;
+        let mut view = context.jit_compile_snapshot(fid)?;
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         self.bake_arith_feedback(&mut view, fid);
@@ -105,7 +105,7 @@ impl Interpreter {
         let (regs, params) = (view.register_count, view.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
         let status = hook.compile_function(jit::JitCompileRequest {
-            function: view,
+            snapshot: view,
             osr_pc,
         });
         if trace {
@@ -122,7 +122,7 @@ impl Interpreter {
     /// inline `LoadElement`/`StoreElement` (the offsets are isolate-independent
     /// `#[repr(C)]` constants, but inline access still needs the cage base to
     /// decompress receiver / buffer pointers).
-    pub(crate) fn bake_typed_array_layout(view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_typed_array_layout(view: &mut jit::JitCompileSnapshot) {
         use crate::binary::array_buffer as ab;
         use crate::binary::typed_array as ta;
         let header = otter_gc::header::HEADER_SIZE as u32;
@@ -154,7 +154,7 @@ impl Interpreter {
     /// paths. String bodies are GC cells addressed through the same cage base as
     /// object/array bodies, so this only enables when the compile snapshot has a
     /// cage base.
-    pub(crate) fn bake_string_layout(view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_string_layout(view: &mut jit::JitCompileSnapshot) {
         let header = otter_gc::header::HEADER_SIZE as u32;
         view.string_layout = jit::JitStringLayout {
             string_type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
@@ -212,7 +212,7 @@ impl Interpreter {
     /// `LoadElement` sites into the compile snapshot, keyed by byte-PC. Sites the
     /// interpreter never observed (or observed with mixed receivers) stay
     /// [`jit::JitElementLoadKind::Any`], which lowers as the generic boxed load.
-    pub(crate) fn bake_element_load_kind(&self, view: &mut jit::JitFunctionView, fid: u32) {
+    pub(crate) fn bake_element_load_kind(&self, view: &mut jit::JitCompileSnapshot, fid: u32) {
         if self.jit_element_load_kind.is_empty() {
             return;
         }
@@ -230,7 +230,7 @@ impl Interpreter {
     /// numeric-specialized sites into the compile snapshot, keyed by each
     /// instruction's byte-PC. Sites the interpreter never observed stay `0`
     /// (unknown), which the optimizing tier lowers generically.
-    pub(crate) fn bake_arith_feedback(&self, view: &mut jit::JitFunctionView, fid: u32) {
+    pub(crate) fn bake_arith_feedback(&self, view: &mut jit::JitCompileSnapshot, fid: u32) {
         if self.jit_arith_feedback.is_empty() && self.jit_arith_widen_float.is_empty() {
             return;
         }
@@ -248,7 +248,7 @@ impl Interpreter {
     /// prototype data load bakes as receiver/prototype shape guards plus the
     /// prototype slot. Megamorphic, accessor, dictionary, mixed, and deeper
     /// prototype sites stay empty and lower through the property bridge.
-    pub(crate) fn bake_property_feedback(&self, view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_property_feedback(&self, view: &mut jit::JitCompileSnapshot) {
         // Byte size of one compressed slot — a `hit.slot` index scales by this to
         // the value's byte offset inside the object's value slab.
         const SLOT_BYTES: u32 =
@@ -351,7 +351,7 @@ impl Interpreter {
     /// at compile time are left `None`, keeping the bridge for those sites.
     pub(crate) fn bake_global_lex_cells(
         &self,
-        view: &mut jit::JitFunctionView,
+        view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
     ) {
         use otter_bytecode::{Op, Operand};
@@ -419,20 +419,20 @@ impl Interpreter {
     /// budget). Anything else is left unplanned and lowers on the baseline.
     pub(crate) fn bake_object_literals(
         &mut self,
-        view: &mut jit::JitFunctionView,
+        view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
     ) {
         use otter_bytecode::{Op, Operand};
         const MAX_PROPS: usize = 4;
-        let reg_op = |instr: &jit::JitInstrView, i: usize| match instr.operands.get(i) {
+        let reg_op = |instr: &jit::JitInstructionMetadata, i: usize| match instr.operands.get(i) {
             Some(Operand::Register(r)) => Some(*r),
             _ => None,
         };
-        let const_op = |instr: &jit::JitInstrView, i: usize| match instr.operands.get(i) {
+        let const_op = |instr: &jit::JitInstructionMetadata, i: usize| match instr.operands.get(i) {
             Some(Operand::ConstIndex(n)) => Some(*n),
             _ => None,
         };
-        let uses_reg = |instr: &jit::JitInstrView, reg: u16| {
+        let uses_reg = |instr: &jit::JitInstructionMetadata, reg: u16| {
             instr
                 .operands
                 .iter()
@@ -802,7 +802,7 @@ impl Interpreter {
     /// sites are left out and emit the normal bridge.
     pub(crate) fn bake_inline_callees(
         &mut self,
-        view: &mut jit::JitFunctionView,
+        view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
     ) {
@@ -848,7 +848,7 @@ impl Interpreter {
                 }
                 continue;
             }
-            let Some(callee_view) = context.jit_function_view(callee_fid) else {
+            let Some(callee_view) = context.jit_compile_snapshot(callee_fid) else {
                 if trace {
                     eprintln!(
                         "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: missing view {callee_fid}"
@@ -980,7 +980,7 @@ impl Interpreter {
         {
             return None;
         }
-        let mut method_view = context.jit_function_view(target.method_fid)?;
+        let mut method_view = context.jit_compile_snapshot(target.method_fid)?;
         // Populate each body op's site feedback so the inliner can lower it: the
         // property `(shape, slot)` for a non-receiver access, and the arithmetic /
         // element-load kind so a body `|`/`&`/`x[i]` lowers to a typed node
@@ -1090,7 +1090,7 @@ impl Interpreter {
     /// Bake dense-array `push` / `pop` method-call guard metadata so the
     /// baseline can splice an inline fast path for the site. The runtime method
     /// bridge re-validates the receiver/prototype/builtin on every miss.
-    pub(crate) fn bake_array_methods(&self, view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_array_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
             if instr.op != Op::CallMethodValue {
                 continue;
@@ -1104,7 +1104,7 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn bake_primitive_method_guards(&self, view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_primitive_method_guards(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
             if instr.op != Op::CallMethodValue {
                 continue;
@@ -1116,7 +1116,7 @@ impl Interpreter {
         }
     }
 
-    pub(crate) fn bake_collection_leaf_methods(&self, view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_collection_leaf_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
             if instr.op != Op::CallMethodValue {
                 continue;
@@ -1136,7 +1136,7 @@ impl Interpreter {
     /// This only publishes guard metadata and the target `AllocStub` descriptor
     /// id. Baseline codegen must continue using the rooted fallback until it can
     /// attach exact safepoint maps to the machine call site.
-    pub(crate) fn bake_collection_alloc_methods(&self, view: &mut jit::JitFunctionView) {
+    pub(crate) fn bake_collection_alloc_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
             if instr.op != Op::CallMethodValue {
                 continue;

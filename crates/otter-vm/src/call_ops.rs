@@ -27,11 +27,11 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    AsyncFrameState, ExecutableFunction, ExecutionContext, Frame, Interpreter, JsObject,
-    NativeCallInfo, NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey,
-    abstract_ops, argument_window::BytecodeArgumentWindow, frame_state::UpvalueSpine,
-    is_constructor_runtime, native_to_vm_error, operand_decode::register_operand, promise_dispatch,
-    read_register, write_register,
+    AsyncFrameState, CodeBlock, ExecutionContext, Frame, Interpreter, JsObject, NativeCallInfo,
+    NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    argument_window::BytecodeArgumentWindow, frame_state::UpvalueSpine, is_constructor_runtime,
+    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
+    write_register,
 };
 
 struct SyncNativeCallRoots<'a> {
@@ -249,7 +249,7 @@ impl Interpreter {
     /// re-expose the captured record for the dynamic walkers.
     pub(crate) fn stash_frame_eval_env(
         &mut self,
-        function: &crate::executable::ExecutableFunction,
+        function: &crate::executable::CodeBlock,
         frame: &mut Frame,
         inherited: Option<crate::eval_env::EvalEnvHandle>,
     ) -> Result<(), VmError> {
@@ -265,7 +265,7 @@ impl Interpreter {
 
     pub(crate) fn bind_bytecode_call_arguments(
         &mut self,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         frame: &mut Frame,
         args: SmallVec<[Value; 8]>,
     ) -> Result<(), VmError> {
@@ -301,7 +301,7 @@ impl Interpreter {
     }
 
     fn bind_lean_bytecode_call_arguments(
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         frame: &mut Frame,
         args: &[Value],
     ) -> Result<(), VmError> {
@@ -1432,7 +1432,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         function_id: u32,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
     ) -> Option<crate::constructor_fast_path::SimpleConstructorInit> {
         if let Some(cached) = self.simple_constructor_init_cache.get(&function_id) {
             return cached.clone();
@@ -2605,7 +2605,11 @@ impl Interpreter {
             crate::jit::JitExecOutcome::Bailed(pc) => {
                 // Finish the partially-run frame in the interpreter, which pops
                 // it on return; the next element rebuilds a fresh recycled frame.
-                state.stack[top_idx].pc = pc;
+                state.stack[top_idx].pc = Self::instruction_pc_for_byte_pc(
+                    context,
+                    state.stack[top_idx].function_id,
+                    pc,
+                )?;
                 self.dispatch_loop(context, &mut state.stack)
             }
             crate::jit::JitExecOutcome::Threw(err) => Err(err),

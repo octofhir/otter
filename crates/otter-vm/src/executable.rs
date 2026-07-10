@@ -7,23 +7,22 @@
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
-//! - [`ExecutableFunction`] — one function body: instruction stream,
+//! - [`CodeBlock`] — one immutable verified function body: instruction stream,
 //!   byte-stream length, byte-offset source-map spans.
-//! - [`ExecInstr`] — single instruction record: opcode, owned operands,
+//! - [`CodeBlockInstruction`] — immutable instruction record: opcode, operands,
 //!   byte length, byte-offset PC, optional IC site id.
 //!
 //! # Invariants
-//! - `frame.pc` is a byte offset into the function's encoded stream.
-//! - Each `ExecInstr` carries its own `byte_pc` and `byte_len` so the
-//!   dispatch loop advances by `byte_len` and resolves jump targets in the
-//!   same coordinate system as the source-map spans.
-//! - `ExecutableFunction::byte_to_instr` is a dense byte-offset → `code`
-//!   index map, so PC resolution is `O(1)`, not a binary search.
+//! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
+//! - Each `CodeBlockInstruction` retains `byte_pc` and `byte_len` only for serialized
+//!   metadata, source maps, profiling, and native bailout/OSR records.
+//! - `CodeBlock::byte_to_instr` converts those cold byte-PC records back to
+//!   instruction indexes; interpreter dispatch never consults it.
 //! - Operands live in a per-instruction `Box<[Operand]>`; there is no
 //!   shared side table. Variadic opcodes just hold a longer slice.
-//! - Branch-class `Imm32` operands hold byte-offset deltas relative to
-//!   `(byte_pc + 1)`. `NO_HANDLER_OFFSET` is preserved verbatim for absent
-//!   try-handler slots.
+//! - Branch-class `Imm32` operands hold instruction-index deltas relative to
+//!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
+//!   try-handler slots by the serialized verifier.
 //! - Named property IC sites receive dense VM-local ids during build; the
 //!   bytecode JSON dump stays unchanged.
 //!
@@ -32,14 +31,14 @@
 //! - [`otter_bytecode::Instruction`]
 
 use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, NO_HANDLER_OFFSET, Op,
-    Operand, SpanEntry,
-    encoding::{EncodedFunction, encode_function, translate_spans_to_byte_pcs},
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand, SpanEntry,
+    encoding::{EncodedFunction, decode_function, encode_function, translate_spans_to_byte_pcs},
 };
+use std::sync::Arc;
 
-const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
+pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
-/// Sentinel in [`ExecutableFunction::byte_to_instr`] for byte offsets
+/// Sentinel in [`CodeBlock::byte_to_instr`] for byte offsets
 /// that are not an instruction boundary (interior bytes / past-end).
 const NO_INSTR_AT_BYTE: u32 = u32::MAX;
 
@@ -50,7 +49,7 @@ const NO_INSTR_AT_BYTE: u32 = u32::MAX;
 /// [`ExecutableModule`] produced by [`Self::freeze`].
 #[derive(Debug, Default)]
 pub(crate) struct ExecutableModuleBuilder {
-    functions: Vec<ExecutableFunction>,
+    functions: Vec<Arc<CodeBlock>>,
     next_property_ic_site: u32,
 }
 
@@ -81,7 +80,10 @@ impl ExecutableModuleBuilder {
     }
 
     fn push_function(&mut self, function: &Function) {
-        let function = ExecutableFunction::from_bytecode(function, &mut self.next_property_ic_site);
+        let function = Arc::new(CodeBlock::from_bytecode(
+            function,
+            &mut self.next_property_ic_site,
+        ));
         self.functions.push(function);
     }
 
@@ -98,7 +100,7 @@ impl ExecutableModuleBuilder {
 /// VM-owned executable view of a bytecode module.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableModule {
-    functions: Box<[ExecutableFunction]>,
+    functions: Box<[Arc<CodeBlock>]>,
     property_ic_site_end: u32,
 }
 
@@ -122,38 +124,48 @@ impl ExecutableModule {
 
     /// Function-table lookup by chunk-local function index.
     #[must_use]
-    pub(crate) fn function(&self, local_index: u32) -> Option<&ExecutableFunction> {
-        self.functions.get(local_index as usize)
+    pub(crate) fn function(&self, local_index: u32) -> Option<&CodeBlock> {
+        self.functions.get(local_index as usize).map(Arc::as_ref)
+    }
+
+    /// Shared immutable CodeBlock handle for native compilation.
+    #[must_use]
+    pub(crate) fn function_arc(&self, local_index: u32) -> Option<Arc<CodeBlock>> {
+        self.functions.get(local_index as usize).cloned()
     }
 
     /// Return an instruction's operands in declaration order.
     #[must_use]
-    pub(crate) fn operands<'a>(&self, instr: &'a ExecInstr) -> &'a [Operand] {
+    pub(crate) fn operands<'a>(&self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
         instr.operands()
     }
 
     /// Return one instruction operand by index without materialising the
     /// whole operand slice at the call site.
     #[must_use]
-    pub(crate) fn operand<'a>(&self, instr: &'a ExecInstr, index: usize) -> Option<&'a Operand> {
+    pub(crate) fn operand<'a>(
+        &self,
+        instr: &'a CodeBlockInstruction,
+        index: usize,
+    ) -> Option<&'a Operand> {
         instr.operand(index)
     }
 
     /// Decode one register operand.
     #[must_use]
-    pub(crate) fn register(&self, instr: &ExecInstr, index: usize) -> Option<u16> {
+    pub(crate) fn register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
         instr.register(index)
     }
 
     /// Decode one constant-pool index operand.
     #[must_use]
-    pub(crate) fn const_index(&self, instr: &ExecInstr, index: usize) -> Option<u32> {
+    pub(crate) fn const_index(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u32> {
         instr.const_index(index)
     }
 
     /// Decode one signed immediate operand.
     #[must_use]
-    pub(crate) fn imm32(&self, instr: &ExecInstr, index: usize) -> Option<i32> {
+    pub(crate) fn imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
         instr.imm32(index)
     }
 
@@ -188,11 +200,11 @@ fn closure_upvalues_ptr_byte() -> u32 {
     (body_off + word) as u32
 }
 
-impl ExecutableFunction {
-    /// Build an owned JIT compile-input snapshot for this function.
+impl CodeBlock {
+    /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.
     #[must_use]
-    pub(crate) fn jit_view(&self) -> crate::jit::JitFunctionView {
-        crate::jit::JitFunctionView {
+    pub(crate) fn jit_compile_snapshot(self: &Arc<Self>) -> crate::jit::JitCompileSnapshot {
+        crate::jit::JitCompileSnapshot {
             function_id: self.id,
             param_count: self.param_count,
             register_count: self.register_count,
@@ -248,21 +260,17 @@ impl ExecutableFunction {
             instructions: self
                 .code
                 .iter()
-                .map(|instr| crate::jit::JitInstrView {
-                    op: instr.op(),
-                    byte_pc: instr.byte_pc,
-                    byte_len: instr.byte_len(),
-                    property_ic_site: instr.property_ic_site(),
-                    operands: instr.operands().to_vec(),
-                    // Resolved by `ExecutionContext::jit_function_view`, which
+                .map(|instr| crate::jit::JitInstructionMetadata {
+                    instruction: instr.clone(),
+                    // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can map a `MakeFunction` constant index to its target id.
                     make_self: false,
-                    // Resolved by `ExecutionContext::jit_function_view`, which
+                    // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can inspect constant strings without exposing them to the
                     // external JIT crate.
                     load_array_length: false,
                     method_hint: crate::jit::JitMethodHint::None,
-                    // Resolved by `ExecutionContext::jit_function_view`, which
+                    // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
                     // Baked by `Interpreter::bake_arith_feedback` from the live
@@ -315,12 +323,12 @@ impl ExecutableFunction {
     /// is out of range or does not fall on an instruction boundary (which
     /// only happens on corrupt bytecode).
     #[must_use]
-    pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&ExecInstr> {
+    pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&CodeBlockInstruction> {
         let idx = *self.byte_to_instr.get(byte_pc as usize)?;
         if idx == NO_INSTR_AT_BYTE {
             return None;
         }
-        self.code.get(idx as usize)
+        self.code.get(idx as usize).map(Arc::as_ref)
     }
 
     /// Resolve a byte-offset PC to its dense `code` index via the
@@ -340,24 +348,29 @@ impl ExecutableFunction {
 
     /// Fetch an instruction by its dense `code` index.
     #[must_use]
-    pub(crate) fn instr_at_index(&self, index: usize) -> Option<&ExecInstr> {
-        self.code.get(index)
+    pub(crate) fn instr_at_index(&self, index: usize) -> Option<&CodeBlockInstruction> {
+        self.code.get(index).map(Arc::as_ref)
     }
 }
 
-/// One executable function body.
+/// One immutable, schema-verified executable function body.
+///
+/// Construction encodes the compiler DTO and immediately decodes it through
+/// `otter-bytecode`'s authoritative verifier. The stored instruction stream is
+/// therefore the verifier result itself, not a second VM-side interpretation of
+/// branch operands or variadic layouts.
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutableFunction {
+pub struct CodeBlock {
     /// Global VM function id (chunk base + local table index).
-    pub(crate) id: u32,
+    pub id: u32,
     /// Number of parameter registers at the start of the frame.
-    pub(crate) param_count: u16,
+    pub param_count: u16,
     /// Total register window size: params + locals + scratch.
-    pub(crate) register_count: u16,
+    pub register_count: u16,
     /// Number of fresh upvalue cells owned by each frame.
     pub(crate) own_upvalue_count: u16,
     /// `true` when this function uses strict-mode call semantics.
-    pub(crate) is_strict: bool,
+    pub is_strict: bool,
     /// `true` when this function is an arrow function.
     pub(crate) is_arrow: bool,
     /// `true` when this function is a MethodDefinition body (class
@@ -367,11 +380,11 @@ pub(crate) struct ExecutableFunction {
     /// `true` when this function declares a rest parameter.
     pub(crate) has_rest: bool,
     /// `true` when this function is async.
-    pub(crate) is_async: bool,
+    pub is_async: bool,
     /// `true` when this function is a generator.
-    pub(crate) is_generator: bool,
+    pub is_generator: bool,
     /// `true` when this function is an async generator.
-    pub(crate) is_async_generator: bool,
+    pub is_async_generator: bool,
     /// `true` when this function is a derived-class constructor whose
     /// `this` is bound by `super(...)` (§10.2.2). Frame setup starts
     /// it in the TDZ.
@@ -409,15 +422,14 @@ pub(crate) struct ExecutableFunction {
     /// this function contains a direct eval call site (the binding
     /// table may still be empty).
     pub(crate) contains_direct_eval: bool,
-    /// Hot instruction stream. Indexed in source order; the dispatch
-    /// loop resolves a frame's byte-offset PC to an entry via
-    /// [`Self::instr_at_byte_pc`] (`O(1)` lookup through `byte_to_instr`).
-    pub(crate) code: Box<[ExecInstr]>,
-    /// Dense byte-offset → `code` index map (length `code_byte_len`).
+    /// Hot instruction stream indexed directly by the frame's canonical PC.
+    pub code: Box<[Arc<CodeBlockInstruction>]>,
+    /// Cold byte-offset → `code` index map (length `code_byte_len`).
     /// Instruction-boundary bytes hold the entry's index; interior bytes
     /// hold [`NO_INSTR_AT_BYTE`]. Turns PC resolution into a single array
     /// index instead of an `O(log N)` binary search over `code`. Costs
-    /// `4 × code_byte_len` bytes per function — paid once at build.
+    /// `4 × code_byte_len` bytes per function — paid once at build until native
+    /// bailout/source metadata switches to a compact boundary table.
     pub(crate) byte_to_instr: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
@@ -425,10 +437,10 @@ pub(crate) struct ExecutableFunction {
     /// Total length in bytes of this function's encoded stream. Acts as
     /// the upper bound for jump targets that fall off the end of the
     /// last instruction.
-    pub(crate) code_byte_len: u32,
+    pub code_byte_len: u32,
 }
 
-impl ExecutableFunction {
+impl CodeBlock {
     fn from_bytecode(function: &Function, next_property_ic_site: &mut u32) -> Self {
         let register_count = function
             .param_count
@@ -440,8 +452,19 @@ impl ExecutableFunction {
         } = encode_function(&function.code);
         let code_byte_len =
             u32::try_from(code_bytes.len()).expect("function byte stream exceeds u32 range");
-        let code = function
-            .code
+        let verified_code = decode_function(&code_bytes).unwrap_or_else(|error| {
+            let offset = decode_error_offset(&error);
+            let opcode = instr_to_byte_pc
+                .binary_search(&u32::try_from(offset).unwrap_or(u32::MAX))
+                .ok()
+                .and_then(|index| function.code.get(index))
+                .map(|instr| instr.op);
+            panic!(
+                "compiler emitted bytecode that violates the opcode schema: function={} id={} offset={} opcode={opcode:?}: {error}",
+                function.name, function.id, offset
+            )
+        });
+        let code = verified_code
             .iter()
             .enumerate()
             .map(|(idx, instr)| {
@@ -461,27 +484,21 @@ impl ExecutableFunction {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
-                let byte_pc = instr_to_byte_pc[idx];
-                let next_byte_pc = instr_to_byte_pc
+                let byte_pc = instr.pc;
+                let next_byte_pc = verified_code
                     .get(idx + 1)
-                    .copied()
-                    .unwrap_or(code_byte_len);
+                    .map_or(code_byte_len, |next| next.pc);
                 let byte_len = u16::try_from(next_byte_pc - byte_pc)
                     .expect("single instruction exceeds 65535-byte encoding");
-                // Compiler emits branch deltas in instruction-index units;
-                // the dispatcher resolves them as byte offsets relative to
-                // `(byte_pc + 1)` (the byte right after the opcode), so the
-                // executable builder rewrites each branch operand into the
-                // dispatcher's coordinate system here.
-                let operands = rewrite_branch_operands(
-                    instr.op,
-                    instr.operands.as_slice(),
-                    idx,
+                let source_instr = &function.code[idx];
+                Arc::new(CodeBlockInstruction::from_operands(
+                    source_instr.op,
+                    source_instr.operands.as_slice().to_vec(),
+                    idx as u32,
+                    property_ic_site,
                     byte_pc,
-                    &instr_to_byte_pc,
-                    code_byte_len,
-                );
-                ExecInstr::from_operands(instr.op, operands, property_ic_site, byte_pc, byte_len)
+                    byte_len,
+                ))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -582,45 +599,17 @@ impl ExecutableFunction {
     }
 }
 
-/// Translate branch-class `Imm32` operands from compiler-emitted
-/// instruction-index deltas into byte-offset deltas relative to
-/// `(jump_byte_pc + 1)`. Non-branch opcodes pass through.
-fn rewrite_branch_operands(
-    op: Op,
-    operands: &[Operand],
-    jump_idx: usize,
-    jump_byte_pc: u32,
-    instr_to_byte_pc: &[u32],
-    code_byte_len: u32,
-) -> Vec<Operand> {
-    let branch_slots: &[usize] = match op {
-        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
-        // `JumpViaFinally` operand 0 is the branch delta; operand 1 is
-        // the handler-stack floor (not a branch target).
-        Op::JumpViaFinally => &[0],
-        Op::EnterTry => &[0, 1],
-        _ => return operands.to_vec(),
-    };
-    let mut out = operands.to_vec();
-    for &slot in branch_slots {
-        let Some(Operand::Imm32(raw)) = out.get(slot).copied() else {
-            continue;
-        };
-        if raw == NO_HANDLER_OFFSET {
-            continue;
-        }
-        let target_idx = jump_idx as i64 + 1 + raw as i64;
-        let target_byte_pc = if target_idx as usize >= instr_to_byte_pc.len() {
-            code_byte_len
-        } else {
-            instr_to_byte_pc[target_idx as usize]
-        };
-        let byte_delta = i64::from(target_byte_pc) - (i64::from(jump_byte_pc) + 1);
-        let byte_delta_i32 =
-            i32::try_from(byte_delta).expect("branch byte-offset delta exceeds i32 range");
-        out[slot] = Operand::Imm32(byte_delta_i32);
+fn decode_error_offset(error: &otter_bytecode::encoding::DecodeError) -> usize {
+    use otter_bytecode::encoding::DecodeError;
+
+    match error {
+        DecodeError::UnexpectedEnd { offset }
+        | DecodeError::UnknownOpcode { offset, .. }
+        | DecodeError::UnknownOperandKind { offset, .. }
+        | DecodeError::InvalidOperandShape { offset, .. }
+        | DecodeError::InvalidControlFlowTarget { offset, .. }
+        | DecodeError::InvalidControlFlowOperand { offset, .. } => *offset,
     }
-    out
 }
 
 /// One direct-eval caller binding: name → own-upvalue cell index.
@@ -657,38 +646,55 @@ pub(crate) struct ExecMappedArgumentBinding {
 /// touches the instruction record and the per-instruction operand
 /// allocation; there is no module-level side table to chase through.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExecInstr {
+#[non_exhaustive]
+pub struct CodeBlockInstruction {
     /// Opcode.
-    op: Op,
+    pub op: Op,
+    /// Canonical dense instruction index used by interpreter and JIT CFG.
+    pub instruction_pc: u32,
     /// Byte length of this instruction in the encoded stream
     /// (`opcode` + `operand_count` header + tagged operand bytes).
     /// `u16` to cover pathological inputs (constant-pool indices that
     /// occupy multiple varint bytes per operand combined with
     /// variadic opcodes) — a single instruction can encode up to
     /// ~640 bytes for `NewArray` over thousands of literals.
-    byte_len: u16,
+    pub byte_len: u32,
     /// Dense module-local property IC site id for named property ops.
-    property_ic_site: u32,
+    pub property_ic_site: Option<usize>,
     /// Byte-offset PC of this instruction in the encoded stream.
-    byte_pc: u32,
+    pub byte_pc: u32,
     /// Operands in declaration order. Variadic opcodes (e.g. `Call`,
     /// `NewArray`, `MakeClosure`) just lengthen the slice; there is no
     /// fixed-width inline fast path.
-    operands: Box<[Operand]>,
+    pub operands: Box<[Operand]>,
 }
 
-impl ExecInstr {
-    fn from_operands(
+impl CodeBlockInstruction {
+    /// Byte offset in the serialized stream, retained for source maps,
+    /// profiler/JIT metadata, and native bailout records. Interpreter frames
+    /// use the dense instruction index instead.
+    #[must_use]
+    pub const fn byte_pc(&self) -> u32 {
+        self.byte_pc
+    }
+
+    pub(crate) fn from_operands(
         op: Op,
         operands: Vec<Operand>,
+        instruction_pc: u32,
         property_ic_site: u32,
         byte_pc: u32,
         byte_len: u16,
     ) -> Self {
         Self {
             op,
-            byte_len,
-            property_ic_site,
+            instruction_pc,
+            byte_len: byte_len as u32,
+            property_ic_site: if property_ic_site == NO_PROPERTY_IC_SITE {
+                None
+            } else {
+                Some(property_ic_site as usize)
+            },
             byte_pc,
             operands: operands.into_boxed_slice(),
         }
@@ -696,27 +702,25 @@ impl ExecInstr {
 
     /// Opcode.
     #[must_use]
-    pub(crate) const fn op(&self) -> Op {
+    pub const fn op(&self) -> Op {
         self.op
     }
 
     /// Byte length of this instruction in the encoded stream.
     #[must_use]
-    pub(crate) const fn byte_len(&self) -> u32 {
-        self.byte_len as u32
+    pub const fn byte_len(&self) -> u32 {
+        self.byte_len
     }
 
     /// Dense property IC site index for named property opcodes.
     #[must_use]
-    pub(crate) const fn property_ic_site(&self) -> Option<usize> {
-        if self.property_ic_site == NO_PROPERTY_IC_SITE {
-            None
-        } else {
-            Some(self.property_ic_site as usize)
-        }
+    pub const fn property_ic_site(&self) -> Option<usize> {
+        self.property_ic_site
     }
 
-    fn operands(&self) -> &[Operand] {
+    /// Operands in schema declaration order.
+    #[must_use]
+    pub fn operands(&self) -> &[Operand] {
         &self.operands
     }
 
@@ -809,7 +813,7 @@ mod tests {
         let operands = vec![
             Operand::Register(0),
             Operand::Register(1),
-            Operand::ConstIndex(4),
+            Operand::ConstIndex(2),
             Operand::Register(2),
             Operand::Register(3),
         ];
@@ -826,7 +830,7 @@ mod tests {
         assert_eq!(instr.op(), Op::Call);
         assert_eq!(executable.register(instr, 0), Some(0));
         assert_eq!(executable.register(instr, 1), Some(1));
-        assert_eq!(executable.const_index(instr, 2), Some(4));
+        assert_eq!(executable.const_index(instr, 2), Some(2));
         assert_eq!(executable.register(instr, 3), Some(2));
         assert_eq!(executable.register(instr, 4), Some(3));
         assert_eq!(executable.register(instr, 5), None);
@@ -869,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_view_carries_bytecode_and_ic_metadata() {
+    fn jit_snapshot_reuses_codeblock_instruction_metadata() {
         let function = function(vec![
             Instruction {
                 pc: 0,
@@ -895,7 +899,7 @@ mod tests {
         let module = module(function);
 
         let executable = ExecutableModule::from_bytecode(&module);
-        let view = executable.function(0).unwrap().jit_view();
+        let view = executable.functions[0].jit_compile_snapshot();
 
         assert_eq!(view.function_id, 0);
         assert_eq!(view.instructions.len(), 2);
@@ -904,8 +908,8 @@ mod tests {
         assert!(view.instructions[0].byte_len > 0);
         assert_eq!(view.instructions[0].property_ic_site, Some(0));
         assert_eq!(
-            view.instructions[0].operands,
-            vec![
+            view.instructions[0].operands(),
+            &[
                 Operand::Register(0),
                 Operand::Register(1),
                 Operand::ConstIndex(7),
@@ -913,6 +917,10 @@ mod tests {
         );
         assert_eq!(view.instructions[1].op, Op::Add);
         assert_eq!(view.instructions[1].property_ic_site, None);
+        assert!(Arc::ptr_eq(
+            &view.instructions[0].instruction,
+            &executable.functions[0].code[0]
+        ));
     }
 
     #[test]
@@ -934,7 +942,7 @@ mod tests {
                 operands: vec![
                     Operand::Register(2),
                     Operand::Register(3),
-                    Operand::ConstIndex(4),
+                    Operand::ConstIndex(1),
                     Operand::Register(5),
                 ]
                 .into(),
@@ -955,9 +963,27 @@ mod tests {
             &[
                 Operand::Register(2),
                 Operand::Register(3),
-                Operand::ConstIndex(4),
+                Operand::ConstIndex(1),
                 Operand::Register(5)
             ]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "compiler emitted bytecode that violates the opcode schema")]
+    fn code_block_rejects_unverified_variadic_layout() {
+        let function = function(vec![Instruction {
+            pc: 0,
+            op: Op::Call,
+            operands: vec![
+                Operand::Register(0),
+                Operand::Register(1),
+                Operand::ConstIndex(2),
+                Operand::Register(2),
+            ]
+            .into(),
+        }]);
+
+        let _ = ExecutableModule::from_bytecode(&module(function));
     }
 }

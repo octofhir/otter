@@ -1,269 +1,213 @@
-//! Checked inventory of active bytecode effects and tier support.
+//! Machine-readable projection of the declarative opcode schema.
 //!
 //! # Contents
-//! - [`OpcodeAudit`] is the machine-readable Phase 0 row for one active opcode.
-//! - [`opcode_inventory`] derives a row for every entry in
-//!   [`crate::encoding::OP_BYTE_TABLE`].
+//! - [`OpcodeAudit`] exposes one stable JSON row per active opcode.
+//! - [`opcode_inventory`] projects [`crate::opcode_schema::OPCODE_SCHEMA`].
 //!
 //! # Invariants
-//! - Inventory membership and opcode ids come from the active encoder table, so
-//!   adding/removing an opcode cannot silently leave the audit stale.
-//! - Unknown effects are conservative: they require throw/allocation/GC/reentry
-//!   handling and a safepoint rather than claiming an unsafe leaf path.
-//! - The current self-describing encoding has no authoritative static operand
-//!   schema. Rows say so explicitly; Phase 2 replaces that gap with generated
-//!   exact read/write formats without maintaining a second execution bytecode.
+//! - Identity, wire format, conservative effects, and tier policy are copied
+//!   from the declarative schema rather than reconstructed here.
+//! - Authority markers distinguish exact schema facts from deliberately
+//!   conservative effect classifications.
+//! - The audit is diagnostic only and adds no dispatch/allocation hot-path work.
+//!
+//! # See also
+//! - [`crate::opcode_schema`] for the authoritative Phase 2 metadata slice.
 
 use serde::Serialize;
 
-use crate::{Op, encoding::OP_BYTE_TABLE};
+use crate::opcode_schema::OPCODE_SCHEMA;
+pub use crate::opcode_schema::{
+    ControlFlow, ExceptionSuccessorSpec, FeedbackKind, MetadataStatus, OperandFormat,
+    RegisterAccess, RegisterSource, SuccessorSpec, TierSupport,
+};
 
-/// Current operand encoding classification.
+/// Exact reference to a register identifier in an operand position.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum OperandFormat {
-    /// Operand kind bytes are embedded in each instruction; no opcode schema
-    /// currently defines a static format.
-    SelfDescribing,
+pub struct RegisterReference {
+    /// Operand position in the decoded instruction.
+    pub operand_index: usize,
+    /// How the operand encodes the register number.
+    pub source: RegisterSource,
 }
 
-/// Current control-flow shape.
+/// Exact counted register tail in a variadic operand shape.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ControlFlow {
-    /// Successor is the next instruction.
-    Fallthrough,
-    /// One relative target.
-    Jump,
-    /// Relative target plus fallthrough.
-    Branch,
-    /// Call-like operation returns to the next instruction.
-    Call,
-    /// Function/frame completion.
-    Return,
-    /// Explicit throw/unwind.
-    Throw,
-    /// Suspend/resume boundary.
-    Suspend,
-    /// Static and abrupt-completion successors.
-    ExceptionRegion,
+pub struct VariadicRegisterReference {
+    /// First repeated operand position.
+    pub start_operand_index: usize,
+    /// Prefix operand containing the repeated-operand count.
+    pub count_operand_index: usize,
+    /// How each tail operand encodes its register number.
+    pub source: RegisterSource,
 }
 
-/// Feedback family currently associated with an opcode.
+/// Authority/precision markers for the audit row's metadata families.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum FeedbackKind {
-    /// No current feedback cell.
-    None,
-    /// Arithmetic operand/result feedback.
-    Arithmetic,
-    /// Named-property inline cache.
-    Property,
-    /// Element/array/typed-array feedback.
-    Element,
-    /// Call target/arity feedback.
-    Call,
-    /// Global/dynamic environment feedback.
-    Global,
+pub struct OpcodeAuthority {
+    /// Opcode identity and byte assignment.
+    pub identity: MetadataStatus,
+    /// Current executable operand encoding.
+    pub operand_format: MetadataStatus,
+    /// Register read/write set precision.
+    pub register_sets: MetadataStatus,
+    /// Exact successor precision.
+    pub successors: MetadataStatus,
+    /// Exception/unwind successor precision.
+    pub exception_successors: MetadataStatus,
+    /// Execution-effect precision.
+    pub effects: MetadataStatus,
+    /// Interpreter/baseline/optimizer coverage policy.
+    pub tier_policy: MetadataStatus,
 }
 
-/// Current machine-code tier coverage.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum TierSupport {
-    /// The current emitter has a native or runtime-stub path for common cases.
-    Partial,
-    /// The current tier declines or exits to the interpreter.
-    Fallback,
-    /// Tier is excluded from normal builds and retained only experimentally.
-    ExperimentalOnly,
-}
-
-/// One checked active-opcode audit row.
+/// One active-opcode audit row.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct OpcodeAudit {
     /// Stable current wire byte.
     pub opcode_byte: u8,
-    /// Mnemonic.
+    /// Canonical mnemonic.
     pub opcode: String,
-    /// Operand wire format.
+    /// Per-family metadata precision.
+    pub authority: OpcodeAuthority,
+    /// Executable operand encoding.
     pub operand_format: OperandFormat,
-    /// Register read description. Exact static sets do not exist in the current
-    /// encoding and are recovered by each consumer from the operand list.
+    /// Register-read description retained for compatibility.
     pub registers_read: &'static str,
-    /// Register write description; same current-schema limitation as reads.
+    /// Human-readable register-write summary.
     pub registers_written: &'static str,
-    /// Normal control-flow successors.
+    /// Exact schema register reads.
+    pub register_reads_exact: Vec<RegisterReference>,
+    /// Exact schema register writes.
+    pub register_writes_exact: Vec<RegisterReference>,
+    /// Exact counted register-read tails.
+    pub register_read_variadic_tails: Vec<VariadicRegisterReference>,
+    /// Exact counted register-write tails.
+    pub register_write_variadic_tails: Vec<VariadicRegisterReference>,
+    /// Coarse control-flow class.
     pub control_flow: ControlFlow,
-    /// Exception successor description.
+    /// Normal-successor description.
+    pub normal_successors: &'static str,
+    /// Exact schema successors.
+    pub successors_exact: Vec<SuccessorSpec>,
+    /// Abrupt-successor description.
     pub exception_successor: &'static str,
-    /// May throw under conservative current semantics.
+    /// Exact schema exception successors.
+    pub exception_successors_exact: Vec<ExceptionSuccessorSpec>,
+    /// Whether execution may throw.
     pub may_throw: bool,
-    /// May allocate under conservative current semantics.
+    /// Whether execution may allocate.
     pub may_allocate: bool,
-    /// May trigger moving GC.
+    /// Whether execution may trigger moving GC.
     pub may_trigger_gc: bool,
-    /// May invoke JavaScript/proxy/accessor/coercion behavior.
+    /// Whether execution may invoke JavaScript.
     pub may_reenter_javascript: bool,
     /// Current feedback family.
     pub feedback: FeedbackKind,
-    /// Whether compiled execution must publish a safepoint before its slow path.
+    /// Whether compiled execution needs a safepoint.
     pub safepoint_required: bool,
     /// Interpreter implementation owner.
     pub interpreter: &'static str,
-    /// Current baseline coverage.
+    /// Baseline tier coverage.
     pub baseline: TierSupport,
-    /// Current optimizing-tier coverage.
+    /// Optimizing tier coverage.
     pub optimizer: TierSupport,
-    /// Declared fallback behavior.
+    /// Declared machine-code fallback contract.
     pub fallback: &'static str,
 }
 
-fn control_flow(op: Op) -> ControlFlow {
-    match op {
-        Op::Jump | Op::JumpViaFinally => ControlFlow::Jump,
-        Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => ControlFlow::Branch,
-        Op::Return | Op::ReturnValue | Op::ReturnUndefined | Op::TailCall => ControlFlow::Return,
-        Op::Throw => ControlFlow::Throw,
-        Op::EnterTry | Op::LeaveTry | Op::EndFinally | Op::PopParkedFinally => {
-            ControlFlow::ExceptionRegion
-        }
-        Op::Await | Op::Yield | Op::YieldDelegate | Op::GeneratorStart => ControlFlow::Suspend,
-        Op::Call
-        | Op::CallWithThis
-        | Op::CallMethodValue
-        | Op::CallSpread
-        | Op::New
-        | Op::NewSpread
-        | Op::SuperConstructSpread
-        | Op::Eval
-        | Op::MathCall
-        | Op::PromiseCall => ControlFlow::Call,
-        _ => ControlFlow::Fallthrough,
-    }
+fn register_references(
+    schema: &crate::opcode_schema::OpcodeSchema,
+    access: RegisterAccess,
+) -> Vec<RegisterReference> {
+    schema
+        .operand_shape
+        .prefix()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, spec)| spec.register_access == access)
+        .map(|(operand_index, spec)| RegisterReference {
+            operand_index,
+            source: spec
+                .register_source
+                .expect("register access always declares its source"),
+        })
+        .collect()
 }
 
-fn feedback(op: Op) -> FeedbackKind {
-    match op {
-        Op::Add
-        | Op::Sub
-        | Op::Mul
-        | Op::Div
-        | Op::Rem
-        | Op::Pow
-        | Op::Increment
-        | Op::LessThan
-        | Op::LessEq
-        | Op::GreaterThan
-        | Op::GreaterEq => FeedbackKind::Arithmetic,
-        Op::LoadProperty | Op::StoreProperty | Op::HasProperty | Op::DeleteProperty => {
-            FeedbackKind::Property
-        }
-        Op::LoadElement | Op::StoreElement | Op::DeleteElement | Op::ArrayLength => {
-            FeedbackKind::Element
-        }
-        Op::Call | Op::CallWithThis | Op::CallMethodValue | Op::TailCall => FeedbackKind::Call,
-        Op::LoadGlobalOrThrow
-        | Op::LoadGlobalOrUndefined
-        | Op::StoreGlobalBinding
-        | Op::LoadDynamic
-        | Op::StoreDynamic => FeedbackKind::Global,
-        _ => FeedbackKind::None,
+fn variadic_register_references(
+    schema: &crate::opcode_schema::OpcodeSchema,
+    access: RegisterAccess,
+) -> Vec<VariadicRegisterReference> {
+    let Some((count_operand_index, tail)) = schema.operand_shape.variadic() else {
+        return Vec::new();
+    };
+    if tail.register_access != access {
+        return Vec::new();
     }
-}
-
-fn proven_leaf(op: Op) -> bool {
-    matches!(
-        op,
-        Op::Nop
-            | Op::LoadUndefined
-            | Op::LoadHole
-            | Op::LoadTrue
-            | Op::LoadFalse
-            | Op::LoadNull
-            | Op::LoadLocal
-            | Op::StoreLocal
-            | Op::LoadThis
-            | Op::LoadNewTarget
-            | Op::Jump
-            | Op::JumpIfTrue
-            | Op::JumpIfFalse
-            | Op::JumpIfNullish
-            | Op::LeaveTry
-            | Op::Return
-            | Op::ReturnValue
-            | Op::ReturnUndefined
-    )
-}
-
-fn baseline_support(op: Op) -> TierSupport {
-    match op {
-        Op::Nop
-        | Op::LoadUndefined
-        | Op::LoadTrue
-        | Op::LoadFalse
-        | Op::LoadNull
-        | Op::LoadString
-        | Op::LoadNumber
-        | Op::LoadInt32
-        | Op::Add
-        | Op::Sub
-        | Op::Mul
-        | Op::Div
-        | Op::Rem
-        | Op::Neg
-        | Op::Equal
-        | Op::NotEqual
-        | Op::LessThan
-        | Op::LessEq
-        | Op::GreaterThan
-        | Op::GreaterEq
-        | Op::Jump
-        | Op::JumpIfTrue
-        | Op::JumpIfFalse
-        | Op::JumpIfNullish
-        | Op::LoadLocal
-        | Op::StoreLocal
-        | Op::LoadProperty
-        | Op::StoreProperty
-        | Op::LoadElement
-        | Op::StoreElement
-        | Op::ArrayLength
-        | Op::Call
-        | Op::CallWithThis
-        | Op::CallMethodValue
-        | Op::Return
-        | Op::ReturnValue
-        | Op::ReturnUndefined => TierSupport::Partial,
-        _ => TierSupport::Fallback,
-    }
+    vec![VariadicRegisterReference {
+        start_operand_index: schema
+            .operand_shape
+            .prefix()
+            .expect("variadic shape has a prefix")
+            .len(),
+        count_operand_index,
+        source: tail
+            .register_source
+            .expect("register tail always declares its source"),
+    }]
 }
 
 /// Generate the checked active-opcode inventory.
 #[must_use]
 pub fn opcode_inventory() -> Vec<OpcodeAudit> {
-    OP_BYTE_TABLE
+    OPCODE_SCHEMA
         .iter()
-        .map(|(op, byte)| {
-            let leaf = proven_leaf(*op);
+        .map(|schema| {
+            let exact_successors = schema.successor_shape.exact();
+            let exact_exception_successors = schema.exception_successor_shape.exact();
             OpcodeAudit {
-                opcode_byte: *byte,
-                opcode: op.mnemonic().to_owned(),
-                operand_format: OperandFormat::SelfDescribing,
-                registers_read: "decoded per instruction; no authoritative opcode schema",
-                registers_written: "decoded per instruction; no authoritative opcode schema",
-                control_flow: control_flow(*op),
-                exception_successor: if leaf { "none" } else { "dynamic frame handler or caller" },
-                may_throw: !leaf,
-                may_allocate: !leaf,
-                may_trigger_gc: !leaf,
-                may_reenter_javascript: !leaf,
-                feedback: feedback(*op),
-                safepoint_required: !leaf,
+                opcode_byte: schema.byte,
+                opcode: schema.op.mnemonic().to_owned(),
+                authority: OpcodeAuthority {
+                    identity: MetadataStatus::SchemaAuthoritative,
+                    operand_format: MetadataStatus::SchemaAuthoritative,
+                    register_sets: MetadataStatus::SchemaAuthoritative,
+                    successors: MetadataStatus::SchemaAuthoritative,
+                    exception_successors: MetadataStatus::SchemaAuthoritative,
+                    effects: MetadataStatus::SchemaConservative,
+                    tier_policy: MetadataStatus::SchemaAuthoritative,
+                },
+                operand_format: schema.operand_format,
+                registers_read: "schema-authoritative: see register_reads_exact",
+                registers_written: "schema-authoritative: see register_writes_exact",
+                register_reads_exact: register_references(schema, RegisterAccess::Read),
+                register_writes_exact: register_references(schema, RegisterAccess::Write),
+                register_read_variadic_tails: variadic_register_references(
+                    schema,
+                    RegisterAccess::Read,
+                ),
+                register_write_variadic_tails: variadic_register_references(
+                    schema,
+                    RegisterAccess::Write,
+                ),
+                control_flow: schema.control_flow,
+                normal_successors: "schema-authoritative: see successors_exact",
+                successors_exact: exact_successors.to_vec(),
+                exception_successor: "schema-authoritative: see exception_successors_exact",
+                exception_successors_exact: exact_exception_successors.to_vec(),
+                may_throw: schema.effects.may_throw,
+                may_allocate: schema.effects.may_allocate,
+                may_trigger_gc: schema.effects.may_trigger_gc,
+                may_reenter_javascript: schema.effects.may_reenter_javascript,
+                feedback: schema.feedback,
+                safepoint_required: schema.effects.safepoint_required,
                 interpreter: "crates/otter-vm/src/interp/dispatch.rs",
-                baseline: baseline_support(*op),
-                optimizer: TierSupport::ExperimentalOnly,
-                fallback: "exact-PC interpreter continuation when emitted; compile decline otherwise",
+                baseline: schema.baseline,
+                optimizer: schema.optimizer,
+                fallback:
+                    "exact-PC interpreter continuation when emitted; compile decline otherwise",
             }
         })
         .collect()
@@ -272,27 +216,240 @@ pub fn opcode_inventory() -> Vec<OpcodeAudit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::OP_BYTE_TABLE;
+
+    fn row<'a>(inventory: &'a [OpcodeAudit], opcode: &str) -> &'a OpcodeAudit {
+        inventory
+            .iter()
+            .find(|row| row.opcode == opcode)
+            .unwrap_or_else(|| panic!("missing {opcode} audit row"))
+    }
 
     #[test]
-    fn inventory_covers_every_active_opcode_once() {
+    fn inventory_covers_schema_and_compatibility_table_once() {
         let inventory = opcode_inventory();
+        assert_eq!(inventory.len(), OPCODE_SCHEMA.len());
         assert_eq!(inventory.len(), OP_BYTE_TABLE.len());
         for (index, row) in inventory.iter().enumerate() {
             assert_eq!(row.opcode_byte as usize, index);
+            assert_eq!(row.opcode_byte, OP_BYTE_TABLE[index].1);
+            assert_eq!(row.authority.identity, MetadataStatus::SchemaAuthoritative);
             assert!(!row.opcode.is_empty());
             assert!(!row.registers_read.is_empty());
             assert!(!row.registers_written.is_empty());
-            assert!(!row.interpreter.is_empty());
-            assert!(!row.fallback.is_empty());
+            assert!(!row.normal_successors.is_empty());
         }
     }
 
     #[test]
-    fn conservative_effects_always_require_safepoints() {
-        for row in opcode_inventory() {
-            if row.may_allocate || row.may_trigger_gc || row.may_reenter_javascript {
-                assert!(row.safepoint_required, "{}", row.opcode);
+    fn json_exposes_authority_and_experimental_tier_honestly() {
+        let json = serde_json::to_value(opcode_inventory()).expect("audit JSON");
+        let first = &json.as_array().expect("array")[0];
+        assert_eq!(first["authority"]["identity"], "schema-authoritative");
+        assert_eq!(first["authority"]["register_sets"], "schema-authoritative");
+        assert_eq!(first["optimizer"], "experimental-only");
+    }
+
+    #[test]
+    fn local_and_arithmetic_rows_expose_exact_register_sources() {
+        let inventory = opcode_inventory();
+        let load_local = row(&inventory, "LOAD_LOCAL");
+        assert_eq!(
+            load_local.authority.register_sets,
+            MetadataStatus::SchemaAuthoritative
+        );
+        assert_eq!(
+            load_local.register_reads_exact,
+            vec![RegisterReference {
+                operand_index: 1,
+                source: RegisterSource::Imm32RegisterIndex,
+            }]
+        );
+        assert_eq!(load_local.register_writes_exact[0].operand_index, 0);
+
+        let add = row(&inventory, "ADD");
+        assert_eq!(
+            add.register_reads_exact
+                .iter()
+                .map(|reference| reference.operand_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(add.register_writes_exact[0].operand_index, 0);
+
+        let evaluate_module = row(&inventory, "EVALUATE_MODULE");
+        assert_eq!(
+            evaluate_module.authority.register_sets,
+            MetadataStatus::SchemaAuthoritative
+        );
+        assert_eq!(evaluate_module.register_writes_exact[0].operand_index, 0);
+        assert!(evaluate_module.register_reads_exact.is_empty());
+    }
+
+    #[test]
+    fn property_upvalue_and_iterator_rows_are_exact() {
+        let inventory = opcode_inventory();
+        let store_property = row(&inventory, "STORE_PROPERTY");
+        assert_eq!(
+            store_property
+                .register_reads_exact
+                .iter()
+                .map(|reference| reference.operand_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(store_property.register_writes_exact[0].operand_index, 3);
+
+        let load_upvalue = row(&inventory, "LOAD_UPVALUE");
+        assert!(load_upvalue.register_reads_exact.is_empty());
+        assert_eq!(load_upvalue.register_writes_exact[0].operand_index, 0);
+
+        let iterator_next = row(&inventory, "ITERATOR_NEXT");
+        assert_eq!(
+            iterator_next
+                .register_writes_exact
+                .iter()
+                .map(|reference| reference.operand_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(iterator_next.register_reads_exact[0].operand_index, 2);
+    }
+
+    #[test]
+    fn call_family_exposes_prefix_and_counted_register_tail() {
+        let inventory = opcode_inventory();
+        let call = row(&inventory, "CALL");
+        assert_eq!(
+            call.authority.register_sets,
+            MetadataStatus::SchemaAuthoritative
+        );
+        assert_eq!(
+            call.register_reads_exact,
+            vec![RegisterReference {
+                operand_index: 1,
+                source: RegisterSource::RegisterOperand,
+            }]
+        );
+        assert_eq!(call.register_writes_exact[0].operand_index, 0);
+        assert_eq!(
+            call.register_read_variadic_tails,
+            vec![VariadicRegisterReference {
+                start_operand_index: 3,
+                count_operand_index: 2,
+                source: RegisterSource::RegisterOperand,
+            }]
+        );
+
+        let call_with_this = row(&inventory, "CALL_WITH_THIS");
+        assert_eq!(
+            call_with_this
+                .register_reads_exact
+                .iter()
+                .map(|reference| reference.operand_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            call_with_this.register_read_variadic_tails[0].start_operand_index,
+            4
+        );
+
+        let new_array = row(&inventory, "NEW_ARRAY");
+        assert_eq!(new_array.register_writes_exact[0].operand_index, 0);
+        assert_eq!(
+            new_array.register_read_variadic_tails[0],
+            VariadicRegisterReference {
+                start_operand_index: 2,
+                count_operand_index: 1,
+                source: RegisterSource::RegisterOperand,
             }
-        }
+        );
+
+        let method = row(&inventory, "CALL_METHOD_VALUE");
+        assert_eq!(method.register_reads_exact[0].operand_index, 1);
+        assert_eq!(
+            method.register_read_variadic_tails[0].start_operand_index,
+            4
+        );
+    }
+
+    #[test]
+    fn branch_and_return_rows_expose_exact_successors() {
+        let inventory = opcode_inventory();
+        let branch = row(&inventory, "JUMP_IF_FALSE");
+        assert_eq!(
+            branch.authority.successors,
+            MetadataStatus::SchemaAuthoritative
+        );
+        assert_eq!(branch.successors_exact.len(), 2);
+        assert!(matches!(
+            branch.successors_exact[0],
+            SuccessorSpec::RelativeTarget {
+                operand_index: 0,
+                ..
+            }
+        ));
+        assert_eq!(branch.successors_exact[1], SuccessorSpec::Fallthrough);
+
+        let return_row = row(&inventory, "RETURN");
+        assert_eq!(
+            return_row.successors_exact,
+            vec![SuccessorSpec::FrameReturn]
+        );
+
+        let call = row(&inventory, "CALL");
+        assert_eq!(
+            call.authority.successors,
+            MetadataStatus::SchemaAuthoritative
+        );
+        assert_eq!(call.successors_exact, vec![SuccessorSpec::Fallthrough]);
+    }
+
+    #[test]
+    fn exception_rows_distinguish_handlers_and_dynamic_unwind() {
+        let inventory = opcode_inventory();
+        let enter_try = row(&inventory, "ENTER_TRY");
+        assert_eq!(
+            enter_try.authority.exception_successors,
+            MetadataStatus::SchemaAuthoritative
+        );
+        assert_eq!(enter_try.exception_successors_exact.len(), 2);
+        assert!(matches!(
+            enter_try.exception_successors_exact[0],
+            ExceptionSuccessorSpec::OptionalRelativeTarget {
+                operand_index: 0,
+                absent_value: crate::NO_HANDLER_OFFSET,
+                ..
+            }
+        ));
+
+        let throw = row(&inventory, "THROW");
+        assert_eq!(
+            throw.exception_successors_exact,
+            vec![ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller]
+        );
+        assert!(throw.successors_exact.is_empty());
+
+        let end_finally = row(&inventory, "END_FINALLY");
+        assert_eq!(
+            end_finally.exception_successors_exact,
+            vec![ExceptionSuccessorSpec::ResumeParkedAbruptCompletion]
+        );
+
+        let jump_via_finally = row(&inventory, "JUMP_VIA_FINALLY");
+        assert!(matches!(
+            jump_via_finally.exception_successors_exact[0],
+            ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
+                floor_operand_index: 1
+            }
+        ));
+        assert!(matches!(
+            jump_via_finally.successors_exact[0],
+            SuccessorSpec::RelativeTarget {
+                operand_index: 0,
+                ..
+            }
+        ));
     }
 }

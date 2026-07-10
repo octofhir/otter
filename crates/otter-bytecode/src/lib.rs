@@ -15,12 +15,16 @@
 //! - [`disasm`] — text disassembler for CLI/debug output.
 //! - [`dump`] — JSON dump for tooling and tests
 //!   (`otterBytecodeDumpVersion: 1`).
+//! - [`opcode_schema`] — declarative opcode identity, wire-format, conservative
+//!   effects, and tier-policy metadata.
 //!
 //! # Invariants
 //! - Instructions inside [`Function::code`] are sorted by `pc`
 //!   ascending; spans inside [`Function::spans`] are sorted by `pc`.
 //! - Mnemonics are `SCREAMING_SNAKE_CASE` and match the strings the
 //!   disassembler emits.
+//! - Opcode byte assignments have one source in [`opcode_schema`]; encoding
+//!   retains a generated compatibility view of the unchanged wire format.
 //!
 //! # See also
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
@@ -30,6 +34,7 @@ pub mod dump;
 pub mod encoding;
 pub mod method_id;
 pub mod opcode_audit;
+pub mod opcode_schema;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -715,7 +720,8 @@ pub enum Op {
     /// Evaluate the module with the canonical URL in the constant
     /// operand (and its not-yet-evaluated, non-deferred dependency
     /// closure, in post-order). Idempotent: a module whose body has
-    /// already run is skipped. Operand: `ConstIndex(url)`. Emitted by
+    /// already run is skipped. Operands: `Register(dst),
+    /// ConstIndex(url)`. Emitted by
     /// the synthesised `<entry>` driver in place of an inline
     /// module-init call so eager evaluation and deferred force-eval
     /// share one guarded primitive.
@@ -1468,6 +1474,12 @@ impl Op {
     /// with an extra `this` register before `argc`.
     #[must_use]
     pub const fn operand_count(self) -> usize {
+        if let Some(operands) = crate::opcode_schema::opcode_schema(self)
+            .operand_shape
+            .prefix()
+        {
+            return operands.len();
+        }
         match self {
             Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => 0,
             Op::LoadUndefined

@@ -10,8 +10,8 @@
 //! - Frame GC slot tracing.
 //!
 //! # Invariants
-//! - Frame construction sizes registers from bytecode/executable metadata.
-//! - Pending records identify their originating pc before resume.
+//! - Frame construction sizes registers from verified CodeBlock metadata.
+//! - Frame and pending-record PCs are dense CodeBlock instruction indexes.
 //! - GC-bearing frame fields are visited by trace_frame_slots.
 //!
 //! # Frame ABI (frozen)
@@ -51,8 +51,7 @@ use otter_bytecode::Function;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    ExecutableFunction, JsPromiseHandle, UpvalueCell, Value, VmError, abstract_ops,
-    cold_frame::ColdFrameIdx,
+    CodeBlock, JsPromiseHandle, UpvalueCell, Value, VmError, abstract_ops, cold_frame::ColdFrameIdx,
 };
 
 pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
@@ -403,16 +402,12 @@ pub struct TryHandler {
 }
 
 impl Frame {
-    /// Advance the program counter by `byte_len` bytes. Surfaces
+    /// Advance the canonical instruction-index program counter by one. Surfaces
     /// [`VmError::InvalidOperand`] on overflow. The dispatch loop
-    /// passes the byte length of the instruction it just executed;
-    /// helper opcodes read it indirectly via
-    /// [`Interpreter::current_byte_len`].
-    pub(crate) fn advance_pc(&mut self, byte_len: u32) -> Result<(), VmError> {
-        self.pc = self
-            .pc
-            .checked_add(byte_len)
-            .ok_or(VmError::InvalidOperand)?;
+    /// still passes encoded length while JIT metadata finishes migrating; it
+    /// does not participate in interpreter control flow.
+    pub(crate) fn advance_pc(&mut self, _encoded_byte_len: u32) -> Result<(), VmError> {
+        self.pc = self.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         Ok(())
     }
 
@@ -498,7 +493,7 @@ impl Frame {
 
     pub(crate) fn build_upvalues_for_exec(
         heap: &mut otter_gc::GcHeap,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         parent_upvalues: UpvalueSpine,
     ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
         let mut empty = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
@@ -516,7 +511,7 @@ impl Frame {
     /// is not yet on a traced stack; those locals must ride through here.
     pub(crate) fn build_upvalues_for_exec_with_roots(
         heap: &mut otter_gc::GcHeap,
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         parent_upvalues: UpvalueSpine,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
@@ -588,7 +583,7 @@ impl Frame {
 
     #[must_use]
     pub(crate) fn with_exec_return_upvalues_and_this(
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         return_register: Option<u16>,
         upvalues: UpvalueSpine,
         this_value: Value,
@@ -609,7 +604,7 @@ impl Frame {
     /// zero-filled with `Value::undefined()`.
     #[must_use]
     pub(crate) fn with_exec_registers(
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         return_register: Option<u16>,
         upvalues: UpvalueSpine,
         this_value: Value,
@@ -643,7 +638,7 @@ impl Frame {
     /// instead of an inline-owned buffer. The window is pre-zeroed.
     #[must_use]
     pub(crate) fn with_exec_window(
-        function: &ExecutableFunction,
+        function: &CodeBlock,
         return_register: Option<u16>,
         upvalues: UpvalueSpine,
         this_value: Value,

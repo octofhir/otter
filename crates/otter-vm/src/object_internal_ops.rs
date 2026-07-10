@@ -2917,6 +2917,26 @@ impl Interpreter {
             }
             return Ok(keys);
         }
+        if target.is_intl() {
+            // ECMA-402 service instances are ordinary objects; own keys
+            // are exactly the user-props side-table entries (resolved
+            // options live in internal slots, not own properties).
+            let mut keys = Vec::new();
+            if let Some(bag) = self.non_gc_exotic_user_props(&target) {
+                let (strings, mut symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(bag, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::symbol).collect(),
+                        )
+                    });
+                for key in strings {
+                    self.push_own_key_string(&mut keys, &mut target, &mut symbols, &key)?;
+                }
+                keys.extend(symbols);
+            }
+            return Ok(keys);
+        }
         Ok(Vec::new())
     }
 

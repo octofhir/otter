@@ -50,8 +50,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use otter_bytecode::{
-    BytecodeModule, Constant, Function, Instruction, ModuleInit, ModuleResolution, Op, Operand,
-    OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
+    BytecodeModule, Constant, Function, FunctionCode, FunctionCodeBuilder, ModuleInit,
+    ModuleResolution, Op, Operand, SourceKind as BytecodeSourceKind, SpanEntry,
 };
 use otter_compiler::{
     CompileError, CompiledExport, CompiledModuleMetadata, ModuleHostInfo, ResolvedBinding,
@@ -704,6 +704,8 @@ fn dynamic_literal_should_preload(specifier: &str) -> bool {
 }
 
 fn hosted_module_fragment(url: &str) -> BytecodeModule {
+    let mut code = FunctionCodeBuilder::new();
+    code.push(Op::ReturnUndefined, &[]);
     BytecodeModule {
         module: url.to_string(),
         template_sites: Vec::new(),
@@ -714,11 +716,7 @@ fn hosted_module_fragment(url: &str) -> BytecodeModule {
             param_count: 2,
             is_module: true,
             module_url: url.to_string(),
-            code: vec![Instruction {
-                pc: 0,
-                op: Op::ReturnUndefined,
-                operands: Vec::new().into(),
-            }],
+            code: code.finish(),
             spans: Vec::new(),
             ..Default::default()
         }],
@@ -1378,33 +1376,28 @@ fn link(nodes: &BTreeMap<String, ModuleNode>, order: &[String], entry_url: &str)
 /// [`Op::is_const_pool_operand`]. Other [`Operand::ConstIndex`]
 /// uses (`argc`, `upvalue_count`, method-id enums, typed-array
 /// kind enums, …) are intentionally left untouched.
-fn rewrite_const_indices(code: &[Instruction], offset: u32) -> Vec<Instruction> {
-    code.iter()
-        .map(|instr| {
-            let op = instr.op;
-            Instruction {
-                pc: instr.pc,
-                op,
-                operands: instr
-                    .operands
-                    .iter()
-                    .enumerate()
-                    .map(|(pos, operand)| match *operand {
-                        Operand::ConstIndex(k) if op.is_const_pool_operand(pos) => {
-                            Operand::ConstIndex(k + offset)
-                        }
-                        other => other,
-                    })
-                    .collect::<Vec<_>>()
-                    .into(),
-            }
-        })
-        .collect()
+fn rewrite_const_indices(code: &FunctionCode, offset: u32) -> FunctionCode {
+    let mut rewritten = FunctionCodeBuilder::new();
+    for instr in code {
+        let operands = code
+            .operands(instr)
+            .iter()
+            .enumerate()
+            .map(|(pos, operand)| match operand {
+                Operand::ConstIndex(k) if instr.op.is_const_pool_operand(pos) => {
+                    Operand::ConstIndex(k + offset)
+                }
+                other => other,
+            })
+            .collect::<Vec<_>>();
+        rewritten.push(instr.op, &operands);
+    }
+    rewritten.finish()
 }
 
 /// One assembled `<entry>` body.
 struct EntryBody {
-    code: Vec<Instruction>,
+    code: FunctionCode,
     spans: Vec<SpanEntry>,
     scratch: u16,
     /// `true` when the graph contains a top-level-await module, so the
@@ -1454,9 +1447,8 @@ fn build_entry_body(
     entry_url: &str,
     constants: &mut Vec<Constant>,
 ) -> EntryBody {
-    let mut code: Vec<Instruction> = Vec::new();
+    let mut code = FunctionCodeBuilder::new();
     let mut spans: Vec<SpanEntry> = Vec::new();
-    let mut next_pc: u32 = 0;
 
     // A module-init has its own top-level await iff its `<main>`
     // (fragment function 0) is async.
@@ -1596,9 +1588,8 @@ fn build_entry_body(
     // keep evaluating while it is suspended.
     let mut next_reg: u16 = 0;
     let mut gate_regs: Vec<u16> = Vec::new();
-    let emit_evaluate = |code: &mut Vec<Instruction>,
+    let emit_evaluate = |code: &mut FunctionCodeBuilder,
                          spans: &mut Vec<SpanEntry>,
-                         next_pc: &mut u32,
                          constants: &mut Vec<Constant>,
                          next_reg: &mut u16,
                          url: &str|
@@ -1609,15 +1600,13 @@ fn build_entry_body(
         emit_op(
             code,
             spans,
-            next_pc,
             Op::EvaluateModule,
             [Operand::Register(dst), Operand::ConstIndex(url_const_idx)],
         );
         dst
     };
-    let emit_awaits = |code: &mut Vec<Instruction>,
+    let emit_awaits = |code: &mut FunctionCodeBuilder,
                        spans: &mut Vec<SpanEntry>,
-                       next_pc: &mut u32,
                        next_reg: &mut u16,
                        gates: &mut Vec<u16>| {
         for gate in gates.drain(..) {
@@ -1626,7 +1615,6 @@ fn build_entry_body(
             emit_op(
                 code,
                 spans,
-                next_pc,
                 Op::Await,
                 [Operand::Register(r_awaited), Operand::Register(gate)],
             );
@@ -1635,14 +1623,7 @@ fn build_entry_body(
     // Deferred-async TLA roots need no special handling here:
     // InnerModuleEvaluation gathers them into the importing module's
     // own evaluation list (import-defer proposal), in request order.
-    let entry_gate = emit_evaluate(
-        &mut code,
-        &mut spans,
-        &mut next_pc,
-        constants,
-        &mut next_reg,
-        entry_url,
-    );
+    let entry_gate = emit_evaluate(&mut code, &mut spans, constants, &mut next_reg, entry_url);
     gate_regs.push(entry_gate);
     // Idempotent no-op sweeps for any module reachable outside the
     // entry's own DFS (defensive parity with the records' walk).
@@ -1650,28 +1631,15 @@ fn build_entry_body(
         if url == entry_url || !reachable.contains(url) {
             continue;
         }
-        let dst = emit_evaluate(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            constants,
-            &mut next_reg,
-            url,
-        );
+        let dst = emit_evaluate(&mut code, &mut spans, constants, &mut next_reg, url);
         gate_regs.push(dst);
     }
     if has_async {
-        emit_awaits(
-            &mut code,
-            &mut spans,
-            &mut next_pc,
-            &mut next_reg,
-            &mut gate_regs,
-        );
+        emit_awaits(&mut code, &mut spans, &mut next_reg, &mut gate_regs);
     }
-    emit_op(&mut code, &mut spans, &mut next_pc, Op::ReturnUndefined, []);
+    emit_op(&mut code, &mut spans, Op::ReturnUndefined, []);
     EntryBody {
-        code,
+        code: code.finish(),
         spans,
         scratch: next_reg,
         is_async: has_async,
@@ -1679,20 +1647,14 @@ fn build_entry_body(
 }
 
 fn emit_op(
-    code: &mut Vec<Instruction>,
+    code: &mut FunctionCodeBuilder,
     spans: &mut Vec<SpanEntry>,
-    next_pc: &mut u32,
     op: Op,
-    operands: impl Into<OperandList>,
+    operands: impl AsRef<[Operand]>,
 ) {
-    let pc = *next_pc;
-    code.push(Instruction {
-        pc,
-        op,
-        operands: operands.into(),
-    });
+    let pc = code.next_pc();
+    code.push(op, operands.as_ref());
     spans.push(SpanEntry { pc, span: (0, 0) });
-    *next_pc += 1;
 }
 
 fn intern_string_const(constants: &mut Vec<Constant>, s: &str) -> u32 {

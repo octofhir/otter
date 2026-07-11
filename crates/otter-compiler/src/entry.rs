@@ -928,7 +928,7 @@ pub(crate) fn compile_program_with_mode_impl_super(
             &mut m.functions[0].direct_eval_bindings,
             cx.own_upvalue_count,
         );
-        m.functions[0].code = code;
+        m.functions[0].code = code.finish();
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
     drop(cx);
@@ -1556,7 +1556,7 @@ pub fn compile_module_program(
             &mut no_eval_meta,
             cx.own_upvalue_count,
         );
-        m.functions[0].code = code;
+        m.functions[0].code = code.finish();
         m.functions[0].spans = std::mem::take(&mut cx.spans);
     }
     // Capture deferred import specifiers before dropping the compiler

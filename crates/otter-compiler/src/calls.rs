@@ -1082,7 +1082,7 @@ pub(crate) fn emit_spread_into_array(
     );
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
-    let loop_top = cx.next_pc;
+    let loop_top = cx.next_pc();
     cx.emit(
         Op::IteratorNext,
         vec![

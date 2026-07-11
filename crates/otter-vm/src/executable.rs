@@ -34,14 +34,13 @@
 //! - [`otter_bytecode::Instruction`]
 
 use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand, SpanEntry,
-    encoding::{FunctionLayout, layout_function, translate_spans_to_byte_pcs},
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, FunctionCode,
+    FunctionCodeBuilder, Op, Operand, SpanEntry, WordInstruction,
+    encoding::{FunctionLayout, layout_wordcode_function, translate_spans_to_byte_pcs},
 };
 use std::sync::Arc;
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
-const INLINE_OPERAND_CAPACITY: usize = 4;
-const NO_OVERFLOW_OPERANDS: u32 = u32::MAX;
 
 /// Transient builder for [`ExecutableModule`].
 ///
@@ -277,7 +276,11 @@ impl CodeBlock {
         register_count: u16,
         instructions: &[crate::jit::JitTestInstruction],
     ) -> Arc<Self> {
-        let mut overflow_operand_words = Vec::new();
+        let mut wordcode_builder = FunctionCodeBuilder::new();
+        for instr in instructions {
+            wordcode_builder.push(instr.op, &instr.operands);
+        }
+        let wordcode = Arc::new(wordcode_builder.finish());
         let instruction_metadata: Vec<_> = instructions
             .iter()
             .map(|instr| ColdInstructionMetadata {
@@ -287,14 +290,14 @@ impl CodeBlock {
             .collect();
         let code: Vec<_> = instructions
             .iter()
-            .map(|instr| {
-                Arc::new(CodeBlockInstruction::from_operands(
-                    instr.op,
-                    &instr.operands,
+            .enumerate()
+            .map(|(word_index, instr)| {
+                Arc::new(CodeBlockInstruction::from_wordcode(
+                    Arc::clone(&wordcode),
+                    word_index as u32,
                     id,
                     instr.instruction_pc,
                     NO_PROPERTY_IC_SITE,
-                    &mut overflow_operand_words,
                 ))
             })
             .collect();
@@ -325,8 +328,8 @@ impl CodeBlock {
             direct_eval_bindings: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
+            wordcode,
             instruction_metadata: instruction_metadata.into_boxed_slice(),
-            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             byte_spans: Box::new([]),
             code_byte_len,
         })
@@ -390,7 +393,7 @@ impl CodeBlock {
     #[cfg(test)]
     #[must_use]
     pub fn operands(&self, instr: &CodeBlockInstruction) -> smallvec::SmallVec<[Operand; 4]> {
-        (0..usize::from(instr.operand_count))
+        (0..instr.operand_count())
             .map(|index| {
                 self.operand(instr, index)
                     .expect("verified CodeBlock operand must decode")
@@ -412,9 +415,7 @@ impl CodeBlock {
     /// One schema-typed operand.
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
-        let word = instr.operand_word(&self.overflow_operand_words, index)?;
-        let kind = otter_bytecode::opcode_schema::operand_kind_at(instr.op, index)?;
-        otter_bytecode::opcode_schema::decode_operand_word(kind, word)
+        self.wordcode.operand(instr, index)
     }
 
     /// Decode one register operand.
@@ -477,9 +478,9 @@ enum OperandViewSource<'a> {
 impl<'a> OperandView<'a> {
     /// Number of operands declared by the verified instruction.
     #[must_use]
-    pub const fn len(self) -> usize {
+    pub fn len(self) -> usize {
         match self.source {
-            OperandViewSource::Wordcode { instr, .. } => instr.operand_count as usize,
+            OperandViewSource::Wordcode { instr, .. } => instr.operand_count(),
             #[cfg(test)]
             OperandViewSource::Decoded(decoded) => decoded.len(),
         }
@@ -487,7 +488,7 @@ impl<'a> OperandView<'a> {
 
     /// Whether this instruction has no operands.
     #[must_use]
-    pub const fn is_empty(self) -> bool {
+    pub fn is_empty(self) -> bool {
         self.len() == 0
     }
 
@@ -646,11 +647,10 @@ pub struct CodeBlock {
     pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[Arc<CodeBlockInstruction>]>,
+    /// Authoritative schema-typed execution wordcode shared by VM and JIT.
+    wordcode: Arc<FunctionCode>,
     /// Cold serialized byte coordinates parallel to `code`.
     instruction_metadata: Box<[ColdInstructionMetadata]>,
-    /// Untagged operand-word side table used only by instructions exceeding the
-    /// fixed inline capacity; the opcode schema supplies every word's kind.
-    overflow_operand_words: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
@@ -675,13 +675,13 @@ impl CodeBlock {
         let FunctionLayout {
             total_bytes: code_byte_len,
             instr_to_byte_pc,
-        } = layout_function(&function.code).unwrap_or_else(|error| {
+        } = layout_wordcode_function(&function.code).unwrap_or_else(|error| {
             panic!(
                 "compiler emitted bytecode that violates the opcode schema: function={} id={}: {error}",
                 function.name, function.id
             )
         });
-        let mut overflow_operand_words = Vec::new();
+        let wordcode = Arc::new(function.code.clone());
         let instruction_metadata = instr_to_byte_pc
             .iter()
             .enumerate()
@@ -718,13 +718,12 @@ impl CodeBlock {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
-                Arc::new(CodeBlockInstruction::from_operands(
-                    instr.op,
-                    instr.operands.as_slice(),
+                Arc::new(CodeBlockInstruction::from_wordcode(
+                    Arc::clone(&wordcode),
+                    idx as u32,
                     function.id,
                     idx as u32,
                     property_ic_site,
-                    &mut overflow_operand_words,
                 ))
             })
             .collect::<Vec<_>>()
@@ -811,8 +810,8 @@ impl CodeBlock {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
+            wordcode,
             instruction_metadata,
-            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             byte_spans,
             code_byte_len,
         }
@@ -853,52 +852,30 @@ pub(crate) struct ExecMappedArgumentBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CodeBlockInstruction {
-    /// Opcode.
-    pub op: Op,
-    /// Owning CodeBlock identity used only to resolve long variadic operands.
+    /// Shared authoritative wordcode body; `word_index` selects the record.
+    wordcode: Arc<FunctionCode>,
+    /// Dense index into `wordcode`; test snapshots may carry a distinct PC.
+    word_index: u32,
+    /// Owning CodeBlock identity used to resolve runtime function state.
     code_block_id: u32,
     /// Canonical dense instruction index used by interpreter and JIT CFG.
     pub instruction_pc: u32,
     /// Dense module-local property IC site id for named property ops.
     pub property_ic_site: Option<usize>,
-    /// Number of operands in declaration order.
-    operand_count: u8,
-    /// Inline untagged operand words for common fixed-width instructions.
-    inline_operand_words: [u32; INLINE_OPERAND_CAPACITY],
-    /// Start in the owning CodeBlock side table, or `u32::MAX` for inline data.
-    overflow_operand_offset: u32,
 }
 
 impl CodeBlockInstruction {
-    pub(crate) fn from_operands(
-        op: Op,
-        operands: &[Operand],
+    pub(crate) fn from_wordcode(
+        wordcode: Arc<FunctionCode>,
+        word_index: u32,
         code_block_id: u32,
         instruction_pc: u32,
         property_ic_site: u32,
-        overflow_operand_words: &mut Vec<u32>,
     ) -> Self {
-        let operand_count =
-            u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
-        let mut inline_operand_words = [0; INLINE_OPERAND_CAPACITY];
-        let overflow_operand_offset = if operands.len() <= INLINE_OPERAND_CAPACITY {
-            for (slot, operand) in inline_operand_words.iter_mut().zip(operands) {
-                *slot = otter_bytecode::opcode_schema::encode_operand_word(*operand);
-            }
-            NO_OVERFLOW_OPERANDS
-        } else {
-            let offset = u32::try_from(overflow_operand_words.len())
-                .expect("operand overflow table exceeds u32");
-            overflow_operand_words.extend(
-                operands
-                    .iter()
-                    .copied()
-                    .map(otter_bytecode::opcode_schema::encode_operand_word),
-            );
-            offset
-        };
+        assert!(wordcode.get(word_index as usize).is_some());
         Self {
-            op,
+            wordcode,
+            word_index,
             code_block_id,
             instruction_pc,
             property_ic_site: if property_ic_site == NO_PROPERTY_IC_SITE {
@@ -906,16 +883,13 @@ impl CodeBlockInstruction {
             } else {
                 Some(property_ic_site as usize)
             },
-            operand_count,
-            inline_operand_words,
-            overflow_operand_offset,
         }
     }
 
     /// Opcode.
     #[must_use]
-    pub const fn op(&self) -> Op {
-        self.op
+    pub fn op(&self) -> Op {
+        self.deref_word().op
     }
 
     /// Owning CodeBlock identity.
@@ -925,26 +899,28 @@ impl CodeBlockInstruction {
     }
 
     /// Whether all operand words live in the instruction record.
+    #[cfg(test)]
     #[must_use]
-    pub(crate) const fn operands_are_inline(&self) -> bool {
-        self.overflow_operand_offset == NO_OVERFLOW_OPERANDS
-    }
-
-    fn operand_word(&self, overflow_operand_words: &[u32], index: usize) -> Option<u32> {
-        if index >= usize::from(self.operand_count) {
-            return None;
-        }
-        if self.operands_are_inline() {
-            return self.inline_operand_words.get(index).copied();
-        }
-        let start = self.overflow_operand_offset as usize;
-        overflow_operand_words.get(start + index).copied()
+    pub(crate) fn operands_are_inline(&self) -> bool {
+        self.deref_word().operands_are_inline()
     }
 
     /// Dense property IC site index for named property opcodes.
     #[must_use]
     pub const fn property_ic_site(&self) -> Option<usize> {
         self.property_ic_site
+    }
+
+    fn deref_word(&self) -> &WordInstruction {
+        &self.wordcode[self.word_index as usize]
+    }
+}
+
+impl std::ops::Deref for CodeBlockInstruction {
+    type Target = WordInstruction;
+
+    fn deref(&self) -> &Self::Target {
+        self.deref_word()
     }
 }
 
@@ -957,7 +933,7 @@ mod tests {
         Function {
             id: 0,
             name: "exec-test".to_string(),
-            code,
+            code: code.into(),
             ..Function::default()
         }
     }
@@ -983,8 +959,7 @@ mod tests {
                 Operand::Register(0),
                 Operand::Register(1),
                 Operand::Register(2),
-            ]
-            .into(),
+            ],
         }]);
         let module = module(function);
 
@@ -994,7 +969,7 @@ mod tests {
 
         assert_eq!(instr.op(), Op::Add);
         assert!(instr.operands_are_inline());
-        assert_eq!(std::mem::size_of_val(&instr.inline_operand_words), 16);
+        assert_eq!(std::mem::size_of::<WordInstruction>(), 24);
         assert_eq!(function.register(instr, 0), Some(0));
         assert_eq!(function.register(instr, 1), Some(1));
         assert_eq!(function.register(instr, 2), Some(2));
@@ -1015,12 +990,12 @@ mod tests {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(u16::MAX), Operand::Imm32(i32::MIN)].into(),
+                operands: vec![Operand::Register(u16::MAX), Operand::Imm32(i32::MIN)],
             },
             Instruction {
                 pc: 1,
                 op: Op::LoadNumber,
-                operands: vec![Operand::Register(7), Operand::ConstIndex(u32::MAX)].into(),
+                operands: vec![Operand::Register(7), Operand::ConstIndex(u32::MAX)],
             },
         ]);
         let executable = ExecutableModule::from_bytecode(&module(function));
@@ -1044,7 +1019,7 @@ mod tests {
         let function = function(vec![Instruction {
             pc: 7,
             op: Op::Call,
-            operands: operands.clone().into(),
+            operands: operands.clone(),
         }]);
         let module = module(function);
 
@@ -1075,7 +1050,7 @@ mod tests {
         let function = function(vec![Instruction {
             pc: 0,
             op: Op::MakeClass,
-            operands: operands.clone().into(),
+            operands: operands.clone(),
         }]);
         let executable = ExecutableModule::from_bytecode(&module(function));
         let function = executable.function(0).unwrap();
@@ -1095,8 +1070,7 @@ mod tests {
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::ConstIndex(0),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 1,
@@ -1106,8 +1080,7 @@ mod tests {
                     Operand::ConstIndex(0),
                     Operand::Register(0),
                     Operand::Register(2),
-                ]
-                .into(),
+                ],
             },
         ]);
         let module = module(function);
@@ -1130,8 +1103,7 @@ mod tests {
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::ConstIndex(7),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 1,
@@ -1140,8 +1112,7 @@ mod tests {
                     Operand::Register(2),
                     Operand::Register(0),
                     Operand::Register(3),
-                ]
-                .into(),
+                ],
             },
         ]);
         let module = module(function);
@@ -1182,8 +1153,7 @@ mod tests {
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::ConstIndex(0),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 1,
@@ -1193,8 +1163,7 @@ mod tests {
                     Operand::Register(3),
                     Operand::ConstIndex(1),
                     Operand::Register(5),
-                ]
-                .into(),
+                ],
             },
         ]);
         let module = module(function);
@@ -1219,8 +1188,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "compiler emitted bytecode that violates the opcode schema")]
-    fn code_block_rejects_unverified_variadic_layout() {
+    #[should_panic(expected = "invalid Call wordcode operands")]
+    fn wordcode_builder_rejects_unverified_variadic_layout() {
         let function = function(vec![Instruction {
             pc: 0,
             op: Op::Call,
@@ -1229,8 +1198,7 @@ mod tests {
                 Operand::Register(1),
                 Operand::ConstIndex(2),
                 Operand::Register(2),
-            ]
-            .into(),
+            ],
         }]);
 
         let _ = ExecutableModule::from_bytecode(&module(function));

@@ -7,9 +7,11 @@
 //! # Contents
 //! - [`Op`] — canonical opcode enum (`Nop`, `LoadUndefined`, `Return`
 //!   for the harness slice; extended slice-by-slice).
-//! - [`Instruction`] — decoded form: `(pc, op, operands)`.
-//! - [`Function`] — one compiled function: registers, code, spans,
-//!   constants index.
+//! - [`FunctionCode`] / [`WordInstruction`] — authoritative compact execution
+//!   wordcode and schema-driven operand access.
+//! - [`Instruction`] — cold decoded wire/debug DTO.
+//! - [`Function`] — one compiled function: registers, authoritative wordcode,
+//!   spans, and constants index.
 //! - [`BytecodeModule`] — top-level container the compiler emits and
 //!   the VM consumes.
 //! - [`disasm`] — text disassembler for CLI/debug output.
@@ -19,8 +21,10 @@
 //!   effects, and tier-policy metadata.
 //!
 //! # Invariants
-//! - Instructions inside [`Function::code`] are sorted by `pc`
-//!   ascending; spans inside [`Function::spans`] are sorted by `pc`.
+//! - An instruction's index in [`Function::code`] is its logical PC; spans
+//!   inside [`Function::spans`] are sorted by logical PC.
+//! - Decoded [`Instruction`] values and byte PCs never enter the hot execution
+//!   representation.
 //! - Mnemonics are `SCREAMING_SNAKE_CASE` and match the strings the
 //!   disassembler emits.
 //! - Opcode byte assignments have one source in [`opcode_schema`]; encoding
@@ -35,8 +39,14 @@ pub mod encoding;
 pub mod method_id;
 pub mod opcode_audit;
 pub mod opcode_schema;
+pub mod wordcode;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+pub use wordcode::{
+    FunctionCode, FunctionCodeBuilder, Instruction as WordInstruction,
+    OperandView as WordOperandView,
+};
+
+use serde::{Deserialize, Serialize};
 
 /// Sentinel offset value that means "this try block does not have
 /// a catch (or finally) clause". Picked as `i32::MIN` so any real
@@ -52,6 +62,7 @@ pub const NO_HANDLER_OFFSET: i32 = i32::MIN;
 /// required to compile and execute the smoke fixtures
 /// (`empty-script.ts`, `literal-undefined.ts`). Slice tasks
 /// `09`–`13` extend this enum.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
@@ -1767,15 +1778,19 @@ impl Op {
     }
 }
 
-/// One decoded instruction.
+/// One cold decoded wire/debug instruction.
+///
+/// Runtime execution never stores this DTO: [`Function::code`] is authoritative
+/// [`FunctionCode`]. The byte PC exists only while validating or displaying a
+/// serialized byte stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Instruction {
-    /// Program counter (byte offset within the function's `code`).
+    /// Byte offset within the cold serialized instruction stream.
     pub pc: u32,
     /// Opcode.
     pub op: Op,
     /// Operands in declaration order.
-    pub operands: OperandList,
+    pub operands: Vec<Operand>,
 }
 
 /// One operand value with a kind tag for the JSON dump.
@@ -1788,184 +1803,6 @@ pub enum Operand {
     ConstIndex(u32),
     /// Inline signed 32-bit immediate (used by `LoadInt32`).
     Imm32(i32),
-}
-
-/// Inline-first instruction operand storage.
-///
-/// Most VM instructions use one to three operands. Keeping those
-/// operands inside the instruction avoids one heap allocation per
-/// fixed-width instruction. Rare variadic instructions spill into a frozen
-/// boxed slice so compiled bytecode does not retain builder-only vector
-/// capacity.
-#[derive(Clone, PartialEq, Eq)]
-pub enum OperandList {
-    /// Inline storage for common fixed-width instructions.
-    Inline {
-        /// Number of valid entries in `operands`.
-        len: u8,
-        /// Inline operand slots.
-        operands: [Operand; 3],
-    },
-    /// Heap storage for rare variadic instructions.
-    Spill(Box<[Operand]>),
-}
-
-impl OperandList {
-    /// Return operands in declaration order.
-    #[must_use]
-    pub fn as_slice(&self) -> &[Operand] {
-        match self {
-            Self::Inline { len, operands } => &operands[..*len as usize],
-            Self::Spill(operands) => operands,
-        }
-    }
-
-    /// Return mutable operands in declaration order.
-    #[must_use]
-    pub fn as_mut_slice(&mut self) -> &mut [Operand] {
-        match self {
-            Self::Inline { len, operands } => &mut operands[..*len as usize],
-            Self::Spill(operands) => operands,
-        }
-    }
-
-    /// Number of operands.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.as_slice().len()
-    }
-
-    /// Whether the instruction has no operands.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.as_slice().is_empty()
-    }
-
-    /// First operand, if present.
-    #[must_use]
-    pub fn first(&self) -> Option<&Operand> {
-        self.as_slice().first()
-    }
-
-    /// First mutable operand, if present.
-    #[must_use]
-    pub fn first_mut(&mut self) -> Option<&mut Operand> {
-        self.as_mut_slice().first_mut()
-    }
-
-    /// Operand by index.
-    #[must_use]
-    pub fn get(&self, index: usize) -> Option<&Operand> {
-        self.as_slice().get(index)
-    }
-
-    /// Mutable operand by index.
-    #[must_use]
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut Operand> {
-        self.as_mut_slice().get_mut(index)
-    }
-
-    /// Iterator over operands in declaration order.
-    pub fn iter(&self) -> std::slice::Iter<'_, Operand> {
-        self.as_slice().iter()
-    }
-
-    /// Heap-backed operand slots. Inline operands report zero.
-    #[must_use]
-    pub fn spilled_operand_len(&self) -> usize {
-        match self {
-            Self::Inline { .. } => 0,
-            Self::Spill(operands) => operands.len(),
-        }
-    }
-}
-
-impl Default for OperandList {
-    fn default() -> Self {
-        Self::Inline {
-            len: 0,
-            operands: [Operand::Register(0); 3],
-        }
-    }
-}
-
-impl std::fmt::Debug for OperandList {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.as_slice()).finish()
-    }
-}
-
-impl From<Vec<Operand>> for OperandList {
-    fn from(operands: Vec<Operand>) -> Self {
-        match operands.len() {
-            0 => Self::default(),
-            1..=3 => {
-                let len = operands.len();
-                let mut inline = [Operand::Register(0); 3];
-                for (slot, operand) in inline.iter_mut().zip(operands) {
-                    *slot = operand;
-                }
-                Self::Inline {
-                    len: len as u8,
-                    operands: inline,
-                }
-            }
-            _ => Self::Spill(operands.into_boxed_slice()),
-        }
-    }
-}
-
-impl<const N: usize> From<[Operand; N]> for OperandList {
-    fn from(operands: [Operand; N]) -> Self {
-        Vec::from(operands).into()
-    }
-}
-
-impl From<&[Operand]> for OperandList {
-    fn from(operands: &[Operand]) -> Self {
-        operands.to_vec().into()
-    }
-}
-
-impl<'a> IntoIterator for &'a OperandList {
-    type IntoIter = std::slice::Iter<'a, Operand>;
-    type Item = &'a Operand;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl std::ops::Index<usize> for OperandList {
-    type Output = Operand;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.as_slice()[index]
-    }
-}
-
-impl std::ops::IndexMut<usize> for OperandList {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.as_mut_slice()[index]
-    }
-}
-
-impl Serialize for OperandList {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self.as_slice().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for OperandList {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Vec::<Operand>::deserialize(deserializer).map(Self::from)
-    }
 }
 
 /// One source-span entry attached to a `pc`.
@@ -2171,8 +2008,8 @@ pub struct Function {
     /// serialized.
     #[serde(skip)]
     pub source_text_span: Option<(u32, u32)>,
-    /// Encoded instructions.
-    pub code: Vec<Instruction>,
+    /// Authoritative execution wordcode.
+    pub code: FunctionCode,
     /// `pc -> source span` table.
     pub spans: Vec<SpanEntry>,
 }

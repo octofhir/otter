@@ -14,7 +14,7 @@
 
 use std::mem::{align_of, size_of};
 
-use otter_bytecode::{Function, Instruction, Op, Operand};
+use otter_bytecode::{Function, Instruction, Op, Operand, WordInstruction};
 use otter_vm::{Frame, Value, VmError};
 
 #[test]
@@ -40,6 +40,11 @@ fn print_hot_struct_layouts() {
         align_of::<Instruction>()
     );
     eprintln!(
+        "otter_bytecode::WordInstruction: size={} align={}",
+        size_of::<WordInstruction>(),
+        align_of::<WordInstruction>()
+    );
+    eprintln!(
         "otter_bytecode::Operand: size={} align={}",
         size_of::<Operand>(),
         align_of::<Operand>()
@@ -49,17 +54,22 @@ fn print_hot_struct_layouts() {
 #[test]
 fn print_representative_bytecode_operand_pressure() {
     let function = representative_fixed_width_function();
-    let instruction_stream_bytes = function.code.len() * size_of::<Instruction>();
-    let operand_slots: usize = function.code.iter().map(|instr| instr.operands.len()).sum();
+    let instruction_stream_bytes = function.code.len() * size_of::<WordInstruction>();
+    let operand_slots: usize = function
+        .code
+        .iter()
+        .map(|instr| instr.operand_count())
+        .sum();
     let spilled_operand_instructions = function
         .code
         .iter()
-        .filter(|instr| instr.operands.spilled_operand_len() > 0)
+        .filter(|instr| !instr.operands_are_inline())
         .count();
     let spilled_operand_bytes: usize = function
         .code
         .iter()
-        .map(|instr| instr.operands.spilled_operand_len() * size_of::<Operand>())
+        .filter(|instr| !instr.operands_are_inline())
+        .map(|instr| instr.operand_count() * size_of::<u32>())
         .sum();
 
     eprintln!(
@@ -85,39 +95,40 @@ fn representative_fixed_width_function() -> Function {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Register(0), Imm32(1)].into(),
+                operands: vec![Register(0), Imm32(1)],
             },
             Instruction {
                 pc: 1,
                 op: Op::LoadInt32,
-                operands: vec![Register(1), Imm32(2)].into(),
+                operands: vec![Register(1), Imm32(2)],
             },
             Instruction {
                 pc: 2,
                 op: Op::Add,
-                operands: vec![Register(2), Register(0), Register(1)].into(),
+                operands: vec![Register(2), Register(0), Register(1)],
             },
             Instruction {
                 pc: 3,
                 op: Op::NewObject,
-                operands: vec![Register(3)].into(),
+                operands: vec![Register(3)],
             },
             Instruction {
                 pc: 4,
                 op: Op::StoreProperty,
-                operands: vec![Register(3), ConstIndex(0), Register(2)].into(),
+                operands: vec![Register(3), ConstIndex(0), Register(2), Register(2)],
             },
             Instruction {
                 pc: 5,
                 op: Op::LoadProperty,
-                operands: vec![Register(2), Register(3), ConstIndex(0)].into(),
+                operands: vec![Register(2), Register(3), ConstIndex(0)],
             },
             Instruction {
                 pc: 6,
                 op: Op::ReturnValue,
-                operands: vec![Register(2)].into(),
+                operands: vec![Register(2)],
             },
-        ],
+        ]
+        .into(),
         ..Function::default()
     }
 }

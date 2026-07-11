@@ -87,7 +87,7 @@ pub(crate) fn compile_static_block(
     slot.contains_direct_eval = child.contains_direct_eval;
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
-    slot.code = child.code;
+    slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
 }
@@ -167,7 +167,7 @@ pub(crate) fn compile_static_field_initializer(
     slot.contains_direct_eval = child.contains_direct_eval;
     slot.param_count = 0;
     slot.own_upvalue_count = child.own_upvalue_count;
-    slot.code = child.code;
+    slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
 }

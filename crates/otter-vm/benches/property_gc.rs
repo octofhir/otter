@@ -13,11 +13,11 @@ use std::time::Instant;
 
 const GC_CADENCE_RUNS: u32 = 512;
 
-fn instr(pc: u32, op: Op, operands: impl Into<otter_bytecode::OperandList>) -> Instruction {
+fn instr(pc: u32, op: Op, operands: impl AsRef<[Operand]>) -> Instruction {
     Instruction {
         pc,
         op,
-        operands: operands.into(),
+        operands: operands.as_ref().to_vec(),
     }
 }
 
@@ -82,7 +82,7 @@ fn new_object_named_store_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -157,7 +157,7 @@ fn new_object_two_named_stores_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo"), string_constant("bar")],
@@ -238,7 +238,7 @@ fn inherited_writable_data_store_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 10,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -345,7 +345,7 @@ fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 12,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![
@@ -419,7 +419,7 @@ fn direct_prototype_missing_store_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 10,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -483,7 +483,7 @@ fn primitive_boolean_store_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],

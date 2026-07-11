@@ -178,7 +178,7 @@ pub(crate) fn compile_synthetic_constructor(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
-    slot.code = child.code;
+    slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
 }
@@ -372,7 +372,7 @@ pub(crate) fn compile_class_constructor(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
-    slot.code = child.code;
+    slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
 }

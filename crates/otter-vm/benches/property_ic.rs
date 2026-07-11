@@ -14,11 +14,11 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use otter_bytecode::{BytecodeModule, Constant, Function, Instruction, Op, Operand, SourceKind};
 use otter_vm::{ExecutionContext, Interpreter};
 
-fn instr(pc: u32, op: Op, operands: impl Into<otter_bytecode::OperandList>) -> Instruction {
+fn instr(pc: u32, op: Op, operands: impl AsRef<[Operand]>) -> Instruction {
     Instruction {
         pc,
         op,
-        operands: operands.into(),
+        operands: operands.as_ref().to_vec(),
     }
 }
 
@@ -102,7 +102,7 @@ fn named_property_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -190,7 +190,7 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -263,7 +263,7 @@ fn own_named_load_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -337,7 +337,7 @@ fn own_named_store_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -416,7 +416,7 @@ fn prototype_named_load_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 10,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -494,7 +494,7 @@ fn has_property_own_data_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -578,7 +578,7 @@ fn has_property_prototype_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 10,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -645,7 +645,7 @@ fn has_property_missing_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 8,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("missing")],
@@ -718,7 +718,7 @@ fn named_delete_own_data_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 9,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],
@@ -780,7 +780,7 @@ fn named_delete_missing_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 7,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("missing")],
@@ -859,7 +859,7 @@ fn named_delete_inherited_present_loop(iterations: i32) -> ExecutionContext {
             id: 0,
             name: "<main>".to_string(),
             scratch: 10,
-            code,
+            code: code.into(),
             ..Function::default()
         }],
         constants: vec![string_constant("foo")],

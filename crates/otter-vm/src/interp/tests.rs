@@ -49,7 +49,7 @@ fn test_function(
         module_url: String::new(),
         direct_eval_bindings: Vec::new(),
         contains_direct_eval: false,
-        code,
+        code: code.into(),
         spans,
     }
 }
@@ -107,12 +107,12 @@ fn returns_undefined_for_load_then_return() {
             Instruction {
                 pc: 0,
                 op: Op::LoadUndefined,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         1,
@@ -128,7 +128,7 @@ fn strict_store_global_binding_rejects_non_writable_global_property() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(0), Operand::Imm32(12)].into(),
+            operands: vec![Operand::Register(0), Operand::Imm32(12)],
         },
         Instruction {
             pc: 1,
@@ -137,13 +137,12 @@ fn strict_store_global_binding_rejects_non_writable_global_property() {
                 Operand::Register(0),
                 Operand::ConstIndex(0),
                 Operand::Imm32(1),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 2,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -173,17 +172,17 @@ fn load_string_constant_reuses_traced_cache_entry() {
         Instruction {
             pc: 0,
             op: Op::LoadString,
-            operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadString,
-            operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(1), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 2,
             op: Op::Return,
-            operands: vec![Operand::Register(1)].into(),
+            operands: vec![Operand::Register(1)],
         },
     ];
     let module = BytecodeModule {
@@ -225,12 +224,12 @@ fn load_string_constant_cache_distinguishes_standalone_contexts() {
                     Instruction {
                         pc: 0,
                         op: Op::LoadString,
-                        operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+                        operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
                     },
                     Instruction {
                         pc: 1,
                         op: Op::Return,
-                        operands: vec![Operand::Register(0)].into(),
+                        operands: vec![Operand::Register(0)],
                     },
                 ],
             )],
@@ -257,17 +256,17 @@ fn load_bigint_constant_reuses_traced_cache_entry() {
         Instruction {
             pc: 0,
             op: Op::LoadBigInt,
-            operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadBigInt,
-            operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(1), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 2,
             op: Op::Return,
-            operands: vec![Operand::Register(1)].into(),
+            operands: vec![Operand::Register(1)],
         },
     ];
     let module = BytecodeModule {
@@ -309,12 +308,12 @@ fn load_bigint_constant_cache_distinguishes_standalone_contexts() {
                     Instruction {
                         pc: 0,
                         op: Op::LoadBigInt,
-                        operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+                        operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
                     },
                     Instruction {
                         pc: 1,
                         op: Op::Return,
-                        operands: vec![Operand::Register(0)].into(),
+                        operands: vec![Operand::Register(0)],
                     },
                 ],
             )],
@@ -346,7 +345,7 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(3), Operand::Imm32(100)].into(),
+                operands: vec![Operand::Register(3), Operand::Imm32(100)],
             },
             Instruction {
                 pc: 1,
@@ -355,13 +354,12 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
                     Operand::Register(3),
                     Operand::Register(0),
                     Operand::Register(3),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 2,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(4), Operand::Imm32(10)].into(),
+                operands: vec![Operand::Register(4), Operand::Imm32(10)],
             },
             Instruction {
                 pc: 3,
@@ -370,8 +368,7 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
                     Operand::Register(4),
                     Operand::Register(1),
                     Operand::Register(4),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 4,
@@ -380,8 +377,7 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
                     Operand::Register(3),
                     Operand::Register(3),
                     Operand::Register(4),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 5,
@@ -390,13 +386,12 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
                     Operand::Register(3),
                     Operand::Register(3),
                     Operand::Register(2),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 6,
                 op: Op::Return,
-                operands: vec![Operand::Register(3)].into(),
+                operands: vec![Operand::Register(3)],
             },
         ],
     );
@@ -404,22 +399,22 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(1)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(1)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(2), Operand::Imm32(2)].into(),
+            operands: vec![Operand::Register(2), Operand::Imm32(2)],
         },
         Instruction {
             pc: 2,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(3), Operand::Imm32(3)].into(),
+            operands: vec![Operand::Register(3), Operand::Imm32(3)],
         },
         Instruction {
             pc: 3,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(4), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(4), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 4,
@@ -431,13 +426,12 @@ fn direct_bytecode_call_binds_arguments_from_register_window() {
                 Operand::Register(3),
                 Operand::Register(1),
                 Operand::Register(2),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 5,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -468,12 +462,12 @@ fn direct_bytecode_call_window_populates_arguments_object() {
             Instruction {
                 pc: 0,
                 op: Op::CollectArguments,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -482,17 +476,17 @@ fn direct_bytecode_call_window_populates_arguments_object() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(21)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(21)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(2), Operand::Imm32(34)].into(),
+            operands: vec![Operand::Register(2), Operand::Imm32(34)],
         },
         Instruction {
             pc: 2,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(3), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(3), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 3,
@@ -503,13 +497,12 @@ fn direct_bytecode_call_window_populates_arguments_object() {
                 Operand::ConstIndex(2),
                 Operand::Register(2),
                 Operand::Register(1),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 4,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -551,12 +544,12 @@ fn direct_bytecode_call_window_populates_rest_arguments() {
             Instruction {
                 pc: 0,
                 op: Op::CollectRest,
-                operands: vec![Operand::Register(1)].into(),
+                operands: vec![Operand::Register(1)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(1)].into(),
+                operands: vec![Operand::Register(1)],
             },
         ],
     );
@@ -565,22 +558,22 @@ fn direct_bytecode_call_window_populates_rest_arguments() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(5)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(5)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(2), Operand::Imm32(8)].into(),
+            operands: vec![Operand::Register(2), Operand::Imm32(8)],
         },
         Instruction {
             pc: 2,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(3), Operand::Imm32(13)].into(),
+            operands: vec![Operand::Register(3), Operand::Imm32(13)],
         },
         Instruction {
             pc: 3,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(4), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(4), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 4,
@@ -592,13 +585,12 @@ fn direct_bytecode_call_window_populates_rest_arguments() {
                 Operand::Register(1),
                 Operand::Register(3),
                 Operand::Register(2),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 5,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -638,12 +630,12 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
         Instruction {
             pc: 0,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(42)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(42)],
         },
         Instruction {
             pc: 2,
@@ -653,13 +645,12 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
                 Operand::ConstIndex(1),
                 Operand::Register(1),
                 Operand::Register(2),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 3,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -798,12 +789,12 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
         Instruction {
             pc: 0,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let inner = test_function(1, "anonymous", 0, 1, Vec::new());
@@ -3076,17 +3067,17 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadUndefined,
-                operands: vec![Operand::Register(1)].into(),
+                operands: vec![Operand::Register(1)],
             },
             Instruction {
                 pc: 1,
                 op: Op::NewError,
-                operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+                operands: vec![Operand::Register(0), Operand::Register(1)],
             },
             Instruction {
                 pc: 2,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         2,
@@ -3197,17 +3188,17 @@ fn bytecode_new_weak_ref_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::NewObject,
-                operands: vec![Operand::Register(1)].into(),
+                operands: vec![Operand::Register(1)],
             },
             Instruction {
                 pc: 1,
                 op: Op::NewWeakRef,
-                operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+                operands: vec![Operand::Register(0), Operand::Register(1)],
             },
             Instruction {
                 pc: 2,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         2,
@@ -3230,17 +3221,17 @@ fn bytecode_new_finalization_registry_uses_young_allocation_with_frame_roots() {
         Instruction {
             pc: 0,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(1), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
             op: Op::NewFinalizationRegistry,
-            operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+            operands: vec![Operand::Register(0), Operand::Register(1)],
         },
         Instruction {
             pc: 2,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -3273,7 +3264,7 @@ fn direct_bytecode_async_call_window_populates_parameters() {
         vec![Instruction {
             pc: 0,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         }],
     );
     callee.is_async = true;
@@ -3281,12 +3272,12 @@ fn direct_bytecode_async_call_window_populates_parameters() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(144)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(144)],
         },
         Instruction {
             pc: 1,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(2), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(2), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 2,
@@ -3296,13 +3287,12 @@ fn direct_bytecode_async_call_window_populates_parameters() {
                 Operand::Register(2),
                 Operand::ConstIndex(1),
                 Operand::Register(1),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 3,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -3341,12 +3331,12 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(91)].into(),
+                operands: vec![Operand::Register(0), Operand::Imm32(91)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -3448,12 +3438,12 @@ fn top_level_async_entry_returns_the_awaited_completion() {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(512)].into(),
+                operands: vec![Operand::Register(0), Operand::Imm32(512)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -3482,17 +3472,17 @@ fn promise_fulfilled_of_allocates_the_body_in_old_space() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(211)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(211)],
         },
         Instruction {
             pc: 1,
             op: Op::PromiseFulfilledOf,
-            operands: vec![Operand::Register(0), Operand::Register(1)].into(),
+            operands: vec![Operand::Register(0), Operand::Register(1)],
         },
         Instruction {
             pc: 2,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -3656,12 +3646,12 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
             Instruction {
                 pc: 0,
                 op: Op::CollectArguments,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -3670,17 +3660,17 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
         Instruction {
             pc: 0,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(1), Operand::Imm32(55)].into(),
+            operands: vec![Operand::Register(1), Operand::Imm32(55)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadInt32,
-            operands: vec![Operand::Register(2), Operand::Imm32(89)].into(),
+            operands: vec![Operand::Register(2), Operand::Imm32(89)],
         },
         Instruction {
             pc: 2,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(3), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(3), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 3,
@@ -3691,13 +3681,12 @@ fn direct_bytecode_construct_window_populates_arguments_object() {
                 Operand::ConstIndex(2),
                 Operand::Register(2),
                 Operand::Register(1),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 4,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -3735,12 +3724,12 @@ fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadThis,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -3748,7 +3737,7 @@ fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
         Instruction {
             pc: 0,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(1), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
@@ -3757,13 +3746,12 @@ fn direct_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
                 Operand::Register(0),
                 Operand::Register(1),
                 Operand::ConstIndex(0),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 2,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -3797,12 +3785,12 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadThis,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -3810,12 +3798,12 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
         Instruction {
             pc: 0,
             op: Op::MakeFunction,
-            operands: vec![Operand::Register(1), Operand::ConstIndex(0)].into(),
+            operands: vec![Operand::Register(1), Operand::ConstIndex(0)],
         },
         Instruction {
             pc: 1,
             op: Op::LoadUndefined,
-            operands: vec![Operand::Register(2)].into(),
+            operands: vec![Operand::Register(2)],
         },
         Instruction {
             pc: 2,
@@ -3825,8 +3813,7 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
                 Operand::Register(1),
                 Operand::Register(2),
                 Operand::ConstIndex(0),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 3,
@@ -3835,13 +3822,12 @@ fn bound_bytecode_construct_receiver_uses_young_allocation_with_frame_roots() {
                 Operand::Register(0),
                 Operand::Register(3),
                 Operand::ConstIndex(0),
-            ]
-            .into(),
+            ],
         },
         Instruction {
             pc: 4,
             op: Op::Return,
-            operands: vec![Operand::Register(0)].into(),
+            operands: vec![Operand::Register(0)],
         },
     ];
     let module = BytecodeModule {
@@ -3871,12 +3857,12 @@ fn runtime_budget_stats_record_reductions_and_budget_observations() {
             Instruction {
                 pc: 0,
                 op: Op::LoadUndefined,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         1,
@@ -3904,12 +3890,12 @@ fn runtime_budget_can_reject_on_reduction_limit() {
             Instruction {
                 pc: 0,
                 op: Op::LoadUndefined,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         1,
@@ -3935,12 +3921,12 @@ fn runtime_budget_stats_record_heap_allocations() {
             Instruction {
                 pc: 0,
                 op: Op::NewObject,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         1,
@@ -3962,12 +3948,12 @@ fn bytecode_new_object_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::NewObject,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         1,
@@ -3990,7 +3976,7 @@ fn bytecode_new_array_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(42)].into(),
+                operands: vec![Operand::Register(0), Operand::Imm32(42)],
             },
             Instruction {
                 pc: 1,
@@ -3999,13 +3985,12 @@ fn bytecode_new_array_uses_young_allocation_with_frame_roots() {
                     Operand::Register(1),
                     Operand::ConstIndex(1),
                     Operand::Register(0),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 2,
                 op: Op::Return,
-                operands: vec![Operand::Register(1)].into(),
+                operands: vec![Operand::Register(1)],
             },
         ],
         2,
@@ -4028,22 +4013,22 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(1)].into(),
+                operands: vec![Operand::Register(0), Operand::Imm32(1)],
             },
             Instruction {
                 pc: 1,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(1), Operand::Imm32(2)].into(),
+                operands: vec![Operand::Register(1), Operand::Imm32(2)],
             },
             Instruction {
                 pc: 2,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(2), Operand::Imm32(3)].into(),
+                operands: vec![Operand::Register(2), Operand::Imm32(3)],
             },
             Instruction {
                 pc: 3,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(3), Operand::Imm32(4)].into(),
+                operands: vec![Operand::Register(3), Operand::Imm32(4)],
             },
             Instruction {
                 pc: 4,
@@ -4055,23 +4040,22 @@ fn bytecode_array_push_uses_root_aware_growth_with_frame_roots() {
                     Operand::Register(1),
                     Operand::Register(2),
                     Operand::Register(3),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 5,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(5), Operand::Imm32(5)].into(),
+                operands: vec![Operand::Register(5), Operand::Imm32(5)],
             },
             Instruction {
                 pc: 6,
                 op: Op::ArrayPush,
-                operands: vec![Operand::Register(4), Operand::Register(5)].into(),
+                operands: vec![Operand::Register(4), Operand::Register(5)],
             },
             Instruction {
                 pc: 7,
                 op: Op::Return,
-                operands: vec![Operand::Register(4)].into(),
+                operands: vec![Operand::Register(4)],
             },
         ],
         6,
@@ -4101,22 +4085,22 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(0), Operand::Imm32(1)].into(),
+                operands: vec![Operand::Register(0), Operand::Imm32(1)],
             },
             Instruction {
                 pc: 1,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(1), Operand::Imm32(2)].into(),
+                operands: vec![Operand::Register(1), Operand::Imm32(2)],
             },
             Instruction {
                 pc: 2,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(2), Operand::Imm32(3)].into(),
+                operands: vec![Operand::Register(2), Operand::Imm32(3)],
             },
             Instruction {
                 pc: 3,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(3), Operand::Imm32(4)].into(),
+                operands: vec![Operand::Register(3), Operand::Imm32(4)],
             },
             Instruction {
                 pc: 4,
@@ -4128,18 +4112,17 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
                     Operand::Register(1),
                     Operand::Register(2),
                     Operand::Register(3),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 5,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(5), Operand::Imm32(4)].into(),
+                operands: vec![Operand::Register(5), Operand::Imm32(4)],
             },
             Instruction {
                 pc: 6,
                 op: Op::LoadInt32,
-                operands: vec![Operand::Register(6), Operand::Imm32(99)].into(),
+                operands: vec![Operand::Register(6), Operand::Imm32(99)],
             },
             Instruction {
                 pc: 7,
@@ -4149,13 +4132,12 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
                     Operand::Register(5),
                     Operand::Register(6),
                     Operand::Register(7),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 8,
                 op: Op::Return,
-                operands: vec![Operand::Register(4)].into(),
+                operands: vec![Operand::Register(4)],
             },
         ],
         8,
@@ -4206,7 +4188,7 @@ fn missing_return_errors() {
         vec![Instruction {
             pc: 0,
             op: Op::Nop,
-            operands: vec![].into(),
+            operands: vec![],
         }],
         0,
     );
@@ -4252,8 +4234,9 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
-            operands: vec![].into(),
-        }],
+            operands: vec![],
+        }]
+        .into(),
         spans: vec![SpanEntry {
             pc: 0,
             span: (0, 0),
@@ -4268,7 +4251,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
-            operands: vec![].into(),
+            operands: vec![],
         }],
         1,
     ));
@@ -4318,8 +4301,9 @@ fn unwind_throw_lands_in_catch_handler() {
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
-            operands: vec![].into(),
-        }],
+            operands: vec![],
+        }]
+        .into(),
         spans: vec![SpanEntry {
             pc: 0,
             span: (0, 0),
@@ -4341,7 +4325,7 @@ fn unwind_throw_lands_in_catch_handler() {
         vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
-            operands: vec![].into(),
+            operands: vec![],
         }],
         2,
     ));
@@ -4515,12 +4499,12 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
             Instruction {
                 pc: 0,
                 op: Op::LoadThis,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -4630,12 +4614,12 @@ fn run_construct_sync_receiver_uses_runtime_rooted_young_allocation() {
             Instruction {
                 pc: 0,
                 op: Op::LoadThis,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -4680,12 +4664,12 @@ fn run_construct_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
             Instruction {
                 pc: 0,
                 op: Op::LoadThis,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
     );
@@ -4771,8 +4755,9 @@ fn arrow_closure_overrides_call_site_this() {
         code: vec![Instruction {
             pc: 0,
             op: Op::ReturnUndefined,
-            operands: vec![].into(),
-        }],
+            operands: vec![],
+        }]
+        .into(),
         spans: vec![SpanEntry {
             pc: 0,
             span: (0, 0),
@@ -4809,14 +4794,15 @@ fn arrow_closure_overrides_call_site_this() {
             Instruction {
                 pc: 0,
                 op: Op::LoadThis,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
             Instruction {
                 pc: 1,
                 op: Op::ReturnValue,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
-        ],
+        ]
+        .into(),
         spans: vec![SpanEntry {
             pc: 0,
             span: (0, 0),
@@ -4879,7 +4865,7 @@ fn arrow_closure_overrides_call_site_this() {
             break;
         }
         if matches!(instr.op, Op::LoadThis) {
-            let dst = match instr.operands[0] {
+            let dst = match f.code.operand(instr, 0).expect("LoadThis dst") {
                 Operand::Register(r) => r,
                 _ => unreachable!(),
             };
@@ -4900,12 +4886,12 @@ fn interrupt_handle_breaks_loop() {
             Instruction {
                 pc: 0,
                 op: Op::Nop,
-                operands: vec![].into(),
+                operands: vec![],
             },
             Instruction {
                 pc: 1,
                 op: Op::Return,
-                operands: vec![Operand::Register(0)].into(),
+                operands: vec![Operand::Register(0)],
             },
         ],
         1,
@@ -4997,7 +4983,17 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
         vec![16u32, 32, 48]
             .into_iter()
             .map(|byte_pc| {
-                jit::JitTestInstruction::new(Op::Add, byte_pc / 16, byte_pc, 16, Vec::new())
+                jit::JitTestInstruction::new(
+                    Op::Add,
+                    byte_pc / 16,
+                    byte_pc,
+                    16,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                )
             })
             .collect(),
     );

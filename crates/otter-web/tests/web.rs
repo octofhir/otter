@@ -138,6 +138,51 @@ fn singleton_web_class_globals_are_branded_and_unconstructable() {
 }
 
 #[test]
+fn transform_stream_uses_branded_default_controller() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        globalThis.out = "pending";
+        let seenController;
+        const ts = new TransformStream({
+          start(c) { seenController = c; },
+          transform(chunk, c) { c.enqueue(chunk * 2); },
+        });
+        // Not directly constructable — checkable synchronously.
+        var ctor = "";
+        try { new TransformStreamDefaultController(); ctor = "ran"; }
+        catch (e) { ctor = String(e instanceof TypeError); }
+
+        const writer = ts.writable.getWriter();
+        const reader = ts.readable.getReader();
+        const collected = [];
+        (async () => {
+          writer.write(1); writer.write(2); writer.write(3);
+          writer.close();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            collected.push(value);
+          }
+          // The controller the transformer received is a branded instance;
+          // its start ran once the writable side pulled, so check it now.
+          let brand = (seenController instanceof TransformStreamDefaultController) + "|";
+          brand += (Object.prototype.toString.call(seenController) === "[object TransformStreamDefaultController]") + "|";
+          brand += (typeof seenController.enqueue === "function") + "|";
+          brand += (typeof TransformStreamDefaultController.prototype.terminate === "function");
+          globalThis.out = ctor + "|" + brand + "||" + collected.join(",");
+        })();
+        ctor
+        "#,
+    );
+    assert_eq!(result, "true");
+    let after = eval_string(&mut runtime, "out");
+    // ctor-throws | branding checks || each written value doubled through the stream.
+    assert_eq!(after, "true|true|true|true|true||2,4,6");
+}
+
+#[test]
 fn url_statics_parse_and_can_parse() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
@@ -462,6 +507,7 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "TextDecoderStream",
       "TextEncoder",
       "TextEncoderStream",
+      "TransformStreamDefaultController",
       "URLSearchParams",
       "URL",
     ];
@@ -481,7 +527,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "ReadableByteStreamController",
       "ReadableStreamBYOBReader",
       "ReadableStreamBYOBRequest",
-      "TransformStreamDefaultController",
       "URLPattern",
       "WebAssembly",
       "WebAssembly.compile",

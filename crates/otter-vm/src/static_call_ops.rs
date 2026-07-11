@@ -296,16 +296,35 @@ impl Interpreter {
         stack: &mut HoltStack,
         operands: &[Operand],
     ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
+        let target_reg = register_operand(operands.first())?;
+        let key_reg = register_operand(operands.get(1))?;
+        let descriptor_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        self.run_define_own_property_regs(
+            context,
+            stack,
+            top_idx,
+            target_reg,
+            key_reg,
+            descriptor_reg,
+        )
+    }
+
+    pub(crate) fn run_define_own_property_regs(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        target_reg: u16,
+        key_reg: u16,
+        descriptor_reg: u16,
+    ) -> Result<(), VmError> {
         let (target, key_value, desc_value) = {
-            let frame = &stack[top_idx];
-            let t = register_operand(operands.first())?;
-            let k = register_operand(operands.get(1))?;
-            let d = register_operand(operands.get(2))?;
+            let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
             (
-                *read_register(frame, t)?,
-                *read_register(frame, k)?,
-                *read_register(frame, d)?,
+                *read_register(frame, target_reg)?,
+                *read_register(frame, key_reg)?,
+                *read_register(frame, descriptor_reg)?,
             )
         };
         if !target.is_object_type() {
@@ -319,7 +338,7 @@ impl Interpreter {
         if !ok {
             return Err(self.err_type(("Cannot define property".to_string()).into()));
         }
-        let frame = &mut stack[top_idx];
+        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }

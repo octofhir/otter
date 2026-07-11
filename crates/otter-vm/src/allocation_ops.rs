@@ -764,11 +764,24 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let count = const_operand(operands.get(1))? as usize;
-        let mut elements: Vec<Value> = Vec::with_capacity(count);
+        let mut source_regs = Vec::with_capacity(count);
+        for i in 0..count {
+            source_regs.push(register_operand(operands.get(2 + i))?);
+        }
+        self.run_new_array_regs(stack, top_idx, dst, &source_regs)
+    }
+
+    pub(crate) fn run_new_array_regs(
+        &mut self,
+        stack: &mut HoltStack,
+        top_idx: usize,
+        dst: u16,
+        source_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let mut elements: Vec<Value> = Vec::with_capacity(source_regs.len());
         {
             let frame = &stack[top_idx];
-            for i in 0..count {
-                let r = register_operand(operands.get(2 + i))?;
+            for &r in source_regs {
                 elements.push(*read_register(frame, r)?);
             }
         }

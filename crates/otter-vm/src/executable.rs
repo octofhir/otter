@@ -8,10 +8,10 @@
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
 //! - [`CodeBlock`] — one immutable verified function body: instruction stream,
-//!   compact instruction records, variadic operand side table, and cold source
+//!   compact instruction records, overflow operand word table, and cold source
 //!   metadata.
-//! - [`CodeBlockInstruction`] — opcode plus inline fixed operands or a range in
-//!   the owning CodeBlock's variadic operand table.
+//! - [`CodeBlockInstruction`] — opcode plus inline operand words or a range in
+//!   the owning CodeBlock's overflow table.
 //!
 //! # Invariants
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
@@ -21,8 +21,8 @@
 //!   map is retained in the execution object.
 //! - Operand payloads are untagged 32-bit words. Their kinds come exclusively
 //!   from the opcode schema and are decoded through [`CodeBlock`] accessors.
-//! - Fixed operand words live inline. Only long schema-variadic instructions
-//!   use the CodeBlock-owned word side table; no instruction owns an operand box.
+//! - Up to four operand words live inline. Any longer instruction uses the
+//!   CodeBlock-owned overflow table; no instruction owns an operand box.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
 //!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
 //!   try-handler slots by the serialized verifier.
@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 const INLINE_OPERAND_CAPACITY: usize = 4;
-const NO_VARIADIC_OPERANDS: u32 = u32::MAX;
+const NO_OVERFLOW_OPERANDS: u32 = u32::MAX;
 
 /// Transient builder for [`ExecutableModule`].
 ///
@@ -274,7 +274,7 @@ impl CodeBlock {
         register_count: u16,
         instructions: &[crate::jit::JitTestInstruction],
     ) -> Arc<Self> {
-        let mut variadic_operand_words = Vec::new();
+        let mut overflow_operand_words = Vec::new();
         let code: Vec<_> = instructions
             .iter()
             .map(|instr| {
@@ -286,7 +286,7 @@ impl CodeBlock {
                     NO_PROPERTY_IC_SITE,
                     instr.byte_pc,
                     instr.byte_len,
-                    &mut variadic_operand_words,
+                    &mut overflow_operand_words,
                 ))
             })
             .collect();
@@ -317,7 +317,7 @@ impl CodeBlock {
             direct_eval_bindings: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
-            variadic_operand_words: variadic_operand_words.into_boxed_slice(),
+            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             byte_spans: Box::new([]),
             code_byte_len,
         })
@@ -375,7 +375,7 @@ impl CodeBlock {
     /// One schema-typed operand.
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
-        let word = instr.operand_word(&self.variadic_operand_words, index)?;
+        let word = instr.operand_word(&self.overflow_operand_words, index)?;
         let shape = otter_bytecode::opcode_schema::opcode_schema(instr.op).operand_shape;
         let prefix = shape.prefix()?;
         let kind = prefix
@@ -502,7 +502,7 @@ pub struct CodeBlock {
     pub code: Box<[Arc<CodeBlockInstruction>]>,
     /// Untagged operand-word side table used only by instructions exceeding the
     /// fixed inline capacity; the opcode schema supplies every word's kind.
-    variadic_operand_words: Box<[u32]>,
+    overflow_operand_words: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
@@ -536,7 +536,7 @@ impl CodeBlock {
                 function.name, function.id, offset
             )
         });
-        let mut variadic_operand_words = Vec::new();
+        let mut overflow_operand_words = Vec::new();
         let code = verified_code
             .iter()
             .enumerate()
@@ -572,7 +572,7 @@ impl CodeBlock {
                     property_ic_site,
                     byte_pc,
                     byte_len,
-                    &mut variadic_operand_words,
+                    &mut overflow_operand_words,
                 ))
             })
             .collect::<Vec<_>>()
@@ -659,7 +659,7 @@ impl CodeBlock {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
-            variadic_operand_words: variadic_operand_words.into_boxed_slice(),
+            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             byte_spans,
             code_byte_len,
         }
@@ -735,7 +735,7 @@ pub struct CodeBlockInstruction {
     /// Inline untagged operand words for common fixed-width instructions.
     inline_operand_words: [u32; INLINE_OPERAND_CAPACITY],
     /// Start in the owning CodeBlock side table, or `u32::MAX` for inline data.
-    variadic_operand_offset: u32,
+    overflow_operand_offset: u32,
 }
 
 impl CodeBlockInstruction {
@@ -755,7 +755,7 @@ impl CodeBlockInstruction {
         property_ic_site: u32,
         byte_pc: u32,
         byte_len: u16,
-        variadic_operand_words: &mut Vec<u32>,
+        overflow_operand_words: &mut Vec<u32>,
     ) -> Self {
         let operand_count =
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
@@ -768,20 +768,13 @@ impl CodeBlockInstruction {
             })
             .collect();
         let mut inline_operand_words = [0; INLINE_OPERAND_CAPACITY];
-        let variadic_operand_offset = if operand_words.len() <= INLINE_OPERAND_CAPACITY {
+        let overflow_operand_offset = if operand_words.len() <= INLINE_OPERAND_CAPACITY {
             inline_operand_words[..operand_words.len()].copy_from_slice(&operand_words);
-            NO_VARIADIC_OPERANDS
+            NO_OVERFLOW_OPERANDS
         } else {
-            assert!(
-                matches!(
-                    otter_bytecode::opcode_schema::opcode_schema(op).operand_shape,
-                    otter_bytecode::opcode_schema::OperandShape::Variadic { .. }
-                ),
-                "fixed opcode exceeds inline operand capacity: {op:?}",
-            );
-            let offset = u32::try_from(variadic_operand_words.len())
-                .expect("variadic operand table exceeds u32");
-            variadic_operand_words.extend_from_slice(&operand_words);
+            let offset = u32::try_from(overflow_operand_words.len())
+                .expect("operand overflow table exceeds u32");
+            overflow_operand_words.extend_from_slice(&operand_words);
             offset
         };
         Self {
@@ -797,7 +790,7 @@ impl CodeBlockInstruction {
             byte_pc,
             operand_count,
             inline_operand_words,
-            variadic_operand_offset,
+            overflow_operand_offset,
         }
     }
 
@@ -816,18 +809,18 @@ impl CodeBlockInstruction {
     /// Whether all operand words live in the instruction record.
     #[must_use]
     pub(crate) const fn operands_are_inline(&self) -> bool {
-        self.variadic_operand_offset == NO_VARIADIC_OPERANDS
+        self.overflow_operand_offset == NO_OVERFLOW_OPERANDS
     }
 
-    fn operand_word(&self, variadic_operand_words: &[u32], index: usize) -> Option<u32> {
+    fn operand_word(&self, overflow_operand_words: &[u32], index: usize) -> Option<u32> {
         if index >= usize::from(self.operand_count) {
             return None;
         }
         if self.operands_are_inline() {
             return self.inline_operand_words.get(index).copied();
         }
-        let start = self.variadic_operand_offset as usize;
-        variadic_operand_words.get(start + index).copied()
+        let start = self.overflow_operand_offset as usize;
+        overflow_operand_words.get(start + index).copied()
     }
 
     /// Byte length of this instruction in the encoded stream.
@@ -955,6 +948,28 @@ mod tests {
         assert_eq!(function.register(instr, 3), Some(2));
         assert_eq!(function.register(instr, 4), Some(3));
         assert_eq!(function.register(instr, 5), None);
+        assert_eq!(function.operands(instr).as_slice(), operands.as_slice());
+    }
+
+    #[test]
+    fn long_fixed_operands_use_codeblock_overflow_table() {
+        let operands = vec![
+            Operand::Register(0),
+            Operand::Register(1),
+            Operand::Register(2),
+            Operand::Register(3),
+            Operand::Register(4),
+        ];
+        let function = function(vec![Instruction {
+            pc: 0,
+            op: Op::MakeClass,
+            operands: operands.clone().into(),
+        }]);
+        let executable = ExecutableModule::from_bytecode(&module(function));
+        let function = executable.function(0).unwrap();
+        let instr = &function.code[0];
+
+        assert!(!instr.operands_are_inline());
         assert_eq!(function.operands(instr).as_slice(), operands.as_slice());
     }
 

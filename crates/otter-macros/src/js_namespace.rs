@@ -368,8 +368,31 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
         Some(tag) => quote!(string_tag = #tag,),
         None => quote!(),
     };
+    // Members whose JS name starts with `__` are private compute hooks meant
+    // only for the glue, not the public namespace. The macro wraps the glue in
+    // a factory: it moves each private member off the namespace object into a
+    // `natives` bag and calls the glue with it, so the glue reads
+    // `natives.hmacSign` instead of poking `crypto.__hmacSign` and deleting it
+    // by hand, and the public object never keeps a raw hook.
     let js_field = match &args.js {
-        Some(path) => quote!(js_glue = include_str!(#path),),
+        Some(path) => {
+            let ns = ns_name.value();
+            let mut collect = String::new();
+            for member in &members {
+                let name = member.js_name.value();
+                if let Some(key) = name.strip_prefix("__") {
+                    collect.push_str(&format!("natives.{key}=__ns.{name};delete __ns.{name};"));
+                }
+            }
+            let prologue = format!(
+                "(function(){{'use strict';var __ns=globalThis.{ns};\
+                 var natives=Object.create(null);{collect}\
+                 (function(natives){{'use strict';\n"
+            );
+            let prologue_lit = LitStr::new(&prologue, Span::call_site());
+            let epilogue_lit = LitStr::new("\n})(natives);})();", Span::call_site());
+            quote!(js_glue = ::core::concat!(#prologue_lit, include_str!(#path), #epilogue_lit),)
+        }
         None => quote!(),
     };
     glue.extend(quote! {

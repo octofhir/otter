@@ -1,33 +1,27 @@
 // The JS half of the native `crypto` namespace: WebIDL validation
 // with exact DOMException names over the native compute members,
 // plus the `Crypto` / `SubtleCrypto` / `CryptoKey` class globals.
-// Consumes and deletes the private `__nativeRandomFill` /
-// `__nativeDigest` members installed by the declaration, so no hidden
-// hooks remain reachable.
+// Runs as a `#[js_namespace]` factory glue: the `__`-prefixed native
+// compute members are handed in through the `natives` bag (see the
+// macro), never left on the public `crypto` object, so this file just
+// reads `natives.<name>` — no hidden hooks to poke or delete by hand.
 //
 // The three interfaces have no constructor (`new Crypto()` etc. throw
 // "Illegal constructor", matching WebCrypto §[Exposed] classes without
 // [Constructor]). The `crypto` singleton is reparented onto
 // `Crypto.prototype` in place — same object identity — so its methods
 // live on the prototype and `crypto instanceof Crypto` holds.
-(function () {
-  'use strict';
-  const nativeRandomFill = crypto.__nativeRandomFill;
-  const nativeDigest = crypto.__nativeDigest;
-  // `randomUUID` is installed as a native own-member on the namespace
-  // object; capture it before reparenting so it can move onto the
-  // prototype.
+  // `natives` is the private compute bag the `#[js_namespace]` factory hands to
+  // this glue (see the macro): the `__`-prefixed members were moved off the
+  // public `crypto` object into it, keyed without the prefix. `randomUUID` is a
+  // public member and stays on `crypto`.
+  const nativeRandomFill = natives.nativeRandomFill;
+  const nativeDigest = natives.nativeDigest;
+  const nativeHmacSign = natives.hmacSign;
+  const nativePbkdf2 = natives.pbkdf2;
+  const nativeAesGcmEncrypt = natives.aesGcmEncrypt;
+  const nativeAesGcmDecrypt = natives.aesGcmDecrypt;
   const nativeRandomUUID = crypto.randomUUID;
-  const nativeHmacSign = crypto.__hmacSign;
-  const nativePbkdf2 = crypto.__pbkdf2;
-  const nativeAesGcmEncrypt = crypto.__aesGcmEncrypt;
-  const nativeAesGcmDecrypt = crypto.__aesGcmDecrypt;
-  delete crypto.__nativeRandomFill;
-  delete crypto.__nativeDigest;
-  delete crypto.__hmacSign;
-  delete crypto.__pbkdf2;
-  delete crypto.__aesGcmEncrypt;
-  delete crypto.__aesGcmDecrypt;
 
   function tagged(proto, tag) {
     Object.defineProperty(proto, Symbol.toStringTag, {
@@ -296,4 +290,3 @@
   def('Crypto', Crypto);
   def('SubtleCrypto', SubtleCrypto);
   def('CryptoKey', CryptoKey);
-})();

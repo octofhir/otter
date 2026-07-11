@@ -438,9 +438,9 @@ impl Interpreter {
             };
         let uses_reg = |instr: &jit::JitInstructionMetadata, reg: u16| {
             code_block
-                .operands(instr)
+                .operand_view(instr)
                 .iter()
-                .any(|o| matches!(o, Operand::Register(r) if *r == reg))
+                .any(|o| matches!(o, Operand::Register(r) if r == reg))
         };
 
         let fid = view.code_block.id;

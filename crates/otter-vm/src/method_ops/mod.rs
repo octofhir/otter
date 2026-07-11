@@ -177,7 +177,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let frame_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         self.do_math_call_at_frame(stack, context, frame_index, operands, self.current_byte_len)
@@ -191,13 +191,13 @@ impl Interpreter {
         stack: &mut HoltStack,
         context: &ExecutionContext,
         frame_index: usize,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
         byte_len: u32,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let method_id = const_operand(operands.get(1))?;
         let argc = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
+            Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
         let mut arg_regs = SmallVec::<[u16; 8]>::with_capacity(argc);

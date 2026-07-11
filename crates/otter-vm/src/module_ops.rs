@@ -35,7 +35,6 @@ use crate::{
     operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
     write_register,
 };
-use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 /// Per-Evaluate DFS state (§16.2.1.5): the spec's `stack` plus the
@@ -1204,7 +1203,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut HoltStack,
         top_idx: usize,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let spec_reg = register_operand(operands.get(1))?;

@@ -37,7 +37,7 @@ impl Interpreter {
         op: Op,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let top_idx = stack.len() - 1;
@@ -432,10 +432,10 @@ impl Interpreter {
 
 fn collect_array_args(
     frame: &Frame,
-    operands: &[Operand],
+    operands: impl crate::executable::OperandSource,
 ) -> Result<SmallVec<[Value; 4]>, VmError> {
     let argc = match operands.get(1) {
-        Some(&Operand::ConstIndex(n)) => n as usize,
+        Some(Operand::ConstIndex(n)) => n as usize,
         _ => return Err(VmError::InvalidOperand),
     };
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);

@@ -25,8 +25,6 @@
 use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
-use otter_bytecode::Operand;
-
 use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
     JsPromise, JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
@@ -1597,7 +1595,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let src = register_operand(operands.get(1))?;
@@ -1808,7 +1806,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let value_dst = register_operand(operands.first())?;
         let done_dst = register_operand(operands.get(1))?;

@@ -480,38 +480,18 @@ impl RuntimeStubAllocContext {
     }
 }
 
-/// Current compiled `Op::Call` bridge. Re-entrant because it can invoke
-/// arbitrary JS or native callables.
-pub const STUB_JIT_RUNTIME_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
+/// Current compiled `CallMethodValue` bridge. Re-entrant because method
+/// resolution and invocation can run user code.
+pub const STUB_JIT_RUNTIME_CALL_METHOD: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 1,
     class: RuntimeStubClass::Reentrant,
     argument_count: VARIADIC_STUB_ARGUMENTS,
     effects: RuntimeStubEffects::reentrant(true),
 };
 
-/// Current compiled `CallMethodValue` bridge. Re-entrant because method
-/// resolution and invocation can run user code.
-pub const STUB_JIT_RUNTIME_CALL_METHOD: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 2,
-    class: RuntimeStubClass::Reentrant,
-    argument_count: VARIADIC_STUB_ARGUMENTS,
-    effects: RuntimeStubEffects::reentrant(true),
-};
-
-/// Direct compiled-call frame preparation. It does not intentionally re-enter
-/// JS, but it can allocate upvalue/frame-side state and therefore needs an
-/// allocating-stub safepoint in the target ABI.
-pub const STUB_JIT_PREPARE_DIRECT_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 3,
-    class: RuntimeStubClass::Alloc,
-    argument_count: VARIADIC_STUB_ARGUMENTS,
-    effects: RuntimeStubEffects::allocating(true, true),
-};
-
-/// Direct compiled method-call frame preparation. Same allocation contract as
-/// [`STUB_JIT_PREPARE_DIRECT_CALL`].
+/// Direct compiled method-call frame preparation.
 pub const STUB_JIT_PREPARE_DIRECT_METHOD_CALL: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 4,
+    id: 2,
     class: RuntimeStubClass::Alloc,
     argument_count: VARIADIC_STUB_ARGUMENTS,
     effects: RuntimeStubEffects::allocating(true, true),
@@ -520,7 +500,7 @@ pub const STUB_JIT_PREPARE_DIRECT_METHOD_CALL: RuntimeStubDescriptor = RuntimeSt
 /// Current compiled property/method runtime fallback bucket. Re-entrant until
 /// individual property operations are split into leaf/allocating stubs.
 pub const STUB_JIT_PROPERTY_FALLBACK: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 5,
+    id: 3,
     class: RuntimeStubClass::Reentrant,
     argument_count: VARIADIC_STUB_ARGUMENTS,
     effects: RuntimeStubEffects::reentrant(true),
@@ -531,7 +511,7 @@ pub const STUB_JIT_PROPERTY_FALLBACK: RuntimeStubDescriptor = RuntimeStubDescrip
 /// and may report an already-constructed structural VM error, but it must not
 /// allocate, trigger GC, or re-enter JS.
 pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 6,
+    id: 4,
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 1,
     effects: RuntimeStubEffects::none(),
@@ -541,7 +521,7 @@ pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = RuntimeStubDescriptor 
 /// proven the receiver and builtin identity. The key must already be in a
 /// representation that does not require flattening/materialisation.
 pub const STUB_COLLECTION_MAP_GET_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 7,
+    id: 5,
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 2,
     effects: RuntimeStubEffects::none(),
@@ -550,7 +530,7 @@ pub const STUB_COLLECTION_MAP_GET_LEAF: RuntimeStubDescriptor = RuntimeStubDescr
 /// Leaf `Map.prototype.has` probe with the same no-flatten/no-GC contract as
 /// [`STUB_COLLECTION_MAP_GET_LEAF`].
 pub const STUB_COLLECTION_MAP_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 8,
+    id: 6,
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 2,
     effects: RuntimeStubEffects::none(),
@@ -559,7 +539,7 @@ pub const STUB_COLLECTION_MAP_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescr
 /// Leaf `Set.prototype.has` probe with the same no-flatten/no-GC contract as
 /// [`STUB_COLLECTION_MAP_GET_LEAF`].
 pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 9,
+    id: 7,
     class: RuntimeStubClass::LeafNoAlloc,
     argument_count: 2,
     effects: RuntimeStubEffects::none(),
@@ -571,7 +551,7 @@ pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = RuntimeStubDescr
 /// must also pass the current VM-native frame/context pointer and a non-sentinel
 /// safepoint id so a moving GC can trace and rewrite all live tagged values.
 pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 10,
+    id: 8,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, true),
@@ -584,7 +564,7 @@ pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// lets generated method-call code pass receiver plus two argument slots without
 /// a per-builtin bridge shape.
 pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 11,
+    id: 9,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, true),
@@ -596,7 +576,7 @@ pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// may materialize or flatten string keys before probing the map, so callers
 /// must publish the same safepoint/root packet as mutation stubs.
 pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 12,
+    id: 10,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, false),
@@ -605,7 +585,7 @@ pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// Allocating `Map.prototype.has` lookup stub with the same materializing key
 /// contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 13,
+    id: 11,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, false),
@@ -614,7 +594,7 @@ pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// Allocating `Set.prototype.has` lookup stub with the same materializing key
 /// contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 14,
+    id: 12,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, false),
@@ -623,7 +603,7 @@ pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = RuntimeStubDesc
 /// Allocating `Map.prototype.delete` mutation stub with the same materializing
 /// key contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 15,
+    id: 13,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, true),
@@ -632,7 +612,7 @@ pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubD
 /// Allocating `Set.prototype.delete` mutation stub with the same materializing
 /// key contract as [`STUB_COLLECTION_MAP_GET_ALLOC`].
 pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 16,
+    id: 14,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, true),
@@ -645,7 +625,7 @@ pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = RuntimeStubD
 /// observable `ToPrimitive` work is needed; other cases miss to the full
 /// bytecode delegate.
 pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = RuntimeStubDescriptor {
-    id: 17,
+    id: 15,
     class: RuntimeStubClass::Alloc,
     argument_count: 3,
     effects: RuntimeStubEffects::allocating(true, false),
@@ -655,32 +635,28 @@ pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = RuntimeStubDescripto
 #[must_use]
 pub const fn runtime_stub_name(id: RuntimeStubId) -> &'static str {
     match id {
-        1 => "jit_runtime_call",
-        2 => "jit_runtime_call_method",
-        3 => "jit_prepare_direct_call",
-        4 => "jit_prepare_direct_method_call",
-        5 => "jit_property_fallback",
-        6 => "jit_backedge_poll",
-        7 => "collection_map_get_leaf",
-        8 => "collection_map_has_leaf",
-        9 => "collection_set_has_leaf",
-        10 => "collection_map_set_alloc",
-        11 => "collection_set_add_alloc",
-        12 => "collection_map_get_alloc",
-        13 => "collection_map_has_alloc",
-        14 => "collection_set_has_alloc",
-        15 => "collection_map_delete_alloc",
-        16 => "collection_set_delete_alloc",
-        17 => "string_concat_alloc",
+        1 => "jit_runtime_call_method",
+        2 => "jit_prepare_direct_method_call",
+        3 => "jit_property_fallback",
+        4 => "jit_backedge_poll",
+        5 => "collection_map_get_leaf",
+        6 => "collection_map_has_leaf",
+        7 => "collection_set_has_leaf",
+        8 => "collection_map_set_alloc",
+        9 => "collection_set_add_alloc",
+        10 => "collection_map_get_alloc",
+        11 => "collection_map_has_alloc",
+        12 => "collection_set_has_alloc",
+        13 => "collection_map_delete_alloc",
+        14 => "collection_set_delete_alloc",
+        15 => "string_concat_alloc",
         _ => "unknown_runtime_stub",
     }
 }
 
 /// Checked inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
-    STUB_JIT_RUNTIME_CALL,
     STUB_JIT_RUNTIME_CALL_METHOD,
-    STUB_JIT_PREPARE_DIRECT_CALL,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
     STUB_JIT_PROPERTY_FALLBACK,
     STUB_JIT_BACKEDGE_POLL,

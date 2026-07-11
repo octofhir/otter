@@ -418,46 +418,6 @@ pub(crate) extern "C" fn jit_pop_native_activation_stub(ctx: *mut JitCtx) -> u64
     0
 }
 
-/// Prepare a direct compiled call. Returns:
-/// - `0`: direct target prepared in `ctx.direct_*`.
-/// - `1`: throw, error parked in `ctx.error`.
-/// - `2`: ineligible/cold callee; caller should bail to the interpreter.
-pub(crate) extern "C" fn jit_prepare_direct_call_stub(
-    ctx: *mut JitCtx,
-    callee: u64,
-    argc: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    let all = [a0 as u16, a1 as u16, a2 as u16, a3 as u16];
-    let argc = (argc as usize).min(MAX_INLINE_ARGS);
-    match vm.jit_prepare_direct_call(context, stack, ctx.frame_index, callee as u16, &all[..argc]) {
-        Ok(Some(prepared)) => {
-            ctx.direct_entry_addr = prepared.entry_addr;
-            ctx.direct_regs = prepared.regs;
-            ctx.direct_safepoint_records = prepared.safepoint_records;
-            ctx.direct_safepoint_count = prepared.safepoint_count;
-            ctx.direct_self_closure = prepared.self_closure;
-            ctx.direct_this_value = prepared.this_value;
-            ctx.direct_frame_index = prepared.frame_index;
-            ctx.direct_upvalues_ptr = prepared.upvalues_ptr;
-            0
-        }
-        Ok(None) => 2,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
 /// Validate a closure callee for scratch-frame inlining and return its captured
 /// upvalue-spine base, or `0` when the site must take the normal call path.
 pub(crate) extern "C" fn jit_inline_closure_upvalues_stub(
@@ -1445,12 +1405,12 @@ pub(crate) mod arm64 {
         jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
         jit_load_string_stub, jit_load_upvalue_stub, jit_make_closure_stub, jit_make_fn_stub,
         jit_math_call_stub, jit_neg_stub, jit_new_array_stub, jit_new_object_stub,
-        jit_pop_native_activation_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_push_native_activation_stub,
-        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
+        jit_pop_native_activation_stub, jit_prepare_direct_method_call_stub,
+        jit_push_native_activation_stub, jit_self_call_bail_stub, jit_store_element_stub,
+        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_checked_stub,
+        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub,
+        leaf_no_alloc_stub2_trampoline_pair, otter_jit_math_random, pack_method_arg_regs,
+        reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -5299,49 +5259,15 @@ pub(crate) mod arm64 {
     /// runtime call bridge.
     fn emit_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        _operands: &[Operand],
         bail: DynamicLabel,
-        threw: DynamicLabel,
+        _threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
-        let dst = reg(operands, 0)?;
-        let callee = reg(operands, 1)?;
-        let argc = const_index(operands, 2)? as usize;
-        if argc > MAX_INLINE_ARGS {
-            return Err(Unsupported::ArgCount(argc));
-        }
-        let direct_done = ops.new_dynamic_label();
-
-        // jit_prepare_direct_call_stub(ctx, callee, argc, a0..a3) -> status.
-        // 0 = direct prepared, 1 = throw, 2 = cold/ineligible → interpreter.
-        dynasm!(ops
-            ; .arch aarch64
-            ; mov x0, x20
-            ; movz x1, callee as u32
-            ; movz x2, argc as u32
-        );
-        for slot in 0..MAX_INLINE_ARGS {
-            let areg = if slot < argc {
-                reg(operands, 3 + slot)?
-            } else {
-                0
-            };
-            // arg registers map to x3..x6.
-            let xn = 3 + slot as u32;
-            dynasm!(ops ; .arch aarch64 ; movz X(xn), areg as u32);
-        }
-        emit_load_u64(ops, 16, jit_prepare_direct_call_stub as *const () as u64);
-        dynasm!(ops
-            ; .arch aarch64
-            ; blr x16
-            ; cmp x0, #1
-            ; b.eq =>threw
-            ; cmp x0, #2
-            ; b.eq =>bail
-        );
-
-        // Direct prepared (status 0): build the callee ctx, branch, finish.
-        emit_direct_call_tail(ops, dst, threw, direct_done);
-        dynasm!(ops ; .arch aarch64 ; =>direct_done);
+        // The former direct-call ABI asked the interpreter to materialize a
+        // HoltStack frame, then re-entered native code. That is neither a
+        // native calling convention nor a useful boundary: plain calls bail
+        // until they have a frameless native link.
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
         Ok(())
     }
 

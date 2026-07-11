@@ -3761,6 +3761,12 @@ pub(crate) fn array_callback_native_dispatch(
         }
         _ => None,
     };
+    // `array_species_create` above allocates the output array and may
+    // scavenge, relocating the receiver / callback / thisArg. The collector
+    // forwarded the `callback_roots` slots in place, but the standalone
+    // locals are copies it never saw — re-read them so every use below
+    // (fast path, iteration anchors, the live walk) sees the moved handles.
+    let [receiver, callback, this_arg] = callback_roots;
     // §23.1.3.12 `flatMap` is FlattenIntoArray(A, O, len, 0, 1, mapper,
     // T): each callback result that IsArray is spliced one level deep
     // through the observable HasProperty / Get / CreateDataProperty

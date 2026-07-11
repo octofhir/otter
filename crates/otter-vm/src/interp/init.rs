@@ -219,8 +219,7 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             reg_pool: Vec::new(),
             holt_pool: Vec::new(),
-            reg_stack: Vec::new(),
-            reg_top: 0,
+            register_stack: register_stack::RegisterStack::new(),
             jit_native_activations: vec![
                 jit::JitNativeActivation::EMPTY;
                 DEFAULT_MAX_STACK_DEPTH as usize

@@ -699,9 +699,9 @@ impl Interpreter {
         // allocated below the saved cursor by the caller and then reclaimed as
         // that frame returned here), the cursor is already below `saved` and
         // raising it back would re-leak that window on every `run_callable_sync`.
-        let saved_reg_top = self.reg_top;
+        let register_checkpoint = self.register_stack.checkpoint();
         let result = self.dispatch_loop_tracked(context, stack);
-        self.reg_top = self.reg_top.min(saved_reg_top);
+        self.register_stack.restore(register_checkpoint);
         self.active_frame_stack = previous;
         result
     }

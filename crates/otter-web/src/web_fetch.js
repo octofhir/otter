@@ -533,6 +533,8 @@
   const kUrl = Symbol('url');
   const kMethod = Symbol('method');
   const kSignal = Symbol('signal');
+  const kRedirect = Symbol('redirect');
+  const REDIRECT_MODES = ['follow', 'error', 'manual'];
 
   const NORMALIZED_METHODS = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'];
   const FORBIDDEN_METHODS = ['CONNECT', 'TRACE', 'TRACK'];
@@ -563,6 +565,7 @@
       let method = 'GET';
       let headers = null;
       let signal = null;
+      let redirect = 'follow';
       let bodySource = null;
 
       if (input instanceof Request) {
@@ -570,6 +573,7 @@
         method = input[kMethod];
         headers = cloneHeaders(input[kHeaders]);
         signal = input[kSignal];
+        redirect = input[kRedirect];
         if (options.body === undefined &&
             (input[kBodyText] !== null || input[kBodyBytes] !== null ||
              input[kBodyStream] !== null)) {
@@ -594,10 +598,17 @@
       if (options.signal !== undefined && options.signal !== null) {
         signal = options.signal;
       }
+      if (options.redirect !== undefined) {
+        if (REDIRECT_MODES.indexOf(options.redirect) < 0) {
+          throw new TypeError(`Request: invalid redirect mode "${options.redirect}"`);
+        }
+        redirect = options.redirect;
+      }
 
       Object.defineProperty(this, kMethod, { value: method, enumerable: false });
       Object.defineProperty(this, kHeaders, { value: headers, enumerable: false });
       Object.defineProperty(this, kSignal, { value: signal, enumerable: false });
+      Object.defineProperty(this, kRedirect, { value: redirect, enumerable: false });
 
       if (bodySource !== null) {
         cloneBodyInto(bodySource, this);
@@ -623,7 +634,7 @@
     get integrity() { return ''; }
     get keepalive() { return false; }
     get mode() { return 'cors'; }
-    get redirect() { return 'follow'; }
+    get redirect() { return this[kRedirect]; }
     get referrer() { return 'about:client'; }
     get referrerPolicy() { return ''; }
 
@@ -640,6 +651,7 @@
         enumerable: false,
       });
       Object.defineProperty(cloned, kSignal, { value: this[kSignal], enumerable: false });
+      Object.defineProperty(cloned, kRedirect, { value: this[kRedirect], enumerable: false });
       cloneBodyInto(this, cloned);
       return cloned;
     }
@@ -821,7 +833,7 @@
       flatHeaders.push(name, value);
     }
     const body = requestBodyBytes(request);
-    const call = nativeFetch(request.method, request.url, flatHeaders, body);
+    const call = nativeFetch(request.method, request.url, flatHeaders, body, request.redirect);
     const toResponse = (parts) =>
       makeResponse(parts[0], parts[1], parts[2], parts[3], parts[4]);
 
@@ -872,6 +884,7 @@
         Object.defineProperty(request, kMethod, { value: method, enumerable: false });
         Object.defineProperty(request, kHeaders, { value: headers, enumerable: false });
         Object.defineProperty(request, kSignal, { value: null, enumerable: false });
+        Object.defineProperty(request, kRedirect, { value: 'follow', enumerable: false });
         if (body !== null && body !== undefined) {
           if (typeof body === 'string') request[kBodyText] = body;
           else request[kBodyBytes] = body;

@@ -85,6 +85,8 @@ pub struct FetchRequest {
     pub headers: Vec<(String, String)>,
     /// Buffered request body, or `None` for bodiless methods.
     pub body: Option<Vec<u8>>,
+    /// Redirect handling mode: `"follow"` (default), `"error"`, or `"manual"`.
+    pub redirect: String,
 }
 
 /// Plain-data response handed back to the `fetch` shim, which mints a
@@ -132,8 +134,15 @@ pub async fn perform_fetch(
 
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .map_err(|_| format!("invalid HTTP method: {}", request.method))?;
+    // `error` and `manual` both stop reqwest from following: `error` rejects
+    // below when a 3xx is seen, `manual` hands the 3xx back to the caller.
+    let redirect_policy = match request.redirect.as_str() {
+        "error" | "manual" => reqwest::redirect::Policy::none(),
+        _ => reqwest::redirect::Policy::default(),
+    };
     let client = reqwest::Client::builder()
         .user_agent(user_agent)
+        .redirect(redirect_policy)
         .build()
         .map_err(|err| format!("fetch client init failed: {err}"))?;
     let mut builder = client.request(method, parsed);
@@ -148,6 +157,16 @@ pub async fn perform_fetch(
         .send()
         .await
         .map_err(|err| format!("fetch failed: {err}"))?;
+    if request.redirect == "error" && response.status().is_redirection() {
+        return Err(format!(
+            "fetch failed: redirect to \"{}\" refused (redirect mode is \"error\")",
+            response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+        ));
+    }
     let status = response.status();
     let status_text = status.canonical_reason().unwrap_or("").to_string();
     let final_url = response.url().to_string();

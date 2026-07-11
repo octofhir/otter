@@ -132,6 +132,7 @@ pub mod realm_intrinsics;
 pub mod reflect;
 pub mod regexp;
 pub mod regexp_prototype;
+mod register_stack;
 #[doc(hidden)]
 pub mod rooting;
 pub mod run_control;
@@ -1091,13 +1092,9 @@ pub struct Interpreter {
     /// Flat register stack for JIT-built callee windows. Compiled code sets up a
     /// direct call by bumping `reg_top`, writing the callee's window into
     /// `reg_stack[reg_top..reg_top+regcount]`, and running the callee — no Rust
-    /// frame-build bridge. Allocated once to `REG_STACK_CAP` and never
-    /// reallocated (windows hold raw pointers into it). `reg_stack[0..reg_top]`
-    /// is a GC root set (live callee windows of in-flight frameless JIT calls).
-    reg_stack: Vec<Value>,
-    /// Live extent of [`Self::reg_stack`] — the top of the JIT call register
-    /// stack. `0` whenever no frameless JIT call is in flight.
-    reg_top: usize,
+    /// VM-owned native register arena. Its published prefix is a precise GC
+    /// root set for in-flight compiled call windows.
+    register_stack: register_stack::RegisterStack,
     /// Fixed VM-owned descriptors for native JIT contexts whose scalar binding
     /// slots must stay visible to a moving collection across safepoints.
     jit_native_activations: Vec<jit::JitNativeActivation>,

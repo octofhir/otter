@@ -1261,14 +1261,7 @@ impl Interpreter {
         bail_pc: u32,
         regcount: usize,
     ) -> Result<Value, VmError> {
-        let base = self
-            .reg_top
-            .checked_sub(regcount)
-            .ok_or(VmError::InvalidOperand)?;
-        let mut registers: smallvec::SmallVec<[Value; 8]> =
-            smallvec::SmallVec::with_capacity(regcount);
-        registers.extend_from_slice(&self.reg_stack[base..base + regcount]);
-        self.reg_top = base;
+        let registers = self.register_stack.take_top(regcount)?;
 
         let caller = stack
             .get(caller_frame_index)
@@ -1302,14 +1295,7 @@ impl Interpreter {
         callee: Value,
         this: Value,
     ) -> Result<Value, VmError> {
-        let base = self
-            .reg_top
-            .checked_sub(regcount)
-            .ok_or(VmError::InvalidOperand)?;
-        let mut registers: smallvec::SmallVec<[Value; 8]> =
-            smallvec::SmallVec::with_capacity(regcount);
-        registers.extend_from_slice(&self.reg_stack[base..base + regcount]);
-        self.reg_top = base;
+        let registers = self.register_stack.take_top(regcount)?;
 
         let (fid, upvalues) = match callee.as_closure(&self.gc_heap) {
             Some(c) => (

@@ -56,20 +56,12 @@ impl Interpreter {
     /// Return a terminated frame's spilled register backing to the pool for
     /// reuse. Inline windows (and a full pool) are dropped normally. The buffer
     /// is cleared, so it carries no live `Value`s — the pool is never traced.
-    /// Total slots in the flat JIT register stack. A frameless JIT call chain
-    /// exceeding this throws a stack overflow (the same bound the frame-depth
-    /// limit enforces, expressed in register slots).
-    pub(crate) const REG_STACK_CAP: usize = 512 * 1024;
-
     /// Base pointer of the flat JIT register stack, allocating its fixed backing
     /// buffer on first use. Stable for the interpreter's life (never
     /// reallocated). Compiled code reads it from `JitCtx.reg_stack_base` to build
     /// self-recursive callee windows inline.
     pub fn jit_reg_stack_base(&mut self) -> *mut u64 {
-        if self.reg_stack.capacity() == 0 {
-            self.reg_stack = vec![Value::undefined(); Self::REG_STACK_CAP];
-        }
-        self.reg_stack.as_mut_ptr().cast::<u64>()
+        self.register_stack.base_ptr()
     }
 
     /// Reserve a zero-filled `count`-slot window at the top of the flat register
@@ -81,21 +73,7 @@ impl Interpreter {
     /// hold raw pointers into it), so an overflow throws a catchable stack
     /// overflow instead of growing.
     pub(crate) fn alloc_reg_window(&mut self, count: usize) -> Result<(*mut Value, u32), VmError> {
-        if self.reg_stack.capacity() == 0 {
-            self.reg_stack = vec![Value::undefined(); Self::REG_STACK_CAP];
-        }
-        let base = self.reg_top;
-        let end = base
-            .checked_add(count)
-            .filter(|&e| e <= Self::REG_STACK_CAP)
-            .ok_or(VmError::StackOverflow {
-                limit: Self::REG_STACK_CAP as u32,
-            })?;
-        let window = &mut self.reg_stack[base..end];
-        window.fill(Value::undefined());
-        let ptr = window.as_mut_ptr();
-        self.reg_top = end;
-        Ok((ptr, base as u32))
+        self.register_stack.allocate(count)
     }
 
     /// Truncate the flat register stack back to `base`, releasing every window
@@ -113,14 +91,14 @@ impl Interpreter {
         // scan those stale register cells as live roots — feeding moved-from /
         // garbage pointers to the scavenger (crashes, wrong dispatch, type
         // mismatches under GC stress). `min` makes a redundant free a no-op.
-        self.reg_top = self.reg_top.min(base as usize);
+        self.register_stack.release(base);
     }
 
     /// Address of `reg_top` (the live extent of the flat register stack, in
     /// slots). Compiled code reads it from `JitCtx.reg_top_ptr` to reserve and
     /// release callee windows.
     pub fn jit_reg_top_ptr(&mut self) -> *mut usize {
-        &mut self.reg_top
+        self.register_stack.top_ptr()
     }
 
     /// Publish the binding scalar slots of a live native JIT context for GC.
@@ -228,43 +206,14 @@ impl Interpreter {
     /// compiled code checks before reserving a callee window.
     #[must_use]
     pub fn jit_reg_stack_cap() -> usize {
-        Self::REG_STACK_CAP
+        register_stack::REGISTER_STACK_CAPACITY
     }
 
     /// GC-trace the live JIT register stack (`reg_stack[0..reg_top]`): every
     /// callee window of an in-flight frameless JIT call. A no-op when no such
     /// call is in flight.
     pub(crate) fn trace_reg_stack(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        if std::env::var_os("OTTER_GC_VERIFY").is_some_and(|v| v != "0") {
-            self.verify_reg_stack_roots();
-        }
-        for value in &self.reg_stack[..self.reg_top] {
-            value.trace_value_slots(visitor);
-        }
-    }
-
-    /// Diagnostic (`OTTER_GC_VERIFY=1`): scan the live register window
-    /// `reg_stack[0..reg_top]` for any slot whose pointer target is not a
-    /// plausible live object, and report its index and the current `reg_top`.
-    /// Pinpoints stale register cells that a window-accounting slip left inside
-    /// the traced range. Off by default; never mutates state.
-    #[cold]
-    pub(crate) fn verify_reg_stack_roots(&self) {
-        let base = self.reg_stack.as_ptr();
-        for (i, value) in self.reg_stack[..self.reg_top].iter().enumerate() {
-            if let Some((size, tag, forwarded)) = value.debug_gc_target_header(&self.gc_heap) {
-                // A forwarded target is fine — the trace pass will rewrite this
-                // slot to the new location. Only a non-forwarded implausible
-                // header is a genuinely stale/dangling register cell.
-                if !forwarded && (size == 0 || size > (1u32 << 20) || tag == 0) {
-                    eprintln!(
-                        "OTTER_GC_VERIFY: stale reg_stack slot idx={i} reg_top={} base={base:p} \
-                         target_size={size} target_tag={tag}",
-                        self.reg_top
-                    );
-                }
-            }
-        }
+        self.register_stack.trace(&self.gc_heap, visitor);
     }
 
     #[inline]

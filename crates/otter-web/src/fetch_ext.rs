@@ -22,7 +22,7 @@
 //! - <https://fetch.spec.whatwg.org/#fetch-method>
 
 use otter_runtime::marshal::{IntoJs, JsError, MarshalCx};
-use otter_runtime::web_fetch_host::{FetchRequest, FetchResponse, perform_fetch};
+use otter_runtime::web_fetch_host::{FetchRequest, FetchResponse, prepare_fetch};
 use otter_runtime::{
     CapabilitySet, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
     RuntimeScoped as Scoped, RuntimeValue as Value,
@@ -59,7 +59,9 @@ impl IntoJs for NativeFetchResult {
 /// `__nativeFetch(method, url, flatHeaders, body)` — the private compute member.
 /// `method`/`url` are strings, `flatHeaders` is `[name0, value0, …]` (names
 /// pre-lowercased), and `body` is a `Uint8Array` or `null`/`undefined`. Returns
-/// a `Promise` that resolves to the response parts array.
+/// `{ promise, abort }`: `promise` resolves to the response parts array, and
+/// `abort()` cancels the in-flight request (closing the socket). The shim races
+/// `abort` against an `AbortSignal` to implement `fetch`'s cancellation.
 pub fn native_fetch(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -97,8 +99,9 @@ pub fn native_fetch(
             headers,
             body,
         };
+        let (abort, transport) = prepare_fetch(request, user_agent, net);
         let future = async move {
-            perform_fetch(request, user_agent, net)
+            transport
                 .await
                 .map(NativeFetchResult)
                 .map_err(JsError::Type)
@@ -106,6 +109,27 @@ pub fn native_fetch(
         let promise = cx
             .promise_from_future(future)
             .map_err(|err| err.into_native("fetch"))?;
-        Ok(cx.escape(promise))
+
+        // `abort()` cancels the in-flight request; idempotent, so the shim can
+        // wire it to a one-shot `AbortSignal` listener without guarding.
+        let abort_fn = cx
+            .ctx()
+            .native_value(
+                "fetch.abort",
+                Default::default(),
+                move |_ctx, _args, _captures| {
+                    abort.abort();
+                    Ok(Value::undefined())
+                },
+            )
+            .map_err(|err| JsError::Type(err.to_string()).into_native("fetch"))?;
+        let abort_handle = cx.park(abort_fn);
+
+        let result = cx.object().map_err(|err| err.into_native("fetch"))?;
+        cx.set(result, "promise", promise)
+            .map_err(|err| err.into_native("fetch"))?;
+        cx.set(result, "abort", abort_handle)
+            .map_err(|err| err.into_native("fetch"))?;
+        Ok(cx.escape(result))
     })
 }

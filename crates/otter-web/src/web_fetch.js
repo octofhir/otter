@@ -807,20 +807,43 @@
   // §5.6 fetch(input, init). Normalize through the Request constructor (which
   // owns URL parsing, method/header validation, and body extraction), then hand
   // the flattened request to the native transport. Network and permission
-  // failures reject with a TypeError (the native maps them already).
+  // failures reject with a TypeError (the native maps them already). An
+  // `AbortSignal` — already aborted or aborted mid-flight — cancels the request
+  // and rejects with the signal's reason.
   async function fetch(input, init) {
     const request = new Request(input, init);
     const signal = request.signal;
     if (signal !== null && signal !== undefined && signal.aborted) {
-      throw new DOMException('The operation was aborted.', 'AbortError');
+      throw signal.reason;
     }
     const flatHeaders = [];
     for (const [name, value] of request.headers) {
       flatHeaders.push(name, value);
     }
     const body = requestBodyBytes(request);
-    const parts = await nativeFetch(request.method, request.url, flatHeaders, body);
-    return makeResponse(parts[0], parts[1], parts[2], parts[3], parts[4]);
+    const call = nativeFetch(request.method, request.url, flatHeaders, body);
+    const toResponse = (parts) =>
+      makeResponse(parts[0], parts[1], parts[2], parts[3], parts[4]);
+
+    if (signal === null || signal === undefined) {
+      return toResponse(await call.promise);
+    }
+    // Race the request against the signal: an abort cancels the socket (via the
+    // native `abort()`) and rejects with the signal's reason.
+    let onAbort;
+    const settled = new Promise((resolve, reject) => {
+      onAbort = () => {
+        try { call.abort(); } catch (_) { /* already settled */ }
+        reject(signal.reason);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      call.promise.then(resolve, reject);
+    });
+    try {
+      return toResponse(await settled);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
   def('fetch', fetch);
 

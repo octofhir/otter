@@ -98,7 +98,7 @@ async fn fetch_performs_buffered_get() -> Result<(), OtterError> {
     otter
         .handle()
         .run_script(
-            SourceInput::from_javascript(&format!(
+            SourceInput::from_javascript(format!(
                 r#"
                 fetch("{url}", {{ headers: {{ "X-Probe": "otter" }} }})
                   .then((response) =>
@@ -152,7 +152,7 @@ async fn fetch_forwards_request_body_on_post() -> Result<(), OtterError> {
     otter
         .handle()
         .run_script(
-            SourceInput::from_javascript(&format!(
+            SourceInput::from_javascript(format!(
                 r#"
                 fetch("{url}", {{ method: "POST", body: "ping=pong" }})
                   .then((response) =>
@@ -168,6 +168,48 @@ async fn fetch_forwards_request_body_on_post() -> Result<(), OtterError> {
         .await?;
     server.join().expect("server thread");
     assert_eq!(capture.snapshot(), vec!["ok:201:received".to_string()]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_aborts_in_flight_request() -> Result<(), OtterError> {
+    // A bound listener that never accepts: reqwest completes the TCP handshake
+    // (kernel backlog) and then waits forever for a response, so the request is
+    // reliably in-flight when the signal aborts. The listener is held for the
+    // test's duration to keep the port bound.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let url = format!("http://{}/", listener.local_addr().expect("addr"));
+
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(allow_net())
+        .console_sink(capture.clone())
+        .build()?;
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(format!(
+                r#"
+                const controller = new AbortController();
+                const p = fetch("{url}", {{ signal: controller.signal }});
+                controller.abort();
+                p.then(
+                  () => console.log("resolved"),
+                  (error) => console.log(
+                    "aborted:" + (error && error.name) + ":" + (error instanceof DOMException)
+                  ),
+                );
+                "#
+            )),
+            "<fetch-abort>",
+        )
+        .await?;
+    drop(listener);
+    assert_eq!(
+        capture.snapshot(),
+        vec!["aborted:AbortError:true".to_string()]
+    );
     Ok(())
 }
 

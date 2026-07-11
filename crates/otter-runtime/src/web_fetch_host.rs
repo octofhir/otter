@@ -19,7 +19,59 @@
 //! # See also
 //! - <https://fetch.spec.whatwg.org/>
 
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::oneshot;
+
 use crate::Permission;
+
+/// Cancellation handle for an in-flight [`prepare_fetch`] request. Calling
+/// [`FetchAbort::abort`] cancels the request (closing the socket by dropping the
+/// reqwest future); dropping the handle without aborting lets it run normally.
+/// `Send + Sync` so it can be captured by the JS-visible abort callback.
+pub struct FetchAbort {
+    sender: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl FetchAbort {
+    /// Cancel the in-flight request. Idempotent: later calls are no-ops.
+    pub fn abort(&self) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .expect("fetch abort mutex poisoned")
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
+}
+
+/// Build a cancellable outbound fetch. Returns the abort handle and the future
+/// to drive on the host executor; the future resolves with the response, or
+/// errors with `"fetch aborted"` if [`FetchAbort::abort`] fires first. The
+/// capability gate lives in [`perform_fetch`], so a refused host still rejects.
+pub fn prepare_fetch(
+    request: FetchRequest,
+    user_agent: String,
+    net: Permission<String>,
+) -> (
+    Arc<FetchAbort>,
+    impl Future<Output = Result<FetchResponse, String>> + Send,
+) {
+    let (sender, receiver) = oneshot::channel();
+    let abort = Arc::new(FetchAbort {
+        sender: Mutex::new(Some(sender)),
+    });
+    let future = async move {
+        tokio::select! {
+            result = perform_fetch(request, user_agent, net) => result,
+            _ = receiver => Err("fetch aborted".to_string()),
+        }
+    };
+    (abort, future)
+}
 
 /// Plain-data outbound request assembled by the `fetch` shim from a normalized
 /// `Request` (method, absolute URL, pre-flattened headers, buffered body).

@@ -95,6 +95,35 @@ fn native_host_instances_link_class_prototype() {
 }
 
 #[test]
+fn url_pattern_matches_named_groups_and_wildcards() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        const p = new URLPattern({ pathname: "/books/:id" });
+        out += (p instanceof URLPattern) + "|";
+        out += p.test("https://example.com/books/42") + "|";
+        out += p.test("https://example.com/books/42/extra") + "|";
+        const r = p.exec("https://example.com/books/42");
+        out += r.pathname.groups.id + "|";
+        // Wildcard + protocol/hostname patterns.
+        const q = new URLPattern("https://*.example.com/api/*");
+        out += q.test("https://a.example.com/api/users") + "|";
+        out += q.test("https://a.other.com/api/users") + "|";
+        // Constructor-string pathname group, matched via an init input
+        // (a bare relative string is not a valid URL for exec).
+        const s = new URLPattern("/files/:name.:ext");
+        const m = s.exec({ pathname: "/files/report.pdf" });
+        out += m.pathname.groups.name + "." + m.pathname.groups.ext + "|";
+        out += (s.exec({ pathname: "/files/nope" }) === null);
+        out
+        "#,
+    );
+    assert_eq!(result, "true|true|false|42|true|false|report.pdf|true");
+}
+
+#[test]
 fn singleton_web_class_globals_are_branded_and_unconstructable() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
@@ -511,6 +540,7 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "PromiseRejectionEvent",
       "URLSearchParams",
       "URL",
+      "URLPattern",
       "fetch",
     ];
     const PARTIAL = [
@@ -534,7 +564,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "ReadableByteStreamController",
       "ReadableStreamBYOBReader",
       "ReadableStreamBYOBRequest",
-      "URLPattern",
       "WebAssembly",
       "WebAssembly.compile",
       "WebAssembly.compileStreaming",

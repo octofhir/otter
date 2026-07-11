@@ -7,13 +7,15 @@
 //! installed for every runtime that enables Web APIs. `atob`/`btoa`,
 //! `queueMicrotask`, `navigator`, the native in-realm `structuredClone`
 //! plus Streams compression codec, and the native CSPRNG/digest backing
-//! for `crypto` (see [`crate::crypto`]) are implemented; `fetch` is still
-//! a placeholder.
+//! for `crypto` (see [`crate::crypto`]) are implemented. `fetch()` is a JS
+//! shim over the private `__nativeFetch` transport (see [`crate::fetch_ext`]).
+
+use std::sync::Arc;
 
 use otter_runtime::{
-    OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeValue as Value, SourceInput, runtime_arg_to_string,
-    runtime_string_value, runtime_type_error,
+    OtterError, Runtime, RuntimeGlobalInstaller, RuntimeNativeCall, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeFn, RuntimeValue as Value, SourceInput,
+    runtime_arg_to_string, runtime_string_value, runtime_type_error,
 };
 
 /// Pure-JS Web Platform globals — the sources live in the `romp!`
@@ -39,7 +41,19 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("btoa", 1, btoa)?;
     runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
-    runtime.install_native_global("fetch", 1, fetch)?;
+    // `fetch()` itself is the JS shim in `web_fetch.js`; it normalizes its
+    // arguments and calls this private native transport member, which the shim
+    // consumes and deletes. The `net` allowlist is captured at install time
+    // (the per-call context does not expose it) and gates every request.
+    let capabilities = runtime.capabilities().clone();
+    let fetch_call: Arc<RuntimeNativeFn> = Arc::new(move |ctx, args, _captures| {
+        crate::fetch_ext::native_fetch(ctx, args, &capabilities)
+    });
+    runtime.install_native_global_call(
+        "__nativeFetch",
+        4,
+        RuntimeNativeCall::Dynamic(fetch_call),
+    )?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
     install_navigator(runtime)?;
     install_self(runtime)?;
@@ -174,12 +188,6 @@ fn queue_microtask(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let callback = args.first().copied().unwrap_or_else(Value::undefined);
     ctx.queue_microtask(callback, [])?;
     Ok(Value::undefined())
-}
-
-// ---- placeholders (present so referencing code loads) ----
-
-fn fetch(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Err(runtime_type_error("fetch", "fetch is not implemented"))
 }
 
 fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

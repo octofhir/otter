@@ -510,9 +510,9 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "TransformStreamDefaultController",
       "URLSearchParams",
       "URL",
+      "fetch",
     ];
     const PARTIAL = [
-      "fetch",
       "Request",
       "Response",
       "crypto.subtle",
@@ -609,11 +609,6 @@ fn wintertc_partial_entries_document_their_gap() {
             r#"
         // Each smoke check returns true while the documented gap is still open.
         const GAPS = {
-          // fetch() is a placeholder that throws instead of performing a request.
-          "fetch": () => {
-            try { fetch("http://example.invalid"); return false; }
-            catch (e) { return String(e.message).includes("fetch is not implemented"); }
-          },
           // Request bodies are default streams only; no BYOB byte reader yet.
           "Request": () => {
             const b = new Request("https://e.com", { method: "POST", body: "hi" }).body;

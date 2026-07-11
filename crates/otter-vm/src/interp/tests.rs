@@ -72,7 +72,7 @@ fn jit_instr(
     byte_pc: u32,
     operands: Vec<Operand>,
 ) -> jit::JitTestInstruction {
-    jit::JitTestInstruction::new(op, instruction_pc, byte_pc, 1, operands)
+    jit::JitTestInstruction::new(op, instruction_pc, byte_pc, operands)
 }
 
 #[test]
@@ -4988,7 +4988,6 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
                     Op::Add,
                     byte_pc / 16,
                     byte_pc,
-                    16,
                     vec![
                         Operand::Register(0),
                         Operand::Register(1),

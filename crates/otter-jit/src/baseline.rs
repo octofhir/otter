@@ -7183,13 +7183,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, (op, operands))| {
-                JitTestInstruction::new(
-                    *op,
-                    idx as u32,
-                    idx as u32 * STRIDE,
-                    STRIDE,
-                    operands.clone(),
-                )
+                JitTestInstruction::new(*op, idx as u32, idx as u32 * STRIDE, operands.clone())
             })
             .collect();
         let mut view = JitCompileSnapshot::without_feedback(0, 1, 8, instructions);

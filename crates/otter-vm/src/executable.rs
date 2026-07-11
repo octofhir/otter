@@ -227,8 +227,7 @@ impl CodeBlock {
                 .enumerate()
                 .map(|(index, _)| crate::jit::JitInstructionMetadata {
                     instruction_index: index as u32,
-                    byte_pc: self.instruction_metadata[index].byte_pc,
-                    byte_len: self.instruction_metadata[index].byte_len,
+                    byte_pc: self.byte_pcs[index],
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can map a `MakeFunction` constant index to its target id.
                     make_self: false,
@@ -287,13 +286,7 @@ impl CodeBlock {
             wordcode_builder.push(instr.op, &instr.operands);
         }
         let wordcode = wordcode_builder.finish();
-        let instruction_metadata: Vec<_> = instructions
-            .iter()
-            .map(|instr| ColdInstructionMetadata {
-                byte_pc: instr.byte_pc,
-                byte_len: u32::from(instr.byte_len),
-            })
-            .collect();
+        let byte_pcs: Vec<_> = instructions.iter().map(|instr| instr.byte_pc).collect();
         let code: Vec<_> = instructions
             .iter()
             .enumerate()
@@ -306,9 +299,6 @@ impl CodeBlock {
                 )
             })
             .collect();
-        let code_byte_len = instruction_metadata.last().map_or(0, |metadata| {
-            metadata.byte_pc.saturating_add(metadata.byte_len)
-        });
         let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
         Arc::new(Self {
             id,
@@ -336,9 +326,8 @@ impl CodeBlock {
             code: code.into_boxed_slice(),
             wordcode,
             control_flow,
-            instruction_metadata: instruction_metadata.into_boxed_slice(),
+            byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
-            code_byte_len,
         })
     }
 
@@ -349,29 +338,17 @@ impl CodeBlock {
         &self.byte_spans
     }
 
-    /// Total length in bytes of this function's encoded stream.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) const fn code_byte_len(&self) -> u32 {
-        self.code_byte_len
-    }
-
-    /// Resolve a cold byte-offset PC by binary-searching instruction metadata.
+    /// Resolve a cold byte-offset PC by binary-searching the source map.
     #[must_use]
     pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&CodeBlockInstruction> {
-        let idx = self
-            .instruction_metadata
-            .binary_search_by_key(&byte_pc, |metadata| metadata.byte_pc)
-            .ok()?;
+        let idx = self.byte_pcs.binary_search(&byte_pc).ok()?;
         self.code.get(idx)
     }
 
     /// Resolve a cold byte-offset PC to its dense instruction index.
     #[must_use]
     pub(crate) fn instr_index_at_byte_pc(&self, byte_pc: u32) -> Option<usize> {
-        self.instruction_metadata
-            .binary_search_by_key(&byte_pc, |metadata| metadata.byte_pc)
-            .ok()
+        self.byte_pcs.binary_search(&byte_pc).ok()
     }
 
     /// Fetch an instruction by its dense `code` index.
@@ -383,17 +360,7 @@ impl CodeBlock {
     /// Cold serialized byte PC for one logical instruction index.
     #[must_use]
     pub(crate) fn instruction_byte_pc(&self, index: usize) -> Option<u32> {
-        self.instruction_metadata
-            .get(index)
-            .map(|metadata| metadata.byte_pc)
-    }
-
-    /// Cold serialized byte length for one logical instruction index.
-    #[must_use]
-    pub(crate) fn instruction_byte_len(&self, index: usize) -> Option<u32> {
-        self.instruction_metadata
-            .get(index)
-            .map(|metadata| metadata.byte_len)
+        self.byte_pcs.get(index).copied()
     }
 
     /// Operands in schema declaration order.
@@ -712,21 +679,11 @@ pub struct CodeBlock {
     wordcode: FunctionCode,
     /// Precomputed logical-PC block, loop, and exception-region tables.
     control_flow: CodeBlockControlFlow,
-    /// Cold serialized byte coordinates parallel to `code`.
-    instruction_metadata: Box<[ColdInstructionMetadata]>,
+    /// Cold serialized byte PCs parallel to `code`.
+    byte_pcs: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
-    /// Total length in bytes of this function's encoded stream. Acts as
-    /// the upper bound for jump targets that fall off the end of the
-    /// last instruction.
-    pub code_byte_len: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ColdInstructionMetadata {
-    byte_pc: u32,
-    byte_len: u32,
 }
 
 impl CodeBlock {
@@ -746,21 +703,6 @@ impl CodeBlock {
         });
         let wordcode = function.code.clone();
         let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
-        let instruction_metadata = instr_to_byte_pc
-            .iter()
-            .enumerate()
-            .map(|(index, &byte_pc)| {
-                let next_byte_pc = instr_to_byte_pc
-                    .get(index + 1)
-                    .copied()
-                    .unwrap_or(code_byte_len);
-                ColdInstructionMetadata {
-                    byte_pc,
-                    byte_len: next_byte_pc - byte_pc,
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
         let code = function
             .code
             .iter()
@@ -875,9 +817,8 @@ impl CodeBlock {
             code,
             wordcode,
             control_flow,
-            instruction_metadata,
+            byte_pcs: instr_to_byte_pc,
             byte_spans,
-            code_byte_len,
         }
     }
 }
@@ -1162,7 +1103,6 @@ mod tests {
         assert_eq!(view.instructions.len(), 2);
         assert_eq!(view.instructions[0].op(&view.code_block), Op::LoadProperty);
         assert_eq!(view.instructions[0].byte_pc, 0);
-        assert!(view.instructions[0].byte_len > 0);
         assert_eq!(
             view.instructions[0].property_ic_site(&view.code_block),
             Some(0)

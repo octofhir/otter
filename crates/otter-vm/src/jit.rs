@@ -593,8 +593,6 @@ pub struct JitInstructionMetadata {
     pub(crate) instruction_index: u32,
     /// Cold serialized byte PC used by bailout/profiling metadata.
     pub byte_pc: u32,
-    /// Cold serialized byte length used by bailout/profiling metadata.
-    pub byte_len: u32,
     /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
     /// being compiled (the named-function SELF binding). The emitter
     /// materializes it as a direct read of the frame's own closure (carried in
@@ -678,11 +676,10 @@ pub struct JitInstructionMetadata {
 }
 
 impl JitInstructionMetadata {
-    fn without_feedback(instruction_index: u32, byte_pc: u32, byte_len: u32) -> Self {
+    fn without_feedback(instruction_index: u32, byte_pc: u32) -> Self {
         Self {
             instruction_index,
             byte_pc,
-            byte_len,
             make_self: false,
             load_array_length: false,
             method_hint: JitMethodHint::None,
@@ -708,26 +705,17 @@ pub struct JitTestInstruction {
     pub(crate) op: Op,
     pub(crate) instruction_pc: u32,
     pub(crate) byte_pc: u32,
-    pub(crate) byte_len: u16,
     pub(crate) operands: Vec<Operand>,
 }
 
 impl JitTestInstruction {
     /// Build transient input for a backend unit-test CodeBlock.
     #[must_use]
-    pub fn new(
-        op: Op,
-        instruction_pc: u32,
-        byte_pc: u32,
-        byte_len: u32,
-        operands: Vec<Operand>,
-    ) -> Self {
-        let byte_len = u16::try_from(byte_len).expect("instruction byte length exceeds u16");
+    pub fn new(op: Op, instruction_pc: u32, byte_pc: u32, operands: Vec<Operand>) -> Self {
         Self {
             op,
             instruction_pc,
             byte_pc,
-            byte_len,
             operands,
         }
     }
@@ -758,9 +746,6 @@ impl JitCompileSnapshot {
                     index as u32,
                     code_block
                         .instruction_byte_pc(index)
-                        .expect("test CodeBlock metadata matches instructions"),
-                    code_block
-                        .instruction_byte_len(index)
                         .expect("test CodeBlock metadata matches instructions"),
                 )
             })

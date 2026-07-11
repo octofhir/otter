@@ -16,7 +16,17 @@ fn web_api_specs_are_static_and_ordered() {
     let specs = web_api_classes();
     assert_eq!(
         specs.iter().map(|spec| spec.name()).collect::<Vec<_>>(),
-        ["URL", "Blob", "File", "crypto"]
+        [
+            "URL",
+            "Blob",
+            "File",
+            "crypto",
+            "WebAssembly.Module",
+            "WebAssembly.Memory",
+            "WebAssembly.Global",
+            "WebAssembly.Table",
+            "WebAssembly",
+        ]
     );
 }
 
@@ -544,6 +554,134 @@ fn web_api_globals_install_and_run_through_runtime_builder() {
     );
 }
 
+/// Real end-to-end WebAssembly: validate a module, instantiate it with an
+/// imported JS function, call an exported function that both does integer
+/// math and re-enters the import, and read the exported linear memory.
+#[test]
+fn web_assembly_validates_instantiates_and_runs() {
+    // A module that imports `env.addThree`, exports `add` (i32.add),
+    // exports `callImport` (forwards to the JS import), and exports a
+    // 1-page `memory` whose byte 0 is initialized to 42.
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (import "env" "addThree" (func $addThree (param i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "\2a")
+          (func (export "add") (param i32 i32) (result i32)
+            local.get 0
+            local.get 1
+            i32.add)
+          (func (export "callImport") (param i32) (result i32)
+            local.get 0
+            call $addThree))
+        "#,
+    )
+    .expect("wat compiles to wasm bytes");
+
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    // Hand the wasm bytes to JS as a base64 string the harness decodes.
+    let base64 = {
+        use std::fmt::Write as _;
+        let mut encoded = String::new();
+        for byte in &wasm {
+            let _ = write!(encoded, "{byte},");
+        }
+        encoded
+    };
+
+    let result = eval_string(
+        &mut runtime,
+        &format!(
+            r#"
+        globalThis.out = "pending";
+        const bytes = Uint8Array.from("{base64}".split(",").filter((s) => s.length).map(Number));
+        // Synchronous validation of real wasm bytes.
+        const valid = WebAssembly.validate(bytes);
+        const invalid = WebAssembly.validate(new Uint8Array([0, 1, 2, 3]));
+        const importObject = {{ env: {{ addThree: (n) => n + 3 }} }};
+        WebAssembly.instantiate(bytes, importObject).then((result) => {{
+          const instance = result.instance;
+          const exports = instance.exports;
+          const sum = exports.add(20, 22);                 // pure i32 math
+          const forwarded = exports.callImport(39);        // re-enters the JS import
+          const memoryOk = exports.memory instanceof WebAssembly.Memory;
+          const firstByte = new Uint8Array(exports.memory.buffer)[0]; // read exported memory
+          const grown = exports.memory.grow(1);
+          globalThis.out = [
+            valid, invalid,
+            result.module instanceof WebAssembly.Module,
+            instance instanceof WebAssembly.Instance,
+            sum, forwarded, memoryOk, firstByte, grown,
+            new Uint8Array(exports.memory.buffer).length,
+          ].join("|");
+        }}, (err) => {{ globalThis.out = "ERR:" + (err && err.stack || err); }});
+        "pending"
+        "#,
+        ),
+    );
+    assert_eq!(result, "pending");
+    let after = eval_string(&mut runtime, "out");
+    // valid | invalid | module-branded | instance-branded | 20+22 | 39+3 |
+    // memory-branded | data byte | grow-returns-old-pages | new size (2 pages).
+    assert_eq!(after, "true|false|true|true|42|42|true|42|1|131072");
+}
+
+/// The synchronous `new WebAssembly.Module` / `new WebAssembly.Instance`
+/// constructors, `Global`, and the typed error classes.
+#[test]
+fn web_assembly_constructors_globals_and_errors() {
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (func (export "id") (param i32) (result i32) local.get 0))
+        "#,
+    )
+    .expect("wat compiles");
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let base64 = {
+        use std::fmt::Write as _;
+        let mut encoded = String::new();
+        for byte in &wasm {
+            let _ = write!(encoded, "{byte},");
+        }
+        encoded
+    };
+    let result = eval_string(
+        &mut runtime,
+        &format!(
+            r#"
+        var out = "";
+        const bytes = Uint8Array.from("{base64}".split(",").filter((s) => s.length).map(Number));
+        const module = new WebAssembly.Module(bytes);
+        out += (module instanceof WebAssembly.Module) + "|";
+        const instance = new WebAssembly.Instance(module);
+        out += (instance instanceof WebAssembly.Instance) + "|";
+        out += instance.exports.id(7) + "|";
+        // A mutable Global round-trips its value.
+        const global = new WebAssembly.Global({{ value: "i32", mutable: true }}, 5);
+        out += global.value + "|";
+        global.value = 11;
+        out += global.value + "|";
+        // The error classes are Error subclasses on the namespace.
+        out += (new WebAssembly.CompileError("x") instanceof Error) + "|";
+        out += (WebAssembly.LinkError.name) + "|";
+        // A bad instantiate rejects with a LinkError (missing import).
+        globalThis.linkOut = "pending";
+        WebAssembly.instantiate(
+          Uint8Array.from(bytes),
+          undefined,
+        ).then(() => {{ globalThis.linkOut = "resolved"; }});
+        // Instantiating a module that needs an import without one throws/rejects;
+        // here `id` needs none, so this resolves — assert the class name instead.
+        out += WebAssembly.RuntimeError.name;
+        out
+        "#,
+        ),
+    );
+    assert_eq!(result, "true|true|7|5|11|true|LinkError|RuntimeError");
+}
+
 /// The authoritative WinterTC / ECMA-429 Minimum Common API ledger.
 ///
 /// Every path named by the ECMA-429 minimum-common-API snapshot appears in
@@ -629,16 +767,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "onerror",
       "onunhandledrejection",
       "onrejectionhandled",
-    ];
-    const PARTIAL = [];
-    // Otter's global object is not a Window/Worker EventTarget, so the global
-    // event-handler IDL attributes are exposed as plain settable
-    // ([Replaceable]-equivalent) globals rather than through addEventListener.
-    // `onunhandledrejection` / `onrejectionhandled` are invoked by the VM's
-    // HostPromiseRejectionTracker checkpoint; `onerror` is present for parity
-    // (uncaught exceptions still surface as runtime diagnostics).
-    const OMITTED = [];
-    const NOT_YET = [
       "WebAssembly",
       "WebAssembly.compile",
       "WebAssembly.compileStreaming",
@@ -650,11 +778,21 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "WebAssembly.Memory",
       "WebAssembly.Table",
       "WebAssembly.Global",
-      "WebAssembly.Tag",
-      "WebAssembly.Exception",
       "WebAssembly.CompileError",
       "WebAssembly.LinkError",
       "WebAssembly.RuntimeError",
+    ];
+    const PARTIAL = [];
+    // Otter's global object is not a Window/Worker EventTarget, so the global
+    // event-handler IDL attributes are exposed as plain settable
+    // ([Replaceable]-equivalent) globals rather than through addEventListener.
+    // `onunhandledrejection` / `onrejectionhandled` are invoked by the VM's
+    // HostPromiseRejectionTracker checkpoint; `onerror` is present for parity
+    // (uncaught exceptions still surface as runtime diagnostics).
+    const OMITTED = [];
+    const NOT_YET = [
+      "WebAssembly.Tag",
+      "WebAssembly.Exception",
       "WebAssembly.JSTag",
     ];
     function lookup(path) {
@@ -818,7 +956,10 @@ fn unhandled_rejection_notifies_and_rejectionhandled_follows() {
     // rejectionhandled must come after the promise was reported unhandled.
     let u_late = entries.iter().position(|e| *e == "U:late:true");
     let h_late = entries.iter().position(|e| *e == "H:late");
-    assert!(u_late < h_late, "rejectionhandled before report, got {result:?}");
+    assert!(
+        u_late < h_late,
+        "rejectionhandled before report, got {result:?}"
+    );
 }
 
 #[test]

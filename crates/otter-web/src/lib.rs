@@ -31,6 +31,7 @@ pub mod crypto;
 pub mod fetch_ext;
 pub mod globals;
 pub mod url;
+pub mod wasm;
 
 use otter_runtime::{GlobalClass, OtterBuilder, RuntimeBuilder};
 
@@ -43,6 +44,14 @@ otter_macros::romp! {
         blob::BlobIntrinsic,
         blob::FileIntrinsic,
         crypto::WebCryptoIntrinsic,
+        // The reference-type classes install first (as hidden dotted-name
+        // globals); the WebAssembly namespace glue then relocates them
+        // onto the namespace, so it must come after them.
+        wasm::WasmModuleIntrinsic,
+        wasm::WasmMemoryIntrinsic,
+        wasm::WasmGlobalIntrinsic,
+        wasm::WasmTableIntrinsic,
+        wasm::WebAssemblyIntrinsic,
     ],
     js = [
         (include_str!("web_bootstrap.js"), defines = [

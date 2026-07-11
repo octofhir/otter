@@ -28,6 +28,7 @@ extern crate otter_runtime as otter_vm;
 
 pub mod blob;
 pub mod crypto;
+pub mod fetch_ext;
 pub mod globals;
 pub mod url;
 
@@ -62,7 +63,7 @@ otter_macros::romp! {
             "TransformStreamDefaultController", "WritableStream",
             "WritableStreamDefaultController", "WritableStreamDefaultWriter",
         ]),
-        (include_str!("web_fetch.js"), defines = ["Headers", "Request", "Response"]),
+        (include_str!("web_fetch.js"), defines = ["fetch", "Headers", "Request", "Response"]),
     ],
 }
 

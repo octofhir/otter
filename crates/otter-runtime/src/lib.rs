@@ -71,6 +71,7 @@ pub mod promise_registry;
 mod runtime_activity;
 pub mod structured_clone;
 pub mod surface;
+pub mod web_fetch_host;
 pub mod web_structured_clone;
 pub mod worker;
 

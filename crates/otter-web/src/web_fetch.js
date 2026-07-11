@@ -772,6 +772,58 @@
   def('Request', Request);
   def('Response', Response);
 
+  // ---- fetch() ----
+  //
+  // The native transport member installed by `web_globals_installer`; consumed
+  // and deleted here so user code never reaches the raw hook. It takes
+  // `(method, url, flatHeaders, bodyBytes)` and resolves to
+  // `[status, statusText, flatHeaders, bodyBytes, finalUrl]`.
+  const nativeFetch = global.__nativeFetch;
+  delete global.__nativeFetch;
+
+  function requestBodyBytes(request) {
+    if (request[kBodyBytes] !== null) return request[kBodyBytes];
+    if (request[kBodyText] !== null) return utf8Encode(request[kBodyText]);
+    return null;
+  }
+
+  // Mint a Response from the native transport's plain parts, bypassing the
+  // constructor (the values are already validated by the server).
+  function makeResponse(status, statusText, flatHeaders, bodyBytes, finalUrl) {
+    const response = Object.create(Response.prototype);
+    const headers = new Headers();
+    const list = headers[kHeaderList];
+    for (let i = 0; i + 1 < flatHeaders.length; i += 2) {
+      list.push([flatHeaders[i], flatHeaders[i + 1]]);
+    }
+    initResponse(response, status, statusText, headers, 'basic');
+    response[kResponseUrl] = finalUrl;
+    if (bodyBytes !== null && bodyBytes !== undefined && bodyBytes.byteLength > 0) {
+      response[kBodyBytes] = bodyBytes;
+    }
+    return response;
+  }
+
+  // §5.6 fetch(input, init). Normalize through the Request constructor (which
+  // owns URL parsing, method/header validation, and body extraction), then hand
+  // the flattened request to the native transport. Network and permission
+  // failures reject with a TypeError (the native maps them already).
+  async function fetch(input, init) {
+    const request = new Request(input, init);
+    const signal = request.signal;
+    if (signal !== null && signal !== undefined && signal.aborted) {
+      throw new DOMException('The operation was aborted.', 'AbortError');
+    }
+    const flatHeaders = [];
+    for (const [name, value] of request.headers) {
+      flatHeaders.push(name, value);
+    }
+    const body = requestBodyBytes(request);
+    const parts = await nativeFetch(request.method, request.url, flatHeaders, body);
+    return makeResponse(parts[0], parts[1], parts[2], parts[3], parts[4]);
+  }
+  def('fetch', fetch);
+
   // ---- Server integration factory ----
   //
   // Native server glue builds Requests and unpacks Responses through this

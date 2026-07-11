@@ -626,18 +626,18 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "structuredClone",
       "crypto.subtle",
       "crypto.subtle.digest",
-    ];
-    const PARTIAL = [];
-    // Omitted by design per ECMA-429 §6: Otter's global object is not a
-    // Window/Worker EventTarget, so the global event-handler IDL attributes are
-    // not exposed. The documented alternative reporting mechanism is
-    // `reportError` (→ console) plus uncaught exceptions/rejections surfacing as
-    // runtime diagnostics. These must stay absent.
-    const OMITTED = [
       "onerror",
       "onunhandledrejection",
       "onrejectionhandled",
     ];
+    const PARTIAL = [];
+    // Otter's global object is not a Window/Worker EventTarget, so the global
+    // event-handler IDL attributes are exposed as plain settable
+    // ([Replaceable]-equivalent) globals rather than through addEventListener.
+    // `onunhandledrejection` / `onrejectionhandled` are invoked by the VM's
+    // HostPromiseRejectionTracker checkpoint; `onerror` is present for parity
+    // (uncaught exceptions still surface as runtime diagnostics).
+    const OMITTED = [];
     const NOT_YET = [
       "WebAssembly",
       "WebAssembly.compile",
@@ -765,6 +765,60 @@ fn global_scope_shell_self_and_report_error() {
         "#,
     );
     assert_eq!(result, "true|true|true|function|false|false");
+}
+
+#[test]
+fn unhandled_rejection_notifies_and_rejectionhandled_follows() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    // First turn: install handlers and reject promises. The
+    // unhandledrejection/rejectionhandled events fire during the microtask drain
+    // the runtime performs after the synchronous script completes, so the log is
+    // only populated by the time control returns here.
+    eval_string(
+        &mut runtime,
+        r#"
+        globalThis.__log = [];
+        const log = globalThis.__log;
+        globalThis.onunhandledrejection = (e) => {
+          log.push("U:" + e.reason + ":" + (e.promise instanceof Promise));
+          e.preventDefault(); // suppress the default console report
+          if (e.reason === "late") {
+            // Attach a handler after the promise was reported unhandled so the
+            // follow-up rejectionhandled notification fires.
+            queueMicrotask(() => { e.promise.catch(() => {}); });
+          }
+        };
+        globalThis.onrejectionhandled = (e) => { log.push("H:" + e.reason); };
+
+        Promise.reject("boom");                 // reported unhandled, stays so
+        Promise.reject("late");                 // reported unhandled, then handled
+        Promise.reject("quiet").catch(() => {}); // handled synchronously: silent
+        undefined
+        "#,
+    );
+    // Second turn: read the log the drained checkpoint populated.
+    let result = eval_string(&mut runtime, "globalThis.__log.join(',')");
+    let entries: Vec<&str> = result.split(',').filter(|s| !s.is_empty()).collect();
+    assert!(
+        entries.contains(&"U:boom:true"),
+        "expected unhandledrejection for boom, got {result:?}"
+    );
+    assert!(
+        entries.contains(&"U:late:true"),
+        "expected unhandledrejection for late, got {result:?}"
+    );
+    assert!(
+        entries.contains(&"H:late"),
+        "expected rejectionhandled for late, got {result:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e.contains("quiet")),
+        "a synchronously-handled rejection must not notify, got {result:?}"
+    );
+    // rejectionhandled must come after the promise was reported unhandled.
+    let u_late = entries.iter().position(|e| *e == "U:late:true");
+    let h_late = entries.iter().position(|e| *e == "H:late");
+    assert!(u_late < h_late, "rejectionhandled before report, got {result:?}");
 }
 
 #[test]

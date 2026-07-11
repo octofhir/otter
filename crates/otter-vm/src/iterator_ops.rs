@@ -1270,6 +1270,7 @@ impl Interpreter {
             }
             Err(reason) => promise.reject(&mut self.gc_heap, reason),
         };
+        self.note_settle_rejection(&jobs);
         for job in jobs.jobs {
             self.microtasks.enqueue(job);
         }

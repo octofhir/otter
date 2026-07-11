@@ -124,6 +124,7 @@ pub mod persistent_roots;
 pub mod promise;
 pub mod promise_dispatch;
 mod promise_ops;
+mod promise_rejection;
 mod property_atom;
 mod property_dispatch;
 mod property_ic;
@@ -1167,6 +1168,10 @@ pub struct Interpreter {
     /// the way out, matching the LIFO call shape. Traced by
     /// [`RuntimeState::trace_roots`].
     iteration_anchors: Vec<Value>,
+    /// HTML HostPromiseRejectionTracker state: rejected promises awaiting the
+    /// post-drain `unhandledrejection`/`rejectionhandled` checkpoint. Both
+    /// internal lists are GC roots. See [`crate::promise_rejection`].
+    rejection_tracker: crate::promise_rejection::RejectionTracker,
     /// Stack-frame snapshot captured at the moment of the
     /// originating `Op::Throw` (before [`Self::unwind_throw`]
     /// pops handler-less frames). Surfaces as [`RunError::frames`]

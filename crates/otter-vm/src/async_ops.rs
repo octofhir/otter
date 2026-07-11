@@ -500,6 +500,7 @@ impl Interpreter {
                         .expect("async_state checked just above")
                         .result_promise;
                     let jobs = result_promise.reject(&mut self.gc_heap, payload);
+                    self.note_settle_rejection(&jobs);
                     for j in jobs.jobs {
                         self.microtasks.enqueue(j);
                     }

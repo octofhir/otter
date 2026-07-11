@@ -151,6 +151,7 @@ fn settle_from_root<R: IntoJs>(
             promise.reject(cx.heap_mut(), raw_out)
         };
         let interp = cx.ctx().interp_mut();
+        interp.note_settle_rejection(&jobs);
         for job in jobs.jobs {
             interp.microtasks_mut().enqueue(job);
         }

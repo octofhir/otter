@@ -5440,6 +5440,13 @@ impl Interpreter {
                     );
                 }
                 if receiver.is_object() {
+                    // The store (or transition capture) may have scavenged,
+                    // relocating the receiver object; re-read the live handle
+                    // from its rooted register before the IC probe touches it.
+                    let Some(obj) = read_register(&stack[top_idx], obj_reg)?.as_object() else {
+                        stack[top_idx].advance_pc()?;
+                        return Ok(true);
+                    };
                     let site = context
                         .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                         .ok_or(VmError::InvalidOperand)?;

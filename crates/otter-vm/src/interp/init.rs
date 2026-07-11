@@ -239,6 +239,7 @@ impl Interpreter {
             pending_generator_throw: None,
             pending_uncaught_throw: None,
             iteration_anchors: Vec::new(),
+            rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
             pending_uncaught_frames: None,
             module_sources: source_registry::SourceRegistry::default(),
             active_frame_stack: std::ptr::null(),

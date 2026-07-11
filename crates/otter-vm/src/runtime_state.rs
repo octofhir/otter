@@ -219,6 +219,9 @@ impl<'a> RuntimeState<'a> {
         for value in interp.iteration_anchors_for_trace() {
             value.trace_value_slots(visitor);
         }
+        // 8c) Promise-rejection tracker: rejected promises awaiting the
+        //     unhandled-rejection checkpoint are roots until reported.
+        interp.rejection_tracker_for_trace().trace(visitor);
         // 9) Active call frames are NOT enumerated here. The
         //    frame stack lives on the call stack of
         //    `Interpreter::run_inner` (`HoltStack`),

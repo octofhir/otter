@@ -448,7 +448,10 @@ impl PromiseBuilder {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
         };
-        JsPromiseHandle::rejected_with_roots(interp.gc_heap_mut(), reason, &mut external_visit)
+        let promise =
+            JsPromiseHandle::rejected_with_roots(interp.gc_heap_mut(), reason, &mut external_visit)?;
+        interp.note_born_rejection(promise);
+        Ok(promise)
     }
 
     pub(crate) fn rejected_runtime_rooted(
@@ -462,7 +465,10 @@ impl PromiseBuilder {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
         };
-        JsPromiseHandle::rejected_with_roots(interp.gc_heap_mut(), reason, &mut external_visit)
+        let promise =
+            JsPromiseHandle::rejected_with_roots(interp.gc_heap_mut(), reason, &mut external_visit)?;
+        interp.note_born_rejection(promise);
+        Ok(promise)
     }
 
     pub(crate) fn pending_native_rooted(
@@ -3473,6 +3479,7 @@ fn make_reject_native_native_rooted(
 }
 
 fn drain_jobs(interp: &mut Interpreter, jobs: PromiseSettleJobs) {
+    interp.note_settle_rejection(&jobs);
     for j in jobs.jobs {
         interp.microtasks_mut().enqueue(j);
     }

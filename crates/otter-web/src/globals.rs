@@ -60,6 +60,65 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
     install_navigator(runtime)?;
     install_self(runtime)?;
+    install_promise_rejection_handling(runtime)?;
+    Ok(())
+}
+
+/// Install the global unhandled-rejection surface (HTML
+/// §handler-onunhandledrejection).
+///
+/// Otter's global object is not a Window/Worker EventTarget, so the
+/// `unhandledrejection` / `rejectionhandled` / `error` handler IDL attributes
+/// are exposed as plain settable ([Replaceable]-equivalent) globals rather than
+/// through `addEventListener`. They and the VM-invoked reporter are installed
+/// **eagerly** — the on* attributes must be assignable before any Web global is
+/// touched (and a later lazy materialization of `web_bootstrap.js` must not
+/// clobber a user-set handler), and the reporter must exist whenever the VM's
+/// HostPromiseRejectionTracker checkpoint runs. The reporter references
+/// `PromiseRejectionEvent` and `reportError` lazily, so those stay in the
+/// deferred `web_bootstrap.js` group and materialize the first time the reporter
+/// actually fires.
+fn install_promise_rejection_handling(runtime: &mut Runtime) -> Result<(), OtterError> {
+    // `handled` is false for the `unhandledrejection` notification and true for
+    // the follow-up `rejectionhandled`. Defensive throughout: a throwing
+    // handler must never abort the microtask drain the VM invokes this from.
+    let shim = "\
+        (function (g) {\n\
+          function replaceable(name) {\n\
+            Object.defineProperty(g, name, {\n\
+              value: null, writable: true, enumerable: false, configurable: true,\n\
+            });\n\
+          }\n\
+          replaceable('onunhandledrejection');\n\
+          replaceable('onrejectionhandled');\n\
+          replaceable('onerror');\n\
+          Object.defineProperty(g, '__otterFirePromiseRejection', {\n\
+            value: function (promise, reason, handled) {\n\
+              var type = handled ? 'rejectionhandled' : 'unhandledrejection';\n\
+              var event;\n\
+              try {\n\
+                event = new g.PromiseRejectionEvent(type, {\n\
+                  promise: promise, reason: reason, cancelable: !handled,\n\
+                });\n\
+              } catch (_) { return; }\n\
+              var handler = g['on' + type];\n\
+              if (typeof handler === 'function') {\n\
+                try { handler.call(g, event); }\n\
+                catch (e) { try { g.reportError(e); } catch (_) {} }\n\
+              }\n\
+              if (!handled && !event.defaultPrevented) {\n\
+                try { g.reportError(reason); } catch (_) {}\n\
+              }\n\
+            },\n\
+            writable: true, enumerable: false, configurable: true,\n\
+          });\n\
+        })(globalThis);";
+    runtime
+        .eval(SourceInput::from_javascript(shim))
+        .map_err(|err| OtterError::Internal {
+            code: "WEB_REJECTION_INSTALL".to_string(),
+            message: format!("promise-rejection surface install failed: {err}"),
+        })?;
     Ok(())
 }
 

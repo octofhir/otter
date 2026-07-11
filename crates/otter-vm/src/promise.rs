@@ -243,6 +243,14 @@ impl otter_gc::GcStore for PromiseCapability {
 pub struct PromiseSettleJobs {
     /// Microtasks to enqueue, in FIFO order.
     pub jobs: Vec<Microtask>,
+    /// Set by [`JsPromise::reject`] when this call transitioned a still-pending
+    /// promise to rejected while no reaction had yet been attached
+    /// (`[[PromiseIsHandled]]` was `false`). The HTML
+    /// HostPromiseRejectionTracker "reject" operation: the interpreter records
+    /// the handle so the post-drain checkpoint can fire `unhandledrejection` if
+    /// it is still unhandled. `None` for fulfillments and already-settled or
+    /// already-handled rejections.
+    pub unhandled_rejection: Option<JsPromiseHandle>,
 }
 
 /// Output of [`JsPromise::perform_then`].
@@ -627,16 +635,23 @@ impl JsPromise for PurePromise {
                 .into_iter()
                 .filter_map(|r| new_promise_reaction_job(heap, r, value))
                 .collect(),
+            unhandled_rejection: None,
         }
     }
 
     fn reject(&self, heap: &mut otter_gc::GcHeap, reason: Value) -> PromiseSettleJobs {
         let barrier_reason = reason;
+        let mut newly_unhandled = false;
         let reactions: Vec<PromiseReaction> = heap.with_payload(self.inner, |body| {
             if body.state.is_settled() {
                 return Vec::new();
             }
             body.state = PromiseState::Rejected(reason);
+            // HostPromiseRejectionTracker(promise, "reject") fires only when no
+            // reaction has yet observed the promise. A `.then`/`.catch`/`await`
+            // attached while pending already set `is_handled`, suppressing the
+            // unhandled-rejection notification.
+            newly_unhandled = !body.is_handled;
             let taken = std::mem::take(&mut body.reject_reactions);
             body.fulfill_reactions.clear();
             taken
@@ -647,6 +662,7 @@ impl JsPromise for PurePromise {
                 .into_iter()
                 .filter_map(|r| new_promise_reaction_job(heap, r, reason))
                 .collect(),
+            unhandled_rejection: newly_unhandled.then(|| JsPromiseHandle::from_pure(*self)),
         }
     }
 

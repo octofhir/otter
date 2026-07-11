@@ -385,6 +385,40 @@ fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     }
 }
 
+/// Publish one machine-constructed [`JitCtx`] before its compiled entry can
+/// reach an allocating/reentrant safepoint. Returns `0` on success and parks a
+/// stack-overflow error in the shared slot on failure.
+pub(crate) extern "C" fn jit_push_native_activation_stub(ctx: *mut JitCtx) -> u64 {
+    // SAFETY: the caller has fully initialized `ctx` on its native stack and
+    // keeps it live until the matching pop stub.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    // SAFETY: both fields live inside `ctx`, whose native allocation remains
+    // live across the compiled callee's dynamic extent.
+    match unsafe {
+        vm.jit_push_native_activation(
+            std::ptr::addr_of_mut!(ctx.self_closure),
+            std::ptr::addr_of_mut!(ctx.this_value),
+        )
+    } {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Release the topmost native JIT activation before its `JitCtx` stack record
+/// is discarded.
+pub(crate) extern "C" fn jit_pop_native_activation_stub(ctx: *mut JitCtx) -> u64 {
+    // SAFETY: the active context and its interpreter pointer are live by ABI.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    vm.jit_pop_native_activation();
+    0
+}
+
 /// Prepare a direct compiled call. Returns:
 /// - `0`: direct target prepared in `ctx.direct_*`.
 /// - `1`: throw, error parked in `ctx.error`.
@@ -1411,7 +1445,12 @@ pub(crate) unsafe fn enter_compiled(
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.
         let entry: JitEntry = unsafe { std::mem::transmute(entry) };
+        let activation_status = jit_push_native_activation_stub(&mut ctx);
+        if activation_status != 0 {
+            return JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand));
+        }
         let ret = entry(&mut ctx);
+        let _ = jit_pop_native_activation_stub(&mut ctx);
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
             STATUS_BAILED => JitExecOutcome::Bailed(ctx.bail_pc),
@@ -1480,11 +1519,12 @@ pub(crate) mod arm64 {
         jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
         jit_load_string_stub, jit_load_upvalue_stub, jit_make_closure_stub, jit_make_fn_stub,
         jit_math_call_stub, jit_neg_stub, jit_new_array_stub, jit_new_object_stub,
-        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
-        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
-        jit_store_upvalue_checked_stub, jit_store_upvalue_stub, jit_write_barrier_stub,
-        jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair, otter_jit_math_random,
-        pack_method_arg_regs, reg_offset, value_tag,
+        jit_pop_native_activation_stub, jit_prepare_direct_call_stub,
+        jit_prepare_direct_method_call_stub, jit_push_native_activation_stub,
+        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
+        otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -4987,23 +5027,16 @@ pub(crate) mod arm64 {
     /// Whether `view`'s body is safe to run as a frameless self-recursive callee:
     /// every op either runs inline against the register window (`x19`) or is a
     /// `Call` (self-recursive — resolved by the inline guard — or a guard miss
-    /// that bails) or the self-binding `MakeFunction`. Any op that addresses
-    /// registers through `JitCtx.frame_index` (a runtime stub: property/element
-    /// access, array/object literals, non-self closures, …) needs a real frame
-    /// and disqualifies the function.
+    /// that bails) or the self-binding `MakeFunction`. Every allowed op is
+    /// safepoint-free. A property/element/runtime operation may allocate or
+    /// re-enter even when it addresses the flat register window, so it needs a
+    /// published native activation and disqualifies the frameless path.
     fn is_self_call_safe(view: &JitCompileSnapshot) -> bool {
         view.instructions.iter().all(|instr| {
             is_inline_pure_op(instr.op)
                 || instr.op == Op::LoadThis
                 || instr.op == Op::Call
                 || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
-                // Property access runs frameless: the inline IC hit reads/writes
-                // the register window directly, and the cold miss routes to the
-                // window stub which resolves the own-data IC against the window
-                // or bails for the slow `[[Get]]`/`[[Set]]` ladder. No op in the
-                // body addresses registers through `JitCtx.frame_index`.
-                || instr.op == Op::LoadProperty
-                || instr.op == Op::StoreProperty
         })
     }
 
@@ -5422,6 +5455,13 @@ pub(crate) mod arm64 {
             ; ldr w9, [x20, DIRECT_SAFEPOINT_COUNT_OFFSET]
             ; str w9, [sp, SAFEPOINT_COUNT_OFFSET]
             ; mov x0, sp
+        );
+        emit_load_u64(ops, 16, jit_push_native_activation_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cbnz x0, =>threw
+            ; mov x0, sp
             ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
             ; blr x16
             ; cmp x1, STATUS_RETURNED as u32
@@ -5430,8 +5470,17 @@ pub(crate) mod arm64 {
             ; b.eq =>direct_bailed
             ; b =>direct_threw
             ; =>direct_returned
-            ; mov x3, x0
-            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; str x0, [sp, DIRECT_ENTRY_OFFSET]
+            ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 16, jit_pop_native_activation_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; ldr x2, [sp, DIRECT_FRAME_INDEX_OFFSET]
+            ; ldr x3, [sp, DIRECT_ENTRY_OFFSET]
             ; add sp, sp, JIT_CTX_STACK_SIZE
             ; mov x0, x20
             ; movz x1, dst as u32
@@ -5446,8 +5495,18 @@ pub(crate) mod arm64 {
         dynasm!(ops
             ; .arch aarch64
             ; =>direct_bailed
-            ; ldr w3, [sp, BAIL_PC_OFFSET]
-            ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; ldr w9, [sp, BAIL_PC_OFFSET]
+            ; str w9, [sp, DIRECT_SAFEPOINT_COUNT_OFFSET]
+            ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 16, jit_pop_native_activation_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; ldr x2, [sp, DIRECT_FRAME_INDEX_OFFSET]
+            ; ldr w3, [sp, DIRECT_SAFEPOINT_COUNT_OFFSET]
             ; add sp, sp, JIT_CTX_STACK_SIZE
             ; mov x0, x20
             ; movz x1, dst as u32
@@ -5462,7 +5521,15 @@ pub(crate) mod arm64 {
         dynasm!(ops
             ; .arch aarch64
             ; =>direct_threw
-            ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
+            ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
+            ; mov x0, sp
+        );
+        emit_load_u64(ops, 16, jit_pop_native_activation_stub as *const () as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; ldr x1, [sp, DIRECT_FRAME_INDEX_OFFSET]
             ; add sp, sp, JIT_CTX_STACK_SIZE
             ; mov x0, x20
         );

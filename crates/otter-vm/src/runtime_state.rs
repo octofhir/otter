@@ -234,5 +234,8 @@ impl<'a> RuntimeState<'a> {
         // 9b) The flat JIT register stack DOES live on the `Interpreter`
         //    struct, so its in-flight callee windows are traced here.
         interp.trace_reg_stack(visitor);
+        // 9c) Native JIT contexts keep SELF/`this` in ABI scalar fields on the
+        // native stack. Their VM-owned descriptors expose those precise slots.
+        interp.trace_native_jit_activations(visitor);
     }
 }

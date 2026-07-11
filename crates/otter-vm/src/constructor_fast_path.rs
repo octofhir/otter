@@ -87,7 +87,7 @@ pub(crate) fn match_simple_constructor_init(
 
     let mut fields: Vec<SimpleConstructorField> = Vec::new();
     for instr in &function.code {
-        match instr.op() {
+        match function.op(instr) {
             Op::LoadThis => {
                 let dst = context.exec_register(instr, 0)? as usize;
                 *registers.get_mut(dst)? = RegisterValue::This;

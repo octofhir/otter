@@ -586,11 +586,11 @@ pub struct JitGcBarrierLayout {
     pub card_shift: u32,
 }
 
-/// Owned snapshot of one executable instruction.
+/// Mutable JIT feedback overlay for one authoritative CodeBlock instruction.
 #[derive(Debug, Clone)]
 pub struct JitInstructionMetadata {
-    /// Shared instruction owned by [`JitCompileSnapshot::code_block`].
-    pub instruction: Arc<CodeBlockInstruction>,
+    /// Dense instruction index into the owning compile snapshot's CodeBlock.
+    pub(crate) instruction_index: u32,
     /// Cold serialized byte PC used by bailout/profiling metadata.
     pub byte_pc: u32,
     /// Cold serialized byte length used by bailout/profiling metadata.
@@ -678,13 +678,9 @@ pub struct JitInstructionMetadata {
 }
 
 impl JitInstructionMetadata {
-    fn without_feedback(
-        instruction: Arc<CodeBlockInstruction>,
-        byte_pc: u32,
-        byte_len: u32,
-    ) -> Self {
+    fn without_feedback(instruction_index: u32, byte_pc: u32, byte_len: u32) -> Self {
         Self {
-            instruction,
+            instruction_index,
             byte_pc,
             byte_len,
             make_self: false,
@@ -742,8 +738,8 @@ impl JitCompileSnapshot {
     ///
     /// Production compilation always starts at
     /// [`CodeBlock::jit_compile_snapshot`]. This fixture still creates one
-    /// authoritative `CodeBlock` and reuses the exact instruction `Arc`s in
-    /// the dynamic overlay, so tests exercise the same ownership boundary.
+    /// authoritative `CodeBlock`; its dynamic overlay addresses the same dense
+    /// instruction slice by index.
     #[must_use]
     pub fn without_feedback(
         function_id: u32,
@@ -757,9 +753,9 @@ impl JitCompileSnapshot {
             .code
             .iter()
             .enumerate()
-            .map(|(index, instruction)| {
+            .map(|(index, _)| {
                 JitInstructionMetadata::without_feedback(
-                    Arc::clone(instruction),
+                    index as u32,
                     code_block
                         .instruction_byte_pc(index)
                         .expect("test CodeBlock metadata matches instructions"),
@@ -800,11 +796,55 @@ impl JitCompileSnapshot {
     }
 }
 
-impl std::ops::Deref for JitInstructionMetadata {
-    type Target = CodeBlockInstruction;
+impl JitInstructionMetadata {
+    /// Resolve this overlay entry against its authoritative CodeBlock.
+    #[must_use]
+    pub fn resolve<'a>(&self, code_block: &'a CodeBlock) -> &'a CodeBlockInstruction {
+        code_block
+            .instr_at_index(self.instruction_index as usize)
+            .expect("JIT metadata instruction index belongs to its CodeBlock")
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.instruction
+    /// Opcode from the authoritative CodeBlock instruction.
+    #[must_use]
+    pub fn op(&self, code_block: &CodeBlock) -> Op {
+        code_block.op(self.resolve(code_block))
+    }
+
+    /// Canonical instruction PC from the authoritative CodeBlock instruction.
+    #[must_use]
+    pub fn instruction_pc(&self, code_block: &CodeBlock) -> u32 {
+        self.resolve(code_block).instruction_pc
+    }
+
+    /// Dense property IC site from the authoritative CodeBlock instruction.
+    #[must_use]
+    pub fn property_ic_site(&self, code_block: &CodeBlock) -> Option<usize> {
+        self.resolve(code_block).property_ic_site()
+    }
+
+    /// Decode one schema-typed operand from the authoritative CodeBlock.
+    #[must_use]
+    pub fn operand(&self, code_block: &CodeBlock, index: usize) -> Option<Operand> {
+        code_block.operand(self.resolve(code_block), index)
+    }
+
+    /// Decode one constant-pool index operand.
+    #[must_use]
+    pub fn const_index(&self, code_block: &CodeBlock, index: usize) -> Option<u32> {
+        code_block.const_index(self.resolve(code_block), index)
+    }
+
+    /// Decode one signed immediate operand.
+    #[must_use]
+    pub fn imm32(&self, code_block: &CodeBlock, index: usize) -> Option<i32> {
+        code_block.imm32(self.resolve(code_block), index)
+    }
+
+    /// Borrow all schema-typed operands from the authoritative CodeBlock.
+    #[must_use]
+    pub fn operand_view<'a>(&self, code_block: &'a CodeBlock) -> crate::OperandView<'a> {
+        code_block.operand_view(self.resolve(code_block))
     }
 }
 

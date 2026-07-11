@@ -63,7 +63,7 @@ impl Interpreter {
         let instruction = context
             .exec_function(fid)
             .and_then(|function| function.instr_at_byte_pc(pc).map(|instr| (function, instr)));
-        let op = instruction.map(|(_, instr)| instr.op());
+        let op = instruction.map(|(function, instr)| function.op(instr));
         let operands = instruction
             .map(|(function, instr)| format!("{:?}", function.operand_view(instr)))
             .unwrap_or_else(|| "[]".to_string());
@@ -299,10 +299,13 @@ impl Interpreter {
     ) -> bool {
         let mut loop_end = None;
         for instr in instructions {
-            if !matches!(instr.op, Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse) {
+            if !matches!(
+                instr.op(code_block),
+                Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse
+            ) {
                 continue;
             }
-            let Some(otter_bytecode::Operand::Imm32(rel)) = code_block.operand(instr, 0) else {
+            let Some(otter_bytecode::Operand::Imm32(rel)) = instr.operand(code_block, 0) else {
                 continue;
             };
             let target = i64::from(instr.byte_pc) + 1 + i64::from(rel);
@@ -335,7 +338,7 @@ impl Interpreter {
         let Some(instr) = function.instr_at_byte_pc(bail_pc) else {
             return false;
         };
-        if !matches!(instr.op(), Op::Add | Op::Sub | Op::Mul) {
+        if !matches!(function.op(instr), Op::Add | Op::Sub | Op::Mul) {
             return false;
         }
         if !self

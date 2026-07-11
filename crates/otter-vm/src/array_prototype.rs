@@ -111,16 +111,16 @@ fn is_numeric_sub_sort_comparator_function(
     }
 
     let code = &function.code;
-    if code[0].op() != Op::StoreLocal
-        || code[1].op() != Op::StoreLocal
-        || code[2].op() != Op::LoadLocal
-        || code[3].op() != Op::LoadLocal
-        || code[4].op() != Op::ToPrimitive
-        || code[5].op() != Op::ToNumeric
-        || code[6].op() != Op::ToPrimitive
-        || code[7].op() != Op::ToNumeric
-        || code[8].op() != Op::Sub
-        || code[9].op() != Op::ReturnValue
+    if function.op_at(0).unwrap() != Op::StoreLocal
+        || function.op_at(1).unwrap() != Op::StoreLocal
+        || function.op_at(2).unwrap() != Op::LoadLocal
+        || function.op_at(3).unwrap() != Op::LoadLocal
+        || function.op_at(4).unwrap() != Op::ToPrimitive
+        || function.op_at(5).unwrap() != Op::ToNumeric
+        || function.op_at(6).unwrap() != Op::ToPrimitive
+        || function.op_at(7).unwrap() != Op::ToNumeric
+        || function.op_at(8).unwrap() != Op::Sub
+        || function.op_at(9).unwrap() != Op::ReturnValue
     {
         return false;
     }
@@ -199,15 +199,15 @@ fn match_map_mul_add_callback(
         return None;
     }
     let code = &function.code;
-    if code[0].op() != Op::StoreLocal
-        || code[1].op() != Op::LoadLocal
-        || code[2].op() != Op::LoadInt32
-        || code[3].op() != Op::ToPrimitive
-        || code[4].op() != Op::ToNumeric
-        || code[5].op() != Op::Mul
-        || code[6].op() != Op::LoadInt32
-        || code[7].op() != Op::Add
-        || code[8].op() != Op::ReturnValue
+    if function.op_at(0).unwrap() != Op::StoreLocal
+        || function.op_at(1).unwrap() != Op::LoadLocal
+        || function.op_at(2).unwrap() != Op::LoadInt32
+        || function.op_at(3).unwrap() != Op::ToPrimitive
+        || function.op_at(4).unwrap() != Op::ToNumeric
+        || function.op_at(5).unwrap() != Op::Mul
+        || function.op_at(6).unwrap() != Op::LoadInt32
+        || function.op_at(7).unwrap() != Op::Add
+        || function.op_at(8).unwrap() != Op::ReturnValue
     {
         return None;
     }
@@ -249,15 +249,15 @@ fn match_filter_rem_eq_zero_callback(
         return None;
     }
     let code = &function.code;
-    if code[0].op() != Op::StoreLocal
-        || code[1].op() != Op::LoadLocal
-        || code[2].op() != Op::LoadInt32
-        || code[3].op() != Op::ToPrimitive
-        || code[4].op() != Op::ToNumeric
-        || code[5].op() != Op::Rem
-        || code[6].op() != Op::LoadInt32
-        || code[7].op() != Op::Equal
-        || code[8].op() != Op::ReturnValue
+    if function.op_at(0).unwrap() != Op::StoreLocal
+        || function.op_at(1).unwrap() != Op::LoadLocal
+        || function.op_at(2).unwrap() != Op::LoadInt32
+        || function.op_at(3).unwrap() != Op::ToPrimitive
+        || function.op_at(4).unwrap() != Op::ToNumeric
+        || function.op_at(5).unwrap() != Op::Rem
+        || function.op_at(6).unwrap() != Op::LoadInt32
+        || function.op_at(7).unwrap() != Op::Equal
+        || function.op_at(8).unwrap() != Op::ReturnValue
     {
         return None;
     }
@@ -299,14 +299,14 @@ fn match_reduce_add_callback(
         return None;
     }
     let code = &function.code;
-    if code[0].op() != Op::StoreLocal
-        || code[1].op() != Op::StoreLocal
-        || code[2].op() != Op::LoadLocal
-        || code[3].op() != Op::LoadLocal
-        || code[4].op() != Op::ToPrimitive
-        || code[5].op() != Op::ToPrimitive
-        || code[6].op() != Op::Add
-        || code[7].op() != Op::ReturnValue
+    if function.op_at(0).unwrap() != Op::StoreLocal
+        || function.op_at(1).unwrap() != Op::StoreLocal
+        || function.op_at(2).unwrap() != Op::LoadLocal
+        || function.op_at(3).unwrap() != Op::LoadLocal
+        || function.op_at(4).unwrap() != Op::ToPrimitive
+        || function.op_at(5).unwrap() != Op::ToPrimitive
+        || function.op_at(6).unwrap() != Op::Add
+        || function.op_at(7).unwrap() != Op::ReturnValue
     {
         return None;
     }
@@ -342,18 +342,18 @@ fn match_for_each_add_bitand_upvalue_callback(
         return None;
     }
     let code = &function.code;
-    if code[0].op() != Op::StoreLocal
-        || code[1].op() != Op::LoadUpvalue
-        || code[2].op() != Op::LoadLocal
-        || code[3].op() != Op::LoadInt32
-        || code[4].op() != Op::ToPrimitive
-        || code[5].op() != Op::ToNumeric
-        || code[6].op() != Op::BitwiseAnd
-        || code[7].op() != Op::ToPrimitive
-        || code[8].op() != Op::ToPrimitive
-        || code[9].op() != Op::Add
-        || code[10].op() != Op::StoreUpvalueChecked
-        || code[11].op() != Op::ReturnUndefined
+    if function.op_at(0).unwrap() != Op::StoreLocal
+        || function.op_at(1).unwrap() != Op::LoadUpvalue
+        || function.op_at(2).unwrap() != Op::LoadLocal
+        || function.op_at(3).unwrap() != Op::LoadInt32
+        || function.op_at(4).unwrap() != Op::ToPrimitive
+        || function.op_at(5).unwrap() != Op::ToNumeric
+        || function.op_at(6).unwrap() != Op::BitwiseAnd
+        || function.op_at(7).unwrap() != Op::ToPrimitive
+        || function.op_at(8).unwrap() != Op::ToPrimitive
+        || function.op_at(9).unwrap() != Op::Add
+        || function.op_at(10).unwrap() != Op::StoreUpvalueChecked
+        || function.op_at(11).unwrap() != Op::ReturnUndefined
     {
         return None;
     }

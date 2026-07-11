@@ -480,9 +480,8 @@ impl RuntimeStubAllocContext {
     }
 }
 
-/// Current compiled `CallMethodValue` bridge. Re-entrant because method
-/// resolution and invocation can run user code.
-pub const STUB_JIT_RUNTIME_CALL_METHOD: RuntimeStubDescriptor = RuntimeStubDescriptor {
+/// VM-published collection/method inline-cache probe and refresh operation.
+pub const STUB_JIT_COLLECTION_METHOD_IC: RuntimeStubDescriptor = RuntimeStubDescriptor {
     id: 1,
     class: RuntimeStubClass::Reentrant,
     argument_count: VARIADIC_STUB_ARGUMENTS,
@@ -635,7 +634,7 @@ pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = RuntimeStubDescripto
 #[must_use]
 pub const fn runtime_stub_name(id: RuntimeStubId) -> &'static str {
     match id {
-        1 => "jit_runtime_call_method",
+        1 => "jit_collection_method_ic",
         2 => "jit_prepare_direct_method_call",
         3 => "jit_property_fallback",
         4 => "jit_backedge_poll",
@@ -656,7 +655,7 @@ pub const fn runtime_stub_name(id: RuntimeStubId) -> &'static str {
 
 /// Checked inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
-    STUB_JIT_RUNTIME_CALL_METHOD,
+    STUB_JIT_COLLECTION_METHOD_IC,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
     STUB_JIT_PROPERTY_FALLBACK,
     STUB_JIT_BACKEDGE_POLL,

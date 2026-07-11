@@ -151,30 +151,8 @@ impl Interpreter {
             .saturating_add(1);
     }
 
-    pub(crate) fn record_jit_runtime_method_stub(&mut self, source: JitRuntimeMethodStubSource) {
-        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL_METHOD);
-        self.jit_runtime_stats.runtime_method_stubs = self
-            .jit_runtime_stats
-            .runtime_method_stubs
-            .saturating_add(1);
-        match source {
-            JitRuntimeMethodStubSource::Baseline => {
-                self.jit_runtime_stats.runtime_method_baseline_stubs = self
-                    .jit_runtime_stats
-                    .runtime_method_baseline_stubs
-                    .saturating_add(1);
-            }
-            JitRuntimeMethodStubSource::Optimizing => {
-                self.jit_runtime_stats.runtime_method_optimizing_stubs = self
-                    .jit_runtime_stats
-                    .runtime_method_optimizing_stubs
-                    .saturating_add(1);
-            }
-        }
-    }
-
     pub(crate) fn record_jit_runtime_collection_method_ic_stub(&mut self) {
-        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_RUNTIME_CALL_METHOD);
+        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_COLLECTION_METHOD_IC);
         self.jit_runtime_stats.runtime_collection_method_ic_stubs = self
             .jit_runtime_stats
             .runtime_collection_method_ic_stubs
@@ -250,20 +228,6 @@ impl Interpreter {
             .saturating_add(1);
     }
 
-    pub(crate) fn record_jit_method_fast_collection_hit(&mut self) {
-        self.jit_runtime_stats.method_fast_collection_hits = self
-            .jit_runtime_stats
-            .method_fast_collection_hits
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_jit_method_array_fast_hit(&mut self) {
-        self.jit_runtime_stats.method_array_fast_hits = self
-            .jit_runtime_stats
-            .method_array_fast_hits
-            .saturating_add(1);
-    }
-
     pub(crate) fn record_jit_method_string_fast_hit(&mut self) {
         self.jit_runtime_stats.method_string_fast_hits = self
             .jit_runtime_stats
@@ -275,13 +239,6 @@ impl Interpreter {
         self.jit_runtime_stats.method_number_fast_hits = self
             .jit_runtime_stats
             .method_number_fast_hits
-            .saturating_add(1);
-    }
-
-    pub(crate) fn record_jit_method_generic_call(&mut self) {
-        self.jit_runtime_stats.method_generic_calls = self
-            .jit_runtime_stats
-            .method_generic_calls
             .saturating_add(1);
     }
 

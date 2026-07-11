@@ -354,6 +354,8 @@ impl JitCollectionMethodIcSlot {
 /// do not match this `function_id` makes the guard bail to the interpreter.
 #[derive(Debug, Clone)]
 pub struct JitInlineCallee {
+    /// Authoritative callee execution body owning operand side tables.
+    pub code_block: Arc<CodeBlock>,
     /// Callee function id the call-site identity guard is keyed on.
     pub function_id: u32,
     /// Callee formal parameter count; must equal the call's argument count for
@@ -381,6 +383,8 @@ pub struct JitInlineCallee {
 /// per-call resolve bridge.
 #[derive(Debug, Clone)]
 pub struct JitInlineMethod {
+    /// Authoritative method execution body owning operand side tables.
+    pub code_block: Arc<CodeBlock>,
     /// Method function id the call-site identity check is keyed on.
     pub method_fid: u32,
     /// Receiver shape-handle compressed offset the sealed loads are baked for.
@@ -670,29 +674,9 @@ pub struct JitInstructionMetadata {
 }
 
 impl JitInstructionMetadata {
-    /// Build a feedback-free metadata record around one verified instruction.
-    ///
-    /// Production snapshots reuse the exact instruction `Arc` owned by the
-    /// interpreter's `CodeBlock`; this constructor exists for backend unit
-    /// tests that exercise lowering without constructing a whole VM isolate.
-    #[must_use]
-    pub fn without_feedback(
-        op: Op,
-        instruction_pc: u32,
-        byte_pc: u32,
-        byte_len: u32,
-        operands: Vec<Operand>,
-    ) -> Self {
-        let byte_len = u16::try_from(byte_len).expect("instruction byte length exceeds u16");
+    fn without_feedback(instruction: Arc<CodeBlockInstruction>) -> Self {
         Self {
-            instruction: Arc::new(CodeBlockInstruction::from_operands(
-                op,
-                operands,
-                instruction_pc,
-                crate::executable::NO_PROPERTY_IC_SITE,
-                byte_pc,
-                byte_len,
-            )),
+            instruction,
             make_self: false,
             load_array_length: false,
             method_hint: JitMethodHint::None,
@@ -704,6 +688,41 @@ impl JitInstructionMetadata {
             object_literal: None,
             element_load_kind: JitElementLoadKind::Any,
             global_lex_cell: None,
+        }
+    }
+}
+
+/// Transient backend-test instruction input.
+///
+/// This is consumed while building one authoritative [`CodeBlock`]; it is not
+/// retained as an executable or frozen compatibility representation.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct JitTestInstruction {
+    pub(crate) op: Op,
+    pub(crate) instruction_pc: u32,
+    pub(crate) byte_pc: u32,
+    pub(crate) byte_len: u16,
+    pub(crate) operands: Vec<Operand>,
+}
+
+impl JitTestInstruction {
+    /// Build transient input for a backend unit-test CodeBlock.
+    #[must_use]
+    pub fn new(
+        op: Op,
+        instruction_pc: u32,
+        byte_pc: u32,
+        byte_len: u32,
+        operands: Vec<Operand>,
+    ) -> Self {
+        let byte_len = u16::try_from(byte_len).expect("instruction byte length exceeds u16");
+        Self {
+            op,
+            instruction_pc,
+            byte_pc,
+            byte_len,
+            operands,
         }
     }
 }
@@ -720,17 +739,16 @@ impl JitCompileSnapshot {
         function_id: u32,
         param_count: u16,
         register_count: u16,
-        instructions: Vec<JitInstructionMetadata>,
+        instructions: Vec<JitTestInstruction>,
     ) -> Self {
-        let code_block = CodeBlock::jit_test_stub(
-            function_id,
-            param_count,
-            register_count,
-            instructions
-                .iter()
-                .map(|metadata| Arc::clone(&metadata.instruction))
-                .collect(),
-        );
+        let code_block =
+            CodeBlock::jit_test_stub(function_id, param_count, register_count, &instructions);
+        let instructions = code_block
+            .code
+            .iter()
+            .cloned()
+            .map(JitInstructionMetadata::without_feedback)
+            .collect();
         Self {
             code_block,
             cage_base: 0,

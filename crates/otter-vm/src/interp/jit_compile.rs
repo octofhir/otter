@@ -356,11 +356,12 @@ impl Interpreter {
     ) {
         use otter_bytecode::{Op, Operand};
         let fid = view.code_block.id;
+        let code_block = std::sync::Arc::clone(&view.code_block);
         for instr in &mut view.instructions {
             if instr.op != Op::LoadGlobalOrThrow {
                 continue;
             }
-            let Some(Operand::ConstIndex(name_idx)) = instr.operands.get(1).copied() else {
+            let Some(Operand::ConstIndex(name_idx)) = code_block.operand(instr, 1).copied() else {
                 continue;
             };
             let Some(name) = context.string_constant_str_for_function(fid, name_idx) else {
@@ -424,17 +425,20 @@ impl Interpreter {
     ) {
         use otter_bytecode::{Op, Operand};
         const MAX_PROPS: usize = 4;
-        let reg_op = |instr: &jit::JitInstructionMetadata, i: usize| match instr.operands.get(i) {
-            Some(Operand::Register(r)) => Some(*r),
-            _ => None,
-        };
-        let const_op = |instr: &jit::JitInstructionMetadata, i: usize| match instr.operands.get(i) {
-            Some(Operand::ConstIndex(n)) => Some(*n),
-            _ => None,
-        };
+        let code_block = std::sync::Arc::clone(&view.code_block);
+        let reg_op =
+            |instr: &jit::JitInstructionMetadata, i: usize| match code_block.operand(instr, i) {
+                Some(Operand::Register(r)) => Some(*r),
+                _ => None,
+            };
+        let const_op =
+            |instr: &jit::JitInstructionMetadata, i: usize| match code_block.operand(instr, i) {
+                Some(Operand::ConstIndex(n)) => Some(*n),
+                _ => None,
+            };
         let uses_reg = |instr: &jit::JitInstructionMetadata, reg: u16| {
-            instr
-                .operands
+            code_block
+                .operands(instr)
                 .iter()
                 .any(|o| matches!(o, Operand::Register(r) if *r == reg))
         };
@@ -854,6 +858,7 @@ impl Interpreter {
             view.inline_callees.insert(
                 byte_pc,
                 jit::JitInlineCallee {
+                    code_block: std::sync::Arc::clone(&callee_view.code_block),
                     function_id: callee_fid,
                     param_count: callee_view.code_block.param_count,
                     register_count: callee_view.code_block.register_count,
@@ -995,8 +1000,10 @@ impl Interpreter {
                 Op::StoreProperty => 1,
                 _ => continue,
             };
-            let otter_bytecode::Operand::ConstIndex(name_idx) =
-                instr.operands.get(name_operand).copied()?
+            let otter_bytecode::Operand::ConstIndex(name_idx) = method_view
+                .code_block
+                .operand(instr, name_operand)
+                .copied()?
             else {
                 return None;
             };
@@ -1053,6 +1060,7 @@ impl Interpreter {
             }
         }
         Some(jit::JitInlineMethod {
+            code_block: std::sync::Arc::clone(&method_view.code_block),
             method_fid: target.method_fid,
             recv_shape: target.recv_shape.offset(),
             proto_chain: target

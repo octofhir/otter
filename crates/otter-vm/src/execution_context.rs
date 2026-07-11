@@ -254,6 +254,7 @@ impl ExecutionContext {
     #[must_use]
     pub fn jit_compile_snapshot(&self, function_id: u32) -> Option<crate::jit::JitCompileSnapshot> {
         let mut view = self.code_block_arc(function_id)?.jit_compile_snapshot();
+        let code_block = Arc::clone(&view.code_block);
         // Mark each self-binding maker whose constant resolves to the function
         // being compiled: it materializes the named-function SELF binding, which
         // the emitter can read straight from the frame's own closure instead of
@@ -262,13 +263,15 @@ impl ExecutionContext {
             if matches!(
                 instr.op,
                 otter_bytecode::Op::MakeFunction | otter_bytecode::Op::MakeClosure
-            ) && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
+            ) && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
+                code_block.operand(instr, 1)
                 && self.function_id_constant(idx) == Some(function_id)
             {
                 instr.make_self = true;
             }
             if instr.op == otter_bytecode::Op::LoadProperty
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(2)
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
+                    code_block.operand(instr, 2)
                 && self
                     .string_constant_str_for_function(function_id, idx)
                     .is_some_and(|name| name == "length")
@@ -276,7 +279,8 @@ impl ExecutionContext {
                 instr.load_array_length = true;
             }
             if instr.op == otter_bytecode::Op::CallMethodValue
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(2)
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
+                    code_block.operand(instr, 2)
                 && let Some(name) = self.string_constant_str_for_function(function_id, idx)
             {
                 instr.method_hint = match name {
@@ -286,7 +290,8 @@ impl ExecutionContext {
                 };
             }
             if instr.op == otter_bytecode::Op::LoadNumber
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) = instr.operands.get(1)
+                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
+                    code_block.operand(instr, 1)
                 && let Some(bits) = self.number_constant_bits(idx)
             {
                 instr.load_number = Some(f64::from_bits(bits));
@@ -295,26 +300,34 @@ impl ExecutionContext {
         Some(view)
     }
 
-    /// Return an executable instruction's operands in declaration order.
+    /// Return operands without a table lookup for fixed-width instructions.
     #[must_use]
     pub(crate) fn exec_operands<'a>(&'a self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
-        self.executable.operands(instr)
+        if let Some(operands) = instr.inline_operands() {
+            return operands;
+        }
+        self.exec_function(instr.code_block_id())
+            .expect("verified instruction must retain its owning CodeBlock")
+            .operands(instr)
     }
 
-    /// Return one executable instruction operand by index.
+    /// Return one schema-typed operand.
     #[must_use]
     pub(crate) fn exec_operand<'a>(
         &'a self,
         instr: &'a CodeBlockInstruction,
         index: usize,
     ) -> Option<&'a Operand> {
-        self.executable.operand(instr, index)
+        self.exec_operands(instr).get(index)
     }
 
-    /// Decode one executable register operand.
+    /// Decode one register operand.
     #[must_use]
     pub(crate) fn exec_register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
-        self.executable.register(instr, index)
+        match self.exec_operand(instr, index) {
+            Some(Operand::Register(value)) => Some(*value),
+            _ => None,
+        }
     }
 
     /// Decode the common `dst, lhs, rhs` register triple.
@@ -327,20 +340,26 @@ impl ExecutionContext {
         ))
     }
 
-    /// Decode one executable constant-pool index operand.
+    /// Decode one constant-pool index operand.
     #[must_use]
     pub(crate) fn exec_const_index(
         &self,
         instr: &CodeBlockInstruction,
         index: usize,
     ) -> Option<u32> {
-        self.executable.const_index(instr, index)
+        match self.exec_operand(instr, index) {
+            Some(Operand::ConstIndex(value)) => Some(*value),
+            _ => None,
+        }
     }
 
-    /// Decode one executable signed immediate operand.
+    /// Decode one signed immediate operand.
     #[must_use]
     pub(crate) fn exec_imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
-        self.executable.imm32(instr, index)
+        match self.exec_operand(instr, index) {
+            Some(Operand::Imm32(value)) => Some(*value),
+            _ => None,
+        }
     }
 
     /// One past the highest dense named-property IC site id used by

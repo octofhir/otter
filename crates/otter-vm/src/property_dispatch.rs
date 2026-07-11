@@ -3438,9 +3438,10 @@ impl Interpreter {
     /// Frameless `StoreProperty` — the [`Self::jit_runtime_load_property_window`]
     /// counterpart. Resolves an existing-own-data monomorphic store (including
     /// the generational write barrier, which the IC's `store` applies) directly
-    /// against the register window. Returns `Ok(Some(fill))` when handled, or
-    /// `Ok(None)` for a transition / accessor / reject that needs the full
-    /// `[[Set]]` ladder (caller bails).
+    /// against the register window. An ordinary-object miss continues through
+    /// the same [`Self::set_property`] data-write primitive as interpreter
+    /// dispatch, with already-decoded values, so shape transitions do not
+    /// deoptimize. Accessor/exotic/non-object outcomes return `Ok(None)`.
     ///
     /// # Safety
     /// As [`Self::jit_runtime_load_property_window`].
@@ -3463,52 +3464,64 @@ impl Interpreter {
         let Some(obj) = receiver.as_object() else {
             return Ok(None);
         };
-        if site >= self.store_property_ics.len()
-            || !object::supports_fast_property_ic(obj, &self.gc_heap)
-        {
+        if !object::supports_fast_property_ic(obj, &self.gc_heap) {
             return Ok(None);
         }
-        let entries_len = self.store_property_ics[site].entry_count();
-        for idx in 0..entries_len {
-            let ic = self.store_property_ics[site].entries()[idx].clone();
-            if ic
-                .run_store(obj, &mut self.gc_heap, atomized_key, &value)
-                .is_some()
+        // A store IC may describe the receiver's shaped own-data layout, but it
+        // is not authority to bypass an inherited accessor/non-writable/exotic
+        // `[[Set]]` outcome. Prove the operation is an ordinary data assignment
+        // before consulting any cached store entry.
+        let set_outcome = object::resolve_set(obj, &self.gc_heap, atomized_key.name());
+        if !matches!(set_outcome, object::SetOutcome::AssignData) {
+            return Ok(None);
+        }
+        if site < self.store_property_ics.len() {
+            let entries_len = self.store_property_ics[site].entry_count();
+            for idx in 0..entries_len {
+                let ic = self.store_property_ics[site].entries()[idx].clone();
+                if ic
+                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .is_some()
+                {
+                    self.property_ic_stats.record_hit(PropertyIcKind::Store);
+                    return Ok(Some(self.whisker_store_cell_fill(
+                        site,
+                        object::shape(obj, &self.gc_heap).offset(),
+                    )));
+                }
+            }
+            if entries_len > 0 {
+                self.store_property_ics[site].record_guard_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                );
+            } else {
+                self.store_property_ics[site].record_uncached_miss_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                );
+            }
+            if !self.store_property_ics[site].is_megamorphic()
+                && let Some(ic) =
+                    cache_ir::CacheStub::install_store_existing(obj, &self.gc_heap, atomized_key)
+                && ic
+                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
+                    .is_some()
             {
-                self.property_ic_stats.record_hit(PropertyIcKind::Store);
+                self.store_property_ics[site].install_with_stats(
+                    &mut self.property_ic_stats,
+                    PropertyIcKind::Store,
+                    ic,
+                );
                 return Ok(Some(self.whisker_store_cell_fill(
                     site,
                     object::shape(obj, &self.gc_heap).offset(),
                 )));
             }
         }
-        if entries_len > 0 {
-            self.store_property_ics[site]
-                .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Store);
-        } else {
-            self.store_property_ics[site].record_uncached_miss_with_stats(
-                &mut self.property_ic_stats,
-                PropertyIcKind::Store,
-            );
-        }
-        if !self.store_property_ics[site].is_megamorphic()
-            && let Some(ic) =
-                cache_ir::CacheStub::install_store_existing(obj, &self.gc_heap, atomized_key)
-            && ic
-                .run_store(obj, &mut self.gc_heap, atomized_key, &value)
-                .is_some()
-        {
-            self.store_property_ics[site].install_with_stats(
-                &mut self.property_ic_stats,
-                PropertyIcKind::Store,
-                ic,
-            );
-            return Ok(Some(self.whisker_store_cell_fill(
-                site,
-                object::shape(obj, &self.gc_heap).offset(),
-            )));
-        }
-        Ok(None)
+
+        self.set_property(obj, atomized_key.name(), value)?;
+        Ok(Some(0))
     }
 
     /// Packed WhiskerIC inline-load cell fill for `site`, or `0` for "no inline".
@@ -3790,6 +3803,26 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let receiver = *read_register(&stack[frame_index], obj_reg)?;
         let value = *read_register(&stack[frame_index], src)?;
+        if let Some(obj) = receiver.as_object() {
+            // The IC only describes shaped data-slot mechanics. It cannot
+            // override an inherited setter, rejection, or exotic-prototype
+            // `[[Set]]` outcome. Handle those through the typed semantic ABI
+            // before consulting any cached store entry.
+            if !matches!(
+                object::resolve_set(obj, &self.gc_heap, atomized_key.name()),
+                object::SetOutcome::AssignData
+            ) {
+                let strict = context.function_is_strict(stack[frame_index].function_id);
+                self.ordinary_set_with_callable_setter(
+                    context,
+                    obj,
+                    atomized_key.name(),
+                    value,
+                    strict,
+                )?;
+                return Ok(0);
+            }
+        }
         if let Some(obj) = receiver.as_object()
             && site < self.store_property_ics.len()
             && object::supports_fast_property_ic(obj, &self.gc_heap)

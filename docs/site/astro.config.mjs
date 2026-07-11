@@ -75,7 +75,10 @@ export default defineConfig({
 				},
 				{
 					label: 'Web APIs',
-					items: [{ label: 'Contribution Workflow', slug: 'web/contributing' }],
+					items: [
+						{ label: 'Contribution Workflow', slug: 'web/contributing' },
+						{ label: 'WebAssembly: Status & Roadmap', slug: 'web/webassembly-roadmap' },
+					],
 				},
 				{
 					label: 'Performance',

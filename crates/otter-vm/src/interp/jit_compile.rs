@@ -102,7 +102,7 @@ impl Interpreter {
                 view.inline_methods.len()
             );
         }
-        let (regs, params) = (view.register_count, view.param_count);
+        let (regs, params) = (view.code_block.register_count, view.code_block.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
         let status = hook.compile_function(jit::JitCompileRequest {
             snapshot: view,
@@ -355,7 +355,7 @@ impl Interpreter {
         context: &ExecutionContext,
     ) {
         use otter_bytecode::{Op, Operand};
-        let fid = view.function_id;
+        let fid = view.code_block.id;
         for instr in &mut view.instructions {
             if instr.op != Op::LoadGlobalOrThrow {
                 continue;
@@ -439,7 +439,7 @@ impl Interpreter {
                 .any(|o| matches!(o, Operand::Register(r) if *r == reg))
         };
 
-        let fid = view.function_id;
+        let fid = view.code_block.id;
         let mut plans: Vec<(usize, jit::ObjectLiteralPlan)> = Vec::new();
         let instrs = &view.instructions;
         for i in 0..instrs.len() {
@@ -855,8 +855,8 @@ impl Interpreter {
                 byte_pc,
                 jit::JitInlineCallee {
                     function_id: callee_fid,
-                    param_count: callee_view.param_count,
-                    register_count: callee_view.register_count,
+                    param_count: callee_view.code_block.param_count,
+                    register_count: callee_view.code_block.register_count,
                     instructions: callee_view.instructions,
                 },
             );
@@ -1062,8 +1062,8 @@ impl Interpreter {
                 .map(|s| s.offset())
                 .collect(),
             method_value_byte: target.method_value_byte,
-            param_count: method_view.param_count,
-            register_count: method_view.register_count,
+            param_count: method_view.code_block.param_count,
+            register_count: method_view.code_block.register_count,
             instructions: method_view.instructions,
             prop_offsets,
             prop_shapes,
@@ -1149,7 +1149,7 @@ impl Interpreter {
                 native_abi::SafepointRecord::frame_slot_window(
                     safepoint_id,
                     native_abi::NO_FRAME_STATE,
-                    view.register_count,
+                    view.code_block.register_count,
                 ),
             );
             view.collection_alloc_methods

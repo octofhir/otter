@@ -63,7 +63,7 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
-        let fid = request.snapshot.function_id;
+        let fid = request.snapshot.code_block.id;
         // The baseline tier serves OSR requests too: it builds a loop-header
         // OSR trampoline per back-edge target, so a hot loop the optimizing tier
         // declined (an unsupported opcode or not-yet-int32 feedback in its

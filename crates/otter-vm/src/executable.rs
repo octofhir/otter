@@ -205,14 +205,7 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn jit_compile_snapshot(self: &Arc<Self>) -> crate::jit::JitCompileSnapshot {
         crate::jit::JitCompileSnapshot {
-            function_id: self.id,
-            param_count: self.param_count,
-            register_count: self.register_count,
-            code_byte_len: self.code_byte_len,
-            is_strict: self.is_strict,
-            is_async: self.is_async,
-            is_generator: self.is_generator,
-            is_async_generator: self.is_async_generator,
+            code_block: Arc::clone(self),
             // Baked by `Interpreter::compile_jit_function`, which holds the
             // cage base and the live property-IC tables.
             cage_base: 0,
@@ -302,6 +295,56 @@ impl CodeBlock {
             primitive_method_guards: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
+    }
+
+    /// Construct the authoritative executable body used by a backend unit-test
+    /// snapshot. Kept crate-private so production callers can only obtain a
+    /// snapshot from a verified compiler `CodeBlock`.
+    #[doc(hidden)]
+    #[must_use]
+    pub(crate) fn jit_test_stub(
+        id: u32,
+        param_count: u16,
+        register_count: u16,
+        code: Vec<Arc<CodeBlockInstruction>>,
+    ) -> Arc<Self> {
+        let code_byte_len = code
+            .last()
+            .map_or(0, |instr| instr.byte_pc.saturating_add(instr.byte_len));
+        let mut byte_to_instr = vec![NO_INSTR_AT_BYTE; code_byte_len as usize];
+        for (index, instr) in code.iter().enumerate() {
+            if let Some(slot) = byte_to_instr.get_mut(instr.byte_pc as usize) {
+                *slot = index as u32;
+            }
+        }
+        Arc::new(Self {
+            id,
+            param_count,
+            register_count,
+            own_upvalue_count: 0,
+            is_strict: false,
+            is_arrow: false,
+            is_method: false,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_async_generator: false,
+            is_derived_constructor: false,
+            makes_function: false,
+            is_leaf: true,
+            needs_arguments: false,
+            uses_arguments_callee: false,
+            arguments_object_kind: ArgumentsObjectKind::Unmapped,
+            mapped_argument_bindings: Box::new([]),
+            is_module: false,
+            module_url: Box::<str>::from(""),
+            direct_eval_bindings: Box::new([]),
+            contains_direct_eval: false,
+            code: code.into_boxed_slice(),
+            byte_to_instr: byte_to_instr.into_boxed_slice(),
+            byte_spans: Box::new([]),
+            code_byte_len,
+        })
     }
 
     /// Byte-offset source-map entries, sorted by `pc`. Empty when the
@@ -901,7 +944,8 @@ mod tests {
         let executable = ExecutableModule::from_bytecode(&module);
         let view = executable.functions[0].jit_compile_snapshot();
 
-        assert_eq!(view.function_id, 0);
+        assert_eq!(view.code_block.id, 0);
+        assert!(Arc::ptr_eq(&view.code_block, &executable.functions[0]));
         assert_eq!(view.instructions.len(), 2);
         assert_eq!(view.instructions[0].op, Op::LoadProperty);
         assert_eq!(view.instructions[0].byte_pc, 0);

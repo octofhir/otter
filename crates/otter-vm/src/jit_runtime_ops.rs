@@ -122,24 +122,6 @@ impl Interpreter {
         result
     }
 
-    /// Execute abstract equality or inequality from decoded registers.
-    pub fn jit_runtime_loose_equal(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
-        dst: u16,
-        lhs: u16,
-        rhs: u16,
-        negate: bool,
-    ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result =
-            self.run_loose_equal_regs(context, &mut stack[frame_index], dst, lhs, rhs, negate);
-        stack[frame_index].pc = saved_pc;
-        result
-    }
-
     /// Apply a descriptor object through `OrdinaryDefineOwnProperty`.
     pub fn jit_runtime_define_own_property(
         &mut self,

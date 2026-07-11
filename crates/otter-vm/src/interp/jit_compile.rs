@@ -642,11 +642,15 @@ impl Interpreter {
         )
     }
 
-    /// Record a `Mono`/`Poly` observation for one `Op::CallMethodValue` site:
-    /// the resolved method function id and the receiver's shape. A site stays
-    /// `Mono` only while both stay constant; any change in either promotes it to
-    /// `Poly`. Mirrors [`Self::note_call_target`]; only reached with a JIT hook
-    /// installed.
+    /// Record the live `Mono`/`Poly` overlay for one `Op::CallMethodValue` site.
+    ///
+    /// Method feedback does not invalidate installed machine code. Baseline
+    /// method sites always retain their runtime IC/direct-link fallback, so new
+    /// receiver shapes can populate that live overlay without rebuilding the
+    /// caller's immutable executable body. The initial snapshot may still bake
+    /// already-observed tiny method bodies; later observations use the live
+    /// multi-entry link table until normal bail-driven tier policy decides that
+    /// a fresh compilation is warranted.
     pub(crate) fn note_method_target(
         &mut self,
         caller_fid: u32,
@@ -662,11 +666,7 @@ impl Interpreter {
             method_value_byte: site.method_value_byte,
             hits: 1,
         };
-        // `changed` tracks whether the *set* of inlinable targets grew, which is
-        // what a recompile needs to re-bake. A repeat observation of an
-        // already-known target only bumps an ordering counter and must not evict
-        // (that would thrash the compiled body during steady-state execution).
-        let changed = match self
+        match self
             .jit_method_site_feedback
             .entry((caller_fid, call_byte_pc))
         {
@@ -677,7 +677,6 @@ impl Interpreter {
                     proto_chain: site.proto_chain,
                     method_value_byte: site.method_value_byte,
                 });
-                true
             }
             Entry::Occupied(mut slot) => match slot.get_mut() {
                 MethodCallFeedback::Mono {
@@ -690,9 +689,7 @@ impl Interpreter {
                         && seen_shape.offset() == site.recv_shape.offset()
                         && seen_proto_chain.same(&site.proto_chain)
                         && *seen_value_byte == site.method_value_byte;
-                    if same {
-                        false
-                    } else {
+                    if !same {
                         let prior = PolyMethodTarget {
                             method_fid: *seen_fid,
                             recv_shape: *seen_shape,
@@ -705,7 +702,6 @@ impl Interpreter {
                         targets.push(prior);
                         targets.push(new_target);
                         *slot.get_mut() = MethodCallFeedback::Poly(Box::new(targets));
-                        true
                     }
                 }
                 MethodCallFeedback::Poly(targets) => {
@@ -713,20 +709,14 @@ impl Interpreter {
                         targets.iter_mut().find(|t| t.matches(method_fid, &site))
                     {
                         existing.hits = existing.hits.saturating_add(1);
-                        false
                     } else if targets.len() < MAX_POLY_METHOD_TARGETS {
                         targets.push(new_target);
-                        true
                     } else {
                         *slot.get_mut() = MethodCallFeedback::Megamorphic;
-                        true
                     }
                 }
-                MethodCallFeedback::Megamorphic => false,
+                MethodCallFeedback::Megamorphic => {}
             },
-        };
-        if changed {
-            self.evict_compiled_for_reopt(caller_fid);
         }
     }
 

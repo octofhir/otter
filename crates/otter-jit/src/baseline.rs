@@ -49,8 +49,8 @@ mod runtime_ops;
 use runtime_ops::{
     jit_add_stub, jit_define_data_property_stub, jit_define_own_property_stub,
     jit_fresh_upvalue_stub, jit_load_builtin_error_stub, jit_load_string_stub,
-    jit_loose_equal_stub, jit_make_closure_stub, jit_math_call_stub, jit_neg_stub,
-    jit_new_array_stub, jit_store_upvalue_checked_stub,
+    jit_make_closure_stub, jit_math_call_stub, jit_neg_stub, jit_new_array_stub,
+    jit_store_upvalue_checked_stub,
 };
 
 // The compiled value encoding is single-sourced from the frozen
@@ -1478,13 +1478,13 @@ pub(crate) mod arm64 {
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
         jit_fresh_upvalue_stub, jit_inline_closure_upvalues_stub, jit_load_builtin_error_stub,
         jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
-        jit_load_string_stub, jit_load_upvalue_stub, jit_loose_equal_stub, jit_make_closure_stub,
-        jit_make_fn_stub, jit_math_call_stub, jit_neg_stub, jit_new_array_stub,
-        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
-        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
-        jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
-        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
+        jit_load_string_stub, jit_load_upvalue_stub, jit_make_closure_stub, jit_make_fn_stub,
+        jit_math_call_stub, jit_neg_stub, jit_new_array_stub, jit_new_object_stub,
+        jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub, jit_self_call_bail_stub,
+        jit_store_element_stub, jit_store_prop_stub, jit_store_prop_window_stub,
+        jit_store_upvalue_checked_stub, jit_store_upvalue_stub, jit_write_barrier_stub,
+        jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair, otter_jit_math_random,
+        pack_method_arg_regs, reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -3356,17 +3356,7 @@ pub(crate) mod arm64 {
                     emit_call_stub(&mut ops, jit_neg_stub as *const () as usize, threw);
                 }
                 Op::LooseEqual | Op::LooseNotEqual => {
-                    let (dst, lhs, rhs) = reg3(ops_ref)?;
-                    let negate = u32::from(instr.op == Op::LooseNotEqual);
-                    dynasm!(ops
-                        ; .arch aarch64
-                        ; mov x0, x20
-                        ; movz x1, dst as u32
-                        ; movz x2, lhs as u32
-                        ; movz x3, rhs as u32
-                        ; movz x4, negate
-                    );
-                    emit_call_stub(&mut ops, jit_loose_equal_stub as *const () as usize, threw);
+                    emit_loose_cmp(&mut ops, ops_ref, instr.op == Op::LooseNotEqual, bail)?;
                 }
                 Op::DefineOwnProperty => {
                     let (target, key, descriptor) = reg3(ops_ref)?;
@@ -6584,6 +6574,57 @@ pub(crate) mod arm64 {
         Ok(())
     }
 
+    /// Inline abstract equality for numbers and the null/undefined equivalence
+    /// class. String/object/coercive cases bail before observable work to the
+    /// exact interpreter instruction.
+    fn emit_loose_cmp(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        negate: bool,
+        bail: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let (dst, lhs, rhs) = reg3(operands)?;
+        load_reg(ops, 9, lhs)?;
+        load_reg(ops, 10, rhs)?;
+        let lhs_nullish = ops.new_dynamic_label();
+        let rhs_nullish = ops.new_dynamic_label();
+        let have_bool = ops.new_dynamic_label();
+        emit_load_u64(ops, 11, VALUE_NULL);
+        dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>lhs_nullish);
+        emit_load_u64(ops, 11, VALUE_UNDEFINED);
+        dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>lhs_nullish);
+        emit_load_u64(ops, 11, VALUE_NULL);
+        dynasm!(ops ; .arch aarch64 ; cmp x10, x11 ; b.eq =>rhs_nullish);
+        emit_load_u64(ops, 11, VALUE_UNDEFINED);
+        dynasm!(ops ; .arch aarch64 ; cmp x10, x11 ; b.eq =>rhs_nullish);
+
+        emit_num_to_double(ops, 9, 0, bail);
+        emit_num_to_double(ops, 10, 1, bail);
+        dynasm!(ops ; .arch aarch64 ; fcmp d0, d1 ; cset w13, eq ; b =>have_bool);
+
+        dynasm!(ops ; .arch aarch64 ; =>lhs_nullish);
+        emit_load_u64(ops, 11, VALUE_NULL);
+        dynasm!(ops ; .arch aarch64 ; cmp x10, x11 ; b.eq >both_nullish);
+        emit_load_u64(ops, 11, VALUE_UNDEFINED);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x10, x11
+            ; cset w13, eq
+            ; b =>have_bool
+            ; both_nullish:
+            ; movz w13, #1
+            ; b =>have_bool
+            ; =>rhs_nullish
+            ; movz w13, #0
+            ; =>have_bool
+        );
+        if negate {
+            dynasm!(ops ; .arch aarch64 ; eor w13, w13, #1);
+        }
+        box_bool!(ops, 13, 12);
+        store_reg(ops, 13, dst)
+    }
+
     /// `ldr X(t), [x19, #idx*8]`.
     fn load_reg(ops: &mut Assembler, t: u32, idx: u16) -> Result<(), Unsupported> {
         let off = reg_offset(idx)?;
@@ -7319,6 +7360,43 @@ mod tests {
                 .expect("runtime-operation body compiles")
                 .frameless_entry_safe()
         );
+    }
+
+    #[test]
+    fn loose_equality_inlines_numeric_and_nullish_cases() {
+        let nullish = view(&[
+            (
+                Op::LooseEqual,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [VALUE_NULL, VALUE_UNDEFINED, 0, 0, 0, 0, 0, 0];
+        match run(&nullish, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(bits, VALUE_TRUE),
+            Exit::Bailed => panic!("nullish loose equality bailed"),
+        }
+
+        let numeric = view(&[
+            (
+                Op::LooseNotEqual,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let mut regs = [box_i32(1), box_i32(2), 0, 0, 0, 0, 0, 0];
+        match run(&numeric, &mut regs) {
+            Exit::Returned(bits) => assert_eq!(bits, VALUE_TRUE),
+            Exit::Bailed => panic!("numeric loose inequality bailed"),
+        }
     }
 
     // CodeBlock branch encoding: target instruction = current + 1 + rel.

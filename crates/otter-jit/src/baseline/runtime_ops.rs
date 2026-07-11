@@ -135,30 +135,6 @@ pub(super) extern "C" fn jit_neg_stub(ctx: *mut JitCtx, dst: u64, src: u64) -> u
     park_result(ctx, result)
 }
 
-pub(super) extern "C" fn jit_loose_equal_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    lhs: u64,
-    rhs: u64,
-    negate: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    let result = vm.jit_runtime_loose_equal(
-        context,
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        lhs as u16,
-        rhs as u16,
-        negate != 0,
-    );
-    park_result(ctx, result)
-}
-
 pub(super) extern "C" fn jit_define_own_property_stub(
     ctx: *mut JitCtx,
     target: u64,

@@ -238,6 +238,16 @@ impl Interpreter {
         // the constructor's virtual metadata property entirely (the
         // class never receives the implicit own `name`): mark it
         // deleted so removing the static later does not resurrect it.
+        //
+        // Re-read `ctor` and `statics` from their GC-rooted registers: the
+        // class construction above allocates a hidden class and may scavenge,
+        // relocating both objects. The bare locals read before that allocation
+        // are stale, and walking a stale object's shape here is a
+        // use-after-move (the reclaimed shape cell is reused as another type).
+        let ctor = *read_register(&stack[frame_idx], ctor_reg)?;
+        let statics = read_register(&stack[frame_idx], statics_reg)?
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
         if let Some(fid) = ctor
             .as_function()
             .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))

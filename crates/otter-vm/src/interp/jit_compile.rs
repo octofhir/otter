@@ -216,11 +216,15 @@ impl Interpreter {
         if self.jit_element_load_kind.is_empty() {
             return;
         }
+        let code_block = std::sync::Arc::clone(&view.code_block);
         for instr in &mut view.instructions {
-            if instr.op != Op::LoadElement {
+            if instr.op(&code_block) != Op::LoadElement {
                 continue;
             }
-            if let Some(kind) = self.jit_element_load_kind.get(&(fid, instr.instruction_pc)) {
+            if let Some(kind) = self
+                .jit_element_load_kind
+                .get(&(fid, instr.instruction_pc(&code_block)))
+            {
                 instr.element_load_kind = *kind;
             }
         }
@@ -234,13 +238,12 @@ impl Interpreter {
         if self.jit_arith_feedback.is_empty() && self.jit_arith_widen_float.is_empty() {
             return;
         }
+        let code_block = std::sync::Arc::clone(&view.code_block);
         for instr in &mut view.instructions {
-            if self
-                .jit_arith_widen_float
-                .contains(&(fid, instr.instruction_pc))
-            {
+            let instruction_pc = instr.instruction_pc(&code_block);
+            if self.jit_arith_widen_float.contains(&(fid, instruction_pc)) {
                 instr.arith_feedback = jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64;
-            } else if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.instruction_pc)) {
+            } else if let Some(fb) = self.jit_arith_feedback.get(&(fid, instruction_pc)) {
                 instr.arith_feedback = fb.bits();
             }
         }
@@ -256,8 +259,9 @@ impl Interpreter {
         // the value's byte offset inside the object's value slab.
         const SLOT_BYTES: u32 =
             std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
+        let code_block = std::sync::Arc::clone(&view.code_block);
         for instr in &mut view.instructions {
-            let Some(site) = instr.property_ic_site else {
+            let Some(site) = instr.property_ic_site(&code_block) else {
                 continue;
             };
             // Collect every entry's own-data `(shape_offset, slot_byte)` case, or
@@ -273,7 +277,7 @@ impl Interpreter {
                 (!hit.shape.is_null())
                     .then_some((hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
             };
-            let cases: Option<Vec<(u32, u32)>> = match instr.op {
+            let cases: Option<Vec<(u32, u32)>> = match instr.op(&code_block) {
                 otter_bytecode::Op::LoadProperty => self.load_property_ics.get(site).map(|e| {
                     e.entries()
                         .iter()
@@ -312,7 +316,7 @@ impl Interpreter {
                 }
             }
 
-            if !matches!(instr.op, otter_bytecode::Op::LoadProperty)
+            if !matches!(instr.op(&code_block), otter_bytecode::Op::LoadProperty)
                 || instr.property_feedback.is_some()
                 || !instr.property_feedback_poly.is_empty()
             {
@@ -361,10 +365,10 @@ impl Interpreter {
         let fid = view.code_block.id;
         let code_block = std::sync::Arc::clone(&view.code_block);
         for instr in &mut view.instructions {
-            if instr.op != Op::LoadGlobalOrThrow {
+            if instr.op(&code_block) != Op::LoadGlobalOrThrow {
                 continue;
             }
-            let Some(Operand::ConstIndex(name_idx)) = code_block.operand(instr, 1) else {
+            let Some(Operand::ConstIndex(name_idx)) = instr.operand(&code_block, 1) else {
                 continue;
             };
             let Some(name) = context.string_constant_str_for_function(fid, name_idx) else {
@@ -430,18 +434,18 @@ impl Interpreter {
         const MAX_PROPS: usize = 4;
         let code_block = std::sync::Arc::clone(&view.code_block);
         let reg_op =
-            |instr: &jit::JitInstructionMetadata, i: usize| match code_block.operand(instr, i) {
+            |instr: &jit::JitInstructionMetadata, i: usize| match instr.operand(&code_block, i) {
                 Some(Operand::Register(r)) => Some(r),
                 _ => None,
             };
         let const_op =
-            |instr: &jit::JitInstructionMetadata, i: usize| match code_block.operand(instr, i) {
+            |instr: &jit::JitInstructionMetadata, i: usize| match instr.operand(&code_block, i) {
                 Some(Operand::ConstIndex(n)) => Some(n),
                 _ => None,
             };
         let uses_reg = |instr: &jit::JitInstructionMetadata, reg: u16| {
-            code_block
-                .operand_view(instr)
+            instr
+                .operand_view(&code_block)
                 .iter()
                 .any(|o| matches!(o, Operand::Register(r) if r == reg))
         };
@@ -450,7 +454,7 @@ impl Interpreter {
         let mut plans: Vec<(usize, jit::ObjectLiteralPlan)> = Vec::new();
         let instrs = &view.instructions;
         for i in 0..instrs.len() {
-            if instrs[i].op != Op::NewObject {
+            if instrs[i].op(&code_block) != Op::NewObject {
                 continue;
             }
             let Some(obj_reg) = reg_op(&instrs[i], 0) else {
@@ -466,7 +470,9 @@ impl Interpreter {
                 // A `__proto__`-free data property defined on this literal:
                 // `LoadString key` immediately followed by `DefineDataProperty
                 // obj, key, value`.
-                if instr.op == Op::DefineDataProperty && reg_op(instr, 0) == Some(obj_reg) {
+                if instr.op(&code_block) == Op::DefineDataProperty
+                    && reg_op(instr, 0) == Some(obj_reg)
+                {
                     let (Some(key_reg), Some(val_reg)) = (reg_op(instr, 1), reg_op(instr, 2))
                     else {
                         ok = false;
@@ -477,7 +483,7 @@ impl Interpreter {
                         break;
                     }
                     let prev = &instrs[j - 1];
-                    if prev.op != Op::LoadString || reg_op(prev, 0) != Some(key_reg) {
+                    if prev.op(&code_block) != Op::LoadString || reg_op(prev, 0) != Some(key_reg) {
                         ok = false;
                         break;
                     }
@@ -510,7 +516,10 @@ impl Interpreter {
                 if uses_reg(instr, obj_reg) {
                     break;
                 }
-                if matches!(instr.op, Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse) {
+                if matches!(
+                    instr.op(&code_block),
+                    Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse
+                ) {
                     ok = false;
                     break;
                 }
@@ -816,7 +825,7 @@ impl Interpreter {
             let Some(call_byte_pc) = view
                 .instructions
                 .iter()
-                .find(|instr| instr.instruction_pc == instruction_pc)
+                .find(|instr| instr.instruction_pc(&view.code_block) == instruction_pc)
                 .map(|instr| instr.byte_pc)
             else {
                 continue;
@@ -939,7 +948,7 @@ impl Interpreter {
             let Some(call_byte_pc) = view
                 .instructions
                 .iter()
-                .find(|instr| instr.instruction_pc == snap.instruction_pc)
+                .find(|instr| instr.instruction_pc(&view.code_block) == snap.instruction_pc)
                 .map(|instr| instr.byte_pc)
             else {
                 continue;
@@ -1025,13 +1034,13 @@ impl Interpreter {
         const SLOT_BYTES: u32 =
             std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
         for instr in &method_view.instructions {
-            let name_operand = match instr.op {
+            let name_operand = match instr.op(&method_view.code_block) {
                 Op::LoadProperty => 2,
                 Op::StoreProperty => 1,
                 _ => continue,
             };
             let otter_bytecode::Operand::ConstIndex(name_idx) =
-                method_view.code_block.operand(instr, name_operand)?
+                instr.operand(&method_view.code_block, name_operand)?
             else {
                 return None;
             };
@@ -1055,7 +1064,7 @@ impl Interpreter {
         let mut nested_targets: Vec<(u32, PolyMethodTarget)> = Vec::new();
         if depth < Self::MAX_INLINE_METHOD_DEPTH {
             for instr in &method_view.instructions {
-                if instr.op != Op::CallMethodValue {
+                if instr.op(&method_view.code_block) != Op::CallMethodValue {
                     continue;
                 }
                 if let Some(MethodCallFeedback::Mono {
@@ -1063,10 +1072,10 @@ impl Interpreter {
                     recv_shape,
                     proto_chain,
                     method_value_byte,
-                }) = self
-                    .jit_method_site_feedback
-                    .get(&(target.method_fid, instr.instruction_pc))
-                {
+                }) = self.jit_method_site_feedback.get(&(
+                    target.method_fid,
+                    instr.instruction_pc(&method_view.code_block),
+                )) {
                     nested_targets.push((
                         instr.byte_pc,
                         PolyMethodTarget {
@@ -1118,10 +1127,10 @@ impl Interpreter {
     /// bridge re-validates the receiver/prototype/builtin on every miss.
     pub(crate) fn bake_array_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
-            if instr.op != Op::CallMethodValue {
+            if instr.op(&view.code_block) != Op::CallMethodValue {
                 continue;
             }
-            let Some(site) = instr.property_ic_site else {
+            let Some(site) = instr.property_ic_site(&view.code_block) else {
                 continue;
             };
             if let Some(feedback) = self.jit_array_method_feedback(site) {
@@ -1132,7 +1141,7 @@ impl Interpreter {
 
     pub(crate) fn bake_primitive_method_guards(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
-            if instr.op != Op::CallMethodValue {
+            if instr.op(&view.code_block) != Op::CallMethodValue {
                 continue;
             }
             let Some(feedback) = self.jit_primitive_method_guard(instr.method_hint) else {
@@ -1144,10 +1153,10 @@ impl Interpreter {
 
     pub(crate) fn bake_collection_leaf_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
-            if instr.op != Op::CallMethodValue {
+            if instr.op(&view.code_block) != Op::CallMethodValue {
                 continue;
             }
-            let Some(site) = instr.property_ic_site else {
+            let Some(site) = instr.property_ic_site(&view.code_block) else {
                 continue;
             };
             let Some(feedback) = self.jit_collection_leaf_method_feedback(site) else {
@@ -1164,10 +1173,10 @@ impl Interpreter {
     /// attach exact safepoint maps to the machine call site.
     pub(crate) fn bake_collection_alloc_methods(&self, view: &mut jit::JitCompileSnapshot) {
         for instr in &view.instructions {
-            if instr.op != Op::CallMethodValue {
+            if instr.op(&view.code_block) != Op::CallMethodValue {
                 continue;
             }
-            let Some(site) = instr.property_ic_site else {
+            let Some(site) = instr.property_ic_site(&view.code_block) else {
                 continue;
             };
             let safepoint_id = view.safepoints.len() as native_abi::SafepointId;

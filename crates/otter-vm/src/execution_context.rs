@@ -261,24 +261,26 @@ impl ExecutionContext {
         // a Rust round-trip. Operand 1 is the function-id constant index.
         for instr in &mut view.instructions {
             if matches!(
-                instr.op,
+                instr.op(&code_block),
                 otter_bytecode::Op::MakeFunction | otter_bytecode::Op::MakeClosure
             ) && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
-                code_block.operand(instr, 1)
+                instr.operand(&code_block, 1)
                 && self.function_id_constant(idx) == Some(function_id)
             {
                 instr.make_self = true;
             }
-            if instr.op == otter_bytecode::Op::LoadProperty
-                && let Some(otter_bytecode::Operand::ConstIndex(idx)) = code_block.operand(instr, 2)
+            if instr.op(&code_block) == otter_bytecode::Op::LoadProperty
+                && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
+                    instr.operand(&code_block, 2)
                 && self
                     .string_constant_str_for_function(function_id, idx)
                     .is_some_and(|name| name == "length")
             {
                 instr.load_array_length = true;
             }
-            if instr.op == otter_bytecode::Op::CallMethodValue
-                && let Some(otter_bytecode::Operand::ConstIndex(idx)) = code_block.operand(instr, 2)
+            if instr.op(&code_block) == otter_bytecode::Op::CallMethodValue
+                && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
+                    instr.operand(&code_block, 2)
                 && let Some(name) = self.string_constant_str_for_function(function_id, idx)
             {
                 instr.method_hint = match name {
@@ -287,8 +289,9 @@ impl ExecutionContext {
                     _ => crate::jit::JitMethodHint::None,
                 };
             }
-            if instr.op == otter_bytecode::Op::LoadNumber
-                && let Some(otter_bytecode::Operand::ConstIndex(idx)) = code_block.operand(instr, 1)
+            if instr.op(&code_block) == otter_bytecode::Op::LoadNumber
+                && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
+                    instr.operand(&code_block, 1)
                 && let Some(bits) = self.number_constant_bits(idx)
             {
                 instr.load_number = Some(f64::from_bits(bits));

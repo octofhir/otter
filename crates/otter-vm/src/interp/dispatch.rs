@@ -154,7 +154,7 @@ impl Interpreter {
                     (context, function, idx)
                 };
             let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
-            let op = instr.op();
+            let op = function.op(instr);
             // `current_function_id` / `current_instruction_pc` exist only to key the
             // optimizing-tier arithmetic type-feedback cell (`note_arith`),
             // which the arith opcode helpers record only when a JIT hook is

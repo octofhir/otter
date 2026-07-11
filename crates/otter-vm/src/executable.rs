@@ -7,11 +7,10 @@
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
-//! - [`CodeBlock`] — one immutable verified function body: instruction stream,
-//!   compact instruction records, overflow operand word table, and cold source
-//!   metadata.
-//! - [`CodeBlockInstruction`] — opcode plus inline operand words or a range in
-//!   the owning CodeBlock's overflow table.
+//! - [`CodeBlock`] — one immutable verified function body: authoritative
+//!   wordcode, dense site metadata, and cold source metadata.
+//! - [`CodeBlockInstruction`] — compact site identity selecting one wordcode
+//!   record and its VM-local IC metadata.
 //!
 //! # Invariants
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
@@ -21,8 +20,9 @@
 //!   map is retained in the execution object.
 //! - Operand payloads are untagged 32-bit words. Their kinds come exclusively
 //!   from the opcode schema and are decoded through [`CodeBlock`] accessors.
-//! - Up to four operand words live inline. Any longer instruction uses the
-//!   CodeBlock-owned overflow table; no instruction owns an operand box.
+//! - Up to four operand words live in the authoritative wordcode record. Any
+//!   longer instruction uses the CodeBlock-owned overflow table; site metadata
+//!   owns neither operand storage nor reference counts.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
 //!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
 //!   try-handler slots by the serialized verifier.
@@ -219,8 +219,8 @@ impl CodeBlock {
                 .code
                 .iter()
                 .enumerate()
-                .map(|(index, instr)| crate::jit::JitInstructionMetadata {
-                    instruction: instr.clone(),
+                .map(|(index, _)| crate::jit::JitInstructionMetadata {
+                    instruction_index: index as u32,
                     byte_pc: self.instruction_metadata[index].byte_pc,
                     byte_len: self.instruction_metadata[index].byte_len,
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
@@ -280,7 +280,7 @@ impl CodeBlock {
         for instr in instructions {
             wordcode_builder.push(instr.op, &instr.operands);
         }
-        let wordcode = Arc::new(wordcode_builder.finish());
+        let wordcode = wordcode_builder.finish();
         let instruction_metadata: Vec<_> = instructions
             .iter()
             .map(|instr| ColdInstructionMetadata {
@@ -292,13 +292,12 @@ impl CodeBlock {
             .iter()
             .enumerate()
             .map(|(word_index, instr)| {
-                Arc::new(CodeBlockInstruction::from_wordcode(
-                    Arc::clone(&wordcode),
+                CodeBlockInstruction::from_word_index(
                     word_index as u32,
                     id,
                     instr.instruction_pc,
                     NO_PROPERTY_IC_SITE,
-                ))
+                )
             })
             .collect();
         let code_byte_len = instruction_metadata.last().map_or(0, |metadata| {
@@ -356,7 +355,7 @@ impl CodeBlock {
             .instruction_metadata
             .binary_search_by_key(&byte_pc, |metadata| metadata.byte_pc)
             .ok()?;
-        self.code.get(idx).map(Arc::as_ref)
+        self.code.get(idx)
     }
 
     /// Resolve a cold byte-offset PC to its dense instruction index.
@@ -370,7 +369,7 @@ impl CodeBlock {
     /// Fetch an instruction by its dense `code` index.
     #[must_use]
     pub(crate) fn instr_at_index(&self, index: usize) -> Option<&CodeBlockInstruction> {
-        self.code.get(index).map(Arc::as_ref)
+        self.code.get(index)
     }
 
     /// Cold serialized byte PC for one logical instruction index.
@@ -393,12 +392,37 @@ impl CodeBlock {
     #[cfg(test)]
     #[must_use]
     pub fn operands(&self, instr: &CodeBlockInstruction) -> smallvec::SmallVec<[Operand; 4]> {
-        (0..instr.operand_count())
+        (0..self.operand_count(instr))
             .map(|index| {
                 self.operand(instr, index)
                     .expect("verified CodeBlock operand must decode")
             })
             .collect()
+    }
+
+    /// Opcode from the authoritative wordcode record.
+    #[must_use]
+    pub fn op(&self, instr: &CodeBlockInstruction) -> Op {
+        self.word_instruction(instr).op
+    }
+
+    /// Opcode at one canonical instruction index.
+    #[must_use]
+    pub fn op_at(&self, index: usize) -> Option<Op> {
+        self.wordcode.get(index).map(|instruction| instruction.op)
+    }
+
+    /// Number of schema-typed operands on this instruction.
+    #[must_use]
+    pub fn operand_count(&self, instr: &CodeBlockInstruction) -> usize {
+        self.word_instruction(instr).operand_count()
+    }
+
+    /// Whether every operand word lives in the instruction record.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn operands_are_inline(&self, instr: &CodeBlockInstruction) -> bool {
+        self.word_instruction(instr).operands_are_inline()
     }
 
     /// Borrowed schema-decoded operand view with no materialisation.
@@ -415,7 +439,7 @@ impl CodeBlock {
     /// One schema-typed operand.
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
-        self.wordcode.operand(instr, index)
+        self.wordcode.operand(self.word_instruction(instr), index)
     }
 
     /// Decode one register operand.
@@ -454,6 +478,11 @@ impl CodeBlock {
             _ => None,
         }
     }
+
+    fn word_instruction(&self, instr: &CodeBlockInstruction) -> &WordInstruction {
+        debug_assert_eq!(instr.code_block_id(), self.id);
+        &self.wordcode[instr.word_index as usize]
+    }
 }
 
 /// Borrowed access to one instruction's schema-typed operand words.
@@ -480,7 +509,7 @@ impl<'a> OperandView<'a> {
     #[must_use]
     pub fn len(self) -> usize {
         match self.source {
-            OperandViewSource::Wordcode { instr, .. } => instr.operand_count(),
+            OperandViewSource::Wordcode { code_block, instr } => code_block.operand_count(instr),
             #[cfg(test)]
             OperandViewSource::Decoded(decoded) => decoded.len(),
         }
@@ -646,9 +675,9 @@ pub struct CodeBlock {
     /// table may still be empty).
     pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream indexed directly by the frame's canonical PC.
-    pub code: Box<[Arc<CodeBlockInstruction>]>,
+    pub code: Box<[CodeBlockInstruction]>,
     /// Authoritative schema-typed execution wordcode shared by VM and JIT.
-    wordcode: Arc<FunctionCode>,
+    wordcode: FunctionCode,
     /// Cold serialized byte coordinates parallel to `code`.
     instruction_metadata: Box<[ColdInstructionMetadata]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
@@ -681,7 +710,7 @@ impl CodeBlock {
                 function.name, function.id
             )
         });
-        let wordcode = Arc::new(function.code.clone());
+        let wordcode = function.code.clone();
         let instruction_metadata = instr_to_byte_pc
             .iter()
             .enumerate()
@@ -718,13 +747,12 @@ impl CodeBlock {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
-                Arc::new(CodeBlockInstruction::from_wordcode(
-                    Arc::clone(&wordcode),
+                CodeBlockInstruction::from_word_index(
                     idx as u32,
                     function.id,
                     idx as u32,
                     property_ic_site,
-                ))
+                )
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -848,48 +876,40 @@ pub(crate) struct ExecMappedArgumentBinding {
     pub(crate) storage: ArgumentBindingStorage,
 }
 
-/// Hot dispatch instruction with inline schema-typed wordcode operands.
+/// Dense VM site metadata selecting one authoritative wordcode instruction.
+///
+/// This record owns no opcode/operand payload and no `Arc`; the owning
+/// [`CodeBlock`] resolves `word_index` against its single [`FunctionCode`].
+#[repr(C)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CodeBlockInstruction {
-    /// Shared authoritative wordcode body; `word_index` selects the record.
-    wordcode: Arc<FunctionCode>,
-    /// Dense index into `wordcode`; test snapshots may carry a distinct PC.
+    /// Dense index into the owning CodeBlock wordcode; tests may carry a distinct PC.
     word_index: u32,
     /// Owning CodeBlock identity used to resolve runtime function state.
     code_block_id: u32,
     /// Canonical dense instruction index used by interpreter and JIT CFG.
     pub instruction_pc: u32,
     /// Dense module-local property IC site id for named property ops.
-    pub property_ic_site: Option<usize>,
+    property_ic_site: u32,
 }
 
+const _: [(); 16] = [(); std::mem::size_of::<CodeBlockInstruction>()];
+const _: [(); 4] = [(); std::mem::align_of::<CodeBlockInstruction>()];
+
 impl CodeBlockInstruction {
-    pub(crate) fn from_wordcode(
-        wordcode: Arc<FunctionCode>,
+    pub(crate) fn from_word_index(
         word_index: u32,
         code_block_id: u32,
         instruction_pc: u32,
         property_ic_site: u32,
     ) -> Self {
-        assert!(wordcode.get(word_index as usize).is_some());
         Self {
-            wordcode,
             word_index,
             code_block_id,
             instruction_pc,
-            property_ic_site: if property_ic_site == NO_PROPERTY_IC_SITE {
-                None
-            } else {
-                Some(property_ic_site as usize)
-            },
+            property_ic_site,
         }
-    }
-
-    /// Opcode.
-    #[must_use]
-    pub fn op(&self) -> Op {
-        self.deref_word().op
     }
 
     /// Owning CodeBlock identity.
@@ -898,29 +918,10 @@ impl CodeBlockInstruction {
         self.code_block_id
     }
 
-    /// Whether all operand words live in the instruction record.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn operands_are_inline(&self) -> bool {
-        self.deref_word().operands_are_inline()
-    }
-
     /// Dense property IC site index for named property opcodes.
     #[must_use]
-    pub const fn property_ic_site(&self) -> Option<usize> {
-        self.property_ic_site
-    }
-
-    fn deref_word(&self) -> &WordInstruction {
-        &self.wordcode[self.word_index as usize]
-    }
-}
-
-impl std::ops::Deref for CodeBlockInstruction {
-    type Target = WordInstruction;
-
-    fn deref(&self) -> &Self::Target {
-        self.deref_word()
+    pub fn property_ic_site(&self) -> Option<usize> {
+        (self.property_ic_site != NO_PROPERTY_IC_SITE).then_some(self.property_ic_site as usize)
     }
 }
 
@@ -967,8 +968,8 @@ mod tests {
         let function = executable.function(0).unwrap();
         let instr = &function.code[0];
 
-        assert_eq!(instr.op(), Op::Add);
-        assert!(instr.operands_are_inline());
+        assert_eq!(function.op(instr), Op::Add);
+        assert!(function.operands_are_inline(instr));
         assert_eq!(std::mem::size_of::<WordInstruction>(), 24);
         assert_eq!(function.register(instr, 0), Some(0));
         assert_eq!(function.register(instr, 1), Some(1));
@@ -1027,8 +1028,8 @@ mod tests {
         let function = executable.function(0).unwrap();
         let instr = &function.code[0];
 
-        assert_eq!(instr.op(), Op::Call);
-        assert!(!instr.operands_are_inline());
+        assert_eq!(function.op(instr), Op::Call);
+        assert!(!function.operands_are_inline(instr));
         assert_eq!(function.register(instr, 0), Some(0));
         assert_eq!(function.register(instr, 1), Some(1));
         assert_eq!(function.const_index(instr, 2), Some(2));
@@ -1056,7 +1057,7 @@ mod tests {
         let function = executable.function(0).unwrap();
         let instr = &function.code[0];
 
-        assert!(!instr.operands_are_inline());
+        assert!(!function.operands_are_inline(instr));
         assert_eq!(function.operands(instr).as_slice(), operands.as_slice());
     }
 
@@ -1123,22 +1124,30 @@ mod tests {
         assert_eq!(view.code_block.id, 0);
         assert!(Arc::ptr_eq(&view.code_block, &executable.functions[0]));
         assert_eq!(view.instructions.len(), 2);
-        assert_eq!(view.instructions[0].op, Op::LoadProperty);
+        assert_eq!(view.instructions[0].op(&view.code_block), Op::LoadProperty);
         assert_eq!(view.instructions[0].byte_pc, 0);
         assert!(view.instructions[0].byte_len > 0);
-        assert_eq!(view.instructions[0].property_ic_site, Some(0));
         assert_eq!(
-            view.code_block.operands(&view.instructions[0]).as_slice(),
+            view.instructions[0].property_ic_site(&view.code_block),
+            Some(0)
+        );
+        assert_eq!(
+            view.code_block
+                .operands(view.instructions[0].resolve(&view.code_block))
+                .as_slice(),
             &[
                 Operand::Register(0),
                 Operand::Register(1),
                 Operand::ConstIndex(7),
             ]
         );
-        assert_eq!(view.instructions[1].op, Op::Add);
-        assert_eq!(view.instructions[1].property_ic_site, None);
-        assert!(Arc::ptr_eq(
-            &view.instructions[0].instruction,
+        assert_eq!(view.instructions[1].op(&view.code_block), Op::Add);
+        assert_eq!(
+            view.instructions[1].property_ic_site(&view.code_block),
+            None
+        );
+        assert!(std::ptr::eq::<CodeBlockInstruction>(
+            view.instructions[0].resolve(&view.code_block),
             &executable.functions[0].code[0]
         ));
     }

@@ -2012,19 +2012,20 @@ pub(crate) mod arm64 {
     }
 
     pub(super) fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
+        let code_block = view.code_block.as_ref();
         if let Some(instr) = view.instructions.iter().find(|instr| {
             matches!(
-                instr.op,
+                instr.op(code_block),
                 Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally
             )
         }) {
-            return Err(Unsupported::Opcode(instr.op));
+            return Err(Unsupported::Opcode(instr.op(code_block)));
         }
         if let Some(argc) = view
             .instructions
             .iter()
-            .filter(|instr| instr.op == Op::CallMethodValue)
-            .filter_map(|instr| view.code_block.const_index(instr, 3))
+            .filter(|instr| instr.op(code_block) == Op::CallMethodValue)
+            .filter_map(|instr| instr.const_index(code_block, 3))
             .find(|&argc| argc as usize > super::MAX_METHOD_ARGS)
         {
             return Err(Unsupported::ArgCount(argc as usize));
@@ -2038,7 +2039,7 @@ pub(crate) mod arm64 {
         // metadata for bailout/OSR records only.
         let mut labels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for instr in &view.instructions {
-            labels.insert(instr.instruction_pc, ops.new_dynamic_label());
+            labels.insert(instr.instruction_pc(code_block), ops.new_dynamic_label());
         }
         let target_label = |instruction_pc: i64| -> Result<DynamicLabel, Unsupported> {
             u32::try_from(instruction_pc)
@@ -2064,7 +2065,7 @@ pub(crate) mod arm64 {
         let mut add_alloc_safepoints: BTreeMap<u32, SafepointId> = BTreeMap::new();
         let mut live_method_alloc_safepoints: BTreeMap<u32, SafepointId> = BTreeMap::new();
         for instr in &view.instructions {
-            if instr.op == Op::CallMethodValue {
+            if instr.op(code_block) == Op::CallMethodValue {
                 if let Some(alloc) = view.collection_alloc_methods.get(&instr.byte_pc) {
                     live_method_alloc_safepoints.insert(instr.byte_pc, alloc.safepoint_id);
                 } else {
@@ -2078,7 +2079,7 @@ pub(crate) mod arm64 {
                     ));
                 }
             }
-            if instr.op == Op::Add {
+            if instr.op(code_block) == Op::Add {
                 let safepoint = next_safepoint;
                 next_safepoint = next_safepoint.saturating_add(1);
                 add_alloc_safepoints.insert(instr.byte_pc, safepoint);
@@ -2098,14 +2099,16 @@ pub(crate) mod arm64 {
         // a trampoline is emitted for each after the body.
         let mut loop_headers: BTreeMap<u32, u32> = BTreeMap::new();
         for instr in &view.instructions {
-            if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = view
-                    .code_block
-                    .imm32(instr, 0)
+            if matches!(
+                instr.op(code_block),
+                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
+            ) {
+                let rel = instr
+                    .imm32(code_block, 0)
                     .ok_or(Unsupported::OperandShape("branch offset"))?;
-                let target = branch_target(instr, rel);
+                let target = branch_target(code_block, instr, rel);
                 if target >= 0
-                    && target < i64::from(instr.instruction_pc)
+                    && target < i64::from(instr.instruction_pc(code_block))
                     && let Ok(target_pc) = u32::try_from(target)
                     && labels.contains_key(&target_pc)
                 {
@@ -2120,12 +2123,14 @@ pub(crate) mod arm64 {
         // entry. Includes forward targets, unlike `loop_headers`.
         let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
         for instr in &view.instructions {
-            if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = view
-                    .code_block
-                    .imm32(instr, 0)
+            if matches!(
+                instr.op(code_block),
+                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
+            ) {
+                let rel = instr
+                    .imm32(code_block, 0)
                     .ok_or(Unsupported::OperandShape("branch offset"))?;
-                let target = branch_target(instr, rel);
+                let target = branch_target(code_block, instr, rel);
                 if let Ok(pc) = u32::try_from(target) {
                     branch_targets.insert(pc);
                 }
@@ -2138,7 +2143,10 @@ pub(crate) mod arm64 {
         // never slow a non-dividing function. `Op::Div` always produces a
         // Number via `f64`, so a function that contains one already runs its
         // arithmetic through the double path on the hot values.
-        let enable_fres = view.instructions.iter().any(|i| i.op == Op::Div);
+        let enable_fres = view
+            .instructions
+            .iter()
+            .any(|i| i.op(code_block) == Op::Div);
         let mut fres = FloatResidency::default();
 
         // One self-patching WhiskerIC cell per `LoadProperty` op. Allocated up
@@ -2150,7 +2158,7 @@ pub(crate) mod arm64 {
         let load_property_count = view
             .instructions
             .iter()
-            .filter(|i| i.op == Op::LoadProperty)
+            .filter(|i| i.op(code_block) == Op::LoadProperty)
             .count();
         let mut load_ic_cells: Box<[WhiskerIcCell]> =
             vec![WhiskerIcCell::default(); load_property_count].into_boxed_slice();
@@ -2162,7 +2170,7 @@ pub(crate) mod arm64 {
         let store_property_count = view
             .instructions
             .iter()
-            .filter(|i| i.op == Op::StoreProperty)
+            .filter(|i| i.op(code_block) == Op::StoreProperty)
             .count();
         let mut store_ic_cells: Box<[WhiskerIcCell]> =
             vec![WhiskerIcCell::default(); store_property_count].into_boxed_slice();
@@ -2185,12 +2193,13 @@ pub(crate) mod arm64 {
         let ta_layout = view.ta_layout;
 
         for instr in &view.instructions {
-            dynasm!(ops ; .arch aarch64 ; =>labels[&instr.instruction_pc]);
+            let instruction_pc = instr.instruction_pc(code_block);
+            dynasm!(ops ; .arch aarch64 ; =>labels[&instruction_pc]);
             // A branch target is a block boundary: control can arrive here from
             // elsewhere with unknown register state (and OSR enters loop headers
             // with values freshly loaded from memory), so no FP register can be
             // assumed to hold a slot's value.
-            if enable_fres && branch_targets.contains(&instr.instruction_pc) {
+            if enable_fres && branch_targets.contains(&instruction_pc) {
                 fres.clear();
             }
             // Stamp this op's byte-PC into the context so any bail (guard
@@ -2198,8 +2207,8 @@ pub(crate) mod arm64 {
             // exact instruction, preserving committed side effects.
             emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
-            let ops_ref = view.code_block.operand_view(instr);
-            match instr.op {
+            let ops_ref = instr.operand_view(code_block);
+            match instr.op(code_block) {
                 Op::LoadInt32 => {
                     let dst = reg(ops_ref, 0)?;
                     let v = imm32(ops_ref, 1)?;
@@ -2266,10 +2275,10 @@ pub(crate) mod arm64 {
                     threw,
                 )?,
                 Op::Sub | Op::Mul | Op::Div if enable_fres => {
-                    emit_float_binop_res(&mut ops, ops_ref, bail, instr.op, &mut fres)?;
+                    emit_float_binop_res(&mut ops, ops_ref, bail, instr.op(code_block), &mut fres)?;
                 }
                 Op::Sub | Op::Mul => {
-                    emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op)?;
+                    emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op(code_block))?;
                 }
                 Op::Div => emit_div(&mut ops, ops_ref, bail)?,
                 Op::Rem => emit_rem(&mut ops, ops_ref, bail)?,
@@ -2281,7 +2290,7 @@ pub(crate) mod arm64 {
                 | Op::NotEqual
                     if enable_fres =>
                 {
-                    let cmp = match instr.op {
+                    let cmp = match instr.op(code_block) {
                         Op::LessThan => Cmp::Lt,
                         Op::LessEq => Cmp::Le,
                         Op::GreaterThan => Cmp::Gt,
@@ -2315,9 +2324,9 @@ pub(crate) mod arm64 {
                 }
                 Op::Jump => {
                     let rel = imm32(ops_ref, 0)?;
-                    let target = branch_target(instr, rel);
+                    let target = branch_target(code_block, instr, rel);
                     let tgt = target_label(target)?;
-                    if target <= i64::from(instr.instruction_pc) {
+                    if target <= i64::from(instruction_pc) {
                         emit_backedge_interrupt_check(&mut ops, threw);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>tgt);
@@ -2325,7 +2334,7 @@ pub(crate) mod arm64 {
                 Op::JumpIfFalse | Op::JumpIfTrue => {
                     let rel = imm32(ops_ref, 0)?;
                     let cond = reg(ops_ref, 1)?;
-                    let target = branch_target(instr, rel);
+                    let target = branch_target(code_block, instr, rel);
                     let tgt = target_label(target)?;
                     load_reg(&mut ops, 9, cond)?;
                     // Only boolean conditions are supported in this subset.
@@ -2336,10 +2345,10 @@ pub(crate) mod arm64 {
                         ; b.hi =>bail
                         ; cmp x9, #(VALUE_TRUE as u32)                // eq iff true
                     );
-                    if target <= i64::from(instr.instruction_pc) {
+                    if target <= i64::from(instruction_pc) {
                         let taken = ops.new_dynamic_label();
                         let fallthrough = ops.new_dynamic_label();
-                        if matches!(instr.op, Op::JumpIfFalse) {
+                        if matches!(instr.op(code_block), Op::JumpIfFalse) {
                             dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
                         } else {
                             dynasm!(ops ; .arch aarch64 ; b.eq =>taken);
@@ -2347,7 +2356,7 @@ pub(crate) mod arm64 {
                         dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
                         emit_backedge_interrupt_check(&mut ops, threw);
                         dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
-                    } else if matches!(instr.op, Op::JumpIfFalse) {
+                    } else if matches!(instr.op(code_block), Op::JumpIfFalse) {
                         dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
                     } else {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -2425,7 +2434,7 @@ pub(crate) mod arm64 {
                 // its compiled entry (WhiskerIC method call), falling back to the
                 // in-place full method-call stub when ineligible.
                 Op::CallMethodValue => {
-                    let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
+                    let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
                     // Splice a tiny monomorphic read-only method inline under an
                     // identity + receiver-shape guard; fall back to the method
                     // bridge for absent / ineligible sites.
@@ -2810,7 +2819,7 @@ pub(crate) mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     let obj = reg(ops_ref, 1)?;
                     let name = const_index(ops_ref, 2)?;
-                    let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
+                    let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
 
                     // This site's WhiskerIC cell address (stable for the code's
                     // life). Filled by the stub on a monomorphic own-data hit.
@@ -2960,7 +2969,7 @@ pub(crate) mod arm64 {
                     let obj = reg(ops_ref, 0)?;
                     let name = const_index(ops_ref, 1)?;
                     let src = reg(ops_ref, 2)?;
-                    let site = instr.property_ic_site.unwrap_or(usize::MAX) as u64;
+                    let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
 
                     let cell_addr =
                         store_cell_base + store_ic_idx * std::mem::size_of::<WhiskerIcCell>();
@@ -3225,7 +3234,12 @@ pub(crate) mod arm64 {
                     emit_call_stub(&mut ops, jit_neg_stub as *const () as usize, threw);
                 }
                 Op::LooseEqual | Op::LooseNotEqual => {
-                    emit_loose_cmp(&mut ops, ops_ref, instr.op == Op::LooseNotEqual, bail)?;
+                    emit_loose_cmp(
+                        &mut ops,
+                        ops_ref,
+                        instr.op(code_block) == Op::LooseNotEqual,
+                        bail,
+                    )?;
                 }
                 Op::DefineOwnProperty => {
                     let (target, key, descriptor) = reg3(ops_ref)?;
@@ -3260,7 +3274,7 @@ pub(crate) mod arm64 {
             // values around it in a numeric cluster); anything else is a
             // boundary or writes a slot the cache cannot track, so drop all.
             if enable_fres {
-                match instr.op {
+                match instr.op(code_block) {
                     Op::Sub
                     | Op::Mul
                     | Op::Div
@@ -3497,18 +3511,23 @@ pub(crate) mod arm64 {
         )
     }
 
-    fn inline_plain_op_allowed(instr: &otter_vm::JitInstructionMetadata) -> bool {
-        is_inline_pure_op(instr.op)
-            || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
+    fn inline_plain_op_allowed(
+        code_block: &otter_vm::CodeBlock,
+        instr: &otter_vm::JitInstructionMetadata,
+    ) -> bool {
+        is_inline_pure_op(instr.op(code_block))
+            || (matches!(instr.op(code_block), Op::MakeFunction | Op::MakeClosure)
+                && instr.make_self)
     }
 
     fn self_bindings_are_dead(callee: &JitInlineCallee) -> bool {
         let mut pending = Vec::<u16>::new();
+        let code_block = callee.code_block.as_ref();
 
         for instr in &callee.instructions {
-            let operands = callee.code_block.operand_view(instr);
+            let operands = instr.operand_view(code_block);
             let mut ok = true;
-            match instr.op {
+            match instr.op(code_block) {
                 Op::LoadLocal | Op::StoreLocal => {}
                 Op::ToPrimitive | Op::ToNumeric => {
                     ok &= reg(operands, 1)
@@ -3561,7 +3580,10 @@ pub(crate) mod arm64 {
                     if std::env::var_os("OTTER_JIT_TRACE").is_some() {
                         eprintln!(
                             "[otter-jit] dead-self skip callee {} pc {} op {:?} make_self={} pending={pending:?}",
-                            callee.function_id, instr.byte_pc, instr.op, instr.make_self,
+                            callee.function_id,
+                            instr.byte_pc,
+                            instr.op(code_block),
+                            instr.make_self,
                         );
                     }
                     return false;
@@ -3571,13 +3593,15 @@ pub(crate) mod arm64 {
                 if std::env::var_os("OTTER_JIT_TRACE").is_some() {
                     eprintln!(
                         "[otter-jit] dead-self read callee {} pc {} op {:?} pending={pending:?}",
-                        callee.function_id, instr.byte_pc, instr.op,
+                        callee.function_id,
+                        instr.byte_pc,
+                        instr.op(code_block),
                     );
                 }
                 return false;
             }
 
-            match instr.op {
+            match instr.op(code_block) {
                 Op::LoadInt32
                 | Op::LoadNumber
                 | Op::LoadUndefined
@@ -3653,21 +3677,25 @@ pub(crate) mod arm64 {
     }
 
     fn classify_inline_call(callee: &JitInlineCallee) -> Option<InlineCallKind> {
+        let code_block = callee.code_block.as_ref();
         let has_upvalue_op = callee.instructions.iter().any(|instr| {
             matches!(
-                instr.op,
+                instr.op(code_block),
                 Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked
             )
         });
         if !has_upvalue_op {
-            let ops_ok = callee.instructions.iter().all(inline_plain_op_allowed);
+            let ops_ok = callee
+                .instructions
+                .iter()
+                .all(|instr| inline_plain_op_allowed(code_block, instr));
             let dead_self = self_bindings_are_dead(callee);
             if std::env::var_os("OTTER_JIT_TRACE").is_some() && (!ops_ok || !dead_self) {
                 let bad_op = callee
                     .instructions
                     .iter()
-                    .find(|instr| !inline_plain_op_allowed(instr))
-                    .map(|instr| (instr.byte_pc, instr.op));
+                    .find(|instr| !inline_plain_op_allowed(code_block, instr))
+                    .map(|instr| (instr.byte_pc, instr.op(code_block)));
                 eprintln!(
                     "[otter-jit] inline call classify skip callee {}: ops_ok={ops_ok} dead_self={dead_self} bad_op={bad_op:?}",
                     callee.function_id
@@ -3688,7 +3716,7 @@ pub(crate) mod arm64 {
         let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
         let mut store_seen = false;
         for instr in &callee.instructions {
-            let operands = callee.code_block.operand_view(instr);
+            let operands = instr.operand_view(code_block);
             let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
                 regs.get(regn as usize).copied()
             };
@@ -3698,7 +3726,7 @@ pub(crate) mod arm64 {
                 Some(())
             };
 
-            match instr.op {
+            match instr.op(code_block) {
                 Op::LoadInt32 | Op::LoadNumber => {
                     write(&mut regs, reg(operands, 0).ok()?, InlineKnown::Number)?;
                 }
@@ -3769,7 +3797,7 @@ pub(crate) mod arm64 {
                         return None;
                     }
                     let result = if matches!(
-                        instr.op,
+                        instr.op(code_block),
                         Op::LessThan
                             | Op::LessEq
                             | Op::GreaterThan
@@ -3816,15 +3844,15 @@ pub(crate) mod arm64 {
         clabels: &BTreeMap<u32, DynamicLabel>,
         cage_base: usize,
     ) -> Result<(), Unsupported> {
-        let ops_ref = code_block.operand_view(instr);
+        let ops_ref = instr.operand_view(code_block);
         let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
-            let t = branch_target(instr, rel);
+            let t = branch_target(code_block, instr, rel);
             u32::try_from(t)
                 .ok()
                 .and_then(|pc| clabels.get(&pc).copied())
                 .ok_or(Unsupported::BranchTarget(t))
         };
-        match instr.op {
+        match instr.op(code_block) {
             Op::LoadInt32 => {
                 let dst = reg(ops_ref, 0)?;
                 let v = imm32(ops_ref, 1)?;
@@ -3936,7 +3964,7 @@ pub(crate) mod arm64 {
                 );
                 emit_load_u64(ops, 13, cage_base as u64);
                 dynasm!(ops ; .arch aarch64 ; add x13, x13, x10);
-                if instr.op == Op::StoreUpvalueChecked {
+                if instr.op(code_block) == Op::StoreUpvalueChecked {
                     emit_load_u64(ops, 11, VALUE_HOLE);
                     dynasm!(ops
                         ; .arch aarch64
@@ -3947,7 +3975,9 @@ pub(crate) mod arm64 {
                 }
                 dynasm!(ops ; .arch aarch64 ; str x12, [x13, UPVALUE_VALUE_OFFSET]);
             }
-            Op::Add | Op::Sub | Op::Mul => emit_add_sub_mul(ops, ops_ref, bail, instr.op)?,
+            Op::Add | Op::Sub | Op::Mul => {
+                emit_add_sub_mul(ops, ops_ref, bail, instr.op(code_block))?
+            }
             Op::Div => emit_div(ops, ops_ref, bail)?,
             Op::Rem => emit_rem(ops, ops_ref, bail)?,
             Op::BitwiseOr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Or)?,
@@ -3991,7 +4021,7 @@ pub(crate) mod arm64 {
                     ; b.hi =>bail
                     ; cmp x9, #(VALUE_TRUE as u32)                // eq iff true
                 );
-                if matches!(instr.op, Op::JumpIfFalse) {
+                if matches!(instr.op(code_block), Op::JumpIfFalse) {
                     dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
                 } else {
                     dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -4066,7 +4096,10 @@ pub(crate) mod arm64 {
         // One private label per callee byte-PC for internal branches.
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &callee.instructions {
-            clabels.insert(i.instruction_pc, ops.new_dynamic_label());
+            clabels.insert(
+                i.instruction_pc(&callee.code_block),
+                ops.new_dynamic_label(),
+            );
         }
         let inline_done = ops.new_dynamic_label();
         let inline_bail = ops.new_dynamic_label();
@@ -4131,7 +4164,8 @@ pub(crate) mod arm64 {
         dynasm!(ops ; .arch aarch64 ; add x19, sp, #0);
 
         for i in &callee.instructions {
-            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.instruction_pc]);
+            let instruction_pc = i.instruction_pc(&callee.code_block);
+            dynasm!(ops ; .arch aarch64 ; =>clabels[&instruction_pc]);
             emit_inline_pure_op(
                 ops,
                 &callee.code_block,
@@ -4233,8 +4267,8 @@ pub(crate) mod arm64 {
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
     ) -> Result<(), Unsupported> {
-        let ops_ref = code_block.operand_view(instr);
-        match instr.op {
+        let ops_ref = instr.operand_view(code_block);
+        match instr.op(code_block) {
             Op::LoadThis => {
                 let dst = reg(ops_ref, 0)?;
                 load_reg(ops, 9, this_slot)?;
@@ -4338,6 +4372,7 @@ pub(crate) mod arm64 {
     /// and no bailing op after an in-place `StoreProperty` (a post-store bail
     /// would re-run the whole method and double-apply the mutation).
     fn inline_method_emit_eligible(method: &JitInlineMethod, argc: usize) -> bool {
+        let code_block = method.code_block.as_ref();
         if argc != usize::from(method.param_count)
             || argc > INLINE_MAX_ARGS
             || method.register_count >= INLINE_MAX_REGS
@@ -4345,16 +4380,16 @@ pub(crate) mod arm64 {
             || !method
                 .instructions
                 .iter()
-                .all(|i| is_inline_method_op(i.op))
+                .all(|i| is_inline_method_op(i.op(code_block)))
         {
             return false;
         }
         let mut store_seen = false;
         for i in &method.instructions {
-            if store_seen && !is_nonbailing_after_store(i.op) {
+            if store_seen && !is_nonbailing_after_store(i.op(code_block)) {
                 return false;
             }
-            if i.op == Op::StoreProperty {
+            if i.op(code_block) == Op::StoreProperty {
                 store_seen = true;
             }
         }
@@ -4395,7 +4430,10 @@ pub(crate) mod arm64 {
 
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &method.instructions {
-            clabels.insert(i.instruction_pc, ops.new_dynamic_label());
+            clabels.insert(
+                i.instruction_pc(&method.code_block),
+                ops.new_dynamic_label(),
+            );
         }
         let inline_done = ops.new_dynamic_label();
         let inline_bail = ops.new_dynamic_label();
@@ -4520,7 +4558,8 @@ pub(crate) mod arm64 {
         dynasm!(ops ; .arch aarch64 ; add x19, sp, #0);
 
         for i in &method.instructions {
-            dynasm!(ops ; .arch aarch64 ; =>clabels[&i.instruction_pc]);
+            let instruction_pc = i.instruction_pc(&method.code_block);
+            dynasm!(ops ; .arch aarch64 ; =>clabels[&instruction_pc]);
             emit_inline_method_op(
                 ops,
                 &method.code_block,
@@ -4901,11 +4940,13 @@ pub(crate) mod arm64 {
     /// re-enter even when it addresses the flat register window, so it needs a
     /// published native activation and disqualifies the frameless path.
     fn is_self_call_safe(view: &JitCompileSnapshot) -> bool {
+        let code_block = view.code_block.as_ref();
         view.instructions.iter().all(|instr| {
-            is_inline_pure_op(instr.op)
-                || instr.op == Op::LoadThis
-                || instr.op == Op::Call
-                || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
+            is_inline_pure_op(instr.op(code_block))
+                || instr.op(code_block) == Op::LoadThis
+                || instr.op(code_block) == Op::Call
+                || (matches!(instr.op(code_block), Op::MakeFunction | Op::MakeClosure)
+                    && instr.make_self)
         })
     }
 
@@ -7068,8 +7109,12 @@ pub(crate) mod arm64 {
     }
 
     /// Target canonical instruction PC of a relative branch.
-    fn branch_target(instr: &otter_vm::JitInstructionMetadata, rel: i32) -> i64 {
-        i64::from(instr.instruction_pc) + 1 + i64::from(rel)
+    fn branch_target(
+        code_block: &otter_vm::CodeBlock,
+        instr: &otter_vm::JitInstructionMetadata,
+        rel: i32,
+    ) -> i64 {
+        i64::from(instr.instruction_pc(code_block)) + 1 + i64::from(rel)
     }
 
     trait WordOperands: Copy {

@@ -263,15 +263,14 @@ impl ExecutionContext {
             if matches!(
                 instr.op,
                 otter_bytecode::Op::MakeFunction | otter_bytecode::Op::MakeClosure
-            ) && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
+            ) && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
                 code_block.operand(instr, 1)
                 && self.function_id_constant(idx) == Some(function_id)
             {
                 instr.make_self = true;
             }
             if instr.op == otter_bytecode::Op::LoadProperty
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
-                    code_block.operand(instr, 2)
+                && let Some(otter_bytecode::Operand::ConstIndex(idx)) = code_block.operand(instr, 2)
                 && self
                     .string_constant_str_for_function(function_id, idx)
                     .is_some_and(|name| name == "length")
@@ -279,8 +278,7 @@ impl ExecutionContext {
                 instr.load_array_length = true;
             }
             if instr.op == otter_bytecode::Op::CallMethodValue
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
-                    code_block.operand(instr, 2)
+                && let Some(otter_bytecode::Operand::ConstIndex(idx)) = code_block.operand(instr, 2)
                 && let Some(name) = self.string_constant_str_for_function(function_id, idx)
             {
                 instr.method_hint = match name {
@@ -290,8 +288,7 @@ impl ExecutionContext {
                 };
             }
             if instr.op == otter_bytecode::Op::LoadNumber
-                && let Some(&otter_bytecode::Operand::ConstIndex(idx)) =
-                    code_block.operand(instr, 1)
+                && let Some(otter_bytecode::Operand::ConstIndex(idx)) = code_block.operand(instr, 1)
                 && let Some(bits) = self.number_constant_bits(idx)
             {
                 instr.load_number = Some(f64::from_bits(bits));
@@ -300,12 +297,13 @@ impl ExecutionContext {
         Some(view)
     }
 
-    /// Return operands without a table lookup for fixed-width instructions.
+    /// Decode operands for the few legacy semantic helpers that still consume
+    /// slices. Hot fixed-operand dispatch uses the typed accessors below.
     #[must_use]
-    pub(crate) fn exec_operands<'a>(&'a self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
-        if let Some(operands) = instr.inline_operands() {
-            return operands;
-        }
+    pub(crate) fn exec_operands(
+        &self,
+        instr: &CodeBlockInstruction,
+    ) -> smallvec::SmallVec<[Operand; 4]> {
         self.exec_function(instr.code_block_id())
             .expect("verified instruction must retain its owning CodeBlock")
             .operands(instr)
@@ -313,19 +311,20 @@ impl ExecutionContext {
 
     /// Return one schema-typed operand.
     #[must_use]
-    pub(crate) fn exec_operand<'a>(
-        &'a self,
-        instr: &'a CodeBlockInstruction,
+    pub(crate) fn exec_operand(
+        &self,
+        instr: &CodeBlockInstruction,
         index: usize,
-    ) -> Option<&'a Operand> {
-        self.exec_operands(instr).get(index)
+    ) -> Option<Operand> {
+        self.exec_function(instr.code_block_id())?
+            .operand(instr, index)
     }
 
     /// Decode one register operand.
     #[must_use]
     pub(crate) fn exec_register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
         match self.exec_operand(instr, index) {
-            Some(Operand::Register(value)) => Some(*value),
+            Some(Operand::Register(value)) => Some(value),
             _ => None,
         }
     }
@@ -348,7 +347,7 @@ impl ExecutionContext {
         index: usize,
     ) -> Option<u32> {
         match self.exec_operand(instr, index) {
-            Some(Operand::ConstIndex(value)) => Some(*value),
+            Some(Operand::ConstIndex(value)) => Some(value),
             _ => None,
         }
     }
@@ -357,7 +356,7 @@ impl ExecutionContext {
     #[must_use]
     pub(crate) fn exec_imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
         match self.exec_operand(instr, index) {
-            Some(Operand::Imm32(value)) => Some(*value),
+            Some(Operand::Imm32(value)) => Some(value),
             _ => None,
         }
     }

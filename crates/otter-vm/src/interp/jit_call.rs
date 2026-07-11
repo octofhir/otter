@@ -311,7 +311,7 @@ impl Interpreter {
             let Some(otter_bytecode::Operand::Imm32(rel)) = code_block.operand(instr, 0) else {
                 continue;
             };
-            let target = i64::from(instr.byte_pc) + 1 + i64::from(*rel);
+            let target = i64::from(instr.byte_pc) + 1 + i64::from(rel);
             if target == i64::from(osr_pc) && instr.byte_pc >= osr_pc {
                 loop_end = Some(loop_end.map_or(instr.byte_pc, |end: u32| end.max(instr.byte_pc)));
             }

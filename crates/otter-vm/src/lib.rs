@@ -807,6 +807,13 @@ pub struct Interpreter {
     /// frame; every linked [`ExecutionContext`] resolves foreign ids
     /// through this shared registry.
     code_space: std::sync::Arc<code_space::CodeSpace>,
+    /// The most recent top-level [`ExecutionContext`] this interpreter ran.
+    /// Every chunk links into the shared [`code_space`], so this context
+    /// resolves function ids for any closure reachable in the realm — it is the
+    /// universal fallback the microtask drain uses when a queued job carries no
+    /// origin context (async-resume continuations, host-settled reactions),
+    /// guaranteeing a drain never strands a deep chain for want of a context.
+    realm_context: Option<ExecutionContext>,
     /// Interpreter-owned hidden-class side tables for GC-managed shapes.
     /// Runtime object storage uses the root, interned shape keys, and
     /// transition/cache tables here.

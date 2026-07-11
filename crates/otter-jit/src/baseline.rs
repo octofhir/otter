@@ -38,8 +38,7 @@ use otter_bytecode::{Op, Operand};
 pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
     ExecutionContext, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFrameStack,
-    JitFunctionCode, JitReentryPtrs, JitRuntimeMethodStubSource, RuntimeStubAllocContext,
-    SafepointRecord, Value, VmError,
+    JitFunctionCode, JitReentryPtrs, RuntimeStubAllocContext, SafepointRecord, Value, VmError,
     runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
 };
 
@@ -1085,75 +1084,6 @@ extern "C" fn otter_jit_math_random() -> u64 {
     Value::number(otter_vm::math::random_number()).to_bits()
 }
 
-/// Bridge stub: perform a `CallMethodValue` (`recv.name(args…)`) from compiled
-/// code, delegating to the safe [`Interpreter::jit_runtime_call_method`].
-/// Returns `0` on success, `1` when the call threw (error parked in `ctx`).
-/// At most [`MAX_INLINE_ARGS`] argument registers are passed (a0..a2 here,
-/// since `recv` and the packed name/site consume two of the eight ABI
-/// registers). `name_and_site` packs the call-site IC id in the high 32 bits
-/// and the method-name constant index in the low 32 bits, keeping the call
-/// within the 8 argument registers.
-#[allow(clippy::too_many_arguments)]
-pub(crate) extern "C" fn jit_call_method_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    recv: u64,
-    name_and_site: u64,
-    argc: u64,
-    packed_args: u64,
-) -> u64 {
-    jit_call_method_stub_impl(
-        ctx,
-        dst,
-        recv,
-        name_and_site,
-        argc,
-        packed_args,
-        JitRuntimeMethodStubSource::Baseline,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn jit_call_method_stub_impl(
-    ctx: *mut JitCtx,
-    dst: u64,
-    recv: u64,
-    name_and_site: u64,
-    argc: u64,
-    packed_args: u64,
-    source: JitRuntimeMethodStubSource,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    let name_idx = (name_and_site & 0xffff_ffff) as u32;
-    let raw_site = (name_and_site >> 32) as u32;
-    let site = (raw_site != otter_vm::JIT_METHOD_CALL_NO_SITE).then_some(raw_site as usize);
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
-    let status = match vm.jit_runtime_call_method(
-        context,
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        recv as u16,
-        name_idx,
-        site,
-        &all[..argc],
-        source,
-    ) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    };
-    refresh_jit_collection_method_ics(ctx, vm);
-    status
-}
-
 /// Narrow collection-IC method bridge.
 ///
 /// Return status: `0` = IC hit and `dst` written, `1` = throw parked in ctx,
@@ -1508,7 +1438,7 @@ pub(crate) mod arm64 {
         Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
         VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell, alloc_value_stub_trampoline_pair,
         jit_abort_direct_call_stub, jit_add_stub, jit_backedge_poll_stub,
-        jit_call_collection_method_ic_stub, jit_call_method_stub, jit_define_data_property_stub,
+        jit_call_collection_method_ic_stub, jit_define_data_property_stub,
         jit_define_own_property_stub, jit_direct_method_call_bail_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
         jit_fresh_upvalue_stub, jit_inline_closure_upvalues_stub, jit_load_builtin_error_stub,
@@ -2650,6 +2580,7 @@ pub(crate) mod arm64 {
                             view.collection_alloc_methods.get(&instr.byte_pc),
                             Some(view),
                             live_method_alloc_safepoints.get(&instr.byte_pc).copied(),
+                            bail,
                             threw,
                         )?;
                         if spliced_array {
@@ -4738,7 +4669,17 @@ pub(crate) mod arm64 {
         // Ineligible at run time (method changed / shape mismatch): the full
         // in-place method call, which restores nothing (sp untouched here).
         dynasm!(ops ; .arch aarch64 ; =>fallback);
-        emit_method_call(ops, call_operands, site, None, None, None, None, threw)?;
+        emit_method_call(
+            ops,
+            call_operands,
+            site,
+            None,
+            None,
+            None,
+            None,
+            bail,
+            threw,
+        )?;
         dynasm!(ops ; .arch aarch64 ; =>after);
         Ok(true)
     }
@@ -4809,7 +4750,17 @@ pub(crate) mod arm64 {
         }
         // No guard matched: the full in-place method call (sp untouched here).
         dynasm!(ops ; .arch aarch64 ; =>fallback);
-        emit_method_call(ops, call_operands, site, None, None, None, None, threw)?;
+        emit_method_call(
+            ops,
+            call_operands,
+            site,
+            None,
+            None,
+            None,
+            None,
+            bail,
+            threw,
+        )?;
         dynasm!(ops ; .arch aarch64 ; =>after);
         Ok(true)
     }
@@ -6398,6 +6349,7 @@ pub(crate) mod arm64 {
         alloc: Option<&JitCollectionAllocMethod>,
         view: Option<&JitCompileSnapshot>,
         live_alloc_safepoint: Option<SafepointId>,
+        bail: DynamicLabel,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let dst = reg(operands, 0)?;
@@ -6538,22 +6490,9 @@ pub(crate) mod arm64 {
         // Direct prepared (status 0): same dispatch tail as Op::Call.
         emit_direct_call_tail(ops, dst, threw, done);
 
-        // Ineligible (status 2): in-place full method call, returns to compiled
-        // code (the receiver method may be native / polymorphic / accessor).
-        dynasm!(ops
-            ; .arch aarch64
-            ; =>fallback
-            ; mov x0, x20
-            ; movz x1, dst as u32
-            ; movz x2, recv as u32
-        );
-        // Pack the call-site IC id (high 32) with the name constant index (low
-        // 32) so the bridge stays within its 8 argument registers.
-        emit_load_u64(ops, 3, (site << 32) | u64::from(name));
-        dynasm!(ops ; .arch aarch64 ; movz x4, argc as u32);
-        emit_load_u64(ops, 5, packed_args);
-        emit_call_stub(ops, jit_call_method_stub as *const () as usize, threw);
-        dynasm!(ops ; .arch aarch64 ; =>done);
+        // Ineligible resolution bails to normal dispatch. Native code never
+        // re-enters one interpreter opcode through a bespoke method bridge.
+        dynasm!(ops ; .arch aarch64 ; =>fallback ; b =>bail ; =>done);
         Ok(())
     }
 

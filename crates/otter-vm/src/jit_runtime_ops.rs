@@ -175,7 +175,6 @@ impl Interpreter {
         dst: u16,
         method_id: u32,
         argument_regs: &[u16],
-        byte_len: u32,
     ) -> Result<(), VmError> {
         let saved_pc = stack[frame_index].pc;
         let result = self.do_math_call_regs(
@@ -185,7 +184,7 @@ impl Interpreter {
             dst,
             method_id,
             argument_regs,
-            byte_len,
+            None,
         );
         stack[frame_index].pc = saved_pc;
         result

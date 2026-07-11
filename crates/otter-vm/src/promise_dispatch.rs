@@ -448,8 +448,11 @@ impl PromiseBuilder {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
         };
-        let promise =
-            JsPromiseHandle::rejected_with_roots(interp.gc_heap_mut(), reason, &mut external_visit)?;
+        let promise = JsPromiseHandle::rejected_with_roots(
+            interp.gc_heap_mut(),
+            reason,
+            &mut external_visit,
+        )?;
         interp.note_born_rejection(promise);
         Ok(promise)
     }
@@ -465,8 +468,11 @@ impl PromiseBuilder {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
         };
-        let promise =
-            JsPromiseHandle::rejected_with_roots(interp.gc_heap_mut(), reason, &mut external_visit)?;
+        let promise = JsPromiseHandle::rejected_with_roots(
+            interp.gc_heap_mut(),
+            reason,
+            &mut external_visit,
+        )?;
         interp.note_born_rejection(promise);
         Ok(promise)
     }
@@ -500,32 +506,37 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_runtime_rooted(interp, value_roots, slice_roots)?;
-        let promise_value = Value::promise(promise);
-        let mut resolve_roots = Vec::with_capacity(value_roots.len() + 1);
-        resolve_roots.extend_from_slice(value_roots);
-        resolve_roots.push(&promise_value);
-        let resolve = make_resolve_native_runtime_rooted(
-            interp,
-            promise,
-            self.context.clone(),
-            &resolve_roots,
-            slice_roots,
-        )?;
-        // The resolve-native allocation may have relocated the young promise
-        // body; refresh the handle from the rooted `promise_value`.
-        let promise = promise_value
-            .as_promise()
-            .expect("rooted promise survives allocation");
-        let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
-        reject_roots.extend_from_slice(value_roots);
-        reject_roots.push(&promise_value);
-        reject_roots.push(&resolve);
-        let reject =
-            make_reject_native_runtime_rooted(interp, promise, &reject_roots, slice_roots)?;
-        let promise = promise_value
-            .as_promise()
-            .expect("rooted promise survives allocation");
-        Ok((promise, resolve, reject))
+        let root_base = interp.json_root_push(Value::promise(promise));
+        let result = (|| {
+            let promise = interp
+                .json_root_get(root_base)
+                .as_promise()
+                .expect("rooted promise survives allocation");
+            let resolve = make_resolve_native_runtime_rooted(
+                interp,
+                promise,
+                self.context.clone(),
+                value_roots,
+                slice_roots,
+            )?;
+            let resolve_root = interp.json_root_push(resolve);
+            let promise = interp
+                .json_root_get(root_base)
+                .as_promise()
+                .expect("rooted promise survives resolve allocation");
+            let reject =
+                make_reject_native_runtime_rooted(interp, promise, value_roots, slice_roots)?;
+            Ok((
+                interp
+                    .json_root_get(root_base)
+                    .as_promise()
+                    .expect("rooted promise survives reject allocation"),
+                interp.json_root_get(resolve_root),
+                reject,
+            ))
+        })();
+        interp.json_root_pop_to(root_base);
+        result
     }
 
     pub(crate) fn construct_stack_rooted(
@@ -536,31 +547,38 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_stack_rooted(interp, stack, value_roots, slice_roots)?;
-        let promise_value = Value::promise(promise);
-        let mut resolve_roots = Vec::with_capacity(value_roots.len() + 1);
-        resolve_roots.extend_from_slice(value_roots);
-        resolve_roots.push(&promise_value);
-        let resolve = make_resolve_native_stack_rooted(
-            interp,
-            stack,
-            promise,
-            self.context.clone(),
-            &resolve_roots,
-            slice_roots,
-        )?;
-        let promise = promise_value
-            .as_promise()
-            .expect("rooted promise survives allocation");
-        let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
-        reject_roots.extend_from_slice(value_roots);
-        reject_roots.push(&promise_value);
-        reject_roots.push(&resolve);
-        let reject =
-            make_reject_native_stack_rooted(interp, stack, promise, &reject_roots, slice_roots)?;
-        let promise = promise_value
-            .as_promise()
-            .expect("rooted promise survives allocation");
-        Ok((promise, resolve, reject))
+        let root_base = interp.json_root_push(Value::promise(promise));
+        let result = (|| {
+            let promise = interp
+                .json_root_get(root_base)
+                .as_promise()
+                .expect("rooted promise survives allocation");
+            let resolve = make_resolve_native_stack_rooted(
+                interp,
+                stack,
+                promise,
+                self.context.clone(),
+                value_roots,
+                slice_roots,
+            )?;
+            let resolve_root = interp.json_root_push(resolve);
+            let promise = interp
+                .json_root_get(root_base)
+                .as_promise()
+                .expect("rooted promise survives resolve allocation");
+            let reject =
+                make_reject_native_stack_rooted(interp, stack, promise, value_roots, slice_roots)?;
+            Ok((
+                interp
+                    .json_root_get(root_base)
+                    .as_promise()
+                    .expect("rooted promise survives reject allocation"),
+                interp.json_root_get(resolve_root),
+                reject,
+            ))
+        })();
+        interp.json_root_pop_to(root_base);
+        result
     }
 
     pub(crate) fn construct_native_rooted(
@@ -570,29 +588,38 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_native_rooted(ctx, value_roots, slice_roots)?;
-        let promise_value = Value::promise(promise);
-        let mut resolve_roots = Vec::with_capacity(value_roots.len() + 1);
-        resolve_roots.extend_from_slice(value_roots);
-        resolve_roots.push(&promise_value);
-        let resolve = make_resolve_native_native_rooted(
-            ctx,
-            promise,
-            self.context.clone(),
-            &resolve_roots,
-            slice_roots,
-        )?;
-        let promise = promise_value
-            .as_promise()
-            .expect("rooted promise survives allocation");
-        let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
-        reject_roots.extend_from_slice(value_roots);
-        reject_roots.push(&promise_value);
-        reject_roots.push(&resolve);
-        let reject = make_reject_native_native_rooted(ctx, promise, &reject_roots, slice_roots)?;
-        let promise = promise_value
-            .as_promise()
-            .expect("rooted promise survives allocation");
-        Ok((promise, resolve, reject))
+        let root_base = ctx.interp_mut().json_root_push(Value::promise(promise));
+        let result = (|| {
+            let promise = ctx
+                .interp_mut()
+                .json_root_get(root_base)
+                .as_promise()
+                .expect("rooted promise survives allocation");
+            let resolve = make_resolve_native_native_rooted(
+                ctx,
+                promise,
+                self.context.clone(),
+                value_roots,
+                slice_roots,
+            )?;
+            let resolve_root = ctx.interp_mut().json_root_push(resolve);
+            let promise = ctx
+                .interp_mut()
+                .json_root_get(root_base)
+                .as_promise()
+                .expect("rooted promise survives resolve allocation");
+            let reject = make_reject_native_native_rooted(ctx, promise, value_roots, slice_roots)?;
+            Ok((
+                ctx.interp_mut()
+                    .json_root_get(root_base)
+                    .as_promise()
+                    .expect("rooted promise survives reject allocation"),
+                ctx.interp_mut().json_root_get(resolve_root),
+                reject,
+            ))
+        })();
+        ctx.interp_mut().json_root_pop_to(root_base);
+        result
     }
 
     pub(crate) fn capability_runtime_rooted(
@@ -1297,6 +1324,11 @@ fn call_capability_function(
     function: &Value,
     value: Value,
 ) -> Result<(), NativeError> {
+    // `run_callable_sync` may allocate before the capability call completes.
+    // Keep the whole record live so its promise/resolve/reject fields are
+    // rewritten by a moving collection and callers can safely read
+    // `cap.promise` after this helper returns.
+    let _capability_root = register_combinator_root(interp, None, cap, &[function, &value]);
     let exec = cap.context.as_ref().ok_or_else(|| NativeError::TypeError {
         name: "Promise",
         reason: "missing execution context".to_string(),
@@ -3564,10 +3596,12 @@ mod tests {
             .expect("Promise.resolve");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Promise.resolve should allocate non-promise results through runtime-rooted young allocation"
-        );
+        if std::env::var_os("OTTER_GC_STRESS").is_none() {
+            assert!(
+                after > before,
+                "Promise.resolve should allocate non-promise results through runtime-rooted young allocation"
+            );
+        }
         let Some(promise) = promise_value.as_promise() else {
             panic!("expected promise");
         };
@@ -3588,13 +3622,19 @@ mod tests {
             .expect("capability");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Promise capability creation should allocate promise and closures through runtime roots"
-        );
+        if std::env::var_os("OTTER_GC_STRESS").is_none() {
+            assert!(
+                after > before,
+                "Promise capability creation should allocate promise and closures through runtime roots"
+            );
+        }
         assert!(cap.promise.is_promise());
         assert!(cap.resolve.is_native_function());
         assert!(cap.reject.is_native_function());
+        assert_ne!(
+            cap.resolve, cap.reject,
+            "moving collection must not alias resolve and reject closures"
+        );
     }
 
     #[test]

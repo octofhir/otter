@@ -216,7 +216,6 @@ impl Interpreter {
             jit_direct_method_cache: Vec::new(),
             jit_direct_method_inline_slots: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
-            reg_pool: Vec::new(),
             holt_pool: Vec::new(),
             register_stack: register_stack::RegisterStack::new(),
             jit_native_activations: vec![

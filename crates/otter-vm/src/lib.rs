@@ -1065,13 +1065,6 @@ pub struct Interpreter {
     jit_direct_method_inline_slots: Vec<JitDirectMethodInline>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
-    /// Free-list of spilled register-window backing buffers. Every bytecode
-    /// call frame whose `register_count` exceeds the inline `SmallVec` capacity
-    /// would otherwise `malloc`/`free` a fresh `Vec<Value>` per call — the hot
-    /// recursion / call-loop tax. Reclaimed buffers (cleared, so they hold no
-    /// traced `Value`s and never need GC visiting) are reused on the next frame
-    /// build. General to interpreter and JIT call paths alike.
-    reg_pool: Vec<Vec<Value>>,
     /// Pool of reservation-stable [`HoltStack`]s reused for synchronous callable
     /// re-entry (Array / collection callbacks, comparators, sync `@@iterator`
     /// drives). Every re-entry needs a stack whose frames never move, so a

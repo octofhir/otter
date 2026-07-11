@@ -2,8 +2,7 @@
 //! boundaries.
 
 fn main() {
-    let function = otter_bytecode::Function::default();
-    let frame = otter_vm::Frame::for_function(&function);
+    let frame: Option<otter_vm::Frame> = None;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         std::hint::black_box(frame);

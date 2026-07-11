@@ -449,6 +449,66 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
+error[E0277]: `*mut otter_vm::Value` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut otter_vm::Value` cannot be sent between threads safely
+  |
+  = help: within `Frame`, the trait `Send` is not implemented for `*mut otter_vm::Value`
+note: required because it appears within the type `RegisterWindow`
+ --> src/register_stack.rs
+  |
+  | pub struct RegisterWindow {
+  |            ^^^^^^^^^^^^^^
+note: required because it appears within the type `Frame`
+ --> src/frame_state.rs
+  |
+  | pub struct Frame {
+  |            ^^^^^
+  = note: required for `smallvec::SmallVec<[Frame; 8]>` to implement `Send`
+note: required because it appears within the type `HoltStack`
+ --> src/holt_stack.rs
+  |
+  | pub struct HoltStack {
+  |            ^^^^^^^^^
+note: required because it appears within the type `PhantomData<HoltStack>`
+ --> $RUST/core/src/marker.rs
+  |
+  | pub struct PhantomData<T: PointeeSized>;
+  |            ^^^^^^^^^^^
+note: required because it appears within the type `alloc::raw_vec::RawVec<HoltStack>`
+ --> $RUST/alloc/src/raw_vec/mod.rs
+  |
+  | pub(crate) struct RawVec<T, A: Allocator = Global> {
+  |                   ^^^^^^
+note: required because it appears within the type `Vec<HoltStack>`
+ --> $RUST/alloc/src/vec/mod.rs
+  |
+  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
+  |            ^^^
+note: required because it appears within the type `otter_vm::Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeCx<'rt> {
+  |                   ^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*const SymbolBody` cannot be sent between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
@@ -545,71 +605,6 @@ note: required because it appears within the type `otter_vm::object::shape_runti
   |
   | pub(crate) struct ShapeRuntime {
   |                   ^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Interpreter`
- --> src/lib.rs
-  |
-  | pub struct Interpreter {
-  |            ^^^^^^^^^^^
-  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
-note: required because it appears within the type `runtime_cx::RuntimeCx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub(crate) struct RuntimeCx<'rt> {
-  |                   ^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `*mut otter_vm::Value` cannot be sent between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut otter_vm::Value` cannot be sent between threads safely
-  |
-  = help: within `Frame`, the trait `Send` is not implemented for `*mut otter_vm::Value`
-note: required because it appears within the type `RegisterWindow`
- --> src/register_stack.rs
-  |
-  | pub struct RegisterWindow {
-  |            ^^^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::frame_state::FrameRegisters`
- --> src/frame_state.rs
-  |
-  | pub enum FrameRegisters {
-  |          ^^^^^^^^^^^^^^
-note: required because it appears within the type `Frame`
- --> src/frame_state.rs
-  |
-  | pub struct Frame {
-  |            ^^^^^
-  = note: required for `smallvec::SmallVec<[Frame; 8]>` to implement `Send`
-note: required because it appears within the type `HoltStack`
- --> src/holt_stack.rs
-  |
-  | pub struct HoltStack {
-  |            ^^^^^^^^^
-note: required because it appears within the type `PhantomData<HoltStack>`
- --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
-note: required because it appears within the type `alloc::raw_vec::RawVec<HoltStack>`
- --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
-note: required because it appears within the type `Vec<HoltStack>`
- --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
 note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |

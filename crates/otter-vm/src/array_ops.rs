@@ -563,7 +563,11 @@ mod tests {
         let mut interp = Interpreter::new();
         let module = empty_module();
         let mut stack: HoltStack = HoltStack::new();
-        stack.push(Frame::for_function(&module.functions[0]));
+        stack.push(
+            interp
+                .test_frame_for_function(&module.functions[0])
+                .unwrap(),
+        );
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = interp
@@ -586,7 +590,11 @@ mod tests {
         let mut interp = Interpreter::new();
         let module = empty_module();
         let mut stack: HoltStack = HoltStack::new();
-        stack.push(Frame::for_function(&module.functions[0]));
+        stack.push(
+            interp
+                .test_frame_for_function(&module.functions[0])
+                .unwrap(),
+        );
         let before_alloc = interp.gc_heap().stats().new_allocated_bytes;
         let before_reserved = interp.gc_heap().stats().reserved_bytes;
 
@@ -617,7 +625,11 @@ mod tests {
         let mut interp = Interpreter::new();
         let module = empty_module();
         let mut stack: HoltStack = HoltStack::new();
-        stack.push(Frame::for_function(&module.functions[0]));
+        stack.push(
+            interp
+                .test_frame_for_function(&module.functions[0])
+                .unwrap(),
+        );
         let before_reserved = interp.gc_heap().stats().reserved_bytes;
 
         let result = interp

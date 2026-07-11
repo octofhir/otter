@@ -440,7 +440,7 @@ fn microtask_payload_root_survives_force_gc() {
 #[test]
 fn parked_frame_keeps_alive() {
     use crate::generator::PARKED_FRAME_BODY_TYPE_TAG;
-    use crate::{Frame, PromiseCapability, Value};
+    use crate::{PromiseCapability, Value};
     use otter_bytecode::Function;
 
     let mut interp = Interpreter::new();
@@ -455,10 +455,13 @@ fn parked_frame_keeps_alive() {
         scratch: 1,
         ..Function::default()
     };
-    let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
+    let mut frame = interp
+        .test_frame_for_function_with_heap(&function)
+        .expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::object(object);
 
+    let frame = interp.park_active_frame(frame);
     let parked = crate::generator::alloc_parked_frame(interp.gc_heap_mut(), frame, None)
         .expect("parked frame");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");

@@ -8,7 +8,7 @@ use crate::test_support::{
     promise_fulfill_reaction_count, promise_fulfill_reaction_debug,
     promise_has_object_fulfill_capability,
 };
-use crate::{Frame, ITERATOR_STATE_TYPE_TAG, Interpreter, IteratorState, Value};
+use crate::{ITERATOR_STATE_TYPE_TAG, Interpreter, IteratorState, Value};
 use otter_bytecode::Function;
 
 fn empty_function() -> Function {
@@ -168,9 +168,12 @@ fn iterator_state_holding_array_object_survives_force_gc() {
 fn generator_and_parked_frame_roots_register_values() {
     let mut interp = Interpreter::new();
     let function = empty_function();
-    let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
+    let mut frame = interp
+        .test_frame_for_function_with_heap(&function)
+        .expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::object(object);
+    let frame = interp.park_active_frame(frame);
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
     let mut global = *interp.global_this();
@@ -191,14 +194,16 @@ fn generator_and_parked_frame_roots_register_values() {
     };
     generator.with_body(interp.gc_heap(), |body| {
         let frame = body.frame.as_ref().expect("saved frame");
-        assert!(frame.registers[0].is_object());
+        assert!(frame.debug_register(0).is_some_and(Value::is_object));
     });
 
-    let mut parked_frame =
-        Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("parked frame");
+    let mut parked_frame = interp
+        .test_frame_for_function_with_heap(&function)
+        .expect("parked frame");
     let parked_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     parked_frame.registers[0] = Value::object(parked_object);
+    let parked_frame = interp.park_active_frame(parked_frame);
     let parked = crate::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame, None)
         .expect("park");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
@@ -259,7 +264,10 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     });
 
     let function = empty_function();
-    let frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
+    let frame = interp
+        .test_frame_for_function_with_heap(&function)
+        .expect("frame");
+    let frame = interp.park_active_frame(frame);
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
     generator.install_owner_on_frame(interp.gc_heap_mut());

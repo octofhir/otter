@@ -45,8 +45,8 @@ use std::collections::VecDeque;
 
 use smallvec::SmallVec;
 
+use crate::Value;
 use crate::execution_context::ExecutionContext;
-use crate::{Frame, Value};
 use otter_gc::raw::RawGc;
 
 /// Hard cap on tasks drained per single drain call. Past this we
@@ -123,9 +123,9 @@ pub enum MicrotaskKind {
     /// a fresh stack containing only this frame and continues
     /// execution from the next pc.
     AsyncResume {
-        /// Frame the drain re-pushes. Boxed so the `Microtask`
-        /// stays small in the common-case `Call` enqueue path.
-        frame: Box<Frame>,
+        /// Owned parked state consumed to create the active frame. Boxed so the
+        /// `Microtask` stays small in the common-case `Call` enqueue path.
+        frame: Box<crate::frame_state::ParkedFrameState>,
         /// Detached cold record extracted from the interpreter pool
         /// at suspend time. The drain re-attaches it before pushing
         /// the frame back onto the stack. `None` when the parked
@@ -144,8 +144,8 @@ pub enum MicrotaskKind {
     /// but also carries the owning generator handle so the drain
     /// can settle queued requests on completion.
     AsyncGenResume {
-        /// Frame the drain re-pushes.
-        frame: Box<Frame>,
+        /// Owned parked state consumed to create the active frame.
+        frame: Box<crate::frame_state::ParkedFrameState>,
         /// Detached cold record, see [`Self::AsyncResume::cold`].
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
         /// Register inside `frame` that receives the awaited
@@ -318,7 +318,7 @@ impl Microtask {
         match &self.kind {
             MicrotaskKind::Call | MicrotaskKind::FinalizationCallback => {}
             MicrotaskKind::AsyncResume { frame, cold, .. } => {
-                frame.trace_frame_slots(visitor);
+                frame.trace_slots(visitor);
                 if let Some(c) = cold {
                     c.trace_cold_slots(visitor);
                 }
@@ -326,7 +326,7 @@ impl Microtask {
             MicrotaskKind::AsyncGenResume {
                 frame, cold, owner, ..
             } => {
-                frame.trace_frame_slots(visitor);
+                frame.trace_slots(visitor);
                 if let Some(c) = cold {
                     c.trace_cold_slots(visitor);
                 }

@@ -5,14 +5,16 @@
 //! protocol ladders such as ToPrimitive, bind metadata, and iterator stepping.
 //!
 //! # Contents
-//! - Frame register windows and return metadata.
+//! - Active register windows and owned parked-frame snapshots.
 //! - Pending state records for stack-modifying protocol drivers.
 //! - Frame GC slot tracing.
 //!
 //! # Invariants
 //! - Frame construction sizes registers from verified CodeBlock metadata.
 //! - Frame and pending-record PCs are dense CodeBlock instruction indexes.
-//! - GC-bearing frame fields are visited by trace_frame_slots.
+//! - Every active frame owns one attached [`RegisterWindow`].
+//! - Parked states own copied register snapshots and no arena pointers.
+//! - GC-bearing frame and parked-state fields are visited by their tracers.
 //!
 //! # Frame ABI (frozen)
 //!
@@ -23,10 +25,8 @@
 //!
 //! - **Register window.** A frame's registers are a contiguous run of [`Value`]
 //!   slots. Register `r` lives at `window_base + r * size_of::<Value>()`; the
-//!   stride is 8 bytes ([`REGISTER_SLOT_BYTES`]). For a [`FrameRegisters::Window`]
-//!   the base and arena offset come from its [`RegisterWindow`]; an
-//!   [`FrameRegisters::Owned`] window has the same per-register layout
-//!   in its own buffer.
+//!   stride is 8 bytes ([`REGISTER_SLOT_BYTES`]). The base and arena offset
+//!   always come from the frame's attached [`RegisterWindow`].
 //! - **Calling convention.** Argument `i` (declaration order) is delivered in
 //!   window register `i` for `i < arity`; the caller writes the arguments into
 //!   the callee window starting at register 0 before transferring control. The
@@ -73,116 +73,26 @@ const _: () = assert!(
     "hot Frame must stay within ~2 cache lines; cold-state fields belong in ColdFrame",
 );
 
-/// A frame's register window: inline-owned (interpreter and parked frames) or a
-/// slice into the interpreter's flat register stack (the JIT direct-call path,
-/// which builds callee windows in machine code without a Rust bridge). Derefs to
-/// `[Value]` so register access is uniform.
+/// Owned register values of a suspended frame. This type deliberately cannot
+/// expose a [`RegisterWindow`]: parked state is independent of the active arena.
 #[derive(Debug)]
-pub enum FrameRegisters {
-    /// Inline-owned window — every interpreter-created frame, and any frame that
-    /// may be parked (generators / async), since a parked window must survive
-    /// while other frames push/pop the flat stack.
-    Owned(SmallVec<[Value; 8]>),
-    /// A `[ptr, ptr+len)` window into the interpreter's reserved (never
-    /// reallocating) flat register stack, built by the JIT direct-call path. A
-    /// `Window` frame is never parked (the direct-call eligibility check rejects
-    /// generators / async), so its window is only ever popped when the frame ends.
-    Window(RegisterWindow),
-}
+pub struct OwnedRegisterSnapshot(SmallVec<[Value; 8]>);
 
-impl FrameRegisters {
-    /// Slot index of a `Window` in the flat register stack, or `None` for an
-    /// inline-owned buffer.
-    #[inline]
+impl OwnedRegisterSnapshot {
     #[must_use]
-    pub(crate) fn window_base(&self) -> Option<u32> {
-        match self {
-            FrameRegisters::Owned(_) => None,
-            FrameRegisters::Window(window) => window.stack_base(),
+    pub(crate) fn copy_from(window: RegisterWindow) -> Self {
+        Self(SmallVec::from_slice(&window))
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn trace_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        for value in &self.0 {
+            value.trace_value_slots(visitor);
         }
-    }
-}
-
-impl FrameRegisters {
-    #[inline]
-    #[must_use]
-    pub fn as_slice(&self) -> &[Value] {
-        match self {
-            FrameRegisters::Owned(v) => v,
-            // SAFETY: a `Window` points at `len` live slots in the reserved flat
-            // register stack, valid for the frame's life (the stack never
-            // reallocates; the window is popped only when the frame ends).
-            FrameRegisters::Window(window) => unsafe {
-                std::slice::from_raw_parts(window.as_mut_ptr(), window.len())
-            },
-        }
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn as_mut_slice(&mut self) -> &mut [Value] {
-        match self {
-            FrameRegisters::Owned(v) => v,
-            // SAFETY: see `as_slice`; `&mut self` gives exclusive access.
-            FrameRegisters::Window(window) => unsafe {
-                std::slice::from_raw_parts_mut(window.as_mut_ptr(), window.len())
-            },
-        }
-    }
-
-    /// Raw pointer to the first slot (the JIT frame register base).
-    #[inline]
-    #[must_use]
-    pub fn as_mut_ptr(&mut self) -> *mut Value {
-        match self {
-            FrameRegisters::Owned(v) => v.as_mut_ptr(),
-            FrameRegisters::Window(window) => window.as_mut_ptr(),
-        }
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        match self {
-            FrameRegisters::Owned(v) => v.len(),
-            FrameRegisters::Window(window) => window.len(),
-        }
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl std::ops::Deref for FrameRegisters {
-    type Target = [Value];
-    #[inline]
-    fn deref(&self) -> &[Value] {
-        self.as_slice()
-    }
-}
-
-impl std::ops::DerefMut for FrameRegisters {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [Value] {
-        self.as_mut_slice()
-    }
-}
-
-impl Default for FrameRegisters {
-    fn default() -> Self {
-        FrameRegisters::Owned(SmallVec::new())
-    }
-}
-
-impl Clone for FrameRegisters {
-    /// Always clones to `Owned` (a `Window` aliases the flat stack and must not
-    /// be duplicated). Cloning is a cold path (frame park / generator save) that
-    /// needs an owned copy anyway.
-    fn clone(&self) -> Self {
-        FrameRegisters::Owned(SmallVec::from_slice(self.as_slice()))
     }
 }
 
@@ -191,12 +101,12 @@ impl Clone for FrameRegisters {
 /// stack (`HoltStack` inside the dispatcher) so
 /// function calls push and pop without per-call `Vec` allocation.
 #[repr(C, align(8))]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Frame {
     /// Common interpreter/baseline machine-visible frame prefix.
     pub header: VmFrameHeader,
     /// Register window for this frame.
-    pub registers: FrameRegisters,
+    pub registers: RegisterWindow,
     /// Captured upvalues for this call. Empty for non-closure
     /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
     /// operands.
@@ -239,6 +149,19 @@ pub struct Frame {
     /// the first opcode that needs cold state writes through
     /// [`crate::Interpreter::frame_ensure_cold`].
     pub cold: Option<ColdFrameIdx>,
+}
+
+/// GC-traceable off-stack frame ownership used by generators and async await.
+/// It contains no pointer into [`crate::register_stack::RegisterStack`].
+#[derive(Debug)]
+pub struct ParkedFrameState {
+    pub header: VmFrameHeader,
+    registers: OwnedRegisterSnapshot,
+    pub upvalues: UpvalueSpine,
+    pub this_value: Value,
+    pub async_state: Option<AsyncFrameState>,
+    pub generator_owner: Option<crate::generator::JsGenerator>,
+    pub return_register: Option<u16>,
 }
 
 const _: [(); 0] = [(); std::mem::offset_of!(Frame, header)];
@@ -433,12 +356,12 @@ impl Frame {
     /// [`Self::for_function_with_heap`] (production path) or
     /// [`Self::build_upvalues`] + [`Self::with_return_upvalues_and_this`].
     #[must_use]
-    pub fn for_function(function: &Function) -> Self {
+    pub fn for_function(function: &Function, window: RegisterWindow) -> Self {
         debug_assert_eq!(
             function.own_upvalue_count, 0,
             "Frame::for_function requires zero own upvalues — use for_function_with_heap or build_upvalues + with_return_upvalues_and_this"
         );
-        Self::with_return(function, None)
+        Self::with_return(function, None, window)
     }
 
     /// Allocate a frame for `function`, allocating
@@ -453,6 +376,7 @@ impl Frame {
     pub fn for_function_with_heap(
         function: &Function,
         heap: &mut otter_gc::GcHeap,
+        window: RegisterWindow,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let upvalues = Self::build_upvalues(heap, function, Self::empty_upvalues())?;
         Ok(Self::with_return_upvalues_and_this(
@@ -460,6 +384,7 @@ impl Frame {
             None,
             upvalues,
             Value::undefined(),
+            window,
         ))
     }
 
@@ -467,12 +392,17 @@ impl Frame {
     /// caller's register `return_register`. Same precondition as
     /// [`Self::for_function`] — zero own upvalues.
     #[must_use]
-    pub fn with_return(function: &Function, return_register: Option<u16>) -> Self {
+    pub fn with_return(
+        function: &Function,
+        return_register: Option<u16>,
+        window: RegisterWindow,
+    ) -> Self {
         Self::with_return_upvalues_and_this(
             function,
             return_register,
             Self::empty_upvalues(),
             Value::undefined(),
+            window,
         )
     }
 
@@ -564,20 +494,20 @@ impl Frame {
         return_register: Option<u16>,
         upvalues: UpvalueSpine,
         this_value: Value,
+        window: RegisterWindow,
     ) -> Self {
         let total = function
             .param_count
             .saturating_add(function.locals)
             .saturating_add(function.scratch) as usize;
-        let mut registers: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
-        registers.resize(total, Value::undefined());
+        debug_assert_eq!(window.len(), total);
         debug_assert!(
             upvalues.len() >= function.own_upvalue_count as usize,
             "frame upvalues must include the function's own cells"
         );
         Self {
             header: VmFrameHeader::interpreter(function.id, total as u16),
-            registers: FrameRegisters::Owned(registers),
+            registers: window,
             return_register,
             upvalues,
             this_value,
@@ -593,31 +523,10 @@ impl Frame {
         return_register: Option<u16>,
         upvalues: UpvalueSpine,
         this_value: Value,
-    ) -> Self {
-        let mut registers: SmallVec<[Value; 8]> =
-            SmallVec::with_capacity(function.register_count as usize);
-        registers.resize(function.register_count as usize, Value::undefined());
-        Self::with_exec_registers(function, return_register, upvalues, this_value, registers)
-    }
-
-    /// Same as [`Self::with_exec_return_upvalues_and_this`] but consumes a
-    /// caller-supplied register window. The hot call paths draw that window
-    /// from [`crate::Interpreter::reg_pool`] (see
-    /// [`crate::Interpreter::draw_registers`]) so a recursive / tight-loop call
-    /// reuses a spilled buffer instead of allocating one per frame.
-    ///
-    /// `registers` must already be sized to `function.register_count` and
-    /// zero-filled with `Value::undefined()`.
-    #[must_use]
-    pub(crate) fn with_exec_registers(
-        function: &CodeBlock,
-        return_register: Option<u16>,
-        upvalues: UpvalueSpine,
-        this_value: Value,
-        registers: SmallVec<[Value; 8]>,
+        window: RegisterWindow,
     ) -> Self {
         debug_assert_eq!(
-            registers.len(),
+            window.len(),
             function.register_count as usize,
             "register window must match the function's register_count"
         );
@@ -627,36 +536,7 @@ impl Frame {
         );
         Self {
             header: VmFrameHeader::interpreter(function.id, function.register_count),
-            registers: FrameRegisters::Owned(registers),
-            return_register,
-            upvalues,
-            this_value,
-            async_state: None,
-            cold: None,
-            generator_owner: None,
-        }
-    }
-
-    /// Same as [`Self::with_exec_return_upvalues_and_this`] but backs the
-    /// frame's registers with a `Window` into the interpreter's flat register
-    /// stack (the [`RegisterWindow`] from [`crate::Interpreter::alloc_reg_window`])
-    /// instead of an inline-owned buffer. The window is pre-zeroed.
-    #[must_use]
-    pub(crate) fn with_exec_window(
-        function: &CodeBlock,
-        return_register: Option<u16>,
-        upvalues: UpvalueSpine,
-        this_value: Value,
-        window: RegisterWindow,
-    ) -> Self {
-        debug_assert_eq!(window.len(), function.register_count as usize);
-        debug_assert!(
-            upvalues.len() >= function.own_upvalue_count as usize,
-            "frame upvalues must include the function's own cells"
-        );
-        Self {
-            header: VmFrameHeader::interpreter(function.id, function.register_count),
-            registers: FrameRegisters::Window(window),
+            registers: window,
             return_register,
             upvalues,
             this_value,
@@ -669,9 +549,8 @@ impl Frame {
     /// Trace locals, register window, receiver, parked side-channel
     /// values, and nested generator / async state held by this frame.
     pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in self.registers.iter() {
-            value.trace_value_slots(visitor);
-        }
+        // Active register windows are traced once through RegisterStack's
+        // precisely published prefix. The frame walker owns scalar/header state.
         for slot in self.upvalues.iter() {
             let p = slot as *const UpvalueCell as *mut RawGc;
             visitor(p);
@@ -687,5 +566,78 @@ impl Frame {
         if let Some(owner) = &self.generator_owner {
             owner.trace_value_slots(visitor);
         }
+    }
+}
+
+impl ParkedFrameState {
+    /// Copy an active frame's values into owned suspension state. The caller
+    /// must release `frame.registers` immediately after this returns.
+    #[must_use]
+    pub(crate) fn copy_from_active(frame: Frame) -> (Self, RegisterWindow) {
+        let window = frame.registers;
+        let registers = OwnedRegisterSnapshot::copy_from(window);
+        (
+            Self {
+                header: frame.header,
+                registers,
+                upvalues: frame.upvalues,
+                this_value: frame.this_value,
+                async_state: frame.async_state,
+                generator_owner: frame.generator_owner,
+                return_register: frame.return_register,
+            },
+            window,
+        )
+    }
+
+    /// Move a parked snapshot into a newly reserved active window.
+    #[must_use]
+    pub(crate) fn into_active(self, mut window: RegisterWindow) -> Frame {
+        debug_assert_eq!(window.len(), self.registers.len());
+        window.copy_from_slice(&self.registers.0);
+        let Self {
+            header,
+            registers: _,
+            upvalues,
+            this_value,
+            async_state,
+            generator_owner,
+            return_register,
+        } = self;
+        Frame {
+            header,
+            registers: window,
+            upvalues,
+            this_value,
+            async_state,
+            generator_owner,
+            return_register,
+            cold: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn register_count(&self) -> usize {
+        self.registers.len()
+    }
+
+    pub(crate) fn trace_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        self.registers.trace_slots(visitor);
+        for slot in self.upvalues.iter() {
+            let p = slot as *const UpvalueCell as *mut RawGc;
+            visitor(p);
+        }
+        self.this_value.trace_value_slots(visitor);
+        if let Some(async_state) = &self.async_state {
+            async_state.result_promise.trace_value_slots(visitor);
+        }
+        if let Some(owner) = &self.generator_owner {
+            owner.trace_value_slots(visitor);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_register(&self, index: usize) -> Option<Value> {
+        self.registers.0.get(index).copied()
     }
 }

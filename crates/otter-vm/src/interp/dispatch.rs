@@ -187,7 +187,7 @@ impl Interpreter {
                     .function(function_id)
                     .map(|f| f.name.as_str())
                     .unwrap_or("<unknown>");
-                let register_window = stack[top_idx].registers.as_slice();
+                let register_window: &[Value] = &stack[top_idx].registers;
                 let event = inspect::StepEvent {
                     frame_depth: stack.len(),
                     function_id,
@@ -466,6 +466,7 @@ impl Interpreter {
                     frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
+                    let popped = self.park_active_frame(popped);
                     owner.park_after_yield_delegate(
                         &mut self.gc_heap,
                         popped,
@@ -485,6 +486,7 @@ impl Interpreter {
                     frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
+                    let popped = self.park_active_frame(popped);
                     owner.park_after_yield(&mut self.gc_heap, popped, detached_cold, dst, yielded);
                     // §27.6 — async-generator yield settles the
                     // outer `.next()` promise immediately with
@@ -506,6 +508,7 @@ impl Interpreter {
                     frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
+                    let popped = self.park_active_frame(popped);
                     owner.park_frame(&mut self.gc_heap, popped, detached_cold);
                     return Ok(Value::undefined());
                 }

@@ -1,7 +1,7 @@
 //! Register-window and frame-stack management.
 //!
 //! # Contents
-//! Register drawing/reclaim on the contiguous reg stack, HoltStack
+//! Register allocation/reclaim on the contiguous register stack, HoltStack
 //! draw/return, cold-frame attach/detach, frame pop/unwind
 //! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), and the
 //! raw pointers compiled code uses to address the reg window.
@@ -13,6 +13,32 @@
 use crate::*;
 
 impl Interpreter {
+    #[cfg(test)]
+    pub(crate) fn test_frame_for_function(
+        &mut self,
+        function: &otter_bytecode::Function,
+    ) -> Result<Frame, VmError> {
+        let total = function
+            .param_count
+            .saturating_add(function.locals)
+            .saturating_add(function.scratch) as usize;
+        let window = self.alloc_reg_window(total)?;
+        Ok(Frame::for_function(function, window))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_frame_for_function_with_heap(
+        &mut self,
+        function: &otter_bytecode::Function,
+    ) -> Result<Frame, VmError> {
+        let total = function
+            .param_count
+            .saturating_add(function.locals)
+            .saturating_add(function.scratch) as usize;
+        let window = self.alloc_reg_window(total)?;
+        Frame::for_function_with_heap(function, &mut self.gc_heap, window).map_err(VmError::from)
+    }
+
     /// Borrow the cold record attached to `frame`, if any.
     #[inline]
     #[must_use]
@@ -30,32 +56,6 @@ impl Interpreter {
         frame.cold.map(|idx| self.cold_frames.get_mut(idx))
     }
 
-    /// Acquire a cold record for `frame` if it doesn't have one yet,
-    /// Build a `register_count`-wide register window, drawing a spilled
-    /// backing buffer from [`Self::reg_pool`] when one is available so a hot
-    /// call need not `malloc` a fresh `Vec` per frame. Windows that fit inline
-    /// (`<= 8`) never spill and never touch the pool.
-    #[inline]
-    pub(crate) fn draw_registers(&mut self, total: usize) -> SmallVec<[Value; 8]> {
-        if total > 8 {
-            while let Some(mut buf) = self.reg_pool.pop() {
-                // Defensive: only reuse buffers whose capacity is in a sane
-                // band, so one giant frame can't pin an oversized allocation.
-                if buf.capacity() <= Self::REG_POOL_MAX_CAP {
-                    buf.clear();
-                    buf.resize(total, Value::undefined());
-                    return SmallVec::from_vec(buf);
-                }
-            }
-        }
-        let mut regs: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
-        regs.resize(total, Value::undefined());
-        regs
-    }
-
-    /// Return a terminated frame's spilled register backing to the pool for
-    /// reuse. Inline windows (and a full pool) are dropped normally. The buffer
-    /// is cleared, so it carries no live `Value`s — the pool is never traced.
     /// Base pointer of the flat JIT register stack, allocating its fixed backing
     /// buffer on first use. Stable for the interpreter's life (never
     /// reallocated). Compiled code reads it from `JitCtx.reg_stack_base` to build
@@ -66,7 +66,7 @@ impl Interpreter {
 
     /// Reserve a zero-filled `count`-slot window at the top of the flat register
     /// stack, bumping its live cursor. Returns the authoritative C-layout
-    /// descriptor stored in [`FrameRegisters::Window`]; frame pop releases the
+    /// descriptor stored in [`Frame`]; frame pop releases the
     /// arena back to its recorded base.
     ///
     /// The stack is pre-reserved and never reallocates (live `Window` frames
@@ -74,6 +74,32 @@ impl Interpreter {
     /// overflow instead of growing.
     pub(crate) fn alloc_reg_window(&mut self, count: usize) -> Result<RegisterWindow, VmError> {
         self.register_stack.allocate(count)
+    }
+
+    pub(crate) fn register_window_rollback(
+        &mut self,
+    ) -> crate::register_stack::RegisterStackCheckpoint {
+        self.register_stack.rollback_checkpoint()
+    }
+
+    /// Convert an active frame into owned suspension state and atomically
+    /// unpublish its register window from the arena.
+    pub(crate) fn park_active_frame(
+        &mut self,
+        frame: Frame,
+    ) -> crate::frame_state::ParkedFrameState {
+        let (parked, window) = crate::frame_state::ParkedFrameState::copy_from_active(frame);
+        self.free_reg_window(window.stack_base());
+        parked
+    }
+
+    /// Reserve a fresh initialized window and restore one parked frame into it.
+    pub(crate) fn resume_parked_frame(
+        &mut self,
+        parked: crate::frame_state::ParkedFrameState,
+    ) -> Result<Frame, VmError> {
+        let window = self.alloc_reg_window(parked.register_count())?;
+        Ok(parked.into_active(window))
     }
 
     /// Truncate the flat register stack back to `base`, releasing every window
@@ -218,21 +244,7 @@ impl Interpreter {
 
     #[inline]
     pub(crate) fn reclaim_registers(&mut self, frame: &mut Frame) {
-        // A `Window` frame's registers live in the flat register stack; release
-        // them by truncating the cursor back to the window base.
-        if let Some(base) = frame.registers.window_base() {
-            self.free_reg_window(base);
-            return;
-        }
-        // An inline-owned, heap-spilled buffer goes back to the pool.
-        if let crate::frame_state::FrameRegisters::Owned(regs) = &mut frame.registers
-            && regs.spilled()
-            && self.reg_pool.len() < Self::REG_POOL_CAP
-        {
-            let mut buf = std::mem::take(regs).into_vec();
-            buf.clear();
-            self.reg_pool.push(buf);
-        }
+        self.free_reg_window(frame.registers.stack_base());
     }
 
     /// Draw a reservation-stable [`HoltStack`] for a synchronous re-entry,
@@ -259,11 +271,6 @@ impl Interpreter {
 
     /// Maximum pooled re-entry stacks retained at once.
     const HOLT_POOL_CAP: usize = 64;
-
-    /// Maximum pooled register buffers retained at once.
-    const REG_POOL_CAP: usize = 256;
-    /// Largest pooled buffer capacity (in `Value`s) kept for reuse.
-    const REG_POOL_MAX_CAP: usize = 4096;
 
     /// Acquire (or lazily create) this frame's cold side record and
     /// then return a mutable borrow.
@@ -507,5 +514,57 @@ impl Interpreter {
         } else {
             self.pop_frame(stack, value)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn function(registers: u16) -> otter_bytecode::Function {
+        otter_bytecode::Function {
+            locals: registers,
+            ..otter_bytecode::Function::default()
+        }
+    }
+
+    #[test]
+    fn park_releases_window_and_resume_restores_fresh_window() {
+        let mut interp = Interpreter::new();
+        let function = function(3);
+        let mut frame = interp.test_frame_for_function(&function).unwrap();
+        frame.registers.copy_from_slice(&[
+            Value::number_i32(7),
+            Value::number_i32(11),
+            Value::number_i32(13),
+        ]);
+        assert_eq!(interp.register_stack.checkpoint(), 3);
+
+        let parked = interp.park_active_frame(frame);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+        assert_eq!(parked.debug_register(1), Some(Value::number_i32(11)));
+
+        let mut resumed = interp.resume_parked_frame(parked).unwrap();
+        assert_eq!(interp.register_stack.checkpoint(), 3);
+        assert_eq!(resumed.registers[2], Value::number_i32(13));
+        interp.reclaim_registers(&mut resumed);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+    }
+
+    #[test]
+    fn nested_windows_reclaim_lifo_and_duplicate_cleanup_never_raises_top() {
+        let mut interp = Interpreter::new();
+        let outer_function = function(2);
+        let inner_function = function(5);
+        let mut outer = interp.test_frame_for_function(&outer_function).unwrap();
+        let mut inner = interp.test_frame_for_function(&inner_function).unwrap();
+        assert_eq!(interp.register_stack.checkpoint(), 7);
+
+        interp.reclaim_registers(&mut inner);
+        assert_eq!(interp.register_stack.checkpoint(), 2);
+        interp.reclaim_registers(&mut outer);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+        interp.reclaim_registers(&mut inner);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
     }
 }

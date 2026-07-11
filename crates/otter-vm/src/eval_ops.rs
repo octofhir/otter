@@ -325,7 +325,9 @@ impl Interpreter {
             }
         }
         let main = context.exec_main();
-        let mut entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let window = self.alloc_reg_window(main.register_count as usize)?;
+        let mut entry =
+            Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
         if caller_new_target.is_some() {
             self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
         }
@@ -421,7 +423,9 @@ impl Interpreter {
         } else {
             Value::object(self.global_this)
         };
-        let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let window = self.alloc_reg_window(main.register_count as usize)?;
+        let entry =
+            Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
         let entry_is_async = main.is_async;
         stack.push(entry);
         let entry_promise = if entry_is_async {
@@ -536,9 +540,16 @@ impl Interpreter {
         // function value (the parenthesised expression is the program's
         // completion).
         let mut stack: HoltStack = HoltStack::new();
+        let main = context.main();
+        let total = main
+            .param_count
+            .saturating_add(main.locals)
+            .saturating_add(main.scratch) as usize;
+        let window = self.alloc_reg_window(total)?;
         stack.push(Frame::for_function_with_heap(
-            context.main(),
+            main,
             &mut self.gc_heap,
+            window,
         )?);
         self.dispatch_loop(&context, &mut stack)
     }
@@ -570,9 +581,16 @@ impl Interpreter {
         // function value (the parenthesised expression is the
         // program's completion).
         let mut stack: HoltStack = HoltStack::new();
+        let main = context.main();
+        let total = main
+            .param_count
+            .saturating_add(main.locals)
+            .saturating_add(main.scratch) as usize;
+        let window = self.alloc_reg_window(total)?;
         stack.push(Frame::for_function_with_heap(
-            context.main(),
+            main,
             &mut self.gc_heap,
+            window,
         )?);
         self.dispatch_loop(&context, &mut stack)
     }

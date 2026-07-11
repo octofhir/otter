@@ -126,8 +126,15 @@ impl Interpreter {
             self.module_init_upvalues.insert(module_url, built.clone());
             built
         };
-        let mut frame =
-            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, Value::undefined());
+        let _window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            Value::undefined(),
+            window,
+        );
         let args: SmallVec<[Value; 8]> =
             smallvec::smallvec![env, import_meta, Value::boolean(hoist_phase)];
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;

@@ -1,12 +1,9 @@
-//! `Frame` owns register windows and async/generator suspension
-//! state containing `Value`, so parked JS frames must stay on the
+//! `Frame` owns an active register window, so live JS frames must stay on the
 //! isolate thread.
 
 
-fn assert_send<T: Send>(_t: T) {}
+fn assert_send<T: Send>() {}
 
 fn main() {
-    let function = otter_bytecode::Function::default();
-    let frame = otter_vm::Frame::for_function(&function);
-    assert_send(frame);
+    assert_send::<otter_vm::Frame>();
 }

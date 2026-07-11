@@ -103,10 +103,7 @@ impl HoltCallReservation {
     #[inline]
     #[must_use]
     pub fn register_window(&mut self) -> RegisterWindow {
-        RegisterWindow::detached(
-            self.frame.registers.as_mut_ptr(),
-            self.frame.registers.len(),
-        )
+        self.frame.registers
     }
 
     /// Publish the frame onto `stack`, returning the stable descriptor for the
@@ -192,7 +189,7 @@ impl HoltStack {
     ///
     /// The frame is fully constructed before it is published (its register
     /// window is already `Value::undefined()`-filled by
-    /// [`Frame::with_exec_registers`] and friends), so it is never visible to
+    /// [`Frame::with_exec_return_upvalues_and_this`] and friends), so it is never visible to
     /// GC in a partially-initialized state. Callers that need the pushed frame
     /// read it back with [`last_mut`](Self::last_mut); that reference stays valid
     /// until the matching [`pop`](Self::pop) / [`truncate`](Self::truncate),
@@ -222,10 +219,7 @@ impl HoltStack {
         let frame = self.frames.get_mut(index)?;
         Some(HoltFrameDesc {
             index,
-            register_window: RegisterWindow::detached(
-                frame.registers.as_mut_ptr(),
-                frame.registers.len(),
-            ),
+            register_window: frame.registers,
         })
     }
 
@@ -382,8 +376,13 @@ mod tests {
     }
 
     /// A frame whose single register holds `tag`.
-    fn tagged_frame(function: &Function, tag: i32) -> Frame {
-        let mut frame = Frame::for_function(function);
+    fn tagged_frame(
+        function: &Function,
+        tag: i32,
+        registers: &mut crate::register_stack::RegisterStack,
+    ) -> Frame {
+        let window = registers.allocate(1).unwrap();
+        let mut frame = Frame::for_function(function, window);
         frame.registers[0] = Value::number_i32(tag);
         frame
     }
@@ -393,10 +392,11 @@ mod tests {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
         assert!(stack.is_empty());
 
         for tag in 0..5 {
-            stack.push(tagged_frame(f, tag));
+            stack.push(tagged_frame(f, tag, &mut registers));
         }
         assert_eq!(stack.len(), 5);
 
@@ -418,11 +418,12 @@ mod tests {
         // A dispatch stack reserves the max call depth, so pushing up to that
         // bound never reallocates and never moves a previously-pushed frame.
         let mut stack = HoltStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
         let n = crate::DEFAULT_MAX_STACK_DEPTH as usize;
 
         let mut addrs = Vec::with_capacity(n);
         for tag in 0..n {
-            stack.push(tagged_frame(f, tag as i32));
+            stack.push(tagged_frame(f, tag as i32, &mut registers));
             addrs.push(stack.last().unwrap() as *const Frame as usize);
         }
         for (i, &addr) in addrs.iter().enumerate() {
@@ -437,7 +438,8 @@ mod tests {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
-        let mut reservation = HoltCallReservation::from_frame(tagged_frame(f, 7));
+        let mut registers = crate::register_stack::RegisterStack::new();
+        let mut reservation = HoltCallReservation::from_frame(tagged_frame(f, 7, &mut registers));
 
         assert_eq!(stack.len(), 0);
         assert_eq!(reservation.register_window().len(), 1);
@@ -455,8 +457,10 @@ mod tests {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
 
-        let desc = HoltCallReservation::from_frame(tagged_frame(f, 3)).publish(&mut stack);
+        let desc =
+            HoltCallReservation::from_frame(tagged_frame(f, 3, &mut registers)).publish(&mut stack);
         let frame = stack.get_mut(desc.index()).unwrap();
 
         assert_eq!(
@@ -471,8 +475,9 @@ mod tests {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
         for tag in 0..100 {
-            stack.push(tagged_frame(f, tag));
+            stack.push(tagged_frame(f, tag, &mut registers));
         }
 
         stack.truncate(40);
@@ -492,8 +497,9 @@ mod tests {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
         for tag in 0..3 {
-            stack.push(tagged_frame(f, tag));
+            stack.push(tagged_frame(f, tag, &mut registers));
         }
         assert!(stack.get(3).is_none());
         assert!(stack.get_mut(3).is_none());
@@ -506,9 +512,10 @@ mod tests {
         let module = one_register_module();
         let f = &module.functions[0];
         let mut stack = HoltStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
         let n = 200;
         for tag in 0..n as i32 {
-            stack.push(tagged_frame(f, tag));
+            stack.push(tagged_frame(f, tag, &mut registers));
         }
 
         // Mirrors how `trace_active_frame_roots` walks the live stack for GC:

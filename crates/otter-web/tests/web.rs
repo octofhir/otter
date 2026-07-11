@@ -95,6 +95,49 @@ fn native_host_instances_link_class_prototype() {
 }
 
 #[test]
+fn singleton_web_class_globals_are_branded_and_unconstructable() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        const tag = (v) => Object.prototype.toString.call(v);
+        // `crypto` is an instance of `Crypto`, methods live on the prototype.
+        out += (crypto instanceof Crypto) + "|";
+        out += (tag(crypto) === "[object Crypto]") + "|";
+        out += (typeof Crypto.prototype.getRandomValues === "function") + "|";
+        out += (typeof Crypto.prototype.randomUUID === "function") + "|";
+        out += (crypto.subtle instanceof SubtleCrypto) + "|";
+        out += (tag(crypto.subtle) === "[object SubtleCrypto]") + "|";
+        out += (typeof SubtleCrypto.prototype.digest === "function") + "|";
+        out += (typeof CryptoKey === "function") + "|";
+        // `performance`/`navigator` are instances of their branded classes.
+        out += (performance instanceof Performance) + "|";
+        out += (tag(performance) === "[object Performance]") + "|";
+        out += (navigator instanceof Navigator) + "|";
+        out += (tag(navigator) === "[object Navigator]") + "|";
+        out += (navigator.userAgent.startsWith("Otter/")) + "|";
+        // None of the interfaces are directly constructable.
+        const illegal = (fn) => {
+          try { fn(); return "ran"; } catch (e) { return e instanceof TypeError; }
+        };
+        out += illegal(() => new Crypto()) + "|";
+        out += illegal(() => new SubtleCrypto()) + "|";
+        out += illegal(() => new CryptoKey()) + "|";
+        out += illegal(() => new Performance()) + "|";
+        out += illegal(() => new Navigator());
+        // Functional smoke: randomUUID + digest still work through the prototype.
+        out += "|" + (crypto.randomUUID().length === 36);
+        out
+        "#,
+    );
+    assert_eq!(
+        result,
+        "true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true|true"
+    );
+}
+
+#[test]
 fn url_statics_parse_and_can_parse() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
@@ -378,12 +421,17 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "clearInterval",
       "console",
       "crypto",
+      "Crypto",
+      "CryptoKey",
+      "SubtleCrypto",
       "crypto.getRandomValues",
       "crypto.randomUUID",
       "performance",
+      "Performance",
       "performance.now",
       "performance.timeOrigin",
       "navigator",
+      "Navigator",
       "navigator.userAgent",
       "AbortController",
       "AbortSignal",
@@ -429,11 +477,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "onerror",
       "onunhandledrejection",
       "onrejectionhandled",
-      "Crypto",
-      "CryptoKey",
-      "SubtleCrypto",
-      "Navigator",
-      "Performance",
       "PromiseRejectionEvent",
       "ReadableByteStreamController",
       "ReadableStreamBYOBReader",

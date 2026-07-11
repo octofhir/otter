@@ -48,8 +48,9 @@ otter_macros::romp! {
             "AbortController", "AbortSignal", "BroadcastChannel", "CloseEvent",
             "CustomEvent", "DOMException", "ErrorEvent", "Event",
             "EventTarget", "FormData", "MessageChannel", "MessageEvent",
-            "MessagePort", "performance", "ProgressEvent", "reportError",
-            "TextDecoder", "TextEncoder", "URLSearchParams",
+            "MessagePort", "Navigator", "performance", "Performance",
+            "ProgressEvent", "reportError", "TextDecoder", "TextEncoder",
+            "URLSearchParams",
         ]),
         // Streams precede fetch: the fetch body getter wraps buffered
         // bodies in a ReadableStream.

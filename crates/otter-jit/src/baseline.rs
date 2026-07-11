@@ -40,8 +40,7 @@ use otter_vm::{
     HoltStack, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFunctionCode,
     RuntimeStubAllocContext, SafepointRecord, Value, VmError, VmRuntimeActivation,
     native_abi::{
-        CodeRegistryView, NativeFrame, NativeFrameFlags, NativeFrameHeader, NativeFrameKind,
-        VmThread,
+        CodeRegistryView, NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread,
     },
     runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
 };
@@ -1229,18 +1228,15 @@ pub(crate) unsafe fn enter_compiled(
             NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS)
         };
         let mut native_frame = NativeFrame {
-            header: NativeFrameHeader {
-                previous_frame: 0,
+            header: VmFrameHeader {
                 function_id: code_object_id.saturating_sub(1) as u32,
                 code_block_id: code_object_id.saturating_sub(1) as u32,
-                resume_pc: 0,
-                kind: NativeFrameKind::Baseline,
-                reserved0: [0; 3],
-                flags,
+                pc: 0,
                 register_count,
-                argument_count: 0,
-                feedback_id: 0,
+                kind: NativeFrameKind::Baseline,
+                flags,
             },
+            previous_frame: 0,
             register_base: regs as u64,
             argument_base: 0,
             feedback_base: 0,
@@ -1249,6 +1245,9 @@ pub(crate) unsafe fn enter_compiled(
             new_target_bits: Value::undefined().to_bits(),
             return_register: u32::MAX,
             cold_state_index: u32::MAX,
+            argument_count: 0,
+            reserved0: 0,
+            feedback_id: 0,
         };
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;

@@ -194,7 +194,7 @@ impl Interpreter {
                     frame_depth: stack.len(),
                     function_id,
                     function_name,
-                    byte_pc: pc,
+                    byte_pc: instr.byte_pc(),
                     op,
                     operands: &operands,
                     register_window,

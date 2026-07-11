@@ -4,7 +4,7 @@ frame=1 fn=<main> pc=000012 op=MAKE_FUNCTION  r0 k[2]
 frame=1 fn=<main> pc=000022 op=DEFINE_GLOBAL_FUNCTION  k[0] r0 i32:0
 frame=1 fn=<main> pc=000037 op=LOAD_UNDEFINED  r1
 frame=1 fn=<main> pc=000042 op=LOAD_UNDEFINED  r1
-frame=1 fn=<main> pc=000047 op=ENTER_TRY  i32:56 i32:-2147483648 r2
+frame=1 fn=<main> pc=000047 op=ENTER_TRY  i32:5 i32:-2147483648 r2
 frame=1 fn=<main> pc=000062 op=LOAD_GLOBAL_OR_THROW  r3 k[0]
 frame=1 fn=<main> pc=000072 op=CALL  r3 r3 k[0]
 frame=2 fn=boom pc=000000 op=LOAD_STRING  r0 k[1]

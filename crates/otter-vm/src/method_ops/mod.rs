@@ -180,19 +180,17 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let frame_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
-        self.do_math_call_at_frame(stack, context, frame_index, operands, self.current_byte_len)
+        self.do_math_call_at_frame(stack, context, frame_index, operands)
     }
 
     /// Handle guarded `Math.<method>(args...)` intrinsic calls for a known
-    /// caller frame. JIT re-entry uses this instead of relying on the dispatch
-    /// loop's current top frame and `current_byte_len` side channels.
+    /// caller frame. JIT re-entry uses the decoded-register entry below.
     pub(crate) fn do_math_call_at_frame(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
         frame_index: usize,
         operands: impl crate::executable::OperandSource,
-        byte_len: u32,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let method_id = const_operand(operands.get(1))?;
@@ -204,15 +202,7 @@ impl Interpreter {
         for i in 0..argc {
             arg_regs.push(register_operand(operands.get(3 + i))?);
         }
-        self.do_math_call_regs(
-            stack,
-            context,
-            frame_index,
-            dst,
-            method_id,
-            &arg_regs,
-            Some(byte_len),
-        )
+        self.do_math_call_regs(stack, context, frame_index, dst, method_id, &arg_regs, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -224,7 +214,7 @@ impl Interpreter {
         dst: u16,
         method_id: u32,
         arg_regs: &[u16],
-        advance_byte_len: Option<u32>,
+        advance_pc: bool,
     ) -> Result<(), VmError> {
         if frame_index >= stack.len() {
             return Err(VmError::InvalidOperand);
@@ -252,8 +242,8 @@ impl Interpreter {
                     }
                 })?;
             write_register(&mut stack[frame_index], dst, value)?;
-            if let Some(byte_len) = advance_byte_len {
-                stack[frame_index].advance_pc(byte_len)?;
+            if advance_pc {
+                stack[frame_index].advance_pc()?;
             }
             return Ok(());
         }
@@ -287,8 +277,8 @@ impl Interpreter {
         if !self.is_callable_runtime(&callee) {
             return Err(VmError::NotCallable);
         }
-        if let Some(byte_len) = advance_byte_len {
-            stack[frame_index].advance_pc(byte_len)?;
+        if advance_pc {
+            stack[frame_index].advance_pc()?;
         }
         self.invoke(stack, context, &callee, math_value, arg_values, dst)
     }
@@ -406,7 +396,6 @@ impl Interpreter {
             Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let caller_byte_len = self.current_byte_len;
         let top_idx = stack.len() - 1;
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
             return result;
@@ -436,7 +425,7 @@ impl Interpreter {
             self.try_array_method_call_ic(context, method_site, recv_value, arg_values.as_slice())
         {
             let value = result?;
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
@@ -444,7 +433,7 @@ impl Interpreter {
             self.try_collection_method_call_ic(method_site, recv_value, arg_values.as_slice())
         {
             let value = result?;
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
@@ -467,7 +456,7 @@ impl Interpreter {
             && let Some(method) = self.resolve_method_ic(obj, atomized_key, method_site)
             && self.is_callable_runtime(&method)
         {
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         let name = context
@@ -481,7 +470,7 @@ impl Interpreter {
             arg_values.as_slice(),
         ) {
             let value = result?;
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
@@ -495,7 +484,7 @@ impl Interpreter {
             arg_values.as_slice(),
         ) {
             let value = result?;
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, value)?;
             return Ok(());
         }
@@ -512,7 +501,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(caller_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
@@ -538,7 +527,7 @@ impl Interpreter {
                 self.is_callable_runtime(&method)
             };
             if route_to_invoke {
-                stack[top_idx].advance_pc(self.current_byte_len)?;
+                stack[top_idx].advance_pc()?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
             if recv_value.is_iterator() {
@@ -648,14 +637,14 @@ impl Interpreter {
                     }
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, promise)?;
-                    frame.advance_pc(caller_byte_len)?;
+                    frame.advance_pc()?;
                     return Ok(());
                 }
                 match self.resume_generator(context, &g, kind) {
                     Ok(result) => {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         write_register(frame, dst, result)?;
-                        frame.advance_pc(self.current_byte_len)?;
+                        frame.advance_pc()?;
                         return Ok(());
                     }
                     Err(err) => {
@@ -705,7 +694,7 @@ impl Interpreter {
                 && let Some(method) = crate::object::get(proto, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
             {
-                stack[top_idx].advance_pc(self.current_byte_len)?;
+                stack[top_idx].advance_pc()?;
                 self.invoke(stack, context, &method, recv_value, arg_values, dst)?;
                 return Ok(());
             }
@@ -719,7 +708,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
@@ -728,7 +717,7 @@ impl Interpreter {
             && let Some(result) =
                 self.try_fast_primitive_string_char_code_at(recv_value, arg_values.as_slice())?
         {
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
@@ -738,7 +727,7 @@ impl Interpreter {
             && let Some(result) =
                 self.try_fast_primitive_number_to_string(recv_value, arg_values.as_slice())?
         {
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
@@ -764,7 +753,7 @@ impl Interpreter {
                     && let Some(method) = self.resolve_method_ic(proto, atomized_key, site)
                     && self.is_callable_runtime(&method)
                 {
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     return self.invoke(stack, context, &method, recv_value, arg_values, dst);
                 }
                 // No IC site (an interpreted call site allocates none) or an IC
@@ -790,7 +779,7 @@ impl Interpreter {
                     }
                 };
                 if self.is_callable_runtime(&method) {
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     return self.invoke(stack, context, &method, recv_value, arg_values, dst);
                 }
             }
@@ -800,7 +789,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §9.4.5 integer-indexed exotic: an own expando property shadows
@@ -811,7 +800,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §7.3.11 GetMethod + §7.3.14 Call.
@@ -822,7 +811,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
@@ -856,7 +845,7 @@ impl Interpreter {
                     if !self.is_callable_runtime(&method) {
                         return Err(VmError::NotCallable);
                     }
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     return self.invoke(stack, context, &method, recv_value, arg_values, dst);
                 }
             }
@@ -923,7 +912,7 @@ impl Interpreter {
                     *slot = Value::string(JsString::from_str(&coerced, self.gc_heap_mut())?);
                 }
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             let result = self.dispatch_string_callable_replace(
                 context,
                 &recv_value,
@@ -959,7 +948,7 @@ impl Interpreter {
                         dst,
                     );
                 }
-                stack[top_idx].advance_pc(caller_byte_len)?;
+                stack[top_idx].advance_pc()?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
         }
@@ -978,7 +967,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         if recv_value.as_native_function().is_some() && object_prototype_dispatch_method_name(name)
@@ -987,7 +976,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         if recv_value.as_bound_function().is_some() && object_prototype_dispatch_method_name(name) {
@@ -995,7 +984,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §7.1.18 ToObject — `String.prototype.hasOwnProperty(idx)`,
@@ -1019,7 +1008,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
@@ -1034,7 +1023,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
@@ -1079,7 +1068,7 @@ impl Interpreter {
                     dst,
                 );
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
@@ -2572,7 +2561,7 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
-                stack[top_idx].advance_pc(self.current_byte_len)?;
+                stack[top_idx].advance_pc()?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
             }
             "apply" => {
@@ -2583,7 +2572,7 @@ impl Interpreter {
                     Some(v) if v.is_nullish() => SmallVec::new(),
                     Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
                 };
-                stack[top_idx].advance_pc(self.current_byte_len)?;
+                stack[top_idx].advance_pc()?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
             }
             "bind" => {
@@ -2643,7 +2632,7 @@ impl Interpreter {
                     .map_err(|_| VmError::TypeMismatch)?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::string(s))?;
-                frame.advance_pc(self.current_byte_len)?;
+                frame.advance_pc()?;
                 Ok(())
             }
             _ => Err(self.err_unknown_intrinsic(name.to_string().into())),

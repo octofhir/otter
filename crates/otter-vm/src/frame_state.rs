@@ -411,11 +411,9 @@ pub struct TryHandler {
 }
 
 impl Frame {
-    /// Advance the canonical instruction-index program counter by one. Surfaces
-    /// [`VmError::InvalidOperand`] on overflow. The dispatch loop
-    /// still passes encoded length while JIT metadata finishes migrating; it
-    /// does not participate in interpreter control flow.
-    pub(crate) fn advance_pc(&mut self, _encoded_byte_len: u32) -> Result<(), VmError> {
+    /// Advance the canonical instruction-index program counter by one.
+    /// Surfaces [`VmError::InvalidOperand`] on overflow.
+    pub(crate) fn advance_pc(&mut self) -> Result<(), VmError> {
         self.pc = self.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         Ok(())
     }

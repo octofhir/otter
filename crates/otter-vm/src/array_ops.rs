@@ -43,7 +43,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let args = collect_array_args(&stack[top_idx], operands)?;
 
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         let result = match op {
             Op::ArrayConstruct => self.array_construct_stack_rooted(stack, &args)?,
             Op::ArrayFrom => self.array_from_sync(context, Value::undefined(), &args)?,

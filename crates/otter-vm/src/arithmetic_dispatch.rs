@@ -57,8 +57,7 @@ impl Interpreter {
         if self.jit_hook.is_some() {
             self.note_arith(lhs, rhs);
         }
-        let byte_len = self.current_byte_len;
-        run_numeric_values(self, frame, dst, lhs, rhs, op, bigint_op, byte_len)
+        run_numeric_values(self, frame, dst, lhs, rhs, op, bigint_op)
     }
 
     pub(crate) fn run_add_regs(
@@ -120,7 +119,7 @@ impl Interpreter {
             }
         };
         write_register(frame, dst, result)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -136,15 +135,7 @@ impl Interpreter {
         if self.jit_hook.is_some() {
             self.note_arith(lhs, rhs);
         }
-        run_compare_values(
-            &self.gc_heap,
-            frame,
-            dst,
-            lhs,
-            rhs,
-            op,
-            self.current_byte_len,
-        )
+        run_compare_values(&self.gc_heap, frame, dst, lhs, rhs, op)
     }
 
     pub(crate) fn run_ushr_regs(
@@ -167,7 +158,7 @@ impl Interpreter {
             _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, result)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -189,7 +180,7 @@ impl Interpreter {
                 }
             };
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -211,7 +202,7 @@ impl Interpreter {
                 }
             };
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -234,7 +225,7 @@ impl Interpreter {
         }
         let eq = abstract_ops::is_strictly_equal(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -253,7 +244,7 @@ impl Interpreter {
         }
         let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -322,7 +313,7 @@ impl Interpreter {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         let result = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(result))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 }
@@ -346,7 +337,6 @@ fn run_numeric_values(
     rhs: Value,
     op: fn(NumberValue, NumberValue) -> NumberValue,
     bigint_op: BigIntBinop,
-    byte_len: u32,
 ) -> Result<(), VmError> {
     let lnum =
         abstract_ops::to_numeric_kind(&lhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
@@ -365,7 +355,7 @@ fn run_numeric_values(
         _ => return Err(VmError::TypeMismatch),
     };
     write_register(frame, dst, result)?;
-    frame.advance_pc(byte_len)?;
+    frame.advance_pc()?;
     Ok(())
 }
 
@@ -376,7 +366,6 @@ fn run_compare_values(
     lhs: Value,
     rhs: Value,
     op: Op,
-    byte_len: u32,
 ) -> Result<(), VmError> {
     // §7.2.14 step 3.b — relational comparison applies ToNumeric
     // after ToPrimitive(number). Symbols cannot be converted to a
@@ -404,7 +393,7 @@ fn run_compare_values(
         _ => unreachable!("run_compare_values called with non-relational op"),
     };
     write_register(frame, dst, Value::boolean(truthy))?;
-    frame.advance_pc(byte_len)?;
+    frame.advance_pc()?;
     Ok(())
 }
 

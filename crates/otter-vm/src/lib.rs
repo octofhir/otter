@@ -782,12 +782,6 @@ pub struct Interpreter {
     /// unit at a time per iteration. Reset to [`JIT_BACKEDGE_POLL_BATCH`] by the
     /// checkpoint.
     jit_backedge_fuel: u64,
-    /// Byte length of the instruction currently being dispatched. Set
-    /// by `dispatch_loop_inner` right after each fetch and consumed by
-    /// every `frame.advance_pc(self.current_byte_len)?` call along
-    /// the dispatch path. Centralises the PC advance so opcode helpers
-    /// stay byte-length agnostic.
-    current_byte_len: u32,
     /// Global function id of the instruction currently being dispatched, and
     /// its byte-offset PC. Stashed by `dispatch_loop_inner` right after each
     /// fetch so the arithmetic / relational opcode helpers can key their

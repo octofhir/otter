@@ -102,7 +102,7 @@ impl Interpreter {
                     }
                 }
                 let result = bigint::dispatch::call(self, method, &coerced)?;
-                finish_static_call(frame, dst, result, self.current_byte_len)
+                finish_static_call(frame, dst, result)
             }
             Op::ArrayBufferCall => unreachable!("ArrayBufferCall requires stack-rooted dispatch"),
             Op::DataViewCall => {
@@ -110,7 +110,7 @@ impl Interpreter {
                 let method = method_id::DataViewMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
                 let result = binary::dispatch::data_view_call(method, &args, &mut self.gc_heap)?;
-                finish_static_call(frame, dst, result, self.current_byte_len)
+                finish_static_call(frame, dst, result)
             }
             Op::SharedArrayBufferCall => {
                 unreachable!("SharedArrayBufferCall requires stack-rooted dispatch")
@@ -146,7 +146,7 @@ impl Interpreter {
             self,
             &mut external_visit,
         )?;
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
+        finish_static_call(&mut stack[top_idx], dst, result)
     }
 
     pub(crate) fn run_shared_array_buffer_static_call_operands(
@@ -176,7 +176,7 @@ impl Interpreter {
             self,
             &mut external_visit,
         )?;
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
+        finish_static_call(&mut stack[top_idx], dst, result)
     }
 
     /// `Op::ForInKeys` — snapshot enumerable string-typed keys of an
@@ -208,12 +208,7 @@ impl Interpreter {
             &[],
             &[&args_root],
         )?;
-        finish_static_call(
-            &mut stack[top_idx],
-            dst,
-            Value::array(array),
-            self.current_byte_len,
-        )
+        finish_static_call(&mut stack[top_idx], dst, Value::array(array))
     }
 
     /// `Op::CopyDataProperties` — §7.3.31 CopyDataProperties applied
@@ -238,7 +233,7 @@ impl Interpreter {
         let args = [target, src];
         let _ = self.do_object_assign(context, Some(stack), &args)?;
         let frame = &mut stack[top_idx];
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -282,7 +277,7 @@ impl Interpreter {
             }
         }
         let frame = &mut stack[top_idx];
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -339,7 +334,7 @@ impl Interpreter {
             return Err(self.err_type(("Cannot define property".to_string()).into()));
         }
         let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -1500,14 +1495,9 @@ fn collect_call_args(
     Ok(args)
 }
 
-fn finish_static_call(
-    frame: &mut Frame,
-    dst: u16,
-    result: Value,
-    byte_len: u32,
-) -> Result<(), VmError> {
+fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), VmError> {
     write_register(frame, dst, result)?;
-    frame.advance_pc(byte_len)?;
+    frame.advance_pc()?;
     Ok(())
 }
 

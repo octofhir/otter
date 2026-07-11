@@ -29,7 +29,7 @@ impl Interpreter {
         let tag = read_register(frame, src)?.typeof_string_with_heap(&self.gc_heap);
         let s = JsString::from_str(tag, &mut self.gc_heap)?;
         write_register(frame, dst, Value::string(s))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -57,7 +57,7 @@ impl Interpreter {
             None => JsString::empty(&mut self.gc_heap)?,
         };
         write_register(frame, dst, Value::string(result))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 }

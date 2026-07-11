@@ -38,7 +38,7 @@ impl Interpreter {
             .and_then(|c| c.new_target)
             .unwrap_or(Value::undefined());
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -66,7 +66,7 @@ impl Interpreter {
             });
         }
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -89,7 +89,7 @@ impl Interpreter {
             .get_mut(idx as usize)
             .ok_or(VmError::InvalidOperand)?;
         *slot = fresh;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -108,7 +108,7 @@ impl Interpreter {
             .get(idx as usize)
             .ok_or(VmError::InvalidOperand)?;
         store_upvalue(&mut self.gc_heap, cell, value);
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -137,7 +137,7 @@ impl Interpreter {
             });
         }
         store_upvalue(&mut self.gc_heap, cell, value);
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -200,7 +200,7 @@ impl Interpreter {
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::array(array))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -232,7 +232,7 @@ impl Interpreter {
             finally_pc,
             exc_register,
         });
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -251,7 +251,7 @@ impl Interpreter {
             cold.parked_finally
                 .push((crate::cold_frame::ParkedFinally::Normal, depth));
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 }

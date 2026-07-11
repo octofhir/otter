@@ -751,7 +751,7 @@ impl Interpreter {
         }
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::object(obj))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -787,7 +787,7 @@ impl Interpreter {
         let array = self.alloc_stack_rooted_array_from_vec(stack, elements)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::array(array))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -813,7 +813,7 @@ impl Interpreter {
         )
         .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
         write_register(frame, dst, Value::regexp(regex))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -837,7 +837,7 @@ impl Interpreter {
         };
         crate::array::push_with_roots(array, &mut self.gc_heap, value, &mut external_visit)?;
         let frame = &mut stack[top_idx];
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -863,7 +863,7 @@ impl Interpreter {
         )?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::weak_ref(weak_ref))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -891,7 +891,7 @@ impl Interpreter {
         )?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::finalization_registry(registry))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 }

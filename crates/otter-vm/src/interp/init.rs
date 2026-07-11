@@ -161,7 +161,6 @@ impl Interpreter {
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
-            current_byte_len: 1,
             current_function_id: 0,
             current_byte_pc: 0,
             gc_heap,

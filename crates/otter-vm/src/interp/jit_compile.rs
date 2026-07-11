@@ -165,14 +165,14 @@ impl Interpreter {
 
     /// Fold the operand representations of one observed arithmetic / relational
     /// execution into the optimizing-tier type-feedback cell for the currently
-    /// dispatching site (`current_function_id`, `current_byte_pc`). Called from
+    /// dispatching site (`current_function_id`, `current_instruction_pc`). Called from
     /// the arithmetic opcode helpers; gated by the caller on a JIT hook being
     /// installed, so interpreter-only execution records nothing. The cell is
     /// baked into the compile snapshot at tier-up.
     #[inline]
     pub(crate) fn note_arith(&mut self, lhs: Value, rhs: Value) {
         self.jit_arith_feedback
-            .entry((self.current_function_id, self.current_byte_pc))
+            .entry((self.current_function_id, self.current_instruction_pc))
             .or_default()
             .record(lhs, rhs);
     }
@@ -184,7 +184,7 @@ impl Interpreter {
     /// [`jit::JitElementLoadKind::Any`] (generic boxed load), and that demotion
     /// is sticky — a mixed site never re-specializes.
     pub(crate) fn note_element_load(&mut self, recv: Value) {
-        let key = (self.current_function_id, self.current_byte_pc);
+        let key = (self.current_function_id, self.current_instruction_pc);
         let observed = match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
             Some(crate::binary::TypedArrayKind::Float64) => jit::JitElementLoadKind::Float64,
             Some(crate::binary::TypedArrayKind::Int32) => jit::JitElementLoadKind::Int32,
@@ -209,7 +209,7 @@ impl Interpreter {
     }
 
     /// Copy the warmup element-load kind feedback recorded for `fid`'s
-    /// `LoadElement` sites into the compile snapshot, keyed by byte-PC. Sites the
+    /// `LoadElement` sites into the compile snapshot, keyed by instruction PC. Sites the
     /// interpreter never observed (or observed with mixed receivers) stay
     /// [`jit::JitElementLoadKind::Any`], which lowers as the generic boxed load.
     pub(crate) fn bake_element_load_kind(&self, view: &mut jit::JitCompileSnapshot, fid: u32) {
@@ -220,7 +220,7 @@ impl Interpreter {
             if instr.op != Op::LoadElement {
                 continue;
             }
-            if let Some(kind) = self.jit_element_load_kind.get(&(fid, instr.byte_pc)) {
+            if let Some(kind) = self.jit_element_load_kind.get(&(fid, instr.instruction_pc)) {
                 instr.element_load_kind = *kind;
             }
         }
@@ -228,16 +228,19 @@ impl Interpreter {
 
     /// Copy the warmup value-representation feedback recorded for `fid`'s
     /// numeric-specialized sites into the compile snapshot, keyed by each
-    /// instruction's byte-PC. Sites the interpreter never observed stay `0`
+    /// instruction's canonical PC. Sites the interpreter never observed stay `0`
     /// (unknown), which the optimizing tier lowers generically.
     pub(crate) fn bake_arith_feedback(&self, view: &mut jit::JitCompileSnapshot, fid: u32) {
         if self.jit_arith_feedback.is_empty() && self.jit_arith_widen_float.is_empty() {
             return;
         }
         for instr in &mut view.instructions {
-            if self.jit_arith_widen_float.contains(&(fid, instr.byte_pc)) {
+            if self
+                .jit_arith_widen_float
+                .contains(&(fid, instr.instruction_pc))
+            {
                 instr.arith_feedback = jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64;
-            } else if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.byte_pc)) {
+            } else if let Some(fb) = self.jit_arith_feedback.get(&(fid, instr.instruction_pc)) {
                 instr.arith_feedback = fb.bits();
             }
         }

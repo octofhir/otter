@@ -4955,27 +4955,27 @@ fn call_target_feedback_tracks_mono_then_poly() {
 fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
     let mut interp = Interpreter::new();
 
-    // A pure-int32 site under fid 5 at byte-PC 16.
+    // A pure-int32 site under fid 5 at instruction PC 1.
     interp.current_function_id = 5;
-    interp.current_byte_pc = 16;
+    interp.current_instruction_pc = 1;
     interp.note_arith(Value::number_i32(1), Value::number_i32(2));
     interp.note_arith(Value::number_i32(7), Value::number_i32(-3));
-    let int_site = interp.jit_arith_feedback.get(&(5, 16)).copied().unwrap();
+    let int_site = interp.jit_arith_feedback.get(&(5, 1)).copied().unwrap();
     assert!(int_site.is_int32_only());
     assert!(int_site.is_numeric_only());
 
     // A second site that mixes int32 and double → numeric but not int32.
-    interp.current_byte_pc = 32;
+    interp.current_instruction_pc = 2;
     interp.note_arith(Value::number_i32(1), Value::number_f64(2.5));
-    let num_site = interp.jit_arith_feedback.get(&(5, 32)).copied().unwrap();
+    let num_site = interp.jit_arith_feedback.get(&(5, 2)).copied().unwrap();
     assert!(!num_site.is_int32_only());
     assert!(num_site.is_numeric_only());
 
-    // Same byte-PC under a different fid is independent (never recorded).
-    assert!(!interp.jit_arith_feedback.contains_key(&(9, 16)));
+    // Same instruction PC under a different fid is independent (never recorded).
+    assert!(!interp.jit_arith_feedback.contains_key(&(9, 1)));
 
     // Baking copies each site's bits into the matching instruction by
-    // byte-PC; unobserved instructions stay 0.
+    // instruction PC; unobserved instructions stay 0.
     let mut view = jit::JitCompileSnapshot::without_feedback(
         5,
         0,
@@ -5004,7 +5004,7 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
 
     // A widened overflow site forces numeric mixed feedback even if the
     // interpreter never observed a double operand there.
-    interp.jit_arith_widen_float.insert((5, 48));
+    interp.jit_arith_widen_float.insert((5, 3));
     for instr in &mut view.instructions {
         instr.arith_feedback = 0;
     }

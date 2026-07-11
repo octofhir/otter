@@ -162,7 +162,7 @@ impl Interpreter {
             interrupt: InterruptFlag::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             current_function_id: 0,
-            current_byte_pc: 0,
+            current_instruction_pc: 0,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             realm_context: None,

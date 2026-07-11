@@ -338,7 +338,10 @@ impl Interpreter {
         if !matches!(instr.op(), Op::Add | Op::Sub | Op::Mul) {
             return false;
         }
-        if !self.jit_arith_widen_float.insert((fid, bail_pc)) {
+        if !self
+            .jit_arith_widen_float
+            .insert((fid, instr.instruction_pc))
+        {
             return false;
         }
         self.invalidate_jit_function(fid);

@@ -15,29 +15,6 @@
 use crate::*;
 
 impl Interpreter {
-    pub(crate) fn instruction_pc_for_byte_pc(
-        context: &ExecutionContext,
-        fid: u32,
-        byte_pc: u32,
-    ) -> Result<u32, VmError> {
-        let index = context
-            .exec_function(fid)
-            .and_then(|function| function.instr_index_at_byte_pc(byte_pc))
-            .ok_or(VmError::InvalidOperand)?;
-        u32::try_from(index).map_err(|_| VmError::InvalidOperand)
-    }
-
-    pub(crate) fn byte_pc_for_instruction_pc(
-        context: &ExecutionContext,
-        fid: u32,
-        instruction_pc: u32,
-    ) -> Result<u32, VmError> {
-        context
-            .exec_function(fid)
-            .and_then(|function| function.instruction_byte_pc(instruction_pc as usize))
-            .ok_or(VmError::InvalidOperand)
-    }
-
     /// After a call pushed a fresh bytecode callee frame as the new top of
     /// `stack`, try to run it as compiled baseline code instead of interpreting.
     ///
@@ -60,9 +37,11 @@ impl Interpreter {
             .function(fid)
             .map(|function| function.name.as_str())
             .unwrap_or("<unknown>");
-        let instruction = context
-            .exec_function(fid)
-            .and_then(|function| function.instr_at_byte_pc(pc).map(|instr| (function, instr)));
+        let instruction = context.exec_function(fid).and_then(|function| {
+            function
+                .instr_at_index(pc as usize)
+                .map(|instr| (function, instr))
+        });
         let op = instruction.map(|(function, instr)| function.op(instr));
         let operands = instruction
             .map(|(function, instr)| format!("{:?}", function.operand_view(instr)))
@@ -85,7 +64,7 @@ impl Interpreter {
             jit::JitExecOutcome::Bailed(pc) => {
                 let fid = stack[top_idx].function_id;
                 Self::trace_jit_bail(context, fid, "entry", None, pc);
-                stack[top_idx].pc = Self::instruction_pc_for_byte_pc(context, fid, pc)?;
+                stack[top_idx].pc = pc;
                 if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     self.note_jit_entry_bail(fid);
                 }
@@ -161,10 +140,7 @@ impl Interpreter {
             return Ok(None);
         }
         let frame = &stack[top_idx];
-        let key = (
-            frame.function_id,
-            Self::byte_pc_for_instruction_pc(context, frame.function_id, frame.pc)?,
-        );
+        let key = (frame.function_id, frame.pc);
         // A header that already proved un-tierable, or a whole uncompilable
         // function, never counts again.
         if self.jit_osr_disabled.contains(&key)
@@ -214,7 +190,7 @@ impl Interpreter {
         if self.jit_osr_disabled.contains(&(fid, u32::MAX)) {
             return Ok(None);
         }
-        let osr_pc = Self::byte_pc_for_instruction_pc(context, fid, frame.pc)?;
+        let osr_pc = frame.pc;
         // This specific loop header already proved un-tierable (bailed / no
         // trampoline). The caller re-arms the counter, so a different hot loop
         // in the same function still gets a tier-up shot.
@@ -257,7 +233,7 @@ impl Interpreter {
                 // there; that should not permanently suppress the header on the
                 // next hot iteration.
                 Self::trace_jit_bail(context, fid, "osr", Some(osr_pc), pc);
-                stack[top_idx].pc = Self::instruction_pc_for_byte_pc(context, fid, pc)?;
+                stack[top_idx].pc = pc;
                 if self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     return Ok(None);
                 }
@@ -291,25 +267,13 @@ impl Interpreter {
         osr_pc: u32,
         bail_pc: u32,
     ) -> bool {
-        let Some(header_pc) = code_block
-            .instr_index_at_byte_pc(osr_pc)
-            .and_then(|pc| u32::try_from(pc).ok())
-        else {
+        let Some(loop_latch) = code_block.loop_latch(osr_pc) else {
             return true;
         };
-        let Some(bail_pc) = code_block
-            .instr_index_at_byte_pc(bail_pc)
-            .and_then(|pc| u32::try_from(pc).ok())
-        else {
-            return false;
-        };
-        let Some(loop_latch) = code_block.loop_latch(header_pc) else {
-            return true;
-        };
-        header_pc <= bail_pc && bail_pc <= loop_latch
+        osr_pc <= bail_pc && bail_pc <= loop_latch
     }
 
-    /// Treat the first compiled `Add` / `Sub` / `Mul` bail at a byte-PC as an
+    /// Treat the first compiled `Add` / `Sub` / `Mul` bail at a logical PC as an
     /// int32-result overflow and recompile that function with the site widened
     /// to float arithmetic. The interpreter feedback only records operand
     /// representations, so an accumulator can keep looking int32-only while its
@@ -325,7 +289,7 @@ impl Interpreter {
         let Some(function) = context.exec_function(fid) else {
             return false;
         };
-        let Some(instr) = function.instr_at_byte_pc(bail_pc) else {
+        let Some(instr) = function.instr_at_index(bail_pc as usize) else {
             return false;
         };
         if !matches!(function.op(instr), Op::Add | Op::Sub | Op::Mul) {
@@ -1258,7 +1222,7 @@ impl Interpreter {
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let mut frame =
             Frame::with_exec_registers(function, None, upvalues, Value::undefined(), registers);
-        frame.pc = Self::instruction_pc_for_byte_pc(context, fid, bail_pc)?;
+        frame.pc = bail_pc;
         stack.push(frame);
         self.dispatch_loop(context, stack)
     }
@@ -1297,7 +1261,7 @@ impl Interpreter {
         self.note_jit_entry_bail(fid);
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let mut frame = Frame::with_exec_registers(function, None, upvalues, this, registers);
-        frame.pc = Self::instruction_pc_for_byte_pc(context, fid, bail_pc)?;
+        frame.pc = bail_pc;
         stack.push(frame);
         self.dispatch_loop(context, stack)
     }
@@ -1314,7 +1278,7 @@ impl Interpreter {
     ///
     /// `frames` is ordered outermost first. Every frame's `registers` slice is a
     /// full register window (unwritten slots `undefined`) and its `pc` is the
-    /// byte-PC to resume at — the guard's PC for the top frame, the byte-PC just
+    /// logical PC to resume at — the guard's PC for the top frame, the PC just
     /// past the nested call for each frame below it.
     pub fn jit_resume_inline_callee_stack(
         &mut self,
@@ -1358,7 +1322,7 @@ impl Interpreter {
             };
             let mut frame =
                 Frame::with_exec_registers(function, return_register, upvalues, f.this, registers);
-            frame.pc = Self::instruction_pc_for_byte_pc(context, f.callee_fid, f.callee_pc)?;
+            frame.pc = f.callee_pc;
             built.push(frame);
         }
         self.enter_sync_reentry()?;

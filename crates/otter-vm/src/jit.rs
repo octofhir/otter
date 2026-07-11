@@ -43,7 +43,7 @@ use crate::{
 pub struct JitCompileRequest {
     /// Code and feedback snapshot to compile.
     pub snapshot: JitCompileSnapshot,
-    /// Loop-header byte-PC for an OSR-target compile. `None` means normal
+    /// Loop-header logical PC for an OSR-target compile. `None` means normal
     /// function-entry compilation.
     pub osr_pc: Option<u32>,
 }
@@ -134,7 +134,7 @@ pub struct JitCompileSnapshot {
     /// Byte offset from a decompressed native-function pointer to its
     /// machine-readable static builtin identity.
     pub native_static_fn_byte: u32,
-    /// Instruction stream in byte-PC order.
+    /// Instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
     /// caller's `Op::Call` byte-PC. Populated only for sites the interpreter
@@ -364,7 +364,7 @@ pub struct JitInlineCallee {
     /// Callee register-window length; the spliced body runs in a scratch block
     /// of this many slots.
     pub register_count: u16,
-    /// Callee instruction stream in byte-PC order, emitted inline.
+    /// Callee instruction overlays in canonical logical-PC order.
     pub instructions: Vec<JitInstructionMetadata>,
 }
 
@@ -591,7 +591,7 @@ pub struct JitGcBarrierLayout {
 pub struct JitInstructionMetadata {
     /// Dense instruction index into the owning compile snapshot's CodeBlock.
     pub(crate) instruction_index: u32,
-    /// Cold serialized byte PC used by bailout/profiling metadata.
+    /// Cold serialized byte PC used only by profiling and legacy feedback maps.
     pub byte_pc: u32,
     /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
     /// being compiled (the named-function SELF binding). The emitter
@@ -902,7 +902,7 @@ pub struct ObjectLiteralProp {
 pub struct JitResumeFrame {
     /// Function id this frame executes.
     pub callee_fid: u32,
-    /// Byte-PC to resume this frame at.
+    /// Logical PC to resume this frame at.
     pub callee_pc: u32,
     /// Register in the parent frame that receives this frame's return value.
     /// Ignored for the outermost frame (its result bubbles out to emitted code).
@@ -1071,15 +1071,19 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// stack throughout, so allocation/calls in the body are GC-safe.
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome;
 
-    /// Enter compiled code mid-function at the loop header whose bytecode PC is
-    /// `byte_pc` (on-stack replacement). Returns `None` when this code has no
+    /// Enter compiled code mid-function at the loop header whose logical PC is
+    /// `logical_pc` (on-stack replacement). Returns `None` when this code has no
     /// OSR entry for that PC (the VM keeps interpreting).
     ///
     /// The baseline keeps every live value in the frame register array at each
     /// instruction boundary, so a loop header is a valid resume point: the
     /// interpreter's live registers are exactly what the compiled code reads.
     /// The default returns `None` for codes that do not support OSR.
-    fn osr_entry(&self, _activation: VmRuntimeActivation, _byte_pc: u32) -> Option<JitExecOutcome> {
+    fn osr_entry(
+        &self,
+        _activation: VmRuntimeActivation,
+        _logical_pc: u32,
+    ) -> Option<JitExecOutcome> {
         None
     }
 }

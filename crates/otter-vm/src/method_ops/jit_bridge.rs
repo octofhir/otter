@@ -37,7 +37,6 @@ impl Interpreter {
         dst: u16,
         recv_reg: u16,
         name_idx: u32,
-        call_byte_pc: u32,
         site: Option<usize>,
         arg_regs: &[u16],
         source: crate::JitRuntimeMethodStubSource,
@@ -117,18 +116,6 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
         self.record_jit_method_generic_call();
-        if self.jit_hook.is_some()
-            && let Ok((method_fid, _, _, _, _, _)) =
-                Self::bytecode_call_target_parts(method, recv, &self.gc_heap)
-        {
-            let caller_fid = stack[frame_index].function_id;
-            if !self.method_site_feedback_saturated(caller_fid, call_byte_pc)
-                && let Some(site) =
-                    self.method_site_for_receiver(context, caller_fid, name_idx, recv)
-            {
-                self.note_method_target(caller_fid, call_byte_pc, method_fid, site);
-            }
-        }
         let result = self.run_callable_sync(context, &method, recv, args)?;
         stack[frame_index].pc = saved_pc;
         write_register(&mut stack[frame_index], dst, result)?;

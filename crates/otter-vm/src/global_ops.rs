@@ -34,7 +34,7 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         write_register(frame, dst, Value::object(self.global_this))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -69,7 +69,7 @@ impl Interpreter {
             let value = crate::read_upvalue(&self.gc_heap, cell);
             if !value.is_hole() {
                 write_register(frame, dst, value)?;
-                frame.advance_pc(self.current_byte_len)?;
+                frame.advance_pc()?;
                 return Ok(());
             }
             let name = context
@@ -94,7 +94,7 @@ impl Interpreter {
                 ));
             }
             write_register(frame, dst, value)?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         let receiver = Value::object(self.global_this);
@@ -109,7 +109,7 @@ impl Interpreter {
             }
         };
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -143,7 +143,7 @@ impl Interpreter {
             }
         };
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl Interpreter {
         // in sloppy mode. Only an absent property is defined fresh.
         if object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some() {
             object::set(&mut self.global_this, &mut self.gc_heap, name, value);
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         let descriptor = object::PartialPropertyDescriptor {
@@ -201,7 +201,7 @@ impl Interpreter {
         ) {
             return Err(self.err_type((format!("Cannot declare global var '{name}'")).into()));
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -248,7 +248,7 @@ impl Interpreter {
                 );
             }
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -307,7 +307,7 @@ impl Interpreter {
             }
             object::set(&mut self.global_this, &mut self.gc_heap, name, value);
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -329,7 +329,7 @@ impl Interpreter {
         if let Some(cell) = self.frame_eval_var(frame, name) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
             write_register(frame, dst, value)?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         self.run_load_global_or_throw_reg(context, frame, dst, name_idx)
@@ -352,7 +352,7 @@ impl Interpreter {
         let value = *crate::read_register(frame, value_reg)?;
         if let Some(cell) = self.frame_eval_var(frame, name) {
             crate::store_upvalue(&mut self.gc_heap, cell, value);
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         // Fall through to the full global SetMutableBinding so
@@ -376,7 +376,7 @@ impl Interpreter {
         if let Some(cell) = self.frame_eval_var(frame, name) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
             write_register(frame, dst, value)?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)
@@ -411,7 +411,7 @@ impl Interpreter {
             crate::object::delete(self.global_this, &mut self.gc_heap, name)
         };
         write_register(frame, dst, Value::boolean(removed))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -463,7 +463,7 @@ impl Interpreter {
         }
         let cell = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
         self.global_lexicals.insert(name.into(), (cell, is_const));
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -530,7 +530,7 @@ impl Interpreter {
                 }
             }
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -553,7 +553,7 @@ impl Interpreter {
             .map(|(cell, _)| *cell)
             .ok_or(VmError::InvalidOperand)?;
         crate::store_upvalue(&mut self.gc_heap, cell, value);
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -577,7 +577,7 @@ impl Interpreter {
             || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
             || crate::object::get(self.global_this, &self.gc_heap, name).is_some();
         crate::write_register(frame, dst, Value::boolean(exists))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -629,7 +629,7 @@ impl Interpreter {
                 ));
             }
             crate::store_upvalue(&mut self.gc_heap, cell, value);
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         // §9.1.1.4.18 object-record SetMutableBinding — strict mode
@@ -645,7 +645,7 @@ impl Interpreter {
         if !self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)? && strict {
             return Err(self.err_type((format!("Cannot assign to property '{name}'")).into()));
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 }

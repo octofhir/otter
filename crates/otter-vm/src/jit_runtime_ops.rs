@@ -184,7 +184,7 @@ impl Interpreter {
             dst,
             method_id,
             argument_regs,
-            None,
+            false,
         );
         stack[frame_index].pc = saved_pc;
         result

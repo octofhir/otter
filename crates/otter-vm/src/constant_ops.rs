@@ -27,7 +27,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let value = self.load_bigint_constant_value(context, idx)?;
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 

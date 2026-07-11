@@ -155,9 +155,6 @@ impl Interpreter {
                 };
             let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
             let op = instr.op();
-            self.current_byte_len = function
-                .instruction_byte_len(idx)
-                .ok_or(VmError::MissingReturn)?;
             // `current_function_id` / `current_byte_pc` exist only to key the
             // optimizing-tier arithmetic type-feedback cell (`note_arith`),
             // which the arith opcode helpers record only when a JIT hook is
@@ -380,7 +377,7 @@ impl Interpreter {
                         }
                         crate::store_upvalue(&mut self.gc_heap, cell, value);
                     }
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::Throw => {
@@ -433,7 +430,7 @@ impl Interpreter {
                             }
                         }
                         Some((crate::cold_frame::ParkedFinally::Normal, _)) | None => {
-                            stack[top_idx].advance_pc(self.current_byte_len)?;
+                            stack[top_idx].advance_pc()?;
                         }
                     }
                     continue;
@@ -468,7 +465,7 @@ impl Interpreter {
                     let yielded = *read_register(&stack[top_idx], src)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
                     owner.park_after_yield_delegate(
@@ -487,7 +484,7 @@ impl Interpreter {
                     let yielded = *read_register(&stack[top_idx], src)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
                     owner.park_after_yield(&mut self.gc_heap, popped, detached_cold, dst, yielded);
@@ -508,7 +505,7 @@ impl Interpreter {
                 Op::GeneratorStart => {
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
                     owner.park_frame(&mut self.gc_heap, popped, detached_cold);
@@ -556,7 +553,7 @@ impl Interpreter {
                     let recv = *read_register(&stack[top_idx], src)?;
                     if abstract_ops::is_primitive(&recv) {
                         write_register(&mut stack[top_idx], dst, recv)?;
-                        stack[top_idx].advance_pc(self.current_byte_len)?;
+                        stack[top_idx].advance_pc()?;
                         continue;
                     }
                     self.drive_to_primitive(stack, context, operands)?;
@@ -639,7 +636,7 @@ impl Interpreter {
                     // not close it again (it is already closing).
                     self.deregister_frame_iterator_closer(&mut stack[top_idx], iterator);
                     self.iterator_close_value_sync(context, iterator)?;
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::IteratorCloseStart => {
@@ -656,7 +653,7 @@ impl Interpreter {
                     self.frame_ensure_cold(&mut stack[top_idx])
                         .active_iterator_closers
                         .push((iterator, handler_depth));
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::IteratorCloseEnd => {
@@ -672,7 +669,7 @@ impl Interpreter {
                     {
                         cold.active_iterator_closers.remove(pos);
                     }
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 // §10.1.8 [[Get]] — when the resolved property is an
@@ -1121,11 +1118,11 @@ impl Interpreter {
                     };
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     write_register(frame, dst, Value::object(obj))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::Nop => {
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::LoadUndefined => {
@@ -1134,7 +1131,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::undefined())?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadHole => {
@@ -1143,7 +1140,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::hole())?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadTrue => {
@@ -1152,7 +1149,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(true))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadFalse => {
@@ -1161,7 +1158,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(false))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadNull => {
@@ -1170,7 +1167,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::null())?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadInt32 => {
@@ -1182,7 +1179,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::number(NumberValue::Smi(imm)))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadNumber => {
@@ -1198,7 +1195,7 @@ impl Interpreter {
                     let value = NumberValue::from_f64(f64::from_bits(bits));
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::number(value))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadString => {
@@ -1211,7 +1208,7 @@ impl Interpreter {
                     let value = self.load_string_constant_value(context, idx)?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, value)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadLength => {
@@ -1227,7 +1224,7 @@ impl Interpreter {
                         .ok_or(VmError::TypeMismatch)?;
                     let len = NumberValue::from_i32(s.len() as i32);
                     write_register(frame, dst, Value::number(len))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LogicalNot => {
@@ -1240,7 +1237,7 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::boolean(!truthy))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::ToBoolean => {
@@ -1253,7 +1250,7 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::boolean(truthy))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::GetStringIndex => {
@@ -1301,7 +1298,7 @@ impl Interpreter {
                     }
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, value)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadNewTarget => {
@@ -1532,7 +1529,7 @@ impl Interpreter {
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, value)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §9.1 — captured-binding read in a frame whose
@@ -1557,7 +1554,7 @@ impl Interpreter {
                     {
                         let value = crate::read_upvalue(&self.gc_heap, cell);
                         write_register(frame, dst, value)?;
-                        frame.advance_pc(self.current_byte_len)?;
+                        frame.advance_pc()?;
                         continue;
                     }
                     let cell = frame
@@ -1567,7 +1564,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let value = crate::read_upvalue(&self.gc_heap, cell);
                     write_register(frame, dst, value)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LoadDynamic => {
@@ -1633,7 +1630,7 @@ impl Interpreter {
                         crate::symbol::JsSymbol::new_private(&mut self.gc_heap, Some(desc_str))?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::symbol(sym))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::DefineGlobalFunction => {
@@ -1716,7 +1713,7 @@ impl Interpreter {
                         }
                     }
                     let frame = &mut stack[top_idx];
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.3.7 CreateDataPropertyOrThrow — object literal
@@ -1729,7 +1726,7 @@ impl Interpreter {
                     self.run_define_data_property_regs(
                         context, stack, top_idx, obj_reg, key_reg, value_reg,
                     )?;
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 // §10.2.10 SetFunctionName — names an anonymous
@@ -1791,7 +1788,7 @@ impl Interpreter {
                         )?;
                     }
                     let frame = &mut stack[top_idx];
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.3.31 PrivateGet — brand check (absent name
@@ -1838,7 +1835,7 @@ impl Interpreter {
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.3.32 PrivateSet — brand check, private methods
@@ -1896,7 +1893,7 @@ impl Interpreter {
                         },
                     }
                     let frame = &mut stack[top_idx];
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.1.3 ToNumeric on an already-primitive operand:
@@ -1925,7 +1922,7 @@ impl Interpreter {
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, result)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.1.18 ToObject — wrap a primitive in its
@@ -1946,7 +1943,7 @@ impl Interpreter {
                     let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, value, &[])?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, boxed)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.1.19 ToPropertyKey with full user coercion —
@@ -1975,7 +1972,7 @@ impl Interpreter {
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, key)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §7.3.31 PrivateElementFind own-only — private
@@ -2019,7 +2016,7 @@ impl Interpreter {
                                     .to_string()).into()));
                     }
                     let frame = &mut stack[top_idx];
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 // §13.4.2 UpdateExpression numeric step — ToNumeric
@@ -2061,7 +2058,7 @@ impl Interpreter {
                     };
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, next)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::ValidateGlobalDecl => {
@@ -2151,7 +2148,7 @@ impl Interpreter {
                         self.module_record_mut(&url_arc).status =
                             module_records::ModuleStatus::Evaluated;
                     }
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::ImportMetaResolve => {
@@ -2318,7 +2315,7 @@ impl Interpreter {
                             cold.parked_finally.pop();
                         }
                     }
-                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::JumpViaFinally => {
@@ -2374,7 +2371,7 @@ impl Interpreter {
                             return Ok(value);
                         }
                     } else {
-                        frame.advance_pc(self.current_byte_len)?;
+                        frame.advance_pc()?;
                     }
                     continue;
                 }
@@ -2395,7 +2392,7 @@ impl Interpreter {
                             return Ok(value);
                         }
                     } else {
-                        frame.advance_pc(self.current_byte_len)?;
+                        frame.advance_pc()?;
                     }
                     continue;
                 }
@@ -2410,7 +2407,7 @@ impl Interpreter {
                     if read_register(frame, cond)?.is_nullish() {
                         apply_branch(frame, offset, &self.interrupt)?;
                     } else {
-                        frame.advance_pc(self.current_byte_len)?;
+                        frame.advance_pc()?;
                     }
                     continue;
                 }
@@ -2424,7 +2421,7 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     let value = *read_register(frame, idx as u16)?;
                     write_register(frame, dst, value)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::StoreLocal => {
@@ -2437,7 +2434,7 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     let value = *read_register(frame, src)?;
                     write_register(frame, idx as u16, value)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::TdzError => {
@@ -2626,7 +2623,7 @@ impl Interpreter {
                         .ok_or(VmError::TypeMismatch)?;
                     let n = NumberValue::from_f64(crate::array::len(arr, &self.gc_heap) as f64);
                     write_register(frame, dst, Value::number(n))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::IsArray => {
@@ -2646,7 +2643,7 @@ impl Interpreter {
                     }
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(result))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::IsEvalIntrinsic => {
@@ -2664,7 +2661,7 @@ impl Interpreter {
                     });
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::boolean(is_eval))?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::MakeClosure => {

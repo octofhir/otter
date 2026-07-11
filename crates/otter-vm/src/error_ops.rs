@@ -46,7 +46,7 @@ impl Interpreter {
         self.capture_error_stack_frames(context, stack, obj);
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::object(obj))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -70,7 +70,7 @@ impl Interpreter {
         self.capture_error_stack_frames(context, stack, obj);
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::object(obj))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -168,7 +168,7 @@ impl Interpreter {
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let ctor = self.error_classes.constructor(kind);
         write_register(frame, dst, Value::object(ctor))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
     /// Build a freshly-allocated `TypeError` instance through the live frame

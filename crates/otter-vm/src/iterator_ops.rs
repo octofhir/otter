@@ -141,7 +141,7 @@ impl Interpreter {
             // Already-an-iterator should pass through unchanged.
             let frame = &mut stack[top_idx];
             write_register(frame, dst, Value::iterator(rc))?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         } else {
             return Err(VmError::TypeMismatch);
@@ -149,7 +149,7 @@ impl Interpreter {
         let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::iterator(iter))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -166,7 +166,7 @@ impl Interpreter {
             && handle.is_async(&self.gc_heap)
         {
             write_register(&mut stack[top_idx], dst, value)?;
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return Ok(());
         }
 
@@ -205,7 +205,7 @@ impl Interpreter {
                     return Err(VmError::TypeMismatch);
                 }
                 write_register(&mut stack[top_idx], dst, produced)?;
-                stack[top_idx].advance_pc(self.current_byte_len)?;
+                stack[top_idx].advance_pc()?;
                 return Ok(());
             }
         }
@@ -234,7 +234,7 @@ impl Interpreter {
             let iterator = *read_register(frame, iter_reg)?;
             self.deregister_frame_iterator_closer(frame, iterator);
         }
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -1676,7 +1676,7 @@ impl Interpreter {
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_get_iterator = None;
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return Ok(true);
         }
 
@@ -1862,7 +1862,7 @@ impl Interpreter {
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_iterator_next = None;
             }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return Ok(true);
         }
 
@@ -1898,7 +1898,7 @@ impl Interpreter {
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return Ok(true);
         }
         // Helper-wrapper and RegExp-String iterator states drive
@@ -1920,7 +1920,7 @@ impl Interpreter {
             let (value, done) = self.iterator_next_full(context, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return Ok(true);
         }
         // §23.1.5.1 ArrayIterator `next` performs Get(array, index) —
@@ -1952,7 +1952,7 @@ impl Interpreter {
             };
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(false))?;
-            stack[top_idx].advance_pc(self.current_byte_len)?;
+            stack[top_idx].advance_pc()?;
             return Ok(true);
         }
         // Snapshot the user iterator object out of the inner

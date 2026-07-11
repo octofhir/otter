@@ -96,7 +96,7 @@ impl Interpreter {
             if is_v8_native_eval_hint(&source) {
                 let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                 write_register(frame, dst, Value::undefined())?;
-                frame.advance_pc(self.current_byte_len)?;
+                frame.advance_pc()?;
                 return Ok(());
             }
         }
@@ -149,7 +149,7 @@ impl Interpreter {
         };
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -360,7 +360,7 @@ impl Interpreter {
         let result = self.build_function_constructor_from_parts(parts)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 

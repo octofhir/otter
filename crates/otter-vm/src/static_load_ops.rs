@@ -35,7 +35,7 @@ impl Interpreter {
         let value = math::load_constant(name)
             .ok_or_else(|| self.err_unknown_intrinsic(format!("Math.{name}").into()))?;
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -52,7 +52,7 @@ impl Interpreter {
         let value =
             symbol_dispatch::load_static(self, name).map_err(|e| symbol_to_vm_error(self, e))?;
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 

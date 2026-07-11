@@ -743,12 +743,6 @@ impl Interpreter {
         // under `run` / `run_callable_sync` costs one Vec slot.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
-        // Nested dispatch must not leak its last-instruction byte length
-        // into the caller's PC advance: helpers like Op::Eval invoke
-        // dispatch_loop on a sub-stack and then expect
-        // self.current_byte_len to still describe the *outer* opcode
-        // when they call frame.advance_pc(self.current_byte_len).
-        let saved_byte_len = self.current_byte_len;
         let result = (|| -> Result<Value, VmError> {
             loop {
                 match self.dispatch_loop_inner(context, stack) {
@@ -808,7 +802,6 @@ impl Interpreter {
         drop(extra_roots_guard);
         drop(frame_roots_guard);
         self.finish_runtime_budget_turn();
-        self.current_byte_len = saved_byte_len;
         result
     }
 }

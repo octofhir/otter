@@ -44,7 +44,7 @@ impl Interpreter {
         let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 
@@ -60,7 +60,7 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
         let args = collect_variadic_args(frame, operands, 1, 2)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         self.microtasks.enqueue(Microtask {
             callee,
             this_value: Value::undefined(),
@@ -90,7 +90,7 @@ impl Interpreter {
             promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .construct_stack_rooted(self, stack, &[&executor], &[])?;
         write_register(&mut stack[top_idx], dst, Value::promise(handle))?;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
         args.push(resolve);
         args.push(reject);
@@ -116,7 +116,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let args = collect_variadic_args(&stack[top_idx], operands, 2, 3)?;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         let result = promise_dispatch::statics_call(
             self,
             Some(context.clone()),

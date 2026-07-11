@@ -63,7 +63,7 @@ impl Interpreter {
             .resolve_module_namespace(context, referrer.as_str(), specifier)
             .ok_or_else(|| self.err_unknown_intrinsic(format!("import \"{specifier}\"").into()))?;
         write_register(frame, dst, Value::object(namespace))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -92,7 +92,7 @@ impl Interpreter {
                 self.err_unknown_intrinsic(format!("import * as \"{specifier}\"").into())
             })?;
         write_register(frame, dst, Value::object(namespace))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -127,7 +127,7 @@ impl Interpreter {
             ));
         }
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -158,7 +158,7 @@ impl Interpreter {
         let target_url: std::sync::Arc<str> = std::sync::Arc::from(target.as_str());
         let ns = self.get_or_create_deferred_namespace(target_url)?;
         write_register(frame, dst, Value::object(ns))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -181,7 +181,7 @@ impl Interpreter {
         let gate = self.evaluate_module(context, &url)?;
         let value = gate.map_or_else(Value::undefined, Value::promise);
         write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -1194,7 +1194,7 @@ impl Interpreter {
         let resolved_str =
             JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
         write_register(frame, dst, Value::string(resolved_str))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -1238,7 +1238,7 @@ impl Interpreter {
                         )?;
                         let frame = &mut stack[top_idx];
                         write_register(frame, dst, Value::promise(pending))?;
-                        frame.advance_pc(self.current_byte_len)?;
+                        frame.advance_pc()?;
                         return Ok(());
                     }
                     match self.evaluate_module(context, &target) {
@@ -1340,7 +1340,7 @@ impl Interpreter {
             }
         };
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 }

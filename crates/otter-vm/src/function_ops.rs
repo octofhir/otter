@@ -69,7 +69,7 @@ impl Interpreter {
             )
             .map_err(crate::oom_to_vm)?;
             write_register(frame, dst, Value::closure(closure))?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         // §10.2 — the named-function SELF binding (`function_id` is the
@@ -82,7 +82,7 @@ impl Interpreter {
             && let Some(closure) = self.frame_cold(frame).and_then(|cold| cold.callee_closure)
         {
             write_register(frame, dst, Value::closure(closure))?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         // §10.2 OrdinaryFunctionCreate — every evaluation of a function
@@ -104,7 +104,7 @@ impl Interpreter {
         )
         .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::closure(closure))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -151,7 +151,7 @@ impl Interpreter {
             && let Some(closure) = self.frame_cold(frame).and_then(|cold| cold.callee_closure)
         {
             write_register(frame, dst, Value::closure(closure))?;
-            frame.advance_pc(self.current_byte_len)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(parent_indices.len());
@@ -196,7 +196,7 @@ impl Interpreter {
         )
         .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::closure(closure))?;
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -331,7 +331,7 @@ impl Interpreter {
             let _ = self.define_own_property_partial(prototype, "constructor", constructor_desc)?;
         }
         let frame = &mut stack[frame_idx];
-        frame.advance_pc(self.current_byte_len)?;
+        frame.advance_pc()?;
         Ok(())
     }
 
@@ -524,7 +524,7 @@ impl Interpreter {
             cold.pending_bind_function = None;
         }
         write_register(&mut stack[top_idx], dst, Value::bound_function(bound))?;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 

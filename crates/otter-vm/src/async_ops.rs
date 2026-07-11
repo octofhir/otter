@@ -120,7 +120,7 @@ impl Interpreter {
         }
         // Advance past the Await before parking so resumption
         // continues at the next instruction.
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         let promise = self.await_promise_resolve(context, stack, awaited)?;
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
@@ -157,7 +157,7 @@ impl Interpreter {
         owner: crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
+        stack[top_idx].advance_pc()?;
         let promise = self.await_promise_resolve(context, stack, awaited)?;
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())

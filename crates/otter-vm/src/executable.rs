@@ -219,8 +219,11 @@ impl CodeBlock {
             instructions: self
                 .code
                 .iter()
-                .map(|instr| crate::jit::JitInstructionMetadata {
+                .enumerate()
+                .map(|(index, instr)| crate::jit::JitInstructionMetadata {
                     instruction: instr.clone(),
+                    byte_pc: self.instruction_metadata[index].byte_pc,
+                    byte_len: self.instruction_metadata[index].byte_len,
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can map a `MakeFunction` constant index to its target id.
                     make_self: false,
@@ -275,6 +278,13 @@ impl CodeBlock {
         instructions: &[crate::jit::JitTestInstruction],
     ) -> Arc<Self> {
         let mut overflow_operand_words = Vec::new();
+        let instruction_metadata: Vec<_> = instructions
+            .iter()
+            .map(|instr| ColdInstructionMetadata {
+                byte_pc: instr.byte_pc,
+                byte_len: u32::from(instr.byte_len),
+            })
+            .collect();
         let code: Vec<_> = instructions
             .iter()
             .map(|instr| {
@@ -284,15 +294,13 @@ impl CodeBlock {
                     id,
                     instr.instruction_pc,
                     NO_PROPERTY_IC_SITE,
-                    instr.byte_pc,
-                    instr.byte_len,
                     &mut overflow_operand_words,
                 ))
             })
             .collect();
-        let code_byte_len = code
-            .last()
-            .map_or(0, |instr| instr.byte_pc.saturating_add(instr.byte_len));
+        let code_byte_len = instruction_metadata.last().map_or(0, |metadata| {
+            metadata.byte_pc.saturating_add(metadata.byte_len)
+        });
         Arc::new(Self {
             id,
             param_count,
@@ -317,6 +325,7 @@ impl CodeBlock {
             direct_eval_bindings: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
+            instruction_metadata: instruction_metadata.into_boxed_slice(),
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             byte_spans: Box::new([]),
             code_byte_len,
@@ -341,8 +350,8 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&CodeBlockInstruction> {
         let idx = self
-            .code
-            .binary_search_by_key(&byte_pc, |instr| instr.byte_pc)
+            .instruction_metadata
+            .binary_search_by_key(&byte_pc, |metadata| metadata.byte_pc)
             .ok()?;
         self.code.get(idx).map(Arc::as_ref)
     }
@@ -350,8 +359,8 @@ impl CodeBlock {
     /// Resolve a cold byte-offset PC to its dense instruction index.
     #[must_use]
     pub(crate) fn instr_index_at_byte_pc(&self, byte_pc: u32) -> Option<usize> {
-        self.code
-            .binary_search_by_key(&byte_pc, |instr| instr.byte_pc)
+        self.instruction_metadata
+            .binary_search_by_key(&byte_pc, |metadata| metadata.byte_pc)
             .ok()
     }
 
@@ -359,6 +368,22 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn instr_at_index(&self, index: usize) -> Option<&CodeBlockInstruction> {
         self.code.get(index).map(Arc::as_ref)
+    }
+
+    /// Cold serialized byte PC for one logical instruction index.
+    #[must_use]
+    pub(crate) fn instruction_byte_pc(&self, index: usize) -> Option<u32> {
+        self.instruction_metadata
+            .get(index)
+            .map(|metadata| metadata.byte_pc)
+    }
+
+    /// Cold serialized byte length for one logical instruction index.
+    #[must_use]
+    pub(crate) fn instruction_byte_len(&self, index: usize) -> Option<u32> {
+        self.instruction_metadata
+            .get(index)
+            .map(|metadata| metadata.byte_len)
     }
 
     /// Operands in schema declaration order.
@@ -583,6 +608,8 @@ pub struct CodeBlock {
     pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[Arc<CodeBlockInstruction>]>,
+    /// Cold serialized byte coordinates parallel to `code`.
+    instruction_metadata: Box<[ColdInstructionMetadata]>,
     /// Untagged operand-word side table used only by instructions exceeding the
     /// fixed inline capacity; the opcode schema supplies every word's kind.
     overflow_operand_words: Box<[u32]>,
@@ -593,6 +620,12 @@ pub struct CodeBlock {
     /// the upper bound for jump targets that fall off the end of the
     /// last instruction.
     pub code_byte_len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColdInstructionMetadata {
+    byte_pc: u32,
+    byte_len: u32,
 }
 
 impl CodeBlock {
@@ -611,6 +644,21 @@ impl CodeBlock {
             )
         });
         let mut overflow_operand_words = Vec::new();
+        let instruction_metadata = instr_to_byte_pc
+            .iter()
+            .enumerate()
+            .map(|(index, &byte_pc)| {
+                let next_byte_pc = instr_to_byte_pc
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(code_byte_len);
+                ColdInstructionMetadata {
+                    byte_pc,
+                    byte_len: next_byte_pc - byte_pc,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let code = function
             .code
             .iter()
@@ -632,21 +680,12 @@ impl CodeBlock {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
-                let byte_pc = instr_to_byte_pc[idx];
-                let next_byte_pc = instr_to_byte_pc
-                    .get(idx + 1)
-                    .copied()
-                    .unwrap_or(code_byte_len);
-                let byte_len = u16::try_from(next_byte_pc - byte_pc)
-                    .expect("single instruction exceeds 65535-byte encoding");
                 Arc::new(CodeBlockInstruction::from_operands(
                     instr.op,
                     instr.operands.as_slice().to_vec(),
                     function.id,
                     idx as u32,
                     property_ic_site,
-                    byte_pc,
-                    byte_len,
                     &mut overflow_operand_words,
                 ))
             })
@@ -734,6 +773,7 @@ impl CodeBlock {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
+            instruction_metadata,
             overflow_operand_words: overflow_operand_words.into_boxed_slice(),
             byte_spans,
             code_byte_len,
@@ -781,17 +821,8 @@ pub struct CodeBlockInstruction {
     code_block_id: u32,
     /// Canonical dense instruction index used by interpreter and JIT CFG.
     pub instruction_pc: u32,
-    /// Byte length of this instruction in the encoded stream
-    /// (`opcode` + `operand_count` header + tagged operand bytes).
-    /// `u16` to cover pathological inputs (constant-pool indices that
-    /// occupy multiple varint bytes per operand combined with
-    /// variadic opcodes) — a single instruction can encode up to
-    /// ~640 bytes for `NewArray` over thousands of literals.
-    pub byte_len: u32,
     /// Dense module-local property IC site id for named property ops.
     pub property_ic_site: Option<usize>,
-    /// Byte-offset PC of this instruction in the encoded stream.
-    pub byte_pc: u32,
     /// Number of operands in declaration order.
     operand_count: u8,
     /// Inline untagged operand words for common fixed-width instructions.
@@ -801,22 +832,12 @@ pub struct CodeBlockInstruction {
 }
 
 impl CodeBlockInstruction {
-    /// Byte offset in the serialized stream, retained for source maps,
-    /// profiler/JIT metadata, and native bailout records. Interpreter frames
-    /// use the dense instruction index instead.
-    #[must_use]
-    pub const fn byte_pc(&self) -> u32 {
-        self.byte_pc
-    }
-
     pub(crate) fn from_operands(
         op: Op,
         operands: Vec<Operand>,
         code_block_id: u32,
         instruction_pc: u32,
         property_ic_site: u32,
-        byte_pc: u32,
-        byte_len: u16,
         overflow_operand_words: &mut Vec<u32>,
     ) -> Self {
         let operand_count =
@@ -839,13 +860,11 @@ impl CodeBlockInstruction {
             op,
             code_block_id,
             instruction_pc,
-            byte_len: byte_len as u32,
             property_ic_site: if property_ic_site == NO_PROPERTY_IC_SITE {
                 None
             } else {
                 Some(property_ic_site as usize)
             },
-            byte_pc,
             operand_count,
             inline_operand_words,
             overflow_operand_offset,
@@ -879,12 +898,6 @@ impl CodeBlockInstruction {
         }
         let start = self.overflow_operand_offset as usize;
         overflow_operand_words.get(start + index).copied()
-    }
-
-    /// Byte length of this instruction in the encoded stream.
-    #[must_use]
-    pub const fn byte_len(&self) -> u32 {
-        self.byte_len
     }
 
     /// Dense property IC site index for named property opcodes.

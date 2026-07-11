@@ -155,7 +155,9 @@ impl Interpreter {
                 };
             let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
             let op = instr.op();
-            self.current_byte_len = instr.byte_len();
+            self.current_byte_len = function
+                .instruction_byte_len(idx)
+                .ok_or(VmError::MissingReturn)?;
             // `current_function_id` / `current_byte_pc` exist only to key the
             // optimizing-tier arithmetic type-feedback cell (`note_arith`),
             // which the arith opcode helpers record only when a JIT hook is
@@ -163,7 +165,9 @@ impl Interpreter {
             // per-instruction stores entirely on the interpreter-only path.
             if jit_installed {
                 self.current_function_id = function_id;
-                self.current_byte_pc = instr.byte_pc();
+                self.current_byte_pc = function
+                    .instruction_byte_pc(idx)
+                    .ok_or(VmError::MissingReturn)?;
             }
             // Per-instruction reduction metering. Reductions accumulate exactly
             // as before; the max-stack-depth sample moved to the frame-resolution
@@ -194,7 +198,9 @@ impl Interpreter {
                     frame_depth: stack.len(),
                     function_id,
                     function_name,
-                    byte_pc: instr.byte_pc(),
+                    byte_pc: function
+                        .instruction_byte_pc(idx)
+                        .ok_or(VmError::MissingReturn)?,
                     op,
                     operands: &operands,
                     register_window,

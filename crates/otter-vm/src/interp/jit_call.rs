@@ -34,8 +34,7 @@ impl Interpreter {
     ) -> Result<u32, VmError> {
         context
             .exec_function(fid)
-            .and_then(|function| function.instr_at_index(instruction_pc as usize))
-            .map(|instr| instr.byte_pc())
+            .and_then(|function| function.instruction_byte_pc(instruction_pc as usize))
             .ok_or(VmError::InvalidOperand)
     }
 

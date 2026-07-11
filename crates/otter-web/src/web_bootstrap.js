@@ -302,14 +302,34 @@
   def('EventTarget', EventTarget);
 
   // ---- performance (High Resolution Time, minimal) ----
+  // `Performance` has no constructor (`new Performance()` throws); the
+  // singleton is built by reparenting a bare object onto the prototype,
+  // and its methods read the shared `timeOrigin` closure.
   const timeOrigin = Date.now();
   class Performance {
+    constructor() { throw new TypeError('Illegal constructor'); }
     now() { return Date.now() - timeOrigin; }
     get timeOrigin() { return timeOrigin; }
     toJSON() { return { timeOrigin }; }
   }
   tagged(Performance.prototype, 'Performance');
-  def('performance', new Performance());
+  def('Performance', Performance);
+  def('performance', Object.create(Performance.prototype));
+
+  // ---- Navigator (WinterTC Minimum Common API) ----
+  // The `navigator` singleton is installed eagerly in Rust (see
+  // `install_navigator`) as a plain object carrying `userAgent`. Expose the
+  // `Navigator` class (no constructor) and reparent that same object onto
+  // `Navigator.prototype` in place, so `navigator instanceof Navigator` holds
+  // and the own `userAgent` value is preserved.
+  class Navigator {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  }
+  tagged(Navigator.prototype, 'Navigator');
+  def('Navigator', Navigator);
+  if (global.navigator && Object.getPrototypeOf(global.navigator) === Object.prototype) {
+    Object.setPrototypeOf(global.navigator, Navigator.prototype);
+  }
 
   // ---- TextEncoder / TextDecoder (Encoding §) ----
   // windows-1252 high range (0x80-0x9F) → Unicode; 0xA0-0xFF map 1:1.

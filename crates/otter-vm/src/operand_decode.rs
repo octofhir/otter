@@ -16,18 +16,19 @@
 //! - [`crate::executable`]
 
 use otter_bytecode::Operand;
+use std::borrow::Borrow;
 
 use crate::{Frame, InterruptFlag, VmError};
 
-pub(crate) fn register_operand(operand: Option<&Operand>) -> Result<u16, VmError> {
-    match operand {
+pub(crate) fn register_operand<T: Borrow<Operand>>(operand: Option<T>) -> Result<u16, VmError> {
+    match operand.as_ref().map(Borrow::borrow) {
         Some(Operand::Register(r)) => Ok(*r),
         _ => Err(VmError::InvalidOperand),
     }
 }
 
-pub(crate) fn const_operand(operand: Option<&Operand>) -> Result<u32, VmError> {
-    match operand {
+pub(crate) fn const_operand<T: Borrow<Operand>>(operand: Option<T>) -> Result<u32, VmError> {
+    match operand.as_ref().map(Borrow::borrow) {
         Some(Operand::ConstIndex(k)) => Ok(*k),
         _ => Err(VmError::InvalidOperand),
     }

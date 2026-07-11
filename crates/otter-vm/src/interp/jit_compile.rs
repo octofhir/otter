@@ -361,7 +361,7 @@ impl Interpreter {
             if instr.op != Op::LoadGlobalOrThrow {
                 continue;
             }
-            let Some(Operand::ConstIndex(name_idx)) = code_block.operand(instr, 1).copied() else {
+            let Some(Operand::ConstIndex(name_idx)) = code_block.operand(instr, 1) else {
                 continue;
             };
             let Some(name) = context.string_constant_str_for_function(fid, name_idx) else {
@@ -428,12 +428,12 @@ impl Interpreter {
         let code_block = std::sync::Arc::clone(&view.code_block);
         let reg_op =
             |instr: &jit::JitInstructionMetadata, i: usize| match code_block.operand(instr, i) {
-                Some(Operand::Register(r)) => Some(*r),
+                Some(Operand::Register(r)) => Some(r),
                 _ => None,
             };
         let const_op =
             |instr: &jit::JitInstructionMetadata, i: usize| match code_block.operand(instr, i) {
-                Some(Operand::ConstIndex(n)) => Some(*n),
+                Some(Operand::ConstIndex(n)) => Some(n),
                 _ => None,
             };
         let uses_reg = |instr: &jit::JitInstructionMetadata, reg: u16| {
@@ -1000,10 +1000,8 @@ impl Interpreter {
                 Op::StoreProperty => 1,
                 _ => continue,
             };
-            let otter_bytecode::Operand::ConstIndex(name_idx) = method_view
-                .code_block
-                .operand(instr, name_operand)
-                .copied()?
+            let otter_bytecode::Operand::ConstIndex(name_idx) =
+                method_view.code_block.operand(instr, name_operand)?
             else {
                 return None;
             };

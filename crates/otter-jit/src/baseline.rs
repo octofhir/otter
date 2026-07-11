@@ -2022,7 +2022,7 @@ pub(crate) mod arm64 {
             .instructions
             .iter()
             .filter(|instr| instr.op == Op::CallMethodValue)
-            .filter_map(|instr| const_index(view.code_block.operands(instr), 3).ok())
+            .filter_map(|instr| view.code_block.const_index(instr, 3))
             .find(|&argc| argc as usize > super::MAX_METHOD_ARGS)
         {
             return Err(Unsupported::ArgCount(argc as usize));
@@ -2097,7 +2097,10 @@ pub(crate) mod arm64 {
         let mut loop_headers: BTreeMap<u32, u32> = BTreeMap::new();
         for instr in &view.instructions {
             if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = imm32(view.code_block.operands(instr), 0)?;
+                let rel = view
+                    .code_block
+                    .imm32(instr, 0)
+                    .ok_or(Unsupported::OperandShape("branch offset"))?;
                 let target = branch_target(instr, rel);
                 if target >= 0
                     && target < i64::from(instr.instruction_pc)
@@ -2116,7 +2119,10 @@ pub(crate) mod arm64 {
         let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
         for instr in &view.instructions {
             if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = imm32(view.code_block.operands(instr), 0)?;
+                let rel = view
+                    .code_block
+                    .imm32(instr, 0)
+                    .ok_or(Unsupported::OperandShape("branch offset"))?;
                 let target = branch_target(instr, rel);
                 if let Ok(pc) = u32::try_from(target) {
                     branch_targets.insert(pc);
@@ -2190,7 +2196,8 @@ pub(crate) mod arm64 {
             // exact instruction, preserving committed side effects.
             emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
-            let ops_ref = view.code_block.operands(instr);
+            let operand_values = view.code_block.operands(instr);
+            let ops_ref = operand_values.as_slice();
             match instr.op {
                 Op::LoadInt32 => {
                     let dst = reg(ops_ref, 0)?;
@@ -3498,7 +3505,8 @@ pub(crate) mod arm64 {
         let mut pending = Vec::<u16>::new();
 
         for instr in &callee.instructions {
-            let operands = callee.code_block.operands(instr);
+            let operand_values = callee.code_block.operands(instr);
+            let operands = operand_values.as_slice();
             let mut ok = true;
             match instr.op {
                 Op::LoadLocal | Op::StoreLocal => {}
@@ -3680,7 +3688,8 @@ pub(crate) mod arm64 {
         let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
         let mut store_seen = false;
         for instr in &callee.instructions {
-            let operands = callee.code_block.operands(instr);
+            let operand_values = callee.code_block.operands(instr);
+            let operands = operand_values.as_slice();
             let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
                 regs.get(regn as usize).copied()
             };
@@ -3808,7 +3817,8 @@ pub(crate) mod arm64 {
         clabels: &BTreeMap<u32, DynamicLabel>,
         cage_base: usize,
     ) -> Result<(), Unsupported> {
-        let ops_ref = code_block.operands(instr);
+        let operand_values = code_block.operands(instr);
+        let ops_ref = operand_values.as_slice();
         let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
             let t = branch_target(instr, rel);
             u32::try_from(t)
@@ -4225,7 +4235,8 @@ pub(crate) mod arm64 {
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
     ) -> Result<(), Unsupported> {
-        let ops_ref = code_block.operands(instr);
+        let operand_values = code_block.operands(instr);
+        let ops_ref = operand_values.as_slice();
         match instr.op {
             Op::LoadThis => {
                 let dst = reg(ops_ref, 0)?;

@@ -19,8 +19,10 @@
 //!   metadata, source maps, profiling, and native bailout/OSR records.
 //! - Cold byte-PC lookup binary-searches instruction metadata; no dense reverse
 //!   map is retained in the execution object.
-//! - Fixed operands live inline. Only long schema-variadic instructions use the
-//!   CodeBlock-owned operand side table; no instruction owns an operand box.
+//! - Operand payloads are untagged 32-bit words. Their kinds come exclusively
+//!   from the opcode schema and are decoded through [`CodeBlock`] accessors.
+//! - Fixed operand words live inline. Only long schema-variadic instructions
+//!   use the CodeBlock-owned word side table; no instruction owns an operand box.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
 //!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
 //!   try-handler slots by the serialized verifier.
@@ -272,7 +274,7 @@ impl CodeBlock {
         register_count: u16,
         instructions: &[crate::jit::JitTestInstruction],
     ) -> Arc<Self> {
-        let mut variadic_operands = Vec::new();
+        let mut variadic_operand_words = Vec::new();
         let code: Vec<_> = instructions
             .iter()
             .map(|instr| {
@@ -284,7 +286,7 @@ impl CodeBlock {
                     NO_PROPERTY_IC_SITE,
                     instr.byte_pc,
                     instr.byte_len,
-                    &mut variadic_operands,
+                    &mut variadic_operand_words,
                 ))
             })
             .collect();
@@ -315,7 +317,7 @@ impl CodeBlock {
             direct_eval_bindings: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
-            variadic_operands: variadic_operands.into_boxed_slice(),
+            variadic_operand_words: variadic_operand_words.into_boxed_slice(),
             byte_spans: Box::new([]),
             code_byte_len,
         })
@@ -361,30 +363,39 @@ impl CodeBlock {
 
     /// Operands in schema declaration order.
     #[must_use]
-    pub fn operands<'a>(&'a self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
-        let len = usize::from(instr.operand_count);
-        if instr.variadic_operand_offset == NO_VARIADIC_OPERANDS {
-            return &instr.inline_operands[..len];
-        }
-        let start = instr.variadic_operand_offset as usize;
-        &self.variadic_operands[start..start + len]
+    pub fn operands(&self, instr: &CodeBlockInstruction) -> smallvec::SmallVec<[Operand; 4]> {
+        (0..usize::from(instr.operand_count))
+            .map(|index| {
+                self.operand(instr, index)
+                    .expect("verified CodeBlock operand must decode")
+            })
+            .collect()
     }
 
     /// One schema-typed operand.
     #[must_use]
-    pub fn operand<'a>(
-        &'a self,
-        instr: &'a CodeBlockInstruction,
-        index: usize,
-    ) -> Option<&'a Operand> {
-        self.operands(instr).get(index)
+    pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
+        let word = instr.operand_word(&self.variadic_operand_words, index)?;
+        let shape = otter_bytecode::opcode_schema::opcode_schema(instr.op).operand_shape;
+        let prefix = shape.prefix()?;
+        let kind = prefix
+            .get(index)
+            .map(|spec| spec.kind)
+            .or_else(|| shape.variadic().map(|(_, tail)| tail.kind))?;
+        Some(match kind {
+            otter_bytecode::opcode_schema::OperandKind::Register => {
+                Operand::Register(u16::try_from(word).ok()?)
+            }
+            otter_bytecode::opcode_schema::OperandKind::ConstIndex => Operand::ConstIndex(word),
+            otter_bytecode::opcode_schema::OperandKind::Imm32 => Operand::Imm32(word as i32),
+        })
     }
 
     /// Decode one register operand.
     #[must_use]
     pub fn register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
         match self.operand(instr, index) {
-            Some(Operand::Register(reg)) => Some(*reg),
+            Some(Operand::Register(reg)) => Some(reg),
             _ => None,
         }
     }
@@ -403,7 +414,7 @@ impl CodeBlock {
     #[must_use]
     pub fn const_index(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u32> {
         match self.operand(instr, index) {
-            Some(Operand::ConstIndex(value)) => Some(*value),
+            Some(Operand::ConstIndex(value)) => Some(value),
             _ => None,
         }
     }
@@ -412,7 +423,7 @@ impl CodeBlock {
     #[must_use]
     pub fn imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
         match self.operand(instr, index) {
-            Some(Operand::Imm32(value)) => Some(*value),
+            Some(Operand::Imm32(value)) => Some(value),
             _ => None,
         }
     }
@@ -489,9 +500,9 @@ pub struct CodeBlock {
     pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[Arc<CodeBlockInstruction>]>,
-    /// Operand side table used only by instructions exceeding the fixed inline
-    /// capacity; schema validation guarantees those opcodes are variadic.
-    variadic_operands: Box<[Operand]>,
+    /// Untagged operand-word side table used only by instructions exceeding the
+    /// fixed inline capacity; the opcode schema supplies every word's kind.
+    variadic_operand_words: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
@@ -525,7 +536,7 @@ impl CodeBlock {
                 function.name, function.id, offset
             )
         });
-        let mut variadic_operands = Vec::new();
+        let mut variadic_operand_words = Vec::new();
         let code = verified_code
             .iter()
             .enumerate()
@@ -561,7 +572,7 @@ impl CodeBlock {
                     property_ic_site,
                     byte_pc,
                     byte_len,
-                    &mut variadic_operands,
+                    &mut variadic_operand_words,
                 ))
             })
             .collect::<Vec<_>>()
@@ -648,7 +659,7 @@ impl CodeBlock {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
-            variadic_operands: variadic_operands.into_boxed_slice(),
+            variadic_operand_words: variadic_operand_words.into_boxed_slice(),
             byte_spans,
             code_byte_len,
         }
@@ -698,7 +709,7 @@ pub(crate) struct ExecMappedArgumentBinding {
     pub(crate) storage: ArgumentBindingStorage,
 }
 
-/// Hot dispatch instruction with inline fixed operands.
+/// Hot dispatch instruction with inline schema-typed wordcode operands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CodeBlockInstruction {
@@ -721,8 +732,8 @@ pub struct CodeBlockInstruction {
     pub byte_pc: u32,
     /// Number of operands in declaration order.
     operand_count: u8,
-    /// Inline operand slots for common fixed-width instructions.
-    inline_operands: [Operand; INLINE_OPERAND_CAPACITY],
+    /// Inline untagged operand words for common fixed-width instructions.
+    inline_operand_words: [u32; INLINE_OPERAND_CAPACITY],
     /// Start in the owning CodeBlock side table, or `u32::MAX` for inline data.
     variadic_operand_offset: u32,
 }
@@ -744,13 +755,21 @@ impl CodeBlockInstruction {
         property_ic_site: u32,
         byte_pc: u32,
         byte_len: u16,
-        variadic_operands: &mut Vec<Operand>,
+        variadic_operand_words: &mut Vec<u32>,
     ) -> Self {
         let operand_count =
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
-        let mut inline_operands = [Operand::Imm32(0); INLINE_OPERAND_CAPACITY];
-        let variadic_operand_offset = if operands.len() <= INLINE_OPERAND_CAPACITY {
-            inline_operands[..operands.len()].copy_from_slice(&operands);
+        let operand_words: Vec<u32> = operands
+            .into_iter()
+            .map(|operand| match operand {
+                Operand::Register(value) => u32::from(value),
+                Operand::ConstIndex(value) => value,
+                Operand::Imm32(value) => value as u32,
+            })
+            .collect();
+        let mut inline_operand_words = [0; INLINE_OPERAND_CAPACITY];
+        let variadic_operand_offset = if operand_words.len() <= INLINE_OPERAND_CAPACITY {
+            inline_operand_words[..operand_words.len()].copy_from_slice(&operand_words);
             NO_VARIADIC_OPERANDS
         } else {
             assert!(
@@ -760,9 +779,9 @@ impl CodeBlockInstruction {
                 ),
                 "fixed opcode exceeds inline operand capacity: {op:?}",
             );
-            let offset =
-                u32::try_from(variadic_operands.len()).expect("variadic operand table exceeds u32");
-            variadic_operands.extend_from_slice(&operands);
+            let offset = u32::try_from(variadic_operand_words.len())
+                .expect("variadic operand table exceeds u32");
+            variadic_operand_words.extend_from_slice(&operand_words);
             offset
         };
         Self {
@@ -777,7 +796,7 @@ impl CodeBlockInstruction {
             },
             byte_pc,
             operand_count,
-            inline_operands,
+            inline_operand_words,
             variadic_operand_offset,
         }
     }
@@ -794,11 +813,21 @@ impl CodeBlockInstruction {
         self.code_block_id
     }
 
-    /// Inline operands, or `None` when this instruction uses the variadic table.
+    /// Whether all operand words live in the instruction record.
     #[must_use]
-    pub(crate) fn inline_operands(&self) -> Option<&[Operand]> {
-        (self.variadic_operand_offset == NO_VARIADIC_OPERANDS)
-            .then(|| &self.inline_operands[..usize::from(self.operand_count)])
+    pub(crate) const fn operands_are_inline(&self) -> bool {
+        self.variadic_operand_offset == NO_VARIADIC_OPERANDS
+    }
+
+    fn operand_word(&self, variadic_operand_words: &[u32], index: usize) -> Option<u32> {
+        if index >= usize::from(self.operand_count) {
+            return None;
+        }
+        if self.operands_are_inline() {
+            return self.inline_operand_words.get(index).copied();
+        }
+        let start = self.variadic_operand_offset as usize;
+        variadic_operand_words.get(start + index).copied()
     }
 
     /// Byte length of this instruction in the encoded stream.
@@ -859,19 +888,43 @@ mod tests {
         let instr = &function.code[0];
 
         assert_eq!(instr.op(), Op::Add);
-        assert!(instr.inline_operands().is_some());
+        assert!(instr.operands_are_inline());
+        assert_eq!(std::mem::size_of_val(&instr.inline_operand_words), 16);
         assert_eq!(function.register(instr, 0), Some(0));
         assert_eq!(function.register(instr, 1), Some(1));
         assert_eq!(function.register(instr, 2), Some(2));
         assert_eq!(function.register(instr, 3), None);
         assert_eq!(
-            function.operands(instr),
+            function.operands(instr).as_slice(),
             &[
                 Operand::Register(0),
                 Operand::Register(1),
                 Operand::Register(2)
             ]
         );
+    }
+
+    #[test]
+    fn schema_accessors_round_trip_full_word_payloads() {
+        let function = function(vec![
+            Instruction {
+                pc: 0,
+                op: Op::LoadInt32,
+                operands: vec![Operand::Register(u16::MAX), Operand::Imm32(i32::MIN)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::LoadNumber,
+                operands: vec![Operand::Register(7), Operand::ConstIndex(u32::MAX)].into(),
+            },
+        ]);
+        let executable = ExecutableModule::from_bytecode(&module(function));
+        let function = executable.function(0).unwrap();
+
+        assert_eq!(function.register(&function.code[0], 0), Some(u16::MAX));
+        assert_eq!(function.imm32(&function.code[0], 1), Some(i32::MIN));
+        assert_eq!(function.register(&function.code[1], 0), Some(7));
+        assert_eq!(function.const_index(&function.code[1], 1), Some(u32::MAX));
     }
 
     #[test]
@@ -895,14 +948,14 @@ mod tests {
         let instr = &function.code[0];
 
         assert_eq!(instr.op(), Op::Call);
-        assert!(instr.inline_operands().is_none());
+        assert!(!instr.operands_are_inline());
         assert_eq!(function.register(instr, 0), Some(0));
         assert_eq!(function.register(instr, 1), Some(1));
         assert_eq!(function.const_index(instr, 2), Some(2));
         assert_eq!(function.register(instr, 3), Some(2));
         assert_eq!(function.register(instr, 4), Some(3));
         assert_eq!(function.register(instr, 5), None);
-        assert_eq!(function.operands(instr), operands.as_slice());
+        assert_eq!(function.operands(instr).as_slice(), operands.as_slice());
     }
 
     #[test]
@@ -977,7 +1030,7 @@ mod tests {
         assert!(view.instructions[0].byte_len > 0);
         assert_eq!(view.instructions[0].property_ic_site, Some(0));
         assert_eq!(
-            view.code_block.operands(&view.instructions[0]),
+            view.code_block.operands(&view.instructions[0]).as_slice(),
             &[
                 Operand::Register(0),
                 Operand::Register(1),
@@ -1028,7 +1081,7 @@ mod tests {
         assert_eq!(exec_fn.code.len(), 2);
         assert_eq!(executable.property_ic_site_end(), 1);
         assert_eq!(
-            exec_fn.operands(&exec_fn.code[1]),
+            exec_fn.operands(&exec_fn.code[1]).as_slice(),
             &[
                 Operand::Register(2),
                 Operand::Register(3),

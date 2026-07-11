@@ -240,12 +240,7 @@ impl Interpreter {
             self.jit_osr_disabled.insert((fid, osr_pc));
             return Ok(None);
         };
-        let activation = jit::VmRuntimeActivation {
-            vm: self,
-            stack,
-            context,
-            frame_index: top_idx,
-        };
+        let activation = jit::VmRuntimeActivation::new(self, stack, context, top_idx);
         match code.osr_entry(activation, osr_pc) {
             // No trampoline for this header — it's not an OSR target. Disable
             // just this header and re-arm so another header can still tier up.
@@ -544,12 +539,7 @@ impl Interpreter {
         // borrows (`self`, `stack`, `context`) and are valid for the duration
         // of `run_entry`; the JIT does not retain them, and we do not touch
         // those borrows again until `run_entry` returns.
-        let activation = jit::VmRuntimeActivation {
-            vm: self,
-            stack,
-            context,
-            frame_index: top_idx,
-        };
+        let activation = jit::VmRuntimeActivation::new(self, stack, context, top_idx);
         code.run_entry(activation)
     }
 

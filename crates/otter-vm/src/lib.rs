@@ -210,16 +210,15 @@ pub use js_surface::{
 };
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_abi::{
-    FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameHeader,
-    NativeFrameKind, RuntimeStubAllocContext, RuntimeStubClass, RuntimeStubDescriptor,
-    RuntimeStubId, RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus,
-    STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
-    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_COLLECTION_METHOD_IC,
-    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK, STUB_STRING_CONCAT_ALLOC,
-    SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS,
-    validate_stub_descriptor,
+    FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameKind,
+    RuntimeStubAllocContext, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId,
+    RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus, STUB_COLLECTION_MAP_DELETE_ALLOC,
+    STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
+    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
+    STUB_JIT_COLLECTION_METHOD_IC, STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK,
+    STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind,
+    VARIADIC_STUB_ARGUMENTS, VmFrameHeader, validate_stub_descriptor,
 };
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,

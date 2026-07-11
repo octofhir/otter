@@ -51,8 +51,8 @@ use otter_bytecode::Function;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, abstract_ops,
-    cold_frame::ColdFrameIdx,
+    CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, VmFrameHeader,
+    abstract_ops, cold_frame::ColdFrameIdx,
 };
 
 pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
@@ -190,19 +190,13 @@ impl Clone for FrameRegisters {
 /// plan §M7. Slice 13 promotes the interpreter to a real frame
 /// stack (`HoltStack` inside the dispatcher) so
 /// function calls push and pop without per-call `Vec` allocation.
+#[repr(C, align(8))]
 #[derive(Debug, Clone)]
 pub struct Frame {
-    /// Index into the bytecode container's function table.
-    pub function_id: u32,
-    /// Byte offset into the executable function's encoded stream.
-    pub pc: u32,
+    /// Common interpreter/baseline machine-visible frame prefix.
+    pub header: VmFrameHeader,
     /// Register window for this frame.
     pub registers: FrameRegisters,
-    /// When `Some(reg)`, returning from this frame writes the
-    /// completion value into the **caller's** register `reg` and
-    /// resumes at the caller's next pc. `<main>` carries `None`
-    /// and propagates the value out as the script's completion.
-    pub return_register: Option<u16>,
     /// Captured upvalues for this call. Empty for non-closure
     /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
     /// operands.
@@ -223,13 +217,6 @@ pub struct Frame {
     /// re-pushes it from a microtask once the awaited promise
     /// settles. `None` for ordinary (non-async) frames.
     pub async_state: Option<AsyncFrameState>,
-    /// Handle into the per-interpreter
-    /// [`crate::cold_frame::ColdFramePool`] when this frame has
-    /// acquired a cold side record (try handlers, async parking,
-    /// pending ToPrimitive/bind/iterator ladders, …). `None` until
-    /// the first opcode that needs cold state writes through
-    /// [`crate::Interpreter::frame_ensure_cold`].
-    pub cold: Option<ColdFrameIdx>,
     /// `Some(gen)` when this frame is the suspended body of an
     /// active generator object. [`otter_bytecode::Op::Yield`]
     /// inspects this slot: if set, the running frame is unspooled
@@ -240,6 +227,35 @@ pub struct Frame {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-generator-objects>
     pub generator_owner: Option<crate::generator::JsGenerator>,
+    /// When `Some(reg)`, returning from this frame writes the
+    /// completion value into the **caller's** register `reg` and
+    /// resumes at the caller's next pc. `<main>` carries `None`
+    /// and propagates the value out as the script's completion.
+    pub return_register: Option<u16>,
+    /// Handle into the per-interpreter
+    /// [`crate::cold_frame::ColdFramePool`] when this frame has
+    /// acquired a cold side record (try handlers, async parking,
+    /// pending ToPrimitive/bind/iterator ladders, …). `None` until
+    /// the first opcode that needs cold state writes through
+    /// [`crate::Interpreter::frame_ensure_cold`].
+    pub cold: Option<ColdFrameIdx>,
+}
+
+const _: [(); 0] = [(); std::mem::offset_of!(Frame, header)];
+const _: [(); 16] = [(); std::mem::offset_of!(Frame, registers)];
+
+impl std::ops::Deref for Frame {
+    type Target = VmFrameHeader;
+
+    fn deref(&self) -> &Self::Target {
+        &self.header
+    }
+}
+
+impl std::ops::DerefMut for Frame {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.header
+    }
 }
 
 /// In-flight state for [`Op::GetIterator`] when the source operand
@@ -562,8 +578,7 @@ impl Frame {
             "frame upvalues must include the function's own cells"
         );
         Self {
-            function_id: function.id,
-            pc: 0,
+            header: VmFrameHeader::interpreter(function.id, total as u16),
             registers: FrameRegisters::Owned(registers),
             return_register,
             upvalues,
@@ -613,8 +628,7 @@ impl Frame {
             "frame upvalues must include the function's own cells"
         );
         Self {
-            function_id: function.id,
-            pc: 0,
+            header: VmFrameHeader::interpreter(function.id, function.register_count),
             registers: FrameRegisters::Owned(registers),
             return_register,
             upvalues,
@@ -643,8 +657,7 @@ impl Frame {
             "frame upvalues must include the function's own cells"
         );
         Self {
-            function_id: function.id,
-            pc: 0,
+            header: VmFrameHeader::interpreter(function.id, function.register_count),
             registers: FrameRegisters::Window(window),
             return_register,
             upvalues,

@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`VmThread`] is the only process state generated code receives.
-//! - [`NativeFrameHeader`] is the tier-independent frame prefix.
+//! - [`VmFrameHeader`] is the tier-independent frame prefix.
 //! - [`NativeFrame`] publishes tagged slots and code identity.
 //!
 //! # Invariants
@@ -75,13 +75,13 @@ pub enum NativeFrameKind {
 /// Bitflags attached to a native JS frame header.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NativeFrameFlags(u32);
+pub struct NativeFrameFlags(u8);
 
 impl NativeFrameFlags {
     /// Frame has precise safepoint maps for tagged machine locations.
-    pub const HAS_SAFEPOINTS: u32 = 1 << 0;
+    pub const HAS_SAFEPOINTS: u8 = 1 << 0;
     /// Frame may call back into JS from a runtime stub.
-    pub const MAY_REENTER_JS: u32 = 1 << 1;
+    pub const MAY_REENTER_JS: u8 = 1 << 1;
 
     /// Empty flag set.
     #[must_use]
@@ -91,47 +91,54 @@ impl NativeFrameFlags {
 
     /// Build from raw bits.
     #[must_use]
-    pub const fn from_bits(bits: u32) -> Self {
+    pub const fn from_bits(bits: u8) -> Self {
         Self(bits)
     }
 
     /// Raw flag bits.
     #[must_use]
-    pub const fn bits(self) -> u32 {
+    pub const fn bits(self) -> u8 {
         self.0
     }
 
     /// Whether all `mask` bits are present.
     #[must_use]
-    pub const fn contains(self, mask: u32) -> bool {
+    pub const fn contains(self, mask: u8) -> bool {
         self.0 & mask == mask
     }
 }
 
 /// Fixed prefix shared by interpreter, baseline, and runtime-stub frames.
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeFrameHeader {
-    /// Address of the previous frame, or zero at the stack root.
-    pub previous_frame: u64,
+pub struct VmFrameHeader {
     /// Global VM function id.
     pub function_id: u32,
     /// Immutable code-block id.
     pub code_block_id: u32,
     /// Canonical instruction-index resume PC.
-    pub resume_pc: u32,
-    /// Execution tier owning the frame.
-    pub kind: NativeFrameKind,
-    /// Reserved; zero in layout version 2.
-    pub reserved0: [u8; 3],
-    /// Frame flags.
-    pub flags: NativeFrameFlags,
+    pub pc: u32,
     /// Number of initialized tagged register slots.
     pub register_count: u16,
-    /// Number of argument slots.
-    pub argument_count: u16,
-    /// Dense feedback-vector identity.
-    pub feedback_id: u32,
+    /// Execution tier owning the frame.
+    pub kind: NativeFrameKind,
+    /// Frame flags.
+    pub flags: NativeFrameFlags,
+}
+
+impl VmFrameHeader {
+    /// Interpreter-owned frame header at function entry.
+    #[must_use]
+    pub const fn interpreter(function_id: u32, register_count: u16) -> Self {
+        Self {
+            function_id,
+            code_block_id: function_id,
+            pc: 0,
+            register_count,
+            kind: NativeFrameKind::Interpreter,
+            flags: NativeFrameFlags::empty(),
+        }
+    }
 }
 
 /// Authoritative machine-observed synchronous activation.
@@ -139,7 +146,9 @@ pub struct NativeFrameHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeFrame {
     /// Common tier-independent header.
-    pub header: NativeFrameHeader,
+    pub header: VmFrameHeader,
+    /// Address of the previous frame, or zero at the stack root.
+    pub previous_frame: u64,
     /// Base address of initialized tagged register slots.
     pub register_base: u64,
     /// Base address of overflow arguments, or zero.
@@ -156,22 +165,29 @@ pub struct NativeFrame {
     pub return_register: u32,
     /// Index into cold async/generator/protocol state, or `u32::MAX`.
     pub cold_state_index: u32,
+    /// Number of argument slots.
+    pub argument_count: u16,
+    /// Reserved; zero in layout version 3.
+    pub reserved0: u16,
+    /// Dense feedback-vector identity.
+    pub feedback_id: u32,
 }
 
 const _: [(); 64] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
-const _: [(); 40] = [(); std::mem::size_of::<NativeFrameHeader>()];
-const _: [(); 96] = [(); std::mem::size_of::<NativeFrame>()];
+const _: [(); 16] = [(); std::mem::size_of::<VmFrameHeader>()];
+const _: [(); 88] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
 const _: [(); 40] = [(); std::mem::offset_of!(VmThread, pending_exception_bits)];
 const _: [(); 56] = [(); std::mem::offset_of!(VmThread, layout_version)];
-const _: [(); 16] = [(); std::mem::offset_of!(NativeFrameHeader, resume_pc)];
-const _: [(); 24] = [(); std::mem::offset_of!(NativeFrameHeader, flags)];
-const _: [(); 32] = [(); std::mem::offset_of!(NativeFrameHeader, feedback_id)];
-const _: [(); 40] = [(); std::mem::offset_of!(NativeFrame, register_base)];
-const _: [(); 64] = [(); std::mem::offset_of!(NativeFrame, code_object_id)];
-const _: [(); 88] = [(); std::mem::offset_of!(NativeFrame, return_register)];
+const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
+const _: [(); 12] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
+const _: [(); 15] = [(); std::mem::offset_of!(VmFrameHeader, flags)];
+const _: [(); 24] = [(); std::mem::offset_of!(NativeFrame, register_base)];
+const _: [(); 48] = [(); std::mem::offset_of!(NativeFrame, code_object_id)];
+const _: [(); 72] = [(); std::mem::offset_of!(NativeFrame, return_register)];
+const _: [(); 84] = [(); std::mem::offset_of!(NativeFrame, feedback_id)];
 
 #[cfg(test)]
 mod tests {
@@ -189,5 +205,16 @@ mod tests {
         let flags = NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS);
         assert!(flags.contains(NativeFrameFlags::HAS_SAFEPOINTS));
         assert_eq!(flags.bits(), NativeFrameFlags::HAS_SAFEPOINTS);
+    }
+
+    #[test]
+    fn interpreter_header_uses_common_layout() {
+        let header = VmFrameHeader::interpreter(7, 23);
+        assert_eq!(header.function_id, 7);
+        assert_eq!(header.code_block_id, 7);
+        assert_eq!(header.pc, 0);
+        assert_eq!(header.register_count, 23);
+        assert_eq!(header.kind, NativeFrameKind::Interpreter);
+        assert_eq!(header.flags, NativeFrameFlags::empty());
     }
 }

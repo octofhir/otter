@@ -18,7 +18,7 @@
 //! - [`super::frame::NativeFrame`] for the active code-object id.
 
 /// Native VM ABI layout version.
-pub const VM_LAYOUT_VERSION: u32 = 2;
+pub const VM_LAYOUT_VERSION: u32 = 3;
 /// Runtime-stub table version.
 pub const RUNTIME_STUB_TABLE_VERSION: u32 = 2;
 /// Code-object metadata layout version.

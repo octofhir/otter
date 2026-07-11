@@ -1221,8 +1221,8 @@ fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
 mod tests {
     use super::*;
     use crate::native_abi::{
-        NO_FRAME_STATE, NativeFrame, NativeFrameFlags, NativeFrameHeader, NativeFrameKind,
-        RuntimeStubStatus, TaggedLocation, TaggedLocationKind, VmThread,
+        NO_FRAME_STATE, NativeFrame, NativeFrameFlags, NativeFrameKind, RuntimeStubStatus,
+        TaggedLocation, TaggedLocationKind, VmFrameHeader, VmThread,
     };
     use otter_gc::ExtraRootSource;
 
@@ -1275,18 +1275,15 @@ mod tests {
         }));
         let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation::for_test(vm)));
         let frame = Box::leak(Box::new(NativeFrame {
-            header: NativeFrameHeader {
-                previous_frame: 0,
+            header: VmFrameHeader {
                 function_id: 0,
                 code_block_id: 0,
-                resume_pc: 0,
-                kind: NativeFrameKind::Baseline,
-                reserved0: [0; 3],
-                flags: NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS),
+                pc: 0,
                 register_count: slots.len() as u16,
-                argument_count: 0,
-                feedback_id: 0,
+                kind: NativeFrameKind::Baseline,
+                flags: NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS),
             },
+            previous_frame: 0,
             register_base: slots.as_mut_ptr() as u64,
             argument_base: 0,
             feedback_base: 0,
@@ -1295,6 +1292,9 @@ mod tests {
             new_target_bits: Value::undefined().to_abi_bits(),
             return_register: u32::MAX,
             cold_state_index: u32::MAX,
+            argument_count: 0,
+            reserved0: 0,
+            feedback_id: 0,
         }));
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::from_mut(frame) as u64;

@@ -214,9 +214,10 @@ pub use native_abi::{
     STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF,
     STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC,
     STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC,
-    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK,
-    STUB_JIT_RUNTIME_CALL_METHOD, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
-    TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS, validate_stub_descriptor,
+    STUB_COLLECTION_SET_HAS_LEAF, STUB_JIT_COLLECTION_METHOD_IC,
+    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK, STUB_STRING_CONCAT_ALLOC,
+    SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind, VARIADIC_STUB_ARGUMENTS,
+    validate_stub_descriptor,
 };
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
@@ -429,18 +430,6 @@ pub struct JitRuntimeStats {
     /// JIT method bridge calls that reached generic callable dispatch.
     pub method_generic_calls: u64,
 }
-
-/// Source tier for a compiled `CallMethodValue` runtime bridge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JitRuntimeMethodStubSource {
-    /// Baseline dynasm code emitted the bridge.
-    Baseline,
-    /// Optimizing dynasm code emitted the bridge.
-    Optimizing,
-}
-
-/// Packed method-call bridge site marker for calls without bytecode IC metadata.
-pub const JIT_METHOD_CALL_NO_SITE: u32 = u32::MAX;
 
 /// Snapshot of VM-published collection method IC mirror slots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -1,127 +1,20 @@
-//! JIT runtime bridges for `CallMethodValue` and the collection method IC.
+//! Typed JIT runtime operations for collection and primitive method ICs.
 //!
-//! These methods are called from compiled leaf stubs (JIT off by default) to
-//! resolve and invoke a receiver method, and to build / publish / clear the
-//! per-site collection method inline cache the compiled tier reads. Split out
-//! of the `CallMethodValue` interpreter dispatch in [`super`] for readability.
+//! These methods execute already-guarded leaf/allocating operations and build,
+//! publish, or clear the per-site method IC mirrors read by compiled code.
 
 use smallvec::SmallVec;
 
 use super::{CollectionMethodCallIc, MethodCallIc};
 use crate::holt_stack::HoltStack;
 use crate::native_abi::RuntimeStubId;
-use crate::{ExecutionContext, Interpreter, Value, VmError, read_register, write_register};
+use crate::{Interpreter, Value, VmError, read_register, write_register};
 
 fn compressed_slot_byte(slot: u16) -> u32 {
     u32::from(slot) * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
 }
 
 impl Interpreter {
-    /// JIT bridge for `CallMethodValue` (`recv.name(args…)`) from compiled code.
-    ///
-    /// Resolves the method through the full `[[Get]]` ladder
-    /// ([`Self::get_method_value_for_call`]) and invokes it synchronously with
-    /// `this` = `recv` via [`Self::run_callable_sync`] — the same primitive the
-    /// `Op::Call` bridge uses, so native and ordinary bytecode methods complete
-    /// inline and the result lands in `dst`. The frame PC is saved/restored so a
-    /// later guard bail re-runs the compiled frame from PC 0.
-    ///
-    /// # Errors
-    /// `TypeError` for a nullish receiver, `NotCallable` when the resolved
-    /// property is not callable, plus any error the method itself throws.
-    pub fn jit_runtime_call_method(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
-        dst: u16,
-        recv_reg: u16,
-        name_idx: u32,
-        site: Option<usize>,
-        arg_regs: &[u16],
-        source: crate::JitRuntimeMethodStubSource,
-    ) -> Result<(), VmError> {
-        self.record_jit_runtime_method_stub(source);
-        let recv = *read_register(&stack[frame_index], recv_reg)?;
-        if recv.is_nullish() {
-            let label = if recv.is_null() { "null" } else { "undefined" };
-            return Err(self.err_type((format!("Cannot read properties of {label}")).into()));
-        }
-        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
-        for &r in arg_regs {
-            args.push(*read_register(&stack[frame_index], r)?);
-        }
-        // Cached dense-array builtin: a guard hit dispatches without resolving
-        // the method name, hashing the prototype slot, or string-matching.
-        if let Some(site) = site {
-            if let Some(result) =
-                self.try_array_method_call_ic(context, site, recv, args.as_slice())
-            {
-                let value = result?;
-                self.record_jit_method_array_fast_hit();
-                write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(());
-            }
-            if let Some(result) = self.try_collection_method_call_ic(site, recv, args.as_slice()) {
-                let value = result?;
-                self.record_jit_method_collection_ic_hit();
-                write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(());
-            }
-        }
-        let name = context
-            .string_constant_str_for_function(stack[frame_index].function_id, name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        if let Some(site) = site {
-            if let Some(result) =
-                self.try_fast_array_proto_method(context, site, recv, name, args.as_slice())
-            {
-                let value = result?;
-                self.record_jit_method_array_fast_hit();
-                write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(());
-            }
-            if let Some(result) =
-                self.try_fast_collection_proto_method(site, recv, name, args.as_slice())
-            {
-                let value = result?;
-                self.record_jit_method_fast_collection_hit();
-                write_register(&mut stack[frame_index], dst, value)?;
-                return Ok(());
-            }
-        }
-        if name == "charCodeAt"
-            && recv.is_string()
-            && let Some(result) =
-                self.try_fast_primitive_string_char_code_at(recv, args.as_slice())?
-        {
-            self.record_jit_method_string_fast_hit();
-            write_register(&mut stack[frame_index], dst, result)?;
-            return Ok(());
-        }
-        if name == "toString"
-            && recv.is_number()
-            && let Some(result) = self.try_fast_primitive_number_to_string(recv, args.as_slice())?
-        {
-            self.record_jit_method_number_fast_hit();
-            write_register(&mut stack[frame_index], dst, result)?;
-            return Ok(());
-        }
-        let saved_pc = stack[frame_index].pc;
-        let method = self
-            .get_method_value_for_call(context, stack, recv, name)?
-            .unwrap_or_else(Value::undefined);
-        if !self.is_callable_runtime(&method) {
-            stack[frame_index].pc = saved_pc;
-            return Err(VmError::NotCallable);
-        }
-        self.record_jit_method_generic_call();
-        let result = self.run_callable_sync(context, &method, recv, args)?;
-        stack[frame_index].pc = saved_pc;
-        write_register(&mut stack[frame_index], dst, result)?;
-        Ok(())
-    }
-
     /// Fast non-allocating primitive `String.prototype.charCodeAt` bridge.
     ///
     /// Returns `Ok(true)` only when the receiver is a primitive string, the

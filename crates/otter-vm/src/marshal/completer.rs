@@ -155,7 +155,13 @@ fn settle_from_root<R: IntoJs>(
             interp.microtasks_mut().enqueue(job);
         }
     });
-    let _ = interp.drain_microtasks_with_default(None);
+    // Drain with the settling context as the fallback: the reactions this
+    // settlement unblocks can queue further microtasks of their own (an async
+    // reaction that `await`s again — e.g. `(await fetch(...)).text()`), and
+    // those continuation jobs have no origin context. Falling back to `None`
+    // there aborts the drain mid-chain, stranding the tail; the settling
+    // context lets it run to completion.
+    let _ = interp.drain_microtasks_with_default(context);
 }
 
 /// Build the JS rejection reason for a binding error: a real error

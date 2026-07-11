@@ -166,6 +166,7 @@ impl Interpreter {
             current_byte_pc: 0,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
+            realm_context: None,
             shape_runtime,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),

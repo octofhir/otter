@@ -92,6 +92,12 @@ impl Interpreter {
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
             self.code_space = std::sync::Arc::clone(context.space());
         }
+        // Remember the realm's dispatch context as the universal microtask
+        // fallback. It shares the code space adopted above, so it resolves
+        // function ids for any closure in the realm — a later drain of a
+        // context-less job (async-resume continuation, host-settled reaction)
+        // never strands for want of one.
+        self.realm_context = Some(context.clone());
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
@@ -198,7 +204,16 @@ impl Interpreter {
                         });
                     }
                 }
-                let context = task.context.clone().or_else(|| default_context.clone());
+                // Context resolution is uniform for every drain entry point:
+                // the job's own origin context, else the caller's hint, else
+                // the realm fallback captured in `run`. Only a drain before any
+                // top-level run (no realm context yet) can fail here, which is
+                // an engine invariant violation, not a stranded async chain.
+                let context = task
+                    .context
+                    .clone()
+                    .or_else(|| default_context.clone())
+                    .or_else(|| self.realm_context.clone());
                 let Some(context) = context else {
                     self.microtasks.end_drain();
                     return Err(RunError {

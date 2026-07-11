@@ -218,6 +218,15 @@ impl Interpreter {
         &self.iteration_anchors
     }
 
+    /// Borrow the promise-rejection tracker for GC root tracing. Its two
+    /// handle lists retain rejected promises until the checkpoint reports them.
+    #[must_use]
+    pub(crate) fn rejection_tracker_for_trace(
+        &self,
+    ) -> &crate::promise_rejection::RejectionTracker {
+        &self.rejection_tracker
+    }
+
     /// Push a value onto the iteration-anchor stack. Returns the
     /// new stack depth so the matching pop can sanity-check.
     pub(crate) fn push_iteration_anchor(&mut self, value: Value) -> usize {

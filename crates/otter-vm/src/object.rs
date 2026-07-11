@@ -2969,9 +2969,10 @@ pub(crate) fn ordinary_set_data_property_with_shape(
     next_shape: ShapeHandle,
     append_index: usize,
 ) -> bool {
+    let mut obj = obj;
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
     let success = descriptor_core::ordinary_set_data_property_with_shape(
-        obj,
+        &mut obj,
         heap,
         key,
         value,
@@ -2983,6 +2984,8 @@ pub(crate) fn ordinary_set_data_property_with_shape(
     }
     #[cfg(debug_assertions)]
     if success {
+        // `obj` was relocated in place by the store if the value's compression
+        // scavenged; the assertion reads the live handle.
         debug_assert_appended_shape_slot(obj, heap);
     }
     success

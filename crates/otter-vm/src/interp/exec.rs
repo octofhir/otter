@@ -156,6 +156,35 @@ impl Interpreter {
         &mut self,
         default_context: Option<ExecutionContext>,
     ) -> Result<(), RunError> {
+        // Alternate draining the queue empty with the HTML unhandled-rejection
+        // checkpoint. The checkpoint's reporter/handler can enqueue follow-up
+        // microtasks (and those can reject further promises), so loop until both
+        // the queue and the tracker are quiescent.
+        loop {
+            self.drain_microtask_generations_inner(default_context.clone())?;
+            if !self.promise_rejections_need_checkpoint() {
+                return Ok(());
+            }
+            let context = default_context
+                .clone()
+                .or_else(|| self.realm_context.clone());
+            let Some(context) = context else {
+                // No realm context established yet — the JS reporter cannot run.
+                // Drop the tracked rejections rather than strand them.
+                self.clear_promise_rejection_tracking();
+                return Ok(());
+            };
+            self.run_promise_rejection_checkpoint(&context)?;
+            if !self.microtasks.has_any_pending() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn drain_microtask_generations_inner(
+        &mut self,
+        default_context: Option<ExecutionContext>,
+    ) -> Result<(), RunError> {
         self.record_runtime_microtask_drain_started();
         let mut iters: u32 = 0;
         let mut observed_microtask_budget = false;

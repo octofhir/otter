@@ -81,15 +81,19 @@ pub(super) fn ordinary_set_data_property(
 }
 
 pub(super) fn ordinary_set_data_property_with_shape(
-    obj: JsObject,
+    obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     value: Value,
     next_shape: ShapeHandle,
     append_index: usize,
 ) -> bool {
-    let mut obj = obj;
-    let compressed = super::compress_or_abort(heap, &mut obj, value);
+    // `compress_or_abort` re-reads `obj` after any scavenge its allocation
+    // triggers; propagate that relocated handle back to the caller so its own
+    // post-store reads (write barriers, the debug shape-slot check) observe the
+    // live cell instead of a forwarded one.
+    let compressed = super::compress_or_abort(heap, obj, value);
+    let obj = *obj;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let existing_attrs = existing_offset
         .map(|offset| heap.read_payload(obj, |body| body.slot_attrs(heap, offset as usize)));

@@ -800,8 +800,10 @@
   }
 
   // Mint a Response from the native transport's plain parts, bypassing the
-  // constructor (the values are already validated by the server).
-  function makeResponse(status, statusText, flatHeaders, bodyBytes, finalUrl) {
+  // constructor (the values are already validated by the server). The body is a
+  // streaming ReadableStream whose `pull` reads the next chunk off the socket on
+  // demand, so `response.body` streams and `text()`/`arrayBuffer()` drain it.
+  function makeResponse(status, statusText, flatHeaders, finalUrl, pull) {
     const response = Object.create(Response.prototype);
     const headers = new Headers();
     const list = headers[kHeaderList];
@@ -810,9 +812,22 @@
     }
     initResponse(response, status, statusText, headers, 'basic');
     response[kResponseUrl] = finalUrl;
-    if (bodyBytes !== null && bodyBytes !== undefined && bodyBytes.byteLength > 0) {
-      response[kBodyBytes] = bodyBytes;
-    }
+    response[kBodyStream] = new ReadableStream({
+      async pull(controller) {
+        let chunk;
+        try {
+          chunk = await pull();
+        } catch (error) {
+          controller.error(error);
+          return;
+        }
+        if (chunk === null || chunk === undefined) {
+          controller.close();
+        } else {
+          controller.enqueue(chunk);
+        }
+      },
+    });
     return response;
   }
 

@@ -124,6 +124,55 @@ async fn fetch_performs_buffered_get() -> Result<(), OtterError> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_response_body_is_a_readable_stream() -> Result<(), OtterError> {
+    let (url, server) = spawn_one_shot(|_request| {
+        let body = "chunk-a chunk-b";
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    });
+
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(allow_net())
+        .console_sink(capture.clone())
+        .build()?;
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(format!(
+                r#"
+                fetch("{url}")
+                  .then(async (response) => {{
+                    const isStream = response.body instanceof ReadableStream;
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let text = "";
+                    for (;;) {{
+                      const {{ done, value }} = await reader.read();
+                      if (done) break;
+                      text += decoder.decode(value);
+                    }}
+                    console.log("stream:" + isStream + ":" + text);
+                  }})
+                  .catch((error) => console.log("err:" + error));
+                "#
+            )),
+            "<fetch-stream>",
+        )
+        .await?;
+    server.join().expect("server thread");
+    assert_eq!(
+        capture.snapshot(),
+        vec!["stream:true:chunk-a chunk-b".to_string()]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_forwards_request_body_on_post() -> Result<(), OtterError> {
     let (url, server) = spawn_one_shot(|request| {
         assert!(

@@ -58,7 +58,9 @@ otter_macros::romp! {
         (include_str!("web_streams.js"), defines = [
             "ByteLengthQueuingStrategy", "CompressionStream",
             "CountQueuingStrategy", "DecompressionStream", "ReadableStream",
-            "ReadableStreamDefaultController", "ReadableStreamDefaultReader",
+            "ReadableByteStreamController", "ReadableStreamBYOBReader",
+            "ReadableStreamBYOBRequest", "ReadableStreamDefaultController",
+            "ReadableStreamDefaultReader",
             "TextDecoderStream", "TextEncoderStream", "TransformStream",
             "TransformStreamDefaultController", "WritableStream",
             "WritableStreamDefaultController", "WritableStreamDefaultWriter",

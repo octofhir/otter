@@ -95,6 +95,44 @@ fn native_host_instances_link_class_prototype() {
 }
 
 #[test]
+fn byte_stream_serves_default_and_byob_reads() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        globalThis.out = "pending";
+        const stream = new ReadableStream({
+          type: "bytes",
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            controller.enqueue(new Uint8Array([4, 5]));
+            controller.close();
+          },
+        });
+        // A byte stream's default reader yields Uint8Array chunks.
+        const sync = (stream instanceof ReadableStream) + "";
+        const defaultReader = stream.getReader();
+        (async () => {
+          const a = await defaultReader.read();
+          const first = (a.value instanceof Uint8Array) + ":" + Array.from(a.value).join(",");
+          defaultReader.releaseLock();
+          // A BYOB reader copies bytes into the caller's view.
+          const byob = stream.getReader({ mode: "byob" });
+          const r = await byob.read(new Uint8Array(8));
+          const second = Array.from(r.value).join(",") + ":" + r.value.byteLength;
+          const end = await byob.read(new Uint8Array(8));
+          globalThis.out = sync + "|" + first + "|" + second + "|" + end.done;
+        })();
+        sync
+        "#,
+    );
+    assert_eq!(result, "true");
+    let after = eval_string(&mut runtime, "out");
+    // default read → [1,2,3]; BYOB read → [4,5] (2 bytes); then done.
+    assert_eq!(after, "true|true:1,2,3|4,5:2|true");
+}
+
+#[test]
 fn url_pattern_matches_named_groups_and_wildcards() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
@@ -526,6 +564,9 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "MessageChannel",
       "MessagePort",
       "ReadableStream",
+      "ReadableByteStreamController",
+      "ReadableStreamBYOBReader",
+      "ReadableStreamBYOBRequest",
       "ReadableStreamDefaultController",
       "ReadableStreamDefaultReader",
       "WritableStream",
@@ -561,9 +602,6 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "onrejectionhandled",
     ];
     const NOT_YET = [
-      "ReadableByteStreamController",
-      "ReadableStreamBYOBReader",
-      "ReadableStreamBYOBRequest",
       "WebAssembly",
       "WebAssembly.compile",
       "WebAssembly.compileStreaming",
@@ -650,17 +688,18 @@ fn wintertc_partial_entries_document_their_gap() {
             r#"
         // Each smoke check returns true while the documented gap is still open.
         const GAPS = {
-          // Request bodies are default streams only; no BYOB byte reader yet.
+          // Request bodies are default streams; the spec models them as byte
+          // streams, so a BYOB reader is refused (not a byte stream).
           "Request": () => {
             const b = new Request("https://e.com", { method: "POST", body: "hi" }).body;
             try { b.getReader({ mode: "byob" }); return false; }
-            catch (e) { return String(e.message).includes("byob"); }
+            catch (e) { return String(e.message).includes("non-byte stream"); }
           },
-          // Response bodies are likewise default streams with no BYOB reader.
+          // Response bodies are likewise default (non-byte) streams.
           "Response": () => {
             const b = new Response("x").body;
             try { b.getReader({ mode: "byob" }); return false; }
-            catch (e) { return String(e.message).includes("byob"); }
+            catch (e) { return String(e.message).includes("non-byte stream"); }
           },
           // Only digest is wired on SubtleCrypto; keys/sign/encrypt are absent.
           "crypto.subtle": () => typeof crypto.subtle.encrypt === "undefined"

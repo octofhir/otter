@@ -122,6 +122,9 @@
     read() {
       const s = this[R.stream];
       if (!s) return Promise.reject(new TypeError('Reader released'));
+      if (s[R.controller] instanceof ReadableByteStreamController) {
+        return s[R.controller]._defaultRead();
+      }
       if (s[R.queue].length > 0) {
         const chunk = s[R.queue].shift();
         s[R.queueSize] -= sizeOf(s[R.strategy], chunk);
@@ -164,6 +167,191 @@
     return Promise.resolve(result).then(() => undefined);
   }
 
+  // ---- Byte streams (ReadableStream `type: 'bytes'`) ----
+  // A pragmatic byte stream: `enqueue` copies the view's bytes into a byte
+  // queue that serves both default reads (as Uint8Array) and BYOB reads (copied
+  // into the caller's view). `byobRequest` is surfaced while a BYOB read waits
+  // so a pull source can fill the view directly and `respond`.
+  const kByteQueue = Symbol('byteQueue');
+  const kByteQueueSize = Symbol('byteQueueSize');
+  const kByobReads = Symbol('byobReads');
+  const kByobRequest = Symbol('byobRequest');
+
+  function viewBytes(view) {
+    return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+  }
+  function sameView(view, length) {
+    const Ctor = view.constructor;
+    const elemBytes = view.BYTES_PER_ELEMENT || 1;
+    return new Ctor(view.buffer, view.byteOffset, Math.floor(length / elemBytes));
+  }
+  function pullByte(s) {
+    if (!s[R.started] || s[R.state] !== 'readable' || s[R.pullPromise]) return;
+    const c = s[R.controller];
+    const wants = s[R.readRequests].length > 0 || c[kByobReads].length > 0
+      || s[R.hwm] - c[kByteQueueSize] > 0;
+    if (!wants) return;
+    const source = s[R.source];
+    if (!source || typeof source.pull !== 'function') return;
+    let result;
+    try { result = source.pull(c); } catch (err) { errorStream(s, err); return; }
+    s[R.pullPromise] = Promise.resolve(result).then(
+      () => { s[R.pullPromise] = null; pullByte(s); },
+      (err) => { s[R.pullPromise] = null; errorStream(s, err); });
+  }
+
+  class ReadableStreamBYOBRequest {
+    constructor(controller, view) { this[R.controller] = controller; this._view = view; }
+    get view() { return this._view; }
+    respond(bytesWritten) { this[R.controller]._respond(bytesWritten); }
+    respondWithNewView(view) { this[R.controller]._respondWithView(view); }
+  }
+  Object.defineProperty(ReadableStreamBYOBRequest.prototype, Symbol.toStringTag,
+    { value: 'ReadableStreamBYOBRequest', configurable: true });
+
+  class ReadableByteStreamController {
+    constructor(stream) {
+      this[R.stream] = stream;
+      this[kByteQueue] = [];
+      this[kByteQueueSize] = 0;
+      this[kByobReads] = [];
+      this[kByobRequest] = null;
+    }
+    get desiredSize() {
+      const s = this[R.stream];
+      if (s[R.state] === 'errored') return null;
+      if (s[R.state] === 'closed') return 0;
+      return s[R.hwm] - this[kByteQueueSize];
+    }
+    get byobRequest() { return this[kByobRequest]; }
+    enqueue(chunk) {
+      const s = this[R.stream];
+      if (s[R.state] !== 'readable') throw new TypeError('Cannot enqueue: stream is not readable');
+      if (!ArrayBuffer.isView(chunk)) throw new TypeError('byte stream chunk must be an ArrayBufferView');
+      const bytes = viewBytes(chunk).slice();
+      if (s[R.readRequests].length > 0) {
+        s[R.readRequests].shift().resolve({ value: bytes, done: false });
+      } else if (this[kByobReads].length > 0) {
+        this._fillByob(bytes);
+      } else {
+        this[kByteQueue].push(bytes);
+        this[kByteQueueSize] += bytes.byteLength;
+      }
+      pullByte(s);
+    }
+    close() {
+      const s = this[R.stream];
+      if (s[R.state] !== 'readable') return;
+      s[R.closeRequested] = true;
+      if (this[kByteQueueSize] === 0) {
+        for (const req of this[kByobReads].splice(0)) req.resolve({ value: sameView(req.view, 0), done: true });
+        closeStream(s);
+      }
+    }
+    error(e) { errorStream(this[R.stream], e); }
+
+    _fillByob(bytes) {
+      const req = this[kByobReads].shift();
+      this[kByobRequest] = null;
+      const n = Math.min(req.view.byteLength, bytes.byteLength);
+      viewBytes(req.view).set(bytes.subarray(0, n));
+      if (bytes.byteLength > n) {
+        this[kByteQueue].unshift(bytes.subarray(n));
+        this[kByteQueueSize] += bytes.byteLength - n;
+      }
+      req.resolve({ value: sameView(req.view, n), done: false });
+    }
+    _respond(bytesWritten) {
+      const req = this[kByobReads].shift();
+      this[kByobRequest] = null;
+      if (req) req.resolve({ value: sameView(req.view, Number(bytesWritten)), done: false });
+    }
+    _respondWithView(view) {
+      const req = this[kByobReads].shift();
+      this[kByobRequest] = null;
+      if (req) req.resolve({ value: view, done: false });
+    }
+    _defaultRead() {
+      const s = this[R.stream];
+      if (this[kByteQueueSize] > 0) {
+        const chunk = this[kByteQueue].shift();
+        this[kByteQueueSize] -= chunk.byteLength;
+        if (s[R.closeRequested] && this[kByteQueueSize] === 0) closeStream(s);
+        else pullByte(s);
+        return Promise.resolve({ value: chunk, done: false });
+      }
+      if (s[R.state] === 'closed') return Promise.resolve({ value: undefined, done: true });
+      if (s[R.state] === 'errored') return Promise.reject(s[R.storedError]);
+      const req = deferred();
+      s[R.readRequests].push(req);
+      pullByte(s);
+      return req.promise;
+    }
+    _byobRead(view) {
+      const s = this[R.stream];
+      if (this[kByteQueueSize] > 0) {
+        const chunk = this[kByteQueue].shift();
+        this[kByteQueueSize] -= chunk.byteLength;
+        const n = Math.min(view.byteLength, chunk.byteLength);
+        viewBytes(view).set(chunk.subarray(0, n));
+        if (chunk.byteLength > n) {
+          this[kByteQueue].unshift(chunk.subarray(n));
+          this[kByteQueueSize] += chunk.byteLength - n;
+        }
+        if (s[R.closeRequested] && this[kByteQueueSize] === 0) closeStream(s);
+        return Promise.resolve({ value: sameView(view, n), done: false });
+      }
+      if (s[R.state] === 'closed') return Promise.resolve({ value: sameView(view, 0), done: true });
+      if (s[R.state] === 'errored') return Promise.reject(s[R.storedError]);
+      const req = deferred();
+      req.view = view;
+      this[kByobReads].push(req);
+      this[kByobRequest] = new ReadableStreamBYOBRequest(this, view);
+      pullByte(s);
+      return req.promise;
+    }
+  }
+  Object.defineProperty(ReadableByteStreamController.prototype, Symbol.toStringTag,
+    { value: 'ReadableByteStreamController', configurable: true });
+
+  class ReadableStreamBYOBReader {
+    constructor(stream) {
+      if (!(stream instanceof ReadableStream)) throw new TypeError('Not a ReadableStream');
+      if (!(stream[R.controller] instanceof ReadableByteStreamController)) {
+        throw new TypeError('Cannot get a BYOB reader for a non-byte stream');
+      }
+      if (stream[R.reader]) throw new TypeError('ReadableStream is already locked');
+      this[R.stream] = stream;
+      stream[R.reader] = this;
+      this._closedDeferred = deferred();
+      if (stream[R.state] === 'closed') this._closedDeferred.resolve(undefined);
+      else if (stream[R.state] === 'errored') this._closedDeferred.reject(stream[R.storedError]);
+    }
+    get closed() { return this._closedDeferred ? this._closedDeferred.promise : Promise.reject(new TypeError('released')); }
+    read(view) {
+      const s = this[R.stream];
+      if (!s) return Promise.reject(new TypeError('Reader released'));
+      if (!ArrayBuffer.isView(view)) return Promise.reject(new TypeError('read requires an ArrayBufferView'));
+      if (view.byteLength === 0) return Promise.reject(new TypeError('read view length is zero'));
+      return s[R.controller]._byobRead(view);
+    }
+    cancel(reason) {
+      const s = this[R.stream];
+      if (!s) return Promise.reject(new TypeError('Reader released'));
+      return cancelStream(s, reason);
+    }
+    releaseLock() {
+      const s = this[R.stream];
+      if (!s) return;
+      if (s[R.controller][kByobReads].length > 0) throw new TypeError('Cannot release a reader with pending reads');
+      s[R.reader] = null;
+      this[R.stream] = null;
+      this._closedDeferred = null;
+    }
+  }
+  Object.defineProperty(ReadableStreamBYOBReader.prototype, Symbol.toStringTag,
+    { value: 'ReadableStreamBYOBReader', configurable: true });
+
   class ReadableStream {
     constructor(underlyingSource = {}, strategy = {}) {
       const source = underlyingSource || {};
@@ -179,17 +367,21 @@
       this[R.strategy] = strategy || {};
       this[R.hwm] = strategy && strategy.highWaterMark !== undefined ? Number(strategy.highWaterMark) : 1;
       this[R.started] = false;
-      this[R.controller] = new ReadableStreamDefaultController(this);
+      const isBytes = source.type === 'bytes';
+      this[R.controller] = isBytes
+        ? new ReadableByteStreamController(this)
+        : new ReadableStreamDefaultController(this);
+      const pump = isBytes ? pullByte : pullIfNeeded;
       const startResult = typeof source.start === 'function'
         ? Promise.resolve().then(() => source.start(this[R.controller]))
         : Promise.resolve();
       startResult.then(
-        () => { this[R.started] = true; pullIfNeeded(this); },
+        () => { this[R.started] = true; pump(this); },
         (err) => errorStream(this, err));
     }
     get locked() { return this[R.reader] !== null; }
     getReader(options) {
-      if (options && options.mode === 'byob') throw new TypeError('byob reader not supported');
+      if (options && options.mode === 'byob') return new ReadableStreamBYOBReader(this);
       return new ReadableStreamDefaultReader(this);
     }
     cancel(reason) {
@@ -261,6 +453,9 @@
   def('ReadableStream', ReadableStream);
   def('ReadableStreamDefaultReader', ReadableStreamDefaultReader);
   def('ReadableStreamDefaultController', ReadableStreamDefaultController);
+  def('ReadableByteStreamController', ReadableByteStreamController);
+  def('ReadableStreamBYOBReader', ReadableStreamBYOBReader);
+  def('ReadableStreamBYOBRequest', ReadableStreamBYOBRequest);
 
   // ---- WritableStream ----
   const W = {

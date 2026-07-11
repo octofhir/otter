@@ -29,9 +29,9 @@ use smallvec::SmallVec;
 use crate::{
     AsyncFrameState, CodeBlock, ExecutionContext, Frame, Interpreter, JsObject, NativeCallInfo,
     NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
-    argument_window::BytecodeArgumentWindow, frame_state::UpvalueSpine, is_constructor_runtime,
-    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
-    write_register,
+    argument_window::BytecodeArgumentWindow, executable::OperandView, frame_state::UpvalueSpine,
+    is_constructor_runtime, native_to_vm_error, operand_decode::register_operand, promise_dispatch,
+    read_register, write_register,
 };
 
 struct SyncNativeCallRoots<'a> {
@@ -486,7 +486,7 @@ impl Interpreter {
         current: Value,
         receiver: JsObject,
         new_target: Value,
-        args: &BytecodeArgumentWindow<'_>,
+        args: &BytecodeArgumentWindow<'_, '_>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
         let (function_id, parent_upvalues) =
@@ -724,7 +724,7 @@ impl Interpreter {
         new_target_for_callee: Option<Value>,
         derived_this_cell: Option<crate::UpvalueCell>,
         callee_eval_env: Option<crate::eval_env::EvalEnvHandle>,
-        args: &BytecodeArgumentWindow<'_>,
+        args: &BytecodeArgumentWindow<'_, '_>,
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
     ) -> Result<PreparedBytecodeFrame, VmError> {
@@ -866,7 +866,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
-        operands: &[Operand],
+        operands: OperandView<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
@@ -949,7 +949,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
-        operands: &[Operand],
+        operands: OperandView<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
@@ -1013,16 +1013,17 @@ impl Interpreter {
     /// Handle `Op::Call`: push a new frame for the callee with
     /// arguments copied into the parameter slots and `this` bound
     /// to `Value::undefined()` (foundation strict default).
-    pub(crate) fn do_call(
+    pub(crate) fn do_call<'a>(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
+        let operands = operands.into();
         let dst = register_operand(operands.first())?;
         let callee_reg = register_operand(operands.get(1))?;
         let argc = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n,
+            Some(Operand::ConstIndex(n)) => n,
             _ => return Err(VmError::InvalidOperand),
         };
 
@@ -1074,11 +1075,11 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let callee_reg = register_operand(operands.get(1))?;
         let argc = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
+            Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
         let top_idx = stack.len() - 1;
@@ -1313,16 +1314,17 @@ impl Interpreter {
     /// register receives either the constructor's returned object
     /// or the freshly allocated receiver — `pop_frame` performs
     /// that swap so the unwind path is uniform across call shapes.
-    pub(crate) fn do_construct(
+    pub(crate) fn do_construct<'a>(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
+        let operands = operands.into();
         let dst = register_operand(operands.first())?;
         let callee_reg = register_operand(operands.get(1))?;
         let argc = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n,
+            Some(Operand::ConstIndex(n)) => n,
             _ => return Err(VmError::InvalidOperand),
         };
         let top_idx = stack.len() - 1;
@@ -1352,7 +1354,7 @@ impl Interpreter {
         stack: &mut HoltStack,
         context: &ExecutionContext,
         callee: Value,
-        operands: &[Operand],
+        operands: OperandView<'_>,
         first_arg_operand: usize,
         argc: usize,
         dst: u16,
@@ -1552,7 +1554,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let callee_reg = register_operand(operands.get(1))?;
@@ -1578,7 +1580,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let callee_reg = register_operand(operands.get(1))?;
@@ -1956,7 +1958,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let callee_reg = register_operand(operands.get(1))?;
@@ -1984,13 +1986,13 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: OperandView<'_>,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let callee_reg = register_operand(operands.get(1))?;
         let this_reg = register_operand(operands.get(2))?;
         let argc = match operands.get(3) {
-            Some(&Operand::ConstIndex(n)) => n,
+            Some(Operand::ConstIndex(n)) => n,
             _ => return Err(VmError::InvalidOperand),
         };
         let top_idx = stack.len() - 1;

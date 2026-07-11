@@ -21,24 +21,26 @@
 //! - [`crate::call_ops`]
 //! - [`crate::frame_state::Frame`]
 
-use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
-use crate::{CodeBlock, Frame, Value, VmError, operand_decode::register_operand, read_register};
+use crate::{
+    CodeBlock, Frame, Value, VmError, executable::OperandView, operand_decode::register_operand,
+    read_register,
+};
 
 /// Borrowed view over an opcode's argument-register operands.
-pub(crate) struct BytecodeArgumentWindow<'a> {
-    caller: &'a Frame,
-    operands: &'a [Operand],
+pub(crate) struct BytecodeArgumentWindow<'frame, 'code> {
+    caller: &'frame Frame,
+    operands: OperandView<'code>,
     first_arg_operand: usize,
     len: usize,
 }
 
-impl<'a> BytecodeArgumentWindow<'a> {
+impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
     #[must_use]
     pub(crate) fn new(
-        caller: &'a Frame,
-        operands: &'a [Operand],
+        caller: &'frame Frame,
+        operands: OperandView<'code>,
         first_arg_operand: usize,
         len: usize,
     ) -> Self {
@@ -62,7 +64,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
         read_register(self.caller, register)
     }
 
-    pub(crate) fn contiguous_slice(&self) -> Result<Option<&'a [Value]>, VmError> {
+    pub(crate) fn contiguous_slice(&self) -> Result<Option<&'frame [Value]>, VmError> {
         if self.len == 0 {
             return Ok(Some(&self.caller.registers[0..0]));
         }

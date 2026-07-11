@@ -17,19 +17,15 @@
 //!   slots as roots.
 //!
 //! # See also
-//! - [`crate::frame_state::FrameRegisters`]
+//! - [`crate::frame_state::Frame`]
 //! - [`crate::holt_stack::HoltStack`]
 //! - [`crate::native_abi::NativeFrame`]
 
-use otter_gc::{GcHeap, raw::RawGc};
-use smallvec::SmallVec;
-
 use crate::{Value, VmError};
+use otter_gc::{GcHeap, raw::RawGc};
 
 /// Maximum tagged slots in one native call-chain arena.
 pub(crate) const REGISTER_STACK_CAPACITY: usize = 512 * 1024;
-const DETACHED_WINDOW_BASE: u32 = u32::MAX;
-
 /// C-layout descriptor for one contiguous tagged register window.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,10 +42,6 @@ impl RegisterWindow {
             len: u32::try_from(len).expect("register window length exceeds u32"),
             stack_base,
         }
-    }
-
-    pub(crate) fn detached(base: *mut Value, len: usize) -> Self {
-        Self::attached(base, len, DETACHED_WINDOW_BASE)
     }
 
     /// Base of initialized tagged slots.
@@ -70,14 +62,30 @@ impl RegisterWindow {
         self.len == 0
     }
 
-    /// Slot offset in [`RegisterStack`], or `None` for an owned detached frame.
+    /// Slot offset in [`RegisterStack`]. Every active frame window is attached.
     #[must_use]
-    pub const fn stack_base(self) -> Option<u32> {
-        if self.stack_base == DETACHED_WINDOW_BASE {
-            None
-        } else {
-            Some(self.stack_base)
-        }
+    pub const fn stack_base(self) -> u32 {
+        self.stack_base
+    }
+}
+
+impl std::ops::Deref for RegisterWindow {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: active windows point at initialized slots in the
+        // reservation-stable RegisterStack and are released only after the
+        // owning frame leaves the active stack.
+        unsafe { std::slice::from_raw_parts(self.base, self.len()) }
+    }
+}
+
+impl std::ops::DerefMut for RegisterWindow {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: Frame owns exclusive mutable access to its attached window.
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.len()) }
     }
 }
 
@@ -94,6 +102,42 @@ pub(crate) struct RegisterStack {
     top: usize,
 }
 
+/// Rollback guard for a sequence that may allocate unpublished windows.
+///
+/// The raw pointer avoids borrowing the whole interpreter while frame setup
+/// performs other VM operations. The interpreter is mutably borrowed for the
+/// guard's lexical scope and therefore cannot move; drop only lowers `top`.
+pub(crate) struct RegisterStackCheckpoint {
+    stack: *mut RegisterStack,
+    top: usize,
+    committed: bool,
+}
+
+impl RegisterStackCheckpoint {
+    fn new(stack: &mut RegisterStack) -> Self {
+        Self {
+            stack,
+            top: stack.checkpoint(),
+            committed: false,
+        }
+    }
+
+    /// Transfer ownership of subsequently allocated windows to active frames.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RegisterStackCheckpoint {
+    fn drop(&mut self) {
+        if !self.committed {
+            // SAFETY: constructed from the current interpreter's stable
+            // RegisterStack field; no reference is retained or exposed.
+            unsafe { (*self.stack).restore(self.top) };
+        }
+    }
+}
+
 impl RegisterStack {
     /// Empty lazy arena.
     #[must_use]
@@ -102,6 +146,10 @@ impl RegisterStack {
             slots: Vec::new(),
             top: 0,
         }
+    }
+
+    pub(crate) fn rollback_checkpoint(&mut self) -> RegisterStackCheckpoint {
+        RegisterStackCheckpoint::new(self)
     }
 
     fn ensure_allocated(&mut self) {
@@ -158,14 +206,16 @@ impl RegisterStack {
         self.top = self.top.min(checkpoint);
     }
 
-    /// Copy and release the youngest window when compiled code bails before it
-    /// can publish an interpreter frame.
-    pub(crate) fn take_top(&mut self, count: usize) -> Result<SmallVec<[Value; 8]>, VmError> {
+    /// Describe the youngest already-published window without copying or
+    /// changing the live cursor. Used to materialize interpreter frames after
+    /// a frameless compiled call bails.
+    pub(crate) fn top_window(&mut self, count: usize) -> Result<RegisterWindow, VmError> {
         let base = self.top.checked_sub(count).ok_or(VmError::InvalidOperand)?;
-        let mut values = SmallVec::with_capacity(count);
-        values.extend_from_slice(&self.slots[base..self.top]);
-        self.top = base;
-        Ok(values)
+        Ok(RegisterWindow::attached(
+            self.slots[base..self.top].as_mut_ptr(),
+            count,
+            u32::try_from(base).map_err(|_| VmError::InvalidOperand)?,
+        ))
     }
 
     /// Trace the precisely published tagged prefix.
@@ -207,8 +257,8 @@ mod tests {
         let second = stack.allocate(3).unwrap();
 
         assert_eq!(base, first.as_mut_ptr().cast::<u64>());
-        assert_eq!(first.stack_base(), Some(0));
-        assert_eq!(second.stack_base(), Some(4));
+        assert_eq!(first.stack_base(), 0);
+        assert_eq!(second.stack_base(), 4);
         assert_eq!(stack.base_ptr(), base);
         // SAFETY: both windows are live and initialized by `allocate`.
         unsafe {
@@ -229,24 +279,5 @@ mod tests {
         stack.release(2);
         stack.restore(checkpoint);
         assert_eq!(stack.checkpoint(), 2);
-    }
-
-    #[test]
-    fn take_top_copies_and_releases_bailed_window() {
-        let mut stack = RegisterStack::new();
-        let window = stack.allocate(2).unwrap();
-        // SAFETY: the window is live and exclusively owned by this test.
-        unsafe {
-            *window.as_mut_ptr() = Value::number_i32(7);
-            *window.as_mut_ptr().add(1) = Value::number_i32(11);
-        }
-
-        let values = stack.take_top(2).unwrap();
-        assert_eq!(
-            values.as_slice(),
-            [Value::number_i32(7), Value::number_i32(11)]
-        );
-        assert_eq!(stack.checkpoint(), 0);
-        assert!(matches!(stack.take_top(1), Err(VmError::InvalidOperand)));
     }
 }

@@ -127,6 +127,7 @@ impl Interpreter {
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
         let mut parked = stack.pop().expect("top frame existed");
         let detached_cold = self.frame_detach_cold(&mut parked);
+        let parked = self.park_active_frame(parked);
         let parked =
             crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold)?;
         let outcome = promise.perform_async_resume_then_with_context(
@@ -164,6 +165,7 @@ impl Interpreter {
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
         let mut parked = stack.pop().expect("top frame existed");
         let detached_cold = self.frame_detach_cold(&mut parked);
+        let parked = self.park_active_frame(parked);
         let parked =
             crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold)?;
         let outcome = promise.perform_async_resume_then_with_context(
@@ -184,20 +186,21 @@ impl Interpreter {
     /// `frame`. Mirrors [`Self::run_async_resume`] but settles the
     /// generator's request queue on completion / unhandled
     /// throw rather than the frame's `async_state` promise.
-    // `Box<Frame>` is intentional: the parked frame travels heap-owned
-    // through the microtask queue. Inlining it would require copying
-    // the whole frame on every async-resume dispatch tick.
+    // Box keeps the common Microtask::Call variant compact while ownership
+    // transfers from the queue into this single-shot resume path.
     #[allow(clippy::boxed_local)]
     pub(crate) fn run_async_gen_resume(
         &mut self,
         context: &ExecutionContext,
-        mut frame: Box<Frame>,
+        frame: Box<crate::frame_state::ParkedFrameState>,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
         await_dst: u16,
         fulfilled: bool,
         value: Value,
         owner: crate::generator::JsGenerator,
     ) -> Result<(), RunError> {
+        let _window_rollback = self.register_window_rollback();
+        let mut frame = self.resume_parked_frame(*frame).map_err(RunError::bare)?;
         if let Some(c) = cold {
             self.frame_attach_cold(&mut frame, c);
         }
@@ -213,7 +216,7 @@ impl Interpreter {
             }
         }
         let mut stack: HoltStack = HoltStack::new();
-        stack.push(*frame);
+        stack.push(frame);
         owner.set_async_state(
             &mut self.gc_heap,
             crate::generator::AsyncGeneratorState::Executing,
@@ -339,19 +342,20 @@ impl Interpreter {
     ///   Async frames absorb their own throws via `async_state`,
     ///   so the only errors that escape are runtime-level (OOM,
     ///   stack overflow, interrupt).
-    // Box<Frame>: parked frame travels heap-owned through the
-    // microtask queue; inlining would copy the whole frame on every
-    // tick.
+    // See run_async_gen_resume: the box is a queue-layout decision, not an
+    // allocation introduced by this call boundary.
     #[allow(clippy::boxed_local)]
     pub(crate) fn run_async_resume(
         &mut self,
         context: &ExecutionContext,
-        mut frame: Box<Frame>,
+        frame: Box<crate::frame_state::ParkedFrameState>,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
         await_dst: u16,
         fulfilled: bool,
         value: Value,
     ) -> Result<(), RunError> {
+        let _window_rollback = self.register_window_rollback();
+        let mut frame = self.resume_parked_frame(*frame).map_err(RunError::bare)?;
         if let Some(c) = cold {
             self.frame_attach_cold(&mut frame, c);
         }
@@ -367,7 +371,7 @@ impl Interpreter {
             }
         }
         let mut stack: HoltStack = HoltStack::new();
-        stack.push(*frame);
+        stack.push(frame);
         // The resumed frame and the settlement value must be GC
         // roots *before* `dispatch_loop` registers its own provider:
         // the rejection path below allocates (thrown-value

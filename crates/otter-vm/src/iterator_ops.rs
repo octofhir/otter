@@ -1331,6 +1331,7 @@ impl Interpreter {
         handle: &crate::generator::JsGenerator,
         kind: GeneratorResumeKind,
     ) -> Result<Value, VmError> {
+        let _window_rollback = self.register_window_rollback();
         let (frame_opt, resume_dst) = (
             handle.has_frame(&self.gc_heap),
             handle.resume_dst(&self.gc_heap),
@@ -1359,12 +1360,13 @@ impl Interpreter {
             };
         }
         // Pull the frame out of the gen body so we can mutate it.
-        let (mut frame, cold) = match handle.take_frame(&mut self.gc_heap) {
+        let (frame, cold) = match handle.take_frame(&mut self.gc_heap) {
             Some(pair) => pair,
             None => {
                 return self.make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[]);
             }
         };
+        let mut frame = Box::new(self.resume_parked_frame(*frame)?);
         if let Some(c) = cold {
             self.frame_attach_cold(&mut frame, c);
         }

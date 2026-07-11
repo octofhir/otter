@@ -274,6 +274,7 @@ impl Interpreter {
         context: &ExecutionContext,
         task: Microtask,
     ) -> Result<(), RunError> {
+        let _window_rollback = self.register_window_rollback();
         // Reaction-mode rejection forwarding (§27.2.1.3.2) reads the
         // abrupt completion's [[Value]] from `pending_uncaught_throw`
         // after `dispatch_loop` returns. Clear any stale payload
@@ -502,11 +503,19 @@ impl Interpreter {
                 });
             }
         };
+        let window = self
+            .alloc_reg_window(function.register_count as usize)
+            .map_err(|error| RunError {
+                error,
+                frames: Vec::new(),
+                detail: self.take_error_detail(),
+            })?;
         let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             None, // top-level — no return register
             upvalues,
             this_for_callee,
+            window,
         );
         self.bind_bytecode_call_arguments(function, &mut new_frame, std::mem::take(effective_args))
             .map_err(|error| RunError {
@@ -624,6 +633,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
+        let _window_rollback = self.register_window_rollback();
         let main = context.exec_main();
         let mut stack: HoltStack = HoltStack::new();
         let upvalues =
@@ -634,7 +644,11 @@ impl Interpreter {
         } else {
             Value::object(self.global_this)
         };
-        let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
+        let window = self
+            .alloc_reg_window(main.register_count as usize)
+            .map_err(|error| (error, Vec::new()))?;
+        let entry =
+            Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
         let entry_is_async = main.is_async;
         stack.push(entry);
         // §16.2.1.7 ModuleDeclarationInstantiation step 5 — when the

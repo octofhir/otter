@@ -631,14 +631,16 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?
         };
         let this_for_callee = self.this_for_bytecode_call_runtime_rooted(function, this0, &[])?;
-        let registers = self.draw_registers(usize::from(plan.register_count));
-        let mut callee_frame = HoltCallReservation::from_frame(Frame::with_exec_registers(
-            function,
-            None,
-            upvalues,
-            this_for_callee,
-            registers,
-        ));
+        let window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(usize::from(plan.register_count))?;
+        let mut callee_frame =
+            HoltCallReservation::from_frame(Frame::with_exec_return_upvalues_and_this(
+                function,
+                None,
+                upvalues,
+                this_for_callee,
+                window,
+            ));
         let callee_now = {
             for (dst_slot, &src) in callee_frame
                 .frame_mut()
@@ -683,6 +685,7 @@ impl Interpreter {
         };
 
         let frame_desc = callee_frame.publish(stack);
+        window_rollback.commit();
         Ok(jit::JitPreparedDirectCall {
             entry_addr: plan.entry_addr,
             regs: frame_desc.register_window().as_mut_ptr().cast::<u64>(),
@@ -1198,8 +1201,8 @@ impl Interpreter {
     /// The inline self-call ([`crate::baseline`]) runs a self-recursive callee in
     /// compiled code with its register window in the flat register stack and no
     /// `HoltStack` frame. On a bail it has no frame to resume, so this rebuilds
-    /// one: it copies the live top window (`regcount` slots), pops it off the
-    /// register stack, materializes an interpreter [`Frame`] (self-recursion ⇒
+    /// one: it attaches the live top window (`regcount` slots) to a materialized
+    /// interpreter [`Frame`] (self-recursion ⇒
     /// the function id and upvalue spine come from the caller frame at
     /// `caller_frame_index`), resumes the interpreter at `bail_pc`, and returns
     /// the callee's completion value (the caller's compiled code stores it).
@@ -1211,7 +1214,7 @@ impl Interpreter {
         bail_pc: u32,
         regcount: usize,
     ) -> Result<Value, VmError> {
-        let registers = self.register_stack.take_top(regcount)?;
+        let window = self.register_stack.top_window(regcount)?;
 
         let caller = stack
             .get(caller_frame_index)
@@ -1220,11 +1223,24 @@ impl Interpreter {
         let upvalues = caller.upvalues.clone();
         self.note_jit_entry_bail(fid);
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
-        let mut frame =
-            Frame::with_exec_registers(function, None, upvalues, Value::undefined(), registers);
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            Value::undefined(),
+            window,
+        );
         frame.pc = bail_pc;
+        let initial_stack_len = stack.len();
         stack.push(frame);
-        self.dispatch_loop(context, stack)
+        let result = self.dispatch_loop(context, stack);
+        while stack.len() > initial_stack_len {
+            if let Some(mut frame) = stack.pop() {
+                self.frame_release_cold(&mut frame);
+                self.reclaim_registers(&mut frame);
+            }
+        }
+        result
     }
 
     /// Rebuild and run the interpreter frame for a bridge-free *direct-method*
@@ -1234,8 +1250,8 @@ impl Interpreter {
     /// rebuilt from the method value itself (`callee`, the inline link's SELF
     /// bits — a closure carrying fid + captured spine, or a bare interned
     /// function) with the receiver the inline path bound as `this`. The window
-    /// was built on the flat register stack by emitted code and is popped here
-    /// exactly like the self-call path.
+    /// was built on the flat register stack by emitted code and becomes the
+    /// active frame window exactly like the self-call path.
     pub fn jit_direct_method_call_bail(
         &mut self,
         context: &ExecutionContext,
@@ -1245,7 +1261,7 @@ impl Interpreter {
         callee: Value,
         this: Value,
     ) -> Result<Value, VmError> {
-        let registers = self.register_stack.take_top(regcount)?;
+        let window = self.register_stack.top_window(regcount)?;
 
         let (fid, upvalues) = match callee.as_closure(&self.gc_heap) {
             Some(c) => (
@@ -1260,10 +1276,19 @@ impl Interpreter {
         };
         self.note_jit_entry_bail(fid);
         let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
-        let mut frame = Frame::with_exec_registers(function, None, upvalues, this, registers);
+        let mut frame =
+            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this, window);
         frame.pc = bail_pc;
+        let initial_stack_len = stack.len();
         stack.push(frame);
-        self.dispatch_loop(context, stack)
+        let result = self.dispatch_loop(context, stack);
+        while stack.len() > initial_stack_len {
+            if let Some(mut frame) = stack.pop() {
+                self.frame_release_cold(&mut frame);
+                self.reclaim_registers(&mut frame);
+            }
+        }
+        result
     }
 
     /// Resume a *stack* of inlined callee frames after a guard inside a nested
@@ -1286,6 +1311,8 @@ impl Interpreter {
         stack: &mut HoltStack,
         frames: &[jit::JitResumeFrame],
     ) -> Result<Value, VmError> {
+        let _window_rollback = self.register_window_rollback();
+        let initial_stack_len = stack.len();
         // Build every frame before pushing any: an invalid function id then
         // returns cleanly without leaving a half-pushed reentry on the stack.
         let mut built: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
@@ -1311,8 +1338,8 @@ impl Interpreter {
                         .read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice()),
                     None => Vec::new().into_boxed_slice(),
                 };
-            let registers: smallvec::SmallVec<[Value; 8]> =
-                smallvec::SmallVec::from_slice(&f.registers);
+            let mut window = self.alloc_reg_window(f.registers.len())?;
+            window.copy_from_slice(&f.registers);
             // The bottom (outermost inlined) frame bubbles its result out of the
             // dispatch loop; every frame above it returns into its parent.
             let return_register = if i == 0 {
@@ -1320,8 +1347,13 @@ impl Interpreter {
             } else {
                 Some(f.return_register)
             };
-            let mut frame =
-                Frame::with_exec_registers(function, return_register, upvalues, f.this, registers);
+            let mut frame = Frame::with_exec_return_upvalues_and_this(
+                function,
+                return_register,
+                upvalues,
+                f.this,
+                window,
+            );
             frame.pc = f.callee_pc;
             built.push(frame);
         }
@@ -1331,6 +1363,12 @@ impl Interpreter {
         }
         let result = self.dispatch_loop(context, stack);
         self.leave_sync_reentry();
+        while stack.len() > initial_stack_len {
+            if let Some(mut frame) = stack.pop() {
+                self.frame_release_cold(&mut frame);
+                self.reclaim_registers(&mut frame);
+            }
+        }
         result
     }
 

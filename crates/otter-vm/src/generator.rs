@@ -1,9 +1,8 @@
 //! ECMA-262 §27 Generator and parked-frame state.
 //!
-//! Generator objects and async `await` suspension both park full VM frames off
-//! the active interpreter stack. Those parked states are GC-managed so locals,
-//! register windows, `this`, and pending promise capabilities are ordinary
-//! traceable roots.
+//! Generator objects and async `await` suspension store owned frame snapshots
+//! off the active interpreter stack. Those states contain no register-arena
+//! pointers and are GC-managed roots until resume creates a fresh active window.
 //!
 //! # Contents
 //!
@@ -15,9 +14,8 @@
 //!
 //! - Every operation that reads or mutates a body receives an explicit
 //!   [`otter_gc::GcHeap`].
-//! - Stored frames are isolate-owned. They are traced through the GC
-//!   body and are moved back onto an interpreter stack only by the
-//!   microtask drain.
+//! - Stored states own register snapshots and never retain active windows.
+//! - Resume consumes a stored state before publishing a new active frame.
 //! - A [`ParkedFrame`] is single-shot: the first settling reaction
 //!   takes the frame; the twin reaction observes `None`.
 //!
@@ -27,7 +25,7 @@
 //! - <https://tc39.es/ecma262/#await>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
-use crate::{Frame, GeneratorResumeKind};
+use crate::{GeneratorResumeKind, frame_state::ParkedFrameState};
 use otter_gc::raw::{RawGc, SlotVisitor};
 use std::collections::VecDeque;
 
@@ -78,8 +76,8 @@ pub struct AsyncGeneratorRequest {
 pub struct GeneratorBody {
     /// `Some(frame)` when the generator can still resume; `None`
     /// once done or while an async-generator await owns the frame.
-    #[pelt(via = trace_generator_frame)]
-    pub frame: Option<Box<Frame>>,
+    #[pelt(via = trace_parked_frame_state)]
+    pub frame: Option<Box<ParkedFrameState>>,
     /// Detached cold record for the suspended frame. Acquired by
     /// the interpreter at yield time via
     /// [`crate::Interpreter::frame_detach_cold`]; re-attached on
@@ -128,9 +126,9 @@ pub struct GeneratorBody {
     pub async_state: AsyncGeneratorState,
 }
 
-fn trace_generator_frame(field: &Option<Box<Frame>>, visitor: &mut SlotVisitor<'_>) {
-    if let Some(frame) = field {
-        frame.trace_frame_slots(visitor);
+fn trace_parked_frame_state(field: &Option<Box<ParkedFrameState>>, visitor: &mut SlotVisitor<'_>) {
+    if let Some(state) = field {
+        state.trace_slots(visitor);
     }
 }
 
@@ -168,15 +166,18 @@ fn trace_async_generator_queue(
 #[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = PARKED_FRAME_BODY_TYPE_TAG)]
 pub struct ParkedFrameBody {
-    #[pelt(via = trace_generator_frame)]
-    frame: Option<Box<Frame>>,
+    #[pelt(via = trace_parked_frame_state)]
+    frame: Option<Box<ParkedFrameState>>,
     #[pelt(via = trace_generator_cold)]
     cold: Option<Box<crate::cold_frame::ColdFrame>>,
 }
 
 impl JsGenerator {
     /// Allocate a fresh generator over `frame`.
-    pub fn new(heap: &mut otter_gc::GcHeap, frame: Frame) -> Result<Self, otter_gc::OutOfMemory> {
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        frame: ParkedFrameState,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
         Self::new_with_prototype(heap, frame, None)
     }
 
@@ -184,7 +185,7 @@ impl JsGenerator {
     /// generator prototype.
     pub fn new_with_prototype(
         heap: &mut otter_gc::GcHeap,
-        frame: Frame,
+        frame: ParkedFrameState,
         prototype_override: Option<crate::Value>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
@@ -325,7 +326,10 @@ impl JsGenerator {
     pub fn take_frame(
         &self,
         heap: &mut otter_gc::GcHeap,
-    ) -> Option<(Box<Frame>, Option<Box<crate::cold_frame::ColdFrame>>)> {
+    ) -> Option<(
+        Box<ParkedFrameState>,
+        Option<Box<crate::cold_frame::ColdFrame>>,
+    )> {
         heap.with_payload(self.inner, |body| {
             let frame = body.frame.take()?;
             let cold = body.cold.take();
@@ -337,7 +341,7 @@ impl JsGenerator {
     pub fn park_after_yield(
         &self,
         heap: &mut otter_gc::GcHeap,
-        frame: Frame,
+        frame: ParkedFrameState,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
         resume_dst: u16,
         yielded: crate::Value,
@@ -360,7 +364,7 @@ impl JsGenerator {
     pub fn park_after_yield_delegate(
         &self,
         heap: &mut otter_gc::GcHeap,
-        frame: Frame,
+        frame: ParkedFrameState,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
         kind_dst: u16,
         value_dst: u16,
@@ -407,7 +411,7 @@ impl JsGenerator {
     pub fn park_frame(
         &self,
         heap: &mut otter_gc::GcHeap,
-        frame: Frame,
+        frame: ParkedFrameState,
         cold: Option<Box<crate::cold_frame::ColdFrame>>,
     ) {
         heap.with_payload(self.inner, |body| {
@@ -522,7 +526,7 @@ impl PartialEq for JsGenerator {
 /// frame had no cold state).
 pub fn alloc_parked_frame(
     heap: &mut otter_gc::GcHeap,
-    frame: Frame,
+    frame: ParkedFrameState,
     cold: Option<Box<crate::cold_frame::ColdFrame>>,
 ) -> Result<ParkedFrame, otter_gc::OutOfMemory> {
     heap.alloc_old(ParkedFrameBody {
@@ -536,7 +540,10 @@ pub fn alloc_parked_frame(
 pub fn take_parked_frame(
     parked: ParkedFrame,
     heap: &mut otter_gc::GcHeap,
-) -> Option<(Box<Frame>, Option<Box<crate::cold_frame::ColdFrame>>)> {
+) -> Option<(
+    Box<ParkedFrameState>,
+    Option<Box<crate::cold_frame::ColdFrame>>,
+)> {
     heap.with_payload(parked, |body| {
         let frame = body.frame.take()?;
         let cold = body.cold.take();

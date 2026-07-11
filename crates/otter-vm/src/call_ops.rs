@@ -440,11 +440,14 @@ impl Interpreter {
         } else {
             Value::object(receiver)
         };
+        let window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
             upvalues,
             this_value,
+            window,
         );
         let callee_closure = current.as_closure(&self.gc_heap);
         let derived_this_cell = if is_derived {
@@ -477,6 +480,7 @@ impl Interpreter {
             cold.callee_closure = callee_closure;
         }
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
+        window_rollback.commit();
         Ok(frame)
     }
 
@@ -518,11 +522,14 @@ impl Interpreter {
         } else {
             Value::object(receiver)
         };
+        let window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
             upvalues,
             this_value,
+            window,
         );
         let callee_closure = current.as_closure(&self.gc_heap);
         let extras = args.bind_into(function, &mut frame)?;
@@ -562,6 +569,7 @@ impl Interpreter {
                 cold.incoming_args = extras.incoming_args;
             }
         }
+        window_rollback.commit();
         Ok(frame)
     }
 
@@ -639,20 +647,15 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        let windowed = !function.is_generator && async_state.is_none();
-        let mut new_frame = if windowed {
-            let window = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(function, return_register, upvalues, this_for_callee, window)
-        } else {
-            let registers = self.draw_registers(function.register_count as usize);
-            Frame::with_exec_registers(
-                function,
-                return_register,
-                upvalues,
-                this_for_callee,
-                registers,
-            )
-        };
+        let window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
+        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            return_register,
+            upvalues,
+            this_for_callee,
+            window,
+        );
         new_frame.async_state = async_state;
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
@@ -672,6 +675,7 @@ impl Interpreter {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
             let generator_function_id = function.id;
+            let new_frame = self.park_active_frame(new_frame);
             let gen_handle = crate::generator::JsGenerator::new_with_prototype(
                 &mut self.gc_heap,
                 new_frame,
@@ -684,7 +688,7 @@ impl Interpreter {
             let (frame, cold) = gen_handle
                 .take_frame(&mut self.gc_heap)
                 .ok_or(VmError::InvalidOperand)?;
-            let mut frame = *frame;
+            let mut frame = self.resume_parked_frame(*frame)?;
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
@@ -703,6 +707,7 @@ impl Interpreter {
             return Ok(());
         }
         stack.push(new_frame);
+        window_rollback.commit();
         Ok(())
     }
 
@@ -728,24 +733,15 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
-        // Ordinary calls back their registers with a window into the flat
-        // register stack (one indirection, no per-frame buffer). Generators and
-        // async functions leave the stack (lazy / parked off-stack), so they
-        // keep an inline-owned buffer that survives independent of the cursor.
-        let windowed = !function.is_generator && async_state.is_none();
-        let mut frame = if windowed {
-            let window = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(function, return_register, upvalues, this_for_callee, window)
-        } else {
-            let registers = self.draw_registers(function.register_count as usize);
-            Frame::with_exec_registers(
-                function,
-                return_register,
-                upvalues,
-                this_for_callee,
-                registers,
-            )
-        };
+        let window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
+        let mut frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            return_register,
+            upvalues,
+            this_for_callee,
+            window,
+        );
         frame.async_state = async_state;
         let extras = args.bind_into(function, &mut frame)?;
         if !extras.is_empty() {
@@ -762,13 +758,15 @@ impl Interpreter {
             cold.derived_this_cell = Some(cell);
         }
         self.stash_frame_eval_env(function, &mut frame, callee_eval_env)?;
-        Ok(PreparedBytecodeFrame {
+        let prepared = PreparedBytecodeFrame {
             frame,
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
             generator_function_id: function_id,
             callee_closure: None,
-        })
+        };
+        window_rollback.commit();
+        Ok(prepared)
     }
 
     /// §27.5.1 step 3 / §9.1.14 — resolve a fresh generator's
@@ -817,6 +815,7 @@ impl Interpreter {
         } = prepared;
         if is_generator {
             frame.return_register = None;
+            let frame = self.park_active_frame(frame);
             let gen_handle =
                 crate::generator::JsGenerator::new_with_prototype(&mut self.gc_heap, frame, None)?;
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
@@ -824,7 +823,7 @@ impl Interpreter {
             let (frame, cold) = gen_handle
                 .take_frame(&mut self.gc_heap)
                 .ok_or(VmError::InvalidOperand)?;
-            let mut frame = *frame;
+            let mut frame = self.resume_parked_frame(*frame)?;
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
@@ -2346,17 +2345,15 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
-        // An async frame can suspend on `await`, which moves it off the
-        // active stack; it must therefore own its registers rather than
-        // borrow a stack-tied register window (a window cannot survive
-        // parking). Generators own their registers for the same reason.
-        let mut new_frame = if function.is_generator || is_plain_async {
-            let registers = self.draw_registers(function.register_count as usize);
-            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
-        } else {
-            let window = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(function, None, upvalues, this_for_callee, window)
-        };
+        let _window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
+        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            this_for_callee,
+            window,
+        );
         if let Some(result_promise) = async_result_promise {
             new_frame.async_state = Some(crate::frame_state::AsyncFrameState { result_promise });
         }
@@ -2390,6 +2387,7 @@ impl Interpreter {
         if function.is_generator {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
+            let new_frame = self.park_active_frame(new_frame);
             let gen_handle = crate::generator::JsGenerator::new_with_prototype(
                 &mut self.gc_heap,
                 new_frame,
@@ -2407,7 +2405,7 @@ impl Interpreter {
             let (frame, cold) = gen_handle
                 .take_frame(&mut self.gc_heap)
                 .ok_or(VmError::InvalidOperand)?;
-            let mut frame = *frame;
+            let mut frame = self.resume_parked_frame(*frame)?;
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
@@ -2511,6 +2509,7 @@ impl Interpreter {
         effective_this: Value,
         effective_args: &[Value],
     ) -> Result<Value, VmError> {
+        let window_rollback = self.register_window_rollback();
         // Refresh the GC-live inputs from the traced root every element: the
         // recycled frame is held off-stack between calls and is not itself
         // traced, so its captured upvalues / receiver could be relocated by a
@@ -2565,22 +2564,25 @@ impl Interpreter {
                 let function = context
                     .exec_function(state.function_id)
                     .ok_or(VmError::InvalidOperand)?;
-                let registers = self.draw_registers(register_count);
+                let window = self.alloc_reg_window(register_count)?;
                 let parent_upvalues = parent_upvalues.unwrap_or_else(Frame::empty_upvalues);
-                Frame::with_exec_registers(
+                Frame::with_exec_return_upvalues_and_this(
                     function,
                     None,
                     parent_upvalues,
                     this_for_callee,
-                    registers,
+                    window,
                 )
             }
         };
-        Self::reset_and_bind_lean_bytecode_call_arguments(
+        if let Err(error) = Self::reset_and_bind_lean_bytecode_call_arguments(
             state.param_count,
             &mut frame,
             effective_args,
-        )?;
+        ) {
+            self.reclaim_registers(&mut frame);
+            return Err(error);
+        }
         state.stack.push(frame);
         let top_idx = state.stack.len() - 1;
         match self.run_compiled_frame(&mut state.stack, context, top_idx, code) {
@@ -2588,6 +2590,7 @@ impl Interpreter {
                 // The body ran to completion and left its frame on the stack;
                 // recycle that frame (window + shell) for the next element.
                 state.reuse_frame = state.stack.pop();
+                window_rollback.commit();
                 Ok(value)
             }
             crate::jit::JitExecOutcome::Bailed(pc) => {
@@ -2596,7 +2599,13 @@ impl Interpreter {
                 state.stack[top_idx].pc = pc;
                 self.dispatch_loop(context, &mut state.stack)
             }
-            crate::jit::JitExecOutcome::Threw(err) => Err(err),
+            crate::jit::JitExecOutcome::Threw(err) => {
+                if let Some(mut frame) = state.stack.pop() {
+                    self.frame_release_cold(&mut frame);
+                    self.reclaim_registers(&mut frame);
+                }
+                Err(err)
+            }
         }
     }
 
@@ -2654,13 +2663,15 @@ impl Interpreter {
             this_for_callee,
             &[effective_args],
         )?;
-        let mut new_frame = if function.is_generator {
-            let registers = self.draw_registers(function.register_count as usize);
-            Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
-        } else {
-            let window = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(function, None, upvalues, this_for_callee, window)
-        };
+        let _window_rollback = self.register_window_rollback();
+        let window = self.alloc_reg_window(function.register_count as usize)?;
+        let mut new_frame = Frame::with_exec_return_upvalues_and_this(
+            function,
+            None,
+            upvalues,
+            this_for_callee,
+            window,
+        );
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);

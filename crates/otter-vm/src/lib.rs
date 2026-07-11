@@ -1103,6 +1103,11 @@ pub struct Interpreter {
     /// Live extent of [`Self::reg_stack`] — the top of the JIT call register
     /// stack. `0` whenever no frameless JIT call is in flight.
     reg_top: usize,
+    /// Fixed VM-owned descriptors for native JIT contexts whose scalar binding
+    /// slots must stay visible to a moving collection across safepoints.
+    jit_native_activations: Vec<jit::JitNativeActivation>,
+    /// Live prefix of [`Self::jit_native_activations`].
+    jit_native_activation_top: usize,
     /// Optional per-turn resource policy. This slice records observations but
     /// does not yet yield or reject when a limit is exceeded.
     runtime_budget: RuntimeBudget,

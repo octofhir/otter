@@ -5,12 +5,15 @@
 //! - Typed variadic JIT metadata for arrays, closures, and Math calls.
 //! - Frameless shared-context JIT-to-JIT method calls.
 //! - Store IC misses preserving inherited accessor semantics.
+//! - Native JIT activation roots across allocating safepoints.
 //!
 //! # Invariants
 //! - JIT runtime bridges resolve string/property constants against the executing
 //!   function's chunk, not the caller or ambient module.
 //! - A shaped store cache never overrides the receiver's current `[[Set]]`
 //!   outcome.
+//! - A compiled named function reloads its SELF binding from a GC-traced native
+//!   activation after every allocating runtime ABI call.
 //!
 //! # See also
 //! - `otter_vm::global_ops`
@@ -162,6 +165,33 @@ fn hot_store_property_does_not_bypass_inherited_setter() {
     let mut runtime = Runtime::builder().build().expect("runtime");
     let completion = runtime
         .run_script(SourceInput::from_javascript(source), "<jit-store-setter>")
+        .expect("script")
+        .completion_string()
+        .to_string();
+    assert_eq!(completion, "ok");
+}
+
+#[test]
+fn hot_named_self_survives_allocating_jit_safepoint() {
+    let source = r#"
+        function named() {
+            const allocation = { value: 1 };
+            if (allocation.value !== 1) throw new Error("bad allocation");
+            return named;
+        }
+
+        for (let i = 0; i < 200; i++) {
+            if (named() !== named) throw new Error("stale named self binding");
+        }
+        "ok";
+    "#;
+
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(source),
+            "<jit-native-activation>",
+        )
         .expect("script")
         .completion_string()
         .to_string();

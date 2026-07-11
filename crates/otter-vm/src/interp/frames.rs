@@ -123,6 +123,53 @@ impl Interpreter {
         &mut self.reg_top
     }
 
+    /// Publish the binding scalar slots of a live native JIT context for GC.
+    ///
+    /// # Safety
+    /// Both pointers must name writable boxed-`Value` slots in a native context
+    /// that remains live until the matching [`Self::jit_pop_native_activation`].
+    pub unsafe fn jit_push_native_activation(
+        &mut self,
+        self_slot: *mut u64,
+        this_slot: *mut u64,
+    ) -> Result<(), VmError> {
+        if self.jit_native_activation_top >= self.jit_native_activations.len() {
+            return Err(VmError::StackOverflow {
+                limit: self.max_stack_depth,
+            });
+        }
+        self.jit_native_activations[self.jit_native_activation_top] = jit::JitNativeActivation {
+            self_slot,
+            this_slot,
+        };
+        self.jit_native_activation_top += 1;
+        Ok(())
+    }
+
+    /// Unpublish the most recently pushed native JIT activation.
+    #[inline]
+    pub fn jit_pop_native_activation(&mut self) {
+        debug_assert!(self.jit_native_activation_top > 0);
+        self.jit_native_activation_top -= 1;
+        self.jit_native_activations[self.jit_native_activation_top] =
+            jit::JitNativeActivation::EMPTY;
+    }
+
+    /// Trace the scalar SELF/`this` fields of every native activation currently
+    /// capable of crossing a safepoint.
+    pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        for activation in &self.jit_native_activations[..self.jit_native_activation_top] {
+            for slot in [activation.self_slot, activation.this_slot] {
+                if !slot.is_null() {
+                    // SAFETY: publication requires the native context to remain
+                    // live; `Value::trace_value_slots` updates its low-word GC
+                    // offset in place when the referent moves.
+                    unsafe { (&*slot.cast::<Value>()).trace_value_slots(visitor) };
+                }
+            }
+        }
+    }
+
     /// Address of synchronous reentry depth shared by framed and frameless JIT
     /// calls. Emitted code checks and updates it around native recursion.
     pub fn jit_sync_reentry_depth_ptr(&mut self) -> *mut u32 {

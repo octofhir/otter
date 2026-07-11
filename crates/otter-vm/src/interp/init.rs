@@ -220,6 +220,11 @@ impl Interpreter {
             holt_pool: Vec::new(),
             reg_stack: Vec::new(),
             reg_top: 0,
+            jit_native_activations: vec![
+                jit::JitNativeActivation::EMPTY;
+                DEFAULT_MAX_STACK_DEPTH as usize
+            ],
+            jit_native_activation_top: 0,
             runtime_budget: RuntimeBudget::default(),
             runtime_budget_stats: RuntimeBudgetStats::default(),
             runtime_budget_depth: 0,

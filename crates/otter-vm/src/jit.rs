@@ -447,6 +447,35 @@ pub struct JitDirectCallPlan {
     pub register_count: u16,
 }
 
+/// VM-owned root descriptor for one native JIT activation.
+///
+/// The slots point into the activation's live native [`JitCtx`](crate-local ABI)
+/// record. The descriptor owns no executable state and copies no `Value`: the
+/// collector rewrites the exact scalar fields machine code will reload after a
+/// safepoint.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct JitNativeActivation {
+    /// Address of the boxed SELF binding bits.
+    pub self_slot: *mut u64,
+    /// Address of the boxed `this` binding bits.
+    pub this_slot: *mut u64,
+}
+
+impl JitNativeActivation {
+    /// Empty inactive descriptor.
+    pub const EMPTY: Self = Self {
+        self_slot: std::ptr::null_mut(),
+        this_slot: std::ptr::null_mut(),
+    };
+}
+
+// The descriptor is an opaque pointer carrier. Dereferencing occurs only under
+// `Interpreter`'s single-threaded execution contract; it does not make the VM
+// itself transferable (the heap and value handles remain `!Send`/`!Sync`).
+unsafe impl Send for JitNativeActivation {}
+unsafe impl Sync for JitNativeActivation {}
+
 /// Prepared direct-call entry state returned by the VM to emitted code.
 ///
 /// The frame has already been published onto the active [`JitFrameStack`], so

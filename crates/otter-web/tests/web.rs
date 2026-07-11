@@ -520,10 +520,17 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "crypto.subtle.digest",
       "structuredClone",
     ];
-    const NOT_YET = [
+    // Omitted by design per ECMA-429 §6: Otter's global object is not a
+    // Window/Worker EventTarget, so the global event-handler IDL attributes are
+    // not exposed. The documented alternative reporting mechanism is
+    // `reportError` (→ console) plus uncaught exceptions/rejections surfacing as
+    // runtime diagnostics. These must stay absent.
+    const OMITTED = [
       "onerror",
       "onunhandledrejection",
       "onrejectionhandled",
+    ];
+    const NOT_YET = [
       "ReadableByteStreamController",
       "ReadableStreamBYOBReader",
       "ReadableStreamBYOBRequest",
@@ -572,7 +579,7 @@ fn wintertc_minimum_common_api_ledger() {
             r#"
         const problems = [];
         const seen = new Map();
-        for (const [bucket, list] of [["SUPPORTED", SUPPORTED], ["PARTIAL", PARTIAL], ["NOT_YET", NOT_YET]]) {
+        for (const [bucket, list] of [["SUPPORTED", SUPPORTED], ["PARTIAL", PARTIAL], ["NOT_YET", NOT_YET], ["OMITTED", OMITTED]]) {
           for (const name of list) {
             if (seen.has(name)) problems.push("duplicate ledger entry: " + name + " in " + seen.get(name) + " and " + bucket);
             seen.set(name, bucket);
@@ -587,6 +594,11 @@ fn wintertc_minimum_common_api_ledger() {
         for (const name of NOT_YET) {
           if (lookup(name) !== undefined) {
             problems.push("implemented but listed NOT_YET (promote it): " + name);
+          }
+        }
+        for (const name of OMITTED) {
+          if (lookup(name) !== undefined) {
+            problems.push("OMITTED-by-design API is present: " + name);
           }
         }
         problems.join("; ")

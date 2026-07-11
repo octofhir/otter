@@ -711,58 +711,6 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, shape: u32, value_byte: u32)
     }
 }
 
-/// Bridge stub: perform a named `LoadProperty` from compiled code, delegating
-/// to the safe [`Interpreter::jit_runtime_load_property`]. Returns `0` on
-/// success, `1` when the read threw (error parked in `ctx`). `cell` is this
-/// site's [`WhiskerIcCell`] address (or `0`): on a monomorphic own-data
-/// inline-slot hit the VM returns a packed fill which this stub writes into the
-/// cell so the next load inlines.
-extern "C" fn jit_load_prop_stub(
-    ctx: *mut JitCtx,
-    dst: u64,
-    obj: u64,
-    name_idx: u64,
-    site: u64,
-    cell: u64,
-    function_id: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_load_property(
-        context,
-        stack,
-        ctx.frame_index,
-        function_id as u32,
-        dst as u16,
-        obj as u16,
-        name_idx as u32,
-        site as usize,
-    ) {
-        Ok(fill) => {
-            // Low 32 = cached shape offset (non-zero validity flag), high 32 =
-            // value byte offset. Write `value_byte` before `shape` so the
-            // inline guard never observes a live shape with a stale offset.
-            if cell != 0 && fill != 0 {
-                let cell = cell as *mut WhiskerIcCell;
-                // SAFETY: `cell` is a stable address baked into this site's
-                // emitted code from the owning `BaselineCode::load_ic_cells`
-                // slice, which outlives every execution of this code.
-                unsafe {
-                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
-                }
-            }
-            0
-        }
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
 /// Frameless `LoadProperty` miss handler for a self-recursive callee running on
 /// the flat register window (no `HoltStack` frame). Resolves the own-data IC
 /// directly against `ctx.regs`; returns `0` on an inline-eligible hit (value
@@ -1145,7 +1093,7 @@ pub struct BaselineCode {
     /// loop OSR uses it.
     osr_only: bool,
     /// Stable backing store for the WhiskerIC `LoadProperty` cells — one per
-    /// `LoadProperty` op, self-patched by [`jit_load_prop_stub`]. Emitted code
+    /// `LoadProperty` op, self-patched by [`jit_load_prop_window_stub`]. Emitted code
     /// holds raw addresses into this slice, so it must never be moved out or
     /// cloned after `compile` returns (the code object is only ever shared by
     /// `Arc`, never cloned by value). Boxed so the buffer address is fixed.
@@ -1402,7 +1350,7 @@ pub(crate) mod arm64 {
         jit_define_own_property_stub, jit_direct_method_call_bail_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
         jit_fresh_upvalue_stub, jit_inline_closure_upvalues_stub, jit_load_builtin_error_stub,
-        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_window_stub,
         jit_load_string_stub, jit_load_upvalue_stub, jit_make_closure_stub, jit_make_fn_stub,
         jit_math_call_stub, jit_neg_stub, jit_new_array_stub, jit_new_object_stub,
         jit_pop_native_activation_stub, jit_prepare_direct_method_call_stub,
@@ -2191,7 +2139,7 @@ pub(crate) mod arm64 {
 
         // One self-patching WhiskerIC cell per `LoadProperty` op. Allocated up
         // front (stable boxed buffer) so each site can bake its cell address;
-        // filled at runtime by `jit_load_prop_stub` on a monomorphic own-data
+        // filled at runtime by `jit_load_prop_window_stub` on a monomorphic own-data
         // inline-slot hit. `as_mut_ptr` gives a write-provenance base that
         // outlives every execution (the buffer is owned by the returned
         // `BaselineCode` and never re-formed as a `&[_]` slice).
@@ -2850,7 +2798,7 @@ pub(crate) mod arm64 {
                     store_reg(&mut ops, 9, dst)?;
                 }
                 Op::LoadProperty => {
-                    // jit_load_prop_stub(ctx=x20, dst, obj, name_idx, site, cell).
+                    // jit_load_prop_window_stub(ctx=x20, dst, obj, name_idx, site, cell).
                     // `site` is the dense IC index from the snapshot, used by
                     // the bridge for the monomorphic fast path (PC-keyed lookup
                     // is unavailable at PC 0); `usize::MAX` means "no site".
@@ -2987,24 +2935,19 @@ pub(crate) mod arm64 {
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
                     emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
-                    if self_call_safe {
-                        // Frameless-eligible body: the miss handler resolves the
-                        // own-data IC against the register window (works framed
-                        // or frameless) and signals a bail for the rare slow
-                        // `[[Get]]`, so no `frame_index`-keyed stub is needed and
-                        // this body's self-calls can run frameless.
-                        emit_load_u64(&mut ops, 16, jit_load_prop_window_stub as *const () as u64);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; blr x16
-                            ; cmp x0, #1
-                            ; b.eq =>threw
-                            ; cmp x0, #2
-                            ; b.eq =>bail
-                        );
-                    } else {
-                        emit_call_stub(&mut ops, jit_load_prop_stub as *const () as usize, threw);
-                    }
+                    // The typed window operation handles only own-data IC
+                    // resolution and self-patching. Full `[[Get]]` semantics
+                    // bail to normal dispatch instead of re-entering one
+                    // interpreter opcode through a framed bridge.
+                    emit_load_u64(&mut ops, 16, jit_load_prop_window_stub as *const () as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>bail
+                    );
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::StoreProperty => {

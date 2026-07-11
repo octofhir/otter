@@ -591,6 +591,10 @@ pub struct JitGcBarrierLayout {
 pub struct JitInstructionMetadata {
     /// Shared instruction owned by [`JitCompileSnapshot::code_block`].
     pub instruction: Arc<CodeBlockInstruction>,
+    /// Cold serialized byte PC used by bailout/profiling metadata.
+    pub byte_pc: u32,
+    /// Cold serialized byte length used by bailout/profiling metadata.
+    pub byte_len: u32,
     /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
     /// being compiled (the named-function SELF binding). The emitter
     /// materializes it as a direct read of the frame's own closure (carried in
@@ -674,9 +678,15 @@ pub struct JitInstructionMetadata {
 }
 
 impl JitInstructionMetadata {
-    fn without_feedback(instruction: Arc<CodeBlockInstruction>) -> Self {
+    fn without_feedback(
+        instruction: Arc<CodeBlockInstruction>,
+        byte_pc: u32,
+        byte_len: u32,
+    ) -> Self {
         Self {
             instruction,
+            byte_pc,
+            byte_len,
             make_self: false,
             load_array_length: false,
             method_hint: JitMethodHint::None,
@@ -746,8 +756,18 @@ impl JitCompileSnapshot {
         let instructions = code_block
             .code
             .iter()
-            .cloned()
-            .map(JitInstructionMetadata::without_feedback)
+            .enumerate()
+            .map(|(index, instruction)| {
+                JitInstructionMetadata::without_feedback(
+                    Arc::clone(instruction),
+                    code_block
+                        .instruction_byte_pc(index)
+                        .expect("test CodeBlock metadata matches instructions"),
+                    code_block
+                        .instruction_byte_len(index)
+                        .expect("test CodeBlock metadata matches instructions"),
+                )
+            })
             .collect();
         Self {
             code_block,

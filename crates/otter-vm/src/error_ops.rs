@@ -458,8 +458,7 @@ pub(crate) fn snapshot_frames(
                 .map(|fun| fun.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string());
             let byte_pc = exec_function
-                .and_then(|fun| fun.instr_at_index(f.pc as usize))
-                .map(|instr| instr.byte_pc())
+                .and_then(|fun| fun.instruction_byte_pc(f.pc as usize))
                 .unwrap_or(0);
             // `byte_spans` is sorted by `pc`. `partition_point` finds
             // the predecessor entry (largest `pc <= byte_pc`), so

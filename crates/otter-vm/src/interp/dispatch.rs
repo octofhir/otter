@@ -2265,17 +2265,11 @@ impl Interpreter {
                     continue;
                 }
                 Op::EnterTry => {
-                    let catch_off = context
-                        .exec_imm32(instr, 0)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let finally_off = context
-                        .exec_imm32(instr, 1)
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let exc_register = context
-                        .exec_register(instr, 2)
+                    let region = context
+                        .exec_exception_region(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_enter_try_regs(frame, catch_off, finally_off, exc_register)?;
+                    self.run_enter_try_region(frame, region)?;
                     continue;
                 }
                 Op::LeaveTry => {

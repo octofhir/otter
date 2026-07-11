@@ -283,40 +283,30 @@ impl Interpreter {
         let Some(view) = context.jit_compile_snapshot(fid) else {
             return true;
         };
-        Self::osr_bail_inside_target_loop_instructions(
-            &view.code_block,
-            &view.instructions,
-            osr_pc,
-            bail_pc,
-        )
+        Self::osr_bail_inside_target_loop_instructions(&view.code_block, osr_pc, bail_pc)
     }
 
     pub(crate) fn osr_bail_inside_target_loop_instructions(
         code_block: &crate::executable::CodeBlock,
-        instructions: &[JitInstructionMetadata],
         osr_pc: u32,
         bail_pc: u32,
     ) -> bool {
-        let mut loop_end = None;
-        for instr in instructions {
-            if !matches!(
-                instr.op(code_block),
-                Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse
-            ) {
-                continue;
-            }
-            let Some(otter_bytecode::Operand::Imm32(rel)) = instr.operand(code_block, 0) else {
-                continue;
-            };
-            let target = i64::from(instr.byte_pc) + 1 + i64::from(rel);
-            if target == i64::from(osr_pc) && instr.byte_pc >= osr_pc {
-                loop_end = Some(loop_end.map_or(instr.byte_pc, |end: u32| end.max(instr.byte_pc)));
-            }
-        }
-        let Some(loop_end) = loop_end else {
+        let Some(header_pc) = code_block
+            .instr_index_at_byte_pc(osr_pc)
+            .and_then(|pc| u32::try_from(pc).ok())
+        else {
             return true;
         };
-        osr_pc <= bail_pc && bail_pc <= loop_end
+        let Some(bail_pc) = code_block
+            .instr_index_at_byte_pc(bail_pc)
+            .and_then(|pc| u32::try_from(pc).ok())
+        else {
+            return false;
+        };
+        let Some(loop_latch) = code_block.loop_latch(header_pc) else {
+            return true;
+        };
+        header_pc <= bail_pc && bail_pc <= loop_latch
     }
 
     /// Treat the first compiled `Add` / `Sub` / `Mul` bail at a byte-PC as an

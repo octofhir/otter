@@ -1373,7 +1373,7 @@ pub(crate) mod arm64 {
         jit::{JIT_COLLECTION_METHOD_IC_COLLECTION, JIT_COLLECTION_METHOD_IC_NO_STUB},
         runtime_stubs::alloc_value_stub_by_id,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     /// Comparison flavors that emit a `cset` from integer `cmp` flags.
     enum Cmp {
@@ -2091,51 +2091,16 @@ pub(crate) mod arm64 {
             }
         }
 
-        // Loop headers = back-edge targets: the PCs an OSR entry can land on.
-        // A branch whose resolved target sits at or before its own PC closes a
-        // loop; that target is a basic-block boundary where the interpreter's
-        // live registers match what compiled code expects (the baseline keeps
-        // all live values in the frame array between ops). Collect them here so
-        // a trampoline is emitted for each after the body.
+        // Loop headers are verified once by the owning CodeBlock. Translate
+        // their logical PCs to cold byte PCs only for the legacy OSR lookup key.
         let mut loop_headers: BTreeMap<u32, u32> = BTreeMap::new();
-        for instr in &view.instructions {
-            if matches!(
-                instr.op(code_block),
-                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
-            ) {
-                let rel = instr
-                    .imm32(code_block, 0)
-                    .ok_or(Unsupported::OperandShape("branch offset"))?;
-                let target = branch_target(code_block, instr, rel);
-                if target >= 0
-                    && target < i64::from(instr.instruction_pc(code_block))
-                    && let Ok(target_pc) = u32::try_from(target)
-                    && labels.contains_key(&target_pc)
-                {
-                    let byte_pc = view.instructions[target_pc as usize].byte_pc;
-                    loop_headers.insert(byte_pc, target_pc);
-                }
-            }
+        for &target_pc in code_block.loop_headers() {
+            let byte_pc = view.instructions[target_pc as usize].byte_pc;
+            loop_headers.insert(byte_pc, target_pc);
         }
 
-        // Every instruction reachable by a branch is a basic-block boundary: the
-        // incoming register state is unknown, so FP residency is cleared on
-        // entry. Includes forward targets, unlike `loop_headers`.
-        let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
-        for instr in &view.instructions {
-            if matches!(
-                instr.op(code_block),
-                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
-            ) {
-                let rel = instr
-                    .imm32(code_block, 0)
-                    .ok_or(Unsupported::OperandShape("branch offset"))?;
-                let target = branch_target(code_block, instr, rel);
-                if let Ok(pc) = u32::try_from(target) {
-                    branch_targets.insert(pc);
-                }
-            }
-        }
+        // Incoming register state is unknown at every verified block entry.
+        let block_starts = code_block.block_starts();
 
         // FP-residency read cache (OPTIMIZING_TIER.md S1) is enabled only for
         // float-natured functions — those that divide. Integer-heavy code (no
@@ -2199,7 +2164,7 @@ pub(crate) mod arm64 {
             // elsewhere with unknown register state (and OSR enters loop headers
             // with values freshly loaded from memory), so no FP register can be
             // assumed to hold a slot's value.
-            if enable_fres && branch_targets.contains(&instruction_pc) {
+            if enable_fres && block_starts.binary_search(&instruction_pc).is_ok() {
                 fres.clear();
             }
             // Stamp this op's byte-PC into the context so any bail (guard

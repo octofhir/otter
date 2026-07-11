@@ -8,7 +8,8 @@
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
 //! - [`CodeBlock`] — one immutable verified function body: authoritative
-//!   wordcode, dense site metadata, and cold source metadata.
+//!   wordcode, dense site metadata, precomputed control flow, and cold source
+//!   metadata.
 //! - [`CodeBlockInstruction`] — compact site identity selecting one wordcode
 //!   record and its VM-local IC metadata.
 //!
@@ -33,12 +34,17 @@
 //! - [`crate::execution_context`]
 //! - [`otter_bytecode::Instruction`]
 
+#[path = "code_block_cfg.rs"]
+pub(crate) mod code_block_cfg;
+
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, FunctionCode,
     FunctionCodeBuilder, Op, Operand, SpanEntry, WordInstruction,
     encoding::{FunctionLayout, layout_wordcode_function, translate_spans_to_byte_pcs},
 };
 use std::sync::Arc;
+
+use code_block_cfg::{CodeBlockControlFlow, CodeBlockExceptionRegion};
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
@@ -303,6 +309,7 @@ impl CodeBlock {
         let code_byte_len = instruction_metadata.last().map_or(0, |metadata| {
             metadata.byte_pc.saturating_add(metadata.byte_len)
         });
+        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
         Arc::new(Self {
             id,
             param_count,
@@ -328,6 +335,7 @@ impl CodeBlock {
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
             wordcode,
+            control_flow,
             instruction_metadata: instruction_metadata.into_boxed_slice(),
             byte_spans: Box::new([]),
             code_byte_len,
@@ -410,6 +418,30 @@ impl CodeBlock {
     #[must_use]
     pub fn op_at(&self, index: usize) -> Option<Op> {
         self.wordcode.get(index).map(|instruction| instruction.op)
+    }
+
+    /// Sorted logical PCs beginning basic blocks in this function.
+    #[must_use]
+    pub fn block_starts(&self) -> &[u32] {
+        self.control_flow.block_starts()
+    }
+
+    /// Sorted logical PCs targeted by backwards normal-flow edges.
+    #[must_use]
+    pub fn loop_headers(&self) -> &[u32] {
+        self.control_flow.loop_headers()
+    }
+
+    /// Last logical backedge PC for a loop header.
+    #[must_use]
+    pub(crate) fn loop_latch(&self, header_pc: u32) -> Option<u32> {
+        self.control_flow.loop_latch(header_pc)
+    }
+
+    /// Resolved handlers installed by an `EnterTry` instruction.
+    #[must_use]
+    pub(crate) fn exception_region(&self, enter_pc: u32) -> Option<CodeBlockExceptionRegion> {
+        self.control_flow.exception_region(enter_pc)
     }
 
     /// Number of schema-typed operands on this instruction.
@@ -678,6 +710,8 @@ pub struct CodeBlock {
     pub code: Box<[CodeBlockInstruction]>,
     /// Authoritative schema-typed execution wordcode shared by VM and JIT.
     wordcode: FunctionCode,
+    /// Precomputed logical-PC block, loop, and exception-region tables.
+    control_flow: CodeBlockControlFlow,
     /// Cold serialized byte coordinates parallel to `code`.
     instruction_metadata: Box<[ColdInstructionMetadata]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
@@ -711,6 +745,7 @@ impl CodeBlock {
             )
         });
         let wordcode = function.code.clone();
+        let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
         let instruction_metadata = instr_to_byte_pc
             .iter()
             .enumerate()
@@ -839,6 +874,7 @@ impl CodeBlock {
             contains_direct_eval: function.contains_direct_eval,
             code,
             wordcode,
+            control_flow,
             instruction_metadata,
             byte_spans,
             code_byte_len,

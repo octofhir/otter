@@ -66,8 +66,13 @@ fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
     }
 }
 
-fn jit_instr(op: Op, byte_pc: u32, operands: Vec<Operand>) -> jit::JitTestInstruction {
-    jit::JitTestInstruction::new(op, byte_pc, byte_pc, 1, operands)
+fn jit_instr(
+    op: Op,
+    instruction_pc: u32,
+    byte_pc: u32,
+    operands: Vec<Operand>,
+) -> jit::JitTestInstruction {
+    jit::JitTestInstruction::new(op, instruction_pc, byte_pc, 1, operands)
 }
 
 #[test]
@@ -76,26 +81,22 @@ fn osr_bail_policy_only_disables_target_loop_misses() {
         jit_instr(
             Op::LoadInt32,
             0,
+            0,
             vec![Operand::Register(0), Operand::Imm32(0)],
         ),
-        jit_instr(
-            Op::Jump,
-            40,
-            vec![Operand::Imm32(-31)], // target = 40 + 1 - 31 = 10.
-        ),
+        jit_instr(Op::Nop, 1, 20, vec![]),
+        jit_instr(Op::Jump, 2, 40, vec![Operand::Imm32(-3)]),
     ];
 
     let snapshot = jit::JitCompileSnapshot::without_feedback(0, 0, 4, instructions);
     assert!(Interpreter::osr_bail_inside_target_loop_instructions(
         &snapshot.code_block,
-        &snapshot.instructions,
-        10,
-        30
+        0,
+        20
     ));
     assert!(!Interpreter::osr_bail_inside_target_loop_instructions(
         &snapshot.code_block,
-        &snapshot.instructions,
-        10,
+        0,
         50
     ));
 }

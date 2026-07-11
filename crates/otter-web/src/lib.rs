@@ -51,6 +51,8 @@ otter_macros::romp! {
         wasm::WasmMemoryIntrinsic,
         wasm::WasmGlobalIntrinsic,
         wasm::WasmTableIntrinsic,
+        wasm::WasmTagIntrinsic,
+        wasm::WasmExceptionIntrinsic,
         wasm::WebAssemblyIntrinsic,
     ],
     js = [

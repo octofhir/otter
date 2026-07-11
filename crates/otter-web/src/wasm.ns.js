@@ -27,6 +27,8 @@ relocate('Module');
 relocate('Memory');
 relocate('Global');
 relocate('Table');
+relocate('Tag');
+relocate('Exception');
 
 // The three error interfaces are ordinary Error subclasses.
 function makeErrorClass(name) {
@@ -83,6 +85,27 @@ __ns.Instance = Instance;
 // through the marshalling layer, so mirror it as a hidden object property.
 Object.defineProperty(__ns, '__instanceProto', {
   value: Instance.prototype,
+  writable: false,
+  enumerable: false,
+  configurable: true,
+});
+
+// A wasm export that `throw`s surfaces its exception to native code, which
+// re-throws the JS value through this hidden re-thrower so the value's
+// identity (a `WebAssembly.Exception`, or the original JS value carried by a
+// `JSTag` exception) is preserved as the caught value.
+Object.defineProperty(__ns, '__throw', {
+  value: (value) => { throw value; },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+
+// `WebAssembly.JSTag` is the realm-wide well-known tag (parameters:
+// `[externref]`) that carries a JS value across wasm frames. It is a readonly
+// `WebAssembly.Tag` instance built once by the native factory.
+Object.defineProperty(__ns, 'JSTag', {
+  value: natives.jsTag(),
   writable: false,
   enumerable: false,
   configurable: true,

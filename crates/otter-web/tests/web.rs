@@ -25,6 +25,8 @@ fn web_api_specs_are_static_and_ordered() {
             "WebAssembly.Memory",
             "WebAssembly.Global",
             "WebAssembly.Table",
+            "WebAssembly.Tag",
+            "WebAssembly.Exception",
             "WebAssembly",
         ]
     );
@@ -746,6 +748,125 @@ fn web_assembly_cross_store_bigint_and_externref() {
     assert_eq!(after, "42|9007199254740994|true|true");
 }
 
+/// Encode wasm bytes as the comma-separated byte string the test harness
+/// decodes back into a `Uint8Array`.
+fn wasm_byte_literal(wasm: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::new();
+    for byte in wasm {
+        let _ = write!(encoded, "{byte},");
+    }
+    encoded
+}
+
+/// A wasm module that defines an exception tag, exports it, and exports a
+/// function that `throw`s it with an `i32` payload. JS catches the escaping
+/// throw as a `WebAssembly.Exception`, confirms its tag identity, and reads the
+/// payload back.
+#[test]
+fn web_assembly_tagged_exception_crosses_to_js() {
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (tag $e (export "e") (param i32))
+          (func (export "boom") (param i32)
+            local.get 0
+            throw $e))
+        "#,
+    )
+    .expect("wat compiles");
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let base64 = wasm_byte_literal(&wasm);
+    let result = eval_string(
+        &mut runtime,
+        &format!(
+            r#"
+        var out = "";
+        const bytes = Uint8Array.from("{base64}".split(",").filter((s) => s.length).map(Number));
+        const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes));
+        const tag = instance.exports.e;
+        out += (tag instanceof WebAssembly.Tag) + "|";
+        try {{
+          instance.exports.boom(99);
+          out += "NO-THROW";
+        }} catch (e) {{
+          out += (e instanceof WebAssembly.Exception) + "|";
+          out += e.is(tag) + "|";
+          out += e.getArg(tag, 0);
+        }}
+        out
+        "#,
+        ),
+    );
+    // tag-branded | exception-branded | tag identity | payload read back.
+    assert_eq!(result, "true|true|true|99");
+}
+
+/// A JS-constructed `WebAssembly.Exception` round-trips its tag identity and
+/// payload, and `WebAssembly.JSTag` is a well-known `WebAssembly.Tag`.
+#[test]
+fn web_assembly_exception_constructed_in_js_and_jstag() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        var out = "";
+        const tag = new WebAssembly.Tag({ parameters: ["i32"] });
+        const exn = new WebAssembly.Exception(tag, [42]);
+        out += (exn instanceof WebAssembly.Exception) + "|";
+        out += exn.is(tag) + "|";
+        out += exn.getArg(tag, 0) + "|";
+        // A different tag is not this exception's tag.
+        const other = new WebAssembly.Tag({ parameters: ["i32"] });
+        out += exn.is(other) + "|";
+        // JSTag is a well-known Tag instance.
+        out += (WebAssembly.JSTag instanceof WebAssembly.Tag);
+        out
+        "#,
+    );
+    // exception-branded | tag identity | payload | wrong-tag false | JSTag is a Tag.
+    assert_eq!(result, "true|true|42|false|true");
+}
+
+/// A JS import that throws crosses wasm frames via the `JSTag`: an uncaught
+/// throw propagates back through the export call and surfaces to JS as the
+/// original thrown value, with identity preserved.
+#[test]
+fn web_assembly_js_import_throw_crosses_wasm_frames() {
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (import "js" "boom" (func $boom))
+          (func (export "call") (call $boom)))
+        "#,
+    )
+    .expect("wat compiles");
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let base64 = wasm_byte_literal(&wasm);
+    let result = eval_string(
+        &mut runtime,
+        &format!(
+            r#"
+        var out = "";
+        const bytes = Uint8Array.from("{base64}".split(",").filter((s) => s.length).map(Number));
+        const sentinel = new Error("from-js");
+        const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {{
+          js: {{ boom: () => {{ throw sentinel; }} }},
+        }});
+        try {{
+          instance.exports.call();
+          out += "NO-THROW";
+        }} catch (e) {{
+          // The original JS error object crosses the wasm frame with identity.
+          out += (e === sentinel) + "|" + (e.message === "from-js");
+        }}
+        out
+        "#,
+        ),
+    );
+    assert_eq!(result, "true|true");
+}
+
 /// The authoritative WinterTC / ECMA-429 Minimum Common API ledger.
 ///
 /// Every path named by the ECMA-429 minimum-common-API snapshot appears in
@@ -845,6 +966,9 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "WebAssembly.CompileError",
       "WebAssembly.LinkError",
       "WebAssembly.RuntimeError",
+      "WebAssembly.Tag",
+      "WebAssembly.Exception",
+      "WebAssembly.JSTag",
     ];
     const PARTIAL = [];
     // Otter's global object is not a Window/Worker EventTarget, so the global
@@ -854,11 +978,7 @@ const WINTERTC_LEDGER_JS: &str = r#"
     // HostPromiseRejectionTracker checkpoint; `onerror` is present for parity
     // (uncaught exceptions still surface as runtime diagnostics).
     const OMITTED = [];
-    const NOT_YET = [
-      "WebAssembly.Tag",
-      "WebAssembly.Exception",
-      "WebAssembly.JSTag",
-    ];
+    const NOT_YET = [];
     function lookup(path) {
       let value = globalThis;
       for (const part of path.split(".")) {

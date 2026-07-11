@@ -487,11 +487,46 @@ impl Interpreter {
             })?;
         let mut stack: HoltStack = HoltStack::new();
         stack.push(new_frame);
+        // An `async` handler invoked as a reaction is a top-level call with no
+        // caller frame, so — exactly like the async entry frame in `run_inner`
+        // and the direct-call path — it needs an async result promise wired up
+        // front. Without it `Op::Await` finds no `async_state` and aborts with
+        // `InvalidOperand`. The downstream reaction promise then adopts this
+        // result promise, so it settles when the handler ultimately completes.
+        let async_result = if function.is_async && !function.is_generator {
+            let result = match promise_dispatch::PromiseBuilder::with_context(context.clone())
+                .pending_stack_rooted(self, &stack, &[], &[])
+            {
+                Ok(result) => result,
+                Err(oom) => {
+                    return Err(RunError {
+                        error: VmError::from(oom),
+                        frames: Vec::new(),
+                        detail: self.take_error_detail(),
+                    });
+                }
+            };
+            stack
+                .last_mut()
+                .expect("reaction frame was just pushed")
+                .async_state = Some(AsyncFrameState {
+                result_promise: result,
+            });
+            Some(result)
+        } else {
+            None
+        };
         match self.dispatch_loop(context, &mut stack) {
             Ok(value) => {
                 // Reaction job: settle the downstream promise with
-                // the handler's return value (spec §27.2.5.4).
-                self.settle_microtask_capability(context, result_capability, Ok(value));
+                // the handler's return value (spec §27.2.5.4). For an async
+                // handler the return value is its result promise, which the
+                // downstream adopts (resolving once the handler completes).
+                let settle_value = match async_result {
+                    Some(result) => Value::promise(result),
+                    None => value,
+                };
+                self.settle_microtask_capability(context, result_capability, Ok(settle_value));
                 Ok(())
             }
             Err(error) => {

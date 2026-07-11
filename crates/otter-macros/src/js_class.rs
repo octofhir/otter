@@ -154,6 +154,7 @@ enum ReceiverKind {
 enum Role {
     Constructor {
         length: Option<u8>,
+        raw: bool,
     },
     Method {
         js_name: LitStr,
@@ -169,9 +170,11 @@ enum Role {
     },
     Getter {
         js_name: LitStr,
+        raw: bool,
     },
     Setter {
         js_name: LitStr,
+        raw: bool,
     },
 }
 
@@ -197,18 +200,22 @@ fn classify(item: &mut ImplItemFn) -> Result<Option<Role>> {
         match ident.as_deref() {
             Some("constructor") => {
                 let mut length: Option<u8> = None;
+                let mut raw = false;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
                     attr.parse_nested_meta(|meta| {
                         if meta.path.is_ident("length") {
                             let lit: LitInt = meta.value()?.parse()?;
                             length = Some(lit.base10_parse()?);
                             Ok(())
+                        } else if meta.path.is_ident("raw") {
+                            raw = true;
+                            Ok(())
                         } else {
-                            Err(meta.error("constructor supports only `length = N`"))
+                            Err(meta.error("constructor supports `length = N` and `raw`"))
                         }
                     })?;
                 }
-                set_role(&mut role, Role::Constructor { length }, attr.span())?;
+                set_role(&mut role, Role::Constructor { length, raw }, attr.span())?;
             }
             Some(kind @ ("method" | "static_method")) => {
                 let mut js_name: Option<LitStr> = None;
@@ -254,21 +261,25 @@ fn classify(item: &mut ImplItemFn) -> Result<Option<Role>> {
             }
             Some(kind @ ("getter" | "setter")) => {
                 let mut js_name: Option<LitStr> = None;
+                let mut raw = false;
                 attr.parse_nested_meta(|meta| {
                     if meta.path.is_ident("name") {
                         js_name = Some(meta.value()?.parse()?);
                         Ok(())
+                    } else if meta.path.is_ident("raw") {
+                        raw = true;
+                        Ok(())
                     } else {
-                        Err(meta.error("accessor markers support only `name = \"…\"`"))
+                        Err(meta.error("accessor markers support `name = \"…\"` and `raw`"))
                     }
                 })?;
                 let js_name = js_name.ok_or_else(|| {
                     Error::new(attr.span(), "accessor markers require `name = \"…\"`")
                 })?;
                 let parsed = if kind == "getter" {
-                    Role::Getter { js_name }
+                    Role::Getter { js_name, raw }
                 } else {
-                    Role::Setter { js_name }
+                    Role::Setter { js_name, raw }
                 };
                 set_role(&mut role, parsed, attr.span())?;
             }
@@ -470,13 +481,33 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
 
     // Constructor glue.
     let ctor_glue_ident = format_ident!("__otter_js_class_{glue_prefix}_constructor");
-    let ctor_length = match &constructor.role {
-        Role::Constructor { length } => {
-            length.unwrap_or_else(|| default_length(&constructor.params))
-        }
+    let (ctor_length, ctor_raw) = match &constructor.role {
+        Role::Constructor { length, raw } => (
+            length.unwrap_or_else(|| {
+                if *raw {
+                    0
+                } else {
+                    default_length(&constructor.params)
+                }
+            }),
+            *raw,
+        ),
         _ => unreachable!("filtered above"),
     };
-    {
+    // A `raw` constructor is a `fn(ctx, args) -> Result<Value, NativeError>`
+    // that builds and returns the instance itself (its body calls
+    // `into_js`); it is registered directly, with no marshalling glue.
+    let ctor_fn_path = {
+        let fn_ident = &constructor.fn_ident;
+        let type_path = &self_path.path;
+        quote!(#type_path::#fn_ident)
+    };
+    let ctor_call = if ctor_raw {
+        ctor_fn_path
+    } else {
+        quote!(#ctor_glue_ident)
+    };
+    if !ctor_raw {
         if !matches!(constructor.receiver, ReceiverKind::None) {
             return Err(Error::new(
                 constructor.fn_ident.span(),
@@ -642,8 +673,12 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 *raw,
                 Emitted::Method,
             ),
-            Role::Getter { js_name } => (js_name.clone(), 0, false, false, Emitted::Getter),
-            Role::Setter { js_name } => (js_name.clone(), 1, false, false, Emitted::Setter),
+            Role::Getter { js_name, raw } => {
+                (js_name.clone(), 0, false, *raw, Emitted::Getter)
+            }
+            Role::Setter { js_name, raw } => {
+                (js_name.clone(), 1, false, *raw, Emitted::Setter)
+            }
             Role::Constructor { .. } | Role::StaticMethod { .. } => {
                 unreachable!("filtered above")
             }
@@ -651,13 +686,90 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         let fn_ident = &member.fn_ident;
 
         if raw {
-            if !matches!(kind, Emitted::Method) {
-                return Err(Error::new(fn_ident.span(), "accessors cannot be `raw`"));
-            }
-            let name_lit = js_name;
+            // A raw member's body is `fn(ctx, args) -> Result<Value,
+            // NativeError>` and does its own marshalling. Without a receiver it
+            // is registered directly (a static-shaped instance method). With a
+            // `&self` receiver, a thin glue extracts (clones) the host data in a
+            // scoped block — matching the `IntoJs`/`FromJs` snapshot contract —
+            // then calls the body with the freed `ctx`, so the body can open its
+            // own scope and marshal reference/BigInt values that no `IntoJs`
+            // lowering can produce.
             let length_lit = LitInt::new(&length.to_string(), Span::call_site());
-            let type_path = &self_path.path;
-            method_rows.push(quote!(#name_lit / #length_lit => #type_path::#fn_ident));
+            let call_ident = match member.receiver {
+                ReceiverKind::None => {
+                    if !matches!(kind, Emitted::Method) {
+                        return Err(Error::new(
+                            fn_ident.span(),
+                            "a raw accessor must take `&self` or `&mut self`",
+                        ));
+                    }
+                    let type_path = &self_path.path;
+                    quote!(#type_path::#fn_ident)
+                }
+                ReceiverKind::Ref | ReceiverKind::RefMut | ReceiverKind::Owned => {
+                    let op_string =
+                        format!("{}.prototype.{}", class_name.value(), js_name.value());
+                    let op = LitStr::new(&op_string, js_name.span());
+                    let glue_ident =
+                        format_ident!("__otter_js_class_{glue_prefix}_raw_{fn_ident}");
+                    glue.extend(quote! {
+                        fn #glue_ident(
+                            ctx: &mut ::otter_vm::NativeCtx<'_>,
+                            args: &[::otter_vm::Value],
+                        ) -> ::core::result::Result<
+                            ::otter_vm::Value,
+                            ::otter_vm::NativeError,
+                        > {
+                            let __this_value = *ctx.this_value();
+                            let __recv: #self_ty = ctx.scope(|ctx, __s| {
+                                let mut __cx =
+                                    ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                                let __this = __cx.park(__this_value);
+                                __cx.with_host_data::<#self_ty, #self_ty>(
+                                    __this,
+                                    ::core::clone::Clone::clone,
+                                )
+                                .map_err(|e| e.into_native(#op))
+                            })?;
+                            <#self_ty>::#fn_ident(&__recv, ctx, args)
+                        }
+                    });
+                    quote!(#glue_ident)
+                }
+            };
+            match kind {
+                Emitted::Method => {
+                    method_rows.push(quote!(#js_name / #length_lit => #call_ident));
+                }
+                Emitted::Getter | Emitted::Setter => {
+                    let glue_ident = format_ident!(
+                        "__otter_js_class_{glue_prefix}_raw_{fn_ident}"
+                    );
+                    let key = js_name.value();
+                    let slot = match accessor_slots
+                        .iter_mut()
+                        .find(|(name, ..)| *name == key)
+                    {
+                        Some(slot) => slot,
+                        None => {
+                            accessor_slots.push((key, js_name.clone(), None, None));
+                            accessor_slots.last_mut().expect("just pushed")
+                        }
+                    };
+                    let target = if matches!(kind, Emitted::Getter) {
+                        &mut slot.2
+                    } else {
+                        &mut slot.3
+                    };
+                    if target.is_some() {
+                        return Err(Error::new(
+                            fn_ident.span(),
+                            format!("duplicate accessor half for '{}'", js_name.value()),
+                        ));
+                    }
+                    *target = Some(glue_ident);
+                }
+            }
             continue;
         }
 
@@ -980,7 +1092,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
             name = #class_name,
             feature = #feature,
             intrinsic = #intrinsic_ident,
-            constructor = (length = #ctor_length_lit, call = #ctor_glue_ident),
+            constructor = (length = #ctor_length_lit, call = #ctor_call),
             #couch_extras
             #statics_block
             #prototype_block

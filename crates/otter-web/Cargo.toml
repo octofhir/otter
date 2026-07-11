@@ -19,7 +19,7 @@ url = "2"
 hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-wasmi = "1.1.0"
+wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "gc", "gc-drc", "wat", "std"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

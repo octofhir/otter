@@ -682,6 +682,70 @@ fn web_assembly_constructors_globals_and_errors() {
     assert_eq!(result, "true|true|7|5|11|true|LinkError|RuntimeError");
 }
 
+/// wasmtime-backed capabilities beyond the wasmi baseline: cross-store imports
+/// (a standalone `Memory` linked into an instance), `i64` <-> `BigInt`, and an
+/// `externref` global round-tripping a JS object by identity.
+#[test]
+fn web_assembly_cross_store_bigint_and_externref() {
+    // Imports a memory + an i64 helper, exports a func that writes 42 into the
+    // imported memory, an i64 adder, and a mutable externref global.
+    let wasm = wat::parse_str(
+        r#"
+        (module
+          (import "js" "mem" (memory 1))
+          (func (export "poke")
+            i32.const 0
+            i32.const 42
+            i32.store)
+          (func (export "add64") (param i64 i64) (result i64)
+            local.get 0
+            local.get 1
+            i64.add)
+          (global (export "slot") (mut externref) (ref.null extern)))
+        "#,
+    )
+    .expect("wat compiles");
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let base64 = {
+        use std::fmt::Write as _;
+        let mut encoded = String::new();
+        for byte in &wasm {
+            let _ = write!(encoded, "{byte},");
+        }
+        encoded
+    };
+    let result = eval_string(
+        &mut runtime,
+        &format!(
+            r#"
+        globalThis.out = "pending";
+        const bytes = Uint8Array.from("{base64}".split(",").filter((s) => s.length).map(Number));
+        // A standalone Memory, then imported into the instance (cross-store).
+        const mem = new WebAssembly.Memory({{ initial: 1 }});
+        WebAssembly.instantiate(bytes, {{ js: {{ mem }} }}).then((result) => {{
+          const ex = result.instance.exports;
+          ex.poke();
+          // The write is visible through the SAME standalone Memory object.
+          const crossStore = new Uint8Array(mem.buffer)[0];
+          // i64 params/results are BigInt.
+          const sum = ex.add64(9007199254740993n, 1n); // > 2^53, exact only as BigInt
+          const isBig = typeof sum === "bigint";
+          // externref global round-trips a JS object by identity.
+          const sentinel = {{ tag: "otter" }};
+          ex.slot.value = sentinel;
+          const sameRef = ex.slot.value === sentinel;
+          globalThis.out = [crossStore, sum.toString(), isBig, sameRef].join("|");
+        }}, (err) => {{ globalThis.out = "ERR:" + (err && err.stack || err); }});
+        "pending"
+        "#,
+        ),
+    );
+    assert_eq!(result, "pending");
+    let after = eval_string(&mut runtime, "out");
+    // written-byte | 2^53+1 + 1 = 9007199254740994 | bigint | identity preserved.
+    assert_eq!(after, "42|9007199254740994|true|true");
+}
+
 /// The authoritative WinterTC / ECMA-429 Minimum Common API ledger.
 ///
 /// Every path named by the ECMA-429 minimum-common-API snapshot appears in

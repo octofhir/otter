@@ -1247,7 +1247,6 @@ impl Interpreter {
         frame_index: usize,
         recv_reg: u16,
         name_idx: u32,
-        call_byte_pc: u32,
         site: usize,
         arg_regs: &[u16],
         // Caller's live register window (`JitCtx.regs`); see
@@ -1299,18 +1298,6 @@ impl Interpreter {
         else {
             return Ok(None);
         };
-        if self.jit_hook.is_some() {
-            let caller_fid = stack
-                .get(frame_index)
-                .ok_or_else(|| VmError::InvalidOperand)?
-                .function_id;
-            if !self.method_site_feedback_saturated(caller_fid, call_byte_pc)
-                && let Some(site) =
-                    self.method_site_for_receiver(context, caller_fid, name_idx, recv)
-            {
-                self.note_method_target(caller_fid, call_byte_pc, function_id, site);
-            }
-        }
         if new_target.is_some() || derived_this.is_some() || eval_env.is_some() {
             return Ok(None);
         }

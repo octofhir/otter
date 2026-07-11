@@ -495,7 +495,6 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
-    let call_byte_pc = ctx.bail_pc;
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_prepare_direct_method_call(
@@ -504,7 +503,6 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
         ctx.frame_index,
         recv as u16,
         name_idx as u32,
-        call_byte_pc,
         site as usize,
         &all[..argc],
         ctx.regs.cast::<otter_vm::Value>().cast_const(),

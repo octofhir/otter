@@ -309,7 +309,7 @@ impl Interpreter {
         // Resolve callee → function_id + upvalues. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
         // (no caller frame to write back into).
-        let result_capability = task.result_capability.clone();
+        let mut result_capability = task.result_capability.clone();
         let mut current = task.callee;
         let mut effective_this = task.this_value;
         let mut effective_args: SmallVec<[Value; 8]> = task.args.into_iter().collect();
@@ -325,13 +325,14 @@ impl Interpreter {
             current: &raw const current,
             this_value: &raw const effective_this,
             args: &raw const effective_args,
+            result_capability: &raw const result_capability,
         };
         let _locals_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&locals_root));
         self.invoke_microtask_rooted(
             context,
-            result_capability,
+            &mut result_capability,
             &mut current,
             &mut effective_this,
             &mut effective_args,
@@ -346,7 +347,7 @@ impl Interpreter {
     fn invoke_microtask_rooted(
         &mut self,
         context: &ExecutionContext,
-        result_capability: Option<crate::microtask::MicrotaskCapability>,
+        result_capability: &mut Option<crate::microtask::MicrotaskCapability>,
         current: &mut Value,
         effective_this: &mut Value,
         effective_args: &mut SmallVec<[Value; 8]>,
@@ -392,7 +393,11 @@ impl Interpreter {
                     std::mem::take(effective_args),
                 ) {
                     Ok(value) => {
-                        self.settle_microtask_capability(context, result_capability, Ok(value));
+                        self.settle_microtask_capability(
+                            context,
+                            result_capability.take(),
+                            Ok(value),
+                        );
                         Ok(())
                     }
                     Err(vm_err) => {
@@ -400,7 +405,7 @@ impl Interpreter {
                             let reason = vm_err_to_value(self, &vm_err);
                             self.settle_microtask_capability(
                                 context,
-                                result_capability,
+                                result_capability.take(),
                                 Err(reason),
                             );
                             Ok(())
@@ -419,7 +424,7 @@ impl Interpreter {
             let mut ctx = NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
             return match call.invoke(&mut ctx, effective_args.as_slice()) {
                 Ok(value) => {
-                    self.settle_microtask_capability(context, result_capability, Ok(value));
+                    self.settle_microtask_capability(context, result_capability.take(), Ok(value));
                     Ok(())
                 }
                 Err(err) => {
@@ -439,7 +444,11 @@ impl Interpreter {
                             .pending_uncaught_throw
                             .take()
                             .unwrap_or_else(|| vm_err_to_value(self, &vm_err));
-                        self.settle_microtask_capability(context, result_capability, Err(reason));
+                        self.settle_microtask_capability(
+                            context,
+                            result_capability.take(),
+                            Err(reason),
+                        );
                         Ok(())
                     } else {
                         Err(RunError {
@@ -564,7 +573,11 @@ impl Interpreter {
                     Some(result) => Value::promise(result),
                     None => value,
                 };
-                self.settle_microtask_capability(context, result_capability, Ok(settle_value));
+                self.settle_microtask_capability(
+                    context,
+                    result_capability.take(),
+                    Ok(settle_value),
+                );
                 Ok(())
             }
             Err(error) => {
@@ -582,7 +595,11 @@ impl Interpreter {
                         .pending_uncaught_throw
                         .take()
                         .unwrap_or_else(|| vm_err_to_value(self, &error));
-                    self.settle_microtask_capability(context, result_capability, Err(reason));
+                    self.settle_microtask_capability(
+                        context,
+                        result_capability.take(),
+                        Err(reason),
+                    );
                     Ok(())
                 } else {
                     let frames = snapshot_frames(context, &stack);
@@ -861,6 +878,7 @@ struct MicrotaskLocalsRoot {
     current: *const Value,
     this_value: *const Value,
     args: *const SmallVec<[Value; 8]>,
+    result_capability: *const Option<crate::microtask::MicrotaskCapability>,
 }
 
 impl otter_gc::ExtraRootSource for MicrotaskLocalsRoot {
@@ -873,6 +891,10 @@ impl otter_gc::ExtraRootSource for MicrotaskLocalsRoot {
             (*self.this_value).trace_value_slots(visitor);
             for value in (*self.args).iter() {
                 value.trace_value_slots(visitor);
+            }
+            if let Some(capability) = &*self.result_capability {
+                capability.resolve.trace_value_slots(visitor);
+                capability.reject.trace_value_slots(visitor);
             }
         }
     }

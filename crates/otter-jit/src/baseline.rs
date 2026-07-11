@@ -807,55 +807,6 @@ extern "C" fn jit_store_prop_window_stub(
     }
 }
 
-/// Bridge stub: perform a named `StoreProperty` from compiled code, delegating
-/// to the safe [`Interpreter::jit_runtime_store_property`]. Returns `0` on
-/// success, `1` when the write threw (error parked in `ctx`). `cell` is this
-/// site's [`WhiskerIcCell`]: on a monomorphic existing-own-data inline-slot hit
-/// the VM returns a packed fill which this stub writes so the next store
-/// inlines (shape guard + slot write + value-gated barrier, no round-trip).
-extern "C" fn jit_store_prop_stub(
-    ctx: *mut JitCtx,
-    obj: u64,
-    name_idx: u64,
-    src: u64,
-    site: u64,
-    cell: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_store_property(
-        context,
-        stack,
-        ctx.frame_index,
-        obj as u16,
-        name_idx as u32,
-        src as u16,
-        site as usize,
-    ) {
-        Ok(fill) => {
-            // Same packing as the load cell: low 32 = shape (validity flag),
-            // high 32 = value byte offset. Write `value_byte` before `shape`.
-            if cell != 0 && fill != 0 {
-                let cell = cell as *mut WhiskerIcCell;
-                // SAFETY: `cell` is a stable address baked into this site's
-                // emitted code from `BaselineCode::store_ic_cells`, which
-                // outlives every execution of this code.
-                unsafe {
-                    whisker_ic_fill(cell, fill as u32, (fill >> 32) as u32);
-                }
-            }
-            0
-        }
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
 /// Bridge stub: run the GC write barrier for an inline `StoreProperty` whose
 /// stored value is a heap pointer. The emitted fast path skips this for
 /// primitive values (the common case); a pointer store calls here so an
@@ -1100,7 +1051,7 @@ pub struct BaselineCode {
     #[allow(dead_code)]
     load_ic_cells: Box<[WhiskerIcCell]>,
     /// Stable backing store for the WhiskerIC `StoreProperty` cells — one per
-    /// `StoreProperty` op, self-patched by [`jit_store_prop_stub`]. Same
+    /// `StoreProperty` op, self-patched by [`jit_store_prop_window_stub`]. Same
     /// ownership / stability contract as [`Self::load_ic_cells`].
     #[allow(dead_code)]
     store_ic_cells: Box<[WhiskerIcCell]>,
@@ -1355,10 +1306,9 @@ pub(crate) mod arm64 {
         jit_math_call_stub, jit_neg_stub, jit_new_array_stub, jit_new_object_stub,
         jit_pop_native_activation_stub, jit_prepare_direct_method_call_stub,
         jit_push_native_activation_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_checked_stub,
-        jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub,
-        leaf_no_alloc_stub2_trampoline_pair, otter_jit_math_random, pack_method_arg_regs,
-        reg_offset, value_tag,
+        jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
+        jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
+        otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -2952,7 +2902,7 @@ pub(crate) mod arm64 {
                 }
                 Op::StoreProperty => {
                     // Operands: obj, name_const, src, scratch_dst.
-                    // jit_store_prop_stub(ctx=x20, obj, name_idx, src, site, cell).
+                    // jit_store_prop_window_stub(ctx=x20, obj, name_idx, src, site, cell).
                     let obj = reg(ops_ref, 0)?;
                     let name = const_index(ops_ref, 1)?;
                     let src = reg(ops_ref, 2)?;
@@ -3070,20 +3020,16 @@ pub(crate) mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; movz x3, src as u32);
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
-                    if self_call_safe {
-                        emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
-                        emit_load_u64(&mut ops, 16, jit_store_prop_window_stub as *const () as u64);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; blr x16
-                            ; cmp x0, #1
-                            ; b.eq =>threw
-                            ; cmp x0, #2
-                            ; b.eq =>bail
-                        );
-                    } else {
-                        emit_call_stub(&mut ops, jit_store_prop_stub as *const () as usize, threw);
-                    }
+                    emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
+                    emit_load_u64(&mut ops, 16, jit_store_prop_window_stub as *const () as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>bail
+                    );
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::BitwiseOr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Or)?,

@@ -50,8 +50,8 @@ otter_macros::romp! {
             "CustomEvent", "DOMException", "ErrorEvent", "Event",
             "EventTarget", "FormData", "MessageChannel", "MessageEvent",
             "MessagePort", "Navigator", "performance", "Performance",
-            "ProgressEvent", "reportError", "TextDecoder", "TextEncoder",
-            "URLSearchParams",
+            "ProgressEvent", "PromiseRejectionEvent", "reportError",
+            "TextDecoder", "TextEncoder", "URLSearchParams",
         ]),
         // Streams precede fetch: the fetch body getter wraps buffered
         // bodies in a ReadableStream.

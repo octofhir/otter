@@ -626,6 +626,23 @@
   tagged(ProgressEvent.prototype, 'ProgressEvent');
   def('ProgressEvent', ProgressEvent);
 
+  // PromiseRejectionEvent (HTML §promiserejectionevent) — the event delivered
+  // to `unhandledrejection` / `rejectionhandled`. `promise` and `reason` are
+  // readonly per WebIDL; `reason` defaults to `undefined`.
+  class PromiseRejectionEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      const o = options || {};
+      Object.defineProperty(this, 'promise', { value: o.promise, enumerable: true });
+      Object.defineProperty(this, 'reason', {
+        value: 'reason' in o ? o.reason : undefined,
+        enumerable: true,
+      });
+    }
+  }
+  tagged(PromiseRejectionEvent.prototype, 'PromiseRejectionEvent');
+  def('PromiseRejectionEvent', PromiseRejectionEvent);
+
   // ---- MessageChannel / MessagePort (HTML § channel messaging) ----
   const kPortInternal = Symbol('MessagePortInternal');
   const kOther = Symbol('otherPort');

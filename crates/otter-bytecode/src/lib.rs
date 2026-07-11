@@ -1718,7 +1718,7 @@ impl Op {
             Op::EvaluateModule => pos == 1,
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
-            // [dst, record_reg, name_const]
+            // [dst, url_const, name_const]
             Op::LoadImportBinding => pos == 1 || pos == 2,
             // [reg, kind_const, reg]
             Op::NewCollection | Op::NewBuiltinError => pos == 1,

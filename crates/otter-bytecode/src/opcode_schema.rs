@@ -713,6 +713,7 @@ const METHOD_CALL_PREFIX: &[OperandSpec] = &[W, R, CONST, CONST];
 const NAMESPACE_CALL_PREFIX: &[OperandSpec] = &[W, CONST, CONST];
 const ENTER_TRY: &[OperandSpec] = &[IMM, IMM, W];
 const WRITE_READ_CONST: &[OperandSpec] = &[W, R, CONST];
+const WRITE_CONST_CONST: &[OperandSpec] = &[W, CONST, CONST];
 const READ_CONST_READ_WRITE: &[OperandSpec] = &[R, CONST, R, W];
 const READ_READ: &[OperandSpec] = &[R, R];
 const READ_READ_READ_WRITE: &[OperandSpec] = &[R, R, R, W];
@@ -880,7 +881,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::MarkModuleEvaluated => OperandShape::Fixed(&[CONST]),
         Op::DeclareGlobalVar => OperandShape::Fixed(CONST_IMM),
         Op::StarReexport => OperandShape::Fixed(READ_READ),
-        Op::LoadImportBinding => OperandShape::Fixed(WRITE_READ_CONST),
+        Op::LoadImportBinding => OperandShape::Fixed(WRITE_CONST_CONST),
         Op::LoadDynamic | Op::TypeofDynamic | Op::DeleteDynamic => OperandShape::Fixed(WRITE_CONST),
         Op::StoreDynamic | Op::InitGlobalLex => OperandShape::Fixed(READ_CONST),
         Op::DefineGlobalFunction => OperandShape::Fixed(CONST_READ_IMM),

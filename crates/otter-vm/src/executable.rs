@@ -35,7 +35,7 @@
 
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand, SpanEntry,
-    encoding::{EncodedFunction, decode_function, encode_function, translate_spans_to_byte_pcs},
+    encoding::{FunctionLayout, layout_function, translate_spans_to_byte_pcs},
 };
 use std::sync::Arc;
 
@@ -515,10 +515,9 @@ impl<'a> From<&'a Vec<Operand>> for OperandView<'a> {
 
 /// One immutable, schema-verified executable function body.
 ///
-/// Construction encodes the compiler DTO and immediately decodes it through
-/// `otter-bytecode`'s authoritative verifier. The stored instruction stream is
-/// therefore the verifier result itself, not a second VM-side interpretation of
-/// branch operands or variadic layouts.
+/// Construction verifies the compiler DTO directly in logical instruction-index
+/// coordinates, then builds schema-typed words. Cold byte-PC layout is computed
+/// without materialising or decoding the self-describing serialized stream.
 #[derive(Debug, Clone)]
 pub struct CodeBlock {
     /// Global VM function id (chunk base + local table index).
@@ -602,26 +601,18 @@ impl CodeBlock {
             .param_count
             .saturating_add(function.locals)
             .saturating_add(function.scratch);
-        let EncodedFunction {
-            code: code_bytes,
+        let FunctionLayout {
+            total_bytes: code_byte_len,
             instr_to_byte_pc,
-        } = encode_function(&function.code);
-        let code_byte_len =
-            u32::try_from(code_bytes.len()).expect("function byte stream exceeds u32 range");
-        let verified_code = decode_function(&code_bytes).unwrap_or_else(|error| {
-            let offset = decode_error_offset(&error);
-            let opcode = instr_to_byte_pc
-                .binary_search(&u32::try_from(offset).unwrap_or(u32::MAX))
-                .ok()
-                .and_then(|index| function.code.get(index))
-                .map(|instr| instr.op);
+        } = layout_function(&function.code).unwrap_or_else(|error| {
             panic!(
-                "compiler emitted bytecode that violates the opcode schema: function={} id={} offset={} opcode={opcode:?}: {error}",
-                function.name, function.id, offset
+                "compiler emitted bytecode that violates the opcode schema: function={} id={}: {error}",
+                function.name, function.id
             )
         });
         let mut overflow_operand_words = Vec::new();
-        let code = verified_code
+        let code = function
+            .code
             .iter()
             .enumerate()
             .map(|(idx, instr)| {
@@ -641,16 +632,16 @@ impl CodeBlock {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
-                let byte_pc = instr.pc;
-                let next_byte_pc = verified_code
+                let byte_pc = instr_to_byte_pc[idx];
+                let next_byte_pc = instr_to_byte_pc
                     .get(idx + 1)
-                    .map_or(code_byte_len, |next| next.pc);
+                    .copied()
+                    .unwrap_or(code_byte_len);
                 let byte_len = u16::try_from(next_byte_pc - byte_pc)
                     .expect("single instruction exceeds 65535-byte encoding");
-                let source_instr = &function.code[idx];
                 Arc::new(CodeBlockInstruction::from_operands(
-                    source_instr.op,
-                    source_instr.operands.as_slice().to_vec(),
+                    instr.op,
+                    instr.operands.as_slice().to_vec(),
                     function.id,
                     idx as u32,
                     property_ic_site,
@@ -747,19 +738,6 @@ impl CodeBlock {
             byte_spans,
             code_byte_len,
         }
-    }
-}
-
-fn decode_error_offset(error: &otter_bytecode::encoding::DecodeError) -> usize {
-    use otter_bytecode::encoding::DecodeError;
-
-    match error {
-        DecodeError::UnexpectedEnd { offset }
-        | DecodeError::UnknownOpcode { offset, .. }
-        | DecodeError::UnknownOperandKind { offset, .. }
-        | DecodeError::InvalidOperandShape { offset, .. }
-        | DecodeError::InvalidControlFlowTarget { offset, .. }
-        | DecodeError::InvalidControlFlowOperand { offset, .. } => *offset,
     }
 }
 

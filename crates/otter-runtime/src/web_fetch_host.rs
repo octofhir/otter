@@ -58,7 +58,7 @@ pub fn prepare_fetch(
     net: Permission<String>,
 ) -> (
     Arc<FetchAbort>,
-    impl Future<Output = Result<FetchResponse, String>> + Send,
+    impl Future<Output = Result<(FetchResponseHead, ResponseBody), String>> + Send,
 ) {
     let (sender, receiver) = oneshot::channel();
     let abort = Arc::new(FetchAbort {
@@ -89,32 +89,62 @@ pub struct FetchRequest {
     pub redirect: String,
 }
 
-/// Plain-data response handed back to the `fetch` shim, which mints a
-/// `Response` from it.
+/// Plain-data response head handed back to the `fetch` shim, which mints a
+/// `Response` from it. The body is streamed separately through [`ResponseBody`].
 #[derive(Debug, Clone)]
-pub struct FetchResponse {
+pub struct FetchResponseHead {
     /// HTTP status code.
     pub status: u16,
     /// Reason phrase (canonical for the status when the server omits one).
     pub status_text: String,
     /// Response header name/value pairs in wire order.
     pub headers: Vec<(String, String)>,
-    /// Fully buffered response body.
-    pub body: Vec<u8>,
     /// Final URL after redirects.
     pub final_url: String,
 }
 
-/// Perform a buffered outbound HTTP request, gated by the `net` capability.
+/// The streaming body of a fetched response. Each [`ResponseBody::pull`] reads
+/// the next chunk directly off the connection, so the transport applies natural
+/// backpressure — bytes are only pulled from the socket when the reader asks.
+/// The `tokio` mutex serializes pulls (the `ReadableStream` protocol pulls one
+/// chunk at a time) and is held across the `await`.
+pub struct ResponseBody {
+    response: tokio::sync::Mutex<Option<reqwest::Response>>,
+}
+
+impl ResponseBody {
+    /// Read the next body chunk. `Ok(Some)` is a chunk, `Ok(None)` is
+    /// end-of-stream, `Err` is a transport failure. Idempotent once drained.
+    pub async fn pull(&self) -> Result<Option<Vec<u8>>, String> {
+        let mut guard = self.response.lock().await;
+        let Some(response) = guard.as_mut() else {
+            return Ok(None);
+        };
+        match response.chunk().await {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            Ok(None) => {
+                *guard = None;
+                Ok(None)
+            }
+            Err(err) => {
+                *guard = None;
+                Err(format!("fetch body read failed: {err}"))
+            }
+        }
+    }
+}
+
+/// Perform an outbound HTTP request, gated by the `net` capability, and return
+/// the response head plus a streaming [`ResponseBody`].
 ///
 /// The URL's `host[:port]` must match `net` or the request is refused before a
-/// connection is made. Redirects follow reqwest's default policy; the request
-/// and response bodies are fully buffered (streaming is a later slice).
+/// connection is made. Redirects follow reqwest's default policy. The body is
+/// left on the connection and streamed lazily through [`ResponseBody::pull`].
 pub async fn perform_fetch(
     request: FetchRequest,
     user_agent: String,
     net: Permission<String>,
-) -> Result<FetchResponse, String> {
+) -> Result<(FetchResponseHead, ResponseBody), String> {
     let parsed = reqwest::Url::parse(&request.url).map_err(|err| format!("invalid URL: {err}"))?;
     let host = parsed
         .host_str()
@@ -168,28 +198,23 @@ pub async fn perform_fetch(
         ));
     }
     let status = response.status();
-    let status_text = status.canonical_reason().unwrap_or("").to_string();
-    let final_url = response.url().to_string();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_string(), value.to_string()))
-        })
-        .collect();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|err| format!("fetch body read failed: {err}"))?
-        .to_vec();
-    Ok(FetchResponse {
+    let head = FetchResponseHead {
         status: status.as_u16(),
-        status_text,
-        headers,
-        body,
-        final_url,
-    })
+        status_text: status.canonical_reason().unwrap_or("").to_string(),
+        final_url: response.url().to_string(),
+        headers: response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect(),
+    };
+    let body = ResponseBody {
+        response: tokio::sync::Mutex::new(Some(response)),
+    };
+    Ok((head, body))
 }

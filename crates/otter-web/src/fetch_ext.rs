@@ -21,37 +21,80 @@
 //! # See also
 //! - <https://fetch.spec.whatwg.org/#fetch-method>
 
+use std::sync::Arc;
+
 use otter_runtime::marshal::{IntoJs, JsError, MarshalCx};
-use otter_runtime::web_fetch_host::{FetchRequest, FetchResponse, prepare_fetch};
+use otter_runtime::web_fetch_host::{FetchRequest, FetchResponseHead, ResponseBody, prepare_fetch};
 use otter_runtime::{
     CapabilitySet, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
     RuntimeScoped as Scoped, RuntimeValue as Value,
 };
 
-/// The buffered fetch result, marshalled to the `[status, statusText,
-/// flatHeaders, bodyBytes, finalUrl]` array the `fetch.js` shim mints a
-/// `Response` from.
-struct NativeFetchResult(FetchResponse);
+/// One streamed body chunk: `Some` bytes become a `Uint8Array`, end-of-stream
+/// becomes `null` (the shim's `ReadableStream` closes on it).
+struct ChunkResult(Option<Vec<u8>>);
 
-impl IntoJs for NativeFetchResult {
+impl IntoJs for ChunkResult {
     fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Scoped<'s>, JsError> {
-        let response = self.0;
+        match self.0 {
+            Some(bytes) => cx.uint8_array_from_bytes(bytes),
+            None => Ok(cx.null()),
+        }
+    }
+}
+
+/// The response head plus its streaming body, marshalled to the
+/// `[status, statusText, flatHeaders, finalUrl, pull]` array the `fetch.js` shim
+/// mints a `Response` from. `pull` is a native `() => Promise<Uint8Array|null>`
+/// that reads the next body chunk on demand (natural backpressure).
+struct StreamingHead {
+    head: FetchResponseHead,
+    body: Arc<ResponseBody>,
+}
+
+impl IntoJs for StreamingHead {
+    fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Scoped<'s>, JsError> {
+        let StreamingHead { head, body } = self;
         let array = cx.array(5)?;
-        let status = cx.number(f64::from(response.status));
+        let status = cx.number(f64::from(head.status));
         cx.set_index(array, 0, status)?;
-        let status_text = cx.string(&response.status_text)?;
+        let status_text = cx.string(&head.status_text)?;
         cx.set_index(array, 1, status_text)?;
-        let mut flat = Vec::with_capacity(response.headers.len() * 2);
-        for (name, value) in response.headers {
+        let mut flat = Vec::with_capacity(head.headers.len() * 2);
+        for (name, value) in head.headers {
             flat.push(name);
             flat.push(value);
         }
         let flat = flat.into_js(cx)?;
         cx.set_index(array, 2, flat)?;
-        let body = cx.uint8_array_from_bytes(response.body)?;
-        cx.set_index(array, 3, body)?;
-        let final_url = cx.string(&response.final_url)?;
-        cx.set_index(array, 4, final_url)?;
+        let final_url = cx.string(&head.final_url)?;
+        cx.set_index(array, 3, final_url)?;
+
+        // `pull()` reads the next body chunk as a fresh promise; the
+        // `ReadableStream` calls it once per chunk, so the socket is drained
+        // only as the reader consumes it.
+        let pull = cx
+            .ctx()
+            .native_value(
+                "fetch.pull",
+                Default::default(),
+                move |ctx, _args, _captures| {
+                    let body = body.clone();
+                    ctx.scope(|ctx, scope| {
+                        let mut cx = MarshalCx::new(ctx, scope);
+                        let future = async move {
+                            body.pull().await.map(ChunkResult).map_err(JsError::Type)
+                        };
+                        let promise = cx
+                            .promise_from_future(future)
+                            .map_err(|err| err.into_native("fetch"))?;
+                        Ok(cx.escape(promise))
+                    })
+                },
+            )
+            .map_err(|err| JsError::Type(err.to_string()))?;
+        let pull = cx.park(pull);
+        cx.set_index(array, 4, pull)?;
         Ok(array)
     }
 }
@@ -110,7 +153,10 @@ pub fn native_fetch(
         let future = async move {
             transport
                 .await
-                .map(NativeFetchResult)
+                .map(|(head, body)| StreamingHead {
+                    head,
+                    body: Arc::new(body),
+                })
                 .map_err(JsError::Type)
         };
         let promise = cx

@@ -1130,7 +1130,6 @@ fn jit_call_method_stub_impl(
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     let context = unsafe { &*ctx.context };
-    let call_byte_pc = ctx.bail_pc;
     let name_idx = (name_and_site & 0xffff_ffff) as u32;
     let raw_site = (name_and_site >> 32) as u32;
     let site = (raw_site != otter_vm::JIT_METHOD_CALL_NO_SITE).then_some(raw_site as usize);
@@ -1143,7 +1142,6 @@ fn jit_call_method_stub_impl(
         dst as u16,
         recv as u16,
         name_idx,
-        call_byte_pc,
         site,
         &all[..argc],
         source,

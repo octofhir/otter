@@ -76,12 +76,12 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let src_reg = register_operand(operands.get(1))?;
         let flags = match operands.get(2) {
-            Some(&Operand::Imm32(bits)) => bits,
+            Some(Operand::Imm32(bits)) => bits,
             _ => 0,
         };
         let forbid_var_arguments = flags & 1 != 0;
@@ -338,11 +338,11 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let argc = match operands.get(1) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
+            Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
         // Coerce one argument at a time, re-reading each value from

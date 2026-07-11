@@ -1,8 +1,8 @@
 //! Authoritative immutable CodeBlock execution representation.
 //!
 //! `otter-bytecode` owns the compiler/debug DTO shape. The VM owns this
-//! compact view so hot dispatch reads opcodes, operands, byte offsets,
-//! and named-property IC sites directly off each instruction record.
+//! compact view so hot dispatch reads opcodes, schema-typed operand words, and
+//! named-property IC sites directly while byte coordinates stay cold.
 //!
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
@@ -387,6 +387,7 @@ impl CodeBlock {
     }
 
     /// Operands in schema declaration order.
+    #[cfg(test)]
     #[must_use]
     pub fn operands(&self, instr: &CodeBlockInstruction) -> smallvec::SmallVec<[Operand; 4]> {
         (0..usize::from(instr.operand_count))
@@ -512,6 +513,43 @@ impl<'a> OperandView<'a> {
             self.get(index)
                 .expect("verified CodeBlock operand must decode")
         })
+    }
+}
+
+/// Copyable operand source accepted by semantic helpers during the wordcode
+/// migration. Production dispatch supplies [`OperandView`]; borrowed decoded
+/// slices remain available to focused unit tests and cold tooling.
+pub(crate) trait OperandSource: Copy {
+    /// Decode one operand by position.
+    fn get(self, index: usize) -> Option<Operand>;
+
+    /// Decode the first operand.
+    fn first(self) -> Option<Operand> {
+        self.get(0)
+    }
+}
+
+impl OperandSource for OperandView<'_> {
+    fn get(self, index: usize) -> Option<Operand> {
+        self.get(index)
+    }
+}
+
+impl OperandSource for &[Operand] {
+    fn get(self, index: usize) -> Option<Operand> {
+        <[Operand]>::get(self, index).copied()
+    }
+}
+
+impl<const N: usize> OperandSource for &[Operand; N] {
+    fn get(self, index: usize) -> Option<Operand> {
+        self.as_slice().get(index).copied()
+    }
+}
+
+impl std::fmt::Debug for OperandView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 

@@ -192,7 +192,6 @@ impl Interpreter {
                     .function(function_id)
                     .map(|f| f.name.as_str())
                     .unwrap_or("<unknown>");
-                let operands = function.operands(instr);
                 let register_window = stack[top_idx].registers.as_slice();
                 let event = inspect::StepEvent {
                     frame_depth: stack.len(),
@@ -202,7 +201,7 @@ impl Interpreter {
                         .instruction_byte_pc(idx)
                         .ok_or(VmError::MissingReturn)?,
                     op,
-                    operands: &operands,
+                    operands: function.operand_view(instr),
                     register_window,
                 };
                 if let Some(tracer) = self.tracer.as_deref_mut() {
@@ -521,8 +520,8 @@ impl Interpreter {
                 // pushes a frame, so the dispatch happens here —
                 // outside the in-frame mutable borrow below.
                 Op::ToNumber => {
-                    let operands = function.operands(instr);
-                    if let Some(()) = self.try_to_primitive_dispatch(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if let Some(()) = self.try_to_primitive_dispatch(stack, context, operands)? {
                         continue;
                     }
                     let dst = function
@@ -545,7 +544,7 @@ impl Interpreter {
                 // the dispatch loop afterwards — the in-frame
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
-                    let operands = function.operands(instr);
+                    let operands = function.operand_view(instr);
                     // Hot fast path: an already-primitive source (the dominant
                     // case — numeric loop operands) is its own ToPrimitive
                     // result. Skip the hint-token decode and the parked-ladder
@@ -560,7 +559,7 @@ impl Interpreter {
                         stack[top_idx].advance_pc(self.current_byte_len)?;
                         continue;
                     }
-                    self.drive_to_primitive(stack, context, &operands)?;
+                    self.drive_to_primitive(stack, context, operands)?;
                     continue;
                 }
                 // §7.4.3 `GetIterator`. Built-in iterables fall
@@ -568,8 +567,8 @@ impl Interpreter {
                 // route through the call-frame ladder.
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
-                    let operands = function.operands(instr);
-                    if self.drive_get_iterator(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_get_iterator(stack, context, operands)? {
                         continue;
                     }
                     let dst = function
@@ -606,8 +605,8 @@ impl Interpreter {
                         .exec_register(instr, 2)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
-                    let operands = function.operands(instr);
-                    match self.drive_iterator_next(stack, context, &operands) {
+                    let operands = function.operand_view(instr);
+                    match self.drive_iterator_next(stack, context, operands) {
                         Ok(true) => continue,
                         Ok(false) => {}
                         Err(e) => {
@@ -684,8 +683,8 @@ impl Interpreter {
                 // below.
                 // <https://tc39.es/ecma262/#sec-ordinaryget>
                 Op::LoadProperty => {
-                    let operands = function.operands(instr);
-                    if self.drive_load_property(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_load_property(stack, context, operands)? {
                         continue;
                     }
                     let dst = context
@@ -704,14 +703,14 @@ impl Interpreter {
                     continue;
                 }
                 Op::LoadElement => {
-                    let operands = function.operands(instr);
+                    let operands = function.operand_view(instr);
                     if let Some(recv_reg) = context.exec_register(instr, 1)
                         && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
                     {
                         let recv = *recv;
                         self.note_element_load(recv);
                     }
-                    if self.drive_load_element(stack, context, &operands)? {
+                    if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }
                     let (dst, recv_reg, idx_reg) = context
@@ -814,8 +813,8 @@ impl Interpreter {
                 // and non-extensible rejections surface here too.
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
-                    let operands = function.operands(instr);
-                    if self.drive_store_property(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_store_property(stack, context, operands)? {
                         continue;
                     }
                     let obj_reg = context
@@ -834,7 +833,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::StoreElement => {
-                    let operands = function.operands(instr);
+                    let operands = function.operand_view(instr);
                     let recv_reg = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
@@ -848,7 +847,7 @@ impl Interpreter {
                         let value = *read_register(&stack[top_idx], src_reg)?;
                         self.note_arith(value, value);
                     }
-                    if self.drive_store_element(stack, context, &operands)? {
+                    if self.drive_store_element(stack, context, operands)? {
                         continue;
                     }
                     self.run_store_element_regs(
@@ -862,8 +861,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::Instanceof => {
-                    let operands = function.operands(instr);
-                    if self.drive_instanceof(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_instanceof(stack, context, operands)? {
                         continue;
                     }
                     let (dst, lhs, rhs) = function
@@ -877,8 +876,8 @@ impl Interpreter {
                 // [[Delete]] — invoke `has` / `deleteProperty`
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
-                    let operands = function.operands(instr);
-                    if self.drive_has_property_proxy(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_has_property_proxy(stack, context, operands)? {
                         continue;
                     }
                     let (dst, lhs, rhs) = context
@@ -889,8 +888,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::DeleteProperty => {
-                    let operands = function.operands(instr);
-                    if self.drive_delete_property_proxy(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_delete_property_proxy(stack, context, operands)? {
                         continue;
                     }
                     let dst = context
@@ -925,8 +924,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::DeleteElement => {
-                    let operands = function.operands(instr);
-                    if self.drive_delete_element_proxy(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_delete_element_proxy(stack, context, operands)? {
                         continue;
                     }
                     let (dst, obj_reg, idx_reg) = context
@@ -953,8 +952,8 @@ impl Interpreter {
                 // `setPrototypeOf` traps when the receiver is a
                 // Proxy.
                 Op::GetPrototype => {
-                    let operands = function.operands(instr);
-                    if self.drive_get_prototype_proxy(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_get_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
                     let dst = context
@@ -968,8 +967,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::SetPrototype => {
-                    let operands = context.exec_operands(instr);
-                    if self.drive_set_prototype_proxy(stack, context, &operands)? {
+                    let operands = function.operand_view(instr);
+                    if self.drive_set_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
                     let obj_reg = context
@@ -988,15 +987,15 @@ impl Interpreter {
                 // modifying so it has to run before the in-frame
                 // borrow below.
                 Op::Eval => {
-                    let operands = context.exec_operands(instr);
-                    self.run_eval_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_eval_operands(context, stack, operands)?;
                     continue;
                 }
                 // §20.2.1.1 — `new Function(args, body)` recurses
                 // into the eval hook with a synthesised wrapper.
                 Op::NewFunction => {
-                    let operands = context.exec_operands(instr);
-                    self.run_new_function_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_new_function_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::CollectArguments => {
@@ -1321,8 +1320,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::NewArray => {
-                    let operands = context.exec_operands(instr);
-                    self.run_new_array_operands(&mut *stack, top_idx, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_new_array_operands(&mut *stack, top_idx, operands)?;
                     continue;
                 }
                 Op::LoadRegExp => {
@@ -2244,8 +2243,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::MathCall => {
-                    let operands = context.exec_operands(instr);
-                    self.do_math_call(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.do_math_call(stack, context, operands)?;
                     continue;
                 }
                 Op::SymbolLoad => {
@@ -2669,76 +2668,76 @@ impl Interpreter {
                     continue;
                 }
                 Op::MakeClosure => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operand_view(instr);
                     let frame = &mut stack[top_idx];
-                    self.run_make_closure_operands(context, frame, &operands)?;
+                    self.run_make_closure_operands(context, frame, operands)?;
                     continue;
                 }
                 Op::ArrayBufferCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_array_buffer_static_call_operands(stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
                 Op::SharedArrayBufferCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_shared_array_buffer_static_call_operands(stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_shared_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
                 Op::BigIntCall | Op::DataViewCall => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operand_view(instr);
                     let frame = &mut stack[top_idx];
-                    self.run_static_call_operands(op, context, frame, &operands)?;
+                    self.run_static_call_operands(op, context, frame, operands)?;
                     continue;
                 }
                 Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
-                    let operands = context.exec_operands(instr);
-                    self.run_array_static_operands(op, context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_array_static_operands(op, context, stack, operands)?;
                     continue;
                 }
                 Op::ForInKeys => {
-                    let operands = context.exec_operands(instr);
-                    self.run_for_in_keys_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_for_in_keys_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::CopyDataProperties => {
-                    let operands = context.exec_operands(instr);
-                    self.run_copy_data_properties_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_copy_data_properties_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::StarReexport => {
-                    let operands = context.exec_operands(instr);
-                    self.run_star_reexport_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_star_reexport_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::DefineOwnProperty => {
-                    let operands = context.exec_operands(instr);
-                    self.run_define_own_property_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_define_own_property_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::QueueMicrotask => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operand_view(instr);
                     let frame = &mut stack[top_idx];
-                    self.run_queue_microtask_operands(context, frame, &operands)?;
+                    self.run_queue_microtask_operands(context, frame, operands)?;
                     continue;
                 }
                 Op::PromiseNew => {
-                    let operands = context.exec_operands(instr);
-                    self.run_promise_new_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_promise_new_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::PromiseCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_promise_call_operands(context, stack, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_promise_call_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::ImportNamespaceDynamic => {
-                    let operands = context.exec_operands(instr);
-                    self.run_import_namespace_dynamic_operands(context, stack, top_idx, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.run_import_namespace_dynamic_operands(context, stack, top_idx, operands)?;
                     continue;
                 }
                 Op::BindFunction => {
-                    let operands = context.exec_operands(instr);
-                    self.drive_bind_function(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.drive_bind_function(stack, context, operands)?;
                     continue;
                 }
             }

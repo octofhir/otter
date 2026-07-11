@@ -112,18 +112,18 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let idx = const_operand(operands.get(1))?;
         let count = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
+            Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
         let mut parent_indices = Vec::with_capacity(count);
         for i in 0..count {
             match operands.get(3 + i) {
-                Some(&Operand::Imm32(n)) if n >= 0 => parent_indices.push(n as u32),
+                Some(Operand::Imm32(n)) if n >= 0 => parent_indices.push(n as u32),
                 _ => return Err(VmError::InvalidOperand),
             }
         }
@@ -339,7 +339,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         if let Some(result) = self.continue_pending_bind_function(stack, context, dst) {
@@ -351,7 +351,7 @@ impl Interpreter {
         let callee_reg = register_operand(operands.get(1))?;
         let this_reg = register_operand(operands.get(2))?;
         let argc = match operands.get(3) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
+            Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
         let target = *read_register(&stack[top_idx], callee_reg)?;

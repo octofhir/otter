@@ -52,7 +52,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let callee_reg = register_operand(operands.first())?;
         let callee = *read_register(frame, callee_reg)?;
@@ -76,7 +76,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let executor_reg = register_operand(operands.get(1))?;
@@ -108,7 +108,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let method_idx = const_operand(operands.get(1))?;
@@ -132,12 +132,12 @@ impl Interpreter {
 
 fn collect_variadic_args(
     frame: &Frame,
-    operands: &[Operand],
+    operands: impl crate::executable::OperandSource,
     argc_pos: usize,
     args_start: usize,
 ) -> Result<SmallVec<[Value; 4]>, VmError> {
     let argc = match operands.get(argc_pos) {
-        Some(&Operand::ConstIndex(n)) => n as usize,
+        Some(Operand::ConstIndex(n)) => n as usize,
         _ => return Err(VmError::InvalidOperand),
     };
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);

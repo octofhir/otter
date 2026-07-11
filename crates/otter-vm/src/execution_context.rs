@@ -297,18 +297,6 @@ impl ExecutionContext {
         Some(view)
     }
 
-    /// Decode operands for the few legacy semantic helpers that still consume
-    /// slices. Hot fixed-operand dispatch uses the typed accessors below.
-    #[must_use]
-    pub(crate) fn exec_operands(
-        &self,
-        instr: &CodeBlockInstruction,
-    ) -> smallvec::SmallVec<[Operand; 4]> {
-        self.exec_function(instr.code_block_id())
-            .expect("verified instruction must retain its owning CodeBlock")
-            .operands(instr)
-    }
-
     /// Return one schema-typed operand.
     #[must_use]
     pub(crate) fn exec_operand(

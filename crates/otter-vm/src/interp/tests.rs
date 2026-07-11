@@ -918,7 +918,7 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
     let before = interp.gc_heap_mut().stats().old_allocated_bytes;
     assert!(
         interp
-            .drive_get_iterator(&mut stack, &context, &operands)
+            .drive_get_iterator(&mut stack, &context, operands.as_slice())
             .unwrap()
     );
     let after = interp.gc_heap_mut().stats().old_allocated_bytes;

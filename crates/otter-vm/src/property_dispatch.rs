@@ -3768,7 +3768,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
@@ -4079,7 +4079,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let lhs_reg = register_operand(operands.get(1))?;
@@ -4099,7 +4099,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
@@ -4551,7 +4551,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
         let key_reg = register_operand(operands.get(1))?;
@@ -5099,7 +5099,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
         let name_idx = const_operand(operands.get(1))?;
@@ -5536,7 +5536,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let lhs_reg = register_operand(operands.get(1))?;
@@ -5633,7 +5633,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
@@ -5669,7 +5669,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let obj_reg = register_operand(operands.get(1))?;
@@ -5697,7 +5697,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let dst = register_operand(operands.first())?;
         let src = register_operand(operands.get(1))?;
@@ -5718,7 +5718,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
         let obj_reg = register_operand(operands.first())?;
         let proto_reg = register_operand(operands.get(1))?;

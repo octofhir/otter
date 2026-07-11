@@ -18,8 +18,8 @@
 //! - Mnemonics come from [`otter_bytecode::Op::mnemonic`]; renaming an
 //!   opcode shifts every golden trace at compile time through the
 //!   shared mnemonic table.
-//! - The hot dispatch path checks one `Option` slot per instruction
-//!   and pays no allocation when the slot is `None`.
+//! - The hot dispatch path checks one `Option` slot per instruction. Enabled
+//!   tracing borrows wordcode operands and does not materialise a collection.
 //! - The format is line-oriented and deterministic given a fixed
 //!   bytecode module and runtime configuration.
 //!
@@ -49,7 +49,7 @@ use std::io::Write;
 
 use otter_bytecode::{Op, Operand};
 
-use crate::Value;
+use crate::{Value, executable::OperandView};
 
 /// Canonical version banner. Bump on any format change that breaks
 /// existing golden traces.
@@ -75,7 +75,7 @@ pub struct StepEvent<'a> {
     /// [`Op::mnemonic`].
     pub op: Op,
     /// Operands in declaration order.
-    pub operands: &'a [Operand],
+    pub operands: OperandView<'a>,
     /// Register window of the active frame. Embedders that want
     /// frame/register inspection from inside a tracer hook should
     /// read this slice directly — it is the same backing storage the
@@ -165,12 +165,12 @@ pub fn format_event(out: &mut String, event: &StepEvent<'_>) {
     if !event.operands.is_empty() {
         out.push_str("  ");
         let mut first = true;
-        for operand in event.operands {
+        for operand in event.operands.iter() {
             if !first {
                 out.push(' ');
             }
             first = false;
-            format_operand(out, operand);
+            format_operand(out, &operand);
         }
     }
 }
@@ -732,7 +732,7 @@ mod tests {
             function_name: "<main>",
             byte_pc: 12,
             op: Op::Add,
-            operands: &operands,
+            operands: (&operands).into(),
             register_window: &registers,
         };
         let mut out = String::new();
@@ -753,7 +753,7 @@ mod tests {
                 function_name: "<main>",
                 byte_pc: 0,
                 op: Op::LoadInt32,
-                operands: &operands,
+                operands: (&operands).into(),
                 register_window: &registers,
             };
             tracer.on_step(&event);

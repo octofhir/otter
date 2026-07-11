@@ -60,12 +60,12 @@ impl Interpreter {
             .function(fid)
             .map(|function| function.name.as_str())
             .unwrap_or("<unknown>");
-        let instr = context
+        let instruction = context
             .exec_function(fid)
-            .and_then(|function| function.instr_at_byte_pc(pc));
-        let op = instr.map(|instr| instr.op());
-        let operands = instr
-            .map(|instr| format!("{:?}", context.exec_operands(instr)))
+            .and_then(|function| function.instr_at_byte_pc(pc).map(|instr| (function, instr)));
+        let op = instruction.map(|(_, instr)| instr.op());
+        let operands = instruction
+            .map(|(function, instr)| format!("{:?}", function.operand_view(instr)))
             .unwrap_or_else(|| "[]".to_string());
         eprintln!(
             "[otter-jit] {kind} bail fid {fid} {function_name} osr={osr_pc:?} pc {pc} op {op:?} operands {operands}"

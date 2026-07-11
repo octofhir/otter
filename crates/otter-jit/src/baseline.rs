@@ -1483,7 +1483,7 @@ pub(crate) mod arm64 {
     /// non-number operand on that path bails to `bail`.
     fn emit_add_sub_mul(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
         op: Op,
     ) -> Result<(), Unsupported> {
@@ -1536,7 +1536,7 @@ pub(crate) mod arm64 {
     /// baseline JIT while preserving the interpreter's full `+` semantics.
     fn emit_add_with_runtime_fallback(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         string_concat_safepoint: Option<SafepointId>,
         register_count: u16,
         threw: DynamicLabel,
@@ -1652,7 +1652,7 @@ pub(crate) mod arm64 {
     /// operands to f64 and `fdiv`. A non-number operand bails to `bail`.
     fn emit_div(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let (dst, lhs, rhs) = reg3(operands)?;
@@ -1676,7 +1676,7 @@ pub(crate) mod arm64 {
     /// `i32::MIN`, so `msub` yields the correct `0` remainder.
     fn emit_rem(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let (dst, lhs, rhs) = reg3(operands)?;
@@ -1790,7 +1790,7 @@ pub(crate) mod arm64 {
     /// `int32 op int32` is exact in `f64` (operands are ≤ 32-bit).
     fn emit_float_binop_res(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
         op: Op,
         fres: &mut FloatResidency,
@@ -1817,7 +1817,7 @@ pub(crate) mod arm64 {
     /// destination receives a boolean, so its residency is dropped.
     fn emit_cmp_res(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
         cmp: Cmp,
         fres: &mut FloatResidency,
@@ -1939,7 +1939,7 @@ pub(crate) mod arm64 {
     /// exactly as JS masks the right operand to `& 31`.
     fn emit_int_binop(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
         kind: IntBinOp,
     ) -> Result<(), Unsupported> {
@@ -1965,7 +1965,7 @@ pub(crate) mod arm64 {
     /// be represented by Otter's int32 tag.
     fn emit_ushr(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let (dst, lhs, rhs) = reg3(operands)?;
@@ -2196,8 +2196,7 @@ pub(crate) mod arm64 {
             // exact instruction, preserving committed side effects.
             emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
-            let operand_values = view.code_block.operands(instr);
-            let ops_ref = operand_values.as_slice();
+            let ops_ref = view.code_block.operand_view(instr);
             match instr.op {
                 Op::LoadInt32 => {
                     let dst = reg(ops_ref, 0)?;
@@ -3505,8 +3504,7 @@ pub(crate) mod arm64 {
         let mut pending = Vec::<u16>::new();
 
         for instr in &callee.instructions {
-            let operand_values = callee.code_block.operands(instr);
-            let operands = operand_values.as_slice();
+            let operands = callee.code_block.operand_view(instr);
             let mut ok = true;
             match instr.op {
                 Op::LoadLocal | Op::StoreLocal => {}
@@ -3688,8 +3686,7 @@ pub(crate) mod arm64 {
         let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
         let mut store_seen = false;
         for instr in &callee.instructions {
-            let operand_values = callee.code_block.operands(instr);
-            let operands = operand_values.as_slice();
+            let operands = callee.code_block.operand_view(instr);
             let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
                 regs.get(regn as usize).copied()
             };
@@ -3817,8 +3814,7 @@ pub(crate) mod arm64 {
         clabels: &BTreeMap<u32, DynamicLabel>,
         cage_base: usize,
     ) -> Result<(), Unsupported> {
-        let operand_values = code_block.operands(instr);
-        let ops_ref = operand_values.as_slice();
+        let ops_ref = code_block.operand_view(instr);
         let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
             let t = branch_target(instr, rel);
             u32::try_from(t)
@@ -4029,7 +4025,7 @@ pub(crate) mod arm64 {
     fn try_emit_inline_call(
         ops: &mut Assembler,
         callee: &JitInlineCallee,
-        call_operands: &[Operand],
+        call_operands: impl WordOperands,
         cage_base: usize,
         bail: DynamicLabel,
     ) -> Result<bool, Unsupported> {
@@ -4235,8 +4231,7 @@ pub(crate) mod arm64 {
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
     ) -> Result<(), Unsupported> {
-        let operand_values = code_block.operands(instr);
-        let ops_ref = operand_values.as_slice();
+        let ops_ref = code_block.operand_view(instr);
         match instr.op {
             Op::LoadThis => {
                 let dst = reg(ops_ref, 0)?;
@@ -4382,7 +4377,7 @@ pub(crate) mod arm64 {
     fn emit_inline_method_attempt(
         ops: &mut Assembler,
         method: &JitInlineMethod,
-        call_operands: &[Operand],
+        call_operands: impl WordOperands,
         argc: usize,
         cage_base: usize,
         object_shape_byte: u32,
@@ -4563,7 +4558,7 @@ pub(crate) mod arm64 {
     fn try_emit_inline_method_call(
         ops: &mut Assembler,
         method: &JitInlineMethod,
-        call_operands: &[Operand],
+        call_operands: impl WordOperands,
         site: u64,
         cage_base: usize,
         object_shape_byte: u32,
@@ -4625,7 +4620,7 @@ pub(crate) mod arm64 {
     fn try_emit_poly_inline_method_call(
         ops: &mut Assembler,
         methods: &[JitInlineMethod],
-        call_operands: &[Operand],
+        call_operands: impl WordOperands,
         site: u64,
         cage_base: usize,
         object_shape_byte: u32,
@@ -4733,7 +4728,7 @@ pub(crate) mod arm64 {
     /// interpreter at the call (`bail`), which reconstructs a real frame.
     fn emit_self_recursive_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         regcount: u16,
         self_entry: DynamicLabel,
         bail: DynamicLabel,
@@ -4918,7 +4913,7 @@ pub(crate) mod arm64 {
     /// the normal typed method path without observable state.
     fn emit_direct_method_inline(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         site: u64,
         view: &JitCompileSnapshot,
         miss: DynamicLabel,
@@ -5221,7 +5216,7 @@ pub(crate) mod arm64 {
     /// runtime call bridge.
     fn emit_call(
         ops: &mut Assembler,
-        _operands: &[Operand],
+        _operands: impl WordOperands,
         bail: DynamicLabel,
         _threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
@@ -5430,7 +5425,7 @@ pub(crate) mod arm64 {
 
     fn emit_collection_leaf_method_guarded_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         leaf: &JitCollectionLeafMethod,
         view: &JitCompileSnapshot,
         miss: DynamicLabel,
@@ -5637,7 +5632,7 @@ pub(crate) mod arm64 {
     /// rooted in the destination frame slot. No write barrier or safepoint.
     fn emit_array_pop_inline(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         am: &JitArrayMethod,
         view: &JitCompileSnapshot,
         miss: DynamicLabel,
@@ -5700,7 +5695,7 @@ pub(crate) mod arm64 {
     /// inline: no baked cage base, or `push` with other than one argument.
     fn emit_array_push_inline(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         am: &JitArrayMethod,
         view: &JitCompileSnapshot,
         miss: DynamicLabel,
@@ -5783,7 +5778,7 @@ pub(crate) mod arm64 {
 
     fn emit_live_collection_leaf_method_guarded_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         site: u64,
         view: &JitCompileSnapshot,
         miss: DynamicLabel,
@@ -5894,7 +5889,7 @@ pub(crate) mod arm64 {
 
     fn emit_collection_alloc_method_guarded_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         alloc: &JitCollectionAllocMethod,
         view: &JitCompileSnapshot,
         miss: DynamicLabel,
@@ -6040,7 +6035,7 @@ pub(crate) mod arm64 {
 
     fn emit_live_collection_alloc_method_guarded_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         site: u64,
         safepoint: SafepointId,
         view: &JitCompileSnapshot,
@@ -6211,7 +6206,7 @@ pub(crate) mod arm64 {
     #[allow(clippy::too_many_arguments)]
     fn emit_method_call(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         site: u64,
         leaf: Option<&JitCollectionLeafMethod>,
         alloc: Option<&JitCollectionAllocMethod>,
@@ -6366,7 +6361,7 @@ pub(crate) mod arm64 {
 
     fn emit_cmp(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         bail: DynamicLabel,
         cmp: Cmp,
     ) -> Result<(), Unsupported> {
@@ -6469,7 +6464,7 @@ pub(crate) mod arm64 {
     /// exact interpreter instruction.
     fn emit_loose_cmp(
         ops: &mut Assembler,
-        operands: &[Operand],
+        operands: impl WordOperands,
         negate: bool,
         bail: DynamicLabel,
     ) -> Result<(), Unsupported> {
@@ -7075,34 +7070,56 @@ pub(crate) mod arm64 {
         i64::from(instr.instruction_pc) + 1 + i64::from(rel)
     }
 
-    fn reg(operands: &[Operand], i: usize) -> Result<u16, Unsupported> {
+    trait WordOperands: Copy {
+        fn get(self, index: usize) -> Option<Operand>;
+    }
+
+    impl WordOperands for otter_vm::OperandView<'_> {
+        fn get(self, index: usize) -> Option<Operand> {
+            self.get(index)
+        }
+    }
+
+    impl WordOperands for &[Operand] {
+        fn get(self, index: usize) -> Option<Operand> {
+            <[Operand]>::get(self, index).copied()
+        }
+    }
+
+    impl<const N: usize> WordOperands for &[Operand; N] {
+        fn get(self, index: usize) -> Option<Operand> {
+            self.as_slice().get(index).copied()
+        }
+    }
+
+    fn reg(operands: impl WordOperands, i: usize) -> Result<u16, Unsupported> {
         match operands.get(i) {
-            Some(Operand::Register(r)) => Ok(*r),
+            Some(Operand::Register(r)) => Ok(r),
             _ => Err(Unsupported::OperandShape("expected register")),
         }
     }
 
-    fn imm32(operands: &[Operand], i: usize) -> Result<i32, Unsupported> {
+    fn imm32(operands: impl WordOperands, i: usize) -> Result<i32, Unsupported> {
         match operands.get(i) {
-            Some(Operand::Imm32(v)) => Ok(*v),
+            Some(Operand::Imm32(v)) => Ok(v),
             _ => Err(Unsupported::OperandShape("expected imm32")),
         }
     }
 
     /// A local index encoded as an inline immediate (`LoadLocal`/`StoreLocal`).
-    fn local_index(operands: &[Operand], i: usize) -> Result<u16, Unsupported> {
+    fn local_index(operands: impl WordOperands, i: usize) -> Result<u16, Unsupported> {
         u16::try_from(imm32(operands, i)?).map_err(|_| Unsupported::OperandShape("local index"))
     }
 
     /// A constant-pool index operand (`MakeFunction` body id, `Call` argc).
-    fn const_index(operands: &[Operand], i: usize) -> Result<u32, Unsupported> {
+    fn const_index(operands: impl WordOperands, i: usize) -> Result<u32, Unsupported> {
         match operands.get(i) {
-            Some(Operand::ConstIndex(n)) => Ok(*n),
+            Some(Operand::ConstIndex(n)) => Ok(n),
             _ => Err(Unsupported::OperandShape("expected const index")),
         }
     }
 
-    fn reg3(operands: &[Operand]) -> Result<(u16, u16, u16), Unsupported> {
+    fn reg3(operands: impl WordOperands) -> Result<(u16, u16, u16), Unsupported> {
         Ok((reg(operands, 0)?, reg(operands, 1)?, reg(operands, 2)?))
     }
 }

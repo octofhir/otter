@@ -1,8 +1,8 @@
 //! Static namespace call opcode helpers.
 //!
-//! These opcodes are variadic, so their argument registers live in the
-//! executable side-operand slice. Keeping their dispatch here removes a large
-//! repeated decode block from the main interpreter loop.
+//! These opcodes are variadic, so their argument registers are read through a
+//! borrowed executable operand view. Keeping their dispatch here removes a
+//! large repeated decode block from the main interpreter loop.
 //!
 //! # Contents
 //! - Built-in static calls for Math, JSON, Date, BigInt, binary buffers,
@@ -65,7 +65,7 @@ impl Interpreter {
         op: Op,
         _context: &ExecutionContext,
         frame: &mut Frame,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         match op {
             Op::BigIntCall => {
@@ -122,7 +122,7 @@ impl Interpreter {
     pub(crate) fn run_array_buffer_static_call_operands(
         &mut self,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let (dst, method_idx, args) = {
@@ -152,7 +152,7 @@ impl Interpreter {
     pub(crate) fn run_shared_array_buffer_static_call_operands(
         &mut self,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let (dst, method_idx, args) = {
@@ -189,7 +189,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let (dst, target) = {
@@ -223,7 +223,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let (target, src) = {
@@ -254,7 +254,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         let (target, src) = {
@@ -294,7 +294,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let target_reg = register_operand(operands.first())?;
         let key_reg = register_operand(operands.get(1))?;
@@ -1471,7 +1471,7 @@ fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> Strin
 
 fn decode_static_call(
     frame: &Frame,
-    operands: &[Operand],
+    operands: impl crate::executable::OperandSource,
     method_pos: usize,
     argc_pos: usize,
     args_start: usize,
@@ -1484,12 +1484,12 @@ fn decode_static_call(
 
 fn collect_call_args(
     frame: &Frame,
-    operands: &[Operand],
+    operands: impl crate::executable::OperandSource,
     argc_pos: usize,
     args_start: usize,
 ) -> Result<SmallVec<[Value; 4]>, VmError> {
     let argc = match operands.get(argc_pos) {
-        Some(&Operand::ConstIndex(n)) => n as usize,
+        Some(Operand::ConstIndex(n)) => n as usize,
         _ => return Err(VmError::InvalidOperand),
     };
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);

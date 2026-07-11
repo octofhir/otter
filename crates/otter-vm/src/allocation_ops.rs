@@ -28,7 +28,6 @@ use crate::{
     runtime_state::RuntimeState,
     write_register,
 };
-use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 
 impl Interpreter {
@@ -760,7 +759,7 @@ impl Interpreter {
         &mut self,
         stack: &mut HoltStack,
         top_idx: usize,
-        operands: &[Operand],
+        operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let count = const_operand(operands.get(1))? as usize;

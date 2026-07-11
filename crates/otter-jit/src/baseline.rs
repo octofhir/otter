@@ -2242,7 +2242,7 @@ pub(crate) mod arm64 {
                     safepoint_records.push(SafepointRecord::frame_slot_window(
                         safepoint,
                         NO_FRAME_STATE,
-                        view.register_count,
+                        view.code_block.register_count,
                     ));
                 }
             }
@@ -2253,7 +2253,7 @@ pub(crate) mod arm64 {
                 safepoint_records.push(SafepointRecord::frame_slot_window(
                     safepoint,
                     NO_FRAME_STATE,
-                    view.register_count,
+                    view.code_block.register_count,
                 ));
             }
         }
@@ -2424,7 +2424,7 @@ pub(crate) mod arm64 {
                     &mut ops,
                     ops_ref,
                     add_alloc_safepoints.get(&instr.byte_pc).copied(),
-                    view.register_count,
+                    view.code_block.register_count,
                     threw,
                 )?,
                 Op::Sub | Op::Mul | Op::Div if enable_fres => {
@@ -2573,7 +2573,7 @@ pub(crate) mod arm64 {
                             emit_self_recursive_call(
                                 &mut ops,
                                 ops_ref,
-                                view.register_count,
+                                view.code_block.register_count,
                                 self_entry,
                                 bail,
                                 threw,
@@ -2784,7 +2784,7 @@ pub(crate) mod arm64 {
                     let name = const_index(ops_ref, 1)?;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(&mut ops, 2, u64::from(name));
-                    emit_load_u64(&mut ops, 3, u64::from(view.function_id));
+                    emit_load_u64(&mut ops, 3, u64::from(view.code_block.id));
                     emit_call_stub(&mut ops, jit_load_global_stub as *const () as usize, threw);
                 }
                 // `dst = upvalue[idx]` (captured binding). Inline: read the cell
@@ -3099,7 +3099,7 @@ pub(crate) mod arm64 {
                     emit_load_u64(&mut ops, 3, u64::from(name));
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
-                    emit_load_u64(&mut ops, 6, u64::from(view.function_id));
+                    emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
                     if self_call_safe {
                         // Frameless-eligible body: the miss handler resolves the
                         // own-data IC against the register window (works framed
@@ -3241,7 +3241,7 @@ pub(crate) mod arm64 {
                     emit_load_u64(&mut ops, 4, site);
                     emit_load_u64(&mut ops, 5, cell_addr as u64);
                     if self_call_safe {
-                        emit_load_u64(&mut ops, 6, u64::from(view.function_id));
+                        emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
                         emit_load_u64(&mut ops, 16, jit_store_prop_window_stub as *const () as u64);
                         dynasm!(ops
                             ; .arch aarch64
@@ -3332,7 +3332,7 @@ pub(crate) mod arm64 {
                     let parent_indices_ptr = parent_indices.as_ptr();
                     closure_parent_indices.push(parent_indices);
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                    emit_load_u64(&mut ops, 1, u64::from(view.function_id));
+                    emit_load_u64(&mut ops, 1, u64::from(view.code_block.id));
                     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
                     emit_load_u64(&mut ops, 3, u64::from(function_index));
                     emit_load_u64(&mut ops, 4, parent_indices_ptr as u64);
@@ -3343,7 +3343,7 @@ pub(crate) mod arm64 {
                     let dst = reg(ops_ref, 0)?;
                     let constant_index = const_index(ops_ref, 1)?;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                    emit_load_u64(&mut ops, 1, u64::from(view.function_id));
+                    emit_load_u64(&mut ops, 1, u64::from(view.code_block.id));
                     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
                     emit_load_u64(&mut ops, 3, u64::from(constant_index));
                     emit_call_stub(&mut ops, jit_load_string_stub as *const () as usize, threw);
@@ -6161,7 +6161,7 @@ pub(crate) mod arm64 {
             ; ldr x9, [x20, FRAME_INDEX_OFFSET]
             ; str x9, [sp, ALLOC_CTX_FRAME_INDEX_OFFSET]
             ; str x19, [sp, ALLOC_CTX_FRAME_SLOTS_OFFSET]
-            ; movz w9, view.register_count as u32
+            ; movz w9, view.code_block.register_count as u32
             ; strh w9, [sp, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET]
             ; movz w9, #0
             ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
@@ -6324,7 +6324,7 @@ pub(crate) mod arm64 {
             ; ldr x9, [x20, FRAME_INDEX_OFFSET]
             ; str x9, [sp, ALLOC_CTX_FRAME_INDEX_OFFSET]
             ; str x19, [sp, ALLOC_CTX_FRAME_SLOTS_OFFSET]
-            ; movz w9, view.register_count as u32
+            ; movz w9, view.code_block.register_count as u32
             ; strh w9, [sp, ALLOC_CTX_FRAME_SLOT_COUNT_OFFSET]
             ; movz w9, #0
             ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
@@ -7340,41 +7340,18 @@ mod tests {
                 )
             })
             .collect();
-        JitCompileSnapshot {
-            function_id: 0,
-            param_count: 1,
-            register_count: 8,
-            code_byte_len: instrs.len() as u32 * STRIDE,
-            is_strict: true,
-            is_async: false,
-            is_generator: false,
-            is_async_generator: false,
-            cage_base: 0,
-            ta_layout: otter_vm::JitTypedArrayLayout::default(),
-            string_layout: otter_vm::JitStringLayout::default(),
-            object_shape_byte: 8,
-            object_values_ptr_byte: 16,
-            object_inline_values_byte: 80,
-            object_slab_len_byte: 88,
-            object_inline_slot_cap: 2,
-            gc_barrier: Default::default(),
-            jit_proto_byte: 12,
-            heap_number_type_tag: 0x30,
-            heap_number_bits_byte: 8,
-            closure_fid_byte: 8,
-            closure_upvalues_ptr_byte: 16,
-            collection_layout: Default::default(),
-            native_static_fn_byte: 0,
-            instructions,
-            inline_callees: Default::default(),
-            inline_methods: Default::default(),
-            inline_poly_methods: Default::default(),
-            collection_leaf_methods: Default::default(),
-            collection_alloc_methods: Default::default(),
-            array_methods: Default::default(),
-            primitive_method_guards: Default::default(),
-            safepoints: Default::default(),
-        }
+        let mut view = JitCompileSnapshot::without_feedback(0, 1, 8, instructions);
+        view.object_shape_byte = 8;
+        view.object_values_ptr_byte = 16;
+        view.object_inline_values_byte = 80;
+        view.object_slab_len_byte = 88;
+        view.object_inline_slot_cap = 2;
+        view.jit_proto_byte = 12;
+        view.heap_number_type_tag = 0x30;
+        view.heap_number_bits_byte = 8;
+        view.closure_fid_byte = 8;
+        view.closure_upvalues_ptr_byte = 16;
+        view
     }
 
     /// The inline typed-array element path locates the backing buffer's data

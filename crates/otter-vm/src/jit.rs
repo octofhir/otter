@@ -34,7 +34,7 @@ use std::sync::Arc;
 use otter_bytecode::{Op, Operand};
 
 use crate::{
-    CodeBlockInstruction,
+    CodeBlock, CodeBlockInstruction,
     native_abi::{SafepointId, SafepointRecord},
 };
 
@@ -51,22 +51,12 @@ pub struct JitCompileRequest {
 /// Owned snapshot of one executable function body.
 #[derive(Debug, Clone)]
 pub struct JitCompileSnapshot {
-    /// Global VM function id.
-    pub function_id: u32,
-    /// Number of parameter registers at the start of the frame.
-    pub param_count: u16,
-    /// Total register window size: params + locals + scratch.
-    pub register_count: u16,
-    /// Total encoded byte length of the function.
-    pub code_byte_len: u32,
-    /// `true` when this function uses strict-mode call semantics.
-    pub is_strict: bool,
-    /// `true` when this function is async.
-    pub is_async: bool,
-    /// `true` when this function is a generator.
-    pub is_generator: bool,
-    /// `true` when this function is an async generator.
-    pub is_async_generator: bool,
+    /// Exact immutable executable body this feedback overlay decorates.
+    ///
+    /// Function identity, register-window shape, instruction stream, and
+    /// function-mode flags are owned solely by this `CodeBlock`. The JIT must
+    /// not keep a second scalar representation of executable state.
+    pub code_block: Arc<CodeBlock>,
     /// GC cage base address (`otter_gc::cage_base()`), baked at compile time.
     /// Stable for the isolate's life, so emitted inline property loads add it
     /// to a compressed `Gc` offset to decompress an object pointer without a
@@ -722,6 +712,60 @@ impl JitInstructionMetadata {
             object_literal: None,
             element_load_kind: JitElementLoadKind::Any,
             global_lex_cell: None,
+        }
+    }
+}
+
+impl JitCompileSnapshot {
+    /// Build a feedback-free snapshot for backend lowering tests.
+    ///
+    /// Production compilation always starts at
+    /// [`CodeBlock::jit_compile_snapshot`]. This fixture still creates one
+    /// authoritative `CodeBlock` and reuses the exact instruction `Arc`s in
+    /// the dynamic overlay, so tests exercise the same ownership boundary.
+    #[must_use]
+    pub fn without_feedback(
+        function_id: u32,
+        param_count: u16,
+        register_count: u16,
+        instructions: Vec<JitInstructionMetadata>,
+    ) -> Self {
+        let code_block = CodeBlock::jit_test_stub(
+            function_id,
+            param_count,
+            register_count,
+            instructions
+                .iter()
+                .map(|metadata| Arc::clone(&metadata.instruction))
+                .collect(),
+        );
+        Self {
+            code_block,
+            cage_base: 0,
+            ta_layout: JitTypedArrayLayout::default(),
+            string_layout: JitStringLayout::default(),
+            object_shape_byte: 0,
+            object_values_ptr_byte: 0,
+            object_inline_values_byte: 0,
+            object_slab_len_byte: 0,
+            object_inline_slot_cap: 0,
+            gc_barrier: JitGcBarrierLayout::default(),
+            jit_proto_byte: 0,
+            heap_number_type_tag: 0,
+            heap_number_bits_byte: 0,
+            closure_fid_byte: 0,
+            closure_upvalues_ptr_byte: 0,
+            collection_layout: JitCollectionLayout::default(),
+            native_static_fn_byte: 0,
+            instructions,
+            inline_callees: rustc_hash::FxHashMap::default(),
+            inline_methods: rustc_hash::FxHashMap::default(),
+            inline_poly_methods: rustc_hash::FxHashMap::default(),
+            collection_leaf_methods: rustc_hash::FxHashMap::default(),
+            collection_alloc_methods: rustc_hash::FxHashMap::default(),
+            array_methods: rustc_hash::FxHashMap::default(),
+            primitive_method_guards: rustc_hash::FxHashMap::default(),
+            safepoints: rustc_hash::FxHashMap::default(),
         }
     }
 }

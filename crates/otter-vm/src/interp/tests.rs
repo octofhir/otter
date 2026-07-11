@@ -4987,32 +4987,11 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
 
     // Baking copies each site's bits into the matching instruction by
     // byte-PC; unobserved instructions stay 0.
-    let mut view = jit::JitCompileSnapshot {
-        function_id: 5,
-        param_count: 0,
-        register_count: 4,
-        code_byte_len: 64,
-        is_strict: false,
-        is_async: false,
-        is_generator: false,
-        is_async_generator: false,
-        cage_base: 0,
-        ta_layout: jit::JitTypedArrayLayout::default(),
-        string_layout: jit::JitStringLayout::default(),
-        object_shape_byte: 0,
-        object_values_ptr_byte: 0,
-        object_inline_values_byte: 0,
-        object_slab_len_byte: 0,
-        object_inline_slot_cap: 0,
-        gc_barrier: jit::JitGcBarrierLayout::default(),
-        jit_proto_byte: 0,
-        heap_number_type_tag: 0,
-        heap_number_bits_byte: 0,
-        closure_fid_byte: 0,
-        closure_upvalues_ptr_byte: 0,
-        collection_layout: jit::JitCollectionLayout::default(),
-        native_static_fn_byte: 0,
-        instructions: vec![16u32, 32, 48]
+    let mut view = jit::JitCompileSnapshot::without_feedback(
+        5,
+        0,
+        4,
+        vec![16u32, 32, 48]
             .into_iter()
             .map(|byte_pc| {
                 jit::JitInstructionMetadata::without_feedback(
@@ -5024,15 +5003,7 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
                 )
             })
             .collect(),
-        inline_callees: rustc_hash::FxHashMap::default(),
-        inline_methods: rustc_hash::FxHashMap::default(),
-        inline_poly_methods: rustc_hash::FxHashMap::default(),
-        collection_leaf_methods: rustc_hash::FxHashMap::default(),
-        collection_alloc_methods: rustc_hash::FxHashMap::default(),
-        array_methods: rustc_hash::FxHashMap::default(),
-        primitive_method_guards: rustc_hash::FxHashMap::default(),
-        safepoints: rustc_hash::FxHashMap::default(),
-    };
+    );
     interp.bake_arith_feedback(&mut view, 5);
     assert_eq!(view.instructions[0].arith_feedback, int_site.bits());
     assert_eq!(view.instructions[1].arith_feedback, num_site.bits());

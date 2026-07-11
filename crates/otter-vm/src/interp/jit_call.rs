@@ -289,10 +289,16 @@ impl Interpreter {
         let Some(view) = context.jit_compile_snapshot(fid) else {
             return true;
         };
-        Self::osr_bail_inside_target_loop_instructions(&view.instructions, osr_pc, bail_pc)
+        Self::osr_bail_inside_target_loop_instructions(
+            &view.code_block,
+            &view.instructions,
+            osr_pc,
+            bail_pc,
+        )
     }
 
     pub(crate) fn osr_bail_inside_target_loop_instructions(
+        code_block: &crate::executable::CodeBlock,
         instructions: &[JitInstructionMetadata],
         osr_pc: u32,
         bail_pc: u32,
@@ -302,7 +308,7 @@ impl Interpreter {
             if !matches!(instr.op, Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse) {
                 continue;
             }
-            let Some(otter_bytecode::Operand::Imm32(rel)) = instr.operands.first() else {
+            let Some(otter_bytecode::Operand::Imm32(rel)) = code_block.operand(instr, 0) else {
                 continue;
             };
             let target = i64::from(instr.byte_pc) + 1 + i64::from(*rel);

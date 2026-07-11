@@ -66,8 +66,8 @@ fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
     }
 }
 
-fn jit_instr(op: Op, byte_pc: u32, operands: Vec<Operand>) -> JitInstructionMetadata {
-    JitInstructionMetadata::without_feedback(op, byte_pc, byte_pc, 1, operands)
+fn jit_instr(op: Op, byte_pc: u32, operands: Vec<Operand>) -> jit::JitTestInstruction {
+    jit::JitTestInstruction::new(op, byte_pc, byte_pc, 1, operands)
 }
 
 #[test]
@@ -85,13 +85,16 @@ fn osr_bail_policy_only_disables_target_loop_misses() {
         ),
     ];
 
+    let snapshot = jit::JitCompileSnapshot::without_feedback(0, 0, 4, instructions);
     assert!(Interpreter::osr_bail_inside_target_loop_instructions(
-        &instructions,
+        &snapshot.code_block,
+        &snapshot.instructions,
         10,
         30
     ));
     assert!(!Interpreter::osr_bail_inside_target_loop_instructions(
-        &instructions,
+        &snapshot.code_block,
+        &snapshot.instructions,
         10,
         50
     ));
@@ -4994,13 +4997,7 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
         vec![16u32, 32, 48]
             .into_iter()
             .map(|byte_pc| {
-                jit::JitInstructionMetadata::without_feedback(
-                    Op::Add,
-                    byte_pc / 16,
-                    byte_pc,
-                    16,
-                    Vec::new(),
-                )
+                jit::JitTestInstruction::new(Op::Add, byte_pc / 16, byte_pc, 16, Vec::new())
             })
             .collect(),
     );

@@ -1,4 +1,4 @@
-//! Frozen execution bytecode for the VM dispatch loop.
+//! Authoritative immutable CodeBlock execution representation.
 //!
 //! `otter-bytecode` owns the compiler/debug DTO shape. The VM owns this
 //! compact view so hot dispatch reads opcodes, operands, byte offsets,
@@ -8,18 +8,19 @@
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
 //! - [`CodeBlock`] — one immutable verified function body: instruction stream,
-//!   byte-stream length, byte-offset source-map spans.
-//! - [`CodeBlockInstruction`] — immutable instruction record: opcode, operands,
-//!   byte length, byte-offset PC, optional IC site id.
+//!   compact instruction records, variadic operand side table, and cold source
+//!   metadata.
+//! - [`CodeBlockInstruction`] — opcode plus inline fixed operands or a range in
+//!   the owning CodeBlock's variadic operand table.
 //!
 //! # Invariants
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
 //! - Each `CodeBlockInstruction` retains `byte_pc` and `byte_len` only for serialized
 //!   metadata, source maps, profiling, and native bailout/OSR records.
-//! - `CodeBlock::byte_to_instr` converts those cold byte-PC records back to
-//!   instruction indexes; interpreter dispatch never consults it.
-//! - Operands live in a per-instruction `Box<[Operand]>`; there is no
-//!   shared side table. Variadic opcodes just hold a longer slice.
+//! - Cold byte-PC lookup binary-searches instruction metadata; no dense reverse
+//!   map is retained in the execution object.
+//! - Fixed operands live inline. Only long schema-variadic instructions use the
+//!   CodeBlock-owned operand side table; no instruction owns an operand box.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
 //!   the next instruction. `NO_HANDLER_OFFSET` is preserved for absent
 //!   try-handler slots by the serialized verifier.
@@ -37,10 +38,8 @@ use otter_bytecode::{
 use std::sync::Arc;
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
-
-/// Sentinel in [`CodeBlock::byte_to_instr`] for byte offsets
-/// that are not an instruction boundary (interior bytes / past-end).
-const NO_INSTR_AT_BYTE: u32 = u32::MAX;
+const INLINE_OPERAND_CAPACITY: usize = 4;
+const NO_VARIADIC_OPERANDS: u32 = u32::MAX;
 
 /// Transient builder for [`ExecutableModule`].
 ///
@@ -132,41 +131,6 @@ impl ExecutableModule {
     #[must_use]
     pub(crate) fn function_arc(&self, local_index: u32) -> Option<Arc<CodeBlock>> {
         self.functions.get(local_index as usize).cloned()
-    }
-
-    /// Return an instruction's operands in declaration order.
-    #[must_use]
-    pub(crate) fn operands<'a>(&self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
-        instr.operands()
-    }
-
-    /// Return one instruction operand by index without materialising the
-    /// whole operand slice at the call site.
-    #[must_use]
-    pub(crate) fn operand<'a>(
-        &self,
-        instr: &'a CodeBlockInstruction,
-        index: usize,
-    ) -> Option<&'a Operand> {
-        instr.operand(index)
-    }
-
-    /// Decode one register operand.
-    #[must_use]
-    pub(crate) fn register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
-        instr.register(index)
-    }
-
-    /// Decode one constant-pool index operand.
-    #[must_use]
-    pub(crate) fn const_index(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u32> {
-        instr.const_index(index)
-    }
-
-    /// Decode one signed immediate operand.
-    #[must_use]
-    pub(crate) fn imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
-        instr.imm32(index)
     }
 
     /// One past the highest dense named-property IC site id in this
@@ -306,17 +270,27 @@ impl CodeBlock {
         id: u32,
         param_count: u16,
         register_count: u16,
-        code: Vec<Arc<CodeBlockInstruction>>,
+        instructions: &[crate::jit::JitTestInstruction],
     ) -> Arc<Self> {
+        let mut variadic_operands = Vec::new();
+        let code: Vec<_> = instructions
+            .iter()
+            .map(|instr| {
+                Arc::new(CodeBlockInstruction::from_operands(
+                    instr.op,
+                    instr.operands.clone(),
+                    id,
+                    instr.instruction_pc,
+                    NO_PROPERTY_IC_SITE,
+                    instr.byte_pc,
+                    instr.byte_len,
+                    &mut variadic_operands,
+                ))
+            })
+            .collect();
         let code_byte_len = code
             .last()
             .map_or(0, |instr| instr.byte_pc.saturating_add(instr.byte_len));
-        let mut byte_to_instr = vec![NO_INSTR_AT_BYTE; code_byte_len as usize];
-        for (index, instr) in code.iter().enumerate() {
-            if let Some(slot) = byte_to_instr.get_mut(instr.byte_pc as usize) {
-                *slot = index as u32;
-            }
-        }
         Arc::new(Self {
             id,
             param_count,
@@ -341,7 +315,7 @@ impl CodeBlock {
             direct_eval_bindings: Box::new([]),
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
-            byte_to_instr: byte_to_instr.into_boxed_slice(),
+            variadic_operands: variadic_operands.into_boxed_slice(),
             byte_spans: Box::new([]),
             code_byte_len,
         })
@@ -361,38 +335,86 @@ impl CodeBlock {
         self.code_byte_len
     }
 
-    /// Resolve a byte-offset PC to its `ExecInstr` in `O(1)` via the
-    /// dense `byte_to_instr` boundary map. Returns `None` when `byte_pc`
-    /// is out of range or does not fall on an instruction boundary (which
-    /// only happens on corrupt bytecode).
+    /// Resolve a cold byte-offset PC by binary-searching instruction metadata.
     #[must_use]
     pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&CodeBlockInstruction> {
-        let idx = *self.byte_to_instr.get(byte_pc as usize)?;
-        if idx == NO_INSTR_AT_BYTE {
-            return None;
-        }
-        self.code.get(idx as usize).map(Arc::as_ref)
+        let idx = self
+            .code
+            .binary_search_by_key(&byte_pc, |instr| instr.byte_pc)
+            .ok()?;
+        self.code.get(idx).map(Arc::as_ref)
     }
 
-    /// Resolve a byte-offset PC to its dense `code` index via the
-    /// `byte_to_instr` boundary map. The dispatch loop caches this index
-    /// per frame and advances it by one on straight-line ticks, so the
-    /// `byte_pc` → index lookup is paid only on entry, branches, and
-    /// call/return — not on every instruction. Returns `None` on the same
-    /// corrupt-bytecode conditions as [`Self::instr_at_byte_pc`].
+    /// Resolve a cold byte-offset PC to its dense instruction index.
     #[must_use]
     pub(crate) fn instr_index_at_byte_pc(&self, byte_pc: u32) -> Option<usize> {
-        let idx = *self.byte_to_instr.get(byte_pc as usize)?;
-        if idx == NO_INSTR_AT_BYTE {
-            return None;
-        }
-        (idx as usize).lt(&self.code.len()).then_some(idx as usize)
+        self.code
+            .binary_search_by_key(&byte_pc, |instr| instr.byte_pc)
+            .ok()
     }
 
     /// Fetch an instruction by its dense `code` index.
     #[must_use]
     pub(crate) fn instr_at_index(&self, index: usize) -> Option<&CodeBlockInstruction> {
         self.code.get(index).map(Arc::as_ref)
+    }
+
+    /// Operands in schema declaration order.
+    #[must_use]
+    pub fn operands<'a>(&'a self, instr: &'a CodeBlockInstruction) -> &'a [Operand] {
+        let len = usize::from(instr.operand_count);
+        if instr.variadic_operand_offset == NO_VARIADIC_OPERANDS {
+            return &instr.inline_operands[..len];
+        }
+        let start = instr.variadic_operand_offset as usize;
+        &self.variadic_operands[start..start + len]
+    }
+
+    /// One schema-typed operand.
+    #[must_use]
+    pub fn operand<'a>(
+        &'a self,
+        instr: &'a CodeBlockInstruction,
+        index: usize,
+    ) -> Option<&'a Operand> {
+        self.operands(instr).get(index)
+    }
+
+    /// Decode one register operand.
+    #[must_use]
+    pub fn register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
+        match self.operand(instr, index) {
+            Some(Operand::Register(reg)) => Some(*reg),
+            _ => None,
+        }
+    }
+
+    /// Decode the common `dst, lhs, rhs` register triple.
+    #[must_use]
+    pub fn register3(&self, instr: &CodeBlockInstruction) -> Option<(u16, u16, u16)> {
+        Some((
+            self.register(instr, 0)?,
+            self.register(instr, 1)?,
+            self.register(instr, 2)?,
+        ))
+    }
+
+    /// Decode one constant-pool index operand.
+    #[must_use]
+    pub fn const_index(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u32> {
+        match self.operand(instr, index) {
+            Some(Operand::ConstIndex(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Decode one signed immediate operand.
+    #[must_use]
+    pub fn imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
+        match self.operand(instr, index) {
+            Some(Operand::Imm32(value)) => Some(*value),
+            _ => None,
+        }
     }
 }
 
@@ -467,13 +489,9 @@ pub struct CodeBlock {
     pub(crate) contains_direct_eval: bool,
     /// Hot instruction stream indexed directly by the frame's canonical PC.
     pub code: Box<[Arc<CodeBlockInstruction>]>,
-    /// Cold byte-offset → `code` index map (length `code_byte_len`).
-    /// Instruction-boundary bytes hold the entry's index; interior bytes
-    /// hold [`NO_INSTR_AT_BYTE`]. Turns PC resolution into a single array
-    /// index instead of an `O(log N)` binary search over `code`. Costs
-    /// `4 × code_byte_len` bytes per function — paid once at build until native
-    /// bailout/source metadata switches to a compact boundary table.
-    pub(crate) byte_to_instr: Box<[u32]>,
+    /// Operand side table used only by instructions exceeding the fixed inline
+    /// capacity; schema validation guarantees those opcodes are variadic.
+    variadic_operands: Box<[Operand]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
@@ -507,6 +525,7 @@ impl CodeBlock {
                 function.name, function.id, offset
             )
         });
+        let mut variadic_operands = Vec::new();
         let code = verified_code
             .iter()
             .enumerate()
@@ -537,10 +556,12 @@ impl CodeBlock {
                 Arc::new(CodeBlockInstruction::from_operands(
                     source_instr.op,
                     source_instr.operands.as_slice().to_vec(),
+                    function.id,
                     idx as u32,
                     property_ic_site,
                     byte_pc,
                     byte_len,
+                    &mut variadic_operands,
                 ))
             })
             .collect::<Vec<_>>()
@@ -553,14 +574,6 @@ impl CodeBlock {
                 storage: binding.storage,
             })
             .collect();
-        // Invert `instr_to_byte_pc` into a dense byte → index map so the
-        // dispatch loop resolves a byte-offset PC in O(1). Interior /
-        // past-end bytes stay `NO_INSTR_AT_BYTE`.
-        let mut byte_to_instr = vec![NO_INSTR_AT_BYTE; code_byte_len as usize];
-        for (idx, &bpc) in instr_to_byte_pc.iter().enumerate() {
-            byte_to_instr[bpc as usize] = idx as u32;
-        }
-        let byte_to_instr = byte_to_instr.into_boxed_slice();
         let byte_spans =
             translate_spans_to_byte_pcs(&function.spans, &instr_to_byte_pc, code_byte_len)
                 .into_boxed_slice();
@@ -635,7 +648,7 @@ impl CodeBlock {
                 .collect(),
             contains_direct_eval: function.contains_direct_eval,
             code,
-            byte_to_instr,
+            variadic_operands: variadic_operands.into_boxed_slice(),
             byte_spans,
             code_byte_len,
         }
@@ -685,14 +698,14 @@ pub(crate) struct ExecMappedArgumentBinding {
     pub(crate) storage: ArgumentBindingStorage,
 }
 
-/// Hot dispatch instruction. Owns its operand slice so dispatch only
-/// touches the instruction record and the per-instruction operand
-/// allocation; there is no module-level side table to chase through.
+/// Hot dispatch instruction with inline fixed operands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CodeBlockInstruction {
     /// Opcode.
     pub op: Op,
+    /// Owning CodeBlock identity used only to resolve long variadic operands.
+    code_block_id: u32,
     /// Canonical dense instruction index used by interpreter and JIT CFG.
     pub instruction_pc: u32,
     /// Byte length of this instruction in the encoded stream
@@ -706,10 +719,12 @@ pub struct CodeBlockInstruction {
     pub property_ic_site: Option<usize>,
     /// Byte-offset PC of this instruction in the encoded stream.
     pub byte_pc: u32,
-    /// Operands in declaration order. Variadic opcodes (e.g. `Call`,
-    /// `NewArray`, `MakeClosure`) just lengthen the slice; there is no
-    /// fixed-width inline fast path.
-    pub operands: Box<[Operand]>,
+    /// Number of operands in declaration order.
+    operand_count: u8,
+    /// Inline operand slots for common fixed-width instructions.
+    inline_operands: [Operand; INLINE_OPERAND_CAPACITY],
+    /// Start in the owning CodeBlock side table, or `u32::MAX` for inline data.
+    variadic_operand_offset: u32,
 }
 
 impl CodeBlockInstruction {
@@ -724,13 +739,35 @@ impl CodeBlockInstruction {
     pub(crate) fn from_operands(
         op: Op,
         operands: Vec<Operand>,
+        code_block_id: u32,
         instruction_pc: u32,
         property_ic_site: u32,
         byte_pc: u32,
         byte_len: u16,
+        variadic_operands: &mut Vec<Operand>,
     ) -> Self {
+        let operand_count =
+            u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
+        let mut inline_operands = [Operand::Imm32(0); INLINE_OPERAND_CAPACITY];
+        let variadic_operand_offset = if operands.len() <= INLINE_OPERAND_CAPACITY {
+            inline_operands[..operands.len()].copy_from_slice(&operands);
+            NO_VARIADIC_OPERANDS
+        } else {
+            assert!(
+                matches!(
+                    otter_bytecode::opcode_schema::opcode_schema(op).operand_shape,
+                    otter_bytecode::opcode_schema::OperandShape::Variadic { .. }
+                ),
+                "fixed opcode exceeds inline operand capacity: {op:?}",
+            );
+            let offset =
+                u32::try_from(variadic_operands.len()).expect("variadic operand table exceeds u32");
+            variadic_operands.extend_from_slice(&operands);
+            offset
+        };
         Self {
             op,
+            code_block_id,
             instruction_pc,
             byte_len: byte_len as u32,
             property_ic_site: if property_ic_site == NO_PROPERTY_IC_SITE {
@@ -739,7 +776,9 @@ impl CodeBlockInstruction {
                 Some(property_ic_site as usize)
             },
             byte_pc,
-            operands: operands.into_boxed_slice(),
+            operand_count,
+            inline_operands,
+            variadic_operand_offset,
         }
     }
 
@@ -747,6 +786,19 @@ impl CodeBlockInstruction {
     #[must_use]
     pub const fn op(&self) -> Op {
         self.op
+    }
+
+    /// Owning CodeBlock identity.
+    #[must_use]
+    pub(crate) const fn code_block_id(&self) -> u32 {
+        self.code_block_id
+    }
+
+    /// Inline operands, or `None` when this instruction uses the variadic table.
+    #[must_use]
+    pub(crate) fn inline_operands(&self) -> Option<&[Operand]> {
+        (self.variadic_operand_offset == NO_VARIADIC_OPERANDS)
+            .then(|| &self.inline_operands[..usize::from(self.operand_count)])
     }
 
     /// Byte length of this instruction in the encoded stream.
@@ -759,37 +811,6 @@ impl CodeBlockInstruction {
     #[must_use]
     pub const fn property_ic_site(&self) -> Option<usize> {
         self.property_ic_site
-    }
-
-    /// Operands in schema declaration order.
-    #[must_use]
-    pub fn operands(&self) -> &[Operand] {
-        &self.operands
-    }
-
-    fn operand(&self, index: usize) -> Option<&Operand> {
-        self.operands.get(index)
-    }
-
-    fn register(&self, index: usize) -> Option<u16> {
-        match self.operand(index) {
-            Some(Operand::Register(reg)) => Some(*reg),
-            _ => None,
-        }
-    }
-
-    fn const_index(&self, index: usize) -> Option<u32> {
-        match self.operand(index) {
-            Some(Operand::ConstIndex(idx)) => Some(*idx),
-            _ => None,
-        }
-    }
-
-    fn imm32(&self, index: usize) -> Option<i32> {
-        match self.operand(index) {
-            Some(Operand::Imm32(value)) => Some(*value),
-            _ => None,
-        }
     }
 }
 
@@ -834,15 +855,17 @@ mod tests {
         let module = module(function);
 
         let executable = ExecutableModule::from_bytecode(&module);
-        let instr = &executable.function(0).unwrap().code[0];
+        let function = executable.function(0).unwrap();
+        let instr = &function.code[0];
 
         assert_eq!(instr.op(), Op::Add);
-        assert_eq!(executable.register(instr, 0), Some(0));
-        assert_eq!(executable.register(instr, 1), Some(1));
-        assert_eq!(executable.register(instr, 2), Some(2));
-        assert_eq!(executable.register(instr, 3), None);
+        assert!(instr.inline_operands().is_some());
+        assert_eq!(function.register(instr, 0), Some(0));
+        assert_eq!(function.register(instr, 1), Some(1));
+        assert_eq!(function.register(instr, 2), Some(2));
+        assert_eq!(function.register(instr, 3), None);
         assert_eq!(
-            executable.operands(instr),
+            function.operands(instr),
             &[
                 Operand::Register(0),
                 Operand::Register(1),
@@ -852,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn variadic_operands_are_owned_by_the_instruction() {
+    fn long_variadic_operands_use_codeblock_side_table() {
         let operands = vec![
             Operand::Register(0),
             Operand::Register(1),
@@ -868,16 +891,18 @@ mod tests {
         let module = module(function);
 
         let executable = ExecutableModule::from_bytecode(&module);
-        let instr = &executable.function(0).unwrap().code[0];
+        let function = executable.function(0).unwrap();
+        let instr = &function.code[0];
 
         assert_eq!(instr.op(), Op::Call);
-        assert_eq!(executable.register(instr, 0), Some(0));
-        assert_eq!(executable.register(instr, 1), Some(1));
-        assert_eq!(executable.const_index(instr, 2), Some(2));
-        assert_eq!(executable.register(instr, 3), Some(2));
-        assert_eq!(executable.register(instr, 4), Some(3));
-        assert_eq!(executable.register(instr, 5), None);
-        assert_eq!(executable.operands(instr), operands.as_slice());
+        assert!(instr.inline_operands().is_none());
+        assert_eq!(function.register(instr, 0), Some(0));
+        assert_eq!(function.register(instr, 1), Some(1));
+        assert_eq!(function.const_index(instr, 2), Some(2));
+        assert_eq!(function.register(instr, 3), Some(2));
+        assert_eq!(function.register(instr, 4), Some(3));
+        assert_eq!(function.register(instr, 5), None);
+        assert_eq!(function.operands(instr), operands.as_slice());
     }
 
     #[test]
@@ -952,7 +977,7 @@ mod tests {
         assert!(view.instructions[0].byte_len > 0);
         assert_eq!(view.instructions[0].property_ic_site, Some(0));
         assert_eq!(
-            view.instructions[0].operands(),
+            view.code_block.operands(&view.instructions[0]),
             &[
                 Operand::Register(0),
                 Operand::Register(1),
@@ -1003,7 +1028,7 @@ mod tests {
         assert_eq!(exec_fn.code.len(), 2);
         assert_eq!(executable.property_ic_site_end(), 1);
         assert_eq!(
-            executable.operands(&exec_fn.code[1]),
+            exec_fn.operands(&exec_fn.code[1]),
             &[
                 Operand::Register(2),
                 Operand::Register(3),

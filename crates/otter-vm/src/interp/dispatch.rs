@@ -188,7 +188,7 @@ impl Interpreter {
                     .function(function_id)
                     .map(|f| f.name.as_str())
                     .unwrap_or("<unknown>");
-                let operands = context.exec_operands(instr);
+                let operands = function.operands(instr);
                 let register_window = stack[top_idx].registers.as_slice();
                 let event = inspect::StepEvent {
                     frame_depth: stack.len(),
@@ -208,7 +208,7 @@ impl Interpreter {
             // `&mut Frame` borrow while pushing / popping.
             match op {
                 Op::ReturnValue | Op::Return => {
-                    let src = register_operand(context.exec_operand(instr, 0))?;
+                    let src = register_operand(function.operand(instr, 0))?;
                     let value = stack[top_idx]
                         .registers
                         .get(src as usize)
@@ -226,7 +226,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     let depth_before = stack.len();
                     self.do_call(stack, context, operands)?;
                     // Tier-up hook: only when a bytecode callee frame was just
@@ -244,17 +244,17 @@ impl Interpreter {
                     continue;
                 }
                 Op::TailCall => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     self.do_tail_call(stack, context, operands)?;
                     continue;
                 }
                 Op::CallWithThis => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     self.do_call_with_this(stack, context, operands)?;
                     continue;
                 }
                 Op::CallMethodValue => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     let depth_before = stack.len();
                     // Capture the receiver/prototype layout before the call for
                     // method-inline feedback (the receiver register lives in the
@@ -264,7 +264,7 @@ impl Interpreter {
                     // resolved here while it is still valid).
                     let method_site =
                         if jit_installed && !self.method_site_feedback_saturated(function_id, pc) {
-                            register_operand(context.exec_operand(instr, 1))
+                            register_operand(function.operand(instr, 1))
                                 .ok()
                                 .and_then(|r| {
                                     stack
@@ -272,7 +272,7 @@ impl Interpreter {
                                         .and_then(|f| f.registers.get(r as usize).copied())
                                 })
                                 .and_then(|recv| {
-                                    const_operand(context.exec_operand(instr, 2)).ok().and_then(
+                                    const_operand(function.operand(instr, 2)).ok().and_then(
                                         |name_idx| {
                                             self.method_site_for_receiver(
                                                 context,
@@ -301,12 +301,12 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallSpread => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     self.do_call_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::New => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     let depth_before = stack.len();
                     self.do_construct(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode
@@ -320,17 +320,17 @@ impl Interpreter {
                     continue;
                 }
                 Op::NewSpread => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     self.do_construct_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::SuperConstructSpread => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     self.do_super_construct_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::BindThisValue => {
-                    let src = register_operand(context.exec_operand(instr, 0))?;
+                    let src = register_operand(function.operand(instr, 0))?;
                     let value = *read_register(&stack[top_idx], src)?;
                     // §13.3.7.2 — super() may execute inside an arrow
                     // (its this/super are lexical); the binding
@@ -379,7 +379,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::Throw => {
-                    let src = register_operand(context.exec_operand(instr, 0))?;
+                    let src = register_operand(function.operand(instr, 0))?;
                     let value = stack[top_idx]
                         .registers
                         .get(src as usize)
@@ -434,8 +434,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::Await => {
-                    let dst = register_operand(context.exec_operand(instr, 0))?;
-                    let src = register_operand(context.exec_operand(instr, 1))?;
+                    let dst = register_operand(function.operand(instr, 0))?;
+                    let src = register_operand(function.operand(instr, 1))?;
                     let awaited = *read_register(&stack[top_idx], src)?;
                     self.do_await(stack, context, dst, awaited)?;
                     if stack.is_empty() {
@@ -477,8 +477,8 @@ impl Interpreter {
                     return Ok(Value::undefined());
                 }
                 Op::Yield => {
-                    let dst = register_operand(context.exec_operand(instr, 0))?;
-                    let src = register_operand(context.exec_operand(instr, 1))?;
+                    let dst = register_operand(function.operand(instr, 0))?;
+                    let src = register_operand(function.operand(instr, 1))?;
                     let yielded = *read_register(&stack[top_idx], src)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
@@ -515,15 +515,15 @@ impl Interpreter {
                 // pushes a frame, so the dispatch happens here —
                 // outside the in-frame mutable borrow below.
                 Op::ToNumber => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if let Some(()) = self.try_to_primitive_dispatch(stack, context, operands)? {
                         continue;
                     }
-                    let dst = context
-                        .exec_register(instr, 0)
+                    let dst = function
+                        .register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 1)
+                    let src = function
+                        .register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_to_number_regs(frame, dst, src)?;
@@ -539,7 +539,7 @@ impl Interpreter {
                 // the dispatch loop afterwards — the in-frame
                 // match below has no arm for `Op::ToPrimitive`.
                 Op::ToPrimitive => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     // Hot fast path: an already-primitive source (the dominant
                     // case — numeric loop operands) is its own ToPrimitive
                     // result. Skip the hint-token decode and the parked-ladder
@@ -562,25 +562,25 @@ impl Interpreter {
                 // route through the call-frame ladder.
                 // <https://tc39.es/ecma262/#sec-getiterator>
                 Op::GetIterator => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_get_iterator(stack, context, operands)? {
                         continue;
                     }
-                    let dst = context
-                        .exec_register(instr, 0)
+                    let dst = function
+                        .register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 1)
+                    let src = function
+                        .register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::GetAsyncIterator => {
-                    let dst = context
-                        .exec_register(instr, 0)
+                    let dst = function
+                        .register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 1)
+                    let src = function
+                        .register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     self.run_get_async_iterator_regs(context, &mut *stack, top_idx, dst, src)?;
                     continue;
@@ -600,7 +600,7 @@ impl Interpreter {
                         .exec_register(instr, 2)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     match self.drive_iterator_next(stack, context, operands) {
                         Ok(true) => continue,
                         Ok(false) => {}
@@ -678,7 +678,7 @@ impl Interpreter {
                 // below.
                 // <https://tc39.es/ecma262/#sec-ordinaryget>
                 Op::LoadProperty => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_load_property(stack, context, operands)? {
                         continue;
                     }
@@ -698,7 +698,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::LoadElement => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if let Some(recv_reg) = context.exec_register(instr, 1)
                         && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
                     {
@@ -716,8 +716,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::LoadSuperProperty => {
-                    let dst = context
-                        .exec_register(instr, 0)
+                    let dst = function
+                        .register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let home_reg = context
                         .exec_register(instr, 1)
@@ -808,7 +808,7 @@ impl Interpreter {
                 // and non-extensible rejections surface here too.
                 // <https://tc39.es/ecma262/#sec-ordinaryset>
                 Op::StoreProperty => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_store_property(stack, context, operands)? {
                         continue;
                     }
@@ -818,8 +818,8 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 2)
+                    let src = function
+                        .register(instr, 2)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let key = context
                         .property_atom(name_idx)
@@ -828,7 +828,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::StoreElement => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     let recv_reg = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
@@ -856,12 +856,12 @@ impl Interpreter {
                     continue;
                 }
                 Op::Instanceof => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_instanceof(stack, context, operands)? {
                         continue;
                     }
-                    let (dst, lhs, rhs) = context
-                        .exec_register3(instr)
+                    let (dst, lhs, rhs) = function
+                        .register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_instanceof_legacy_regs(frame, dst, lhs, rhs)?;
@@ -871,7 +871,7 @@ impl Interpreter {
                 // [[Delete]] — invoke `has` / `deleteProperty`
                 // traps when the receiver is a Proxy.
                 Op::HasProperty => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_has_property_proxy(stack, context, operands)? {
                         continue;
                     }
@@ -883,7 +883,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::DeleteProperty => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_delete_property_proxy(stack, context, operands)? {
                         continue;
                     }
@@ -919,7 +919,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::DeleteElement => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_delete_element_proxy(stack, context, operands)? {
                         continue;
                     }
@@ -947,7 +947,7 @@ impl Interpreter {
                 // `setPrototypeOf` traps when the receiver is a
                 // Proxy.
                 Op::GetPrototype => {
-                    let operands = context.exec_operands(instr);
+                    let operands = function.operands(instr);
                     if self.drive_get_prototype_proxy(stack, context, operands)? {
                         continue;
                     }

@@ -2022,7 +2022,7 @@ pub(crate) mod arm64 {
             .instructions
             .iter()
             .filter(|instr| instr.op == Op::CallMethodValue)
-            .filter_map(|instr| const_index(&instr.operands, 3).ok())
+            .filter_map(|instr| const_index(view.code_block.operands(instr), 3).ok())
             .find(|&argc| argc as usize > super::MAX_METHOD_ARGS)
         {
             return Err(Unsupported::ArgCount(argc as usize));
@@ -2097,7 +2097,7 @@ pub(crate) mod arm64 {
         let mut loop_headers: BTreeMap<u32, u32> = BTreeMap::new();
         for instr in &view.instructions {
             if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = imm32(instr.operands(), 0)?;
+                let rel = imm32(view.code_block.operands(instr), 0)?;
                 let target = branch_target(instr, rel);
                 if target >= 0
                     && target < i64::from(instr.instruction_pc)
@@ -2116,7 +2116,7 @@ pub(crate) mod arm64 {
         let mut branch_targets: BTreeSet<u32> = BTreeSet::new();
         for instr in &view.instructions {
             if matches!(instr.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
-                let rel = imm32(instr.operands(), 0)?;
+                let rel = imm32(view.code_block.operands(instr), 0)?;
                 let target = branch_target(instr, rel);
                 if let Ok(pc) = u32::try_from(target) {
                     branch_targets.insert(pc);
@@ -2190,7 +2190,7 @@ pub(crate) mod arm64 {
             // exact instruction, preserving committed side effects.
             emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
-            let ops_ref = instr.operands();
+            let ops_ref = view.code_block.operands(instr);
             match instr.op {
                 Op::LoadInt32 => {
                     let dst = reg(ops_ref, 0)?;
@@ -3498,7 +3498,7 @@ pub(crate) mod arm64 {
         let mut pending = Vec::<u16>::new();
 
         for instr in &callee.instructions {
-            let operands = instr.operands();
+            let operands = callee.code_block.operands(instr);
             let mut ok = true;
             match instr.op {
                 Op::LoadLocal | Op::StoreLocal => {}
@@ -3680,7 +3680,7 @@ pub(crate) mod arm64 {
         let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
         let mut store_seen = false;
         for instr in &callee.instructions {
-            let operands = instr.operands();
+            let operands = callee.code_block.operands(instr);
             let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
                 regs.get(regn as usize).copied()
             };
@@ -3801,13 +3801,14 @@ pub(crate) mod arm64 {
     /// label per callee byte-PC).
     fn emit_inline_pure_op(
         ops: &mut Assembler,
+        code_block: &otter_vm::CodeBlock,
         instr: &otter_vm::JitInstructionMetadata,
         bail: DynamicLabel,
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
         cage_base: usize,
     ) -> Result<(), Unsupported> {
-        let ops_ref = instr.operands();
+        let ops_ref = code_block.operands(instr);
         let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
             let t = branch_target(instr, rel);
             u32::try_from(t)
@@ -4123,7 +4124,15 @@ pub(crate) mod arm64 {
 
         for i in &callee.instructions {
             dynasm!(ops ; .arch aarch64 ; =>clabels[&i.instruction_pc]);
-            emit_inline_pure_op(ops, i, inline_bail, inline_done, &clabels, cage_base)?;
+            emit_inline_pure_op(
+                ops,
+                &callee.code_block,
+                i,
+                inline_bail,
+                inline_done,
+                &clabels,
+                cage_base,
+            )?;
         }
 
         // Normal completion: result in x9, unwind scratch, restore caller base,
@@ -4204,6 +4213,7 @@ pub(crate) mod arm64 {
     #[allow(clippy::too_many_arguments)]
     fn emit_inline_method_op(
         ops: &mut Assembler,
+        code_block: &otter_vm::CodeBlock,
         instr: &otter_vm::JitInstructionMetadata,
         this_slot: u16,
         prop_offsets: &rustc_hash::FxHashMap<u32, u32>,
@@ -4215,7 +4225,7 @@ pub(crate) mod arm64 {
         inline_done: DynamicLabel,
         clabels: &BTreeMap<u32, DynamicLabel>,
     ) -> Result<(), Unsupported> {
-        let ops_ref = instr.operands();
+        let ops_ref = code_block.operands(instr);
         match instr.op {
             Op::LoadThis => {
                 let dst = reg(ops_ref, 0)?;
@@ -4302,7 +4312,15 @@ pub(crate) mod arm64 {
                 dynasm!(ops ; .arch aarch64 ; str w10, [x13, off]);
                 Ok(())
             }
-            _ => emit_inline_pure_op(ops, instr, bail, inline_done, clabels, cage_base),
+            _ => emit_inline_pure_op(
+                ops,
+                code_block,
+                instr,
+                bail,
+                inline_done,
+                clabels,
+                cage_base,
+            ),
         }
     }
 
@@ -4497,6 +4515,7 @@ pub(crate) mod arm64 {
             dynasm!(ops ; .arch aarch64 ; =>clabels[&i.instruction_pc]);
             emit_inline_method_op(
                 ops,
+                &method.code_block,
                 i,
                 this_slot,
                 &method.prop_offsets,
@@ -7103,7 +7122,7 @@ mod tests {
         VALUE_UNDEFINED, compile, value_tag,
     };
     use otter_bytecode::{Op, Operand};
-    use otter_vm::{JitCompileSnapshot, JitFunctionCode, JitInstructionMetadata};
+    use otter_vm::{JitCompileSnapshot, JitFunctionCode, jit::JitTestInstruction};
 
     const STRIDE: u32 = 4;
 
@@ -7124,7 +7143,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, (op, operands))| {
-                JitInstructionMetadata::without_feedback(
+                JitTestInstruction::new(
                     *op,
                     idx as u32,
                     idx as u32 * STRIDE,

@@ -1,18 +1,13 @@
 //! Bytecode wire format: byte-stream encoder, decoder, source-map
 //! and jump-offset helpers.
 //!
-//! Encodes the compiler's [`Instruction`] DTO stream into a single
-//! `Vec<u8>` byte buffer that the VM dispatch loop reads opcode-by-
-//! opcode. The format is self-describing per operand (a kind byte
-//! precedes each operand), so the decoder does not need a per-opcode
-//! schema. The declarative opcode schema records that executable format, while
-//! exact load/local/arithmetic/property/upvalue/iterator/variadic shapes are
-//! schema-verified. Whole-function decoding validates authoritative branch and
-//! handler targets against instruction boundaries. Remaining roles stay
-//! consumer-decoded. The
-//! encoder and decoder ship in the same binary build — bytecode is
-//! never persisted across versions, so no wire-format version is
-//! carried in the stream.
+//! Encodes the compiler's [`Instruction`] DTO stream into a self-describing
+//! byte buffer retained for cold metadata, diagnostics, and serialization.
+//! Active VM dispatch executes schema-typed CodeBlock words instead. Logical
+//! instruction-index DTOs are verified directly before encoding; decoding a
+//! serialized stream independently validates byte-boundary branch and handler
+//! targets. Bytecode is never persisted across incompatible versions, so no
+//! wire-format version is carried in the stream.
 //!
 //! # Wire format (per instruction)
 //!
@@ -40,7 +35,7 @@ const OPERAND_KIND_REGISTER: u8 = 0;
 const OPERAND_KIND_CONST_INDEX: u8 = 1;
 const OPERAND_KIND_IMM32: u8 = 2;
 
-/// Errors surfaced by the decoder.
+/// Errors surfaced while decoding the cold serialized representation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// Stream ended mid-instruction.
@@ -122,6 +117,190 @@ impl std::fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
+
+/// Structural error in the compiler's logical instruction-index DTO.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyError {
+    /// Cold serialized metadata would exceed the u32 PC coordinate space.
+    FunctionTooLarge,
+    /// An instruction violates its authoritative operand shape.
+    InvalidOperandShape {
+        /// Dense source-order instruction index.
+        instruction_index: usize,
+        /// Exact count or kind mismatch.
+        error: OperandShapeError,
+    },
+    /// A relative branch or handler target falls outside `0..=len`.
+    InvalidControlFlowTarget {
+        /// Dense source-order instruction index.
+        instruction_index: usize,
+        /// Resolved signed target instruction index.
+        target: i64,
+    },
+    /// A schema-declared control-flow operand contains an invalid value.
+    InvalidControlFlowOperand {
+        /// Dense source-order instruction index.
+        instruction_index: usize,
+        /// Operand position.
+        operand_index: usize,
+        /// Invalid signed immediate.
+        value: i32,
+    },
+}
+
+impl std::fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FunctionTooLarge => write!(f, "function byte metadata exceeds u32::MAX"),
+            Self::InvalidOperandShape {
+                instruction_index,
+                error,
+            } => write!(
+                f,
+                "invalid operand shape at instruction {instruction_index}: {error}"
+            ),
+            Self::InvalidControlFlowTarget {
+                instruction_index,
+                target,
+            } => write!(
+                f,
+                "invalid control-flow target {target} at instruction {instruction_index}"
+            ),
+            Self::InvalidControlFlowOperand {
+                instruction_index,
+                operand_index,
+                value,
+            } => write!(
+                f,
+                "invalid control-flow operand {operand_index} value {value} at instruction {instruction_index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {}
+
+/// Verify compiler instructions directly in their logical instruction-index
+/// coordinate system.
+///
+/// # Errors
+/// Returns [`VerifyError`] for operand-shape, branch-target, handler-target, or
+/// finally-floor violations.
+pub fn verify_logical_function(instructions: &[Instruction]) -> Result<(), VerifyError> {
+    let len = instructions.len() as i64;
+    for (instruction_index, instr) in instructions.iter().enumerate() {
+        verify_operand_shape(instr.op, instr.operands.as_slice()).map_err(|error| {
+            VerifyError::InvalidOperandShape {
+                instruction_index,
+                error,
+            }
+        })?;
+        let schema = opcode_schema(instr.op);
+        for successor in schema.successor_shape.exact() {
+            if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
+                verify_logical_target(instructions, instruction_index, *operand_index, None, len)?;
+            }
+        }
+        for successor in schema.exception_successor_shape.exact() {
+            match successor {
+                ExceptionSuccessorSpec::OptionalRelativeTarget {
+                    operand_index,
+                    absent_value,
+                    ..
+                } => verify_logical_target(
+                    instructions,
+                    instruction_index,
+                    *operand_index,
+                    Some(*absent_value),
+                    len,
+                )?,
+                ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
+                    floor_operand_index,
+                } => {
+                    let Operand::Imm32(floor) = instr.operands.as_slice()[*floor_operand_index]
+                    else {
+                        unreachable!("operand shape verified before control-flow metadata")
+                    };
+                    if floor < 0 {
+                        return Err(VerifyError::InvalidControlFlowOperand {
+                            instruction_index,
+                            operand_index: *floor_operand_index,
+                            value: floor,
+                        });
+                    }
+                }
+                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller
+                | ExceptionSuccessorSpec::ResumeParkedAbruptCompletion => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cold serialized byte-PC layout derived without materialising a byte stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionLayout {
+    /// Total serialized length used as the byte-PC end boundary.
+    pub total_bytes: u32,
+    /// Byte PC for every logical instruction index.
+    pub instr_to_byte_pc: Box<[u32]>,
+}
+
+/// Verify a logical function and calculate its cold serialized byte-PC layout
+/// without encoding or decoding a byte stream.
+///
+/// # Errors
+/// Returns [`VerifyError`] for an invalid logical function or u32 metadata
+/// overflow.
+pub fn layout_function(instructions: &[Instruction]) -> Result<FunctionLayout, VerifyError> {
+    verify_logical_function(instructions)?;
+    let mut byte_pc = 0_u32;
+    let mut instr_to_byte_pc = Vec::with_capacity(instructions.len());
+    for instr in instructions {
+        instr_to_byte_pc.push(byte_pc);
+        let mut byte_len = 2_u32;
+        for operand in instr.operands.iter() {
+            let operand_len = match operand {
+                Operand::Register(_) => 3,
+                Operand::ConstIndex(_) | Operand::Imm32(_) => 5,
+            };
+            byte_len = byte_len
+                .checked_add(operand_len)
+                .ok_or(VerifyError::FunctionTooLarge)?;
+        }
+        byte_pc = byte_pc
+            .checked_add(byte_len)
+            .ok_or(VerifyError::FunctionTooLarge)?;
+    }
+    Ok(FunctionLayout {
+        total_bytes: byte_pc,
+        instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
+    })
+}
+
+fn verify_logical_target(
+    instructions: &[Instruction],
+    instruction_index: usize,
+    operand_index: usize,
+    absent_value: Option<i32>,
+    instruction_count: i64,
+) -> Result<(), VerifyError> {
+    let Operand::Imm32(delta) = instructions[instruction_index].operands.as_slice()[operand_index]
+    else {
+        unreachable!("operand shape verified before control-flow metadata")
+    };
+    if absent_value == Some(delta) {
+        return Ok(());
+    }
+    let target = instruction_index as i64 + 1 + i64::from(delta);
+    if !(0..=instruction_count).contains(&target) {
+        return Err(VerifyError::InvalidControlFlowTarget {
+            instruction_index,
+            target,
+        });
+    }
+    Ok(())
+}
 
 /// Append-only writer that builds the byte stream from an
 /// [`Instruction`] sequence.
@@ -219,6 +398,18 @@ pub struct EncodedFunction {
 /// the runtime treats it as "absent handler" for [`Op::EnterTry`].
 #[must_use]
 pub fn encode_function(instructions: &[Instruction]) -> EncodedFunction {
+    try_encode_function(instructions)
+        .unwrap_or_else(|error| panic!("invalid logical bytecode function: {error}"))
+}
+
+/// Verify and encode a compiler function DTO without decoding the serialized
+/// bytes back into an execution representation.
+///
+/// # Errors
+/// Returns [`VerifyError`] before encoding when the logical instruction stream
+/// violates the opcode schema or its instruction-index CFG.
+pub fn try_encode_function(instructions: &[Instruction]) -> Result<EncodedFunction, VerifyError> {
+    verify_logical_function(instructions)?;
     let mut writer = BytecodeWriter::new();
     let mut instr_to_byte_pc: Vec<u32> = Vec::with_capacity(instructions.len());
     let mut fixups: Vec<JumpFixup> = Vec::new();
@@ -240,10 +431,10 @@ pub fn encode_function(instructions: &[Instruction]) -> EncodedFunction {
         );
     }
 
-    EncodedFunction {
+    Ok(EncodedFunction {
         code: writer.into_bytes(),
         instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
-    }
+    })
 }
 
 /// Slot bookkeeping for a single jump-class `Imm32` operand needing
@@ -637,6 +828,31 @@ mod tests {
         let (third, next) = decode_instruction(&bytes, pc).unwrap();
         assert_eq!(third.op, Op::LoadInt32);
         assert_eq!(next, bytes.len());
+    }
+
+    #[test]
+    fn direct_layout_matches_serialized_encoder_boundaries() {
+        let instructions = vec![
+            make_instr(Op::LoadUndefined, &[Operand::Register(1)]),
+            make_instr(
+                Op::LoadInt32,
+                &[Operand::Register(2), Operand::Imm32(i32::MIN)],
+            ),
+            make_instr(
+                Op::Call,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(1),
+                    Operand::Register(2),
+                ],
+            ),
+        ];
+        let layout = layout_function(&instructions).unwrap();
+        let encoded = try_encode_function(&instructions).unwrap();
+
+        assert_eq!(layout.instr_to_byte_pc, encoded.instr_to_byte_pc);
+        assert_eq!(layout.total_bytes as usize, encoded.code.len());
     }
 
     #[test]

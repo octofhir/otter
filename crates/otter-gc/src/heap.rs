@@ -215,6 +215,62 @@ pub struct GcHeap {
     oom_flag: Arc<AtomicBool>,
 }
 
+/// Debug-only stale-handle trap. A live handle is always updated to its
+/// to-space copy by the collector, so a mutator payload access that lands on
+/// a *forwarded* cell means a raw `Gc<T>` was held across an allocation that
+/// scavenged — a use-after-move rooting bug that is *never* legitimate.
+/// Trapping here names the type and condition at the offending read instead
+/// of leaving a cryptic downstream shape/tag corruption.
+///
+/// The stricter *swept* (use-after-free) check reads dropped old-space memory;
+/// a handful of low-level collector tests deliberately probe non-moving
+/// old-space cells after a full GC, so it is gated behind `OTTER_GC_VERIFY=1`
+/// alongside the other opt-in scavenge diagnostics.
+///
+/// Compiled out entirely in release builds. Type-tag mismatch is left to the
+/// existing per-payload asserts; this only checks liveness.
+#[inline]
+fn debug_assert_handle_live<T: Traceable>(handle: Gc<T>, context: &str) {
+    if cfg!(debug_assertions) && !handle.is_null() {
+        // SAFETY: header read only (no payload touch); single mutator, STW GC.
+        unsafe {
+            let header = &*handle.as_header_ptr();
+            debug_assert!(
+                !header.is_forwarded(),
+                "use-after-move: {context} on a forwarded {} cell (tag={:#x}) — a raw Gc handle \
+                 was held across a scavenging allocation and never re-read from its rooted slot",
+                std::any::type_name::<T>(),
+                header.type_tag(),
+            );
+            if gc_verify_use_after_free_enabled() {
+                debug_assert!(
+                    !header.is_swept(),
+                    "use-after-free: {context} on a swept {} cell (tag={:#x}) — the handle \
+                     outlived a full collection that finalized and dropped the payload",
+                    std::any::type_name::<T>(),
+                    header.type_tag(),
+                );
+            }
+        }
+    }
+}
+
+/// Cached `OTTER_GC_VERIFY` gate for the opt-in use-after-free trap. Read once;
+/// a per-read env lookup would dominate the debug-build hot path.
+fn gc_verify_use_after_free_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("OTTER_GC_VERIFY").is_some_and(|v| v != "0");
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        2 => true,
+        _ => false,
+    }
+}
+
 impl GcHeap {
     /// Build a fresh heap with no cap. Equivalent to
     /// `Self::with_max_heap_bytes(0)`.
@@ -1233,6 +1289,7 @@ impl GcHeap {
     #[inline]
     pub fn read_payload<T: Traceable, R>(&self, handle: Gc<T>, f: impl FnOnce(&T) -> R) -> R {
         debug_assert!(!handle.is_null(), "read_payload on null handle");
+        debug_assert_handle_live::<T>(handle, "read_payload");
         // SAFETY: handle was issued by `alloc` / `alloc_old`;
         // payload lives immediately after the header at the
         // same allocation; single-mutator GC (no concurrent
@@ -1261,6 +1318,7 @@ impl GcHeap {
         f: impl FnOnce(&mut T) -> R,
     ) -> R {
         debug_assert!(!handle.is_null(), "with_payload on null handle");
+        debug_assert_handle_live::<T>(handle, "with_payload");
         // SAFETY: same contract as [`Self::read_payload`]; the
         // exclusive `&mut self` upholds payload uniqueness.
         unsafe {

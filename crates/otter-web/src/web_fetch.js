@@ -442,9 +442,11 @@
       this[kBodyText] = null;
       this[kBodyBytes] = null;
       const used = this[kBodyUsed];
+      // Fetch bodies are byte streams (§body), so a BYOB reader works.
       const stream = new global.ReadableStream({
+        type: 'bytes',
         start(controller) {
-          controller.enqueue(bytes);
+          if (bytes.byteLength > 0) controller.enqueue(bytes);
           controller.close();
         },
       });
@@ -813,6 +815,7 @@
     initResponse(response, status, statusText, headers, 'basic');
     response[kResponseUrl] = finalUrl;
     response[kBodyStream] = new ReadableStream({
+      type: 'bytes',
       async pull(controller) {
         let chunk;
         try {
@@ -823,7 +826,7 @@
         }
         if (chunk === null || chunk === undefined) {
           controller.close();
-        } else {
+        } else if (chunk.byteLength > 0) {
           controller.enqueue(chunk);
         }
       },

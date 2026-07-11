@@ -561,6 +561,8 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "MessageEvent",
       "DOMException",
       "Headers",
+      "Request",
+      "Response",
       "MessageChannel",
       "MessagePort",
       "ReadableStream",
@@ -583,13 +585,11 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "URL",
       "URLPattern",
       "fetch",
+      "structuredClone",
     ];
     const PARTIAL = [
-      "Request",
-      "Response",
       "crypto.subtle",
       "crypto.subtle.digest",
-      "structuredClone",
     ];
     // Omitted by design per ECMA-429 §6: Otter's global object is not a
     // Window/Worker EventTarget, so the global event-handler IDL attributes are
@@ -688,30 +688,11 @@ fn wintertc_partial_entries_document_their_gap() {
             r#"
         // Each smoke check returns true while the documented gap is still open.
         const GAPS = {
-          // Request bodies are default streams; the spec models them as byte
-          // streams, so a BYOB reader is refused (not a byte stream).
-          "Request": () => {
-            const b = new Request("https://e.com", { method: "POST", body: "hi" }).body;
-            try { b.getReader({ mode: "byob" }); return false; }
-            catch (e) { return String(e.message).includes("non-byte stream"); }
-          },
-          // Response bodies are likewise default (non-byte) streams.
-          "Response": () => {
-            const b = new Response("x").body;
-            try { b.getReader({ mode: "byob" }); return false; }
-            catch (e) { return String(e.message).includes("non-byte stream"); }
-          },
           // Only digest is wired on SubtleCrypto; keys/sign/encrypt are absent.
           "crypto.subtle": () => typeof crypto.subtle.encrypt === "undefined"
             && typeof crypto.subtle.importKey === "undefined",
           "crypto.subtle.digest": () => typeof crypto.subtle.digest === "function"
             && typeof crypto.subtle.sign === "undefined",
-          // structuredClone cannot transfer transferables such as MessagePort.
-          "structuredClone": () => {
-            const mc = new MessageChannel();
-            try { structuredClone({ p: mc.port1 }, { transfer: [mc.port1] }); return false; }
-            catch (e) { return true; }
-          },
         };
         const problems = [];
         for (const name of PARTIAL) {

@@ -387,19 +387,8 @@ impl CodeBlock {
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
         let word = instr.operand_word(&self.overflow_operand_words, index)?;
-        let shape = otter_bytecode::opcode_schema::opcode_schema(instr.op).operand_shape;
-        let prefix = shape.prefix()?;
-        let kind = prefix
-            .get(index)
-            .map(|spec| spec.kind)
-            .or_else(|| shape.variadic().map(|(_, tail)| tail.kind))?;
-        Some(match kind {
-            otter_bytecode::opcode_schema::OperandKind::Register => {
-                Operand::Register(u16::try_from(word).ok()?)
-            }
-            otter_bytecode::opcode_schema::OperandKind::ConstIndex => Operand::ConstIndex(word),
-            otter_bytecode::opcode_schema::OperandKind::Imm32 => Operand::Imm32(word as i32),
-        })
+        let kind = otter_bytecode::opcode_schema::operand_kind_at(instr.op, index)?;
+        otter_bytecode::opcode_schema::decode_operand_word(kind, word)
     }
 
     /// Decode one register operand.
@@ -856,11 +845,7 @@ impl CodeBlockInstruction {
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
         let operand_words: Vec<u32> = operands
             .into_iter()
-            .map(|operand| match operand {
-                Operand::Register(value) => u32::from(value),
-                Operand::ConstIndex(value) => value,
-                Operand::Imm32(value) => value as u32,
-            })
+            .map(otter_bytecode::opcode_schema::encode_operand_word)
             .collect();
         let mut inline_operand_words = [0; INLINE_OPERAND_CAPACITY];
         let overflow_operand_offset = if operand_words.len() <= INLINE_OPERAND_CAPACITY {

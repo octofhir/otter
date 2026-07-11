@@ -5,14 +5,15 @@
 //! - [`OP_BYTE_TABLE`] is the compatibility view consumed by the current wire
 //!   encoder and decoder.
 //! - [`opcode_schema`] provides an exhaustive `Op` lookup.
+//! - [`encode_operand_word`], [`decode_operand_word`], and
+//!   [`operand_kind_at`] define schema-typed CodeBlock word operands.
 //!
 //! # Invariants
 //! - One macro invocation owns opcode identity and byte assignment; generated
 //!   compatibility views cannot drift from it.
-//! - The executable format remains self-describing. A first fixed load/local/
-//!   arithmetic, property/upvalue/iterator, and representative variadic
-//!   families have exact operand/register roles. Branch/return/finally and the
-//!   first exception-region successors are exact; remaining rows stay explicit.
+//! - The serialized compiler/debug format remains self-describing while active
+//!   CodeBlocks store untagged operand words whose kinds come only from this
+//!   schema. Fixed and variadic families have exact operand/register roles.
 //! - Conservative effects never claim a leaf opcode may allocate, throw,
 //!   trigger GC, re-enter JavaScript, or require a safepoint.
 //!
@@ -625,6 +626,42 @@ pub const fn opcode_schema(op: Op) -> &'static OpcodeSchema {
     &OPCODE_SCHEMA[schema_index(op)]
 }
 
+/// Return the schema-declared kind at one fixed or variadic operand position.
+#[must_use]
+pub const fn operand_kind_at(op: Op, index: usize) -> Option<OperandKind> {
+    let shape = opcode_schema(op).operand_shape;
+    let Some(prefix) = shape.prefix() else {
+        return None;
+    };
+    if index < prefix.len() {
+        return Some(prefix[index].kind);
+    }
+    match shape.variadic() {
+        Some((_, tail)) => Some(tail.kind),
+        None => None,
+    }
+}
+
+/// Encode one verified operand as an untagged 32-bit CodeBlock word.
+#[must_use]
+pub const fn encode_operand_word(operand: Operand) -> u32 {
+    match operand {
+        Operand::Register(value) => value as u32,
+        Operand::ConstIndex(value) => value,
+        Operand::Imm32(value) => value as u32,
+    }
+}
+
+/// Decode one CodeBlock word using its authoritative schema kind.
+#[must_use]
+pub fn decode_operand_word(kind: OperandKind, word: u32) -> Option<Operand> {
+    Some(match kind {
+        OperandKind::Register => Operand::Register(u16::try_from(word).ok()?),
+        OperandKind::ConstIndex => Operand::ConstIndex(word),
+        OperandKind::Imm32 => Operand::Imm32(word as i32),
+    })
+}
+
 /// Verify exact fixed or counted-tail operand kinds for an authoritative opcode.
 /// Transitional rows are accepted without making a precision claim.
 ///
@@ -1194,6 +1231,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn word_operands_round_trip_through_schema_kinds() {
+        let cases = [
+            (OperandKind::Register, Operand::Register(u16::MAX)),
+            (OperandKind::ConstIndex, Operand::ConstIndex(u32::MAX)),
+            (OperandKind::Imm32, Operand::Imm32(i32::MIN)),
+        ];
+        for (kind, operand) in cases {
+            assert_eq!(
+                decode_operand_word(kind, encode_operand_word(operand)),
+                Some(operand)
+            );
+        }
+        assert_eq!(
+            operand_kind_at(Op::MakeClass, 4),
+            Some(OperandKind::Register)
+        );
+        assert_eq!(operand_kind_at(Op::MakeClass, 5), None);
+        assert_eq!(operand_kind_at(Op::Call, 4), Some(OperandKind::Register));
     }
 
     #[test]

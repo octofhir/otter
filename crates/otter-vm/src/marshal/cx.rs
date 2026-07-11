@@ -168,6 +168,35 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         self.interp().scoped_boolean(scope, b)
     }
 
+    /// Park a `BigInt` immediate built from a signed 64-bit integer. Unlike
+    /// [`Self::number`], this preserves the full 64-bit range — the
+    /// marshalling the WebAssembly spec mandates for `i64` values, which map to
+    /// JS `BigInt` rather than a lossy `Number`.
+    pub fn bigint_i64(&mut self, n: i64) -> Result<Scoped<'s>, JsError> {
+        let scope = self.scope;
+        self.interp()
+            .scoped_bigint_i64(scope, n)
+            .map_err(|err| self.vm_err(err))
+    }
+
+    /// Truncate a JS `BigInt` to a signed 64-bit integer with wraparound
+    /// (`BigInt.asIntN(64, v)` semantics) — the inverse of [`Self::bigint_i64`]
+    /// used to lower a JS `BigInt` into a WebAssembly `i64` argument. Returns
+    /// `None` when `value` is not a `BigInt`.
+    #[must_use]
+    pub fn i64_from_bigint(&self, value: crate::Value) -> Option<i64> {
+        let bigint = value.as_big_int()?;
+        Some(bigint.with_inner(self.heap(), |bi| {
+            let low = bi.iter_u64_digits().next().unwrap_or(0);
+            let bits = if bi.sign() == num_bigint::Sign::Minus {
+                low.wrapping_neg()
+            } else {
+                low
+            };
+            bits as i64
+        }))
+    }
+
     /// Allocate a JS string from UTF-8 text.
     pub fn string(&mut self, text: &str) -> Result<Scoped<'s>, JsError> {
         let scope = self.scope;

@@ -429,6 +429,19 @@ impl Interpreter {
         self.scoped_value(scope, Value::boolean(b))
     }
 
+    /// Park a `BigInt` built from a signed 64-bit integer. Allocates a BigInt
+    /// body, so — unlike [`Self::scoped_number`] — this preserves the full
+    /// 64-bit range. Used by hosts that surface integral 64-bit values (e.g.
+    /// WebAssembly `i64`) as JS `BigInt` rather than a lossy `Number`.
+    pub(crate) fn scoped_bigint_i64<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        n: i64,
+    ) -> Result<Scoped<'s>, VmError> {
+        let bigint = crate::bigint::BigIntValue::from_i128(&mut self.gc_heap, i128::from(n))?;
+        Ok(self.scoped_value(scope, Value::big_int(bigint)))
+    }
+
     /// Park the `undefined` immediate in the current scope.
     pub(crate) fn scoped_undefined<'s>(&mut self, scope: &'s HandleScope) -> Scoped<'s> {
         self.scoped_value(scope, Value::undefined())
@@ -665,82 +678,6 @@ impl Interpreter {
         } else {
             Err(VmError::TypeMismatch)
         }
-    }
-
-    /// Define accessor property `key` on the object handle `obj` with
-    /// explicit attribute `flags`. Getter/setter handles resolve
-    /// through the arena at call time; a rejected define surfaces as
-    /// [`VmError::TypeMismatch`].
-    pub(crate) fn scoped_define_accessor(
-        &mut self,
-        _scope: &HandleScope,
-        obj: Scoped<'_>,
-        key: &str,
-        getter: Option<Scoped<'_>>,
-        setter: Option<Scoped<'_>>,
-        flags: crate::object::PropertyFlags,
-    ) -> Result<(), VmError> {
-        let object = self
-            .handle_arena
-            .get(obj.index())
-            .as_object()
-            .ok_or(VmError::TypeMismatch)?;
-        let getter = getter.map(|g| self.handle_arena.get(g.index()));
-        let setter = setter.map(|s| self.handle_arena.get(s.index()));
-        let descriptor = crate::object::PropertyDescriptor {
-            kind: crate::object::DescriptorKind::Accessor { getter, setter },
-            flags,
-        };
-        if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
-            Ok(())
-        } else {
-            Err(VmError::TypeMismatch)
-        }
-    }
-
-    /// Allocate a captured native function (dynamic call shape) and
-    /// park it in the current scope. Capture handles are re-read
-    /// through the arena immediately before the allocation, which
-    /// snapshots the runtime roots so they stay current.
-    pub(crate) fn scoped_native_captured<'s, F>(
-        &mut self,
-        scope: &'s HandleScope,
-        name: &'static str,
-        length: u8,
-        captures: &[Scoped<'_>],
-        call: F,
-    ) -> Result<Scoped<'s>, VmError>
-    where
-        F: for<'call> Fn(
-                &mut crate::NativeCtx<'call>,
-                &[Value],
-                &[Value],
-            ) -> Result<Value, crate::NativeError>
-            + 'static,
-    {
-        let _ = length;
-        let roots = self.collect_runtime_roots();
-        let captured: smallvec::SmallVec<[Value; 4]> = captures
-            .iter()
-            .map(|c| self.handle_arena.get(c.index()))
-            .collect();
-        let capture_roots = captured.clone();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for value in &capture_roots {
-                value.trace_value_slots(visitor);
-            }
-        };
-        let function = crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            name,
-            captured,
-            &mut external_visit,
-            call,
-        )?;
-        Ok(self.scoped_value(scope, function))
     }
 
     /// Store `value` at array index `index` on the array handle `arr`,

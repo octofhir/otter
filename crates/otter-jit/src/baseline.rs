@@ -3309,7 +3309,6 @@ pub(crate) mod arm64 {
                         emit_load_u64(&mut ops, 2, u64::from(method_id));
                         emit_load_u64(&mut ops, 3, argument_regs_ptr as u64);
                         emit_load_u64(&mut ops, 4, argc as u64);
-                        emit_load_u64(&mut ops, 5, u64::from(instr.byte_len));
                         emit_call_stub(&mut ops, jit_math_call_stub as *const () as usize, threw);
                     }
                 }
@@ -5041,10 +5040,10 @@ pub(crate) mod arm64 {
     }
 
     /// Probe the VM-published polymorphic direct-method link table and enter a
-    /// zero-argument bytecode method through a rooted flat register window.
+    /// bytecode method through a rooted flat register window.
     /// Every guard precedes the window reservation, so a miss falls through to
     /// the normal typed method path without observable state.
-    fn emit_direct_method_inline_zero_arg(
+    fn emit_direct_method_inline(
         ops: &mut Assembler,
         operands: &[Operand],
         site: u64,
@@ -5055,7 +5054,8 @@ pub(crate) mod arm64 {
     ) -> Result<bool, Unsupported> {
         use otter_vm::jit::JIT_DIRECT_METHOD_WAYS;
 
-        if const_index(operands, 3)? != 0 || view.cage_base == 0 {
+        let argc = const_index(operands, 3)? as usize;
+        if argc > MAX_METHOD_ARGS || view.cage_base == 0 {
             return Ok(false);
         }
         let dst = reg(operands, 0)?;
@@ -5226,6 +5226,26 @@ pub(crate) mod arm64 {
             ; add x9, x9, #1
             ; b =>fill
             ; =>fill_done
+
+            // Bind supplied arguments directly into the callee window. A
+            // frameless link is restricted to bodies without `arguments`, so
+            // slots beyond the formal/register window are semantically dead;
+            // missing slots remain the undefined values written above.
+        );
+        for slot in 0..argc {
+            let arg = reg(operands, 4 + slot)?;
+            let skip_arg = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; cmp x15, slot as u32
+                ; b.ls =>skip_arg
+                ; ldr x9, [x19, arg as u32 * 8]
+                ; str x9, [x14, slot as u32 * 8]
+                ; =>skip_arg
+            );
+        }
+        dynasm!(ops
+            ; .arch aarch64
 
             ; sub sp, sp, JIT_CTX_STACK_SIZE
             ; str x14, [sp]
@@ -6408,7 +6428,7 @@ pub(crate) mod arm64 {
         let done = ops.new_dynamic_label();
 
         if let Some(view) = view
-            && emit_direct_method_inline_zero_arg(
+            && emit_direct_method_inline(
                 ops,
                 operands,
                 site,

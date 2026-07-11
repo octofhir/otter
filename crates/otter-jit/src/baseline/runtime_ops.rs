@@ -190,7 +190,6 @@ pub(super) extern "C" fn jit_math_call_stub(
     method_id: u64,
     argument_regs: *const u16,
     argument_count: u64,
-    byte_len: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract and immutable metadata owner.
     let ctx = unsafe { &mut *ctx };
@@ -206,7 +205,6 @@ pub(super) extern "C" fn jit_math_call_stub(
         dst as u16,
         method_id as u32,
         argument_regs,
-        byte_len as u32,
     );
     park_result(ctx, result)
 }

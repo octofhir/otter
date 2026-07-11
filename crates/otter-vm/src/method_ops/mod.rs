@@ -210,7 +210,7 @@ impl Interpreter {
             dst,
             method_id,
             &arg_regs,
-            byte_len,
+            Some(byte_len),
         )
     }
 
@@ -223,7 +223,7 @@ impl Interpreter {
         dst: u16,
         method_id: u32,
         arg_regs: &[u16],
-        byte_len: u32,
+        advance_byte_len: Option<u32>,
     ) -> Result<(), VmError> {
         if frame_index >= stack.len() {
             return Err(VmError::InvalidOperand);
@@ -251,7 +251,9 @@ impl Interpreter {
                     }
                 })?;
             write_register(&mut stack[frame_index], dst, value)?;
-            stack[frame_index].advance_pc(byte_len)?;
+            if let Some(byte_len) = advance_byte_len {
+                stack[frame_index].advance_pc(byte_len)?;
+            }
             return Ok(());
         }
 
@@ -284,7 +286,9 @@ impl Interpreter {
         if !self.is_callable_runtime(&callee) {
             return Err(VmError::NotCallable);
         }
-        stack[frame_index].advance_pc(byte_len)?;
+        if let Some(byte_len) = advance_byte_len {
+            stack[frame_index].advance_pc(byte_len)?;
+        }
         self.invoke(stack, context, &callee, math_value, arg_values, dst)
     }
 

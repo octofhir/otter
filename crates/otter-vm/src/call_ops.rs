@@ -641,15 +641,8 @@ impl Interpreter {
         )?;
         let windowed = !function.is_generator && async_state.is_none();
         let mut new_frame = if windowed {
-            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(
-                function,
-                return_register,
-                upvalues,
-                this_for_callee,
-                ptr,
-                base_off,
-            )
+            let window = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(function, return_register, upvalues, this_for_callee, window)
         } else {
             let registers = self.draw_registers(function.register_count as usize);
             Frame::with_exec_registers(
@@ -741,15 +734,8 @@ impl Interpreter {
         // keep an inline-owned buffer that survives independent of the cursor.
         let windowed = !function.is_generator && async_state.is_none();
         let mut frame = if windowed {
-            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(
-                function,
-                return_register,
-                upvalues,
-                this_for_callee,
-                ptr,
-                base_off,
-            )
+            let window = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(function, return_register, upvalues, this_for_callee, window)
         } else {
             let registers = self.draw_registers(function.register_count as usize);
             Frame::with_exec_registers(
@@ -2368,8 +2354,8 @@ impl Interpreter {
             let registers = self.draw_registers(function.register_count as usize);
             Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
         } else {
-            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(function, None, upvalues, this_for_callee, ptr, base_off)
+            let window = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(function, None, upvalues, this_for_callee, window)
         };
         if let Some(result_promise) = async_result_promise {
             new_frame.async_state = Some(crate::frame_state::AsyncFrameState { result_promise });
@@ -2676,8 +2662,8 @@ impl Interpreter {
             let registers = self.draw_registers(function.register_count as usize);
             Frame::with_exec_registers(function, None, upvalues, this_for_callee, registers)
         } else {
-            let (ptr, base_off) = self.alloc_reg_window(function.register_count as usize)?;
-            Frame::with_exec_window(function, None, upvalues, this_for_callee, ptr, base_off)
+            let window = self.alloc_reg_window(function.register_count as usize)?;
+            Frame::with_exec_window(function, None, upvalues, this_for_callee, window)
         };
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);

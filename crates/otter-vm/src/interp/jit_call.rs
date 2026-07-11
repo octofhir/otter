@@ -725,7 +725,7 @@ impl Interpreter {
         let frame_desc = callee_frame.publish(stack);
         Ok(jit::JitPreparedDirectCall {
             entry_addr: plan.entry_addr,
-            regs: frame_desc.value_slots().as_mut_ptr().cast::<u64>(),
+            regs: frame_desc.register_window().as_mut_ptr().cast::<u64>(),
             self_closure: self_closure_bits,
             this_value: this_bits,
             frame_index: frame_desc.index(),

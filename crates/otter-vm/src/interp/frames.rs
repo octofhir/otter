@@ -65,14 +65,14 @@ impl Interpreter {
     }
 
     /// Reserve a zero-filled `count`-slot window at the top of the flat register
-    /// stack, bumping `reg_top`. Returns the window's base pointer and its slot
-    /// index; the caller stores both in a [`FrameRegisters::Window`] and frees
-    /// the window by truncating `reg_top` back to the base on frame pop.
+    /// stack, bumping its live cursor. Returns the authoritative C-layout
+    /// descriptor stored in [`FrameRegisters::Window`]; frame pop releases the
+    /// arena back to its recorded base.
     ///
     /// The stack is pre-reserved and never reallocates (live `Window` frames
     /// hold raw pointers into it), so an overflow throws a catchable stack
     /// overflow instead of growing.
-    pub(crate) fn alloc_reg_window(&mut self, count: usize) -> Result<(*mut Value, u32), VmError> {
+    pub(crate) fn alloc_reg_window(&mut self, count: usize) -> Result<RegisterWindow, VmError> {
         self.register_stack.allocate(count)
     }
 

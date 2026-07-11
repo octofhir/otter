@@ -468,7 +468,7 @@ unsafe impl Sync for JitNativeActivation {}
 
 /// Prepared direct-call entry state returned by the VM to emitted code.
 ///
-/// The frame has already been published onto the active [`JitFrameStack`], so
+/// The frame has already been published onto the active [`HoltStack`], so
 /// its value slots are visible to precise GC tracing. Emitted code uses this to
 /// Receiver shapes cached per direct-method call site, and the number of flat
 /// inline-link ways the optimizing tier walks. Shared with the VM so the flat
@@ -870,14 +870,6 @@ pub struct ObjectLiteralProp {
     pub value_reg: u16,
 }
 
-/// Frame stack the interpreter dispatches over. Exposed so the JIT crate can
-/// hold a `*mut JitFrameStack` in its reentry context and hand it back to the
-/// VM-side bridge methods without naming the concrete stack shape itself. This
-/// is the segmented, stable-address [`crate::holt_stack::HoltStack`] — the
-/// stability is exactly what lets compiled code keep a frame/register pointer
-/// across a re-entrant call.
-pub type JitFrameStack = crate::holt_stack::HoltStack;
-
 /// One reconstructed interpreter frame in a nested inline-resume, decoded from
 /// the emitted deopt exit's stack buffer by the resume stub and handed to
 /// [`crate::Interpreter::jit_resume_inline_callee_stack`]. Frames are ordered
@@ -911,17 +903,25 @@ pub struct JitResumeFrame {
 /// - The VM guarantees no live `&mut` aliases these pointers for
 ///   the call's duration (it forms them from its own borrows and does not touch
 ///   those borrows until the call returns).
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
-pub struct JitReentryPtrs {
+pub struct VmRuntimeActivation {
     /// Owning interpreter.
     pub vm: *mut crate::Interpreter,
     /// Active stable-address frame stack.
-    pub stack: *mut JitFrameStack,
+    pub stack: *mut crate::HoltStack,
     /// Linked execution context.
     pub context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
     pub frame_index: usize,
 }
+
+const _: [(); 32] = [(); std::mem::size_of::<VmRuntimeActivation>()];
+const _: [(); 8] = [(); std::mem::align_of::<VmRuntimeActivation>()];
+const _: [(); 0] = [(); std::mem::offset_of!(VmRuntimeActivation, vm)];
+const _: [(); 8] = [(); std::mem::offset_of!(VmRuntimeActivation, stack)];
+const _: [(); 16] = [(); std::mem::offset_of!(VmRuntimeActivation, context)];
+const _: [(); 24] = [(); std::mem::offset_of!(VmRuntimeActivation, frame_index)];
 
 /// Outcome of executing compiled code for one function entry.
 ///
@@ -984,13 +984,15 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         0
     }
 
-    /// Execute the compiled function for the frame at `ptrs.frame_index`.
+    /// Execute the compiled function for the frame at
+    /// `activation.frame_index`.
     ///
     /// Compiled code reads/writes that frame's register window in place and,
     /// for `Call`/`MakeFunction`, re-enters the VM through the safe bridge
-    /// methods reached via `ptrs`. The window stays rooted on the VM frame
+    /// methods reached through the activation published by [`crate::native_abi::VmThread`].
+    /// The window stays rooted on the VM frame
     /// stack throughout, so allocation/calls in the body are GC-safe.
-    fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome;
+    fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome;
 
     /// Enter compiled code mid-function at the loop header whose bytecode PC is
     /// `byte_pc` (on-stack replacement). Returns `None` when this code has no
@@ -1000,7 +1002,7 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// instruction boundary, so a loop header is a valid resume point: the
     /// interpreter's live registers are exactly what the compiled code reads.
     /// The default returns `None` for codes that do not support OSR.
-    fn osr_entry(&self, _ptrs: JitReentryPtrs, _byte_pc: u32) -> Option<JitExecOutcome> {
+    fn osr_entry(&self, _activation: VmRuntimeActivation, _byte_pc: u32) -> Option<JitExecOutcome> {
         None
     }
 }

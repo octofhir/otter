@@ -172,7 +172,7 @@ pub use run_control::{
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
 
-use crate::holt_stack::{HoltCallReservation, HoltStack};
+use crate::holt_stack::HoltCallReservation;
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
 use smallvec::SmallVec;
 
@@ -194,13 +194,14 @@ pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use handles::{HandleArena, HandleScope, Scoped};
+pub use holt_stack::HoltStack;
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
     JitCollectionLayout, JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError,
     JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
-    JitFrameStack, JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitPrimitiveMethodGuard, JitReentryPtrs, JitStringLayout, JitTypedArrayLayout,
+    JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
+    JitPrimitiveMethodGuard, JitStringLayout, JitTypedArrayLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,

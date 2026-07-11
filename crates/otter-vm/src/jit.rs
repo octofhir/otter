@@ -427,10 +427,6 @@ pub struct JitDirectCallPlan {
     pub function_id: u32,
     /// Raw compiled entry address.
     pub entry_addr: usize,
-    /// Base of the callee function's safepoint records.
-    pub safepoint_records: *const crate::native_abi::SafepointRecord,
-    /// Number of records starting at [`Self::safepoint_records`].
-    pub safepoint_count: u32,
     /// Number of formal parameter registers.
     pub param_count: u16,
     /// Total callee register-window length.
@@ -484,10 +480,6 @@ pub struct JitPreparedDirectCall {
     pub entry_addr: usize,
     /// Callee register-window base.
     pub regs: *mut u64,
-    /// Base of the callee function's safepoint records.
-    pub safepoint_records: *const crate::native_abi::SafepointRecord,
-    /// Number of records starting at [`Self::safepoint_records`].
-    pub safepoint_count: u32,
     /// Boxed SELF closure bits for the callee context.
     pub self_closure: u64,
     /// Boxed `this` bits for the callee context.
@@ -869,7 +861,8 @@ pub struct JitResumeFrame {
     pub registers: Vec<crate::Value>,
 }
 
-/// Raw, type-erased pointers the VM hands the JIT so compiled code can re-enter
+/// VM-owned runtime state retained behind [`crate::native_abi::VmThread`]
+/// while compiled code can re-enter
 /// the VM (recursive calls, closure allocation) through the safe bridge methods
 /// ([`crate::Interpreter::jit_runtime_call`],
 /// [`crate::Interpreter::jit_runtime_make_function`]).
@@ -877,19 +870,17 @@ pub struct JitResumeFrame {
 /// # Invariants
 /// - Pointers are valid only for the duration of one
 ///   [`JitFunctionCode::run_entry`] call; the JIT must not retain them.
-/// - `vm`/`stack`/`context` are `*mut Interpreter` / `*mut JitFrameStack` /
-///   `*const ExecutionContext` erased to avoid a naming dependency in the trait.
-///   The JIT casts them back. The VM guarantees no live `&mut` aliases them for
+/// - The VM guarantees no live `&mut` aliases these pointers for
 ///   the call's duration (it forms them from its own borrows and does not touch
 ///   those borrows until the call returns).
 #[derive(Clone, Copy)]
 pub struct JitReentryPtrs {
-    /// Erased `*mut Interpreter`.
-    pub vm: *mut std::ffi::c_void,
-    /// Erased `*mut JitFrameStack`.
-    pub stack: *mut std::ffi::c_void,
-    /// Erased `*const ExecutionContext`.
-    pub context: *const std::ffi::c_void,
+    /// Owning interpreter.
+    pub vm: *mut crate::Interpreter,
+    /// Active stable-address frame stack.
+    pub stack: *mut JitFrameStack,
+    /// Linked execution context.
+    pub context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
     pub frame_index: usize,
 }
@@ -950,11 +941,9 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         false
     }
 
-    /// Safepoint table for compiled code that can call allocating runtime
-    /// stubs. Tiers without a published VM-native safepoint contract return an
-    /// empty table and must not emit allocating stub calls.
-    fn safepoint_table(&self) -> (*const crate::native_abi::SafepointRecord, u32) {
-        (std::ptr::null(), 0)
+    /// Number of safepoints owned by this installed code object.
+    fn safepoint_count(&self) -> u32 {
+        0
     }
 
     /// Execute the compiled function for the frame at `ptrs.frame_index`.

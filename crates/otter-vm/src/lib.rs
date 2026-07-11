@@ -952,14 +952,14 @@ pub struct Interpreter {
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
     /// Per-call-site monomorphic-callee feedback driving baseline leaf-inlining.
-    /// Keyed `(caller_fid, call_byte_pc)`; recorded by the interpreter
+    /// Keyed `(caller_fid, call_instruction_pc)`; recorded by the interpreter
     /// `Op::Call` arm during the warmup interpreter runs that precede tier-up,
     /// and read at compile time (`bake_inline_callees`) so the baseline knows
     /// which sites have a single observed callee. Only mutated when a JIT hook
     /// is installed.
     jit_call_site_feedback: rustc_hash::FxHashMap<(u32, u32), CallTargetFeedback>,
     /// Per-call-site method-call feedback driving baseline method inlining,
-    /// keyed `(caller_fid, call_byte_pc)`. Recorded by the interpreter
+    /// keyed `(caller_fid, call_instruction_pc)`. Recorded by the interpreter
     /// `Op::CallMethodValue` arm during warmup and read at compile time
     /// (`bake_inline_callees`). Only mutated when a JIT hook is installed.
     jit_method_site_feedback: rustc_hash::FxHashMap<(u32, u32), MethodCallFeedback>,

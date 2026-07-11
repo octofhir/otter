@@ -608,11 +608,16 @@ impl Interpreter {
     /// callee is a no-op; any *different* callee promotes the site to `Poly`
     /// permanently. Only reached when a JIT hook is installed (the `Op::Call`
     /// arm gates it), so interpreter-only execution pays nothing.
-    pub(crate) fn note_call_target(&mut self, caller_fid: u32, call_byte_pc: u32, callee_fid: u32) {
+    pub(crate) fn note_call_target(
+        &mut self,
+        caller_fid: u32,
+        call_instruction_pc: u32,
+        callee_fid: u32,
+    ) {
         use std::collections::hash_map::Entry;
         let newly_mono = match self
             .jit_call_site_feedback
-            .entry((caller_fid, call_byte_pc))
+            .entry((caller_fid, call_instruction_pc))
         {
             Entry::Vacant(slot) => {
                 slot.insert(CallTargetFeedback::Mono(callee_fid));
@@ -640,11 +645,11 @@ impl Interpreter {
     pub(crate) fn method_site_feedback_saturated(
         &self,
         caller_fid: u32,
-        call_byte_pc: u32,
+        call_instruction_pc: u32,
     ) -> bool {
         matches!(
             self.jit_method_site_feedback
-                .get(&(caller_fid, call_byte_pc)),
+                .get(&(caller_fid, call_instruction_pc)),
             Some(MethodCallFeedback::Megamorphic)
         )
     }
@@ -661,7 +666,7 @@ impl Interpreter {
     pub(crate) fn note_method_target(
         &mut self,
         caller_fid: u32,
-        call_byte_pc: u32,
+        call_instruction_pc: u32,
         method_fid: u32,
         site: MethodSite,
     ) {
@@ -675,7 +680,7 @@ impl Interpreter {
         };
         match self
             .jit_method_site_feedback
-            .entry((caller_fid, call_byte_pc))
+            .entry((caller_fid, call_instruction_pc))
         {
             Entry::Vacant(slot) => {
                 slot.insert(MethodCallFeedback::Mono {
@@ -804,20 +809,28 @@ impl Interpreter {
         fid: u32,
     ) {
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
-        for (&(caller_fid, byte_pc), state) in &self.jit_call_site_feedback {
+        for (&(caller_fid, instruction_pc), state) in &self.jit_call_site_feedback {
             if caller_fid != fid {
                 continue;
             }
+            let Some(call_byte_pc) = view
+                .instructions
+                .iter()
+                .find(|instr| instr.instruction_pc == instruction_pc)
+                .map(|instr| instr.byte_pc)
+            else {
+                continue;
+            };
             let CallTargetFeedback::Mono(callee_fid) = *state else {
                 if trace {
-                    eprintln!("[otter-jit] inline callee skip fid {fid} pc {byte_pc}: poly");
+                    eprintln!("[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: poly");
                 }
                 continue;
             };
             let Some(callee) = context.exec_function(callee_fid) else {
                 if trace {
                     eprintln!(
-                        "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: missing callee {callee_fid}"
+                        "[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: missing callee {callee_fid}"
                     );
                 }
                 continue;
@@ -832,7 +845,7 @@ impl Interpreter {
             {
                 if trace {
                     eprintln!(
-                        "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: ineligible callee {callee_fid} flags gen={} async={} async_gen={} args={} rest={} eval={} derived={} makes_fn={}",
+                        "[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: ineligible callee {callee_fid} flags gen={} async={} async_gen={} args={} rest={} eval={} derived={} makes_fn={}",
                         callee.is_generator,
                         callee.is_async,
                         callee.is_async_generator,
@@ -848,18 +861,18 @@ impl Interpreter {
             let Some(callee_view) = context.jit_compile_snapshot(callee_fid) else {
                 if trace {
                     eprintln!(
-                        "[otter-jit] inline callee skip fid {fid} pc {byte_pc}: missing view {callee_fid}"
+                        "[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: missing view {callee_fid}"
                     );
                 }
                 continue;
             };
             if trace {
                 eprintln!(
-                    "[otter-jit] inline callee bake fid {fid} pc {byte_pc}: callee {callee_fid}"
+                    "[otter-jit] inline callee bake fid {fid} pc {instruction_pc}: callee {callee_fid}"
                 );
             }
             view.inline_callees.insert(
-                byte_pc,
+                call_byte_pc,
                 jit::JitInlineCallee {
                     code_block: std::sync::Arc::clone(&callee_view.code_block),
                     function_id: callee_fid,
@@ -877,13 +890,13 @@ impl Interpreter {
         // `MAX_POLY_METHOD_TARGETS` (most-frequent first) for `Poly`.
         // `Megamorphic` sites are skipped and take the in-place method bridge.
         struct PolySnapshot {
-            byte_pc: u32,
+            instruction_pc: u32,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
         }
         let method_sites: Vec<PolySnapshot> = self
             .jit_method_site_feedback
             .iter()
-            .filter_map(|(&(caller_fid, byte_pc), state)| {
+            .filter_map(|(&(caller_fid, instruction_pc), state)| {
                 if caller_fid != fid {
                     return None;
                 }
@@ -903,20 +916,34 @@ impl Interpreter {
                             method_value_byte: *method_value_byte,
                             hits: 1,
                         });
-                        Some(PolySnapshot { byte_pc, targets })
+                        Some(PolySnapshot {
+                            instruction_pc,
+                            targets,
+                        })
                     }
                     MethodCallFeedback::Poly(observed) => {
                         let mut targets = (**observed).clone();
                         // Most-frequent target first: the common receiver shape
                         // then hits the shortest guard chain.
                         targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
-                        Some(PolySnapshot { byte_pc, targets })
+                        Some(PolySnapshot {
+                            instruction_pc,
+                            targets,
+                        })
                     }
                     MethodCallFeedback::Megamorphic => None,
                 }
             })
             .collect();
         for snap in method_sites {
+            let Some(call_byte_pc) = view
+                .instructions
+                .iter()
+                .find(|instr| instr.instruction_pc == snap.instruction_pc)
+                .map(|instr| instr.byte_pc)
+            else {
+                continue;
+            };
             let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
             for target in &snap.targets {
                 if let Some(method) = self.bake_one_inline_method(context, target) {
@@ -930,11 +957,11 @@ impl Interpreter {
                 // take the bridge, which is strictly better than no inline.
                 1 => {
                     view.inline_methods
-                        .insert(snap.byte_pc, baked.pop().unwrap());
+                        .insert(call_byte_pc, baked.pop().unwrap());
                 }
                 // Two or more: emit the guarded inline chain.
                 _ => {
-                    view.inline_poly_methods.insert(snap.byte_pc, baked);
+                    view.inline_poly_methods.insert(call_byte_pc, baked);
                 }
             }
         }
@@ -1038,7 +1065,7 @@ impl Interpreter {
                     method_value_byte,
                 }) = self
                     .jit_method_site_feedback
-                    .get(&(target.method_fid, instr.byte_pc))
+                    .get(&(target.method_fid, instr.instruction_pc))
                 {
                     nested_targets.push((
                         instr.byte_pc,

@@ -1195,8 +1195,8 @@ fn alloc_interpreter_mut(ctx: &RuntimeStubAllocContext) -> Option<&'static mut I
     if thread.runtime_context == 0 {
         return None;
     }
-    // SAFETY: `runtime_context` is published from a live JitReentryPtrs value.
-    let reentry = unsafe { &*(thread.runtime_context as *const crate::jit::JitReentryPtrs) };
+    // SAFETY: `runtime_context` is published from a live VmRuntimeActivation value.
+    let reentry = unsafe { &*(thread.runtime_context as *const crate::jit::VmRuntimeActivation) };
     interpreter_mut(reentry.vm.cast())
 }
 
@@ -1273,7 +1273,7 @@ mod tests {
             context: std::ptr::from_ref(active) as u64,
             resolve_safepoint: resolve_test_safepoint as *const () as u64,
         }));
-        let reentry = Box::leak(Box::new(crate::jit::JitReentryPtrs {
+        let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation {
             vm,
             stack: std::ptr::null_mut(),
             context: std::ptr::null(),

@@ -37,8 +37,8 @@
 use otter_bytecode::{Op, Operand};
 pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
-    Interpreter, JitCompileSnapshot, JitExecOutcome, JitFrameStack, JitFunctionCode,
-    JitReentryPtrs, RuntimeStubAllocContext, SafepointRecord, Value, VmError,
+    HoltStack, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFunctionCode,
+    RuntimeStubAllocContext, SafepointRecord, Value, VmError, VmRuntimeActivation,
     native_abi::{
         CodeRegistryView, NativeFrame, NativeFrameFlags, NativeFrameHeader, NativeFrameKind,
         VmThread,
@@ -232,12 +232,12 @@ pub struct JitCtx {
 }
 
 impl std::ops::Deref for JitCtx {
-    type Target = JitReentryPtrs;
+    type Target = VmRuntimeActivation;
 
     fn deref(&self) -> &Self::Target {
         // SAFETY: runtime-capable contexts point at the VmThread built for the
-        // current entry, whose runtime_context retains JitReentryPtrs.
-        unsafe { &*((*self.thread).runtime_context as *const JitReentryPtrs) }
+        // current entry, whose runtime_context retains VmRuntimeActivation.
+        unsafe { &*((*self.thread).runtime_context as *const VmRuntimeActivation) }
     }
 }
 
@@ -1097,15 +1097,15 @@ impl JitFunctionCode for BaselineCode {
         self.safepoint_records.len() as u32
     }
 
-    fn run_entry(&self, ptrs: JitReentryPtrs) -> JitExecOutcome {
+    fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
         // SAFETY: the mapping is live and the main entry was emitted with the
         // `JitEntry` ABI.
         let entry = unsafe { self.code.entry_ptr() };
-        // SAFETY: `entry` points into the live mapping; `ptrs` upholds the
+        // SAFETY: `entry` points into the live mapping; `activation` upholds the
         // reentry contract (valid, non-aliased for the call).
         unsafe {
             enter_compiled(
-                ptrs,
+                activation,
                 entry,
                 self.code_object_id,
                 self.register_count,
@@ -1114,7 +1114,7 @@ impl JitFunctionCode for BaselineCode {
         }
     }
 
-    fn osr_entry(&self, ptrs: JitReentryPtrs, byte_pc: u32) -> Option<JitExecOutcome> {
+    fn osr_entry(&self, activation: VmRuntimeActivation, byte_pc: u32) -> Option<JitExecOutcome> {
         let offset = *self.osr_entries.get(&byte_pc)?;
         // SAFETY: `offset` is an assembler offset recorded for this buffer and
         // points at a prologue trampoline emitted with the `JitEntry` ABI.
@@ -1122,7 +1122,7 @@ impl JitFunctionCode for BaselineCode {
         // SAFETY: same reentry contract as `run_entry`.
         Some(unsafe {
             enter_compiled(
-                ptrs,
+                activation,
                 entry,
                 self.code_object_id,
                 self.register_count,
@@ -1132,7 +1132,7 @@ impl JitFunctionCode for BaselineCode {
     }
 }
 
-/// Build the `JitCtx` for `ptrs` and invoke compiled code at `entry`, mapping
+/// Build the `JitCtx` for `activation` and invoke compiled code at `entry`, mapping
 /// the returned status to a [`JitExecOutcome`].
 ///
 /// Shared across compiled tiers and entry kinds: the baseline function-entry
@@ -1144,8 +1144,8 @@ impl JitFunctionCode for BaselineCode {
 ///
 /// # Safety
 /// `entry` must point at a prologue emitted with the [`JitEntry`] ABI inside a
-/// live executable mapping that outlives the call, and `ptrs` must uphold the
-/// [`JitReentryPtrs`](otter_vm::JitReentryPtrs) contract.
+/// live executable mapping that outlives the call, and `activation` must uphold the
+/// [`VmRuntimeActivation`](otter_vm::VmRuntimeActivation) contract.
 #[repr(C)]
 struct ActiveSafepoints {
     code_object_id: u64,
@@ -1175,27 +1175,28 @@ unsafe extern "C" fn resolve_active_safepoint(
 }
 
 pub(crate) unsafe fn enter_compiled(
-    ptrs: JitReentryPtrs,
+    activation: VmRuntimeActivation,
     entry: *const u8,
     code_object_id: u64,
     register_count: u16,
     safepoint_records: &[SafepointRecord],
 ) -> JitExecOutcome {
     {
-        let stack = ptrs.stack.cast::<JitFrameStack>();
-        let vm = ptrs.vm.cast::<Interpreter>();
-        // SAFETY: `ptrs.stack` is a valid `*mut JitFrameStack` for this call.
-        let regs = Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, ptrs.frame_index);
-        // SAFETY: `ptrs.vm`/`ptrs.stack` are valid for this call and not aliased
+        let stack = activation.stack.cast::<HoltStack>();
+        let vm = activation.vm.cast::<Interpreter>();
+        // SAFETY: `activation.stack` is a valid `*mut HoltStack` for this call.
+        let regs = Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, activation.frame_index);
+        // SAFETY: `activation.vm`/`activation.stack` are valid for this call and not aliased
         // by a live `&mut` (the VM froze its borrows); read the self closure up
         // front so a `MakeFunction`-of-self needs no Rust round-trip.
-        let self_closure = unsafe { (*vm).jit_frame_self_closure_bits(&*stack, ptrs.frame_index) };
+        let self_closure =
+            unsafe { (*vm).jit_frame_self_closure_bits(&*stack, activation.frame_index) };
         // SAFETY: same validity/aliasing contract as `self_closure` above.
-        let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, ptrs.frame_index) };
+        let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, activation.frame_index) };
         // SAFETY: same validity/aliasing contract; the spine `Box` outlives this
         // entry (frame-owned), and the cells it holds are old-space (immobile).
         let upvalues_ptr =
-            Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, ptrs.frame_index);
+            Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, activation.frame_index);
         // SAFETY: `vm` is a valid `*mut Interpreter` for this entry and not
         // aliased by a live `&mut` (the VM froze its borrows); these return the
         // stable base / `reg_top` address of the flat JIT register stack.
@@ -1249,7 +1250,7 @@ pub(crate) unsafe fn enter_compiled(
         };
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
-        thread.runtime_context = std::ptr::addr_of!(ptrs) as u64;
+        thread.runtime_context = std::ptr::addr_of!(activation) as u64;
         thread.code_registry = std::ptr::addr_of!(registry) as u64;
         thread.interrupt_cell = interrupt_flag as u64;
         let mut error = None;
@@ -1259,7 +1260,7 @@ pub(crate) unsafe fn enter_compiled(
             this_value,
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
-            frame_index: ptrs.frame_index,
+            frame_index: activation.frame_index,
             upvalues_ptr,
             bail_pc: 0,
             error: &mut error,

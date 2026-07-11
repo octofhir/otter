@@ -154,8 +154,7 @@ impl HoltCallReservation {
 
 /// `SmallVec` inline threshold. Immaterial to behavior — every `HoltStack`
 /// reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] up front, so storage always lives
-/// in the heap buffer; this only fixes the `SmallVec`'s spilled layout, which the
-/// JIT reentry bridge's `<*mut JitFrameStack>::cast` reinterprets.
+/// in the heap buffer.
 const INLINE_FRAMES: usize = 8;
 
 /// Reservation-stable stack of interpreter call [`Frame`]s.
@@ -171,12 +170,6 @@ const INLINE_FRAMES: usize = 8;
 /// Same stack-discipline surface as the legacy stack (`push` / `pop` / `last` /
 /// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `clear` /
 /// `iter` / `iter_mut`) plus `Index` / `IndexMut`.
-///
-/// `#[repr(transparent)]` over the `SmallVec`: `HoltStack` has identical layout
-/// and ABI to its storage, so the JIT reentry bridge's
-/// `<*mut JitFrameStack>::cast(stack)` is a sound, zero-cost reinterpret and the
-/// optimizer treats the newtype exactly as the bare `SmallVec` it once was.
-#[repr(transparent)]
 #[derive(Debug)]
 pub struct HoltStack {
     frames: SmallVec<[Frame; INLINE_FRAMES]>,

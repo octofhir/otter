@@ -240,13 +240,13 @@ impl Interpreter {
             self.jit_osr_disabled.insert((fid, osr_pc));
             return Ok(None);
         };
-        let ptrs = jit::JitReentryPtrs {
+        let activation = jit::VmRuntimeActivation {
             vm: self,
             stack,
             context,
             frame_index: top_idx,
         };
-        match code.osr_entry(ptrs, osr_pc) {
+        match code.osr_entry(activation, osr_pc) {
             // No trampoline for this header — it's not an OSR target. Disable
             // just this header and re-arm so another header can still tier up.
             None => {
@@ -544,13 +544,13 @@ impl Interpreter {
         // borrows (`self`, `stack`, `context`) and are valid for the duration
         // of `run_entry`; the JIT does not retain them, and we do not touch
         // those borrows again until `run_entry` returns.
-        let ptrs = jit::JitReentryPtrs {
+        let activation = jit::VmRuntimeActivation {
             vm: self,
             stack,
             context,
             frame_index: top_idx,
         };
-        code.run_entry(ptrs)
+        code.run_entry(activation)
     }
 
     /// Resolve `fid`'s installed non-OSR baseline body through the single-entry
@@ -645,7 +645,7 @@ impl Interpreter {
     pub(crate) fn prepare_jit_direct_call_frame(
         &mut self,
         _context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         frame_index: usize,
         function: &crate::executable::CodeBlock,
         parent_upvalues: crate::frame_state::UpvalueSpine,
@@ -800,7 +800,7 @@ impl Interpreter {
     pub(crate) fn try_prepare_cached_direct_method_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         frame_index: usize,
         recv: Value,
         obj: crate::object::JsObject,
@@ -1085,7 +1085,7 @@ impl Interpreter {
     pub fn jit_prepare_direct_method_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         frame_index: usize,
         recv_reg: u16,
         name_idx: u32,
@@ -1216,7 +1216,7 @@ impl Interpreter {
     /// [`Self::jit_prepare_direct_call`].
     pub fn jit_finish_direct_call_returned(
         &mut self,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         caller_frame_index: usize,
         callee_frame_index: usize,
         dst: u16,
@@ -1256,7 +1256,7 @@ impl Interpreter {
     pub fn jit_self_call_bail(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         caller_frame_index: usize,
         bail_pc: u32,
         regcount: usize,
@@ -1289,7 +1289,7 @@ impl Interpreter {
     pub fn jit_direct_method_call_bail(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         bail_pc: u32,
         regcount: usize,
         callee: Value,
@@ -1333,7 +1333,7 @@ impl Interpreter {
     pub fn jit_resume_inline_callee_stack(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         frames: &[jit::JitResumeFrame],
     ) -> Result<Value, VmError> {
         // Build every frame before pushing any: an invalid function id then
@@ -1392,7 +1392,7 @@ impl Interpreter {
     pub fn jit_finish_direct_call_bailed(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         caller_frame_index: usize,
         callee_frame_index: usize,
         dst: u16,
@@ -1429,22 +1429,14 @@ impl Interpreter {
     ///
     /// Used by direct-call throw/bail paths: drops the callee frame and any
     /// nested frames above it, then releases the sync-reentry guard.
-    pub fn jit_abort_direct_call(
-        &mut self,
-        stack: &mut jit::JitFrameStack,
-        callee_frame_index: usize,
-    ) {
+    pub fn jit_abort_direct_call(&mut self, stack: &mut HoltStack, callee_frame_index: usize) {
         self.truncate_frame_stack_reclaiming(stack, callee_frame_index);
         self.release_jit_direct_code_from(callee_frame_index);
         self.leave_sync_reentry();
     }
 
     #[inline]
-    pub(crate) fn truncate_frame_stack_reclaiming(
-        &mut self,
-        stack: &mut jit::JitFrameStack,
-        len: usize,
-    ) {
+    pub(crate) fn truncate_frame_stack_reclaiming(&mut self, stack: &mut HoltStack, len: usize) {
         while stack.len() > len {
             if let Some(mut frame) = stack.pop() {
                 self.reclaim_registers(&mut frame);
@@ -1462,7 +1454,7 @@ impl Interpreter {
     pub fn jit_runtime_make_function(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut jit::JitFrameStack,
+        stack: &mut HoltStack,
         frame_index: usize,
         dst: u16,
         idx: u32,
@@ -1486,7 +1478,7 @@ impl Interpreter {
     /// surfaces verbatim; the emitter guards against it and bails to the
     /// interpreter, which owns the derived-constructor resolution and throw.
     #[must_use]
-    pub fn jit_frame_this_bits(&self, stack: &jit::JitFrameStack, frame_index: usize) -> u64 {
+    pub fn jit_frame_this_bits(&self, stack: &HoltStack, frame_index: usize) -> u64 {
         match stack.get(frame_index) {
             Some(frame) => frame.this_value.to_bits(),
             None => Value::undefined().to_bits(),
@@ -1501,11 +1493,7 @@ impl Interpreter {
     /// [`Self::run_make_function_reg`]: the frame's recorded closure instance
     /// when present, else the bare interned function value.
     #[must_use]
-    pub fn jit_frame_self_closure_bits(
-        &self,
-        stack: &jit::JitFrameStack,
-        frame_index: usize,
-    ) -> u64 {
+    pub fn jit_frame_self_closure_bits(&self, stack: &HoltStack, frame_index: usize) -> u64 {
         let Some(frame) = stack.get(frame_index) else {
             return Value::undefined().to_bits();
         };
@@ -1524,7 +1512,7 @@ impl Interpreter {
     /// (recursive compiled calls append frames to this reservation-stable
     /// HoltStack, whose buffer does not reallocate before the stack-depth guard).
     #[must_use]
-    pub fn jit_frame_regs_ptr(stack: &mut jit::JitFrameStack, frame_index: usize) -> *mut u64 {
+    pub fn jit_frame_regs_ptr(stack: &mut HoltStack, frame_index: usize) -> *mut u64 {
         stack[frame_index].registers.as_mut_ptr().cast::<u64>()
     }
 
@@ -1536,7 +1524,7 @@ impl Interpreter {
     /// stays put for the frame's life (the cells themselves are old-space, so
     /// they never move); a `0` base routes the op to the runtime stub.
     #[must_use]
-    pub fn jit_frame_upvalues_ptr(stack: &jit::JitFrameStack, frame_index: usize) -> usize {
+    pub fn jit_frame_upvalues_ptr(stack: &HoltStack, frame_index: usize) -> usize {
         let upvalues = &stack[frame_index].upvalues;
         if upvalues.is_empty() {
             0

@@ -17,8 +17,8 @@
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
 //! - Serialized byte coordinates live only in the CodeBlock's cold metadata;
 //!   hot instruction records carry the canonical logical instruction PC.
-//! - Cold byte-PC lookup binary-searches instruction metadata; no dense reverse
-//!   map is retained in the execution object.
+//! - Cold byte PCs are a one-way logical-PC source/profiling map; execution has
+//!   no byte-PC-to-instruction reverse lookup.
 //! - Operand payloads are untagged 32-bit words. Their kinds come exclusively
 //!   from the opcode schema and are decoded through [`CodeBlock`] accessors.
 //! - Up to four operand words live in the authoritative wordcode record. Any
@@ -336,19 +336,6 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn byte_spans(&self) -> &[SpanEntry] {
         &self.byte_spans
-    }
-
-    /// Resolve a cold byte-offset PC by binary-searching the source map.
-    #[must_use]
-    pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&CodeBlockInstruction> {
-        let idx = self.byte_pcs.binary_search(&byte_pc).ok()?;
-        self.code.get(idx)
-    }
-
-    /// Resolve a cold byte-offset PC to its dense instruction index.
-    #[must_use]
-    pub(crate) fn instr_index_at_byte_pc(&self, byte_pc: u32) -> Option<usize> {
-        self.byte_pcs.binary_search(&byte_pc).ok()
     }
 
     /// Fetch an instruction by its dense `code` index.

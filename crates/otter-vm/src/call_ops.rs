@@ -2593,11 +2593,7 @@ impl Interpreter {
             crate::jit::JitExecOutcome::Bailed(pc) => {
                 // Finish the partially-run frame in the interpreter, which pops
                 // it on return; the next element rebuilds a fresh recycled frame.
-                state.stack[top_idx].pc = Self::instruction_pc_for_byte_pc(
-                    context,
-                    state.stack[top_idx].function_id,
-                    pc,
-                )?;
+                state.stack[top_idx].pc = pc;
                 self.dispatch_loop(context, &mut state.stack)
             }
             crate::jit::JitExecOutcome::Threw(err) => Err(err),

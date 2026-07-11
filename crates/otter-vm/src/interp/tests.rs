@@ -92,12 +92,12 @@ fn osr_bail_policy_only_disables_target_loop_misses() {
     assert!(Interpreter::osr_bail_inside_target_loop_instructions(
         &snapshot.code_block,
         0,
-        20
+        1
     ));
     assert!(!Interpreter::osr_bail_inside_target_loop_instructions(
         &snapshot.code_block,
         0,
-        50
+        3
     ));
 }
 

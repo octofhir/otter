@@ -158,13 +158,13 @@ pub struct JitCtx {
     /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
     /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
     this_value: u64,
-    /// Byte-PC of the instruction currently executing, written by compiled
-    /// code before each op (offset [`BAIL_PC_OFFSET`]). On a guard bail the
+    /// Logical PC of the instruction currently executing, written by compiled
+    /// code before each op (offset [`RESUME_PC_OFFSET`]). On a guard bail the
     /// interpreter resumes here — the exact instruction, not the entry/loop
     /// header — which is what makes bailing out of a loop body that has
     /// already committed side effects (or out of an unsupported opcode)
     /// correct. Read by `enter_at` on `STATUS_BAILED`.
-    bail_pc: u32,
+    resume_pc: u32,
     /// Sole machine-visible VM state pointer.
     thread: *mut VmThread,
     /// Published authoritative activation.
@@ -253,9 +253,9 @@ pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
 pub(crate) const STATUS_THREW: u64 = 2;
 
-/// Byte offset of [`JitCtx::bail_pc`] — where compiled code stamps the current
-/// instruction's byte-PC before each op so a bail resumes at the exact site.
-pub(crate) const BAIL_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, bail_pc) as u32;
+/// Byte offset of [`JitCtx::resume_pc`] — where compiled code stamps the
+/// current logical PC before each op so a bail resumes at the exact site.
+pub(crate) const RESUME_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, resume_pc) as u32;
 /// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
 #[allow(dead_code)]
 pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
@@ -504,7 +504,7 @@ pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
     ctx: *mut JitCtx,
     dst: u64,
     callee_frame_index: u64,
-    bail_pc: u64,
+    resume_pc: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
@@ -517,7 +517,7 @@ pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
         ctx.frame_index,
         callee_frame_index as usize,
         dst as u16,
-        bail_pc as u32,
+        resume_pc as u32,
     ) {
         Ok(()) => 0,
         Err(err) => {
@@ -545,7 +545,7 @@ pub(crate) extern "C" fn jit_abort_direct_call_stub(
 /// `STATUS_THREW` (error parked in `ctx`) on an uncaught throw.
 pub(crate) extern "C" fn jit_self_call_bail_stub(
     ctx: *mut JitCtx,
-    bail_pc: u64,
+    resume_pc: u64,
     regcount: u64,
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
@@ -557,7 +557,7 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
         context,
         stack,
         ctx.frame_index,
-        bail_pc as u32,
+        resume_pc as u32,
         regcount as usize,
     ) {
         Ok(value) => JitRet {
@@ -579,7 +579,7 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
 /// the already-resolved method value; no bytecode instruction is decoded here.
 pub(crate) extern "C" fn jit_direct_method_call_bail_stub(
     ctx: *mut JitCtx,
-    bail_pc: u64,
+    resume_pc: u64,
     regcount: u64,
     callee: u64,
     this: u64,
@@ -592,7 +592,7 @@ pub(crate) extern "C" fn jit_direct_method_call_bail_stub(
     match vm.jit_direct_method_call_bail(
         context,
         stack,
-        bail_pc as u32,
+        resume_pc as u32,
         regcount as usize,
         Value::from_bits(callee),
         Value::from_bits(this),
@@ -1010,7 +1010,7 @@ pub enum Unsupported {
     Opcode(Op),
     /// An operand whose kind/shape the emitter does not handle here.
     OperandShape(&'static str),
-    /// A branch whose target byte-PC does not land on an instruction boundary.
+    /// A branch whose logical target does not name an instruction boundary.
     BranchTarget(i64),
     /// A register index whose byte offset exceeds the inline load/store range.
     RegisterRange(u16),
@@ -1025,7 +1025,7 @@ pub struct BaselineCode {
     code_object_id: u64,
     /// Tagged register-window width published in the native frame.
     register_count: u16,
-    /// Loop-header bytecode PC → assembler offset of its OSR-entry trampoline.
+    /// Loop-header logical PC → assembler offset of its OSR-entry trampoline.
     /// Each trampoline runs the standard prologue then branches to the header's
     /// body label, so the VM can enter mid-loop with the live frame registers.
     osr_entries: std::collections::BTreeMap<u32, usize>,
@@ -1114,8 +1114,12 @@ impl JitFunctionCode for BaselineCode {
         }
     }
 
-    fn osr_entry(&self, activation: VmRuntimeActivation, byte_pc: u32) -> Option<JitExecOutcome> {
-        let offset = *self.osr_entries.get(&byte_pc)?;
+    fn osr_entry(
+        &self,
+        activation: VmRuntimeActivation,
+        logical_pc: u32,
+    ) -> Option<JitExecOutcome> {
+        let offset = *self.osr_entries.get(&logical_pc)?;
         // SAFETY: `offset` is an assembler offset recorded for this buffer and
         // points at a prologue trampoline emitted with the `JitEntry` ABI.
         let entry = unsafe { self.code.ptr_at(offset) };
@@ -1263,7 +1267,7 @@ pub(crate) unsafe fn enter_compiled(
             native_frame: std::ptr::addr_of_mut!(native_frame),
             frame_index: activation.frame_index(),
             upvalues_ptr,
-            bail_pc: 0,
+            resume_pc: 0,
             error: &mut error,
             direct_entry_addr: 0,
             direct_regs: std::ptr::null_mut(),
@@ -1294,7 +1298,7 @@ pub(crate) unsafe fn enter_compiled(
         let _ = jit_pop_native_activation_stub(&mut ctx);
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
-            STATUS_BAILED => JitExecOutcome::Bailed(ctx.bail_pc),
+            STATUS_BAILED => JitExecOutcome::Bailed(ctx.resume_pc),
             _ => JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand)),
         }
     }
@@ -1329,26 +1333,26 @@ pub(crate) mod arm64 {
         ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET,
         ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE,
         ALLOC_CTX_THREAD_OFFSET, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BACKEDGE_FUEL_OFFSET,
-        BAIL_PC_OFFSET, BaselineCode, CANONICAL_NAN_HI16,
-        COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET, COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET,
-        COLLECTION_METHOD_IC_COUNT_OFFSET, COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET,
-        COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET, COLLECTION_METHOD_IC_PROTO_OFFSET,
-        COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET,
-        COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
-        COLLECTION_METHOD_ICS_OFFSET, DIRECT_ENTRY_OFFSET, DIRECT_FRAME_INDEX_OFFSET,
-        DIRECT_METHOD_ENTRY_OFFSET, DIRECT_METHOD_FID_OFFSET, DIRECT_METHOD_INLINE_OFFSET,
-        DIRECT_METHOD_INLINE_SLOT_SIZE, DIRECT_METHOD_ON_RECEIVER_OFFSET,
-        DIRECT_METHOD_PROTO_SHAPE_OFFSET, DIRECT_METHOD_RECV_SHAPE_OFFSET,
-        DIRECT_METHOD_REGISTER_COUNT_OFFSET, DIRECT_METHOD_VALUE_BYTE_OFFSET, DIRECT_REGS_OFFSET,
-        DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16,
-        ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS,
-        INTERRUPT_FLAG_OFFSET, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS,
-        MAX_METHOD_ARGS, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16,
+        BaselineCode, CANONICAL_NAN_HI16, COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET,
+        COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET, COLLECTION_METHOD_IC_COUNT_OFFSET,
+        COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET,
+        COLLECTION_METHOD_IC_PROTO_OFFSET, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET,
+        COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET, COLLECTION_METHOD_IC_SLOT_SIZE,
+        COLLECTION_METHOD_IC_STATE_OFFSET, COLLECTION_METHOD_ICS_OFFSET, DIRECT_ENTRY_OFFSET,
+        DIRECT_FRAME_INDEX_OFFSET, DIRECT_METHOD_ENTRY_OFFSET, DIRECT_METHOD_FID_OFFSET,
+        DIRECT_METHOD_INLINE_OFFSET, DIRECT_METHOD_INLINE_SLOT_SIZE,
+        DIRECT_METHOD_ON_RECEIVER_OFFSET, DIRECT_METHOD_PROTO_SHAPE_OFFSET,
+        DIRECT_METHOD_RECV_SHAPE_OFFSET, DIRECT_METHOD_REGISTER_COUNT_OFFSET,
+        DIRECT_METHOD_VALUE_BYTE_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
+        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET,
+        FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET,
+        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS,
+        NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16,
         OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, SYNC_REENTRY_DEPTH_PTR_OFFSET,
-        SYNC_REENTRY_LIMIT_OFFSET, THIS_VALUE_OFFSET, THREAD_OFFSET, UPVALUE_CELL_SIZE,
-        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW,
-        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WhiskerIcCell,
+        RESUME_PC_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+        SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THIS_VALUE_OFFSET, THREAD_OFFSET,
+        UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE,
+        VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WhiskerIcCell,
         alloc_value_stub_trampoline_pair, jit_abort_direct_call_stub, jit_add_stub,
         jit_backedge_poll_stub, jit_call_collection_method_ic_stub, jit_define_data_property_stub,
         jit_define_own_property_stub, jit_direct_method_call_bail_stub,
@@ -2091,13 +2095,8 @@ pub(crate) mod arm64 {
             }
         }
 
-        // Loop headers are verified once by the owning CodeBlock. Translate
-        // their logical PCs to cold byte PCs only for the legacy OSR lookup key.
-        let mut loop_headers: BTreeMap<u32, u32> = BTreeMap::new();
-        for &target_pc in code_block.loop_headers() {
-            let byte_pc = view.instructions[target_pc as usize].byte_pc;
-            loop_headers.insert(byte_pc, target_pc);
-        }
+        // Loop headers are verified once by the owning CodeBlock.
+        let loop_headers = code_block.loop_headers();
 
         // Incoming register state is unknown at every verified block entry.
         let block_starts = code_block.block_starts();
@@ -2167,11 +2166,11 @@ pub(crate) mod arm64 {
             if enable_fres && block_starts.binary_search(&instruction_pc).is_ok() {
                 fres.clear();
             }
-            // Stamp this op's byte-PC into the context so any bail (guard
+            // Stamp this op's logical PC into the context so any bail (guard
             // failure or unsupported opcode) resumes the interpreter at the
             // exact instruction, preserving committed side effects.
-            emit_load_u64(&mut ops, 9, u64::from(instr.byte_pc));
-            dynasm!(ops ; .arch aarch64 ; str w9, [x20, BAIL_PC_OFFSET]);
+            emit_load_u64(&mut ops, 9, u64::from(instruction_pc));
+            dynasm!(ops ; .arch aarch64 ; str w9, [x20, RESUME_PC_OFFSET]);
             let ops_ref = instr.operand_view(code_block);
             match instr.op(code_block) {
                 Op::LoadInt32 => {
@@ -3288,12 +3287,12 @@ pub(crate) mod arm64 {
         // (set up x19/x20 from the ctx arg) then branches to the header's body
         // label, so the VM can re-enter mid-loop with the live frame registers.
         let mut osr_entries: BTreeMap<u32, usize> = BTreeMap::new();
-        for (&pc, &instruction_pc) in &loop_headers {
+        for &instruction_pc in loop_headers {
             let off = ops.offset().0;
             emit_prologue(&mut ops);
             let tgt = labels[&instruction_pc];
             dynasm!(ops ; .arch aarch64 ; b =>tgt);
-            osr_entries.insert(pc, off);
+            osr_entries.insert(instruction_pc, off);
         }
 
         safepoint_records.sort_by_key(|record| record.id);
@@ -3796,10 +3795,10 @@ pub(crate) mod arm64 {
     /// Emit one op of an inlined callee body. The frame-register base `x19`
     /// already points at the callee scratch window, so `load_reg`/`store_reg`
     /// address callee registers. Bails route to `bail` (the site's scratch-aware
-    /// bail) without restamping `bail_pc`, so a bail re-runs the whole call in
+    /// bail) without restamping `resume_pc`, so a bail re-runs the whole call in
     /// the interpreter. `Return*` leaves the result in `x9` and branches to
     /// `inline_done`. Internal branches resolve through `clabels` (one private
-    /// label per callee byte-PC).
+    /// label per callee logical PC).
     fn emit_inline_pure_op(
         ops: &mut Assembler,
         code_block: &otter_vm::CodeBlock,
@@ -4017,7 +4016,7 @@ pub(crate) mod arm64 {
     /// native-stack scratch window the frame-register base `x19` is repointed at;
     /// `x19` (from the ctx) and `sp` are restored on every exit, including the
     /// bail path. Because the body has no GC point and commits nothing
-    /// observable before a possible bail — and never restamps `bail_pc` — a guard
+    /// observable before a possible bail — and never restamps `resume_pc` — a guard
     /// or body bail re-runs the whole call in the interpreter, idempotently.
     fn try_emit_inline_call(
         ops: &mut Assembler,
@@ -4058,7 +4057,7 @@ pub(crate) mod arm64 {
             return Ok(false);
         }
 
-        // One private label per callee byte-PC for internal branches.
+        // One private label per callee logical PC for internal branches.
         let mut clabels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
         for i in &callee.instructions {
             clabels.insert(
@@ -4813,7 +4812,7 @@ pub(crate) mod arm64 {
         // Build the callee `JitCtx` on the native stack and re-enter `self_entry`.
         // regs = window; self_closure / upvalues / vm / stack / context /
         // frame_index / error / reg-stack pointers copy from the caller ctx
-        // (self-recursion shares them); this = undefined; bail_pc = 0.
+        // (self-recursion shares them); this = undefined; resume_pc = 0.
         dynasm!(ops
             ; .arch aarch64
             ; sub sp, sp, JIT_CTX_STACK_SIZE
@@ -4821,7 +4820,7 @@ pub(crate) mod arm64 {
             ; ldr x9, [x20, #8] ; str x9, [sp, #8]
         );
         emit_load_u64(ops, 9, undef_bits);
-        dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, BAIL_PC_OFFSET]);
+        dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, RESUME_PC_OFFSET]);
         emit_copy_shared_execution_context(ops);
         for off in [FRAME_INDEX_OFFSET, UPVALUES_PTR_OFFSET] {
             dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
@@ -4875,7 +4874,7 @@ pub(crate) mod arm64 {
         dynasm!(ops
             ; .arch aarch64
             ; =>bailed
-            ; ldr w2, [sp, BAIL_PC_OFFSET]
+        ; ldr w2, [sp, RESUME_PC_OFFSET]
             ; add sp, sp, JIT_CTX_STACK_SIZE
             ; mov x0, x20
             ; mov w1, w2
@@ -5129,7 +5128,7 @@ pub(crate) mod arm64 {
             ; str x9, [sp, #8]
             ; ldr x9, [x19, recv_off]
             ; str x9, [sp, #16]
-            ; str wzr, [sp, BAIL_PC_OFFSET]
+        ; str wzr, [sp, RESUME_PC_OFFSET]
         );
         emit_copy_shared_execution_context(ops);
         dynasm!(ops
@@ -5189,7 +5188,7 @@ pub(crate) mod arm64 {
             ; b =>threw
 
             ; =>bailed
-            ; ldr w1, [sp, BAIL_PC_OFFSET]
+        ; ldr w1, [sp, RESUME_PC_OFFSET]
             ; add sp, sp, JIT_CTX_STACK_SIZE
             ; ldr x2, [sp, #8]
             ; ldr x3, [sp, #16]
@@ -5267,7 +5266,7 @@ pub(crate) mod arm64 {
             ; str x9, [sp, #8]
             ; ldr x9, [x20, DIRECT_THIS_OFFSET]
             ; str x9, [sp, #16]
-            ; str wzr, [sp, BAIL_PC_OFFSET]
+        ; str wzr, [sp, RESUME_PC_OFFSET]
             ; ldr x9, [x20, THREAD_OFFSET]
             ; str x9, [sp, THREAD_OFFSET]
             ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
@@ -5347,7 +5346,7 @@ pub(crate) mod arm64 {
         dynasm!(ops
             ; .arch aarch64
             ; =>direct_bailed
-            ; ldr w9, [sp, BAIL_PC_OFFSET]
+        ; ldr w9, [sp, RESUME_PC_OFFSET]
             ; str w9, [sp, DIRECT_ENTRY_OFFSET]
             ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
             ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
@@ -7311,7 +7310,7 @@ mod tests {
             native_frame: std::ptr::null_mut(),
             frame_index: 0,
             upvalues_ptr: 0,
-            bail_pc: 0,
+            resume_pc: 0,
             error: &mut error,
             direct_entry_addr: 0,
             direct_regs: std::ptr::null_mut(),

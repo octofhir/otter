@@ -15,8 +15,8 @@
 //!
 //! # Invariants
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
-//! - Each `CodeBlockInstruction` retains `byte_pc` and `byte_len` only for serialized
-//!   metadata, source maps, profiling, and native bailout/OSR records.
+//! - Serialized byte coordinates live only in the CodeBlock's cold metadata;
+//!   hot instruction records carry the canonical logical instruction PC.
 //! - Cold byte-PC lookup binary-searches instruction metadata; no dense reverse
 //!   map is retained in the execution object.
 //! - Operand payloads are untagged 32-bit words. Their kinds come exclusively
@@ -290,7 +290,7 @@ impl CodeBlock {
             .map(|instr| {
                 Arc::new(CodeBlockInstruction::from_operands(
                     instr.op,
-                    instr.operands.clone(),
+                    &instr.operands,
                     id,
                     instr.instruction_pc,
                     NO_PROPERTY_IC_SITE,
@@ -682,7 +682,7 @@ impl CodeBlock {
                 };
                 Arc::new(CodeBlockInstruction::from_operands(
                     instr.op,
-                    instr.operands.as_slice().to_vec(),
+                    instr.operands.as_slice(),
                     function.id,
                     idx as u32,
                     property_ic_site,
@@ -834,7 +834,7 @@ pub struct CodeBlockInstruction {
 impl CodeBlockInstruction {
     pub(crate) fn from_operands(
         op: Op,
-        operands: Vec<Operand>,
+        operands: &[Operand],
         code_block_id: u32,
         instruction_pc: u32,
         property_ic_site: u32,
@@ -842,18 +842,21 @@ impl CodeBlockInstruction {
     ) -> Self {
         let operand_count =
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
-        let operand_words: Vec<u32> = operands
-            .into_iter()
-            .map(otter_bytecode::opcode_schema::encode_operand_word)
-            .collect();
         let mut inline_operand_words = [0; INLINE_OPERAND_CAPACITY];
-        let overflow_operand_offset = if operand_words.len() <= INLINE_OPERAND_CAPACITY {
-            inline_operand_words[..operand_words.len()].copy_from_slice(&operand_words);
+        let overflow_operand_offset = if operands.len() <= INLINE_OPERAND_CAPACITY {
+            for (slot, operand) in inline_operand_words.iter_mut().zip(operands) {
+                *slot = otter_bytecode::opcode_schema::encode_operand_word(*operand);
+            }
             NO_OVERFLOW_OPERANDS
         } else {
             let offset = u32::try_from(overflow_operand_words.len())
                 .expect("operand overflow table exceeds u32");
-            overflow_operand_words.extend_from_slice(&operand_words);
+            overflow_operand_words.extend(
+                operands
+                    .iter()
+                    .copied()
+                    .map(otter_bytecode::opcode_schema::encode_operand_word),
+            );
             offset
         };
         Self {

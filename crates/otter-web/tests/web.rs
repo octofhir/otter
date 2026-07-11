@@ -95,6 +95,44 @@ fn native_host_instances_link_class_prototype() {
 }
 
 #[test]
+fn subtle_crypto_hmac_aes_gcm_and_pbkdf2() {
+    let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
+    let result = eval_string(
+        &mut runtime,
+        r#"
+        globalThis.out = "pending";
+        (async () => {
+          const enc = new TextEncoder();
+          const data = enc.encode("message");
+          // HMAC sign / verify + raw export round-trip.
+          const key = await crypto.subtle.importKey(
+            "raw", enc.encode("secret"), { name: "HMAC", hash: "SHA-256" }, true, ["sign", "verify"]);
+          const sig = await crypto.subtle.sign("HMAC", key, data);
+          const good = await crypto.subtle.verify("HMAC", key, sig, data);
+          const bad = await crypto.subtle.verify("HMAC", key, sig, enc.encode("tampered"));
+          const exported = new Uint8Array(await crypto.subtle.exportKey("raw", key));
+          const hmac = sig.byteLength + ":" + good + ":" + bad + ":" + new TextDecoder().decode(exported);
+          // AES-GCM encrypt / decrypt round-trip.
+          const aes = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+          const iv = crypto.getRandomValues(new Uint8Array(12));
+          const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aes, data);
+          const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aes, ct);
+          const aesOut = (ct.byteLength > data.byteLength) + ":" + new TextDecoder().decode(pt);
+          // PBKDF2 deriveBits.
+          const base = await crypto.subtle.importKey("raw", enc.encode("password"), "PBKDF2", false, ["deriveBits"]);
+          const bits = await crypto.subtle.deriveBits(
+            { name: "PBKDF2", hash: "SHA-256", salt: new Uint8Array([1,2,3,4]), iterations: 1000 }, base, 256);
+          globalThis.out = hmac + "|" + aesOut + "|" + bits.byteLength;
+        })().catch((e) => { globalThis.out = "ERR:" + e.name + ":" + e.message; });
+        "pending"
+        "#,
+    );
+    assert_eq!(result, "pending");
+    let after = eval_string(&mut runtime, "out");
+    assert_eq!(after, "32:true:false:secret|true:message|32");
+}
+
+#[test]
 fn byte_stream_serves_default_and_byob_reads() {
     let mut runtime = Runtime::builder().with_web_apis().build().unwrap();
     let result = eval_string(
@@ -586,11 +624,10 @@ const WINTERTC_LEDGER_JS: &str = r#"
       "URLPattern",
       "fetch",
       "structuredClone",
-    ];
-    const PARTIAL = [
       "crypto.subtle",
       "crypto.subtle.digest",
     ];
+    const PARTIAL = [];
     // Omitted by design per ECMA-429 §6: Otter's global object is not a
     // Window/Worker EventTarget, so the global event-handler IDL attributes are
     // not exposed. The documented alternative reporting mechanism is
@@ -687,13 +724,8 @@ fn wintertc_partial_entries_document_their_gap() {
             "{WINTERTC_LEDGER_JS}\n{}",
             r#"
         // Each smoke check returns true while the documented gap is still open.
-        const GAPS = {
-          // Only digest is wired on SubtleCrypto; keys/sign/encrypt are absent.
-          "crypto.subtle": () => typeof crypto.subtle.encrypt === "undefined"
-            && typeof crypto.subtle.importKey === "undefined",
-          "crypto.subtle.digest": () => typeof crypto.subtle.digest === "function"
-            && typeof crypto.subtle.sign === "undefined",
-        };
+        // Empty: every WinterTC path is now SUPPORTED, OMITTED, or NOT_YET.
+        const GAPS = {};
         const problems = [];
         for (const name of PARTIAL) {
           const check = GAPS[name];

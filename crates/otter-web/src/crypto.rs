@@ -27,6 +27,9 @@
 
 use std::fmt::Write as _;
 
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+use hmac::{Hmac, Mac};
 use otter_macros::js_namespace;
 use otter_runtime::marshal::{ArrayBuffer, BufferSource, JsError};
 use otter_runtime::{
@@ -35,6 +38,93 @@ use otter_runtime::{
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
+
+/// HMAC over the named hash, returning the MAC bytes.
+fn hmac_sign(hash: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, JsError> {
+    macro_rules! run {
+        ($hash:ty) => {{
+            let mut mac = <Hmac<$hash> as Mac>::new_from_slice(key)
+                .expect("HMAC accepts a key of any length");
+            mac.update(data);
+            mac.finalize().into_bytes().to_vec()
+        }};
+    }
+    Ok(match hash {
+        "SHA-1" => run!(Sha1),
+        "SHA-256" => run!(Sha256),
+        "SHA-384" => run!(Sha384),
+        "SHA-512" => run!(Sha512),
+        other => return Err(JsError::Type(format!("unsupported HMAC hash '{other}'"))),
+    })
+}
+
+/// PBKDF2 with the named HMAC hash → `bytes` bytes of derived material.
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    bytes: usize,
+) -> Result<Vec<u8>, JsError> {
+    let mut out = vec![0u8; bytes];
+    let ok = match hash {
+        "SHA-1" => pbkdf2::pbkdf2::<Hmac<Sha1>>(password, salt, iterations, &mut out),
+        "SHA-256" => pbkdf2::pbkdf2::<Hmac<Sha256>>(password, salt, iterations, &mut out),
+        "SHA-384" => pbkdf2::pbkdf2::<Hmac<Sha384>>(password, salt, iterations, &mut out),
+        "SHA-512" => pbkdf2::pbkdf2::<Hmac<Sha512>>(password, salt, iterations, &mut out),
+        other => return Err(JsError::Type(format!("unsupported PBKDF2 hash '{other}'"))),
+    };
+    ok.map_err(|_| JsError::Type("PBKDF2: invalid output length".to_string()))?;
+    Ok(out)
+}
+
+/// AES-GCM encrypt/decrypt. `key` is 16 or 32 bytes (AES-128/256); `iv` is the
+/// 12-byte nonce. Decrypt returns an error on tag mismatch.
+fn aes_gcm(
+    encrypt: bool,
+    key: &[u8],
+    iv: &[u8],
+    aad: &[u8],
+    input: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    if iv.len() != 12 {
+        return Err(JsError::Type(
+            "AES-GCM: the iv must be 12 bytes".to_string(),
+        ));
+    }
+    let nonce = Nonce::from_slice(iv);
+    let payload = Payload { msg: input, aad };
+    let run = |result: Result<Vec<u8>, aes_gcm::Error>| {
+        result.map_err(|_| {
+            JsError::Type(if encrypt {
+                "AES-GCM encryption failed".to_string()
+            } else {
+                "AES-GCM decryption failed (bad tag or key)".to_string()
+            })
+        })
+    };
+    match key.len() {
+        16 => {
+            let cipher = Aes128Gcm::new_from_slice(key).expect("16-byte key");
+            run(if encrypt {
+                cipher.encrypt(nonce, payload)
+            } else {
+                cipher.decrypt(nonce, payload)
+            })
+        }
+        32 => {
+            let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+            run(if encrypt {
+                cipher.encrypt(nonce, payload)
+            } else {
+                cipher.decrypt(nonce, payload)
+            })
+        }
+        len => Err(JsError::Type(format!(
+            "AES-GCM: key must be 16 or 32 bytes, got {len}"
+        ))),
+    }
+}
 
 /// Marker type for the `crypto` namespace declaration.
 pub struct WebCrypto;
@@ -119,5 +209,67 @@ impl WebCrypto {
             }
         };
         Ok(ArrayBuffer(hash))
+    }
+
+    /// HMAC sign: MAC of `data` under `key` with the named hash. Consumed and
+    /// deleted by the glue, which owns algorithm normalization and verify.
+    #[method(name = "__hmacSign")]
+    fn native_hmac_sign(
+        hash: String,
+        key: BufferSource,
+        data: BufferSource,
+    ) -> Result<ArrayBuffer, JsError> {
+        hmac_sign(&hash, key.as_ref(), data.as_ref()).map(ArrayBuffer)
+    }
+
+    /// PBKDF2 derive `bytes` bytes of key material. `iterations`/`bytes` arrive
+    /// as `f64` (the glue validates positive integers).
+    #[method(name = "__pbkdf2")]
+    fn native_pbkdf2(
+        hash: String,
+        password: BufferSource,
+        salt: BufferSource,
+        iterations: f64,
+        bytes: f64,
+    ) -> Result<ArrayBuffer, JsError> {
+        pbkdf2_derive(
+            &hash,
+            password.as_ref(),
+            salt.as_ref(),
+            iterations as u32,
+            bytes as usize,
+        )
+        .map(ArrayBuffer)
+    }
+
+    /// AES-GCM encrypt: `data` under `key` with 12-byte `iv` and optional
+    /// additional `aad`, returning ciphertext with the appended tag.
+    #[method(name = "__aesGcmEncrypt")]
+    fn native_aes_gcm_encrypt(
+        key: BufferSource,
+        iv: BufferSource,
+        aad: BufferSource,
+        data: BufferSource,
+    ) -> Result<ArrayBuffer, JsError> {
+        aes_gcm(true, key.as_ref(), iv.as_ref(), aad.as_ref(), data.as_ref()).map(ArrayBuffer)
+    }
+
+    /// AES-GCM decrypt: the inverse of [`Self::native_aes_gcm_encrypt`]; errors
+    /// on tag mismatch.
+    #[method(name = "__aesGcmDecrypt")]
+    fn native_aes_gcm_decrypt(
+        key: BufferSource,
+        iv: BufferSource,
+        aad: BufferSource,
+        data: BufferSource,
+    ) -> Result<ArrayBuffer, JsError> {
+        aes_gcm(
+            false,
+            key.as_ref(),
+            iv.as_ref(),
+            aad.as_ref(),
+            data.as_ref(),
+        )
+        .map(ArrayBuffer)
     }
 }

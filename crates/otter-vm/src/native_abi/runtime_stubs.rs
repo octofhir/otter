@@ -17,7 +17,7 @@
 //! - [`crate::runtime_stubs`] for semantic entrypoints.
 //! - [`super::safepoints`] for root maps.
 
-use super::{NO_SAFEPOINT, RUNTIME_STUB_TABLE_VERSION, SafepointId, SafepointRecord};
+use super::{NO_SAFEPOINT, NativeFrame, RUNTIME_STUB_TABLE_VERSION, SafepointId, VmThread};
 
 /// Descriptor argument count for variadic call shapes.
 pub const VARIADIC_STUB_ARGUMENTS: u8 = u8::MAX;
@@ -232,32 +232,24 @@ impl RuntimeStubTable {
     }
 }
 
-/// VM-native allocation/rooting packet used by current allocating entries.
+/// VM-native allocation/rooting packet used by allocating entries.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeStubAllocContext {
-    /// Erased current interpreter address during migration.
-    pub vm: *mut std::ffi::c_void,
-    /// Erased current JIT frame-stack address during migration.
-    pub stack: *mut std::ffi::c_void,
-    /// Erased execution-context address during migration.
-    pub context: *const std::ffi::c_void,
-    /// Base of expanded safepoint records during migration.
-    pub safepoint_records: *const SafepointRecord,
-    /// Number of records at `safepoint_records`.
-    pub safepoint_count: u32,
-    /// Reserved; zero.
+    /// Active VM thread record.
+    pub thread: *mut VmThread,
+    /// Published activation containing the tagged frame window.
+    pub frame: *mut NativeFrame,
+    /// Installed code-object identity.
+    pub code_object_id: u64,
+    /// Dense safepoint id within the code object.
+    pub safepoint_id: SafepointId,
+    /// Reserved; zero in layout version 2.
     pub reserved0: u32,
-    /// Current frame index within `stack`.
-    pub frame_index: usize,
-    /// Base of current frame tagged slots.
-    pub frame_slots: *mut u64,
-    /// Number of tagged frame slots.
-    pub frame_slot_count: u16,
     /// Number of native spill slots.
     pub spill_slot_count: u16,
-    /// Reserved; zero.
-    pub reserved1: u32,
+    /// Reserved; zero in layout version 2.
+    pub reserved1: u16,
     /// Base of tagged native spill slots.
     pub spill_slots: *mut u64,
 }
@@ -265,27 +257,18 @@ pub struct RuntimeStubAllocContext {
 impl RuntimeStubAllocContext {
     /// Build an allocating call packet.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub const fn new(
-        vm: *mut std::ffi::c_void,
-        stack: *mut std::ffi::c_void,
-        context: *const std::ffi::c_void,
-        safepoint_records: *const SafepointRecord,
-        safepoint_count: u32,
-        frame_index: usize,
-        frame_slots: *mut u64,
-        frame_slot_count: u16,
+        thread: *mut VmThread,
+        frame: *mut NativeFrame,
+        code_object_id: u64,
+        safepoint_id: SafepointId,
     ) -> Self {
         Self {
-            vm,
-            stack,
-            context,
-            safepoint_records,
-            safepoint_count,
+            thread,
+            frame,
+            code_object_id,
+            safepoint_id,
             reserved0: 0,
-            frame_index,
-            frame_slots,
-            frame_slot_count,
             spill_slot_count: 0,
             reserved1: 0,
             spill_slots: std::ptr::null_mut(),
@@ -303,7 +286,12 @@ impl RuntimeStubAllocContext {
     /// Whether a frame-slot window is present.
     #[must_use]
     pub const fn has_frame_slots(self) -> bool {
-        !self.frame_slots.is_null() && self.frame_slot_count != 0
+        if self.frame.is_null() {
+            return false;
+        }
+        // SAFETY: callers uphold the live published-frame contract.
+        let frame = unsafe { &*self.frame };
+        frame.register_base != 0 && frame.header.register_count != 0
     }
 
     /// Whether a spill-slot window is present.
@@ -312,10 +300,10 @@ impl RuntimeStubAllocContext {
         !self.spill_slots.is_null() && self.spill_slot_count != 0
     }
 
-    /// Whether expanded safepoint records are present.
+    /// Whether code-object/safepoint identity is publishable.
     #[must_use]
     pub const fn has_safepoint_records(self) -> bool {
-        !self.safepoint_records.is_null() && self.safepoint_count != 0
+        !self.thread.is_null() && self.code_object_id != 0 && self.safepoint_id != NO_SAFEPOINT
     }
 }
 
@@ -563,6 +551,9 @@ const _: [(); 8] = [(); std::mem::align_of::<RuntimeStubTable>()];
 const _: [(); 0] = [(); std::mem::offset_of!(RuntimeStubDescriptor, id)];
 const _: [(); 12] = [(); std::mem::offset_of!(RuntimeStubDescriptor, effects)];
 const _: [(); 16] = [(); std::mem::offset_of!(RuntimeStubTable, count)];
+const _: [(); 48] = [(); std::mem::size_of::<RuntimeStubAllocContext>()];
+const _: [(); 16] = [(); std::mem::offset_of!(RuntimeStubAllocContext, code_object_id)];
+const _: [(); 24] = [(); std::mem::offset_of!(RuntimeStubAllocContext, safepoint_id)];
 
 #[cfg(test)]
 mod tests {

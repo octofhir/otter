@@ -24,12 +24,13 @@
 //! - [`crate::method_ops`]
 
 use crate::native_abi::{
-    NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId, RuntimeStubResult,
-    RuntimeStubResultPair, STUB_COLLECTION_MAP_DELETE_ALLOC, STUB_COLLECTION_MAP_GET_ALLOC,
-    STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC, STUB_COLLECTION_MAP_HAS_LEAF,
-    STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC, STUB_COLLECTION_SET_DELETE_ALLOC,
-    STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF, STUB_STRING_CONCAT_ALLOC,
-    SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
+    CodeRegistryView, NO_SAFEPOINT, RuntimeStubAllocContext, RuntimeStubDescriptor, RuntimeStubId,
+    RuntimeStubResult, RuntimeStubResultPair, STUB_COLLECTION_MAP_DELETE_ALLOC,
+    STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
+    STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
+    STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
+    STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord, TaggedLocationKind,
+    validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -181,43 +182,36 @@ pub enum AllocSafepointRootError {
     },
 }
 
-/// Resolve an allocating-stub safepoint id through the context packet table.
+/// Resolve an allocating-stub safepoint through the active code registry.
 ///
 /// # Safety
 ///
-/// `ctx.safepoint_records` must point at `ctx.safepoint_count` initialized
-/// [`SafepointRecord`] values that remain alive for the duration of the
-/// allocating stub call.
+/// The thread, code-registry view, resolver context, and returned record must
+/// remain alive for the duration of the allocating stub call.
 pub unsafe fn alloc_safepoint_record(
     ctx: &RuntimeStubAllocContext,
     safepoint: SafepointId,
 ) -> Result<&SafepointRecord, AllocSafepointRootError> {
-    if safepoint == NO_SAFEPOINT {
+    if safepoint == NO_SAFEPOINT || safepoint != ctx.safepoint_id {
         return Err(AllocSafepointRootError::NoSafepoint);
     }
     if !ctx.has_safepoint_records() {
         return Err(AllocSafepointRootError::MissingSafepointRecords);
     }
-    // SAFETY: guaranteed by the caller; generated code builds this pointer
-    // from the active function metadata and the stub must not retain it.
-    let records =
-        unsafe { std::slice::from_raw_parts(ctx.safepoint_records, ctx.safepoint_count as usize) };
-    // Both tiers emit the record table sorted by id. Most functions carry only a
-    // handful of allocating-call safepoints, where a linear scan beats a binary
-    // search's setup; a large table (many allocating calls) binary-searches.
-    debug_assert!(
-        records.windows(2).all(|w| w[0].id <= w[1].id),
-        "safepoint records must be sorted by id",
-    );
-    let found = if records.len() <= 16 {
-        records.iter().find(|record| record.id == safepoint)
-    } else {
-        records
-            .binary_search_by_key(&safepoint, |record| record.id)
-            .ok()
-            .map(|index| &records[index])
+    // SAFETY: guaranteed by the caller's published-thread contract.
+    let thread = unsafe { &*ctx.thread };
+    if thread.code_registry == 0 {
+        return Err(AllocSafepointRootError::MissingSafepointRecords);
+    }
+    // SAFETY: the thread publishes a live CodeRegistryView for this entry.
+    let registry = unsafe { *(thread.code_registry as *const CodeRegistryView) };
+    // SAFETY: the registry publisher retains its resolver and records for the
+    // native entry's dynamic extent.
+    let Some(record) = (unsafe { registry.resolve(ctx.code_object_id, safepoint) }) else {
+        return Err(AllocSafepointRootError::UnknownSafepoint { id: safepoint });
     };
-    found.ok_or(AllocSafepointRootError::UnknownSafepoint { id: safepoint })
+    // SAFETY: resolver contract above.
+    Ok(unsafe { &*record })
 }
 
 /// Validate that `safepoint` can be published from `ctx`'s frame-slot window.
@@ -236,13 +230,16 @@ pub fn validate_alloc_safepoint_frame_roots(
     if !ctx.has_frame_slots() {
         return Err(AllocSafepointRootError::MissingFrameSlots);
     }
+    // SAFETY: `has_frame_slots` verified the published frame pointer/window.
+    let frame = unsafe { &*ctx.frame };
+    let frame_slot_count = frame.header.register_count;
     for location in &safepoint.tagged_locations {
         match location.kind {
             TaggedLocationKind::FrameSlot => {
-                if location.index >= ctx.frame_slot_count {
+                if location.index >= frame_slot_count {
                     return Err(AllocSafepointRootError::FrameSlotOutOfBounds {
                         index: location.index,
-                        frame_slot_count: ctx.frame_slot_count,
+                        frame_slot_count,
                     });
                 }
             }
@@ -284,10 +281,8 @@ impl<'a> AllocSafepointFrameRoots<'a> {
     ///
     /// # Safety
     ///
-    /// `ctx.frame_slots` must point at `ctx.frame_slot_count` live, writable
-    /// `Value` ABI slots for the duration of any heap registration created from
-    /// this value. The slots must remain pinned in memory while a GC may trace
-    /// and update them.
+    /// `ctx.frame` must publish a live, writable tagged register window for the
+    /// duration of any heap registration created from this value.
     pub unsafe fn new(
         ctx: &'a RuntimeStubAllocContext,
         safepoint: &'a SafepointRecord,
@@ -311,6 +306,8 @@ impl<'a> AllocSafepointFrameRoots<'a> {
 impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         for location in &self.safepoint.tagged_locations {
+            // SAFETY: construction validated a live published frame.
+            let frame = unsafe { &*self.ctx.frame };
             // SAFETY: construction validated every location's storage class and
             // bounds and requires callers to keep the writable frame and spill
             // windows alive while this root source is registered. A moving
@@ -319,8 +316,8 @@ impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
             // area is updated exactly like one held in the interpreter window.
             let base = match location.kind {
                 TaggedLocationKind::FrameSlot => {
-                    debug_assert!(location.index < self.ctx.frame_slot_count);
-                    self.ctx.frame_slots
+                    debug_assert!(location.index < frame.header.register_count);
+                    frame.register_base as *mut u64
                 }
                 TaggedLocationKind::SpillSlot => {
                     debug_assert!(location.index < self.ctx.spill_slot_count);
@@ -542,7 +539,7 @@ fn alloc_value_stub_result_pair(
     result: RuntimeStubResult,
 ) -> RuntimeStubResultPair {
     if let Some(ctx) = alloc_context_mut(ctx)
-        && let Some(interp) = interpreter_mut(ctx.vm)
+        && let Some(interp) = alloc_interpreter_mut(ctx)
     {
         interp.record_jit_alloc_value_stub_status(result.status);
     }
@@ -756,7 +753,7 @@ fn collection_map_set_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -805,7 +802,7 @@ fn collection_set_add_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -853,7 +850,7 @@ fn collection_map_get_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -900,7 +897,7 @@ fn collection_map_has_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -949,7 +946,7 @@ fn collection_set_has_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -998,7 +995,7 @@ fn collection_map_delete_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -1047,7 +1044,7 @@ fn collection_set_delete_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
@@ -1096,7 +1093,7 @@ fn string_concat_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
-    let Some(interp) = interpreter_mut(ctx.vm) else {
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
         return RuntimeStubResult::miss();
     };
     // One-allocation fast path for `<short flat latin1 string> + <int32>` and
@@ -1188,6 +1185,21 @@ fn interpreter_mut(vm: *mut std::ffi::c_void) -> Option<&'static mut Interpreter
     Some(unsafe { &mut *(vm as *mut Interpreter) })
 }
 
+fn alloc_interpreter_mut(ctx: &RuntimeStubAllocContext) -> Option<&'static mut Interpreter> {
+    if ctx.thread.is_null() {
+        return None;
+    }
+    // SAFETY: allocating stubs execute synchronously while the JIT entry keeps
+    // both the VmThread and its VM-owned reentry record live.
+    let thread = unsafe { &*ctx.thread };
+    if thread.runtime_context == 0 {
+        return None;
+    }
+    // SAFETY: `runtime_context` is published from a live JitReentryPtrs value.
+    let reentry = unsafe { &*(thread.runtime_context as *const crate::jit::JitReentryPtrs) };
+    interpreter_mut(reentry.vm.cast())
+}
+
 unsafe fn alloc_value_stub_call_roots<'a>(
     ctx: &'a RuntimeStubAllocContext,
     safepoint: SafepointId,
@@ -1209,7 +1221,8 @@ fn leaf_key_is_materialized(heap: &otter_gc::GcHeap, key: Value) -> bool {
 mod tests {
     use super::*;
     use crate::native_abi::{
-        NO_FRAME_STATE, RuntimeStubStatus, TaggedLocation, TaggedLocationKind,
+        NO_FRAME_STATE, NativeFrame, NativeFrameFlags, NativeFrameHeader, NativeFrameKind,
+        RuntimeStubStatus, TaggedLocation, TaggedLocationKind, VmThread,
     };
     use otter_gc::ExtraRootSource;
 
@@ -1220,6 +1233,80 @@ mod tests {
     fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
         let mut no_roots = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
         Value::object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
+    }
+
+    #[repr(C)]
+    struct TestSafepoints {
+        records: *const SafepointRecord,
+        count: u32,
+    }
+
+    unsafe extern "C" fn resolve_test_safepoint(
+        context: u64,
+        code_object_id: u64,
+        safepoint_id: SafepointId,
+    ) -> *const SafepointRecord {
+        if context == 0 || code_object_id != 1 {
+            return std::ptr::null();
+        }
+        // SAFETY: test_alloc_context leaks this bounded fixture for the test process.
+        let active = unsafe { &*(context as *const TestSafepoints) };
+        let records = unsafe { std::slice::from_raw_parts(active.records, active.count as usize) };
+        records
+            .iter()
+            .find(|record| record.id == safepoint_id)
+            .map_or(std::ptr::null(), std::ptr::from_ref)
+    }
+
+    fn test_alloc_context(
+        vm: *mut Interpreter,
+        slots: &mut [u64],
+        records: &[SafepointRecord],
+        safepoint_id: SafepointId,
+    ) -> RuntimeStubAllocContext {
+        let records: &'static [SafepointRecord] = Box::leak(records.to_vec().into_boxed_slice());
+        let active = Box::leak(Box::new(TestSafepoints {
+            records: records.as_ptr(),
+            count: records.len() as u32,
+        }));
+        let registry = Box::leak(Box::new(CodeRegistryView {
+            context: std::ptr::from_ref(active) as u64,
+            resolve_safepoint: resolve_test_safepoint as *const () as u64,
+        }));
+        let reentry = Box::leak(Box::new(crate::jit::JitReentryPtrs {
+            vm,
+            stack: std::ptr::null_mut(),
+            context: std::ptr::null(),
+            frame_index: 0,
+        }));
+        let frame = Box::leak(Box::new(NativeFrame {
+            header: NativeFrameHeader {
+                previous_frame: 0,
+                function_id: 0,
+                code_block_id: 0,
+                resume_pc: 0,
+                kind: NativeFrameKind::Baseline,
+                reserved0: [0; 3],
+                flags: NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS),
+                register_count: slots.len() as u16,
+                argument_count: 0,
+                feedback_id: 0,
+            },
+            register_base: slots.as_mut_ptr() as u64,
+            argument_base: 0,
+            feedback_base: 0,
+            code_object_id: 1,
+            this_value_bits: Value::undefined().to_abi_bits(),
+            new_target_bits: Value::undefined().to_abi_bits(),
+            return_register: u32::MAX,
+            cold_state_index: u32::MAX,
+        }));
+        let mut thread = VmThread::empty();
+        thread.current_frame = std::ptr::from_mut(frame) as u64;
+        thread.runtime_context = std::ptr::from_ref(reentry) as u64;
+        thread.code_registry = std::ptr::from_ref(registry) as u64;
+        let thread = Box::leak(Box::new(thread));
+        RuntimeStubAllocContext::new(thread, frame, 1, safepoint_id)
     }
 
     #[test]
@@ -1325,16 +1412,7 @@ mod tests {
             entry: Some(entry),
         };
         let mut slots = [Value::undefined().to_abi_bits()];
-        let mut ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let mut ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &[], 9);
         assert!(stub.has_entry());
         assert!(stub.entry_addr().is_some());
         let result = stub
@@ -1355,16 +1433,7 @@ mod tests {
             tagged_locations: vec![TaggedLocation::frame_slot(0), TaggedLocation::frame_slot(1)],
         };
         let safepoints = [safepoint.clone()];
-        let ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &safepoints, 12);
 
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&ctx, &safepoint),
@@ -1397,16 +1466,7 @@ mod tests {
         let safepoint = SafepointRecord::frame_slot_window(31, NO_FRAME_STATE, 1);
         let safepoints = [safepoint.clone()];
         let mut slots = [frame_value.to_abi_bits()];
-        let ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &safepoints, 31);
         // SAFETY: `slots` and `safepoints` remain alive while roots are used.
         let frame_roots = unsafe { AllocSafepointFrameRoots::new(&ctx, &safepoint) }.unwrap();
         let roots = AllocValueStubCallRoots::new(
@@ -1427,16 +1487,7 @@ mod tests {
     #[test]
     fn alloc_safepoint_frame_roots_reject_invalid_maps() {
         let mut slots = [Value::undefined().to_abi_bits()];
-        let ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-            0,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &[], 1);
         let no_safepoint = SafepointRecord {
             id: NO_SAFEPOINT,
             frame_state: NO_FRAME_STATE,
@@ -1450,20 +1501,11 @@ mod tests {
         // dereferenced.
         assert_eq!(
             unsafe { alloc_safepoint_record(&ctx, 1) },
-            Err(AllocSafepointRootError::MissingSafepointRecords)
+            Err(AllocSafepointRootError::UnknownSafepoint { id: 1 })
         );
 
         let safepoints = [SafepointRecord::frame_slot_window(7, NO_FRAME_STATE, 1)];
-        let table_ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let table_ctx = test_alloc_context(std::ptr::null_mut(), &mut slots, &safepoints, 9);
         // SAFETY: `safepoints` is alive for the lookup.
         assert_eq!(
             unsafe { alloc_safepoint_record(&table_ctx, NO_SAFEPOINT) },
@@ -1475,16 +1517,8 @@ mod tests {
             Err(AllocSafepointRootError::UnknownSafepoint { id: 9 })
         );
 
-        let missing_slots_ctx = RuntimeStubAllocContext::new(
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            std::ptr::null_mut(),
-            0,
-        );
+        let missing_slots_ctx =
+            RuntimeStubAllocContext::new(std::ptr::null_mut(), std::ptr::null_mut(), 1, 1);
         let valid_safepoint = SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1);
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&missing_slots_ctx, &valid_safepoint),
@@ -1525,16 +1559,7 @@ mod tests {
             Value::string(key).to_abi_bits(),
             n(99).to_abi_bits(),
         ];
-        let mut ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 21);
 
         let pair = COLLECTION_MAP_SET_ALLOC
             .invoke_raw(&mut ctx, 21, slots[0], slots[1], slots[2])
@@ -1559,16 +1584,7 @@ mod tests {
             Value::string(value).to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
-        let mut ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 22);
 
         let pair = COLLECTION_SET_ADD_ALLOC
             .invoke_raw(&mut ctx, 22, slots[0], slots[1], slots[2])
@@ -1593,16 +1609,7 @@ mod tests {
             n(7).to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
-        let mut ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 24);
 
         let pair = STRING_CONCAT_ALLOC
             .invoke_raw(&mut ctx, 24, slots[0], slots[1], slots[2])
@@ -1637,15 +1644,11 @@ mod tests {
             frame_state: NO_FRAME_STATE,
             tagged_locations: vec![TaggedLocation::spill_slot(0)],
         };
-        let ctx = RuntimeStubAllocContext::new(
+        let ctx = test_alloc_context(
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &record as *const SafepointRecord,
+            &mut frame,
+            std::slice::from_ref(&record),
             1,
-            0,
-            frame.as_mut_ptr(),
-            frame.len() as u16,
         )
         .with_spill_area(spill.as_mut_ptr(), spill.len() as u16);
 
@@ -1657,15 +1660,11 @@ mod tests {
 
         // A spill-slot location without a published spill window is rejected, and
         // a machine-register location remains unsupported (spilled first).
-        let no_spill = RuntimeStubAllocContext::new(
+        let no_spill = test_alloc_context(
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            &record as *const SafepointRecord,
+            &mut frame,
+            std::slice::from_ref(&record),
             1,
-            0,
-            frame.as_mut_ptr(),
-            frame.len() as u16,
         );
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&no_spill, &record),
@@ -1699,16 +1698,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let safepoints = [SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1)];
         let mut slots = [Value::undefined().to_abi_bits()];
-        let mut ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            slots.as_mut_ptr(),
-            slots.len() as u16,
-        );
+        let mut ctx = test_alloc_context(&mut interp, &mut slots, &safepoints, 1);
         let pair = collection_set_add_alloc(
             &mut ctx,
             99,
@@ -1815,16 +1805,8 @@ mod tests {
             Value::string(insert_rope).to_abi_bits(),
             n(77).to_abi_bits(),
         ];
-        let mut insert_map_ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            insert_map_slots.as_mut_ptr(),
-            insert_map_slots.len() as u16,
-        );
+        let mut insert_map_ctx =
+            test_alloc_context(&mut interp, &mut insert_map_slots, &safepoints, 23);
         let inserted = COLLECTION_MAP_SET_ALLOC
             .invoke_raw(
                 &mut insert_map_ctx,
@@ -1841,16 +1823,8 @@ mod tests {
             Value::string(insert_rope).to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
-        let mut insert_set_ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            insert_set_slots.as_mut_ptr(),
-            insert_set_slots.len() as u16,
-        );
+        let mut insert_set_ctx =
+            test_alloc_context(&mut interp, &mut insert_set_slots, &safepoints, 23);
         let inserted = COLLECTION_SET_ADD_ALLOC
             .invoke_raw(
                 &mut insert_set_ctx,
@@ -1874,16 +1848,7 @@ mod tests {
             Value::string(lookup_rope).to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
-        let mut map_ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            map_slots.as_mut_ptr(),
-            map_slots.len() as u16,
-        );
+        let mut map_ctx = test_alloc_context(&mut interp, &mut map_slots, &safepoints, 23);
         let get = COLLECTION_MAP_GET_ALLOC
             .invoke_raw(&mut map_ctx, 23, map_slots[0], map_slots[1], map_slots[2])
             .expect("map get entry");
@@ -1910,16 +1875,7 @@ mod tests {
             Value::string(lookup_rope).to_abi_bits(),
             Value::undefined().to_abi_bits(),
         ];
-        let mut set_ctx = RuntimeStubAllocContext::new(
-            (&mut interp as *mut Interpreter).cast(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            safepoints.as_ptr(),
-            safepoints.len() as u32,
-            0,
-            set_slots.as_mut_ptr(),
-            set_slots.len() as u16,
-        );
+        let mut set_ctx = test_alloc_context(&mut interp, &mut set_slots, &safepoints, 23);
         let has = COLLECTION_SET_HAS_ALLOC
             .invoke_raw(&mut set_ctx, 23, set_slots[0], set_slots[1], set_slots[2])
             .expect("set has entry");

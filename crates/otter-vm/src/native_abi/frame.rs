@@ -28,6 +28,8 @@ pub struct VmThread {
     pub runtime_context: u64,
     /// Address of the authoritative [`super::RuntimeStubTable`].
     pub runtime_stub_table: u64,
+    /// Address of the active [`super::CodeRegistryView`].
+    pub code_registry: u64,
     /// Address of the interrupt/budget cell.
     pub interrupt_cell: u64,
     /// Rooted pending exception as boxed `Value` bits, or zero when absent.
@@ -48,6 +50,7 @@ impl VmThread {
             current_frame: 0,
             runtime_context: 0,
             runtime_stub_table: 0,
+            code_registry: 0,
             interrupt_cell: 0,
             pending_exception_bits: 0,
             code_epoch: 0,
@@ -155,14 +158,14 @@ pub struct NativeFrame {
     pub cold_state_index: u32,
 }
 
-const _: [(); 56] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 64] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 40] = [(); std::mem::size_of::<NativeFrameHeader>()];
 const _: [(); 96] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
-const _: [(); 32] = [(); std::mem::offset_of!(VmThread, pending_exception_bits)];
-const _: [(); 48] = [(); std::mem::offset_of!(VmThread, layout_version)];
+const _: [(); 40] = [(); std::mem::offset_of!(VmThread, pending_exception_bits)];
+const _: [(); 56] = [(); std::mem::offset_of!(VmThread, layout_version)];
 const _: [(); 16] = [(); std::mem::offset_of!(NativeFrameHeader, resume_pc)];
 const _: [(); 24] = [(); std::mem::offset_of!(NativeFrameHeader, flags)];
 const _: [(); 32] = [(); std::mem::offset_of!(NativeFrameHeader, feedback_id)];

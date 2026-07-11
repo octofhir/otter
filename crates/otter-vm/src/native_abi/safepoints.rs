@@ -19,6 +19,46 @@
 
 use super::{FrameStateId, NO_FRAME_STATE, RuntimeStubId, SafepointId};
 
+/// Rust resolver behind a machine-visible [`CodeRegistryView`].
+pub type SafepointResolverFn = unsafe extern "C" fn(
+    context: u64,
+    code_object_id: u64,
+    safepoint_id: SafepointId,
+) -> *const SafepointRecord;
+
+/// Fixed code-registry lookup surface published on [`super::VmThread`].
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeRegistryView {
+    /// Opaque resolver-owned context address.
+    pub context: u64,
+    /// Address of a [`SafepointResolverFn`].
+    pub resolve_safepoint: u64,
+}
+
+impl CodeRegistryView {
+    /// Resolve one code-object-local safepoint record.
+    ///
+    /// # Safety
+    /// The resolver and context must remain live for the active native call.
+    #[must_use]
+    pub unsafe fn resolve(
+        self,
+        code_object_id: u64,
+        safepoint_id: SafepointId,
+    ) -> Option<*const SafepointRecord> {
+        if self.resolve_safepoint == 0 {
+            return None;
+        }
+        // SAFETY: guaranteed by the registry publisher.
+        let resolver: SafepointResolverFn = unsafe {
+            std::mem::transmute::<usize, SafepointResolverFn>(self.resolve_safepoint as usize)
+        };
+        let record = unsafe { resolver(self.context, code_object_id, safepoint_id) };
+        (!record.is_null()).then_some(record)
+    }
+}
+
 /// Storage class for one tagged value location at a safepoint.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +201,8 @@ impl SafepointRecord {
 }
 
 const _: [(); 4] = [(); std::mem::size_of::<TaggedLocation>()];
+const _: [(); 16] = [(); std::mem::size_of::<CodeRegistryView>()];
+const _: [(); 8] = [(); std::mem::align_of::<CodeRegistryView>()];
 const _: [(); 12] = [(); std::mem::size_of::<FrameMap>()];
 const _: [(); 12] = [(); std::mem::size_of::<SpillMap>()];
 const _: [(); 32] = [(); std::mem::size_of::<SafepointEntry>()];

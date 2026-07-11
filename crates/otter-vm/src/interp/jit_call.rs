@@ -242,9 +242,9 @@ impl Interpreter {
             return Ok(None);
         };
         let ptrs = jit::JitReentryPtrs {
-            vm: <*mut Interpreter>::cast(self),
-            stack: <*mut jit::JitFrameStack>::cast(stack),
-            context: <*const ExecutionContext>::cast(context),
+            vm: self,
+            stack,
+            context,
             frame_index: top_idx,
         };
         match code.osr_entry(ptrs, osr_pc) {
@@ -540,9 +540,9 @@ impl Interpreter {
         // of `run_entry`; the JIT does not retain them, and we do not touch
         // those borrows again until `run_entry` returns.
         let ptrs = jit::JitReentryPtrs {
-            vm: <*mut Interpreter>::cast(self),
-            stack: <*mut jit::JitFrameStack>::cast(stack),
-            context: <*const ExecutionContext>::cast(context),
+            vm: self,
+            stack,
+            context,
             frame_index: top_idx,
         };
         code.run_entry(ptrs)
@@ -575,12 +575,12 @@ impl Interpreter {
         function: &crate::executable::CodeBlock,
         code: &dyn jit::JitFunctionCode,
     ) -> Option<jit::JitDirectCallPlan> {
-        let (safepoint_records, safepoint_count) = code.safepoint_table();
+        if code.safepoint_count() != 0 {
+            return None;
+        }
         Some(jit::JitDirectCallPlan {
             function_id: function.id,
             entry_addr: code.entry_addr()?,
-            safepoint_records,
-            safepoint_count,
             param_count: function.param_count,
             register_count: function.register_count,
         })
@@ -731,8 +731,6 @@ impl Interpreter {
         Ok(jit::JitPreparedDirectCall {
             entry_addr: plan.entry_addr,
             regs: frame_desc.value_slots().as_mut_ptr().cast::<u64>(),
-            safepoint_records: plan.safepoint_records,
-            safepoint_count: plan.safepoint_count,
             self_closure: self_closure_bits,
             this_value: this_bits,
             frame_index: frame_desc.index(),
@@ -901,7 +899,7 @@ impl Interpreter {
         // body. A bare function has no spine constraint.
         let method_is_plain_function = method == Value::function(function_id);
         let asm_link_eligible = code.frameless_entry_safe()
-            && code.safepoint_table().1 == 0
+            && code.safepoint_count() == 0
             && (method_is_plain_function || frameless_upvalues_ok);
         // A closure method only caches at a monomorphic site. A polymorphic receiver
         // family (one `arr[i].run()` site over sibling classes) exposes no single

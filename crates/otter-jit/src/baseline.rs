@@ -823,9 +823,9 @@ extern "C" fn jit_load_prop_window_stub(
 
 /// Frameless `StoreProperty` miss handler — the [`jit_load_prop_window_stub`]
 /// counterpart. Resolves an existing-own-data store (with barrier) against
-/// `ctx.regs`; returns `0` on hit (cell self-patched), `2` when the store needs
-/// the full `[[Set]]` ladder (transition / accessor / reject → caller bails),
-/// `1` on throw.
+/// `ctx.regs` and runs ordinary data-property transitions from decoded values.
+/// Returns `0` when handled (self-patching the cell when eligible), `2` for
+/// accessor/exotic/non-object semantics, and `1` on throw.
 extern "C" fn jit_store_prop_window_stub(
     ctx: *mut JitCtx,
     obj: u64,

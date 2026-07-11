@@ -4,10 +4,13 @@
 //! - Hot functions whose constant tables differ from their caller.
 //! - Typed variadic JIT metadata for arrays, closures, and Math calls.
 //! - Frameless shared-context JIT-to-JIT method calls.
+//! - Store IC misses preserving inherited accessor semantics.
 //!
 //! # Invariants
 //! - JIT runtime bridges resolve string/property constants against the executing
 //!   function's chunk, not the caller or ambient module.
+//! - A shaped store cache never overrides the receiver's current `[[Set]]`
+//!   outcome.
 //!
 //! # See also
 //! - `otter_vm::global_ops`
@@ -130,6 +133,35 @@ fn hot_zero_arg_method_uses_rooted_frameless_register_window() {
             SourceInput::from_javascript(source),
             "<jit-frameless-method>",
         )
+        .expect("script")
+        .completion_string()
+        .to_string();
+    assert_eq!(completion, "ok");
+}
+
+#[test]
+fn hot_store_property_does_not_bypass_inherited_setter() {
+    let source = r#"
+        let setterSum = 0;
+        const proto = {
+            set value(input) {
+                setterSum += input;
+            },
+        };
+
+        function write(input) {
+            const object = Object.create(proto);
+            object.value = input;
+        }
+
+        for (let i = 0; i < 200; i++) write(i);
+        if (setterSum !== 19900) throw new Error("store IC bypassed inherited setter");
+        "ok";
+    "#;
+
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    let completion = runtime
+        .run_script(SourceInput::from_javascript(source), "<jit-store-setter>")
         .expect("script")
         .completion_string()
         .to_string();

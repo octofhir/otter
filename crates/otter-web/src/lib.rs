@@ -64,6 +64,8 @@ otter_macros::romp! {
             "WritableStreamDefaultController", "WritableStreamDefaultWriter",
         ]),
         (include_str!("web_fetch.js"), defines = ["fetch", "Headers", "Request", "Response"]),
+        // URLPattern needs URL (a native class) + RegExp; both exist eagerly.
+        (include_str!("web_urlpattern.js"), defines = ["URLPattern"]),
     ],
 }
 

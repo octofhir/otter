@@ -30,6 +30,9 @@ const WEB_STREAMS: &str = include_str!("web_streams.js");
 #[cfg(test)]
 const WEB_FETCH: &str = include_str!("web_fetch.js");
 
+#[cfg(test)]
+const WEB_URLPATTERN: &str = include_str!("web_urlpattern.js");
+
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
 pub fn web_globals_installer() -> RuntimeGlobalInstaller {
@@ -271,7 +274,7 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 #[cfg(test)]
 mod tests {
-    use super::{WEB_BOOTSTRAP, WEB_FETCH, WEB_STREAMS};
+    use super::{WEB_BOOTSTRAP, WEB_FETCH, WEB_STREAMS, WEB_URLPATTERN};
     use std::collections::BTreeSet;
 
     /// Scan a shim source for the `def('<name>')` calls that attach a global.
@@ -304,6 +307,7 @@ mod tests {
         let mut from_shims = def_names(WEB_BOOTSTRAP);
         from_shims.extend(def_names(WEB_STREAMS));
         from_shims.extend(def_names(WEB_FETCH));
+        from_shims.extend(def_names(WEB_URLPATTERN));
         let declared: BTreeSet<String> = crate::WEB_EXTENSION
             .lazy_names()
             .map(str::to_string)

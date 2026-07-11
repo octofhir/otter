@@ -204,33 +204,16 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn run_enter_try_regs(
+    pub(crate) fn run_enter_try_region(
         &mut self,
         frame: &mut Frame,
-        catch_off: i32,
-        finally_off: i32,
-        exc_register: u16,
+        region: crate::executable::code_block_cfg::CodeBlockExceptionRegion,
     ) -> Result<(), VmError> {
-        let next_pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)? as i64;
-        let resolve = |off: i32| -> Result<Option<u32>, VmError> {
-            if off == crate::NO_HANDLER_OFFSET {
-                return Ok(None);
-            }
-            let target = next_pc + off as i64;
-            if target < 0 || target > u32::MAX as i64 {
-                return Err(VmError::InvalidOperand);
-            }
-            Ok(Some(target as u32))
-        };
-        let catch_pc = resolve(catch_off)?;
-        let finally_pc = resolve(finally_off)?;
-        if catch_pc.is_none() && finally_pc.is_none() {
-            return Err(VmError::InvalidOperand);
-        }
+        debug_assert_eq!(region.enter_pc, frame.pc);
         self.frame_ensure_cold(frame).handlers.push(TryHandler {
-            catch_pc,
-            finally_pc,
-            exc_register,
+            catch_pc: region.catch_pc,
+            finally_pc: region.finally_pc,
+            exc_register: region.exception_register,
         });
         frame.advance_pc()?;
         Ok(())

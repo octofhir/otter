@@ -34,6 +34,11 @@
 //! # See also
 //! - `JIT_DESIGN.md` §3.2 (backend), §3.5 (GC contract), §4 Phase 1.
 
+// dynasm 5 normalizes dynamic AArch64 register operands through `Into<u8>`;
+// when our register ids are already `u8`, that macro-generated conversion is
+// intentionally redundant and outside the source-level emitter's control.
+#![allow(clippy::useless_conversion)]
+
 use otter_bytecode::{Op, Operand};
 pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
@@ -1706,7 +1711,7 @@ pub(crate) mod arm64 {
     }
 
     /// First caller-saved FP register used to park decoded `f64` values.
-    const FP_RESIDENCY_BASE: u32 = 3;
+    const FP_RESIDENCY_BASE: u8 = 3;
     /// Number of FP residency registers (`d3`..=`d7`). Caller-saved (`v8`–`v15`
     /// are callee-saved and would force a prologue spill on every call), and
     /// clobbered across calls — which is exactly where residency is cleared.
@@ -1746,22 +1751,22 @@ pub(crate) mod arm64 {
         }
 
         /// FP register currently holding `slot`'s `f64`, if any.
-        fn lookup(&self, slot: u16) -> Option<u32> {
+        fn lookup(&self, slot: u16) -> Option<u8> {
             self.entries
                 .iter()
                 .position(|e| *e == Some(slot))
-                .map(|i| FP_RESIDENCY_BASE + i as u32)
+                .map(|i| FP_RESIDENCY_BASE + i as u8)
         }
 
         /// Reserve an FP register for `slot` (evicting round-robin) and return
         /// its number. The evicted slot is simply dropped from the cache — its
         /// authoritative value is still in memory.
-        fn assign(&mut self, slot: u16) -> u32 {
+        fn assign(&mut self, slot: u16) -> u8 {
             self.invalidate(slot);
             let i = self.next;
             self.next = (self.next + 1) % FP_RESIDENCY_REGS;
             self.entries[i] = Some(slot);
-            FP_RESIDENCY_BASE + i as u32
+            FP_RESIDENCY_BASE + i as u8
         }
     }
 
@@ -1772,8 +1777,8 @@ pub(crate) mod arm64 {
         ops: &mut Assembler,
         fres: &FloatResidency,
         slot: u16,
-        dst_d: u32,
-        scratch_x: u32,
+        dst_d: u8,
+        scratch_x: u8,
         bail: DynamicLabel,
     ) -> Result<(), Unsupported> {
         if let Some(src_d) = fres.lookup(slot) {
@@ -1855,7 +1860,7 @@ pub(crate) mod arm64 {
     /// code instead of bailing. Only NaN / infinity / `|x| >= 2^63` (which would
     /// saturate the 64-bit `fcvtzs`) and non-number tags (string / BigInt /
     /// object) bail to the interpreter for exact coercion.
-    fn emit_to_int32_fast(ops: &mut Assembler, src_x: u32, dst_w: u32, bail: DynamicLabel) {
+    fn emit_to_int32_fast(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: DynamicLabel) {
         let is_non_int = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
         dynasm!(ops
@@ -1902,7 +1907,7 @@ pub(crate) mod arm64 {
     /// including negatives (`-1 >>> 0 === 4294967295`) — so it stays compiled
     /// instead of bailing. Only NaN / infinity / `|x| >= 2^63` (which would
     /// saturate the 64-bit `fcvtzs`) and non-number tags bail.
-    fn emit_to_uint32_fast(ops: &mut Assembler, src_x: u32, dst_w: u32, bail: DynamicLabel) {
+    fn emit_to_uint32_fast(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: DynamicLabel) {
         let is_non_int = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
         dynasm!(ops
@@ -5399,7 +5404,7 @@ pub(crate) mod arm64 {
     /// on `Ok`, and branches to `miss` for every non-`Ok` status.
     fn emit_leaf_no_alloc_stub2_pair_call(
         ops: &mut Assembler,
-        stub_id_x: u32,
+        stub_id_x: u8,
         dst: u16,
         recv: u16,
         key: Option<u16>,
@@ -6518,21 +6523,21 @@ pub(crate) mod arm64 {
     }
 
     /// `ldr X(t), [x19, #idx*8]`.
-    fn load_reg(ops: &mut Assembler, t: u32, idx: u16) -> Result<(), Unsupported> {
+    fn load_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
         let off = reg_offset(idx)?;
         dynasm!(ops ; .arch aarch64 ; ldr X(t), [x19, off]);
         Ok(())
     }
 
     /// `str X(t), [x19, #idx*8]`.
-    fn store_reg(ops: &mut Assembler, t: u32, idx: u16) -> Result<(), Unsupported> {
+    fn store_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
         let off = reg_offset(idx)?;
         dynasm!(ops ; .arch aarch64 ; str X(t), [x19, off]);
         Ok(())
     }
 
     /// Materialize a 64-bit constant into x-register `t` via movz/movk.
-    fn emit_load_u64(ops: &mut Assembler, t: u32, v: u64) {
+    fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
         dynasm!(ops ; .arch aarch64 ; movz X(t), (v & 0xFFFF) as u32);
         if (v >> 16) & 0xFFFF != 0 {
             dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 16) & 0xFFFF) as u32, lsl #16);
@@ -6550,7 +6555,7 @@ pub(crate) mod arm64 {
     /// `int32` payloads sign-convert (`scvtf`); a boxed double has the encode
     /// offset subtracted before `fmov`; a cell or non-number immediate (no
     /// `NUMBER_TAG` bit) bails to the interpreter. Uses scratch GPRs x14/x15.
-    fn emit_num_to_double(ops: &mut Assembler, src_x: u32, dst_d: u32, bail: DynamicLabel) {
+    fn emit_num_to_double(ops: &mut Assembler, src_x: u8, dst_d: u8, bail: DynamicLabel) {
         let is_non_int = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
         dynasm!(ops
@@ -6578,7 +6583,7 @@ pub(crate) mod arm64 {
     /// A NaN result is first canonicalised to the single quiet-NaN pattern;
     /// then the encode offset is added so the bits land in the number space.
     /// Uses scratch GPR x14 in addition to `dst_x`.
-    fn emit_box_double(ops: &mut Assembler, src_d: u32, dst_x: u32) {
+    fn emit_box_double(ops: &mut Assembler, src_d: u8, dst_x: u8) {
         let ready = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64

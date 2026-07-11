@@ -226,9 +226,9 @@ impl Interpreter {
                     continue;
                 }
                 Op::Call => {
-                    let operands = function.operands(instr);
+                    let operands = function.operand_view(instr);
                     let depth_before = stack.len();
-                    self.do_call(stack, context, &operands)?;
+                    self.do_call(stack, context, operands)?;
                     // Tier-up hook: only when a bytecode callee frame was just
                     // pushed and a JIT is installed. Cheap (one bool) when off.
                     if jit_installed && stack.len() > depth_before {
@@ -244,17 +244,17 @@ impl Interpreter {
                     continue;
                 }
                 Op::TailCall => {
-                    let operands = function.operands(instr);
-                    self.do_tail_call(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.do_tail_call(stack, context, operands)?;
                     continue;
                 }
                 Op::CallWithThis => {
-                    let operands = function.operands(instr);
-                    self.do_call_with_this(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.do_call_with_this(stack, context, operands)?;
                     continue;
                 }
                 Op::CallMethodValue => {
-                    let operands = function.operands(instr);
+                    let operands = function.operand_view(instr);
                     let depth_before = stack.len();
                     // Capture the receiver/prototype layout before the call for
                     // method-inline feedback (the receiver register lives in the
@@ -286,7 +286,7 @@ impl Interpreter {
                         } else {
                             None
                         };
-                    self.do_call_method_value(stack, context, &operands)?;
+                    self.do_call_method_value(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode method
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.
                     if jit_installed && stack.len() > depth_before {
@@ -301,14 +301,14 @@ impl Interpreter {
                     continue;
                 }
                 Op::CallSpread => {
-                    let operands = function.operands(instr);
-                    self.do_call_spread(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.do_call_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::New => {
-                    let operands = function.operands(instr);
+                    let operands = function.operand_view(instr);
                     let depth_before = stack.len();
-                    self.do_construct(stack, context, &operands)?;
+                    self.do_construct(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode
                     // constructor frame pushed by `new` can enter JIT at pc=0.
                     if jit_installed
@@ -320,13 +320,13 @@ impl Interpreter {
                     continue;
                 }
                 Op::NewSpread => {
-                    let operands = function.operands(instr);
-                    self.do_construct_spread(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.do_construct_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::SuperConstructSpread => {
-                    let operands = function.operands(instr);
-                    self.do_super_construct_spread(stack, context, &operands)?;
+                    let operands = function.operand_view(instr);
+                    self.do_super_construct_spread(stack, context, operands)?;
                     continue;
                 }
                 Op::BindThisValue => {

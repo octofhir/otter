@@ -30,6 +30,7 @@ use crate::{
     PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, cache_ir, collections_prototype, date, descriptor_value,
+    executable::OperandView,
     function_metadata, math,
     native_function::VmIntrinsicFunction,
     number,
@@ -391,17 +392,18 @@ impl Interpreter {
     /// - `Function` / `Closure` / `BoundFunction` — only the
     ///   `call`, `apply`, and `bind` shapes are recognised; anything
     ///   else surfaces as `UnknownIntrinsic`.
-    pub(crate) fn do_call_method_value(
+    pub(crate) fn do_call_method_value<'a>(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
-        operands: &[Operand],
+        operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
+        let operands = operands.into();
         let dst = register_operand(operands.first())?;
         let recv_reg = register_operand(operands.get(1))?;
         let name_idx = const_operand(operands.get(2))?;
         let argc = match operands.get(3) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
+            Some(Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
         let caller_byte_len = self.current_byte_len;

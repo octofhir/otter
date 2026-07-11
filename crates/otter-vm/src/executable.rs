@@ -372,6 +372,17 @@ impl CodeBlock {
             .collect()
     }
 
+    /// Borrowed schema-decoded operand view with no materialisation.
+    #[must_use]
+    pub const fn operand_view<'a>(&'a self, instr: &'a CodeBlockInstruction) -> OperandView<'a> {
+        OperandView {
+            source: OperandViewSource::Wordcode {
+                code_block: self,
+                instr,
+            },
+        }
+    }
+
     /// One schema-typed operand.
     #[must_use]
     pub fn operand(&self, instr: &CodeBlockInstruction, index: usize) -> Option<Operand> {
@@ -426,6 +437,90 @@ impl CodeBlock {
             Some(Operand::Imm32(value)) => Some(value),
             _ => None,
         }
+    }
+}
+
+/// Borrowed access to one instruction's schema-typed operand words.
+///
+/// The view is copyable and decodes individual words on demand. It never owns
+/// or materialises an `Operand` collection.
+#[derive(Clone, Copy)]
+pub struct OperandView<'a> {
+    source: OperandViewSource<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum OperandViewSource<'a> {
+    Wordcode {
+        code_block: &'a CodeBlock,
+        instr: &'a CodeBlockInstruction,
+    },
+    #[cfg(test)]
+    Decoded(&'a [Operand]),
+}
+
+impl<'a> OperandView<'a> {
+    /// Number of operands declared by the verified instruction.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        match self.source {
+            OperandViewSource::Wordcode { instr, .. } => instr.operand_count as usize,
+            #[cfg(test)]
+            OperandViewSource::Decoded(decoded) => decoded.len(),
+        }
+    }
+
+    /// Whether this instruction has no operands.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Decode one schema-typed operand.
+    #[must_use]
+    pub fn get(self, index: usize) -> Option<Operand> {
+        match self.source {
+            OperandViewSource::Wordcode { code_block, instr } => code_block.operand(instr, index),
+            #[cfg(test)]
+            OperandViewSource::Decoded(decoded) => decoded.get(index).copied(),
+        }
+    }
+
+    /// Decode the first operand.
+    #[must_use]
+    pub fn first(self) -> Option<Operand> {
+        self.get(0)
+    }
+
+    /// Iterate over decoded operands without allocating a collection.
+    pub fn iter(self) -> impl ExactSizeIterator<Item = Operand> + 'a {
+        (0..self.len()).map(move |index| {
+            self.get(index)
+                .expect("verified CodeBlock operand must decode")
+        })
+    }
+}
+
+#[cfg(test)]
+impl<'a> From<&'a [Operand]> for OperandView<'a> {
+    fn from(decoded: &'a [Operand]) -> Self {
+        Self {
+            source: OperandViewSource::Decoded(decoded),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a, const N: usize> From<&'a [Operand; N]> for OperandView<'a> {
+    fn from(decoded: &'a [Operand; N]) -> Self {
+        Self::from(decoded.as_slice())
+    }
+}
+
+#[cfg(test)]
+impl<'a> From<&'a Vec<Operand>> for OperandView<'a> {
+    fn from(decoded: &'a Vec<Operand>) -> Self {
+        Self::from(decoded.as_slice())
     }
 }
 

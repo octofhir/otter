@@ -233,6 +233,7 @@ pub use promise::{
     PromiseState, PromiseThenOutcome, PurePromise, ReactionKind,
 };
 pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
+pub use register_stack::RegisterWindow;
 pub use string::{JsString, MAX_ROPE_DEPTH};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};

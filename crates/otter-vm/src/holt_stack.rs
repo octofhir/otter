@@ -31,8 +31,8 @@
 //! - [`HoltStack`] — the frame stack and its stack-discipline API.
 //! - [`HoltCallReservation`] — unpublished frame owner for two-phase call-frame
 //!   construction.
-//! - [`HoltFrameDesc`] / [`HoltValueSlots`] — stable frame index and value-slot
-//!   pointer metadata consumed by JIT call-entry work.
+//! - [`HoltFrameDesc`] / [`crate::RegisterWindow`] — stable frame index and
+//!   value-window metadata consumed by JIT call-entry work.
 //!
 //! # Invariants
 //! - A [`HoltStack`] never exceeds its reserved capacity (the VM's
@@ -47,48 +47,13 @@
 
 use smallvec::SmallVec;
 
-use crate::{Value, frame_state::Frame};
-
-/// Raw metadata for a frame's traced value slots.
-///
-/// This is intentionally just pointer + length. Safe Rust code should continue
-/// indexing through [`HoltStack`]; emitted code and VM-side JIT ABI helpers use
-/// this descriptor to address the register window without learning the Rust
-/// `Frame` layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HoltValueSlots {
-    ptr: *mut Value,
-    len: usize,
-}
-
-impl HoltValueSlots {
-    /// Raw pointer to the first value slot.
-    #[inline]
-    #[must_use]
-    pub fn as_mut_ptr(self) -> *mut Value {
-        self.ptr
-    }
-
-    /// Number of value slots in this frame window.
-    #[inline]
-    #[must_use]
-    pub fn len(self) -> usize {
-        self.len
-    }
-
-    /// `true` when the frame has no value slots.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.len == 0
-    }
-}
+use crate::{RegisterWindow, frame_state::Frame};
 
 /// Published frame descriptor for a live frame on a [`HoltStack`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HoltFrameDesc {
     index: usize,
-    value_slots: HoltValueSlots,
+    register_window: RegisterWindow,
 }
 
 impl HoltFrameDesc {
@@ -102,8 +67,8 @@ impl HoltFrameDesc {
     /// Raw value-slot metadata for the frame's register window.
     #[inline]
     #[must_use]
-    pub fn value_slots(self) -> HoltValueSlots {
-        self.value_slots
+    pub fn register_window(self) -> RegisterWindow {
+        self.register_window
     }
 }
 
@@ -137,11 +102,11 @@ impl HoltCallReservation {
     /// Raw metadata for the unpublished frame's value slots.
     #[inline]
     #[must_use]
-    pub fn value_slots(&mut self) -> HoltValueSlots {
-        HoltValueSlots {
-            ptr: self.frame.registers.as_mut_ptr(),
-            len: self.frame.registers.len(),
-        }
+    pub fn register_window(&mut self) -> RegisterWindow {
+        RegisterWindow::detached(
+            self.frame.registers.as_mut_ptr(),
+            self.frame.registers.len(),
+        )
     }
 
     /// Publish the frame onto `stack`, returning the stable descriptor for the
@@ -257,10 +222,10 @@ impl HoltStack {
         let frame = self.frames.get_mut(index)?;
         Some(HoltFrameDesc {
             index,
-            value_slots: HoltValueSlots {
-                ptr: frame.registers.as_mut_ptr(),
-                len: frame.registers.len(),
-            },
+            register_window: RegisterWindow::detached(
+                frame.registers.as_mut_ptr(),
+                frame.registers.len(),
+            ),
         })
     }
 
@@ -475,12 +440,12 @@ mod tests {
         let mut reservation = HoltCallReservation::from_frame(tagged_frame(f, 7));
 
         assert_eq!(stack.len(), 0);
-        assert_eq!(reservation.value_slots().len(), 1);
+        assert_eq!(reservation.register_window().len(), 1);
         reservation.frame_mut().registers[0] = Value::number_i32(11);
 
         let desc = reservation.publish(&mut stack);
         assert_eq!(desc.index(), 0);
-        assert_eq!(desc.value_slots().len(), 1);
+        assert_eq!(desc.register_window().len(), 1);
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].registers[0], Value::number_i32(11));
     }
@@ -495,10 +460,10 @@ mod tests {
         let frame = stack.get_mut(desc.index()).unwrap();
 
         assert_eq!(
-            desc.value_slots().as_mut_ptr(),
+            desc.register_window().as_mut_ptr(),
             frame.registers.as_mut_ptr()
         );
-        assert_eq!(desc.value_slots().len(), frame.registers.len());
+        assert_eq!(desc.register_window().len(), frame.registers.len());
     }
 
     #[test]

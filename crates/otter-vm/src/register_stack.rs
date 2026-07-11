@@ -28,6 +28,64 @@ use crate::{Value, VmError};
 
 /// Maximum tagged slots in one native call-chain arena.
 pub(crate) const REGISTER_STACK_CAPACITY: usize = 512 * 1024;
+const DETACHED_WINDOW_BASE: u32 = u32::MAX;
+
+/// C-layout descriptor for one contiguous tagged register window.
+#[repr(C, align(8))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterWindow {
+    base: *mut Value,
+    len: u32,
+    stack_base: u32,
+}
+
+impl RegisterWindow {
+    pub(crate) fn attached(base: *mut Value, len: usize, stack_base: u32) -> Self {
+        Self {
+            base,
+            len: u32::try_from(len).expect("register window length exceeds u32"),
+            stack_base,
+        }
+    }
+
+    pub(crate) fn detached(base: *mut Value, len: usize) -> Self {
+        Self::attached(base, len, DETACHED_WINDOW_BASE)
+    }
+
+    /// Base of initialized tagged slots.
+    #[must_use]
+    pub fn as_mut_ptr(self) -> *mut Value {
+        self.base
+    }
+
+    /// Number of initialized tagged slots.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the window contains no tagged slots.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Slot offset in [`RegisterStack`], or `None` for an owned detached frame.
+    #[must_use]
+    pub const fn stack_base(self) -> Option<u32> {
+        if self.stack_base == DETACHED_WINDOW_BASE {
+            None
+        } else {
+            Some(self.stack_base)
+        }
+    }
+}
+
+const _: [(); 16] = [(); std::mem::size_of::<RegisterWindow>()];
+const _: [(); 8] = [(); std::mem::align_of::<RegisterWindow>()];
+const _: [(); 0] = [(); std::mem::offset_of!(RegisterWindow, base)];
+const _: [(); 8] = [(); std::mem::offset_of!(RegisterWindow, len)];
+const _: [(); 12] = [(); std::mem::offset_of!(RegisterWindow, stack_base)];
 
 /// VM-owned, reservation-stable register arena for native call chains.
 #[derive(Debug, Default)]
@@ -64,7 +122,7 @@ impl RegisterStack {
     }
 
     /// Reserve and initialize one contiguous tagged window.
-    pub(crate) fn allocate(&mut self, count: usize) -> Result<(*mut Value, u32), VmError> {
+    pub(crate) fn allocate(&mut self, count: usize) -> Result<RegisterWindow, VmError> {
         self.ensure_allocated();
         let base = self.top;
         let end = base
@@ -76,7 +134,11 @@ impl RegisterStack {
         let window = &mut self.slots[base..end];
         window.fill(Value::undefined());
         self.top = end;
-        Ok((window.as_mut_ptr(), base as u32))
+        Ok(RegisterWindow::attached(
+            window.as_mut_ptr(),
+            count,
+            base as u32,
+        ))
     }
 
     /// Release a window and every younger window.
@@ -141,17 +203,17 @@ mod tests {
     fn allocation_keeps_base_stable_and_initializes_slots() {
         let mut stack = RegisterStack::new();
         let base = stack.base_ptr();
-        let (first, first_offset) = stack.allocate(4).unwrap();
-        let (second, second_offset) = stack.allocate(3).unwrap();
+        let first = stack.allocate(4).unwrap();
+        let second = stack.allocate(3).unwrap();
 
-        assert_eq!(base, first.cast::<u64>());
-        assert_eq!(first_offset, 0);
-        assert_eq!(second_offset, 4);
+        assert_eq!(base, first.as_mut_ptr().cast::<u64>());
+        assert_eq!(first.stack_base(), Some(0));
+        assert_eq!(second.stack_base(), Some(4));
         assert_eq!(stack.base_ptr(), base);
         // SAFETY: both windows are live and initialized by `allocate`.
         unsafe {
-            assert_eq!(*first.add(3), Value::undefined());
-            assert_eq!(*second.add(2), Value::undefined());
+            assert_eq!(*first.as_mut_ptr().add(3), Value::undefined());
+            assert_eq!(*second.as_mut_ptr().add(2), Value::undefined());
         }
     }
 
@@ -172,11 +234,11 @@ mod tests {
     #[test]
     fn take_top_copies_and_releases_bailed_window() {
         let mut stack = RegisterStack::new();
-        let (window, _) = stack.allocate(2).unwrap();
+        let window = stack.allocate(2).unwrap();
         // SAFETY: the window is live and exclusively owned by this test.
         unsafe {
-            *window = Value::number_i32(7);
-            *window.add(1) = Value::number_i32(11);
+            *window.as_mut_ptr() = Value::number_i32(7);
+            *window.as_mut_ptr().add(1) = Value::number_i32(11);
         }
 
         let values = stack.take_top(2).unwrap();

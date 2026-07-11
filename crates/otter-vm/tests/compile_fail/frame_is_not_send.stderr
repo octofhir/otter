@@ -7,6 +7,11 @@ error[E0277]: `*mut otter_vm::Value` cannot be sent between threads safely
    |     required by a bound introduced by this call
    |
    = help: within `Frame`, the trait `Send` is not implemented for `*mut otter_vm::Value`
+note: required because it appears within the type `RegisterWindow`
+  --> src/register_stack.rs
+   |
+   | pub struct RegisterWindow {
+   |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `otter_vm::frame_state::FrameRegisters`
   --> src/frame_state.rs
    |

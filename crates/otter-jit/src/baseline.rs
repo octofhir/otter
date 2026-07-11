@@ -17,12 +17,11 @@
 //! error parked in `ctx.error`.
 //!
 //! # GC contract
-//! The register window stays rooted on the VM frame stack for the whole call
-//! (recursive compiled calls append frames to the same reservation-stable
-//! HoltStack, so the register base is stable). Every op reads operands from and
-//! writes results to that rooted array — no JS value is ever live in a machine
-//! register across a `Call`/`MakeFunction` safepoint — so this tier needs **no
-//! GC stack maps**, matching the interpreter's precise `FrameRoots` rooting.
+//! Framed entries use VM-frame registers; frameless JIT-to-JIT entries reserve
+//! windows in the interpreter's fixed flat register stack. Both stores are
+//! traced as precise roots for their full live extent. No movable JS pointer is
+//! kept only in a machine register across a safepoint; allocating callees remain
+//! framed and carry exact safepoint records.
 //!
 //! # Invariants
 //! - **Whole-function opt-in.** Any opcode/operand shape outside the supported
@@ -45,6 +44,14 @@ use otter_vm::{
 };
 
 use crate::CompiledCode;
+
+mod runtime_ops;
+use runtime_ops::{
+    jit_add_stub, jit_define_data_property_stub, jit_define_own_property_stub,
+    jit_fresh_upvalue_stub, jit_load_builtin_error_stub, jit_load_string_stub,
+    jit_loose_equal_stub, jit_make_closure_stub, jit_math_call_stub, jit_neg_stub,
+    jit_new_array_stub, jit_store_upvalue_checked_stub,
+};
 
 // The compiled value encoding is single-sourced from the frozen
 // `otter_vm::value::tag` constants: emitted box / unbox / tag-test code bakes
@@ -113,7 +120,6 @@ const MAX_INLINE_ARGS: usize = 4;
 /// room in the C ABI's eight argument registers); raising this past 4 needs a
 /// second packed word.
 pub(crate) const MAX_METHOD_ARGS: usize = 4;
-const MAX_BASELINE_METHOD_ARGS: usize = 2;
 
 /// Pack up to [`MAX_METHOD_ARGS`] argument register indices into one word (one
 /// per 16-bit lane), the form the method-call stubs receive.
@@ -167,8 +173,7 @@ pub struct JitCtx {
     frame_index: usize,
     /// Base of this frame's upvalue spine (`Box<[UpvalueCell]>` data; each a
     /// 4-byte compressed cell handle), or `0` when the frame captures nothing
-    /// or the ctx was built on the direct-call path (which leaves it `0` so
-    /// upvalue ops fall back to the runtime stub). Inline `LoadUpvalue` /
+    /// or the function captures nothing. Inline `LoadUpvalue` /
     /// `StoreUpvalue` read `[upvalues_ptr + idx*4]`.
     upvalues_ptr: usize,
     /// Error slot shared by direct callees and bridge stubs when a re-entered
@@ -202,6 +207,10 @@ pub struct JitCtx {
     /// adding the callee register count, and stores it back; the matching pop on
     /// return restores it.
     reg_top_ptr: *mut usize,
+    /// Shared synchronous native-reentry depth counter.
+    sync_reentry_depth_ptr: *mut u32,
+    /// Effective limit checked before a frameless native call mutates state.
+    sync_reentry_limit: u32,
     /// Address of the live array-index accessor protector. Dense array stores
     /// read through this pointer at the store site, not at entry, because a
     /// re-entered VM call can invalidate the protector before later stores.
@@ -211,7 +220,7 @@ pub struct JitCtx {
     /// Number of live collection method IC slots.
     collection_method_ic_count: u32,
     /// Base of the VM-published flat direct-method inline-link table (indexed by
-    /// IC site). The optimizing tier reads a slot to build the callee window and
+    /// IC site). Baseline code reads a slot to build the callee window and
     /// branch to a compiled method with no Rust bridge.
     direct_method_inline: *const otter_vm::JitDirectMethodInline,
     /// Opaque heap pointer for native leaf runtime stubs.
@@ -263,6 +272,10 @@ pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_s
 /// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
 /// `reg_top`, bumped to reserve a callee window and restored on return.
 pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
+pub(crate) const SYNC_REENTRY_DEPTH_PTR_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, sync_reentry_depth_ptr) as u32;
+pub(crate) const SYNC_REENTRY_LIMIT_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, sync_reentry_limit) as u32;
 pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
 pub(crate) const COLLECTION_METHOD_ICS_OFFSET: u32 =
@@ -272,9 +285,25 @@ pub(crate) const COLLECTION_METHOD_IC_COUNT_OFFSET: u32 =
 pub(crate) const COLLECTION_METHOD_IC_SLOT_SIZE: u32 =
     std::mem::size_of::<otter_vm::JitCollectionMethodIcSlot>() as u32;
 /// Byte offset of [`JitCtx::direct_method_inline`] (the direct-method link table
-/// base) and the flat slot layout the optimizing tier reads.
+/// base) and the flat slot layout baseline code reads.
 pub(crate) const DIRECT_METHOD_INLINE_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, direct_method_inline) as u32;
+pub(crate) const DIRECT_METHOD_INLINE_SLOT_SIZE: u32 =
+    std::mem::size_of::<otter_vm::JitDirectMethodInline>() as u32;
+pub(crate) const DIRECT_METHOD_ENTRY_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, entry_addr) as u32;
+pub(crate) const DIRECT_METHOD_REGISTER_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, register_count) as u32;
+pub(crate) const DIRECT_METHOD_RECV_SHAPE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, recv_shape_offset) as u32;
+pub(crate) const DIRECT_METHOD_PROTO_SHAPE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, proto_shape_offset) as u32;
+pub(crate) const DIRECT_METHOD_ON_RECEIVER_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_on_receiver) as u32;
+pub(crate) const DIRECT_METHOD_VALUE_BYTE_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_value_byte) as u32;
+pub(crate) const DIRECT_METHOD_FID_OFFSET: u32 =
+    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_fid) as u32;
 pub(crate) const COLLECTION_METHOD_IC_STATE_OFFSET: u32 =
     std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, state) as u32;
 pub(crate) const COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET: u32 =
@@ -336,7 +365,7 @@ pub(crate) const DIRECT_SAFEPOINT_COUNT_OFFSET: u32 =
 pub(crate) const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
 pub(crate) const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
 /// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
-/// `LoadThis` in both the baseline and optimizing tiers.
+/// `LoadThis` in baseline entries.
 pub(crate) const THIS_VALUE_OFFSET: u32 = std::mem::offset_of!(JitCtx, this_value) as u32;
 pub(crate) const DIRECT_FRAME_INDEX_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
@@ -551,6 +580,43 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
         ctx.frame_index,
         bail_pc as u32,
         regcount as usize,
+    ) {
+        Ok(value) => JitRet {
+            value: value.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(err) => {
+            park_jit_error(ctx, err);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
+    }
+}
+
+/// Complete a frameless direct-method callee after its compiled entry bailed.
+/// The VM rebuilds the callee frame from the rooted flat register window and
+/// the already-resolved method value; no bytecode instruction is decoded here.
+pub(crate) extern "C" fn jit_direct_method_call_bail_stub(
+    ctx: *mut JitCtx,
+    bail_pc: u64,
+    regcount: u64,
+    callee: u64,
+    this: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.vm };
+    let stack = unsafe { &mut *ctx.stack };
+    let context = unsafe { &*ctx.context };
+    match vm.jit_direct_method_call_bail(
+        context,
+        stack,
+        bail_pc as u32,
+        regcount as usize,
+        Value::from_bits(callee),
+        Value::from_bits(this),
     ) {
         Ok(value) => JitRet {
             value: value.to_bits(),
@@ -966,31 +1032,6 @@ extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u6
     }
 }
 
-/// Bridge stub: re-run one synchronous opcode (closure/object/array
-/// construction, string constant, checked upvalue store, addition, remainder,
-/// unsigned shift) at `byte_pc` through [`Interpreter::jit_runtime_delegate_op`].
-/// Returns `0` on success, `1` on throw (error parked in `ctx`).
-extern "C" fn jit_delegate_op_stub(ctx: *mut JitCtx, byte_pc: u64, function_id: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_delegate_op(
-        context,
-        stack,
-        ctx.frame_index,
-        function_id as u32,
-        byte_pc as u32,
-    ) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
 /// Bridge stub: allocate an ordinary object for `NewObject` from compiled code.
 /// Uses the VM's stack-rooted allocator so moving young-GC semantics match the
 /// interpreter path.
@@ -1000,24 +1041,6 @@ extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
     let vm = unsafe { &mut *ctx.vm };
     let stack = unsafe { &mut *ctx.stack };
     match vm.jit_runtime_new_object(stack, ctx.frame_index, dst as u16) {
-        Ok(()) => 0,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
-    }
-}
-
-/// Bridge stub: allocate an array literal for `NewArray` from compiled code.
-/// The VM decodes the variable source-register list at `byte_pc` and uses the
-/// stack-rooted array allocator, matching interpreter GC semantics.
-pub(crate) extern "C" fn jit_new_array_stub(ctx: *mut JitCtx, byte_pc: u64) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
-    match vm.jit_runtime_new_array(context, stack, ctx.frame_index, byte_pc as u32) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1213,6 +1236,17 @@ pub struct BaselineCode {
     /// ownership / stability contract as [`Self::load_ic_cells`].
     #[allow(dead_code)]
     store_ic_cells: Box<[WhiskerIcCell]>,
+    /// Stable decoded source-register tables for `NewArray` sites. Emitted code
+    /// passes pointers into these boxed slices to [`jit_new_array_stub`], so the
+    /// tables must live exactly as long as the executable mapping.
+    #[allow(dead_code)]
+    array_literal_regs: Box<[Box<[u16]>]>,
+    /// Stable decoded parent-upvalue index tables for `MakeClosure` sites.
+    #[allow(dead_code)]
+    closure_parent_indices: Box<[Box<[u32]>]>,
+    /// Stable decoded argument-register tables for non-leaf `MathCall` sites.
+    #[allow(dead_code)]
+    math_argument_regs: Box<[Box<[u16]>]>,
     /// Stable backing store for VM-native allocating-stub safepoints. Emitted
     /// code passes this table through `JitCtx` into `RuntimeStubAllocContext`;
     /// the records must therefore live with the executable code object.
@@ -1330,6 +1364,8 @@ pub(crate) unsafe fn enter_compiled(
         // stable base / `reg_top` address of the flat JIT register stack.
         let reg_stack_base = unsafe { (*vm).jit_reg_stack_base() };
         let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
+        let sync_reentry_depth_ptr = unsafe { (*vm).jit_sync_reentry_depth_ptr() };
+        let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
         let array_index_accessor_protector_ptr =
             unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
         let collection_method_ics = unsafe { (*vm).jit_collection_method_ics_ptr() };
@@ -1360,6 +1396,8 @@ pub(crate) unsafe fn enter_compiled(
             direct_upvalues_ptr: 0,
             reg_stack_base,
             reg_top_ptr,
+            sync_reentry_depth_ptr,
+            sync_reentry_limit,
             array_index_accessor_protector_ptr,
             collection_method_ics,
             collection_method_ic_count,
@@ -1419,24 +1457,32 @@ pub(crate) mod arm64 {
         COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET, COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET,
         COLLECTION_METHOD_IC_SLOT_SIZE, COLLECTION_METHOD_IC_STATE_OFFSET,
         COLLECTION_METHOD_ICS_OFFSET, CONTEXT_OFFSET, DIRECT_ENTRY_OFFSET,
-        DIRECT_FRAME_INDEX_OFFSET, DIRECT_METHOD_INLINE_OFFSET, DIRECT_REGS_OFFSET,
-        DIRECT_SAFEPOINT_COUNT_OFFSET, DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET,
-        DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET,
-        FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET,
-        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS,
-        NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET,
-        REG_TOP_PTR_OFFSET, SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET,
-        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE,
-        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW,
-        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell,
-        alloc_value_stub_trampoline_pair, jit_abort_direct_call_stub, jit_backedge_poll_stub,
-        jit_call_collection_method_ic_stub, jit_call_method_stub, jit_delegate_op_stub,
+        DIRECT_FRAME_INDEX_OFFSET, DIRECT_METHOD_ENTRY_OFFSET, DIRECT_METHOD_FID_OFFSET,
+        DIRECT_METHOD_INLINE_OFFSET, DIRECT_METHOD_INLINE_SLOT_SIZE,
+        DIRECT_METHOD_ON_RECEIVER_OFFSET, DIRECT_METHOD_PROTO_SHAPE_OFFSET,
+        DIRECT_METHOD_RECV_SHAPE_OFFSET, DIRECT_METHOD_REGISTER_COUNT_OFFSET,
+        DIRECT_METHOD_VALUE_BYTE_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SAFEPOINT_COUNT_OFFSET,
+        DIRECT_SAFEPOINT_RECORDS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
+        DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET,
+        FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET, JIT_CTX_STACK_SIZE,
+        JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS, NUMBER_TAG_HI16,
+        OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
+        SAFEPOINT_COUNT_OFFSET, SAFEPOINT_RECORDS_OFFSET, STACK_OFFSET, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET,
+        THIS_VALUE_OFFSET, UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET,
+        Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
+        VALUE_UNDEFINED, VM_OFFSET, WhiskerIcCell, alloc_value_stub_trampoline_pair,
+        jit_abort_direct_call_stub, jit_add_stub, jit_backedge_poll_stub,
+        jit_call_collection_method_ic_stub, jit_call_method_stub, jit_define_data_property_stub,
+        jit_define_own_property_stub, jit_direct_method_call_bail_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
-        jit_inline_closure_upvalues_stub, jit_load_element_stub, jit_load_global_stub,
-        jit_load_prop_stub, jit_load_prop_window_stub, jit_load_upvalue_stub, jit_make_fn_stub,
-        jit_new_array_stub, jit_new_object_stub, jit_prepare_direct_call_stub,
-        jit_prepare_direct_method_call_stub, jit_self_call_bail_stub, jit_store_element_stub,
-        jit_store_prop_stub, jit_store_prop_window_stub, jit_store_upvalue_stub,
+        jit_fresh_upvalue_stub, jit_inline_closure_upvalues_stub, jit_load_builtin_error_stub,
+        jit_load_element_stub, jit_load_global_stub, jit_load_prop_stub, jit_load_prop_window_stub,
+        jit_load_string_stub, jit_load_upvalue_stub, jit_loose_equal_stub, jit_make_closure_stub,
+        jit_make_fn_stub, jit_math_call_stub, jit_neg_stub, jit_new_array_stub,
+        jit_new_object_stub, jit_prepare_direct_call_stub, jit_prepare_direct_method_call_stub,
+        jit_self_call_bail_stub, jit_store_element_stub, jit_store_prop_stub,
+        jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
         jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
         otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
     };
@@ -1618,8 +1664,6 @@ pub(crate) mod arm64 {
         operands: &[Operand],
         string_concat_safepoint: Option<SafepointId>,
         register_count: u16,
-        byte_pc: u32,
-        function_id: u32,
         threw: DynamicLabel,
     ) -> Result<(), Unsupported> {
         let (dst, lhs, rhs) = reg3(operands)?;
@@ -1662,10 +1706,15 @@ pub(crate) mod arm64 {
                 done,
             )?;
         }
-        dynasm!(ops ; .arch aarch64 ; =>delegate_path ; mov x0, x20);
-        emit_load_u64(ops, 1, u64::from(byte_pc));
-        emit_load_u64(ops, 2, u64::from(function_id));
-        emit_call_stub(ops, jit_delegate_op_stub as *const () as usize, threw);
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>delegate_path
+            ; mov x0, x20
+            ; movz x1, dst as u32
+            ; movz x2, lhs as u32
+            ; movz x3, rhs as u32
+        );
+        emit_call_stub(ops, jit_add_stub as *const () as usize, threw);
         dynasm!(ops ; .arch aarch64 ; =>done);
         Ok(())
     }
@@ -2094,7 +2143,7 @@ pub(crate) mod arm64 {
         if let Some(instr) = view.instructions.iter().find(|instr| {
             matches!(
                 instr.op,
-                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally | Op::StoreElement
+                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally
             )
         }) {
             return Err(Unsupported::Opcode(instr.op));
@@ -2104,7 +2153,7 @@ pub(crate) mod arm64 {
             .iter()
             .filter(|instr| instr.op == Op::CallMethodValue)
             .filter_map(|instr| const_index(&instr.operands, 3).ok())
-            .find(|&argc| argc as usize > super::MAX_BASELINE_METHOD_ARGS)
+            .find(|&argc| argc as usize > super::MAX_METHOD_ARGS)
         {
             return Err(Unsupported::ArgCount(argc as usize));
         }
@@ -2129,6 +2178,9 @@ pub(crate) mod arm64 {
         // Set when an unsupported opcode is emitted as a bail (see the catch-all
         // arm); such code is OSR-only.
         let mut osr_only = false;
+        let mut array_literal_regs: Vec<Box<[u16]>> = Vec::new();
+        let mut closure_parent_indices: Vec<Box<[u32]>> = Vec::new();
+        let mut math_argument_regs: Vec<Box<[u16]>> = Vec::new();
 
         let mut safepoint_records: Vec<_> = view.safepoints.values().cloned().collect();
         let mut next_safepoint = safepoint_records
@@ -2333,8 +2385,6 @@ pub(crate) mod arm64 {
                     ops_ref,
                     add_alloc_safepoints.get(&instr.byte_pc).copied(),
                     view.register_count,
-                    instr.byte_pc,
-                    view.function_id,
                     threw,
                 )?,
                 Op::Sub | Op::Mul | Op::Div if enable_fres => {
@@ -2448,8 +2498,20 @@ pub(crate) mod arm64 {
                     emit_call_stub(&mut ops, jit_new_object_stub as *const () as usize, threw);
                 }
                 Op::NewArray => {
-                    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                    emit_load_u64(&mut ops, 1, instr.byte_pc as u64);
+                    let dst = reg(ops_ref, 0)?;
+                    let count = const_index(ops_ref, 1)? as usize;
+                    if ops_ref.len() != count + 2 {
+                        return Err(Unsupported::OperandShape("NewArray register tail"));
+                    }
+                    let source_regs = (0..count)
+                        .map(|slot| reg(ops_ref, slot + 2))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_boxed_slice();
+                    let source_regs_ptr = source_regs.as_ptr();
+                    array_literal_regs.push(source_regs);
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    emit_load_u64(&mut ops, 2, source_regs_ptr as u64);
+                    emit_load_u64(&mut ops, 3, count as u64);
                     emit_call_stub(&mut ops, jit_new_array_stub as *const () as usize, threw);
                 }
                 Op::Call => {
@@ -2807,10 +2869,18 @@ pub(crate) mod arm64 {
                         );
                     }
 
-                    dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20);
-                    emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
-                    emit_load_u64(&mut ops, 2, u64::from(view.function_id));
-                    emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; =>up_miss
+                        ; mov x0, x20
+                        ; movz x1, src as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(idx as u32));
+                    emit_call_stub(
+                        &mut ops,
+                        jit_store_upvalue_checked_stub as *const () as usize,
+                        threw,
+                    );
                     dynasm!(ops ; .arch aarch64 ; =>up_done);
                 }
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
@@ -3168,16 +3238,12 @@ pub(crate) mod arm64 {
                     dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
                     emit_epilogue(&mut ops);
                 }
-                // Synchronous opcodes with variable / awkward operands: re-run
-                // through the interpreter at this instruction's byte_pc via the
-                // generic delegate bridge (closure construction, string/number
-                // constants, checked upvalue store, arithmetic tails, and
-                // descriptor writes). All run to completion without pushing a
-                // frame.
+                // Variadic operations still using compile-owned decoded operand
+                // metadata. Fixed-operand slow paths below use typed ABI stubs.
                 Op::MathCall => {
                     let dst = reg(ops_ref, 0)?;
                     let method_id = const_index(ops_ref, 1)?;
-                    let argc = const_index(ops_ref, 2)?;
+                    let argc = const_index(ops_ref, 2)? as usize;
                     if argc == 0
                         && otter_bytecode::method_id::MathMethod::from_u32(method_id)
                             == Some(otter_bytecode::method_id::MathMethod::Random)
@@ -3186,25 +3252,136 @@ pub(crate) mod arm64 {
                         dynasm!(ops ; .arch aarch64 ; blr x16);
                         store_reg(&mut ops, 0, dst)?;
                     } else {
-                        dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                        emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
-                        emit_load_u64(&mut ops, 2, u64::from(view.function_id));
-                        emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
+                        if ops_ref.len() != argc + 3 {
+                            return Err(Unsupported::OperandShape("MathCall register tail"));
+                        }
+                        let argument_regs = (0..argc)
+                            .map(|slot| reg(ops_ref, slot + 3))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_boxed_slice();
+                        let argument_regs_ptr = argument_regs.as_ptr();
+                        math_argument_regs.push(argument_regs);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; mov x0, x20
+                            ; movz x1, dst as u32
+                        );
+                        emit_load_u64(&mut ops, 2, u64::from(method_id));
+                        emit_load_u64(&mut ops, 3, argument_regs_ptr as u64);
+                        emit_load_u64(&mut ops, 4, argc as u64);
+                        emit_load_u64(&mut ops, 5, u64::from(instr.byte_len));
+                        emit_call_stub(&mut ops, jit_math_call_stub as *const () as usize, threw);
                     }
                 }
-                Op::MakeClosure
-                | Op::LoadString
-                | Op::DefineDataProperty
-                | Op::FreshUpvalue
-                | Op::LoadBuiltinError
-                | Op::Neg
-                | Op::LooseEqual
-                | Op::LooseNotEqual
-                | Op::DefineOwnProperty => {
+                Op::MakeClosure => {
+                    let dst = reg(ops_ref, 0)?;
+                    let function_index = const_index(ops_ref, 1)?;
+                    let count = const_index(ops_ref, 2)? as usize;
+                    if ops_ref.len() != count + 3 {
+                        return Err(Unsupported::OperandShape("MakeClosure upvalue tail"));
+                    }
+                    let parent_indices = (0..count)
+                        .map(|slot| {
+                            let index = imm32(ops_ref, slot + 3)?;
+                            u32::try_from(index).map_err(|_| {
+                                Unsupported::OperandShape("MakeClosure parent upvalue")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_boxed_slice();
+                    let parent_indices_ptr = parent_indices.as_ptr();
+                    closure_parent_indices.push(parent_indices);
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                    emit_load_u64(&mut ops, 1, u64::from(instr.byte_pc));
-                    emit_load_u64(&mut ops, 2, u64::from(view.function_id));
-                    emit_call_stub(&mut ops, jit_delegate_op_stub as *const () as usize, threw);
+                    emit_load_u64(&mut ops, 1, u64::from(view.function_id));
+                    dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
+                    emit_load_u64(&mut ops, 3, u64::from(function_index));
+                    emit_load_u64(&mut ops, 4, parent_indices_ptr as u64);
+                    emit_load_u64(&mut ops, 5, count as u64);
+                    emit_call_stub(&mut ops, jit_make_closure_stub as *const () as usize, threw);
+                }
+                Op::LoadString => {
+                    let dst = reg(ops_ref, 0)?;
+                    let constant_index = const_index(ops_ref, 1)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                    emit_load_u64(&mut ops, 1, u64::from(view.function_id));
+                    dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
+                    emit_load_u64(&mut ops, 3, u64::from(constant_index));
+                    emit_call_stub(&mut ops, jit_load_string_stub as *const () as usize, threw);
+                }
+                Op::DefineDataProperty => {
+                    let (object, key, value) = reg3(ops_ref)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, object as u32
+                        ; movz x2, key as u32
+                        ; movz x3, value as u32
+                    );
+                    emit_call_stub(
+                        &mut ops,
+                        jit_define_data_property_stub as *const () as usize,
+                        threw,
+                    );
+                }
+                Op::FreshUpvalue => {
+                    let idx = imm32(ops_ref, 0)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+                    emit_load_u64(&mut ops, 1, u64::from(idx as u32));
+                    emit_call_stub(
+                        &mut ops,
+                        jit_fresh_upvalue_stub as *const () as usize,
+                        threw,
+                    );
+                }
+                Op::LoadBuiltinError => {
+                    let dst = reg(ops_ref, 0)?;
+                    let kind_index = const_index(ops_ref, 1)?;
+                    dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
+                    emit_load_u64(&mut ops, 2, u64::from(kind_index));
+                    emit_call_stub(
+                        &mut ops,
+                        jit_load_builtin_error_stub as *const () as usize,
+                        threw,
+                    );
+                }
+                Op::Neg => {
+                    let dst = reg(ops_ref, 0)?;
+                    let src = reg(ops_ref, 1)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, src as u32
+                    );
+                    emit_call_stub(&mut ops, jit_neg_stub as *const () as usize, threw);
+                }
+                Op::LooseEqual | Op::LooseNotEqual => {
+                    let (dst, lhs, rhs) = reg3(ops_ref)?;
+                    let negate = u32::from(instr.op == Op::LooseNotEqual);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, lhs as u32
+                        ; movz x3, rhs as u32
+                        ; movz x4, negate
+                    );
+                    emit_call_stub(&mut ops, jit_loose_equal_stub as *const () as usize, threw);
+                }
+                Op::DefineOwnProperty => {
+                    let (target, key, descriptor) = reg3(ops_ref)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, target as u32
+                        ; movz x2, key as u32
+                        ; movz x3, descriptor as u32
+                    );
+                    emit_call_stub(
+                        &mut ops,
+                        jit_define_own_property_stub as *const () as usize,
+                        threw,
+                    );
                 }
                 _other => {
                     // Opcode outside the subset: bail to the interpreter at this
@@ -3290,11 +3467,11 @@ pub(crate) mod arm64 {
             osr_only,
             load_ic_cells,
             store_ic_cells,
+            array_literal_regs: array_literal_regs.into_boxed_slice(),
+            closure_parent_indices: closure_parent_indices.into_boxed_slice(),
+            math_argument_regs: math_argument_regs.into_boxed_slice(),
             safepoint_records,
-            // Baseline bodies can reach delegate/runtime stubs that address
-            // registers through JitCtx.frame_index. They require a published
-            // frame when entered as a method callee.
-            frameless_entry_safe: false,
+            frameless_entry_safe: self_call_safe,
         })
     }
 
@@ -4612,6 +4789,32 @@ pub(crate) mod arm64 {
         Ok(true)
     }
 
+    /// Copy isolate- and execution-owned fields shared by every nested `JitCtx`.
+    /// Callee registers, bindings, frame/upvalues, and safepoints are initialized
+    /// separately by each native calling convention.
+    fn emit_copy_shared_execution_context(ops: &mut Assembler) {
+        for off in [
+            VM_OFFSET,
+            STACK_OFFSET,
+            CONTEXT_OFFSET,
+            ERROR_SLOT_OFFSET,
+            REG_STACK_BASE_OFFSET,
+            REG_TOP_PTR_OFFSET,
+            SYNC_REENTRY_DEPTH_PTR_OFFSET,
+            ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
+            COLLECTION_METHOD_ICS_OFFSET,
+            DIRECT_METHOD_INLINE_OFFSET,
+            GC_HEAP_OFFSET,
+            INTERRUPT_FLAG_OFFSET,
+            BACKEDGE_FUEL_OFFSET,
+        ] {
+            dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
+        }
+        for off in [SYNC_REENTRY_LIMIT_OFFSET, COLLECTION_METHOD_IC_COUNT_OFFSET] {
+            dynasm!(ops ; .arch aarch64 ; ldr w9, [x20, off] ; str w9, [sp, off]);
+        }
+    }
+
     /// Emit a self-recursive `Op::Call` inline, with no Rust frame-build bridge:
     /// guard the callee is the running closure, reserve a callee window on the
     /// interpreter's flat register stack, bind args, build the callee `JitCtx`,
@@ -4668,7 +4871,19 @@ pub(crate) mod arm64 {
         emit_load_u64(ops, 13, u64::from(rc));
         dynasm!(ops ; .arch aarch64 ; add x13, x11, x13);
         emit_load_u64(ops, 9, Interpreter::jit_reg_stack_cap() as u64);
-        dynasm!(ops ; .arch aarch64 ; cmp x13, x9 ; b.hi =>bail ; str x13, [x12]);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x13, x9
+            ; b.hi =>bail
+            ; ldr x17, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w9, [x17]
+            ; ldr w10, [x20, SYNC_REENTRY_LIMIT_OFFSET]
+            ; cmp w9, w10
+            ; b.hs =>bail
+            ; add w9, w9, #1
+            ; str w9, [x17]
+            ; str x13, [x12]
+        );
         // Zero-fill the window to `undefined`.
         emit_load_u64(ops, 10, undef_bits);
         emit_load_u64(ops, 15, u64::from(rc));
@@ -4704,16 +4919,8 @@ pub(crate) mod arm64 {
         );
         emit_load_u64(ops, 9, undef_bits);
         dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, BAIL_PC_OFFSET]);
-        for off in [
-            VM_OFFSET,
-            STACK_OFFSET,
-            CONTEXT_OFFSET,
-            FRAME_INDEX_OFFSET,
-            ERROR_SLOT_OFFSET,
-            UPVALUES_PTR_OFFSET,
-            REG_STACK_BASE_OFFSET,
-            REG_TOP_PTR_OFFSET,
-        ] {
+        emit_copy_shared_execution_context(ops);
+        for off in [FRAME_INDEX_OFFSET, UPVALUES_PTR_OFFSET] {
             dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
         }
         dynasm!(ops
@@ -4733,6 +4940,10 @@ pub(crate) mod arm64 {
             ; .arch aarch64
             ; sub x13, x13, x9
             ; str x13, [x12]
+            ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w13, [x12]
+            ; sub w13, w13, #1
+            ; str w13, [x12]
             ; b =>threw
         );
         // Returned: pop the window, store the value into `dst`.
@@ -4743,7 +4954,15 @@ pub(crate) mod arm64 {
             ; ldr x13, [x12]
         );
         emit_load_u64(ops, 9, u64::from(rc));
-        dynasm!(ops ; .arch aarch64 ; sub x13, x13, x9 ; str x13, [x12]);
+        dynasm!(ops
+            ; .arch aarch64
+            ; sub x13, x13, x9
+            ; str x13, [x12]
+            ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w13, [x12]
+            ; sub w13, w13, #1
+            ; str w13, [x12]
+        );
         store_reg(ops, 0, dst)?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
         // Bailed: read the callee's resume PC, drop the native ctx, and run the
@@ -4763,6 +4982,10 @@ pub(crate) mod arm64 {
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
+            ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w13, [x12]
+            ; sub w13, w13, #1
+            ; str w13, [x12]
             ; cmp x1, STATUS_THREW as u32
             ; b.eq =>threw
         );
@@ -4781,6 +5004,7 @@ pub(crate) mod arm64 {
     fn is_self_call_safe(view: &JitCompileSnapshot) -> bool {
         view.instructions.iter().all(|instr| {
             is_inline_pure_op(instr.op)
+                || instr.op == Op::LoadThis
                 || instr.op == Op::Call
                 || (matches!(instr.op, Op::MakeFunction | Op::MakeClosure) && instr.make_self)
                 // Property access runs frameless: the inline IC hit reads/writes
@@ -4791,6 +5015,291 @@ pub(crate) mod arm64 {
                 || instr.op == Op::LoadProperty
                 || instr.op == Op::StoreProperty
         })
+    }
+
+    /// Probe the VM-published polymorphic direct-method link table and enter a
+    /// zero-argument bytecode method through a rooted flat register window.
+    /// Every guard precedes the window reservation, so a miss falls through to
+    /// the normal typed method path without observable state.
+    fn emit_direct_method_inline_zero_arg(
+        ops: &mut Assembler,
+        operands: &[Operand],
+        site: u64,
+        view: &JitCompileSnapshot,
+        miss: DynamicLabel,
+        done: DynamicLabel,
+        threw: DynamicLabel,
+    ) -> Result<bool, Unsupported> {
+        use otter_vm::jit::JIT_DIRECT_METHOD_WAYS;
+
+        if const_index(operands, 3)? != 0 || view.cage_base == 0 {
+            return Ok(false);
+        }
+        let dst = reg(operands, 0)?;
+        let recv = reg(operands, 1)?;
+        let recv_off = reg_offset(recv)?;
+        let returned = ops.new_dynamic_label();
+        let bailed = ops.new_dynamic_label();
+        let direct_threw = ops.new_dynamic_label();
+        let hit = ops.new_dynamic_label();
+        let table_byte = site
+            .saturating_mul(JIT_DIRECT_METHOD_WAYS as u64)
+            .saturating_mul(u64::from(DIRECT_METHOD_INLINE_SLOT_SIZE));
+
+        // Common receiver guard. x8 retains the compressed object offset and
+        // x7 the first link slot while each way may chase a prototype.
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x7, [x20, DIRECT_METHOD_INLINE_OFFSET]
+            ; cbz x7, =>miss
+        );
+        emit_load_u64(ops, 12, table_byte);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x7, x7, x12
+            // Dense ways: first empty entry means whole site has no asm link.
+            // Take cold fallback before receiver decoding or the large guard
+            // chain, keeping non-eligible sites to one pointer + entry load.
+            ; ldr x16, [x7, DIRECT_METHOD_ENTRY_OFFSET]
+            ; cbz x16, =>miss
+            ; ldr x9, [x19, recv_off]
+            ; movz x11, NUMBER_TAG_HI16, lsl #48
+            ; orr x11, x11, #value_tag::OTHER_TAG
+            ; tst x9, x11
+            ; b.ne =>miss
+            ; mov w8, w9
+        );
+
+        for way in 0..JIT_DIRECT_METHOD_WAYS {
+            let next = if way + 1 == JIT_DIRECT_METHOD_WAYS {
+                miss
+            } else {
+                ops.new_dynamic_label()
+            };
+            let way_byte = way as u32 * DIRECT_METHOD_INLINE_SLOT_SIZE;
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x17, x7, way_byte
+                ; ldr x16, [x17, DIRECT_METHOD_ENTRY_OFFSET]
+                // Ways are appended densely and cleared as a whole. An empty
+                // entry therefore terminates the chain; no later way can hit.
+                ; cbz x16, =>miss
+            );
+            emit_load_u64(ops, 12, view.cage_base as u64);
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x13, x12, x8
+                ; ldrb w14, [x13]
+                ; cmp w14, OBJECT_BODY_TYPE_TAG
+                ; b.ne =>next
+                ; ldr w14, [x13, view.object_shape_byte]
+                ; ldr w15, [x17, DIRECT_METHOD_RECV_SHAPE_OFFSET]
+                ; cmp w14, w15
+                ; b.ne =>next
+                ; ldr w15, [x17, DIRECT_METHOD_ON_RECEIVER_OFFSET]
+                ; cbnz w15, >holder
+                ; ldr w9, [x13, view.jit_proto_byte]
+                ; cbz w9, =>next
+            );
+            emit_load_u64(ops, 12, view.cage_base as u64);
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x13, x12, x9
+                ; ldrb w14, [x13]
+                ; cmp w14, OBJECT_BODY_TYPE_TAG
+                ; b.ne =>next
+                ; ldr w14, [x13, view.object_shape_byte]
+                ; ldr w15, [x17, DIRECT_METHOD_PROTO_SHAPE_OFFSET]
+                ; cmp w14, w15
+                ; b.ne =>next
+                ; holder:
+            );
+            emit_slab_base(ops, view, 13, 14);
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr w12, [x17, DIRECT_METHOD_VALUE_BYTE_OFFSET]
+                ; ldr w9, [x13, x12]
+            );
+            emit_decompress_slot(ops, view.cage_base as u64, next);
+
+            let immediate = ops.new_dynamic_label();
+            let compare = ops.new_dynamic_label();
+            dynasm!(ops
+                ; .arch aarch64
+                ; movz x11, NUMBER_TAG_HI16, lsl #48
+                ; tst x9, x11
+                ; b.ne =>next
+                ; and x10, x9, #0xffff
+                ; cmp x10, #(FUNCTION_ID_TAG as u32)
+                ; b.eq =>immediate
+                ; mov w12, w9
+            );
+            emit_load_u64(ops, 11, view.cage_base as u64);
+            dynasm!(ops
+                ; .arch aarch64
+                ; add x11, x11, x12
+                ; ldrb w14, [x11]
+                ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG
+                ; b.ne =>next
+                ; ldr w14, [x11, view.closure_fid_byte]
+                ; ldr x10, [x11, view.closure_upvalues_ptr_byte]
+                ; b =>compare
+                ; =>immediate
+                ; lsr x14, x9, #16
+                ; movz x10, #0
+                ; =>compare
+                ; ldr w15, [x17, DIRECT_METHOD_FID_OFFSET]
+                ; cmp w14, w15
+                ; b.eq =>hit
+            );
+            if way + 1 != JIT_DIRECT_METHOD_WAYS {
+                dynasm!(ops ; .arch aarch64 ; =>next);
+            }
+        }
+
+        // x17 = selected link, x9 = live method SELF, x10 = live captured
+        // upvalue spine. Keep those plus entry/window size in a native metadata
+        // record while the callee context occupies the stack below it.
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>hit
+            ; ldr x16, [x17, DIRECT_METHOD_ENTRY_OFFSET]
+            ; ldr w15, [x17, DIRECT_METHOD_REGISTER_COUNT_OFFSET]
+            ; sub sp, sp, #32
+            ; str x16, [sp]
+            ; str x15, [sp, #8]
+            ; str x9, [sp, #16]
+            ; str x10, [sp, #24]
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x11, [x12]
+            ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
+            ; add x14, x9, x11, lsl #3
+            ; add x13, x11, x15
+        );
+        emit_load_u64(ops, 9, Interpreter::jit_reg_stack_cap() as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x13, x9
+            ; b.hi >overflow
+            ; ldr x17, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w9, [x17]
+            ; ldr w10, [x20, SYNC_REENTRY_LIMIT_OFFSET]
+            ; cmp w9, w10
+            ; b.hs >overflow
+            ; add w9, w9, #1
+            ; str w9, [x17]
+            ; str x13, [x12]
+        );
+        emit_load_u64(ops, 10, VALUE_UNDEFINED);
+        let fill = ops.new_dynamic_label();
+        let fill_done = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; movz x9, #0
+            ; =>fill
+            ; cmp x9, x15
+            ; b.hs =>fill_done
+            ; str x10, [x14, x9, lsl #3]
+            ; add x9, x9, #1
+            ; b =>fill
+            ; =>fill_done
+
+            ; sub sp, sp, JIT_CTX_STACK_SIZE
+            ; str x14, [sp]
+            ; ldr x9, [sp, JIT_CTX_STACK_SIZE + 16]
+            ; str x9, [sp, #8]
+            ; ldr x9, [x19, recv_off]
+            ; str x9, [sp, #16]
+            ; str wzr, [sp, BAIL_PC_OFFSET]
+        );
+        emit_copy_shared_execution_context(ops);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x20, FRAME_INDEX_OFFSET]
+            ; str x9, [sp, FRAME_INDEX_OFFSET]
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [sp, JIT_CTX_STACK_SIZE + 24]
+            ; str x9, [sp, UPVALUES_PTR_OFFSET]
+            ; str xzr, [sp, DIRECT_ENTRY_OFFSET]
+            ; str xzr, [sp, DIRECT_REGS_OFFSET]
+            ; str xzr, [sp, DIRECT_SAFEPOINT_RECORDS_OFFSET]
+            ; str wzr, [sp, DIRECT_SAFEPOINT_COUNT_OFFSET]
+            ; str xzr, [sp, DIRECT_SELF_OFFSET]
+            ; str xzr, [sp, DIRECT_THIS_OFFSET]
+            ; str xzr, [sp, DIRECT_FRAME_INDEX_OFFSET]
+            ; str xzr, [sp, DIRECT_UPVALUES_OFFSET]
+            ; str xzr, [sp, SAFEPOINT_RECORDS_OFFSET]
+            ; str wzr, [sp, SAFEPOINT_COUNT_OFFSET]
+            ; mov x0, sp
+            ; ldr x16, [sp, JIT_CTX_STACK_SIZE]
+            ; blr x16
+            ; cmp x1, STATUS_RETURNED as u32
+            ; b.eq =>returned
+            ; cmp x1, STATUS_BAILED as u32
+            ; b.eq =>bailed
+            ; b =>direct_threw
+
+            ; =>returned
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; ldr x15, [sp, #8]
+            ; add sp, sp, #32
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+            ; sub x13, x13, x15
+            ; str x13, [x12]
+            ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w13, [x12]
+            ; sub w13, w13, #1
+            ; str w13, [x12]
+        );
+        store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>direct_threw
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; ldr x15, [sp, #8]
+            ; add sp, sp, #32
+            ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
+            ; ldr x13, [x12]
+            ; sub x13, x13, x15
+            ; str x13, [x12]
+            ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w13, [x12]
+            ; sub w13, w13, #1
+            ; str w13, [x12]
+            ; b =>threw
+
+            ; =>bailed
+            ; ldr w1, [sp, BAIL_PC_OFFSET]
+            ; add sp, sp, JIT_CTX_STACK_SIZE
+            ; ldr x2, [sp, #8]
+            ; ldr x3, [sp, #16]
+            ; ldr x4, [x19, recv_off]
+            ; add sp, sp, #32
+            ; mov x0, x20
+        );
+        emit_load_u64(
+            ops,
+            16,
+            jit_direct_method_call_bail_stub as *const () as u64,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w13, [x12]
+            ; sub w13, w13, #1
+            ; str w13, [x12]
+            ; cmp x1, STATUS_THREW as u32
+            ; b.eq =>threw
+        );
+        store_reg(ops, 0, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done ; overflow: ; add sp, sp, #32 ; b =>miss);
+        Ok(true)
     }
 
     /// Emit a direct `Call`: ask the VM to publish an eligible callee frame,
@@ -4898,6 +5407,10 @@ pub(crate) mod arm64 {
             ; str x9, [sp, REG_STACK_BASE_OFFSET]
             ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
             ; str x9, [sp, REG_TOP_PTR_OFFSET]
+            ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; str x9, [sp, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+            ; ldr w9, [x20, SYNC_REENTRY_LIMIT_OFFSET]
+            ; str w9, [sp, SYNC_REENTRY_LIMIT_OFFSET]
             ; ldr x9, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
             ; str x9, [sp, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
             ; ldr x9, [x20, COLLECTION_METHOD_ICS_OFFSET]
@@ -4910,6 +5423,10 @@ pub(crate) mod arm64 {
             ; str x9, [sp, DIRECT_METHOD_INLINE_OFFSET]
             ; ldr x9, [x20, GC_HEAP_OFFSET]
             ; str x9, [sp, GC_HEAP_OFFSET]
+            ; ldr x9, [x20, INTERRUPT_FLAG_OFFSET]
+            ; str x9, [sp, INTERRUPT_FLAG_OFFSET]
+            ; ldr x9, [x20, BACKEDGE_FUEL_OFFSET]
+            ; str x9, [sp, BACKEDGE_FUEL_OFFSET]
             ; ldr x9, [x20, DIRECT_SAFEPOINT_RECORDS_OFFSET]
             ; str x9, [sp, SAFEPOINT_RECORDS_OFFSET]
             ; ldr w9, [x20, DIRECT_SAFEPOINT_COUNT_OFFSET]
@@ -5830,7 +6347,22 @@ pub(crate) mod arm64 {
         let after_alloc = ops.new_dynamic_label();
         let after_live_leaf = ops.new_dynamic_label();
         let after_live_alloc = ops.new_dynamic_label();
+        let after_direct_inline = ops.new_dynamic_label();
         let done = ops.new_dynamic_label();
+
+        if let Some(view) = view
+            && emit_direct_method_inline_zero_arg(
+                ops,
+                operands,
+                site,
+                view,
+                after_direct_inline,
+                done,
+                threw,
+            )?
+        {
+            dynasm!(ops ; .arch aarch64 ; =>after_direct_inline);
+        }
 
         if let (Some(leaf), Some(view)) = (leaf, view)
             && emit_collection_leaf_method_guarded_call(
@@ -6670,7 +7202,7 @@ mod tests {
         VALUE_UNDEFINED, compile, value_tag,
     };
     use otter_bytecode::{Op, Operand};
-    use otter_vm::{JitCompileSnapshot, JitInstructionMetadata};
+    use otter_vm::{JitCompileSnapshot, JitFunctionCode, JitInstructionMetadata};
 
     const STRIDE: u32 = 4;
 
@@ -6759,6 +7291,36 @@ mod tests {
         assert_eq!(read_word(len_off), v.len(), "probe len word");
     }
 
+    #[test]
+    fn frameless_entry_gate_accepts_only_window_owned_bodies() {
+        let window_only = view(&[
+            (Op::LoadThis, vec![Operand::Register(0)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(
+            compile(&window_only)
+                .expect("window-only body compiles")
+                .frameless_entry_safe()
+        );
+
+        let frame_reentry = view(&[
+            (
+                Op::LooseEqual,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        assert!(
+            !compile(&frame_reentry)
+                .expect("runtime-operation body compiles")
+                .frameless_entry_safe()
+        );
+    }
+
     // CodeBlock branch encoding: target instruction = current + 1 + rel.
     fn rel(from: usize, to: usize) -> i32 {
         to as i32 - from as i32 - 1
@@ -6794,6 +7356,8 @@ mod tests {
             direct_upvalues_ptr: 0,
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
+            sync_reentry_depth_ptr: std::ptr::null_mut(),
+            sync_reentry_limit: 0,
             array_index_accessor_protector_ptr: &array_index_accessor_protector,
             collection_method_ics: std::ptr::null(),
             collection_method_ic_count: 0,
@@ -7369,5 +7933,68 @@ mod tests {
             ],
         )]);
         assert!(compile(&v).is_err());
+    }
+
+    #[test]
+    fn method_call_uses_full_packed_argument_abi() {
+        let four_args = view(&[
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(4),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::Register(4),
+                    Operand::Register(5),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(
+            compile(&four_args).is_ok(),
+            "the baseline must accept every argument representable by the shared packed ABI"
+        );
+
+        let five_args = view(&[
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(5),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::Register(4),
+                    Operand::Register(5),
+                    Operand::Register(6),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(compile(&five_args).is_err());
+    }
+
+    #[test]
+    fn store_element_is_part_of_the_baseline_subset() {
+        let store = view(&[
+            (
+                Op::StoreElement,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(
+            compile(&store).is_ok(),
+            "the emitted dense/typed-array fast path and typed runtime miss must be reachable"
+        );
     }
 }

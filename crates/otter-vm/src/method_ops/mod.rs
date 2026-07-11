@@ -193,21 +193,46 @@ impl Interpreter {
         operands: &[Operand],
         byte_len: u32,
     ) -> Result<(), VmError> {
-        if frame_index >= stack.len() {
-            return Err(VmError::InvalidOperand);
-        }
         let dst = register_operand(operands.first())?;
         let method_id = const_operand(operands.get(1))?;
-        let method = otter_bytecode::method_id::MathMethod::from_u32(method_id)
-            .ok_or(VmError::InvalidOperand)?;
         let argc = match operands.get(2) {
             Some(&Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
+        let mut arg_regs = SmallVec::<[u16; 8]>::with_capacity(argc);
         for i in 0..argc {
-            let r = register_operand(operands.get(3 + i))?;
-            arg_values.push(*read_register(&stack[frame_index], r)?);
+            arg_regs.push(register_operand(operands.get(3 + i))?);
+        }
+        self.do_math_call_regs(
+            stack,
+            context,
+            frame_index,
+            dst,
+            method_id,
+            &arg_regs,
+            byte_len,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn do_math_call_regs(
+        &mut self,
+        stack: &mut HoltStack,
+        context: &ExecutionContext,
+        frame_index: usize,
+        dst: u16,
+        method_id: u32,
+        arg_regs: &[u16],
+        byte_len: u32,
+    ) -> Result<(), VmError> {
+        if frame_index >= stack.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        let method = otter_bytecode::method_id::MathMethod::from_u32(method_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &register in arg_regs {
+            arg_values.push(*read_register(&stack[frame_index], register)?);
         }
 
         let lexical_math = self.read_global_lexical("Math")?;

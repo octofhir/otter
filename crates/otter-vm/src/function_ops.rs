@@ -116,8 +116,30 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let idx = const_operand(operands.get(1))?;
+        let count = match operands.get(2) {
+            Some(&Operand::ConstIndex(n)) => n as usize,
+            _ => return Err(VmError::InvalidOperand),
+        };
+        let mut parent_indices = Vec::with_capacity(count);
+        for i in 0..count {
+            match operands.get(3 + i) {
+                Some(&Operand::Imm32(n)) if n >= 0 => parent_indices.push(n as u32),
+                _ => return Err(VmError::InvalidOperand),
+            }
+        }
+        self.run_make_closure_regs(context, frame, dst, idx, &parent_indices)
+    }
+
+    pub(crate) fn run_make_closure_regs(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        function_index: u32,
+        parent_indices: &[u32],
+    ) -> Result<(), VmError> {
         let function_id = context
-            .function_id_constant(idx)
+            .function_id_constant(function_index)
             .ok_or(VmError::InvalidOperand)?;
         // §10.2 — a named function referencing its own binding inside its
         // body (`function_id` is the running function) must resolve to the
@@ -132,19 +154,11 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
-        let count = match operands.get(2) {
-            Some(&Operand::ConstIndex(n)) => n as usize,
-            _ => return Err(VmError::InvalidOperand),
-        };
-        let mut cells: Vec<UpvalueCell> = Vec::with_capacity(count);
-        for i in 0..count {
-            let parent_idx = match operands.get(3 + i) {
-                Some(&Operand::Imm32(n)) if n >= 0 => n as usize,
-                _ => return Err(VmError::InvalidOperand),
-            };
+        let mut cells: Vec<UpvalueCell> = Vec::with_capacity(parent_indices.len());
+        for &parent_idx in parent_indices {
             let cell = *frame
                 .upvalues
-                .get(parent_idx)
+                .get(parent_idx as usize)
                 .ok_or(VmError::InvalidOperand)?;
             cells.push(cell);
         }

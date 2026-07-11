@@ -102,6 +102,7 @@ mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
 pub mod jit_feedback;
+mod jit_runtime_ops;
 pub mod js_surface;
 pub mod json;
 pub mod lazy_globals;
@@ -652,7 +653,7 @@ struct JitDirectMethodCache {
     method_value: Value,
     code: std::sync::Arc<dyn jit::JitFunctionCode>,
     /// Inline-link fields for this shape, mirrored into the flat per-way table the
-    /// optimizing tier walks to take the bridge-free call.
+    /// baseline tier walks to take the bridge-free call.
     inline: JitDirectMethodInline,
 }
 
@@ -675,7 +676,7 @@ impl JitDirectMethodCache {
 const MAX_DIRECT_METHOD_WAYS: usize = jit::JIT_DIRECT_METHOD_WAYS;
 
 /// Inline-readable direct-method-call link, mirroring the collection-method IC:
-/// the optimizing tier guards the receiver shape, then builds the callee window
+/// baseline code guards the receiver shape, then builds the callee window
 /// and branches to `entry_addr` with no bridge.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -696,10 +697,6 @@ pub struct JitDirectMethodInline {
     pub method_value_byte: u32,
     /// Expected method function id the identity walk compares against.
     pub method_fid: u32,
-    /// Boxed SELF closure bits for the callee context.
-    pub self_closure_bits: u64,
-    /// Callee upvalue-spine base pointer, or 0 when it captures nothing.
-    pub upvalues_ptr: usize,
 }
 
 impl JitDirectMethodInline {
@@ -712,8 +709,6 @@ impl JitDirectMethodInline {
         method_on_receiver: 0,
         method_value_byte: 0,
         method_fid: 0,
-        self_closure_bits: 0,
-        upvalues_ptr: 0,
     };
 }
 

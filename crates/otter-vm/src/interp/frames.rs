@@ -123,6 +123,18 @@ impl Interpreter {
         &mut self.reg_top
     }
 
+    /// Address of synchronous reentry depth shared by framed and frameless JIT
+    /// calls. Emitted code checks and updates it around native recursion.
+    pub fn jit_sync_reentry_depth_ptr(&mut self) -> *mut u32 {
+        &mut self.sync_reentry_depth
+    }
+
+    /// Effective synchronous reentry limit for emitted native calls.
+    pub fn jit_sync_reentry_limit(&self) -> u32 {
+        self.max_stack_depth
+            .min(crate::run_control::DEFAULT_MAX_SYNC_REENTRY_DEPTH)
+    }
+
     /// Address of the live array-index accessor protector. Compiled dense-array
     /// stores read this on every store attempt because a VM call inside the same
     /// compiled entry can invalidate the protector before a later store.
@@ -152,7 +164,7 @@ impl Interpreter {
         self.jit_collection_method_ics.len() as u32
     }
 
-    /// Base of the flat direct-method inline-link table. The optimizing tier reads
+    /// Base of the flat direct-method inline-link table. Baseline code reads
     /// a slot by IC site to build the callee window and branch with no bridge; the
     /// pointer is refreshed into `JitCtx` on every entry/reentry because the table
     /// can grow (reallocate).

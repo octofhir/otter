@@ -1044,7 +1044,6 @@ impl Interpreter {
         code: std::sync::Arc<dyn jit::JitFunctionCode>,
         entry_addr: usize,
         register_count: u32,
-        upvalues_ptr: usize,
         // `true` when the callee allocates no OWN upvalue cells
         // (`own_upvalue_count == 0`): the callee's spine is exactly its captured
         // spine, so the emitted call can pass a closure's live spine (or the
@@ -1062,8 +1061,9 @@ impl Interpreter {
         // emitted call reads its captured spine LIVE from the resolved closure
         // body. A bare function has no spine constraint.
         let method_is_plain_function = method == Value::function(function_id);
-        let asm_link_eligible =
-            code.frameless_entry_safe() && (method_is_plain_function || frameless_upvalues_ok);
+        let asm_link_eligible = code.frameless_entry_safe()
+            && code.safepoint_table().1 == 0
+            && (method_is_plain_function || frameless_upvalues_ok);
         // A closure method only caches at a monomorphic site. A polymorphic receiver
         // family (one `arr[i].run()` site over sibling classes) exposes no single
         // stable own/direct-prototype stub to cache, so the shape-walk loop below
@@ -1135,14 +1135,6 @@ impl Interpreter {
             // guard and method-slot byte offset for the identity walk, plus the
             // callee entry / window / SELF / upvalue-spine the emitted call needs.
             let cv = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-            // SELF bits = the resolved method value (closure or bare function);
-            // `makes_function` callees are rejected upstream so SELF is never
-            // read, but keeping it exact is free. The baked `upvalues_ptr` is used
-            // only when the runtime method is a bare function (`fid_immediate`
-            // emit path); a closure hit reads its spine LIVE, so it is inert for a
-            // closure. A closure that builds OWN upvalue cells is not
-            // `asm_link_eligible` and keeps the empty slot (bridge).
-            let self_closure_bits = method.to_bits();
             // A dictionary-mode shape handle is null (compressed offset 0) —
             // the same value every dictionary-mode object stores in its shape
             // field — so an inline guard baked from it would match any
@@ -1166,8 +1158,6 @@ impl Interpreter {
                         method_on_receiver: 1,
                         method_value_byte: u32::from(h.slot) * cv,
                         method_fid: function_id,
-                        self_closure_bits,
-                        upvalues_ptr,
                     },
                     JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
                         JitDirectMethodInline {
@@ -1178,8 +1168,6 @@ impl Interpreter {
                             method_on_receiver: 0,
                             method_value_byte: u32::from(prototype_hit.slot) * cv,
                             method_fid: function_id,
-                            self_closure_bits,
-                            upvalues_ptr,
                         }
                     }
                 }
@@ -1349,13 +1337,6 @@ impl Interpreter {
         let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
-        // The method closure's upvalue spine (constant for a shared prototype
-        // method) for the inline direct-call link the install derives.
-        let upvalues_ptr = if parent_upvalues.is_empty() {
-            0
-        } else {
-            parent_upvalues.as_ptr() as usize
-        };
         // Frameless closure eligibility: (1) builds no own upvalue cells, so its
         // captured spine passes verbatim (no `build_upvalues_for_exec`), and
         // (2) is a leaf — a non-leaf callee's nested call would read a
@@ -1370,7 +1351,6 @@ impl Interpreter {
             code.clone(),
             plan.entry_addr,
             u32::from(plan.register_count),
-            upvalues_ptr,
             frameless_upvalues_ok,
         );
 

@@ -34,6 +34,13 @@
 //! after the native install — the place for members that are
 //! genuinely better in JS).
 //!
+//! A member whose JS name starts with `__` is a **private compute hook**
+//! for the glue, not public API. The glue is wrapped in a factory: those
+//! members are moved off the namespace object into a `natives` bag (keyed
+//! without the `__`) and passed to the glue, which reads `natives.<name>`.
+//! The public object never keeps a raw hook, and the glue writes no
+//! capture/delete boilerplate.
+//!
 //! Member markers: `#[method(name = "…")]` with `length = N`,
 //! `promise`, `raw` options — same semantics as `js_class`, minus
 //! receivers. `async fn` members take no receiver and return the

@@ -93,11 +93,18 @@ pub fn native_fetch(
         let body_handle = cx.park(arg(3));
         let body = cx.buffer_source_bytes(body_handle);
 
+        let redirect_handle = cx.park(arg(4));
+        let redirect = cx
+            .as_string_lossy(redirect_handle)
+            .filter(|mode| matches!(mode.as_str(), "follow" | "error" | "manual"))
+            .unwrap_or_else(|| "follow".to_string());
+
         let request = FetchRequest {
             method,
             url,
             headers,
             body,
+            redirect,
         };
         let (abort, transport) = prepare_fetch(request, user_agent, net);
         let future = async move {

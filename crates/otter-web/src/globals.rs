@@ -51,7 +51,7 @@ fn install(runtime: &mut Runtime) -> Result<(), OtterError> {
     });
     runtime.install_native_global_call(
         "__nativeFetch",
-        4,
+        5,
         RuntimeNativeCall::Dynamic(fetch_call),
     )?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;

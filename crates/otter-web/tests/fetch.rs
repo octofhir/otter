@@ -171,6 +171,72 @@ async fn fetch_forwards_request_body_on_post() -> Result<(), OtterError> {
     Ok(())
 }
 
+/// A one-shot server that answers with a 302 redirect to `location`.
+fn spawn_redirect_server(location: &'static str) -> (String, thread::JoinHandle<()>) {
+    spawn_one_shot(move |_request| {
+        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_redirect_error_rejects() -> Result<(), OtterError> {
+    let (url, server) = spawn_redirect_server("http://127.0.0.1:9/next");
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(allow_net())
+        .console_sink(capture.clone())
+        .build()?;
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(format!(
+                r#"
+                fetch("{url}", {{ redirect: "error" }})
+                  .then(() => console.log("resolved"))
+                  .catch((error) => console.log("rejected:" + (error instanceof TypeError)));
+                "#
+            )),
+            "<fetch-redirect-error>",
+        )
+        .await?;
+    server.join().expect("server thread");
+    assert_eq!(capture.snapshot(), vec!["rejected:true".to_string()]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_redirect_manual_returns_response() -> Result<(), OtterError> {
+    let (url, server) = spawn_redirect_server("http://127.0.0.1:9/next");
+    let capture = LogCapture::new();
+    let otter = Otter::builder()
+        .with_web_apis()
+        .capabilities(allow_net())
+        .console_sink(capture.clone())
+        .build()?;
+    otter
+        .handle()
+        .run_script(
+            SourceInput::from_javascript(format!(
+                r#"
+                fetch("{url}", {{ redirect: "manual" }})
+                  .then((response) => console.log(
+                    "manual:" + response.status + ":" + response.headers.get("location")
+                  ))
+                  .catch((error) => console.log("err:" + error));
+                "#
+            )),
+            "<fetch-redirect-manual>",
+        )
+        .await?;
+    server.join().expect("server thread");
+    assert_eq!(
+        capture.snapshot(),
+        vec!["manual:302:http://127.0.0.1:9/next".to_string()]
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_aborts_in_flight_request() -> Result<(), OtterError> {
     // A bound listener that never accepts: reqwest completes the TCP handshake

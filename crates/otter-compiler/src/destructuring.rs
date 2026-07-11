@@ -217,7 +217,7 @@ pub(crate) fn destructure_array_inner(
         );
         let value_reg = parent.alloc_scratch();
         let done_reg = parent.alloc_scratch();
-        let loop_top = parent.next_pc;
+        let loop_top = parent.next_pc();
         parent.emit(
             Op::IteratorNext,
             vec![

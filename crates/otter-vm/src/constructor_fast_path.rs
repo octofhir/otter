@@ -152,17 +152,17 @@ pub(crate) fn match_simple_constructor_init(
 mod tests {
     use otter_bytecode::{
         ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction, Op, Operand,
-        OperandList, SourceKind,
+        SourceKind,
     };
 
     use super::{SimpleConstructorSource, match_simple_constructor_init};
     use crate::ExecutionContext;
 
-    fn instr(pc: u32, op: Op, operands: impl Into<OperandList>) -> Instruction {
+    fn instr(pc: u32, op: Op, operands: impl AsRef<[Operand]>) -> Instruction {
         Instruction {
             pc,
             op,
-            operands: operands.into(),
+            operands: operands.as_ref().to_vec(),
         }
     }
 
@@ -204,7 +204,7 @@ mod tests {
                 module_url: String::new(),
                 direct_eval_bindings: Vec::new(),
                 contains_direct_eval: false,
-                code,
+                code: code.into(),
                 spans: Vec::new(),
             }],
             constants: vec![

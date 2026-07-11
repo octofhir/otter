@@ -4330,7 +4330,7 @@ mod tests {
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
             contains_direct_eval: false,
-            code,
+            code: code.into(),
             spans,
         }
     }
@@ -4375,7 +4375,7 @@ mod tests {
             module_url: String::new(),
             direct_eval_bindings: Vec::new(),
             contains_direct_eval: false,
-            code,
+            code: code.into(),
             spans,
         }
     }
@@ -4651,11 +4651,7 @@ mod tests {
     }
 
     fn instr(pc: u32, op: Op, operands: Vec<Operand>) -> Instruction {
-        Instruction {
-            pc,
-            op,
-            operands: operands.into(),
-        }
+        Instruction { pc, op, operands }
     }
 
     fn context_for(function: Function) -> ExecutionContext {

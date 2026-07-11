@@ -65,7 +65,7 @@ pub(crate) fn compile_yield(
             let resume_arg_reg = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(resume_arg_reg)], span);
             let next_name = cx.intern_string_constant("next");
-            let loop_top = cx.next_pc;
+            let loop_top = cx.next_pc();
             cx.emit(
                 Op::CallMethodValue,
                 vec![
@@ -164,7 +164,7 @@ pub(crate) fn compile_yield(
         cx.emit(Op::LoadUndefined, [Operand::Register(recv_reg)], span);
         let inner_reg = cx.alloc_scratch();
 
-        let loop_top = cx.next_pc;
+        let loop_top = cx.next_pc();
         // Dispatch on the resume kind.
         let one_reg = cx.alloc_scratch();
         cx.emit(

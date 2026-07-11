@@ -15,13 +15,13 @@ fn bench_dispatch(c: &mut Criterion) {
         code.push(Instruction {
             pc,
             op: Op::Nop,
-            operands: vec![].into(),
+            operands: vec![],
         });
     }
     code.push(Instruction {
         pc: 10_000,
         op: Op::Return,
-        operands: vec![Operand::Register(0)].into(),
+        operands: vec![Operand::Register(0)],
     });
     let spans: Vec<SpanEntry> = code
         .iter()
@@ -38,7 +38,7 @@ fn bench_dispatch(c: &mut Criterion) {
             id: 0,
             name: "<main>".to_string(),
             scratch: 1,
-            code,
+            code: code.into(),
             spans,
             ..Function::default()
         }],

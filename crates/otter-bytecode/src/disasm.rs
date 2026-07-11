@@ -44,12 +44,13 @@ fn write_function(out: &mut String, f: &Function) {
     let _ = writeln!(out, "  upvalues:   0");
     let _ = writeln!(out, "  feedback:   0");
     let _ = writeln!(out, "  bytecode:");
-    for instr in &f.code {
-        let mut line = format!("    {:06}:  {}", instr.pc, instr.op.mnemonic());
-        if !instr.operands.is_empty() {
+    for (pc, instr) in f.code.iter().enumerate() {
+        let operands = f.code.operands(instr);
+        let mut line = format!("    {pc:06}:  {}", instr.op.mnemonic());
+        if !operands.is_empty() {
             line.push_str("  ");
             let mut first = true;
-            for operand in &instr.operands {
+            for operand in operands.iter() {
                 if !first {
                     line.push(' ');
                 }
@@ -92,8 +93,9 @@ mod tests {
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::Return,
-                    operands: vec![Operand::Register(0)].into(),
-                }],
+                    operands: vec![Operand::Register(0)],
+                }]
+                .into(),
                 spans: vec![SpanEntry {
                     pc: 0,
                     span: (0, 0),
@@ -117,7 +119,7 @@ mod tests {
             .map(|(pc, op)| Instruction {
                 pc: pc as u32,
                 op: *op,
-                operands: fixture_operands(*op).into(),
+                operands: fixture_operands(*op),
             })
             .collect();
         let spans = code
@@ -138,7 +140,7 @@ mod tests {
                 locals: 8,
                 scratch: 8,
                 module_url: "all-opcodes.ts".to_string(),
-                code,
+                code: code.into(),
                 spans,
                 ..Function::default()
             }],
@@ -307,183 +309,34 @@ mod tests {
     }
 
     fn fixture_operands(op: Op) -> Vec<Operand> {
-        match op {
-            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => {
-                Vec::new()
-            }
-            Op::LoadUndefined
-            | Op::LoadHole
-            | Op::Return
-            | Op::LoadTrue
-            | Op::LoadFalse
-            | Op::LoadNull
-            | Op::LoadThis
-            | Op::LoadNewTarget
-            | Op::Throw
-            | Op::CollectRest
-            | Op::ReturnValue
-            | Op::NewObject
-            | Op::CollectArguments
-            | Op::BindThisValue
-            | Op::LoadGlobalThis => vec![reg(0)],
-            Op::MarkModuleEvaluated => vec![konst(0)],
-            Op::DeclareGlobalVar => vec![konst(0), imm(1)],
-            Op::LoadDynamic
-            | Op::StoreDynamic
-            | Op::TypeofDynamic
-            | Op::DeleteDynamic
-            | Op::NewPrivateName => {
-                vec![reg(0), konst(1)]
-            }
-            Op::DefineGlobalFunction => vec![konst(0), reg(1), imm(1)],
-            Op::DeclareGlobalLex | Op::ValidateGlobalDecl => vec![konst(0), imm(1)],
-            Op::StoreGlobalBinding => vec![reg(0), konst(1), imm(1)],
-            Op::InitGlobalLex => vec![reg(0), konst(1)],
-            Op::EvaluateModule => vec![reg(0), konst(1)],
-            Op::Jump | Op::TdzError | Op::FreshUpvalue => vec![imm(-1)],
-            Op::JumpViaFinally => vec![imm(-1), imm(1)],
-            Op::PopParkedFinally => vec![imm(1)],
-            Op::GlobalBindingExists => vec![reg(0), konst(1)],
-            Op::StoreGlobalChecked => vec![reg(0), konst(1), reg(2)],
-            Op::LoadString
-            | Op::LoadNumber
-            | Op::LoadInt32
-            | Op::LoadBigInt
-            | Op::LoadRegExp
-            | Op::LoadLength
-            | Op::Neg
-            | Op::BitwiseNot
-            | Op::ToNumber
-            | Op::LogicalNot
-            | Op::ToBoolean
-            | Op::MakeFunction
-            | Op::MathLoad
-            | Op::ImportNamespace
-            | Op::ImportNamespaceDeferred
-            | Op::ModuleNamespaceObject
-            | Op::PromiseFulfilledOf
-            | Op::NewWeakRef
-            | Op::NewFinalizationRegistry
-            | Op::SymbolLoad
-            | Op::TypeOf
-            | Op::Await
-            | Op::IsArray
-            | Op::LoadBuiltinError
-            | Op::BigIntCall
-            | Op::ArrayConstruct
-            | Op::ArrayFrom
-            | Op::ArrayOf
-            | Op::ArrayBufferCall
-            | Op::DataViewCall
-            | Op::SharedArrayBufferCall
-            | Op::LoadGlobalOrThrow
-            | Op::LoadGlobalOrUndefined
-            | Op::ImportMetaResolve
-            | Op::ImportNamespaceDynamic
-            | Op::ForInKeys
-            | Op::CopyDataProperties
-            | Op::StarReexport
-            | Op::Yield
-            | Op::ToObject
-            | Op::ToNumeric => vec![reg(0), reg(1)],
-            Op::DefineGlobalVar => vec![konst(0), reg(1)],
-            Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => vec![imm(2), reg(1)],
-            Op::LoadLocal
-            | Op::StoreLocal
-            | Op::LoadUpvalue
-            | Op::StoreUpvalue
-            | Op::StoreUpvalueChecked => {
-                vec![reg(0), imm(1)]
-            }
-            Op::GetStringIndex
-            | Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Rem
-            | Op::Pow
-            | Op::BitwiseAnd
-            | Op::BitwiseOr
-            | Op::BitwiseXor
-            | Op::Shl
-            | Op::Shr
-            | Op::Ushr
-            | Op::Equal
-            | Op::NotEqual
-            | Op::LessThan
-            | Op::LessEq
-            | Op::GreaterThan
-            | Op::GreaterEq
-            | Op::LoadProperty
-            | Op::LoadSuperProperty
-            | Op::LoadSuperElement
-            | Op::SetSuperProperty
-            | Op::SetSuperElement
-            | Op::DeleteProperty
-            | Op::GetPrototype
-            | Op::SetPrototype
-            | Op::ArrayLength
-            | Op::NewError
-            | Op::GetIterator
-            | Op::ArrayPush
-            | Op::NewSpread
-            | Op::SuperConstructSpread
-            | Op::NewCollection
-            | Op::LoadElement
-            | Op::DeleteElement
-            | Op::HasProperty
-            | Op::Instanceof
-            | Op::SameValue
-            | Op::LooseEqual
-            | Op::LooseNotEqual
-            | Op::NewBuiltinError
-            | Op::ToPrimitive
-            | Op::PromiseCall
-            | Op::LoadImportBinding
-            | Op::DefineOwnProperty
-            | Op::PrivateGet
-            | Op::PrivateSet
-            | Op::YieldDelegate
-            | Op::DefineDataProperty => vec![reg(0), reg(1), reg(2)],
-            Op::SetFunctionName => vec![reg(0), reg(1), konst(2)],
-            Op::ClassCheck => vec![imm(0), reg(1)],
-            Op::ToPropertyKey => vec![reg(0), reg(1)],
-            Op::Increment => vec![reg(0), reg(1), imm(2)],
-            Op::PrivateBrandCheck => vec![reg(0), reg(1)],
-            Op::LoadShadowedUpvalue => vec![reg(0), konst(1), imm(2)],
-            Op::GetTemplateObject => vec![reg(0), konst(1)],
-            Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
-            Op::GetAsyncIterator => vec![reg(0), reg(1)],
-            Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => vec![reg(0)],
-            Op::CallSpread | Op::New | Op::StoreProperty | Op::StoreElement => {
-                vec![reg(0), reg(1), reg(2), reg(3)]
-            }
-            Op::MakeClass => vec![reg(0), reg(1), reg(2), reg(3), reg(4)],
-            Op::CallMethodValue | Op::CallWithThis | Op::BindFunction => {
-                vec![reg(0), reg(1), reg(2), reg(3)]
-            }
-            Op::MathCall => vec![reg(0), konst(31), konst(1), reg(2)],
-            Op::Call | Op::TailCall => vec![reg(0), reg(1), reg(2)],
-            Op::QueueMicrotask => vec![reg(0), reg(1)],
-            Op::PromiseNew => vec![reg(0), reg(1), reg(2)],
-            Op::MakeClosure => vec![reg(0), konst(1), imm(1), imm(2)],
-            Op::EnterTry => vec![imm(1), imm(2), reg(3)],
-            Op::Eval | Op::NewFunction | Op::IsEvalIntrinsic => vec![reg(0), reg(1)],
-            Op::NewArray => vec![reg(0), reg(1), reg(2)],
-            Op::TemporalLoad => vec![reg(0), reg(1)],
+        use crate::opcode_schema::opcode_schema;
+
+        let shape = opcode_schema(op).operand_shape;
+        let mut operands = shape
+            .prefix()
+            .expect("every opcode has an authoritative operand prefix")
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| fixture_operand(spec.kind, index as u32))
+            .collect::<Vec<_>>();
+        if let Some((count_index, tail)) = shape.variadic() {
+            operands[count_index] = fixture_operand(
+                shape.prefix().expect("variadic prefix")[count_index].kind,
+                1,
+            );
+            operands.push(fixture_operand(tail.kind, operands.len() as u32));
         }
+        operands
     }
 
-    fn reg(value: u16) -> Operand {
-        Operand::Register(value)
-    }
+    fn fixture_operand(kind: crate::opcode_schema::OperandKind, value: u32) -> Operand {
+        use crate::opcode_schema::OperandKind;
 
-    fn konst(value: u32) -> Operand {
-        Operand::ConstIndex(value)
-    }
-
-    fn imm(value: i32) -> Operand {
-        Operand::Imm32(value)
+        match kind {
+            OperandKind::Register => Operand::Register(value as u16),
+            OperandKind::ConstIndex => Operand::ConstIndex(value),
+            OperandKind::Imm32 => Operand::Imm32(value as i32),
+        }
     }
 
     fn mnemonic_snapshot(disassembly: &str) -> String {

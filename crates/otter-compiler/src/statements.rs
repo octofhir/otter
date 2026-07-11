@@ -137,7 +137,7 @@ fn emit_loop_exit_jump(cx: &mut Compiler, target_idx: usize, span: (u32, u32)) -
         .saturating_sub(cx.loops[target_idx].finally_floor);
     if crossed_finally > 0 {
         let floor = cx.loops[target_idx].handler_floor as i32;
-        let pc = cx.next_pc;
+        let pc = cx.next_pc();
         cx.emit(
             Op::JumpViaFinally,
             vec![Operand::Imm32(0), Operand::Imm32(floor)],
@@ -490,7 +490,7 @@ pub(crate) fn compile_statement(
             // non-empty body completion (undefined if it never runs).
             let completion_reg = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
-            let loop_top = cx.next_pc;
+            let loop_top = cx.next_pc();
             cx.push_loop_frame(LoopFrame::iteration());
             let cond_reg = compile_expr(cx, &s.test, span)?;
             let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
@@ -523,7 +523,7 @@ pub(crate) fn compile_statement(
             cx.emit_completion_reset(span);
             let completion_reg = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
-            let body_top = cx.next_pc;
+            let body_top = cx.next_pc();
             cx.push_loop_frame(LoopFrame::iteration());
             if let Some(body_reg) = compile_statement(cx, &s.body)? {
                 cx.emit(
@@ -535,7 +535,7 @@ pub(crate) fn compile_statement(
                     span,
                 );
             }
-            let continue_target = cx.next_pc;
+            let continue_target = cx.next_pc();
             let cond_reg = compile_expr(cx, &s.test, span)?;
             let back_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(cond_reg), span);
             cx.patch_branch(back_jmp, body_top);
@@ -600,7 +600,7 @@ pub(crate) fn compile_statement(
             let completion_reg = cx.alloc_scratch();
             cx.emit(Op::LoadUndefined, [Operand::Register(completion_reg)], span);
             cx.push_loop_frame(LoopFrame::iteration());
-            let test_top = cx.next_pc;
+            let test_top = cx.next_pc();
             // Test.
             let exit_patch = if let Some(test) = &s.test {
                 let cond_reg = compile_expr(cx, test, span)?;
@@ -620,7 +620,7 @@ pub(crate) fn compile_statement(
                 );
             }
             // Continue lands on the update.
-            let update_pc = cx.next_pc;
+            let update_pc = cx.next_pc();
             // §14.7.4.2 step 3.e — CreatePerIterationEnvironment runs
             // before the increment, so the increment mutates the *next*
             // iteration's cells while this iteration's closures keep
@@ -1445,7 +1445,7 @@ pub(crate) fn compile_switch_statement(
     // Pass 2: compile each case body in source order.
     let mut case_body_pcs: Vec<u32> = Vec::with_capacity(s.cases.len());
     for case in s.cases.iter() {
-        let body_pc = cx.next_pc;
+        let body_pc = cx.next_pc();
         case_body_pcs.push(body_pc);
         for inner in case.consequent.iter() {
             // UpdateEmpty — only a non-empty statement completion
@@ -1463,7 +1463,7 @@ pub(crate) fn compile_switch_statement(
             }
         }
     }
-    let switch_end_pc = cx.next_pc;
+    let switch_end_pc = cx.next_pc();
 
     // Patch case selector jumps to their body pc.
     for (idx, placeholder) in case_jump_pcs {

@@ -24,12 +24,93 @@
 //! ```
 
 use crate::{
-    Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList, SpanEntry,
+    FunctionCode, Instruction, NO_HANDLER_OFFSET, Op, Operand, SpanEntry,
     opcode_schema::{
         ExceptionSuccessorSpec, OperandShapeError, RelativeTargetBase, SuccessorSpec,
         opcode_schema, verify_operand_shape,
     },
 };
+
+/// Verify authoritative execution wordcode directly in logical-PC space.
+///
+/// # Errors
+/// Returns [`VerifyError`] for operand-shape, branch-target, handler-target, or
+/// finally-floor violations.
+pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> {
+    let len = code.len() as i64;
+    for (instruction_index, instr) in code.iter().enumerate() {
+        let operands = code.operands(instr).iter().collect::<Vec<_>>();
+        verify_operand_shape(instr.op, &operands).map_err(|error| {
+            VerifyError::InvalidOperandShape {
+                instruction_index,
+                error,
+            }
+        })?;
+        let schema = opcode_schema(instr.op);
+        for successor in schema.successor_shape.exact() {
+            if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
+                verify_wordcode_target(code, instruction_index, *operand_index, None, len)?;
+            }
+        }
+        for successor in schema.exception_successor_shape.exact() {
+            match successor {
+                ExceptionSuccessorSpec::OptionalRelativeTarget {
+                    operand_index,
+                    absent_value,
+                    ..
+                } => verify_wordcode_target(
+                    code,
+                    instruction_index,
+                    *operand_index,
+                    Some(*absent_value),
+                    len,
+                )?,
+                ExceptionSuccessorSpec::RunFinallyHandlersToFloor {
+                    floor_operand_index,
+                } => {
+                    let Some(Operand::Imm32(floor)) = code.operand(instr, *floor_operand_index)
+                    else {
+                        unreachable!("operand shape verified before control-flow metadata")
+                    };
+                    if floor < 0 {
+                        return Err(VerifyError::InvalidControlFlowOperand {
+                            instruction_index,
+                            operand_index: *floor_operand_index,
+                            value: floor,
+                        });
+                    }
+                }
+                ExceptionSuccessorSpec::DynamicFrameHandlerOrCaller
+                | ExceptionSuccessorSpec::ResumeParkedAbruptCompletion => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_wordcode_target(
+    code: &FunctionCode,
+    instruction_index: usize,
+    operand_index: usize,
+    absent_value: Option<i32>,
+    instruction_count: i64,
+) -> Result<(), VerifyError> {
+    let instruction = &code[instruction_index];
+    let Some(Operand::Imm32(delta)) = code.operand(instruction, operand_index) else {
+        unreachable!("operand shape verified before control-flow metadata")
+    };
+    if absent_value == Some(delta) {
+        return Ok(());
+    }
+    let target = instruction_index as i64 + 1 + i64::from(delta);
+    if !(0..=instruction_count).contains(&target) {
+        return Err(VerifyError::InvalidControlFlowTarget {
+            instruction_index,
+            target,
+        });
+    }
+    Ok(())
+}
 
 const OPERAND_KIND_REGISTER: u8 = 0;
 const OPERAND_KIND_CONST_INDEX: u8 = 1;
@@ -260,6 +341,37 @@ pub fn layout_function(instructions: &[Instruction]) -> Result<FunctionLayout, V
         instr_to_byte_pc.push(byte_pc);
         let mut byte_len = 2_u32;
         for operand in instr.operands.iter() {
+            let operand_len = match operand {
+                Operand::Register(_) => 3,
+                Operand::ConstIndex(_) | Operand::Imm32(_) => 5,
+            };
+            byte_len = byte_len
+                .checked_add(operand_len)
+                .ok_or(VerifyError::FunctionTooLarge)?;
+        }
+        byte_pc = byte_pc
+            .checked_add(byte_len)
+            .ok_or(VerifyError::FunctionTooLarge)?;
+    }
+    Ok(FunctionLayout {
+        total_bytes: byte_pc,
+        instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
+    })
+}
+
+/// Verify authoritative wordcode and calculate its cold serialized byte-PC
+/// layout without creating a byte stream.
+///
+/// # Errors
+/// Returns [`VerifyError`] for invalid wordcode or u32 metadata overflow.
+pub fn layout_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, VerifyError> {
+    verify_wordcode_function(code)?;
+    let mut byte_pc = 0_u32;
+    let mut instr_to_byte_pc = Vec::with_capacity(code.len());
+    for instruction in code {
+        instr_to_byte_pc.push(byte_pc);
+        let mut byte_len = 2_u32;
+        for operand in code.operands(instruction).iter() {
             let operand_len = match operand {
                 Operand::Register(_) => 3,
                 Operand::ConstIndex(_) | Operand::Imm32(_) => 5,
@@ -694,7 +806,7 @@ pub fn decode_instruction(code: &[u8], pc: usize) -> Result<(Instruction, usize)
     let instr = Instruction {
         pc: u32::try_from(pc).expect("pc fits in u32"),
         op,
-        operands: OperandList::from(operands.as_slice()),
+        operands,
     };
     verify_operand_shape(instr.op, instr.operands.as_slice())
         .map_err(|error| DecodeError::InvalidOperandShape { offset: pc, error })?;
@@ -767,7 +879,7 @@ mod tests {
         Instruction {
             pc: 0,
             op,
-            operands: OperandList::from(operands),
+            operands: operands.to_vec(),
         }
     }
 

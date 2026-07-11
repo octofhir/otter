@@ -96,7 +96,7 @@ pub(crate) fn compile_for_of_statement(
     if !is_for_await {
         cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
     }
-    let loop_top = cx.next_pc;
+    let loop_top = cx.next_pc();
     // §14.7.5.6 — materialise fresh per-iteration cells for a captured
     // `let`/`const` head before the next value binds, so each
     // iteration's closures capture distinct bindings.
@@ -346,7 +346,7 @@ pub(crate) fn compile_for_in_statement(
     let done_reg = cx.alloc_scratch();
 
     cx.push_loop_frame(LoopFrame::iteration());
-    let loop_top = cx.next_pc;
+    let loop_top = cx.next_pc();
     // §14.7.5.6 CreatePerIterationEnvironment — fresh cell before the
     // next key binds so closures capture a distinct binding.
     for &idx in &per_iter_upvalues {

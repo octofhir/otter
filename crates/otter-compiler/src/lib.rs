@@ -117,8 +117,9 @@ pub(crate) use ts_erasure::{
 pub(crate) use with_statement::*;
 
 pub(crate) use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction,
-    MappedArgumentBinding, Op, Operand, OperandList, SourceKind as BytecodeSourceKind, SpanEntry,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function,
+    FunctionCodeBuilder, MappedArgumentBinding, Op, Operand, SourceKind as BytecodeSourceKind,
+    SpanEntry,
 };
 pub(crate) use otter_syntax::{
     SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program,

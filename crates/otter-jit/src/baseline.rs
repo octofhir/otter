@@ -7887,6 +7887,13 @@ mod tests {
                 Operand::Register(1),
                 Operand::ConstIndex(8),
                 Operand::Register(2),
+                Operand::Register(3),
+                Operand::Register(4),
+                Operand::Register(5),
+                Operand::Register(6),
+                Operand::Register(7),
+                Operand::Register(8),
+                Operand::Register(9),
             ],
         )]);
         assert!(compile(&v).is_err());

@@ -18,9 +18,8 @@ use crate::*;
 #[derive(Debug)]
 pub(crate) struct FunctionContext {
     pub(crate) module: Rc<RefCell<ModuleBuilder>>,
-    pub(crate) code: Vec<Instruction>,
+    pub(crate) code: FunctionCodeBuilder,
     pub(crate) spans: Vec<SpanEntry>,
-    pub(crate) next_pc: u32,
     pub(crate) scratch: u16,
     /// Stack of lexical scopes. Index 0 is the function-body
     /// scope.
@@ -167,9 +166,8 @@ impl FunctionContext {
     pub(crate) fn new(module: Rc<RefCell<ModuleBuilder>>) -> Self {
         Self {
             module,
-            code: Vec::new(),
+            code: FunctionCodeBuilder::new(),
             spans: Vec::new(),
-            next_pc: 0,
             scratch: 0,
             scopes: Vec::new(),
             is_strict: false,
@@ -494,19 +492,16 @@ impl FunctionContext {
         exc_reg: u16,
         span: (u32, u32),
     ) -> u32 {
-        let pc = self.next_pc;
-        self.code.push(Instruction {
-            pc,
-            op: Op::EnterTry,
-            operands: [
+        let pc = self.next_pc();
+        self.code.push(
+            Op::EnterTry,
+            &[
                 Operand::Imm32(catch_offset),
                 Operand::Imm32(finally_offset),
                 Operand::Register(exc_reg),
-            ]
-            .into(),
-        });
+            ],
+        );
         self.spans.push(SpanEntry { pc, span });
-        self.next_pc += 1;
         pc
     }
 
@@ -517,20 +512,16 @@ impl FunctionContext {
     /// untouched (kept as the `NO_HANDLER_OFFSET` sentinel the
     /// initial emit installed).
     pub(crate) fn patch_enter_try_offset(&mut self, enter_pc: u32, is_catch: bool) {
-        let target = self.next_pc;
+        let target = self.next_pc();
         let offset = target as i64 - (enter_pc as i64 + 1);
         let offset = i32::try_from(offset).expect("EnterTry offset out of i32 range");
-        let instr = self
-            .code
-            .iter_mut()
-            .find(|i| i.pc == enter_pc)
-            .expect("patch target missing");
-        debug_assert!(matches!(instr.op, Op::EnterTry));
+        debug_assert_eq!(self.code.op(enter_pc), Some(Op::EnterTry));
         let slot_idx = if is_catch { 0 } else { 1 };
-        match instr.operands.get_mut(slot_idx) {
-            Some(Operand::Imm32(slot)) => *slot = offset,
-            _ => panic!("EnterTry operand at index {slot_idx} not Imm32"),
-        }
+        assert!(
+            self.code
+                .set_operand(enter_pc, slot_idx, Operand::Imm32(offset)),
+            "EnterTry operand at index {slot_idx} not Imm32"
+        );
     }
 
     /// Emit a placeholder branch and return its instruction index
@@ -541,22 +532,21 @@ impl FunctionContext {
         cond_reg: Option<u16>,
         span: (u32, u32),
     ) -> u32 {
-        let pc = self.next_pc;
+        let pc = self.next_pc();
         let operands = if let Some(reg) = cond_reg {
-            [Operand::Imm32(0), Operand::Register(reg)].into()
+            vec![Operand::Imm32(0), Operand::Register(reg)]
         } else {
-            [Operand::Imm32(0)].into()
+            vec![Operand::Imm32(0)]
         };
-        self.code.push(Instruction { pc, op, operands });
+        self.code.push(op, operands.as_slice());
         self.spans.push(SpanEntry { pc, span });
-        self.next_pc += 1;
         pc
     }
 
     /// Patch a previously emitted branch so it targets the
     /// **current** `next_pc`.
     pub(crate) fn patch_branch_to_here(&mut self, branch_pc: u32) {
-        let target = self.next_pc;
+        let target = self.next_pc();
         self.patch_branch(branch_pc, target);
     }
 
@@ -564,16 +554,10 @@ impl FunctionContext {
     pub(crate) fn patch_branch(&mut self, branch_pc: u32, target_pc: u32) {
         let offset = target_pc as i64 - (branch_pc as i64 + 1);
         let offset = i32::try_from(offset).expect("branch offset out of i32 range");
-        let instr = self
-            .code
-            .iter_mut()
-            .find(|i| i.pc == branch_pc)
-            .expect("patch target missing");
-        if let Some(Operand::Imm32(slot)) = instr.operands.first_mut() {
-            *slot = offset;
-        } else {
-            panic!("patch target operand not Imm32");
-        }
+        assert!(
+            self.code.set_operand(branch_pc, 0, Operand::Imm32(offset)),
+            "patch target operand not Imm32"
+        );
     }
 
     pub(crate) fn intern_string_constant(&mut self, value: &str) -> u32 {
@@ -664,15 +648,15 @@ impl FunctionContext {
         (module.constants.len() - 1) as u32
     }
 
-    pub(crate) fn emit(&mut self, op: Op, operands: impl Into<OperandList>, span: (u32, u32)) {
-        let pc = self.next_pc;
-        self.code.push(Instruction {
-            pc,
-            op,
-            operands: operands.into(),
-        });
+    pub(crate) fn emit(&mut self, op: Op, operands: impl AsRef<[Operand]>, span: (u32, u32)) {
+        let pc = self.next_pc();
+        self.code.push(op, operands.as_ref());
         self.spans.push(SpanEntry { pc, span });
-        self.next_pc += 1;
+    }
+
+    /// Logical PC assigned to the next emitted instruction.
+    pub(crate) fn next_pc(&self) -> u32 {
+        self.code.next_pc()
     }
 
     /// UpdateEmpty(…, undefined) — a composite statement (`if`,
@@ -882,7 +866,7 @@ pub(crate) const VIRTUAL_CAPTURE_BASE: u16 = 0x8000;
 /// direct-eval binding table) to its final absolute position now
 /// that the frame's own-upvalue count is known.
 pub(crate) fn finalize_virtual_capture_indices(
-    code: &mut [otter_bytecode::Instruction],
+    code: &mut otter_bytecode::FunctionCodeBuilder,
     direct_eval_meta: &mut [otter_bytecode::DirectEvalBinding],
     own_count: u16,
 ) {
@@ -894,28 +878,27 @@ pub(crate) fn finalize_virtual_capture_indices(
             v
         }
     };
-    for instr in code.iter_mut() {
-        match instr.op {
+    for pc in 0..code.len() as u32 {
+        match code.op(pc).expect("compiler wordcode instruction") {
             // `FreshUpvalue` only ever targets OWN cells (for-of
             // per-iteration bindings) — never a parent capture.
             Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked => {
-                if let Some(slot) = instr.operands.get_mut(1)
-                    && let Operand::Imm32(v) = *slot
-                {
-                    *slot = Operand::Imm32(remap(v));
+                if let Some(Operand::Imm32(v)) = code.operand(pc, 1) {
+                    assert!(code.set_operand(pc, 1, Operand::Imm32(remap(v))));
                 }
             }
             Op::LoadShadowedUpvalue => {
-                if let Some(slot) = instr.operands.get_mut(2)
-                    && let Operand::Imm32(v) = *slot
-                {
-                    *slot = Operand::Imm32(remap(v));
+                if let Some(Operand::Imm32(v)) = code.operand(pc, 2) {
+                    assert!(code.set_operand(pc, 2, Operand::Imm32(remap(v))));
                 }
             }
             Op::MakeClosure => {
-                for slot in instr.operands.as_mut_slice().iter_mut().skip(3) {
-                    if let Operand::Imm32(v) = *slot {
-                        *slot = Operand::Imm32(remap(v));
+                let operand_count = code
+                    .operand_count(pc)
+                    .expect("MakeClosure instruction operand count");
+                for index in 3..operand_count {
+                    if let Some(Operand::Imm32(v)) = code.operand(pc, index) {
+                        assert!(code.set_operand(pc, index, Operand::Imm32(remap(v))));
                     }
                 }
             }

@@ -189,8 +189,9 @@ mod tests {
                 code: vec![Instruction {
                     pc: 0,
                     op: Op::ReturnUndefined,
-                    operands: Vec::new().into(),
-                }],
+                    operands: Vec::new(),
+                }]
+                .into(),
                 ..Function::default()
             })
             .collect();
@@ -266,15 +267,15 @@ mod tests {
                     Operand::Register(0),
                     Operand::Register(0),
                     Operand::ConstIndex(0),
-                ]
-                .into(),
+                ],
             },
             Instruction {
                 pc: 1,
                 op: Op::ReturnUndefined,
-                operands: Vec::new().into(),
+                operands: Vec::new(),
             },
-        ];
+        ]
+        .into();
         module.constants = vec![Constant::String {
             utf16: "x".encode_utf16().collect(),
         }];

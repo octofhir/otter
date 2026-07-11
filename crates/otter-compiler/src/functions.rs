@@ -277,12 +277,12 @@ pub(crate) fn compile_function_full(
         let self_captures: Vec<u32> = (0..captures.len())
             .map(|idx| child.own_upvalue_count as u32 + idx as u32)
             .collect();
-        let instruction = child
-            .code
-            .get_mut(self_make_idx)
-            .expect("self binding instruction is emitted before body");
-        instruction.op = Op::MakeClosure;
-        instruction.operands = make_closure_operands(tmp, const_idx, &self_captures, span)?.into();
+        let operands = make_closure_operands(tmp, const_idx, &self_captures, span)?;
+        assert!(
+            child
+                .code
+                .replace(self_make_idx as u32, Op::MakeClosure, &operands)
+        );
     }
     crate::function_context::finalize_virtual_capture_indices(
         &mut child.code,
@@ -315,7 +315,7 @@ pub(crate) fn compile_function_full(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
-    slot.code = child.code;
+    slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
 }
@@ -593,7 +593,7 @@ pub(crate) fn compile_arrow_function(
     slot.is_arrow = true;
     slot.direct_eval_bindings = direct_eval_meta;
     slot.contains_direct_eval = contains_direct_eval;
-    slot.code = child.code;
+    slot.code = child.code.finish();
     slot.spans = child.spans;
     Ok((function_id, captures))
 }

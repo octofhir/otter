@@ -231,10 +231,11 @@ pub struct JitCtx {
     backedge_fuel: *mut u64,
 }
 
-impl std::ops::Deref for JitCtx {
-    type Target = VmRuntimeActivation;
-
-    fn deref(&self) -> &Self::Target {
+impl JitCtx {
+    /// VM-owned activation published through the sole machine-visible thread
+    /// pointer. Runtime stubs use this explicitly; emitted code never observes
+    /// its Rust pointers or container types.
+    fn activation(&self) -> &VmRuntimeActivation {
         // SAFETY: runtime-capable contexts point at the VmThread built for the
         // current entry, whose runtime_context retains VmRuntimeActivation.
         unsafe { &*((*self.thread).runtime_context as *const VmRuntimeActivation) }
@@ -381,7 +382,7 @@ pub(crate) extern "C" fn jit_push_native_activation_stub(ctx: *mut JitCtx) -> u6
     // SAFETY: the caller has fully initialized `ctx` on its native stack and
     // keeps it live until the matching pop stub.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     // SAFETY: both fields live inside `ctx`, whose native allocation remains
     // live across the compiled callee's dynamic extent.
     match unsafe {
@@ -403,7 +404,7 @@ pub(crate) extern "C" fn jit_push_native_activation_stub(ctx: *mut JitCtx) -> u6
 pub(crate) extern "C" fn jit_pop_native_activation_stub(ctx: *mut JitCtx) -> u64 {
     // SAFETY: the active context and its interpreter pointer are live by ABI.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     vm.jit_pop_native_activation();
     0
 }
@@ -417,7 +418,7 @@ pub(crate) extern "C" fn jit_inline_closure_upvalues_stub(
 ) -> usize {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     // SAFETY: `callee_reg` comes from a bytecode register operand inside the
     // active frame window.
     let callee_bits = unsafe { *ctx.regs.add(callee_reg as usize) };
@@ -441,9 +442,9 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_prepare_direct_method_call(
@@ -483,8 +484,8 @@ pub(crate) extern "C" fn jit_finish_direct_call_returned_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     match vm.jit_finish_direct_call_returned(
         stack,
         ctx.frame_index,
@@ -508,9 +509,9 @@ pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_finish_direct_call_bailed(
         context,
         stack,
@@ -533,8 +534,8 @@ pub(crate) extern "C" fn jit_abort_direct_call_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     vm.jit_abort_direct_call(stack, callee_frame_index as usize);
     0
 }
@@ -550,9 +551,9 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_self_call_bail(
         context,
         stack,
@@ -586,9 +587,9 @@ pub(crate) extern "C" fn jit_direct_method_call_bail_stub(
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_direct_method_call_bail(
         context,
         stack,
@@ -616,9 +617,9 @@ pub(crate) extern "C" fn jit_direct_method_call_bail_stub(
 extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_runtime_make_function(context, stack, ctx.frame_index, dst as u16, idx as u32) {
         Ok(()) => 0,
         Err(err) => {
@@ -634,10 +635,10 @@ extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
 pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    if ctx.vm.is_null() {
+    if ctx.activation().vm_ptr().is_null() {
         return 0;
     }
-    let vm = unsafe { &mut *ctx.vm };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     match vm.jit_backedge_poll() {
         Ok(()) => 0,
         Err(err) => {
@@ -717,8 +718,8 @@ extern "C" fn jit_load_prop_window_stub(
     // SAFETY: the live `JitCtx` reentry contract; `ctx.regs` is the GC-traced
     // register window of the executing (framed or frameless) callee.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match unsafe {
         vm.jit_runtime_load_property_window(
             context,
@@ -764,8 +765,8 @@ extern "C" fn jit_store_prop_window_stub(
 ) -> u64 {
     // SAFETY: as `jit_load_prop_window_stub`.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match unsafe {
         vm.jit_runtime_store_property_window(
             context,
@@ -802,8 +803,8 @@ extern "C" fn jit_store_prop_window_stub(
 extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     vm.jit_runtime_write_barrier(stack, ctx.frame_index, obj as u16, src as u16);
     0
 }
@@ -814,7 +815,7 @@ extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u6
 extern "C" fn jit_write_barrier_window_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract; `ctx.regs` is GC-traced.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     unsafe { vm.jit_runtime_write_barrier_window(ctx.regs, obj as u16, src as u16) };
     0
 }
@@ -825,9 +826,9 @@ extern "C" fn jit_write_barrier_window_stub(ctx: *mut JitCtx, obj: u64, src: u64
 extern "C" fn jit_load_element_stub(ctx: *mut JitCtx, dst: u64, recv: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_runtime_load_element(
         context,
         stack,
@@ -856,9 +857,9 @@ extern "C" fn jit_load_global_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_runtime_load_global(
         context,
         stack,
@@ -882,8 +883,8 @@ extern "C" fn jit_load_global_stub(
 extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     match vm.jit_runtime_load_upvalue(stack, ctx.frame_index, dst as u16, idx as i32) {
         Ok(()) => 0,
         Err(err) => {
@@ -899,8 +900,8 @@ extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64
 extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     match vm.jit_runtime_store_upvalue(stack, ctx.frame_index, src as u16, idx as i32) {
         Ok(()) => 0,
         Err(err) => {
@@ -916,8 +917,8 @@ extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u6
 extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     match vm.jit_runtime_new_object(stack, ctx.frame_index, dst as u16) {
         Ok(()) => 0,
         Err(err) => {
@@ -946,8 +947,8 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     let status = match vm.jit_runtime_try_collection_method_ic(
@@ -982,9 +983,9 @@ extern "C" fn jit_store_element_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_runtime_store_element(
         context,
         stack,
@@ -1182,21 +1183,22 @@ pub(crate) unsafe fn enter_compiled(
     safepoint_records: &[SafepointRecord],
 ) -> JitExecOutcome {
     {
-        let stack = activation.stack.cast::<HoltStack>();
-        let vm = activation.vm.cast::<Interpreter>();
-        // SAFETY: `activation.stack` is a valid `*mut HoltStack` for this call.
-        let regs = Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, activation.frame_index);
-        // SAFETY: `activation.vm`/`activation.stack` are valid for this call and not aliased
+        let stack = activation.stack_ptr().cast::<HoltStack>();
+        let vm = activation.vm_ptr().cast::<Interpreter>();
+        // SAFETY: `activation.stack_ptr()` is a valid `*mut HoltStack` for this call.
+        let regs =
+            Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, activation.frame_index());
+        // SAFETY: `activation.vm_ptr()`/`activation.stack_ptr()` are valid for this call and not aliased
         // by a live `&mut` (the VM froze its borrows); read the self closure up
         // front so a `MakeFunction`-of-self needs no Rust round-trip.
         let self_closure =
-            unsafe { (*vm).jit_frame_self_closure_bits(&*stack, activation.frame_index) };
+            unsafe { (*vm).jit_frame_self_closure_bits(&*stack, activation.frame_index()) };
         // SAFETY: same validity/aliasing contract as `self_closure` above.
-        let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, activation.frame_index) };
+        let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, activation.frame_index()) };
         // SAFETY: same validity/aliasing contract; the spine `Box` outlives this
         // entry (frame-owned), and the cells it holds are old-space (immobile).
         let upvalues_ptr =
-            Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, activation.frame_index);
+            Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, activation.frame_index());
         // SAFETY: `vm` is a valid `*mut Interpreter` for this entry and not
         // aliased by a live `&mut` (the VM froze its borrows); these return the
         // stable base / `reg_top` address of the flat JIT register stack.
@@ -1260,7 +1262,7 @@ pub(crate) unsafe fn enter_compiled(
             this_value,
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
-            frame_index: activation.frame_index,
+            frame_index: activation.frame_index(),
             upvalues_ptr,
             bail_pc: 0,
             error: &mut error,

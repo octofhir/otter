@@ -33,8 +33,8 @@ fn park_result(ctx: &mut JitCtx, result: Result<(), VmError>) -> u64 {
 pub(super) extern "C" fn jit_add_stub(ctx: *mut JitCtx, dst: u64, lhs: u64, rhs: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let result = vm.jit_runtime_add(stack, ctx.frame_index, dst as u16, lhs as u16, rhs as u16);
     park_result(ctx, result)
 }
@@ -46,8 +46,8 @@ pub(super) extern "C" fn jit_store_upvalue_checked_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let result =
         vm.jit_runtime_store_upvalue_checked(stack, ctx.frame_index, src as u16, idx as u32 as i32);
     park_result(ctx, result)
@@ -61,9 +61,9 @@ pub(super) extern "C" fn jit_load_string_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let result = vm.jit_runtime_load_string(
         context,
         stack,
@@ -83,9 +83,9 @@ pub(super) extern "C" fn jit_define_data_property_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let result = vm.jit_runtime_define_data_property(
         context,
         stack,
@@ -100,8 +100,8 @@ pub(super) extern "C" fn jit_define_data_property_stub(
 pub(super) extern "C" fn jit_fresh_upvalue_stub(ctx: *mut JitCtx, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let result = vm.jit_runtime_fresh_upvalue(stack, ctx.frame_index, idx as u32 as i32);
     park_result(ctx, result)
 }
@@ -113,9 +113,9 @@ pub(super) extern "C" fn jit_load_builtin_error_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let result = vm.jit_runtime_load_builtin_error(
         context,
         stack,
@@ -129,8 +129,8 @@ pub(super) extern "C" fn jit_load_builtin_error_stub(
 pub(super) extern "C" fn jit_neg_stub(ctx: *mut JitCtx, dst: u64, src: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let result = vm.jit_runtime_neg(stack, ctx.frame_index, dst as u16, src as u16);
     park_result(ctx, result)
 }
@@ -143,9 +143,9 @@ pub(super) extern "C" fn jit_define_own_property_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let result = vm.jit_runtime_define_own_property(
         context,
         stack,
@@ -167,9 +167,9 @@ pub(super) extern "C" fn jit_make_closure_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract and immutable metadata owner.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let parent_indices =
         unsafe { std::slice::from_raw_parts(parent_indices, parent_count as usize) };
     let result = vm.jit_runtime_make_closure(
@@ -193,9 +193,9 @@ pub(super) extern "C" fn jit_math_call_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract and immutable metadata owner.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
-    let context = unsafe { &*ctx.context };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
     let argument_regs =
         unsafe { std::slice::from_raw_parts(argument_regs, argument_count as usize) };
     let result = vm.jit_runtime_math_call(
@@ -217,8 +217,8 @@ pub(super) extern "C" fn jit_new_array_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract and immutable metadata owner.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.vm };
-    let stack = unsafe { &mut *ctx.stack };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let source_regs = unsafe { std::slice::from_raw_parts(source_regs, source_count as usize) };
     let result = vm.jit_runtime_new_array(stack, ctx.frame_index, dst as u16, source_regs);
     park_result(ctx, result)

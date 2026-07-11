@@ -907,13 +907,65 @@ pub struct JitResumeFrame {
 #[derive(Clone, Copy)]
 pub struct VmRuntimeActivation {
     /// Owning interpreter.
-    pub vm: *mut crate::Interpreter,
+    vm: *mut crate::Interpreter,
     /// Active stable-address frame stack.
-    pub stack: *mut crate::HoltStack,
+    stack: *mut crate::HoltStack,
     /// Linked execution context.
-    pub context: *const crate::ExecutionContext,
+    context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
-    pub frame_index: usize,
+    frame_index: usize,
+}
+
+impl VmRuntimeActivation {
+    /// Publish one synchronous compiled activation from live VM borrows.
+    pub(crate) fn new(
+        vm: &mut crate::Interpreter,
+        stack: &mut crate::HoltStack,
+        context: &crate::ExecutionContext,
+        frame_index: usize,
+    ) -> Self {
+        Self {
+            vm,
+            stack,
+            context,
+            frame_index,
+        }
+    }
+
+    /// Owning interpreter address. Dereferencing requires the activation's
+    /// dynamic non-aliasing contract.
+    #[must_use]
+    pub const fn vm_ptr(self) -> *mut crate::Interpreter {
+        self.vm
+    }
+
+    /// Active stable-address frame-stack address.
+    #[must_use]
+    pub const fn stack_ptr(self) -> *mut crate::HoltStack {
+        self.stack
+    }
+
+    /// Linked execution-context address.
+    #[must_use]
+    pub const fn context_ptr(self) -> *const crate::ExecutionContext {
+        self.context
+    }
+
+    /// Executing frame index.
+    #[must_use]
+    pub const fn frame_index(self) -> usize {
+        self.frame_index
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(vm: *mut crate::Interpreter) -> Self {
+        Self {
+            vm,
+            stack: std::ptr::null_mut(),
+            context: std::ptr::null(),
+            frame_index: 0,
+        }
+    }
 }
 
 const _: [(); 32] = [(); std::mem::size_of::<VmRuntimeActivation>()];

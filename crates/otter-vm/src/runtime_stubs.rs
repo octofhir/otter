@@ -1197,7 +1197,7 @@ fn alloc_interpreter_mut(ctx: &RuntimeStubAllocContext) -> Option<&'static mut I
     }
     // SAFETY: `runtime_context` is published from a live VmRuntimeActivation value.
     let reentry = unsafe { &*(thread.runtime_context as *const crate::jit::VmRuntimeActivation) };
-    interpreter_mut(reentry.vm.cast())
+    interpreter_mut(reentry.vm_ptr().cast())
 }
 
 unsafe fn alloc_value_stub_call_roots<'a>(
@@ -1273,12 +1273,7 @@ mod tests {
             context: std::ptr::from_ref(active) as u64,
             resolve_safepoint: resolve_test_safepoint as *const () as u64,
         }));
-        let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation {
-            vm,
-            stack: std::ptr::null_mut(),
-            context: std::ptr::null(),
-            frame_index: 0,
-        }));
+        let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation::for_test(vm)));
         let frame = Box::leak(Box::new(NativeFrame {
             header: NativeFrameHeader {
                 previous_frame: 0,

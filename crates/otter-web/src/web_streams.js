@@ -419,41 +419,49 @@
   def('WritableStreamDefaultController', WritableStreamDefaultController);
 
   // ---- TransformStream ----
+  // The controller is the spec-shaped interface (§TransformStreamDefaultController)
+  // the transformer's start/transform/flush receive; it forwards to the
+  // readable side's controller. No public constructor.
+  const TC = Symbol('readableController');
+  class TransformStreamDefaultController {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get desiredSize() { return this[TC].desiredSize; }
+    enqueue(chunk) { this[TC].enqueue(chunk); }
+    error(reason) { this[TC].error(reason); }
+    terminate() { try { this[TC].close(); } catch (_) { /* already closed */ } }
+  }
+  Object.defineProperty(TransformStreamDefaultController.prototype, Symbol.toStringTag,
+    { value: 'TransformStreamDefaultController', configurable: true });
+
   class TransformStream {
     constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
       const t = transformer || {};
-      let readableController;
+      const controller = Object.create(TransformStreamDefaultController.prototype);
       this.readable = new ReadableStream({
-        start(controller) { readableController = controller; },
+        start(readableController) { controller[TC] = readableController; },
         cancel() {},
       }, readableStrategy);
-      const enqueue = (chunk) => readableController.enqueue(chunk);
-      const transformController = {
-        enqueue,
-        terminate() { try { readableController.close(); } catch (_) {} },
-        error(e) { readableController.error(e); },
-        get desiredSize() { return readableController.desiredSize; },
-      };
       this.writable = new WritableStream({
         start() {
-          if (typeof t.start === 'function') return t.start(transformController);
+          if (typeof t.start === 'function') return t.start(controller);
         },
         write(chunk) {
-          if (typeof t.transform === 'function') return t.transform(chunk, transformController);
-          enqueue(chunk);
+          if (typeof t.transform === 'function') return t.transform(chunk, controller);
+          controller.enqueue(chunk);
         },
         close() {
           const flush = typeof t.flush === 'function'
-            ? Promise.resolve(t.flush(transformController)) : Promise.resolve();
-          return flush.then(() => { try { readableController.close(); } catch (_) {} });
+            ? Promise.resolve(t.flush(controller)) : Promise.resolve();
+          return flush.then(() => controller.terminate());
         },
-        abort(reason) { readableController.error(reason); },
+        abort(reason) { controller.error(reason); },
       }, writableStrategy);
     }
   }
   Object.defineProperty(TransformStream.prototype, Symbol.toStringTag,
     { value: 'TransformStream', configurable: true });
   def('TransformStream', TransformStream);
+  def('TransformStreamDefaultController', TransformStreamDefaultController);
 
   // ---- TextEncoderStream / TextDecoderStream ----
   class TextEncoderStream extends TransformStream {

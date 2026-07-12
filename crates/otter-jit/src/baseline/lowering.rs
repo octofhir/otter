@@ -1,0 +1,132 @@
+//! Backend-neutral baseline lowering rules and operand decoding.
+//!
+//! # Contents
+//! - Whole-function fallback reasons shared by baseline backends.
+//! - Call-site argument packing policy.
+//! - Typed bytecode operand decoding and branch/register validation.
+//!
+//! # Invariants
+//! - Invalid bytecode shapes reject the whole baseline compilation.
+//! - Decoding never invents defaults for missing or mismatched operands.
+//! - Register offsets fit the baseline backend's unsigned scaled addressing.
+//!
+//! # See also
+//! - [`super::arm64`], the first machine-code consumer of these rules.
+
+use otter_bytecode::{Op, Operand};
+
+/// Largest argument count the `Call` emitter inlines.
+pub(crate) const MAX_INLINE_ARGS: usize = 4;
+
+/// Largest argument count a `CallMethodValue` site passes inline.
+///
+/// Argument register indices occupy one 16-bit lane each in a single word.
+pub(crate) const MAX_METHOD_ARGS: usize = 4;
+
+/// Why a function could not be baseline-compiled.
+///
+/// Every variant maps to a silent interpreter fallback and is never exposed as
+/// a JavaScript error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unsupported {
+    /// An opcode outside the supported subset.
+    Opcode(Op),
+    /// An operand whose kind/shape baseline lowering does not handle.
+    OperandShape(&'static str),
+    /// A branch whose logical target does not name an instruction boundary.
+    BranchTarget(i64),
+    /// A register index whose byte offset exceeds inline load/store addressing.
+    RegisterRange(u16),
+    /// A call with more arguments than baseline lowering inlines.
+    ArgCount(usize),
+}
+
+/// Pack method-call argument register indices into one word.
+pub(crate) fn pack_method_arg_regs(arg_regs: &[u16]) -> u64 {
+    let mut packed = 0u64;
+    for (slot, &areg) in arg_regs.iter().take(MAX_METHOD_ARGS).enumerate() {
+        packed |= u64::from(areg) << (16 * slot);
+    }
+    packed
+}
+
+/// Unpack method-call argument register indices from one word.
+pub(crate) fn unpack_method_arg_regs(packed: u64) -> [u16; MAX_METHOD_ARGS] {
+    [
+        (packed & 0xffff) as u16,
+        ((packed >> 16) & 0xffff) as u16,
+        ((packed >> 32) & 0xffff) as u16,
+        ((packed >> 48) & 0xffff) as u16,
+    ]
+}
+
+/// Byte offset of register `idx` within the register array.
+pub(crate) fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
+    let off = u32::from(idx) * 8;
+    if off > 32760 {
+        return Err(Unsupported::RegisterRange(idx));
+    }
+    Ok(off)
+}
+
+/// Target canonical instruction PC of a relative branch.
+pub(crate) fn branch_target(
+    code_block: &otter_vm::CodeBlock,
+    instr: &otter_vm::JitInstructionMetadata,
+    rel: i32,
+) -> i64 {
+    i64::from(instr.instruction_pc(code_block)) + 1 + i64::from(rel)
+}
+
+pub(crate) trait WordOperands: Copy {
+    fn get(self, index: usize) -> Option<Operand>;
+}
+
+impl WordOperands for otter_vm::OperandView<'_> {
+    fn get(self, index: usize) -> Option<Operand> {
+        self.get(index)
+    }
+}
+
+impl WordOperands for &[Operand] {
+    fn get(self, index: usize) -> Option<Operand> {
+        <[Operand]>::get(self, index).copied()
+    }
+}
+
+impl<const N: usize> WordOperands for &[Operand; N] {
+    fn get(self, index: usize) -> Option<Operand> {
+        self.as_slice().get(index).copied()
+    }
+}
+
+pub(crate) fn reg(operands: impl WordOperands, i: usize) -> Result<u16, Unsupported> {
+    match operands.get(i) {
+        Some(Operand::Register(r)) => Ok(r),
+        _ => Err(Unsupported::OperandShape("expected register")),
+    }
+}
+
+pub(crate) fn imm32(operands: impl WordOperands, i: usize) -> Result<i32, Unsupported> {
+    match operands.get(i) {
+        Some(Operand::Imm32(v)) => Ok(v),
+        _ => Err(Unsupported::OperandShape("expected imm32")),
+    }
+}
+
+/// Decode a local index carried by an inline immediate.
+pub(crate) fn local_index(operands: impl WordOperands, i: usize) -> Result<u16, Unsupported> {
+    u16::try_from(imm32(operands, i)?).map_err(|_| Unsupported::OperandShape("local index"))
+}
+
+/// Decode a constant-pool index operand.
+pub(crate) fn const_index(operands: impl WordOperands, i: usize) -> Result<u32, Unsupported> {
+    match operands.get(i) {
+        Some(Operand::ConstIndex(n)) => Ok(n),
+        _ => Err(Unsupported::OperandShape("expected const index")),
+    }
+}
+
+pub(crate) fn reg3(operands: impl WordOperands) -> Result<(u16, u16, u16), Unsupported> {
+    Ok((reg(operands, 0)?, reg(operands, 1)?, reg(operands, 2)?))
+}

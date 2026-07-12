@@ -39,7 +39,7 @@
 // intentionally redundant and outside the source-level emitter's control.
 #![allow(clippy::useless_conversion)]
 
-use otter_bytecode::{Op, Operand};
+use otter_bytecode::Op;
 use otter_vm::{
     HoltStack, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFunctionCode, SafepointRecord,
     Value, VmError, VmRuntimeActivation,
@@ -52,9 +52,12 @@ use otter_vm::{
 use crate::CompiledCode;
 
 mod abi;
+mod lowering;
 mod runtime_ops;
 mod value_abi;
 use abi::*;
+pub use lowering::Unsupported;
+use lowering::*;
 use runtime_ops::*;
 pub(crate) use value_abi::*;
 
@@ -68,54 +71,6 @@ pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// resolved method's `function_id` so a native callable cell is never misread
 /// as a bytecode closure.
 pub(crate) const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
-/// Largest argument count the `Call` emitter inlines (args passed in registers
-/// to the call stub). Functions called with more args fall back.
-const MAX_INLINE_ARGS: usize = 4;
-
-/// Largest argument count a `CallMethodValue` site passes inline. The emitter
-/// packs the argument *register indices* one per 16-bit lane of a single word,
-/// so a full method-call stub needs only one register for all of them (leaving
-/// room in the C ABI's eight argument registers); raising this past 4 needs a
-/// second packed word.
-pub(crate) const MAX_METHOD_ARGS: usize = 4;
-
-/// Pack up to [`MAX_METHOD_ARGS`] argument register indices into one word (one
-/// per 16-bit lane), the form the method-call stubs receive.
-pub(crate) fn pack_method_arg_regs(arg_regs: &[u16]) -> u64 {
-    let mut packed = 0u64;
-    for (slot, &areg) in arg_regs.iter().take(MAX_METHOD_ARGS).enumerate() {
-        packed |= u64::from(areg) << (16 * slot);
-    }
-    packed
-}
-
-/// Unpack the [`MAX_METHOD_ARGS`] argument register indices a method-call stub
-/// received (one per 16-bit lane).
-fn unpack_method_arg_regs(packed: u64) -> [u16; MAX_METHOD_ARGS] {
-    [
-        (packed & 0xffff) as u16,
-        ((packed >> 16) & 0xffff) as u16,
-        ((packed >> 32) & 0xffff) as u16,
-        ((packed >> 48) & 0xffff) as u16,
-    ]
-}
-
-/// Why a function could not be baseline-compiled. Always maps to a silent
-/// interpreter fallback; never a JS-visible error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unsupported {
-    /// An opcode outside the supported subset.
-    Opcode(Op),
-    /// An operand whose kind/shape the emitter does not handle here.
-    OperandShape(&'static str),
-    /// A branch whose logical target does not name an instruction boundary.
-    BranchTarget(i64),
-    /// A register index whose byte offset exceeds the inline load/store range.
-    RegisterRange(u16),
-    /// A `Call` with more arguments than the emitter inlines.
-    ArgCount(usize),
-}
-
 /// Finalized baseline machine code for one function.
 pub struct BaselineCode {
     code: CompiledCode,
@@ -402,18 +357,6 @@ pub(crate) unsafe fn enter_compiled(
     }
 }
 
-/// Byte offset of register `idx` within the register array.
-///
-/// Returns `Err` when the offset exceeds the unsigned-offset `ldr`/`str` range
-/// (scaled imm12 → max element index 4095), which no real frame reaches.
-fn reg_offset(idx: u16) -> Result<u32, Unsupported> {
-    let off = u32::from(idx) * 8;
-    if off > 32760 {
-        return Err(Unsupported::RegisterRange(idx));
-    }
-    Ok(off)
-}
-
 fn refresh_jit_collection_method_ics(ctx: &mut JitCtx, vm: &Interpreter) {
     ctx.collection_method_ics = vm.jit_collection_method_ics_ptr();
     ctx.collection_method_ic_count = vm.jit_collection_method_ics_len();
@@ -446,13 +389,15 @@ pub(crate) mod arm64 {
         FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET,
         JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS,
         NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16,
-        OBJECT_BODY_TYPE_TAG, Op, Operand, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
+        OBJECT_BODY_TYPE_TAG, Op, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
         RESUME_PC_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
         SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THIS_VALUE_OFFSET, THREAD_OFFSET,
         UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE,
         VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WhiskerIcCell,
-        alloc_value_stub_trampoline_pair, jit_abort_direct_call_stub, jit_add_stub,
-        jit_backedge_poll_stub, jit_call_collection_method_ic_stub, jit_define_data_property_stub,
+        WordOperands,
+        alloc_value_stub_trampoline_pair, branch_target, const_index, imm32,
+        jit_abort_direct_call_stub, jit_add_stub, jit_backedge_poll_stub,
+        jit_call_collection_method_ic_stub, jit_define_data_property_stub,
         jit_define_own_property_stub, jit_direct_method_call_bail_stub,
         jit_finish_direct_call_bailed_stub, jit_finish_direct_call_returned_stub,
         jit_fresh_upvalue_stub, jit_inline_closure_upvalues_stub, jit_load_builtin_error_stub,
@@ -463,7 +408,7 @@ pub(crate) mod arm64 {
         jit_push_native_activation_stub, jit_self_call_bail_stub, jit_store_element_stub,
         jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
         jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-        otter_jit_math_random, pack_method_arg_regs, reg_offset, value_tag,
+        local_index, otter_jit_math_random, pack_method_arg_regs, reg, reg_offset, reg3, value_tag,
     };
     use crate::CompiledCode;
     use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -6168,68 +6113,6 @@ pub(crate) mod arm64 {
             ; str x13, [x19, dst_off]
             ; b =>el_done
         );
-    }
-
-    /// Target canonical instruction PC of a relative branch.
-    fn branch_target(
-        code_block: &otter_vm::CodeBlock,
-        instr: &otter_vm::JitInstructionMetadata,
-        rel: i32,
-    ) -> i64 {
-        i64::from(instr.instruction_pc(code_block)) + 1 + i64::from(rel)
-    }
-
-    trait WordOperands: Copy {
-        fn get(self, index: usize) -> Option<Operand>;
-    }
-
-    impl WordOperands for otter_vm::OperandView<'_> {
-        fn get(self, index: usize) -> Option<Operand> {
-            self.get(index)
-        }
-    }
-
-    impl WordOperands for &[Operand] {
-        fn get(self, index: usize) -> Option<Operand> {
-            <[Operand]>::get(self, index).copied()
-        }
-    }
-
-    impl<const N: usize> WordOperands for &[Operand; N] {
-        fn get(self, index: usize) -> Option<Operand> {
-            self.as_slice().get(index).copied()
-        }
-    }
-
-    fn reg(operands: impl WordOperands, i: usize) -> Result<u16, Unsupported> {
-        match operands.get(i) {
-            Some(Operand::Register(r)) => Ok(r),
-            _ => Err(Unsupported::OperandShape("expected register")),
-        }
-    }
-
-    fn imm32(operands: impl WordOperands, i: usize) -> Result<i32, Unsupported> {
-        match operands.get(i) {
-            Some(Operand::Imm32(v)) => Ok(v),
-            _ => Err(Unsupported::OperandShape("expected imm32")),
-        }
-    }
-
-    /// A local index encoded as an inline immediate (`LoadLocal`/`StoreLocal`).
-    fn local_index(operands: impl WordOperands, i: usize) -> Result<u16, Unsupported> {
-        u16::try_from(imm32(operands, i)?).map_err(|_| Unsupported::OperandShape("local index"))
-    }
-
-    /// A constant-pool index operand (`MakeFunction` body id, `Call` argc).
-    fn const_index(operands: impl WordOperands, i: usize) -> Result<u32, Unsupported> {
-        match operands.get(i) {
-            Some(Operand::ConstIndex(n)) => Ok(n),
-            _ => Err(Unsupported::OperandShape("expected const index")),
-        }
-    }
-
-    fn reg3(operands: impl WordOperands) -> Result<(u16, u16, u16), Unsupported> {
-        Ok((reg(operands, 0)?, reg(operands, 1)?, reg(operands, 2)?))
     }
 }
 

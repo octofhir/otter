@@ -40,7 +40,6 @@
 #![allow(clippy::useless_conversion)]
 
 use otter_bytecode::{Op, Operand};
-pub(crate) use otter_vm::value::tag as value_tag;
 use otter_vm::{
     HoltStack, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFunctionCode,
     RuntimeStubAllocContext, SafepointRecord, Value, VmError, VmRuntimeActivation,
@@ -53,59 +52,14 @@ use otter_vm::{
 use crate::CompiledCode;
 
 mod runtime_ops;
+mod value_abi;
 use runtime_ops::{
     jit_add_stub, jit_define_data_property_stub, jit_define_own_property_stub,
     jit_fresh_upvalue_stub, jit_load_builtin_error_stub, jit_load_string_stub,
     jit_make_closure_stub, jit_math_call_stub, jit_neg_stub, jit_new_array_stub,
     jit_store_upvalue_checked_stub,
 };
-
-// The compiled value encoding is single-sourced from the frozen
-// `otter_vm::value::tag` constants: emitted box / unbox / tag-test code bakes
-// these exact bit patterns, and the `debug_assert!`s below trip if the frozen
-// layout is ever edited out from under the codegen.
-//
-// A `Value` is one tagged 64-bit word: an int32 carries `NUMBER_TAG` in its
-// high bits with the payload in the low 32; a double is its IEEE bits plus
-// `DOUBLE_ENCODE_OFFSET`; a heap cell is a bare 4 GiB-cage offset (top 16 bits
-// zero, `OTHER_TAG` clear); the immediates `null` / `false` / `true` /
-// `undefined` / hole and the closure-less function id are small `OTHER_TAG`
-// patterns. Cell-class disambiguation (object vs closure vs string) is by the
-// GC header type tag, never by the value word.
-
-/// High 16 bits of [`value_tag::NUMBER_TAG`] — `movz Xd, NUMBER_TAG_HI16, lsl #48`
-/// materializes the number tag in one instruction (its low 48 bits are zero).
-pub(crate) const NUMBER_TAG_HI16: u32 = (value_tag::NUMBER_TAG >> 48) as u32;
-/// High 16 bits of [`value_tag::DOUBLE_ENCODE_OFFSET`] (`0x0002`), added when
-/// boxing a double and subtracted when unboxing.
-pub(crate) const DOUBLE_OFFSET_HI16: u32 = (value_tag::DOUBLE_ENCODE_OFFSET >> 48) as u32;
-/// High 16 bits of [`value_tag::CANONICAL_NAN`] (`0x7ff8`) — every boxed NaN
-/// canonicalises to this before the double offset is applied.
-pub(crate) const CANONICAL_NAN_HI16: u32 = (value_tag::CANONICAL_NAN >> 48) as u32;
-/// `null` immediate (full value word).
-pub(crate) const VALUE_NULL: u64 = value_tag::VALUE_NULL;
-/// `false` immediate (full value word). A boolean boxes as
-/// `VALUE_FALSE + (cond as 0|1)`, i.e. `VALUE_FALSE` / `VALUE_TRUE`.
-pub(crate) const VALUE_FALSE: u64 = value_tag::VALUE_FALSE;
-/// Low 32 bits of [`VALUE_FALSE`] — the bare-`u32` immediate a `cset`+`add`
-/// boolean box folds in (an `add` immediate is not a logical-immediate cast).
-pub(crate) const VALUE_FALSE_LOW: u32 = value_tag::VALUE_FALSE as u32;
-/// `true` immediate (full value word).
-pub(crate) const VALUE_TRUE: u64 = value_tag::VALUE_TRUE;
-/// `undefined` immediate (full value word).
-pub(crate) const VALUE_UNDEFINED: u64 = value_tag::VALUE_UNDEFINED;
-/// Internal array / `this` hole sentinel (full value word).
-pub(crate) const VALUE_HOLE: u64 = value_tag::VALUE_HOLE;
-/// Low 16 bits selecting the closure-less function-id immediate; the function
-/// id sits in bits `[16, 48)`, so a value boxes as `(fid << 16) | FUNCTION_ID_TAG`
-/// and an inline call site guards identity by comparing the callee word to that
-/// exact immediate.
-pub(crate) const FUNCTION_ID_TAG: u64 = value_tag::FUNCTION_ID_TAG;
-
-const _: () = assert!(value_tag::NUMBER_TAG == 0xfffe_0000_0000_0000);
-const _: () = assert!(value_tag::DOUBLE_ENCODE_OFFSET == 0x0002_0000_0000_0000);
-const _: () = assert!(value_tag::NOT_CELL_MASK == value_tag::NUMBER_TAG | value_tag::OTHER_TAG);
-const _: () = assert!(value_tag::CANONICAL_NAN == 0x7ff8_0000_0000_0000);
+pub(crate) use value_abi::*;
 
 /// GC header type tag for an ordinary `ObjectBody` (mirrors
 /// `otter_vm::object::OBJECT_BODY_TYPE_TAG`). A heap cell is disambiguated by

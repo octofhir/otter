@@ -90,14 +90,152 @@ pub fn compile(
 
 /// JIT-owned runtime transitions installed into the isolate entry table at
 /// compiler-hook install. Each binding names its VM descriptor id and
-/// signature family; the VM validates the pairing before installation.
+/// signature family; the VM validates the pairing before installation and
+/// rejects an installation that leaves any inventory slot vacant, so this
+/// table is the complete machine inventory of baseline transition entries.
 pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
-    let descriptor = otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL;
-    vec![otter_vm::JitRuntimeStubBinding {
-        id: descriptor.id,
-        signature: descriptor.signature,
-        entry_addr: jit_backedge_poll_stub as *const () as usize,
-    }]
+    use otter_vm::native_abi as abi;
+    let binding = |descriptor: abi::RuntimeStubDescriptor,
+                   entry_addr: usize|
+     -> otter_vm::JitRuntimeStubBinding {
+        otter_vm::JitRuntimeStubBinding {
+            id: descriptor.id,
+            signature: descriptor.signature,
+            entry_addr,
+        }
+    };
+    vec![
+        binding(
+            abi::STUB_JIT_BACKEDGE_POLL,
+            jit_backedge_poll_stub as *const () as usize,
+        ),
+        binding(abi::STUB_JIT_ADD, jit_add_stub as *const () as usize),
+        binding(abi::STUB_JIT_NEG, jit_neg_stub as *const () as usize),
+        binding(
+            abi::STUB_JIT_MATH_CALL,
+            jit_math_call_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_LOAD_GLOBAL,
+            jit_load_global_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_LOAD_ELEMENT,
+            jit_load_element_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_STORE_ELEMENT,
+            jit_store_element_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_DEFINE_OWN_PROPERTY,
+            jit_define_own_property_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_COLLECTION_METHOD_IC,
+            jit_call_collection_method_ic_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_FINISH_DIRECT_CALL_BAILED,
+            jit_finish_direct_call_bailed_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_SELF_CALL_BAIL,
+            jit_self_call_bail_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_LOAD_PROP_WINDOW,
+            jit_load_prop_window_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_STORE_PROP_WINDOW,
+            jit_store_prop_window_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_DEFINE_DATA_PROPERTY,
+            jit_define_data_property_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_LOAD_STRING,
+            jit_load_string_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_LOAD_BUILTIN_ERROR,
+            jit_load_builtin_error_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_MAKE_FN,
+            jit_make_fn_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_MAKE_CLOSURE,
+            jit_make_closure_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_NEW_OBJECT,
+            jit_new_object_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_NEW_ARRAY,
+            jit_new_array_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_FRESH_UPVALUE,
+            jit_fresh_upvalue_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_PREPARE_DIRECT_CALL,
+            jit_prepare_direct_call_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
+            jit_prepare_direct_method_call_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_PUSH_NATIVE_ACTIVATION,
+            jit_push_native_activation_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_POP_NATIVE_ACTIVATION,
+            jit_pop_native_activation_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_ABORT_DIRECT_CALL,
+            jit_abort_direct_call_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_FINISH_DIRECT_CALL_RETURNED,
+            jit_finish_direct_call_returned_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_LOAD_UPVALUE,
+            jit_load_upvalue_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_STORE_UPVALUE,
+            jit_store_upvalue_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_STORE_UPVALUE_CHECKED,
+            jit_store_upvalue_checked_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_WRITE_BARRIER,
+            jit_write_barrier_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_WRITE_BARRIER_WINDOW,
+            jit_write_barrier_window_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_INLINE_CLOSURE_UPVALUES,
+            jit_inline_closure_upvalues_stub as *const () as usize,
+        ),
+        binding(
+            abi::STUB_JIT_MATH_RANDOM,
+            otter_jit_math_random as *const () as usize,
+        ),
+    ]
 }
 
 /// Non-arm64 stub: the emitter is arm64-only for now.
@@ -163,6 +301,31 @@ mod tests {
         view.heap_number_bits_byte = 8;
         view.closure_fid_byte = 8;
         view
+    }
+
+    #[test]
+    fn transition_bindings_cover_the_descriptor_inventory() {
+        use otter_vm::native_abi::{RUNTIME_STUB_DESCRIPTORS, RuntimeStubSignature};
+        let bindings = super::runtime_stub_bindings();
+        let mut seen = std::collections::BTreeSet::new();
+        for binding in &bindings {
+            assert!(seen.insert(binding.id), "duplicate binding {}", binding.id);
+            let descriptor = RUNTIME_STUB_DESCRIPTORS[binding.id as usize - 1];
+            assert_eq!(descriptor.id, binding.id);
+            assert_eq!(descriptor.signature, binding.signature);
+            assert_ne!(binding.entry_addr, 0);
+        }
+        // Exactly the JIT-owned slots (everything the VM phase leaves vacant).
+        let jit_owned = RUNTIME_STUB_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| {
+                !matches!(
+                    descriptor.signature,
+                    RuntimeStubSignature::LeafValue2 | RuntimeStubSignature::AllocValue3
+                )
+            })
+            .count();
+        assert_eq!(bindings.len(), jit_owned);
     }
 
     #[test]

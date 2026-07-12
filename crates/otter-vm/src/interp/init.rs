@@ -192,7 +192,7 @@ impl Interpreter {
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
             jit_call_counts: rustc_hash::FxHashMap::default(),
-            jit_method_site_feedback: rustc_hash::FxHashMap::default(),
+            jit_method_site_feedback: Vec::new(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
             jit_entry_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),

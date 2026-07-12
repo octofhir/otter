@@ -714,6 +714,50 @@ pub extern "C" fn string_concat_alloc(
     )
 }
 
+/// Debug guard proving a `LeafNoAlloc` entry neither allocated nor triggered
+/// a collection: the young/old allocation extents must be byte-identical on
+/// exit. Release builds compile it away.
+struct LeafNoAllocGuard {
+    #[cfg(debug_assertions)]
+    heap: *const otter_gc::GcHeap,
+    #[cfg(debug_assertions)]
+    extents: Option<(u64, u64)>,
+}
+
+impl LeafNoAllocGuard {
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    fn new(heap: *const otter_gc::GcHeap) -> Self {
+        Self {
+            #[cfg(debug_assertions)]
+            heap,
+            #[cfg(debug_assertions)]
+            extents: heap_ref(heap).map(Self::extents),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn extents(heap: &otter_gc::GcHeap) -> (u64, u64) {
+        let stats = heap.stats();
+        (
+            stats.new_allocated_bytes as u64,
+            stats.old_allocated_bytes as u64,
+        )
+    }
+}
+
+impl Drop for LeafNoAllocGuard {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let after = heap_ref(self.heap).map(Self::extents);
+            debug_assert_eq!(
+                self.extents, after,
+                "LeafNoAlloc stub allocated or triggered a collection"
+            );
+        }
+    }
+}
+
 /// Leaf `Map.prototype.get` probe.
 ///
 /// Returns `Miss` when the receiver is not a Map or the key would need string
@@ -724,6 +768,7 @@ pub extern "C" fn collection_map_get_leaf(
     recv_bits: u64,
     key_bits: u64,
 ) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
     RuntimeStubResultPair::from_result(collection_map_get_leaf_inner(heap, recv_bits, key_bits))
 }
 
@@ -758,6 +803,7 @@ pub extern "C" fn collection_map_has_leaf(
     recv_bits: u64,
     key_bits: u64,
 ) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
     RuntimeStubResultPair::from_result(collection_map_has_leaf_inner(heap, recv_bits, key_bits))
 }
 
@@ -790,6 +836,7 @@ pub extern "C" fn collection_set_has_leaf(
     recv_bits: u64,
     key_bits: u64,
 ) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
     RuntimeStubResultPair::from_result(collection_set_has_leaf_inner(heap, recv_bits, key_bits))
 }
 
@@ -1982,7 +2029,12 @@ mod tests {
                 }
                 // Only JIT-owned transitions stay vacant before hook install.
                 None => {
-                    assert_eq!(descriptor.id, crate::native_abi::STUB_JIT_BACKEDGE_POLL.id);
+                    assert!(matches!(
+                        descriptor.signature,
+                        crate::native_abi::RuntimeStubSignature::Poll1
+                            | crate::native_abi::RuntimeStubSignature::Variadic
+                            | crate::native_abi::RuntimeStubSignature::NullaryValue
+                    ));
                     assert_eq!(entry.machine_addr(), 0);
                 }
             }
@@ -2013,6 +2065,21 @@ mod tests {
         }
     }
 
+    /// One fake binding per JIT-owned inventory slot (every slot the VM phase
+    /// leaves vacant), addressed by descriptor id.
+    fn all_jit_bindings() -> Vec<crate::jit::JitRuntimeStubBinding> {
+        vm_runtime_stub_entries()
+            .iter()
+            .zip(crate::native_abi::RUNTIME_STUB_DESCRIPTORS)
+            .filter(|(entry, _)| matches!(entry, RuntimeStubEntry::Vacant))
+            .map(|(_, descriptor)| crate::jit::JitRuntimeStubBinding {
+                id: descriptor.id,
+                signature: descriptor.signature,
+                entry_addr: 0x1000 + descriptor.id as usize,
+            })
+            .collect()
+    }
+
     fn published_machine_entries(interp: &Interpreter) -> Vec<u64> {
         // SAFETY: the header and machine column are isolate-owned and live.
         let table = unsafe {
@@ -2038,10 +2105,13 @@ mod tests {
         let before = published_machine_entries(&interp);
         assert_eq!(before[poll_index], 0);
 
-        interp.set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![poll_binding()]))));
+        interp.set_jit_compiler(Some(std::sync::Arc::new(BindingHook(all_jit_bindings()))));
         let installed = published_machine_entries(&interp);
         assert!(installed.iter().all(|&addr| addr != 0));
-        assert_eq!(installed[poll_index], 0x1000);
+        assert_eq!(
+            installed[poll_index],
+            0x1000 + crate::native_abi::STUB_JIT_BACKEDGE_POLL.id as u64
+        );
 
         interp.set_jit_compiler(None);
         let after = published_machine_entries(&interp);

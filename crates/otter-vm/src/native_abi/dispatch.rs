@@ -9,6 +9,12 @@
 //!   rooted exception is published on [`super::VmThread`].
 //! - Every non-success condition has an explicit discriminant and payload.
 //! - Records are fixed-width C-layout values suitable for two-register returns.
+//! - A `SideExit` payload is the exact instruction-index PC of an uncommitted
+//!   instruction. All earlier instructions are committed, frame registers are
+//!   materialized, and the interpreter must continue at (not after) that PC.
+//! - A runtime operation that has started observable work either completes its
+//!   opcode or reports `Throw`; it cannot return a resumable side exit that
+//!   would repeat the operation.
 //!
 //! # See also
 //! - [`super::runtime_stubs`] for descriptor-side status classification.

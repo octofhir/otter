@@ -197,11 +197,11 @@ pub use handles::{HandleArena, HandleScope, Scoped};
 pub use holt_stack::HoltStack;
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
+    JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
     JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
     JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFunctionCode,
     JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPrimitiveMethodGuard,
-    JitStringLayout, JitTypedArrayLayout, VmRuntimeActivation,
+    JitStringLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,

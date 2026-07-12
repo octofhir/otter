@@ -147,29 +147,6 @@ impl ExecutableModule {
     }
 }
 
-/// Byte offset from a decompressed closure pointer to the *data pointer* of its
-/// captured upvalue spine, for the inlined-closure `InlineUpvalue` lowering.
-///
-/// `Vec<T>` is three pointer-sized words but the field order (`ptr`, `cap`,
-/// `len`) is not a stable ABI — the compiler may place the data pointer in any
-/// of the three words. Rather than bake a guessed word, probe a freshly
-/// allocated `Vec<UpvalueCell>` and find the word whose value equals
-/// [`Vec::as_ptr`]; that offset is then constant for the running binary.
-fn closure_upvalues_ptr_byte() -> u32 {
-    let body_off = otter_gc::header::HEADER_SIZE
-        + std::mem::offset_of!(crate::closure::JsClosureBody, upvalues);
-    let probe: Vec<crate::UpvalueCell> = Vec::with_capacity(1);
-    let base = std::ptr::from_ref(&probe) as usize;
-    let want = probe.as_ptr() as usize;
-    let word = (0..3)
-        .map(|w| w * std::mem::size_of::<usize>())
-        // SAFETY: `probe` is a live `Vec`, three pointer-sized words wide; each
-        // in-range word is a valid `usize` read.
-        .find(|&off| unsafe { *((base + off) as *const usize) } == want)
-        .expect("Vec<UpvalueCell> data pointer not in first three words");
-    (body_off + word) as u32
-}
-
 impl CodeBlock {
     /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.
     #[must_use]
@@ -182,7 +159,7 @@ impl CodeBlock {
             // Baked alongside `cage_base` by `compile_jit_function`; the
             // all-zero default is never read because the emitter gates inline
             // element access on `cage_base != 0`.
-            ta_layout: crate::jit::JitTypedArrayLayout::default(),
+            array_layout: crate::jit::JitArrayLayout::default(),
             string_layout: crate::jit::JitStringLayout::default(),
             // `#[repr(C)]` constant: offset from the decompressed object
             // pointer to its shape handle, for the WhiskerIC load-cell guard.
@@ -210,7 +187,6 @@ impl CodeBlock {
                 + std::mem::offset_of!(crate::heap_number::HeapNumberBody, bits) as u32,
             closure_fid_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::closure::JsClosureBody, function_id) as u32,
-            closure_upvalues_ptr_byte: closure_upvalues_ptr_byte(),
             collection_layout: crate::jit::JitCollectionLayout {
                 map_type_tag: crate::collections::MAP_BODY_TYPE_TAG,
                 set_type_tag: crate::collections::SET_BODY_TYPE_TAG,

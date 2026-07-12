@@ -67,7 +67,7 @@ pub struct JitCompileSnapshot {
     /// emitter stays layout-agnostic. The emitter inlines `LoadElement` /
     /// `StoreElement` for monomorphic `Float64Array` / `Int32Array` receivers
     /// only when [`cage_base`](Self::cage_base) is non-zero (baked).
-    pub ta_layout: JitTypedArrayLayout,
+    pub array_layout: JitArrayLayout,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
     /// Byte offset from a decompressed object pointer to its shape handle
@@ -121,13 +121,6 @@ pub struct JitCompileSnapshot {
     /// method-inline guard reads `[closure_ptr + closure_fid_byte]` to compare
     /// a resolved prototype method against the baked target id.
     pub closure_fid_byte: u32,
-    /// Byte offset from a decompressed closure pointer to the data pointer of
-    /// its captured upvalue spine (`HEADER_SIZE + offset_of!(JsClosureBody,
-    /// upvalues)`; the `Vec<UpvalueCell>` stores its backing pointer in its
-    /// first word). An inlined closure body reads `[closure_ptr +
-    /// closure_upvalues_ptr_byte]` to reach the spine, then the per-index
-    /// compressed cell handle, mirroring the context-spine [`LoadUpvalue`] path.
-    pub closure_upvalues_ptr_byte: u32,
     /// Ready-to-use byte offsets and type tags for baseline collection method
     /// IC guards.
     pub collection_layout: JitCollectionLayout,
@@ -436,58 +429,20 @@ pub struct JitPreparedDirectCall {
     pub upvalues_ptr: usize,
 }
 
-/// Ready-to-use byte offsets and tags for the JIT's inline typed-array
-/// element fast path, baked from `otter-vm`'s `#[repr(C)]` body layouts.
+/// Versioned offsets needed by native Array guards.
 ///
-/// All `*_byte` fields are offsets **from the decompressed GC pointer**
-/// (i.e. they already include the GC header), so the emitter adds them straight
-/// to `cage_base + compressed_offset`. The chain a `LoadElement`/`StoreElement`
-/// walks: receiver `Value` → typed-array body (`ta_*`) → embedded buffer handle
-/// (`buffer_*`) → local array-buffer body (`buf_*`) → `Vec<u8>` data pointer.
+/// Dense element storage remains behind runtime stubs because Rust container
+/// layout is not part of the native ABI.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct JitTypedArrayLayout {
-    /// `GcHeader::type_tag` of a `TypedArrayBodyGc` (guarded at byte 0).
-    pub ta_type_tag: u8,
-    /// `GcHeader::type_tag` of a `LocalArrayBufferBodyGc` (guarded at byte 0).
-    pub local_buffer_type_tag: u8,
-    /// `TypedArrayKind` discriminant for `Float64Array` (inlined kind).
-    pub kind_float64: u32,
-    /// `TypedArrayKind` discriminant for `Int32Array` (inlined kind).
-    pub kind_int32: u32,
-    /// `BufferStorage` discriminant value selecting the `Local` variant.
-    pub buffer_local_tag: u32,
-    /// Offset to the `TypedArrayBodyGc.kind` `u32`.
-    pub ta_kind_byte: u32,
-    /// Offset to the `TypedArrayBodyGc.byte_offset` `usize`.
-    pub ta_byte_offset_byte: u32,
-    /// Offset to the `TypedArrayBodyGc.length` `usize` (element count).
-    pub ta_length_byte: u32,
-    /// Offset to the `TypedArrayBodyGc.length_tracking` `bool`.
-    pub ta_length_tracking_byte: u32,
-    /// Offset to the `BufferStorage` discriminant inside the embedded buffer.
-    pub buffer_disc_byte: u32,
-    /// Offset to the `BufferStorage` 4-byte compressed handle payload.
-    pub buffer_handle_byte: u32,
-    /// Offset to the `LocalArrayBufferBodyGc.bytes` `Vec<u8>` itself (its first
-    /// word). The emitter adds the probed `Vec<u8>` data-pointer and length
-    /// sub-offsets to this — the std `Vec` field order is not guaranteed, so
-    /// `otter-jit` discovers it by value-identity rather than hardcoding it.
-    pub buf_bytes_byte: u32,
-    /// `GcHeader::type_tag` of an ordinary `ArrayBody` (guarded at byte 0 for
-    /// the inline dense-array element fast path).
-    pub array_type_tag: u8,
-    /// Offset to the `ArrayBody.elements` `Vec<Value>` itself (its first word).
-    /// The emitter adds the probed `Vec` data-pointer / length sub-offsets;
-    /// each element is a raw 8-byte `Value` (no box/unbox). A hole-sentinel
-    /// element or an out-of-bounds index falls through to the runtime stub,
-    /// which owns the spec-correct prototype / sparse / accessor handling.
-    pub array_elements_byte: u32,
+pub struct JitArrayLayout {
+    /// `GcHeader::type_tag` of an ordinary `ArrayBody`.
+    pub type_tag: u8,
     /// Offset to `ArrayBody.length`, the logical `length` property.
-    pub array_length_byte: u32,
+    pub length_byte: u32,
     /// Offset to `ArrayBody.exotic`; a non-null sidecar means custom
     /// prototype/accessor/descriptor/source-text state may make dense stores
     /// observable, so inline stores must miss to the runtime path.
-    pub array_exotic_byte: u32,
+    pub exotic_byte: u32,
 }
 
 /// Ready-to-use byte offsets and tags for inline primitive string fast paths.
@@ -623,7 +578,7 @@ impl JitCompileSnapshot {
         Self {
             code_block,
             cage_base: 0,
-            ta_layout: JitTypedArrayLayout::default(),
+            array_layout: JitArrayLayout::default(),
             string_layout: JitStringLayout::default(),
             object_shape_byte: 0,
             object_values_ptr_byte: 0,
@@ -635,7 +590,6 @@ impl JitCompileSnapshot {
             heap_number_type_tag: 0,
             heap_number_bits_byte: 0,
             closure_fid_byte: 0,
-            closure_upvalues_ptr_byte: 0,
             collection_layout: JitCollectionLayout::default(),
             native_static_fn_byte: 0,
             instructions,
@@ -864,6 +818,9 @@ pub enum JitExecOutcome {
 /// emitted callers can branch to an already-installed callee without routing
 /// through the generic runtime call bridge.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
+    /// Immutable versioned metadata for this installed code object.
+    fn metadata(&self) -> crate::native_abi::CodeObjectMetadata;
+
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;
 

@@ -125,6 +125,12 @@ pub(crate) const RESUME_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, resume_pc)
 pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
 pub(crate) const THREAD_OFFSET: u32 = std::mem::offset_of!(JitCtx, thread) as u32;
 pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_frame) as u32;
+/// Byte offset of the canonical instruction-index PC in the published native
+/// frame. Generated code updates this together with its nested-call exit
+/// payload before any opcode can observe or mutate JavaScript state.
+pub(crate) const NATIVE_FRAME_PC_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
+    + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, pc))
+    as u32;
 pub(crate) const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, code_object_id) as u32;
 /// Byte offset of [`JitCtx::interrupt_flag`] — the inline back-edge interrupt poll.

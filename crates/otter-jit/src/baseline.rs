@@ -27,9 +27,17 @@
 //! - **Whole-function opt-in.** Any opcode/operand shape outside the supported
 //!   subset aborts the compile with [`Unsupported`]; the VM runs the
 //!   interpreter. Compiled code never executes a partial function.
-//! - **Guard failure = bail, not deopt.** Non-int32 operands / int32 overflow /
-//!   non-boolean branch conditions set `status: 1` and return. Bailing re-runs
-//!   the whole function on the interpreter.
+//! - **Exact-PC side exit.** Before an opcode can guard, mutate, call, throw, or
+//!   allocate, compiled code publishes that opcode's canonical instruction
+//!   index in both its machine-local exit payload and the active native frame.
+//!   `status: 1` means every earlier opcode is committed and the named opcode
+//!   is uncommitted; the interpreter resumes exactly there and never replays
+//!   earlier effects. Throws use `status: 2` and therefore never masquerade as
+//!   resumable side exits.
+//! - **Materialized roots.** Interpreter-visible registers remain in the
+//!   published frame window at every side exit and allocating/reentrant call.
+//!   A nested compiled call owns its machine-local PC until its frame is either
+//!   completed or recovered by the direct-call tail.
 //!
 //! # See also
 //! - `JIT_DESIGN.md` §3.2 (backend), §3.5 (GC contract), §4 Phase 1.
@@ -102,7 +110,7 @@ mod tests {
 
     enum Exit {
         Returned(u64),
-        Bailed,
+        Bailed(u32),
     }
 
     fn box_i32(v: i32) -> u64 {
@@ -130,30 +138,7 @@ mod tests {
         view.heap_number_type_tag = 0x30;
         view.heap_number_bits_byte = 8;
         view.closure_fid_byte = 8;
-        view.closure_upvalues_ptr_byte = 16;
         view
-    }
-
-    /// The inline typed-array element path locates the backing buffer's data
-    /// pointer and live length inside a `Vec<u8>` via `vec_layout_offsets`
-    /// (std does not guarantee the field order). Verify the probe lands on the
-    /// real pointer and length words for an independent Vec.
-    #[test]
-    fn vec_layout_probe_finds_ptr_and_len() {
-        let (ptr_off, len_off) = super::arm64::vec_layout_offsets();
-        assert_ne!(ptr_off, len_off, "ptr and len must be distinct words");
-        assert!(
-            ptr_off < 24 && len_off < 24,
-            "offsets within the 3-word Vec"
-        );
-        let mut v: Vec<u8> = Vec::with_capacity(16);
-        v.extend_from_slice(&[1, 2, 3, 4, 5]);
-        // SAFETY: read one machine word at each probed offset and compare to the
-        // public pointer/length; never dereferenced beyond the read itself.
-        let base = std::ptr::addr_of!(v).cast::<u8>();
-        let read_word = |off: u32| unsafe { base.add(off as usize).cast::<usize>().read() };
-        assert_eq!(read_word(ptr_off), v.as_ptr() as usize, "probe ptr word");
-        assert_eq!(read_word(len_off), v.len(), "probe len word");
     }
 
     #[test]
@@ -202,7 +187,7 @@ mod tests {
         let mut regs = [VALUE_NULL, VALUE_UNDEFINED, 0, 0, 0, 0, 0, 0];
         match run(&nullish, &mut regs) {
             Exit::Returned(bits) => assert_eq!(bits, VALUE_TRUE),
-            Exit::Bailed => panic!("nullish loose equality bailed"),
+            Exit::Bailed(pc) => panic!("nullish loose equality bailed at {pc}"),
         }
 
         let numeric = view(&[
@@ -219,7 +204,7 @@ mod tests {
         let mut regs = [box_i32(1), box_i32(2), 0, 0, 0, 0, 0, 0];
         match run(&numeric, &mut regs) {
             Exit::Returned(bits) => assert_eq!(bits, VALUE_TRUE),
-            Exit::Bailed => panic!("numeric loose inequality bailed"),
+            Exit::Bailed(pc) => panic!("numeric loose inequality bailed at {pc}"),
         }
     }
 
@@ -237,12 +222,27 @@ mod tests {
         // the (null-`vm`) re-entry stub.
         let interrupt_probe: u8 = 0;
         let mut backedge_fuel_probe: u64 = 1 << 30;
+        let mut native_frame = otter_vm::native_abi::NativeFrame {
+            header: otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
+            previous_frame: 0,
+            register_base: regs.as_mut_ptr() as u64,
+            argument_base: 0,
+            feedback_base: 0,
+            code_object_id: 1,
+            this_value_bits: 0,
+            new_target_bits: 0,
+            return_register: u32::MAX,
+            cold_state_index: u32::MAX,
+            argument_count: 0,
+            reserved0: 0,
+            feedback_id: 0,
+        };
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
             self_closure: 0,
             this_value: 0,
             thread: std::ptr::null_mut(),
-            native_frame: std::ptr::null_mut(),
+            native_frame: &mut native_frame,
             frame_index: 0,
             upvalues_ptr: 0,
             resume_pc: 0,
@@ -268,22 +268,47 @@ mod tests {
         if status == STATUS_RETURNED {
             Exit::Returned(value)
         } else {
-            Exit::Bailed
+            assert_eq!(ctx.resume_pc, native_frame.header.pc);
+            Exit::Bailed(ctx.resume_pc)
         }
     }
 
     fn expect_int(view: &JitCompileSnapshot, regs: &mut [u64], expected: i32) {
         match run(view, regs) {
             Exit::Returned(bits) => assert_eq!(unbox_i32(bits), expected),
-            Exit::Bailed => panic!("expected Returned({expected}), got Bailed"),
+            Exit::Bailed(pc) => panic!("expected Returned({expected}), got Bailed({pc})"),
         }
     }
 
     fn expect_f64(view: &JitCompileSnapshot, regs: &mut [u64], expected: f64) {
         match run(view, regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), expected),
-            Exit::Bailed => panic!("expected Returned({expected}), got Bailed"),
+            Exit::Bailed(pc) => panic!("expected Returned({expected}), got Bailed({pc})"),
         }
+    }
+
+    #[test]
+    fn side_exit_publishes_exact_instruction_pc_after_committed_effects() {
+        let v = view(&[
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(2), Operand::Imm32(41)],
+            ),
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+        ]);
+        let mut regs = [box_i32(10), VALUE_UNDEFINED, 0, 0, 0, 0, 0, 0];
+
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed(1)));
+        assert_eq!(regs[2], box_i32(41), "earlier instruction stays committed");
+        assert_eq!(regs[3], 0, "side-exit instruction remains uncommitted");
     }
 
     #[test]
@@ -388,7 +413,7 @@ mod tests {
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_f64(f64::INFINITY), box_i32(0), 0, 0, 0, 0, 0, 0];
-        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed(_)));
         let mut regs = [
             box_f64(9_223_372_036_854_775_808.0),
             box_i32(0),
@@ -399,7 +424,7 @@ mod tests {
             0,
             0,
         ];
-        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed(_)));
     }
 
     #[test]
@@ -580,7 +605,7 @@ mod tests {
             let mut regs = [a, b, 0, 0, 0, 0, 0, 0];
             match run(&v, &mut regs) {
                 Exit::Returned(bits) => bits,
-                Exit::Bailed => panic!("cmp bailed"),
+                Exit::Bailed(pc) => panic!("cmp bailed at {pc}"),
             }
         };
         // ordered doubles
@@ -623,7 +648,7 @@ mod tests {
             let mut regs = [a, b, 0, 0, 0, 0, 0, 0];
             match run(&v, &mut regs) {
                 Exit::Returned(bits) => Some(bits),
-                Exit::Bailed => None,
+                Exit::Bailed(_) => None,
             }
         };
         // Non-number immediates (here, booleans) decide identity inline by raw
@@ -657,7 +682,7 @@ mod tests {
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         let mut regs = [box_i32(10), VALUE_UNDEFINED, 0, 0, 0, 0, 0, 0];
-        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed(_)));
     }
 
     #[test]
@@ -679,7 +704,7 @@ mod tests {
         ]);
         let cell = 0x1234;
         let mut regs = [cell, 0, 0, 0, 0, 0, 0, 0];
-        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed(_)));
     }
 
     #[test]
@@ -688,7 +713,7 @@ mod tests {
         let mut regs = [box_f64(1.5), box_f64(2.25), 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.75),
-            Exit::Bailed => panic!("expected 3.75, bailed"),
+            Exit::Bailed(_) => panic!("expected 3.75, bailed"),
         }
     }
 
@@ -699,7 +724,7 @@ mod tests {
         let mut regs = [box_i32(10), box_f64(2.5), 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 12.5),
-            Exit::Bailed => panic!("expected 12.5, bailed"),
+            Exit::Bailed(_) => panic!("expected 12.5, bailed"),
         }
     }
 
@@ -719,13 +744,13 @@ mod tests {
         let mut regs = [box_f64(7.0), box_f64(2.0), 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.5),
-            Exit::Bailed => panic!("expected 3.5, bailed"),
+            Exit::Bailed(_) => panic!("expected 3.5, bailed"),
         }
         // 6 / 2 yields the Number 3 (an f64), not an int32.
         let mut regs = [box_i32(6), box_i32(2), 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.0),
-            Exit::Bailed => panic!("expected 3.0, bailed"),
+            Exit::Bailed(_) => panic!("expected 3.0, bailed"),
         }
     }
 
@@ -741,11 +766,11 @@ mod tests {
         let mut regs = [box_f64(2.5), 0, 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 2.5),
-            Exit::Bailed => panic!("expected 2.5, bailed"),
+            Exit::Bailed(_) => panic!("expected 2.5, bailed"),
         }
         // A non-number (undefined) still bails.
         let mut regs = [VALUE_UNDEFINED, 0, 0, 0, 0, 0, 0, 0];
-        assert!(matches!(run(&v, &mut regs), Exit::Bailed));
+        assert!(matches!(run(&v, &mut regs), Exit::Bailed(_)));
     }
 
     #[test]
@@ -768,13 +793,13 @@ mod tests {
         let mut regs = [box_f64(2.5), 0, 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.5),
-            Exit::Bailed => panic!("expected 3.5, bailed"),
+            Exit::Bailed(_) => panic!("expected 3.5, bailed"),
         }
         // i32::MAX + 1 overflows → exact double.
         let mut regs = [box_i32(i32::MAX), 0, 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), i32::MAX as f64 + 1.0),
-            Exit::Bailed => panic!("expected overflow→double, bailed"),
+            Exit::Bailed(_) => panic!("expected overflow→double, bailed"),
         }
         // Decrement (delta = -1).
         let vd = view(&[
@@ -810,7 +835,7 @@ mod tests {
         let mut regs = [box_i32(100_000), box_i32(100_000), 0, 0, 0, 0, 0, 0];
         match run(&v, &mut regs) {
             Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 1e10),
-            Exit::Bailed => panic!("expected 1e10, bailed"),
+            Exit::Bailed(_) => panic!("expected 1e10, bailed"),
         }
     }
 

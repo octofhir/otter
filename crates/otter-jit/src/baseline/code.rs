@@ -23,13 +23,16 @@ use otter_vm::{
     HoltStack, Interpreter, JitExecOutcome, JitFunctionCode, SafepointRecord, Value, VmError,
     VmRuntimeActivation,
     native_abi::{
-        CodeRegistryView, NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread,
+        BuildVersionRecord, CodeObjectMetadata, CodeRegistryView, LayoutVersionRecord, NativeFrame,
+        NativeFrameFlags, NativeFrameKind, VM_BUILD_VERSION, VmFrameHeader, VmThread,
     },
 };
 
 /// Finalized baseline machine code for one function.
 pub struct BaselineCode {
     code: CompiledCode,
+    /// Frozen VM-owned metadata validated before every entry selection.
+    metadata: CodeObjectMetadata,
     /// Installed code-object identity used for safepoint lookup.
     code_object_id: u64,
     /// Tagged register-window width published in the native frame.
@@ -83,8 +86,26 @@ impl BaselineCode {
         safepoint_records: Box<[SafepointRecord]>,
         frameless_entry_safe: bool,
     ) -> Self {
+        const AARCH64_BASELINE_ABI: u64 = 0x4136_3442_4c4e_0001;
+        let metadata = CodeObjectMetadata {
+            id: code_object_id,
+            code_block_id: code_object_id.saturating_sub(1) as u32,
+            entry_offset: 0,
+            code_size: code.len() as u32,
+            safepoint_count: safepoint_records.len() as u32,
+            frame_map_count: safepoint_records.len() as u32,
+            spill_map_count: 0,
+            dependency_count: 0,
+            reserved: 0,
+            layout: LayoutVersionRecord::CURRENT,
+            build: BuildVersionRecord {
+                vm_build: VM_BUILD_VERSION,
+                target_abi: AARCH64_BASELINE_ABI,
+            },
+        };
         Self {
             code,
+            metadata,
             code_object_id,
             register_count,
             osr_entries,
@@ -114,6 +135,10 @@ impl std::fmt::Debug for BaselineCode {
 }
 
 impl JitFunctionCode for BaselineCode {
+    fn metadata(&self) -> CodeObjectMetadata {
+        self.metadata
+    }
+
     fn code_len(&self) -> usize {
         self.code.len()
     }
@@ -137,6 +162,10 @@ impl JitFunctionCode for BaselineCode {
     }
 
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
+        assert!(
+            self.metadata.is_compatible_with_current_vm(),
+            "incompatible native code reached entry"
+        );
         // SAFETY: the mapping is live and the main entry was emitted with the
         // `JitEntry` ABI.
         let entry = unsafe { self.code.entry_ptr() };
@@ -158,6 +187,9 @@ impl JitFunctionCode for BaselineCode {
         activation: VmRuntimeActivation,
         logical_pc: u32,
     ) -> Option<JitExecOutcome> {
+        if !self.metadata.is_compatible_with_current_vm() {
+            return None;
+        }
         let offset = *self.osr_entries.get(&logical_pc)?;
         // SAFETY: `offset` is an assembler offset recorded for this buffer and
         // points at a prologue trampoline emitted with the `JitEntry` ABI.
@@ -329,9 +361,13 @@ pub(crate) unsafe fn enter_compiled(
         }
         let ret = entry(&mut ctx);
         let _ = jit_pop_native_activation_stub(&mut ctx);
+        debug_assert!(
+            ret.status != STATUS_BAILED || native_frame.header.pc == ctx.resume_pc,
+            "compiled side exit published divergent logical PCs"
+        );
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
-            STATUS_BAILED => JitExecOutcome::Bailed(ctx.resume_pc),
+            STATUS_BAILED => JitExecOutcome::Bailed(native_frame.header.pc),
             _ => JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand)),
         }
     }

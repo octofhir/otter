@@ -91,10 +91,6 @@ impl EmissionSession {
 
         // Stable GC cage base, baked for inline property-load decompression.
         let cage_base = view.cage_base;
-        // Static typed-array body offsets for inline element access. Only used
-        // when `cage_base != 0` (i.e. baked by the real compile path).
-        let ta_layout = view.ta_layout;
-
         for (instr, lowered) in view.instructions.iter().zip(&plan.instructions) {
             let instruction_pc = lowered.instruction_pc;
             dynasm!(ops ; .arch aarch64 ; =>labels[&instruction_pc]);
@@ -105,11 +101,18 @@ impl EmissionSession {
             if enable_fres && block_starts.binary_search(&instruction_pc).is_ok() {
                 fres.clear();
             }
-            // Stamp this op's logical PC into the context so any bail (guard
-            // failure or unsupported opcode) resumes the interpreter at the
-            // exact instruction, preserving committed side effects.
+            // Publish this op's logical PC before any guard, mutation, call, or
+            // allocation. The NativeFrame copy is authoritative to GC,
+            // diagnostics, and top-level dispatch. The context copy is the
+            // machine-local payload retained by nested compiled calls while
+            // their parent NativeFrame is restored by the call tail.
             emit_load_u64(ops, 9, u64::from(instruction_pc));
-            dynasm!(ops ; .arch aarch64 ; str w9, [x20, RESUME_PC_OFFSET]);
+            dynasm!(ops
+                ; .arch aarch64
+                ; str w9, [x20, RESUME_PC_OFFSET]
+                ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+            );
             match lowered.op {
                 Op::LoadInt32 => {
                     let operands = lowered.load_int32_operands()?;
@@ -374,37 +377,6 @@ impl EmissionSession {
                         },
                     };
                     if !inlined {
-                        // Splice an inline dense-array `pop` / `push` fast path
-                        // ahead of the method bridge; a guard miss falls through to
-                        // the bridge, a hit jumps past it.
-                        let array_done = ops.new_dynamic_label();
-                        let mut spliced_array = false;
-                        if let Some(am) = view.array_methods.get(&lowered.byte_pc).copied() {
-                            let array_miss = ops.new_dynamic_label();
-                            let emitted = match am.kind {
-                                JitArrayMethodKind::Pop => emit_array_pop_inline(
-                                    ops,
-                                    call_operands,
-                                    &am,
-                                    view,
-                                    array_miss,
-                                    array_done,
-                                )?,
-                                JitArrayMethodKind::Push => emit_array_push_inline(
-                                    ops,
-                                    call_operands,
-                                    &am,
-                                    view,
-                                    array_miss,
-                                    array_done,
-                                    threw,
-                                )?,
-                            };
-                            if emitted {
-                                dynasm!(ops ; .arch aarch64 ; =>array_miss);
-                                spliced_array = true;
-                            }
-                        }
                         emit_method_call(
                             ops,
                             call_operands,
@@ -416,117 +388,33 @@ impl EmissionSession {
                             bail,
                             threw,
                         )?;
-                        if spliced_array {
-                            dynasm!(ops ; .arch aarch64 ; =>array_done);
-                        }
                     }
                 }
-                // `recv[idx]` — inline dense-`Array` (raw `Value`) and
-                // `Float64Array`/`Int32Array` element load (guarded, no
-                // safepoint); every other case (sparse/hole, strings, object
-                // `[[Get]]`, polymorphic/detached/OOB) misses to the safe
-                // element-load bridge, which owns the spec-correct semantics.
+                // Element backing stores are VM-owned containers, not native
+                // ABI. Delegate the complete operation from the published
+                // frame instead of probing Rust `Vec` layout.
                 Op::LoadElement => {
                     let operands = lowered.element_load_operands()?;
                     let dst = operands.dst;
                     let recv = operands.receiver;
                     let idx = operands.index;
-                    let el_miss = ops.new_dynamic_label();
-                    let el_done = ops.new_dynamic_label();
-
-                    if cage_base != 0 {
-                        let recv_off = reg_offset(recv)?;
-                        let idx_off = reg_offset(idx)?;
-                        let dst_off = reg_offset(dst)?;
-                        emit_element_load(
-                            ops, &ta_layout, cage_base, recv_off, idx_off, dst_off, el_miss,
-                            el_done,
-                        );
-                    }
-
                     dynasm!(ops
                         ; .arch aarch64
-                        ; =>el_miss
                         ; mov x0, x20
                         ; movz x1, dst as u32
                         ; movz x2, recv as u32
                         ; movz x3, idx as u32
                     );
                     emit_call_stub(ops, jit_load_element_stub as *const () as usize, threw);
-                    dynasm!(ops ; .arch aarch64 ; =>el_done);
                 }
-                // `recv[idx] = src` — inline plain dense `Array` stores and
-                // `Float64Array`/`Int32Array` element stores (guarded, no
-                // safepoint); every other case misses to the safe element-store
-                // bridge. Operands: recv, idx, src, scratch.
                 Op::StoreElement => {
                     let operands = lowered.element_store_operands()?;
                     let recv = operands.receiver;
                     let idx = operands.index;
                     let src = operands.value;
                     let scratch = operands.scratch;
-                    let el_miss = ops.new_dynamic_label();
-                    let el_done = ops.new_dynamic_label();
-
-                    if cage_base != 0 {
-                        let recv_off = reg_offset(recv)?;
-                        let idx_off = reg_offset(idx)?;
-                        let src_off = reg_offset(src)?;
-                        let array_miss = ops.new_dynamic_label();
-                        emit_array_store(
-                            ops, &ta_layout, cage_base, recv_off, idx_off, src_off, array_miss,
-                            el_done, threw, recv, src,
-                        );
-                        dynasm!(ops ; .arch aarch64 ; =>array_miss);
-
-                        let f64_path = ops.new_dynamic_label();
-                        let i32_path = ops.new_dynamic_label();
-                        emit_ta_guard_chain(
-                            ops, &ta_layout, cage_base, recv_off, idx_off, el_miss, f64_path,
-                            i32_path,
-                        );
-                        // Float64Array: coerce src to f64 (int32 or double; any
-                        // other tag misses to the stub for full ToNumber), store.
-                        // Address is held in x10, which `emit_num_to_double`'s
-                        // scratch (x14/x15) does not clobber.
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; =>f64_path
-                            ; lsl x10, x12, #3            // index * 8
-                            ; add x10, x10, x16           // + byte_offset
-                            ; add x15, x10, #8            // + element size (bound)
-                            ; cmp x15, x17
-                            ; b.hi =>el_miss
-                            ; add x10, x13, x10           // element address
-                            ; ldr x9, [x19, src_off]
-                        );
-                        emit_num_to_double(ops, 9, 0, el_miss);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; str d0, [x10]
-                            ; b =>el_done
-                            // Int32Array: src must be int32 (a double misses to
-                            // the stub for ToInt32 truncation); store low-32.
-                            ; =>i32_path
-                            ; lsl x10, x12, #2            // index * 4
-                            ; add x10, x10, x16           // + byte_offset
-                            ; add x15, x10, #4            // + element size (bound)
-                            ; cmp x15, x17
-                            ; b.hi =>el_miss
-                            ; add x10, x13, x10           // element address
-                            ; ldr x9, [x19, src_off]
-                        );
-                        guard_int32!(ops, 9, el_miss);
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; str w9, [x10]
-                            ; b =>el_done
-                        );
-                    }
-
                     dynasm!(ops
                         ; .arch aarch64
-                        ; =>el_miss
                         ; mov x0, x20
                         ; movz x1, recv as u32
                         ; movz x2, idx as u32
@@ -534,7 +422,6 @@ impl EmissionSession {
                         ; movz x4, scratch as u32
                     );
                     emit_call_stub(ops, jit_store_element_stub as *const () as usize, threw);
-                    dynasm!(ops ; .arch aarch64 ; =>el_done);
                 }
                 // `dst = global[name]` or throw — delegate to the safe bridge.
                 Op::LoadGlobalOrThrow => {
@@ -743,8 +630,8 @@ impl EmissionSession {
                     if cage_base != 0 && instr.load_array_length {
                         let obj_off = reg_offset(obj)?;
                         let dst_off = reg_offset(dst)?;
-                        let array_tag = u32::from(view.ta_layout.array_type_tag);
-                        let length_byte = view.ta_layout.array_length_byte;
+                        let array_tag = u32::from(view.array_layout.type_tag);
+                        let length_byte = view.array_layout.length_byte;
                         dynasm!(ops
                             ; .arch aarch64
                             ; ldr x9, [x19, obj_off]   // receiver Value

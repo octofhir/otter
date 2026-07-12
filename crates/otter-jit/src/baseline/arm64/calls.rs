@@ -1418,7 +1418,7 @@ pub(super) fn emit_self_recursive_call(
     // (self-recursion shares them); this = undefined.
     dynasm!(ops
         ; .arch aarch64
-        ; sub sp, sp, JIT_CTX_STACK_SIZE
+        ; sub sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; str x14, [sp]
         ; ldr x9, [x20, #8] ; str x9, [sp, #8]
     );
@@ -1428,13 +1428,49 @@ pub(super) fn emit_self_recursive_call(
     for off in [FRAME_INDEX_OFFSET, UPVALUES_PTR_OFFSET] {
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
     }
+    // Build and publish the callee's own NativeFrame above its JitCtx. The
+    // callee runs the same code object, so its identity/meta/feedback words
+    // copy from the caller frame with a zeroed PC; register_base is the fresh
+    // callee window and previous_frame links the caller.
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; add x15, sp, JIT_CTX_STACK_SIZE
+        ; ldr x9, [x10]
+        ; str x9, [x15]
+        ; ldr x9, [x10, #8]
+        ; str x9, [x15, #8]
+        ; str wzr, [x15, NATIVE_FRAME_PC_OFFSET]
+        ; str x10, [x15, NATIVE_FRAME_PREVIOUS_OFFSET]
+        ; ldr x9, [sp]
+        ; str x9, [x15, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; str xzr, [x15, NATIVE_FRAME_ARGUMENT_BASE_OFFSET]
+        ; str xzr, [x15, NATIVE_FRAME_FEEDBACK_BASE_OFFSET]
+        ; ldr x9, [x10, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
+        ; ldr x9, [sp, #16]
+        ; str x9, [x15, NATIVE_FRAME_THIS_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_NEW_TARGET_OFFSET]
+        ; movn x9, #0
+        ; str x9, [x15, NATIVE_FRAME_RETURN_REGISTER_OFFSET]
+        ; ldr x9, [x10, NATIVE_FRAME_TAIL_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_TAIL_OFFSET]
+        ; str x15, [sp, NATIVE_FRAME_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; str x15, [x9]
+    );
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, sp
         ; bl =>self_entry
+        // The callee frame dies with this reservation: republish the caller's
+        // frame before any exit path runs.
+        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; str x10, [x9]
         ; cmp x1, STATUS_BAILED as u32
         ; b.eq =>bailed
-        ; add sp, sp, JIT_CTX_STACK_SIZE
+        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; cmp x1, STATUS_RETURNED as u32
         ; b.eq =>returned
         ; ldr x12, [x20, REG_TOP_PTR_OFFSET]
@@ -1472,17 +1508,17 @@ pub(super) fn emit_self_recursive_call(
     );
     store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
-    // Bailed: read the callee's exact bail PC from the shared published
-    // frame (the callee stamped it before exiting), drop the native ctx, and
-    // run the bailed callee to completion through the bail helper (which
-    // rebuilds an interpreter frame from the live window and pops it).
-    // Helper returns the value in x0 and status in x1.
+    // Bailed: read the callee's exact bail PC from its own published frame,
+    // drop the native ctx+frame reservation, and run the bailed callee to
+    // completion through the bail helper (which rebuilds an interpreter frame
+    // from the live window and pops it). Helper returns the value in x0 and
+    // status in x1.
     dynasm!(ops
         ; .arch aarch64
         ; =>bailed
-        ; ldr x2, [x20, NATIVE_FRAME_OFFSET]
+        ; add x2, sp, JIT_CTX_STACK_SIZE
         ; ldr w2, [x2, NATIVE_FRAME_PC_OFFSET]
-        ; add sp, sp, JIT_CTX_STACK_SIZE
+        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
         ; mov w1, w2
     );
@@ -1565,7 +1601,7 @@ pub(crate) fn emit_direct_call_tail(
     let direct_threw = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; sub sp, sp, JIT_CTX_STACK_SIZE
+        ; sub sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; ldr x9, [x20, DIRECT_REGS_OFFSET]
         ; str x9, [sp]
         ; ldr x9, [x20, DIRECT_SELF_OFFSET]
@@ -1574,8 +1610,37 @@ pub(crate) fn emit_direct_call_tail(
         ; str x9, [sp, #16]
         ; ldr x9, [x20, THREAD_OFFSET]
         ; str x9, [sp, THREAD_OFFSET]
-        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
-        ; str x9, [sp, NATIVE_FRAME_OFFSET]
+        // Build and publish the callee's own NativeFrame above its JitCtx:
+        // prepared identity/meta words, caller frame as previous_frame, the
+        // callee window as register_base, and the callee code-object id, so
+        // the isolate registry resolves the callee's safepoints while the
+        // caller frame keeps its own exact PC.
+        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; add x15, sp, JIT_CTX_STACK_SIZE
+        ; ldr x9, [x20, DIRECT_FRAME_IDS_OFFSET]
+        ; str x9, [x15]
+        ; ldr x9, [x20, DIRECT_FRAME_META_OFFSET]
+        ; str x9, [x15, #8]
+        ; str x10, [x15, NATIVE_FRAME_PREVIOUS_OFFSET]
+        ; ldr x9, [x20, DIRECT_REGS_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_REGISTER_BASE_OFFSET]
+        ; str xzr, [x15, NATIVE_FRAME_ARGUMENT_BASE_OFFSET]
+        ; str xzr, [x15, NATIVE_FRAME_FEEDBACK_BASE_OFFSET]
+        ; ldr x9, [x20, DIRECT_CODE_OBJECT_ID_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
+        ; ldr x9, [x20, DIRECT_THIS_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_THIS_OFFSET]
+    );
+    emit_load_u64(ops, 9, VALUE_UNDEFINED);
+    dynasm!(ops
+        ; .arch aarch64
+        ; str x9, [x15, NATIVE_FRAME_NEW_TARGET_OFFSET]
+        ; movn x9, #0
+        ; str x9, [x15, NATIVE_FRAME_RETURN_REGISTER_OFFSET]
+        ; str xzr, [x15, NATIVE_FRAME_TAIL_OFFSET]
+        ; str x15, [sp, NATIVE_FRAME_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; str x15, [x9]
         ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
         ; str x9, [sp, FRAME_INDEX_OFFSET]
         ; ldr x9, [x20, ERROR_SLOT_OFFSET]
@@ -1600,6 +1665,11 @@ pub(crate) fn emit_direct_call_tail(
         ; mov x0, sp
         ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
         ; blr x16
+        // The callee frame dies with this reservation: republish the caller's
+        // frame before any exit path runs.
+        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; str x10, [x9]
         ; cmp x1, STATUS_RETURNED as u32
         ; b.eq =>direct_returned
         ; cmp x1, STATUS_BAILED as u32
@@ -1617,7 +1687,7 @@ pub(crate) fn emit_direct_call_tail(
         ; blr x16
         ; ldr x2, [sp, DIRECT_FRAME_INDEX_OFFSET]
         ; ldr x3, [sp, DIRECT_ENTRY_OFFSET]
-        ; add sp, sp, JIT_CTX_STACK_SIZE
+        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
         ; movz x1, dst as u32
     );
@@ -1631,9 +1701,9 @@ pub(crate) fn emit_direct_call_tail(
     dynasm!(ops
         ; .arch aarch64
         ; =>direct_bailed
-        // The callee shares the published frame and stamped its exact bail PC
-        // there; park it in the spent entry slot across the activation pop.
-        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
+        // The callee stamped its exact bail PC into its own published frame;
+        // park it in the spent entry slot across the activation pop.
+        ; add x9, sp, JIT_CTX_STACK_SIZE
         ; ldr w9, [x9, NATIVE_FRAME_PC_OFFSET]
         ; str w9, [sp, DIRECT_ENTRY_OFFSET]
         ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
@@ -1646,7 +1716,7 @@ pub(crate) fn emit_direct_call_tail(
         ; blr x16
         ; ldr x2, [sp, DIRECT_FRAME_INDEX_OFFSET]
         ; ldr w3, [sp, DIRECT_ENTRY_OFFSET]
-        ; add sp, sp, JIT_CTX_STACK_SIZE
+        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
         ; movz x1, dst as u32
     );
@@ -1669,7 +1739,7 @@ pub(crate) fn emit_direct_call_tail(
         ; .arch aarch64
         ; blr x16
         ; ldr x1, [sp, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, JIT_CTX_STACK_SIZE
+        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
     );
     emit_call_stub(ops, jit_abort_direct_call_stub as *const () as usize, threw);

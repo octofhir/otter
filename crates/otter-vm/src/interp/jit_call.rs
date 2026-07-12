@@ -532,7 +532,7 @@ impl Interpreter {
         function: &crate::executable::CodeBlock,
         code: &dyn jit::JitFunctionCode,
     ) -> Option<jit::JitDirectCallPlan> {
-        if !code.metadata().is_compatible_with_current_vm() || code.safepoint_count() != 0 {
+        if !code.metadata().is_compatible_with_current_vm() {
             return None;
         }
         Some(jit::JitDirectCallPlan {
@@ -540,6 +540,8 @@ impl Interpreter {
             entry_addr: code.entry_addr()?,
             param_count: function.param_count,
             register_count: function.register_count,
+            code_object_id: code.metadata().id,
+            has_safepoints: code.safepoint_count() != 0,
         })
     }
 
@@ -673,6 +675,11 @@ impl Interpreter {
 
         let frame_desc = callee_frame.publish(stack);
         window_rollback.commit();
+        let frame_flags = if plan.has_safepoints {
+            crate::native_abi::NativeFrameFlags::HAS_SAFEPOINTS
+        } else {
+            0
+        };
         Ok(jit::JitPreparedDirectCall {
             entry_addr: plan.entry_addr,
             regs: frame_desc.register_window().as_mut_ptr().cast::<u64>(),
@@ -680,6 +687,11 @@ impl Interpreter {
             this_value: this_bits,
             frame_index: frame_desc.index(),
             upvalues_ptr,
+            frame_ids: u64::from(plan.function_id) | (u64::from(plan.function_id) << 32),
+            frame_meta: (u64::from(plan.register_count) << 32)
+                | ((crate::native_abi::NativeFrameKind::Baseline as u64) << 48)
+                | (u64::from(frame_flags) << 56),
+            code_object_id: plan.code_object_id,
         })
     }
 

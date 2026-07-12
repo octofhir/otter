@@ -114,6 +114,9 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
             ctx.direct_this_value = prepared.this_value;
             ctx.direct_frame_index = prepared.frame_index;
             ctx.direct_upvalues_ptr = prepared.upvalues_ptr;
+            ctx.direct_frame_ids = prepared.frame_ids;
+            ctx.direct_frame_meta = prepared.frame_meta;
+            ctx.direct_code_object_id = prepared.code_object_id;
             0
         }
         Ok(None) => 2,

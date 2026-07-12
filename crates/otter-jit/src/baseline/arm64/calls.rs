@@ -91,7 +91,10 @@ pub(super) fn self_bindings_are_dead(callee: &JitInlineCallee) -> bool {
     let code_block = callee.code_block.as_ref();
 
     for instr in &callee.instructions {
-        let operands = instr.operand_view(code_block);
+        let operands = InstructionOperandView {
+            code_block,
+            instruction: instr,
+        };
         let mut ok = true;
         match instr.op(code_block) {
             Op::LoadLocal | Op::StoreLocal => {}
@@ -282,7 +285,10 @@ pub(super) fn classify_inline_call(callee: &JitInlineCallee) -> Option<InlineCal
     let mut regs = vec![InlineKnown::Unknown; usize::from(callee.register_count)];
     let mut store_seen = false;
     for instr in &callee.instructions {
-        let operands = instr.operand_view(code_block);
+        let operands = InstructionOperandView {
+            code_block,
+            instruction: instr,
+        };
         let read = |regs: &[InlineKnown], regn: u16| -> Option<InlineKnown> {
             regs.get(regn as usize).copied()
         };
@@ -410,7 +416,10 @@ pub(super) fn emit_inline_pure_op(
     clabels: &BTreeMap<u32, DynamicLabel>,
     cage_base: usize,
 ) -> Result<(), Unsupported> {
-    let ops_ref = instr.operand_view(code_block);
+    let ops_ref = InstructionOperandView {
+        code_block,
+        instruction: instr,
+    };
     let ctarget = |rel: i32| -> Result<DynamicLabel, Unsupported> {
         let t = branch_target(code_block, instr, rel);
         u32::try_from(t)
@@ -831,7 +840,10 @@ pub(super) fn emit_inline_method_op(
     inline_done: DynamicLabel,
     clabels: &BTreeMap<u32, DynamicLabel>,
 ) -> Result<(), Unsupported> {
-    let ops_ref = instr.operand_view(code_block);
+    let ops_ref = InstructionOperandView {
+        code_block,
+        instruction: instr,
+    };
     match instr.op(code_block) {
         Op::LoadThis => {
             let dst = reg(ops_ref, 0)?;

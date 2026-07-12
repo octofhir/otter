@@ -173,6 +173,23 @@ pub(crate) struct MakeClosureOperands {
     pub(crate) parents: OperandRange,
 }
 
+/// Typed plain-call prefix plus plan-owned argument-register range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallOperands {
+    pub(crate) dst: u16,
+    pub(crate) callee: u16,
+    pub(crate) arguments: OperandRange,
+}
+
+/// Typed method-call prefix plus plan-owned argument-register range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MethodCallOperands {
+    pub(crate) dst: u16,
+    pub(crate) receiver: u16,
+    pub(crate) name: u32,
+    pub(crate) arguments: OperandRange,
+}
+
 /// Typed single immediate operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImmediateOperands {
@@ -219,6 +236,8 @@ enum LoweredOperands {
     NewArray(NewArrayOperands),
     MathCall(MathCallOperands),
     MakeClosure(MakeClosureOperands),
+    Call(CallOperands),
+    MethodCall(MethodCallOperands),
     Immediate(ImmediateOperands),
     Triple(TripleOperands),
     Branch(BranchOperands),
@@ -347,6 +366,22 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn call_operands(self) -> Result<CallOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Call(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered Call operands")),
+        }
+    }
+
+    pub(crate) fn method_call_operands(self) -> Result<MethodCallOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::MethodCall(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape(
+                "lowered CallMethodValue operands",
+            )),
+        }
+    }
+
     pub(crate) fn immediate_operands(self) -> Result<ImmediateOperands, Unsupported> {
         match self.operands {
             LoweredOperands::Immediate(operands) => Ok(operands),
@@ -393,6 +428,8 @@ impl LoweredInstr {
             LoweredOperands::NewArray(operands) => Some(operands.dst),
             LoweredOperands::MathCall(operands) => Some(operands.dst),
             LoweredOperands::MakeClosure(operands) => Some(operands.dst),
+            LoweredOperands::Call(operands) => Some(operands.dst),
+            LoweredOperands::MethodCall(operands) => Some(operands.dst),
             LoweredOperands::Upvalue(operands) if self.op == Op::LoadUpvalue => {
                 Some(operands.value)
             }
@@ -511,6 +548,39 @@ impl BaselinePlan {
                     value: reg(operands, 2)?,
                     scratch: reg(operands, 3)?,
                 }),
+                Op::Call => {
+                    let count = const_index(operands, 2)? as usize;
+                    let arguments = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        3,
+                        count,
+                        "Call register tail",
+                    )?;
+                    LoweredOperands::Call(CallOperands {
+                        dst: reg(operands, 0)?,
+                        callee: reg(operands, 1)?,
+                        arguments,
+                    })
+                }
+                Op::CallMethodValue => {
+                    let count = const_index(operands, 3)? as usize;
+                    let arguments = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        4,
+                        count,
+                        "CallMethodValue register tail",
+                    )?;
+                    LoweredOperands::MethodCall(MethodCallOperands {
+                        dst: reg(operands, 0)?,
+                        receiver: reg(operands, 1)?,
+                        name: const_index(operands, 2)?,
+                        arguments,
+                    })
+                }
                 Op::NewArray => {
                     let count = const_index(operands, 1)? as usize;
                     let elements = append_register_tail(
@@ -757,6 +827,60 @@ pub(crate) fn branch_target(
 
 pub(crate) trait WordOperands: Copy {
     fn get(self, index: usize) -> Option<Operand>;
+}
+
+/// Borrowed typed call operands exposed through the legacy word accessor while
+/// call emitters are migrated to field-based inputs.
+#[derive(Clone, Copy)]
+pub(crate) enum CallOperandView<'a> {
+    Plain {
+        call: CallOperands,
+        arguments: &'a [u16],
+    },
+    Method {
+        call: MethodCallOperands,
+        arguments: &'a [u16],
+    },
+}
+
+impl WordOperands for CallOperandView<'_> {
+    fn get(self, index: usize) -> Option<Operand> {
+        match self {
+            Self::Plain { call, arguments } => match index {
+                0 => Some(Operand::Register(call.dst)),
+                1 => Some(Operand::Register(call.callee)),
+                2 => Some(Operand::ConstIndex(u32::try_from(arguments.len()).ok()?)),
+                tail => arguments
+                    .get(tail.checked_sub(3)?)
+                    .copied()
+                    .map(Operand::Register),
+            },
+            Self::Method { call, arguments } => match index {
+                0 => Some(Operand::Register(call.dst)),
+                1 => Some(Operand::Register(call.receiver)),
+                2 => Some(Operand::ConstIndex(call.name)),
+                3 => Some(Operand::ConstIndex(u32::try_from(arguments.len()).ok()?)),
+                tail => arguments
+                    .get(tail.checked_sub(4)?)
+                    .copied()
+                    .map(Operand::Register),
+            },
+        }
+    }
+}
+
+/// Schema-checked accessor used only while nested inline-callee bodies are
+/// lowered independently from the owning function plan.
+#[derive(Clone, Copy)]
+pub(crate) struct InstructionOperandView<'a> {
+    pub(crate) code_block: &'a otter_vm::CodeBlock,
+    pub(crate) instruction: &'a otter_vm::JitInstructionMetadata,
+}
+
+impl WordOperands for InstructionOperandView<'_> {
+    fn get(self, index: usize) -> Option<Operand> {
+        self.instruction.operand(self.code_block, index)
+    }
 }
 
 fn append_register_tail(

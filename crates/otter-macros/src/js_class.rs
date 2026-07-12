@@ -673,12 +673,8 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 *raw,
                 Emitted::Method,
             ),
-            Role::Getter { js_name, raw } => {
-                (js_name.clone(), 0, false, *raw, Emitted::Getter)
-            }
-            Role::Setter { js_name, raw } => {
-                (js_name.clone(), 1, false, *raw, Emitted::Setter)
-            }
+            Role::Getter { js_name, raw } => (js_name.clone(), 0, false, *raw, Emitted::Getter),
+            Role::Setter { js_name, raw } => (js_name.clone(), 1, false, *raw, Emitted::Setter),
             Role::Constructor { .. } | Role::StaticMethod { .. } => {
                 unreachable!("filtered above")
             }
@@ -707,11 +703,9 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                     quote!(#type_path::#fn_ident)
                 }
                 ReceiverKind::Ref | ReceiverKind::RefMut | ReceiverKind::Owned => {
-                    let op_string =
-                        format!("{}.prototype.{}", class_name.value(), js_name.value());
+                    let op_string = format!("{}.prototype.{}", class_name.value(), js_name.value());
                     let op = LitStr::new(&op_string, js_name.span());
-                    let glue_ident =
-                        format_ident!("__otter_js_class_{glue_prefix}_raw_{fn_ident}");
+                    let glue_ident = format_ident!("__otter_js_class_{glue_prefix}_raw_{fn_ident}");
                     glue.extend(quote! {
                         fn #glue_ident(
                             ctx: &mut ::otter_vm::NativeCtx<'_>,
@@ -742,14 +736,9 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                     method_rows.push(quote!(#js_name / #length_lit => #call_ident));
                 }
                 Emitted::Getter | Emitted::Setter => {
-                    let glue_ident = format_ident!(
-                        "__otter_js_class_{glue_prefix}_raw_{fn_ident}"
-                    );
+                    let glue_ident = format_ident!("__otter_js_class_{glue_prefix}_raw_{fn_ident}");
                     let key = js_name.value();
-                    let slot = match accessor_slots
-                        .iter_mut()
-                        .find(|(name, ..)| *name == key)
-                    {
+                    let slot = match accessor_slots.iter_mut().find(|(name, ..)| *name == key) {
                         Some(slot) => slot,
                         None => {
                             accessor_slots.push((key, js_name.clone(), None, None));

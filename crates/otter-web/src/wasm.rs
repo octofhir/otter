@@ -196,16 +196,28 @@ struct WasmThrow {
 
 impl WasmThrow {
     fn compile(message: impl Into<String>) -> Self {
-        Self { kind: "CompileError", message: message.into() }
+        Self {
+            kind: "CompileError",
+            message: message.into(),
+        }
     }
     fn link(message: impl Into<String>) -> Self {
-        Self { kind: "LinkError", message: message.into() }
+        Self {
+            kind: "LinkError",
+            message: message.into(),
+        }
     }
     fn runtime(message: impl Into<String>) -> Self {
-        Self { kind: "RuntimeError", message: message.into() }
+        Self {
+            kind: "RuntimeError",
+            message: message.into(),
+        }
     }
     fn type_error(message: impl Into<String>) -> Self {
-        Self { kind: "TypeError", message: message.into() }
+        Self {
+            kind: "TypeError",
+            message: message.into(),
+        }
     }
     fn from_js(err: JsError) -> Self {
         Self::runtime(err.to_string())
@@ -288,7 +300,10 @@ fn extern_ref_to_js<'s>(
     };
     match root {
         Some(root) => {
-            let value = cx.ctx().persistent_root_get(root).unwrap_or_else(Value::undefined);
+            let value = cx
+                .ctx()
+                .persistent_root_get(root)
+                .unwrap_or_else(Value::undefined);
             cx.park(value)
         }
         None => cx.null(),
@@ -382,9 +397,13 @@ fn drive_call(
     outputs: &mut [Val],
 ) -> Result<(), CallFailure> {
     let ctx_ptr: *mut NativeCtx<'_> = ctx;
-    let bridge = Bridge { ctx: ctx_ptr as usize };
+    let bridge = Bridge {
+        ctx: ctx_ptr as usize,
+    };
     let mut guard = store.try_lock().map_err(|_| {
-        CallFailure::Throw(WasmThrow::runtime("re-entrant WebAssembly call is not supported"))
+        CallFailure::Throw(WasmThrow::runtime(
+            "re-entrant WebAssembly call is not supported",
+        ))
     })?;
     guard.data_mut().bridge = &bridge as *const Bridge as usize;
     let result = func.call(&mut *guard, inputs, outputs);
@@ -544,11 +563,17 @@ fn throw_js_value(
     name: &'static str,
 ) -> NativeError {
     let Some(thrower) = namespace_thrower(cx) else {
-        return NativeError::Thrown { name, message: "WebAssembly exception".to_string() };
+        return NativeError::Thrown {
+            name,
+            message: "WebAssembly exception".to_string(),
+        };
     };
     let this = cx.undefined();
     match cx.call(thrower, this, &[value]) {
-        Ok(_) => NativeError::Thrown { name, message: "WebAssembly exception".to_string() },
+        Ok(_) => NativeError::Thrown {
+            name,
+            message: "WebAssembly exception".to_string(),
+        },
         Err(err) => err.into_native(name),
     }
 }
@@ -564,13 +589,19 @@ fn surface_call_failure(
 ) -> NativeError {
     const NAME: &str = "WebAssembly.Instance exported function";
     match failure {
-        CallFailure::Throw(throw) => {
-            NativeError::Thrown { name: NAME, message: format!("{}: {}", throw.kind, throw.message) }
-        }
+        CallFailure::Throw(throw) => NativeError::Thrown {
+            name: NAME,
+            message: format!("{}: {}", throw.kind, throw.message),
+        },
         CallFailure::Exception(exn) => {
             let value = match js_tag_payload(cx, store, js_tag, exn) {
                 Some(value) => value,
-                None => match (WasmException { store: store.clone(), exn }).into_js(cx) {
+                None => match (WasmException {
+                    store: store.clone(),
+                    exn,
+                })
+                .into_js(cx)
+                {
                     Ok(value) => value,
                     Err(err) => return err.into_native(NAME),
                 },
@@ -601,9 +632,10 @@ fn make_export_function<'s>(
             let mut inputs: Vec<Val> = Vec::with_capacity(params.len());
             for (index, ty) in params.iter().enumerate() {
                 let handle = cx.park(args.get(index).copied().unwrap_or_else(Value::undefined));
-                inputs.push(js_to_val(&mut cx, &store, handle, ty).map_err(|err| {
-                    err.into_native("WebAssembly.Instance exported function")
-                })?);
+                inputs
+                    .push(js_to_val(&mut cx, &store, handle, ty).map_err(|err| {
+                        err.into_native("WebAssembly.Instance exported function")
+                    })?);
             }
             let mut outputs: Vec<Val> = results.iter().map(default_val).collect();
             if let Err(failure) = drive_call(cx.ctx(), &store, func, &inputs, &mut outputs) {
@@ -663,22 +695,37 @@ fn build_exports<'s>(
             Extern::Func(func) => {
                 make_export_function(cx, store, js_tag, func).map_err(WasmThrow::from_js)?
             }
-            Extern::Memory(memory) => WasmMemory { store: store.clone(), memory }
-                .into_js(cx)
-                .map_err(WasmThrow::from_js)?,
-            Extern::Global(global) => {
-                let content =
-                    global.ty(&mut *store.lock().expect("wasm store poisoned")).content().clone();
-                WasmGlobal { store: store.clone(), global, content }
-                    .into_js(cx)
-                    .map_err(WasmThrow::from_js)?
+            Extern::Memory(memory) => WasmMemory {
+                store: store.clone(),
+                memory,
             }
-            Extern::Table(table) => WasmTable { store: store.clone(), table }
+            .into_js(cx)
+            .map_err(WasmThrow::from_js)?,
+            Extern::Global(global) => {
+                let content = global
+                    .ty(&mut *store.lock().expect("wasm store poisoned"))
+                    .content()
+                    .clone();
+                WasmGlobal {
+                    store: store.clone(),
+                    global,
+                    content,
+                }
                 .into_js(cx)
-                .map_err(WasmThrow::from_js)?,
-            Extern::Tag(tag) => WasmTag { store: store.clone(), tag }
-                .into_js(cx)
-                .map_err(WasmThrow::from_js)?,
+                .map_err(WasmThrow::from_js)?
+            }
+            Extern::Table(table) => WasmTable {
+                store: store.clone(),
+                table,
+            }
+            .into_js(cx)
+            .map_err(WasmThrow::from_js)?,
+            Extern::Tag(tag) => WasmTag {
+                store: store.clone(),
+                tag,
+            }
+            .into_js(cx)
+            .map_err(WasmThrow::from_js)?,
             _ => continue,
         };
         cx.set(object, &name, value).map_err(WasmThrow::from_js)?;
@@ -693,7 +740,8 @@ fn make_instance_object<'s>(
     exports: JsValue<'s>,
 ) -> Result<JsValue<'s>, WasmThrow> {
     let instance = cx.object().map_err(WasmThrow::from_js)?;
-    cx.set(instance, "exports", exports).map_err(WasmThrow::from_js)?;
+    cx.set(instance, "exports", exports)
+        .map_err(WasmThrow::from_js)?;
     if let Some(proto) = instance_prototype(cx) {
         let proto_raw = cx.escape(proto);
         let instance_raw = cx.escape(instance);
@@ -728,13 +776,23 @@ fn instantiate_core<'s>(
     module: &WasmModule,
     import_object: JsValue<'s>,
 ) -> Result<JsValue<'s>, WasmThrow> {
-    let WasmRealm { engine, store, js_tag } = realm_handle(cx).map_err(WasmThrow::from_js)?;
+    let WasmRealm {
+        engine,
+        store,
+        js_tag,
+    } = realm_handle(cx).map_err(WasmThrow::from_js)?;
     let mut linker: Linker<StoreState> = Linker::new(&engine);
 
     let imports: Vec<(String, String, ExternType)> = module
         .module
         .imports()
-        .map(|import| (import.module().to_string(), import.name().to_string(), import.ty()))
+        .map(|import| {
+            (
+                import.module().to_string(),
+                import.name().to_string(),
+                import.ty(),
+            )
+        })
         .collect();
 
     for (module_name, field, ty) in &imports {
@@ -761,7 +819,8 @@ fn instantiate_core<'s>(
                         func_ty.clone(),
                         move |mut caller: Caller<'_, StoreState>, params, outputs| {
                             let bridge = caller.data().bridge;
-                            match run_import(&import_store, bridge, params, outputs, root, &results) {
+                            match run_import(&import_store, bridge, params, outputs, root, &results)
+                            {
                                 Ok(()) => Ok(()),
                                 Err(ImportFailure::Fatal(err)) => Err(err),
                                 Err(ImportFailure::JsThrow(parked)) => {
@@ -796,7 +855,9 @@ fn instantiate_core<'s>(
 
     let instance = {
         let ctx_ptr: *mut NativeCtx<'_> = cx.ctx();
-        let bridge = Bridge { ctx: ctx_ptr as usize };
+        let bridge = Bridge {
+            ctx: ctx_ptr as usize,
+        };
         let mut guard = store.lock().expect("wasm store poisoned");
         guard.data_mut().bridge = &bridge as *const Bridge as usize;
         let outcome = linker.instantiate(&mut *guard, &module.module);
@@ -843,7 +904,9 @@ fn compile_module<'s>(
     let (engine, _store) = realm(cx).map_err(WasmThrow::from_js)?;
     let module =
         WtModule::new(&engine, &bytes).map_err(|err| WasmThrow::compile(err.to_string()))?;
-    WasmModule { module }.into_js(cx).map_err(WasmThrow::from_js)
+    WasmModule { module }
+        .into_js(cx)
+        .map_err(WasmThrow::from_js)
 }
 
 /// Complete a namespace async method: fulfil with `result` or reject with the
@@ -855,12 +918,16 @@ fn settle_promise(
 ) -> Result<Value, NativeError> {
     match result {
         Ok(value) => {
-            let promise = cx.promise_fulfilled(value).map_err(|err| err.into_native(operation))?;
+            let promise = cx
+                .promise_fulfilled(value)
+                .map_err(|err| err.into_native(operation))?;
             Ok(cx.escape(promise))
         }
         Err(throw) => {
             let reason = throw.to_value(cx);
-            let promise = cx.promise_rejected(reason).map_err(|err| err.into_native(operation))?;
+            let promise = cx
+                .promise_rejected(reason)
+                .map_err(|err| err.into_native(operation))?;
             Ok(cx.escape(promise))
         }
     }
@@ -943,10 +1010,14 @@ impl WebAssembly {
     fn js_tag(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
         ctx.scope(|ctx, scope| {
             let mut cx = MarshalCx::new(ctx, scope);
-            let realm = realm_handle(&mut cx).map_err(|err| err.into_native("WebAssembly.JSTag"))?;
-            let value = WasmTag { store: realm.store, tag: realm.js_tag }
-                .into_js(&mut cx)
-                .map_err(|err| err.into_native("WebAssembly.JSTag"))?;
+            let realm =
+                realm_handle(&mut cx).map_err(|err| err.into_native("WebAssembly.JSTag"))?;
+            let value = WasmTag {
+                store: realm.store,
+                tag: realm.js_tag,
+            }
+            .into_js(&mut cx)
+            .map_err(|err| err.into_native("WebAssembly.JSTag"))?;
             Ok(cx.escape(value))
         })
     }
@@ -971,8 +1042,10 @@ fn instantiate_entry<'s>(
     let instance = instantiate_core(cx, &module, imports)?;
     let module_js = module.into_js(cx).map_err(WasmThrow::from_js)?;
     let result = cx.object().map_err(WasmThrow::from_js)?;
-    cx.set(result, "module", module_js).map_err(WasmThrow::from_js)?;
-    cx.set(result, "instance", instance).map_err(WasmThrow::from_js)?;
+    cx.set(result, "module", module_js)
+        .map_err(WasmThrow::from_js)?;
+    cx.set(result, "instance", instance)
+        .map_err(WasmThrow::from_js)?;
     Ok(result)
 }
 
@@ -989,11 +1062,14 @@ impl WasmModule {
         ctx.scope(|ctx, scope| {
             let mut cx = MarshalCx::new(ctx, scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
-            let bytes = cx.buffer_source_bytes(handle).ok_or_else(|| NativeError::Thrown {
-                name: "WebAssembly.Module",
-                message: "TypeError: expected a BufferSource of wasm bytes".to_string(),
-            })?;
-            let (engine, _store) = realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Module"))?;
+            let bytes = cx
+                .buffer_source_bytes(handle)
+                .ok_or_else(|| NativeError::Thrown {
+                    name: "WebAssembly.Module",
+                    message: "TypeError: expected a BufferSource of wasm bytes".to_string(),
+                })?;
+            let (engine, _store) =
+                realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Module"))?;
             let module = WtModule::new(&engine, &bytes).map_err(|err| NativeError::Thrown {
                 name: "WebAssembly.Module",
                 message: format!("CompileError: {err}"),
@@ -1034,8 +1110,12 @@ impl WasmMemory {
                     ValueIdent::Argument(0),
                 )
                 .map_err(|err| err.into_native("WebAssembly.Memory"))?;
-            let (_engine, store) = realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Memory"))?;
-            let ty = MemoryType::new(descriptor.initial as u32, descriptor.maximum.map(|v| v as u32));
+            let (_engine, store) =
+                realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Memory"))?;
+            let ty = MemoryType::new(
+                descriptor.initial as u32,
+                descriptor.maximum.map(|v| v as u32),
+            );
             let memory = {
                 let mut guard = store.lock().expect("wasm store poisoned");
                 WtMemory::new(&mut *guard, ty).map_err(|err| NativeError::Thrown {
@@ -1043,9 +1123,12 @@ impl WasmMemory {
                     message: format!("RangeError: {err}"),
                 })?
             };
-            let value = WasmMemory { store: store.clone(), memory }
-                .into_js(&mut cx)
-                .map_err(|err| err.into_native("WebAssembly.Memory"))?;
+            let value = WasmMemory {
+                store: store.clone(),
+                memory,
+            }
+            .into_js(&mut cx)
+            .map_err(|err| err.into_native("WebAssembly.Memory"))?;
             Ok(cx.escape(value))
         })
     }
@@ -1099,7 +1182,8 @@ impl WasmGlobal {
                 .map_err(|err| err.into_native("WebAssembly.Global"))?;
             let content = parse_val_type(&descriptor.value)
                 .map_err(|err| err.into_native("WebAssembly.Global"))?;
-            let (_engine, store) = realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Global"))?;
+            let (_engine, store) =
+                realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Global"))?;
             let initial = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let value = if cx.is_undefined(initial) {
                 default_val(&content)
@@ -1114,15 +1198,23 @@ impl WasmGlobal {
             };
             let global = {
                 let mut guard = store.lock().expect("wasm store poisoned");
-                WtGlobal::new(&mut *guard, GlobalType::new(content.clone(), mutability), value)
-                    .map_err(|err| NativeError::Thrown {
-                        name: "WebAssembly.Global",
-                        message: format!("TypeError: {err}"),
-                    })?
+                WtGlobal::new(
+                    &mut *guard,
+                    GlobalType::new(content.clone(), mutability),
+                    value,
+                )
+                .map_err(|err| NativeError::Thrown {
+                    name: "WebAssembly.Global",
+                    message: format!("TypeError: {err}"),
+                })?
             };
-            let out = WasmGlobal { store: store.clone(), global, content }
-                .into_js(&mut cx)
-                .map_err(|err| err.into_native("WebAssembly.Global"))?;
+            let out = WasmGlobal {
+                store: store.clone(),
+                global,
+                content,
+            }
+            .into_js(&mut cx)
+            .map_err(|err| err.into_native("WebAssembly.Global"))?;
             Ok(cx.escape(out))
         })
     }
@@ -1196,10 +1288,12 @@ impl WasmTable {
             let ValType::Ref(ref_ty) = &element else {
                 return Err(NativeError::Thrown {
                     name: "WebAssembly.Table",
-                    message: "TypeError: Table element must be 'funcref' or 'externref'".to_string(),
+                    message: "TypeError: Table element must be 'funcref' or 'externref'"
+                        .to_string(),
                 });
             };
-            let (_engine, store) = realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Table"))?;
+            let (_engine, store) =
+                realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Table"))?;
             let init = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let init_ref = table_init_ref(&mut cx, &store, ref_ty.clone(), init)
                 .map_err(|err| err.into_native("WebAssembly.Table"))?;
@@ -1215,9 +1309,12 @@ impl WasmTable {
                     message: format!("RangeError: {err}"),
                 })?
             };
-            let out = WasmTable { store: store.clone(), table }
-                .into_js(&mut cx)
-                .map_err(|err| err.into_native("WebAssembly.Table"))?;
+            let out = WasmTable {
+                store: store.clone(),
+                table,
+            }
+            .into_js(&mut cx)
+            .map_err(|err| err.into_native("WebAssembly.Table"))?;
             Ok(cx.escape(out))
         })
     }
@@ -1234,9 +1331,10 @@ impl WasmTable {
         let table = self.table;
         ctx.scope(|ctx, scope| {
             let mut cx = MarshalCx::new(ctx, scope);
-            let index = cx
-                .park(args.first().copied().unwrap_or_else(Value::undefined));
-            let index = cx.to_number_spec(index).map_err(|err| err.into_native("WebAssembly.Table"))? as u64;
+            let index = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
+            let index =
+                cx.to_number_spec(index)
+                    .map_err(|err| err.into_native("WebAssembly.Table"))? as u64;
             let cell = {
                 let mut guard = store.lock().expect("wasm store poisoned");
                 table.get(&mut *guard, index)
@@ -1262,9 +1360,9 @@ impl WasmTable {
         ctx.scope(|ctx, scope| {
             let mut cx = MarshalCx::new(ctx, scope);
             let index_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
-            let index = cx
-                .to_number_spec(index_handle)
-                .map_err(|err| err.into_native("WebAssembly.Table"))? as u64;
+            let index =
+                cx.to_number_spec(index_handle)
+                    .map_err(|err| err.into_native("WebAssembly.Table"))? as u64;
             let value_handle = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let ref_ty = {
                 let mut guard = store.lock().expect("wasm store poisoned");
@@ -1273,10 +1371,12 @@ impl WasmTable {
             let new_ref = table_init_ref(&mut cx, &store, ref_ty, value_handle)
                 .map_err(|err| err.into_native("WebAssembly.Table"))?;
             let mut guard = store.lock().expect("wasm store poisoned");
-            table.set(&mut *guard, index, new_ref).map_err(|err| NativeError::Thrown {
-                name: "WebAssembly.Table",
-                message: format!("RangeError: {err}"),
-            })?;
+            table
+                .set(&mut *guard, index, new_ref)
+                .map_err(|err| NativeError::Thrown {
+                    name: "WebAssembly.Table",
+                    message: format!("RangeError: {err}"),
+                })?;
             Ok(Value::undefined())
         })
     }
@@ -1307,7 +1407,9 @@ fn read_tag_parameters(
     descriptor: JsValue<'_>,
 ) -> Result<Vec<ValType>, JsError> {
     if !cx.is_object(descriptor) {
-        return Err(JsError::Type("Tag descriptor must be an object".to_string()));
+        return Err(JsError::Type(
+            "Tag descriptor must be an object".to_string(),
+        ));
     }
     let parameters = cx.get(descriptor, "parameters")?;
     let handles = cx.iterate_to_handles(parameters)?;
@@ -1343,7 +1445,8 @@ impl WasmTag {
             let descriptor = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let params = read_tag_parameters(&mut cx, descriptor)
                 .map_err(|err| err.into_native("WebAssembly.Tag"))?;
-            let (engine, store) = realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Tag"))?;
+            let (engine, store) =
+                realm(&mut cx).map_err(|err| err.into_native("WebAssembly.Tag"))?;
             let tag = make_tag(&engine, &store, &params)
                 .map_err(|err| err.into_native("WebAssembly.Tag"))?;
             let value = WasmTag { store, tag }
@@ -1365,15 +1468,21 @@ impl WasmTag {
                 let guard = store.lock().expect("wasm store poisoned");
                 tag.ty(&*guard).ty().params().collect()
             };
-            let array = cx.array(params.len()).map_err(|err| err.into_native("WebAssembly.Tag"))?;
+            let array = cx
+                .array(params.len())
+                .map_err(|err| err.into_native("WebAssembly.Tag"))?;
             for (index, ty) in params.iter().enumerate() {
                 let name = cx
                     .string(val_type_name(ty))
                     .map_err(|err| err.into_native("WebAssembly.Tag"))?;
-                cx.set_index(array, index, name).map_err(|err| err.into_native("WebAssembly.Tag"))?;
+                cx.set_index(array, index, name)
+                    .map_err(|err| err.into_native("WebAssembly.Tag"))?;
             }
-            let object = cx.object().map_err(|err| err.into_native("WebAssembly.Tag"))?;
-            cx.set(object, "parameters", array).map_err(|err| err.into_native("WebAssembly.Tag"))?;
+            let object = cx
+                .object()
+                .map_err(|err| err.into_native("WebAssembly.Tag"))?;
+            cx.set(object, "parameters", array)
+                .map_err(|err| err.into_native("WebAssembly.Tag"))?;
             Ok(cx.escape(object))
         })
     }
@@ -1442,14 +1551,19 @@ impl WasmException {
                     JsError::Type(err.to_string()).into_native("WebAssembly.Exception")
                 })?;
                 let pre = ExnRefPre::new(&mut *guard, exn_ty);
-                ExnRef::new(&mut *guard, &pre, &tag, &fields).map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Exception",
-                    message: format!("TypeError: {err}"),
+                ExnRef::new(&mut *guard, &pre, &tag, &fields).map_err(|err| {
+                    NativeError::Thrown {
+                        name: "WebAssembly.Exception",
+                        message: format!("TypeError: {err}"),
+                    }
                 })?
             };
-            let value = WasmException { store: store.clone(), exn }
-                .into_js(&mut cx)
-                .map_err(|err| err.into_native("WebAssembly.Exception"))?;
+            let value = WasmException {
+                store: store.clone(),
+                exn,
+            }
+            .into_js(&mut cx)
+            .map_err(|err| err.into_native("WebAssembly.Exception"))?;
             Ok(cx.escape(value))
         })
     }
@@ -1491,7 +1605,8 @@ impl WasmException {
             let index_handle = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let index = cx
                 .to_number_spec(index_handle)
-                .map_err(|err| err.into_native("WebAssembly.Exception"))? as usize;
+                .map_err(|err| err.into_native("WebAssembly.Exception"))?
+                as usize;
             let field = {
                 let mut guard = store.lock().expect("wasm store poisoned");
                 let own = exn.tag(&mut *guard).map_err(|err| NativeError::Thrown {
@@ -1511,10 +1626,11 @@ impl WasmException {
                         message: "RangeError: getArg index out of range".to_string(),
                     });
                 }
-                exn.field(&mut *guard, index).map_err(|err| NativeError::Thrown {
-                    name: "WebAssembly.Exception",
-                    message: format!("RangeError: {err}"),
-                })?
+                exn.field(&mut *guard, index)
+                    .map_err(|err| NativeError::Thrown {
+                        name: "WebAssembly.Exception",
+                        message: format!("RangeError: {err}"),
+                    })?
             };
             let out = val_to_js(&mut cx, &store, &field);
             Ok(cx.escape(out))

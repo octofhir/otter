@@ -40,7 +40,7 @@ mod template;
 
 pub use baseline::{BaselineCode, Unsupported, compile};
 pub use code::CompiledCode;
-pub use template::TemplateCode;
+pub use template::{TemplateCode, compile as compile_template};
 
 /// Which native compiler implementation the installed hook drives.
 ///

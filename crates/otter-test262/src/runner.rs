@@ -197,6 +197,8 @@ pub struct ExecConfig {
     pub max_heap_bytes: u64,
     /// Loaded `test262_config.toml` (drives skip lists).
     pub config: Test262Config,
+    /// Execution tiers installed in every per-test runtime.
+    pub jit_selection: otter_runtime::JitSelection,
 }
 
 impl ExecConfig {
@@ -468,6 +470,7 @@ fn run_script_with_fresh_runtime(
         exec.timeout,
         exec.max_heap_bytes,
         allow_blocking_atomics_wait,
+        exec.jit_selection,
     ) {
         Ok(rt) => rt,
         Err(err) => {
@@ -517,6 +520,7 @@ fn run_module_with_fresh_runtime(
         exec.timeout,
         exec.max_heap_bytes,
         allow_blocking_atomics_wait,
+        exec.jit_selection,
     ) {
         Ok(rt) => rt,
         Err(err) => {

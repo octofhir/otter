@@ -178,6 +178,39 @@ struct RunArgs {
     /// fresh process.
     #[arg(long)]
     worker_soft_rss_bytes: Option<u64>,
+
+    /// Execution tier installed in every per-test runtime.
+    #[arg(long, value_enum, default_value_t = JitTierArg::Baseline)]
+    jit_tier: JitTierArg,
+}
+
+/// Execution-tier selection forwarded to every per-test runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum JitTierArg {
+    /// Interpreter plus the production baseline compiler.
+    Baseline,
+    /// Interpreter plus the template compiler (differential coverage).
+    Template,
+    /// Interpreter only.
+    Interpreter,
+}
+
+impl JitTierArg {
+    fn selection(self) -> otter_runtime::JitSelection {
+        match self {
+            Self::Baseline => otter_runtime::JitSelection::Baseline,
+            Self::Template => otter_runtime::JitSelection::Template,
+            Self::Interpreter => otter_runtime::JitSelection::InterpreterOnly,
+        }
+    }
+
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::Baseline => "baseline",
+            Self::Template => "template",
+            Self::Interpreter => "interpreter",
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -213,6 +246,10 @@ struct WorkerArgs {
     /// Worker resident-memory soft ceiling in bytes. `0` disables.
     #[arg(long, default_value_t = DEFAULT_WORKER_SOFT_RSS_BYTES)]
     worker_soft_rss_bytes: u64,
+
+    /// Execution tier installed in every per-test runtime.
+    #[arg(long, value_enum, default_value_t = JitTierArg::Baseline)]
+    jit_tier: JitTierArg,
 }
 
 #[derive(Parser, Debug)]
@@ -315,6 +352,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_WORKER_SOFT_RSS_BYTES)
     });
+    let jit_tier = args.jit_tier;
     if timeout_ms > MAX_TIMEOUT_MS {
         eprintln!(
             "error: --timeout {timeout_ms} ms exceeds the {MAX_TIMEOUT_MS} ms cap — \
@@ -378,6 +416,7 @@ fn run(repo_root: &Path, args: RunArgs) -> Result<ExitCode> {
         jobs,
         args.process_chunk_size.max(1),
         worker_soft_rss_bytes,
+        jit_tier,
     )
 }
 
@@ -472,6 +511,7 @@ fn execute_process_isolated(
     jobs: usize,
     chunk_size: usize,
     worker_soft_rss_bytes: u64,
+    jit_tier: JitTierArg,
 ) -> Result<ExitCode> {
     let temp = tempfile::Builder::new()
         .prefix("otter-test262-")
@@ -558,6 +598,7 @@ fn execute_process_isolated(
                     timeout_ms,
                     max_heap_bytes,
                     worker_soft_rss_bytes,
+                    jit_tier,
                 );
             })
         })
@@ -622,6 +663,7 @@ fn process_parent_worker_loop(
     timeout_ms: u64,
     max_heap_bytes: u64,
     worker_soft_rss_bytes: u64,
+    jit_tier: JitTierArg,
 ) {
     loop {
         if interrupted.load(Ordering::Relaxed) {
@@ -646,6 +688,7 @@ fn process_parent_worker_loop(
             max_heap_bytes,
             worker_soft_rss_bytes,
             config_path,
+            jit_tier,
         );
 
         let recorded = read_worker_lines(&out_file, slots, pb, progress);
@@ -735,6 +778,7 @@ fn run_worker_child(
     max_heap_bytes: u64,
     worker_soft_rss_bytes: u64,
     config_path: Option<&Path>,
+    jit_tier: JitTierArg,
 ) -> WorkerRunStatus {
     let mut cmd = std::process::Command::new(exe);
     let stdout = File::create(stdout_file).ok();
@@ -756,7 +800,9 @@ fn run_worker_child(
         .arg("--max-heap-bytes")
         .arg(max_heap_bytes.to_string())
         .arg("--worker-soft-rss-bytes")
-        .arg(worker_soft_rss_bytes.to_string());
+        .arg(worker_soft_rss_bytes.to_string())
+        .arg("--jit-tier")
+        .arg(jit_tier.as_arg());
     if let Some(stdout) = stdout {
         cmd.stdout(stdout);
     }
@@ -890,6 +936,7 @@ fn worker(repo_root: &Path, args: WorkerArgs) -> Result<ExitCode> {
         timeout: Duration::from_millis(args.timeout_ms),
         max_heap_bytes: args.max_heap_bytes,
         config,
+        jit_selection: args.jit_tier.selection(),
     };
     let test_paths = std::fs::read_to_string(&args.paths_file)
         .with_context(|| format!("failed to read {}", args.paths_file.display()))?;

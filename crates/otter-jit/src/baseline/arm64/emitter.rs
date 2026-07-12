@@ -66,12 +66,6 @@ impl EmissionSession {
         let artifacts = &mut self.artifacts;
         let fres = &mut self.fres;
         let osr_only = &mut self.osr_only;
-        let target_label = |instruction_pc: i64| -> Result<DynamicLabel, Unsupported> {
-            u32::try_from(instruction_pc)
-                .ok()
-                .and_then(|pc| labels.get(&pc).copied())
-                .ok_or(Unsupported::BranchTarget(instruction_pc))
-        };
 
         // Loop headers are verified once by the owning CodeBlock.
         let loop_headers = code_block.loop_headers();
@@ -232,19 +226,17 @@ impl EmissionSession {
                     store_reg(ops, 9, dst)?;
                 }
                 Op::Jump => {
-                    let rel = imm32(ops_ref, 0)?;
-                    let target = branch_target(code_block, instr, rel);
-                    let tgt = target_label(target)?;
-                    if target <= i64::from(instruction_pc) {
+                    let target = plan.branch_target(instr.byte_pc)?;
+                    let tgt = labels[&target];
+                    if target <= instruction_pc {
                         emit_backedge_interrupt_check(ops, threw);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>tgt);
                 }
                 Op::JumpIfFalse | Op::JumpIfTrue => {
-                    let rel = imm32(ops_ref, 0)?;
                     let cond = reg(ops_ref, 1)?;
-                    let target = branch_target(code_block, instr, rel);
-                    let tgt = target_label(target)?;
+                    let target = plan.branch_target(instr.byte_pc)?;
+                    let tgt = labels[&target];
                     load_reg(ops, 9, cond)?;
                     // Only boolean conditions are supported in this subset.
                     dynasm!(ops
@@ -254,7 +246,7 @@ impl EmissionSession {
                         ; b.hi =>bail
                         ; cmp x9, #(VALUE_TRUE as u32)                // eq iff true
                     );
-                    if target <= i64::from(instruction_pc) {
+                    if target <= instruction_pc {
                         let taken = ops.new_dynamic_label();
                         let fallthrough = ops.new_dynamic_label();
                         if matches!(instr.op(code_block), Op::JumpIfFalse) {

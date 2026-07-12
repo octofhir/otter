@@ -864,6 +864,16 @@ mod tests {
     }
 
     #[test]
+    fn lowering_plan_publishes_canonical_branch_target() {
+        let v = view(&[
+            (Op::Jump, vec![Operand::Imm32(0)]),
+            (Op::ReturnUndefined, vec![]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+        assert_eq!(plan.branch_target(0), Ok(1));
+    }
+
+    #[test]
     fn lowering_plan_assigns_allocating_add_safepoint() {
         let v = view(&[
             (

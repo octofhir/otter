@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Self-patching property IC cells whose addresses are embedded in code.
-//! - Decoded variadic operand tables passed to runtime stubs.
+//! - Plan-owned variadic operand buffers passed to runtime stubs.
 //! - Emission cursors checked against the backend-neutral lowering plan.
 //!
 //! # Invariants
@@ -20,9 +20,8 @@ use super::WhiskerIcCell;
 pub(crate) struct EmissionArtifacts {
     pub(crate) load_ic_cells: Box<[WhiskerIcCell]>,
     pub(crate) store_ic_cells: Box<[WhiskerIcCell]>,
-    pub(crate) array_literal_regs: Vec<Box<[u16]>>,
-    pub(crate) closure_parent_indices: Vec<Box<[u32]>>,
-    pub(crate) math_argument_regs: Vec<Box<[u16]>>,
+    pub(crate) register_operands: Box<[u16]>,
+    pub(crate) index_operands: Box<[u32]>,
     next_load_ic: usize,
     next_store_ic: usize,
 }
@@ -32,9 +31,8 @@ impl EmissionArtifacts {
         Self {
             load_ic_cells: vec![WhiskerIcCell::default(); load_property_count].into_boxed_slice(),
             store_ic_cells: vec![WhiskerIcCell::default(); store_property_count].into_boxed_slice(),
-            array_literal_regs: Vec::new(),
-            closure_parent_indices: Vec::new(),
-            math_argument_regs: Vec::new(),
+            register_operands: Box::default(),
+            index_operands: Box::default(),
             next_load_ic: 0,
             next_store_ic: 0,
         }
@@ -58,22 +56,11 @@ impl EmissionArtifacts {
         cell as *mut WhiskerIcCell as usize
     }
 
-    pub(crate) fn retain_array_literal_regs(&mut self, regs: Box<[u16]>) -> *const u16 {
-        let ptr = regs.as_ptr();
-        self.array_literal_regs.push(regs);
-        ptr
-    }
-
-    pub(crate) fn retain_closure_parent_indices(&mut self, indices: Box<[u32]>) -> *const u32 {
-        let ptr = indices.as_ptr();
-        self.closure_parent_indices.push(indices);
-        ptr
-    }
-
-    pub(crate) fn retain_math_argument_regs(&mut self, regs: Box<[u16]>) -> *const u16 {
-        let ptr = regs.as_ptr();
-        self.math_argument_regs.push(regs);
-        ptr
+    pub(crate) fn retain_operand_buffers(&mut self, registers: Box<[u16]>, indices: Box<[u32]>) {
+        assert!(self.register_operands.is_empty());
+        assert!(self.index_operands.is_empty());
+        self.register_operands = registers;
+        self.index_operands = indices;
     }
 
     pub(crate) fn finish(self) -> Self {
@@ -100,13 +87,16 @@ mod tests {
         let mut artifacts = EmissionArtifacts::new(1, 1);
         let load = artifacts.next_load_ic_addr();
         let store = artifacts.next_store_ic_addr();
-        let regs = artifacts.retain_array_literal_regs(vec![2, 4, 6].into_boxed_slice());
+        let regs = vec![2, 4, 6].into_boxed_slice();
+        let regs_ptr = regs.as_ptr();
+        artifacts.retain_operand_buffers(regs, vec![1].into_boxed_slice());
         let artifacts = artifacts.finish();
 
         assert_eq!(load, artifacts.load_ic_cells.as_ptr() as usize);
         assert_eq!(store, artifacts.store_ic_cells.as_ptr() as usize);
-        assert_eq!(regs, artifacts.array_literal_regs[0].as_ptr());
-        assert_eq!(&*artifacts.array_literal_regs[0], &[2, 4, 6]);
+        assert_eq!(regs_ptr, artifacts.register_operands.as_ptr());
+        assert_eq!(&*artifacts.register_operands, &[2, 4, 6]);
+        assert_eq!(&*artifacts.index_operands, &[1]);
     }
 
     #[test]

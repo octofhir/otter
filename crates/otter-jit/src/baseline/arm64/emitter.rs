@@ -283,16 +283,11 @@ impl EmissionSession {
                     emit_call_stub(ops, jit_new_object_stub as *const () as usize, threw);
                 }
                 Op::NewArray => {
-                    let dst = reg(ops_ref, 0)?;
-                    let count = const_index(ops_ref, 1)? as usize;
-                    if ops_ref.len() != count + 2 {
-                        return Err(Unsupported::OperandShape("NewArray register tail"));
-                    }
-                    let source_regs = (0..count)
-                        .map(|slot| reg(ops_ref, slot + 2))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice();
-                    let source_regs_ptr = artifacts.retain_array_literal_regs(source_regs);
+                    let operands = lowered.new_array_operands()?;
+                    let dst = operands.dst;
+                    let source_regs = plan.register_tail(operands.elements)?;
+                    let count = source_regs.len();
+                    let source_regs_ptr = source_regs.as_ptr();
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(ops, 2, source_regs_ptr as u64);
                     emit_load_u64(ops, 3, count as u64);
@@ -1021,9 +1016,11 @@ impl EmissionSession {
                 // Variadic operations still using compile-owned decoded operand
                 // metadata. Fixed-operand slow paths below use typed ABI stubs.
                 Op::MathCall => {
-                    let dst = reg(ops_ref, 0)?;
-                    let method_id = const_index(ops_ref, 1)?;
-                    let argc = const_index(ops_ref, 2)? as usize;
+                    let operands = lowered.math_call_operands()?;
+                    let dst = operands.dst;
+                    let method_id = operands.method;
+                    let argument_regs = plan.register_tail(operands.arguments)?;
+                    let argc = argument_regs.len();
                     if argc == 0
                         && otter_bytecode::method_id::MathMethod::from_u32(method_id)
                             == Some(otter_bytecode::method_id::MathMethod::Random)
@@ -1032,14 +1029,7 @@ impl EmissionSession {
                         dynasm!(ops ; .arch aarch64 ; blr x16);
                         store_reg(ops, 0, dst)?;
                     } else {
-                        if ops_ref.len() != argc + 3 {
-                            return Err(Unsupported::OperandShape("MathCall register tail"));
-                        }
-                        let argument_regs = (0..argc)
-                            .map(|slot| reg(ops_ref, slot + 3))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .into_boxed_slice();
-                        let argument_regs_ptr = artifacts.retain_math_argument_regs(argument_regs);
+                        let argument_regs_ptr = argument_regs.as_ptr();
                         dynasm!(ops
                             ; .arch aarch64
                             ; mov x0, x20
@@ -1052,23 +1042,12 @@ impl EmissionSession {
                     }
                 }
                 Op::MakeClosure => {
-                    let dst = reg(ops_ref, 0)?;
-                    let function_index = const_index(ops_ref, 1)?;
-                    let count = const_index(ops_ref, 2)? as usize;
-                    if ops_ref.len() != count + 3 {
-                        return Err(Unsupported::OperandShape("MakeClosure upvalue tail"));
-                    }
-                    let parent_indices = (0..count)
-                        .map(|slot| {
-                            let index = imm32(ops_ref, slot + 3)?;
-                            u32::try_from(index).map_err(|_| {
-                                Unsupported::OperandShape("MakeClosure parent upvalue")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice();
-                    let parent_indices_ptr =
-                        artifacts.retain_closure_parent_indices(parent_indices);
+                    let operands = lowered.make_closure_operands()?;
+                    let dst = operands.dst;
+                    let function_index = operands.function;
+                    let parent_indices = plan.index_tail(operands.parents)?;
+                    let count = parent_indices.len();
+                    let parent_indices_ptr = parent_indices.as_ptr();
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                     emit_load_u64(ops, 1, u64::from(view.code_block.id));
                     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
@@ -1088,7 +1067,8 @@ impl EmissionSession {
                     emit_call_stub(ops, jit_load_string_stub as *const () as usize, threw);
                 }
                 Op::DefineDataProperty => {
-                    let (object, key, value) = reg3(ops_ref)?;
+                    let operands = lowered.triple_operands()?;
+                    let (object, key, value) = (operands.first, operands.second, operands.third);
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -1103,7 +1083,7 @@ impl EmissionSession {
                     );
                 }
                 Op::FreshUpvalue => {
-                    let idx = imm32(ops_ref, 0)?;
+                    let idx = lowered.immediate_operands()?.value;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                     emit_load_u64(ops, 1, u64::from(idx as u32));
                     emit_call_stub(ops, jit_fresh_upvalue_stub as *const () as usize, threw);
@@ -1139,7 +1119,9 @@ impl EmissionSession {
                     )?;
                 }
                 Op::DefineOwnProperty => {
-                    let (target, key, descriptor) = reg3(ops_ref)?;
+                    let operands = lowered.triple_operands()?;
+                    let (target, key, descriptor) =
+                        (operands.first, operands.second, operands.third);
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -1184,17 +1166,13 @@ impl EmissionSession {
                     Op::LoadInt32
                     | Op::LoadLocal
                     | Op::LoadNumber
+                    | Op::LoadBigInt
                     | Op::LoadString
                     | Op::LoadTrue
                     | Op::LoadFalse
                     | Op::LoadUndefined
                     | Op::LoadHole => {
                         if let Some(dst) = lowered.written_register() {
-                            fres.invalidate(dst);
-                        }
-                    }
-                    Op::LoadBigInt => {
-                        if let Ok(dst) = reg(ops_ref, 0) {
                             fres.invalidate(dst);
                         }
                     }
@@ -1233,6 +1211,8 @@ impl EmissionSession {
         }
 
         plan.safepoint_records.sort_by_key(|record| record.id);
+        let (register_operands, index_operands) = plan.take_operand_buffers();
+        artifacts.retain_operand_buffers(register_operands, index_operands);
         let safepoint_records = plan.safepoint_records.into_boxed_slice();
         let osr_only = self.osr_only;
         let artifacts = self.artifacts.finish();

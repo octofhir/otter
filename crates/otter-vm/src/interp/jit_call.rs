@@ -441,6 +441,7 @@ impl Interpreter {
         // so it needs no further filtering.
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
+            && code.metadata().is_compatible_with_current_vm()
         {
             return Some(code.clone());
         }
@@ -471,7 +472,7 @@ impl Interpreter {
         // The function-entry path never runs OSR-only code (compiled with
         // unsupported opcodes emitted as bails); only loop OSR enters it, at a
         // supported loop header. The code stays cached for that OSR path.
-        let code = code.filter(|c| !c.osr_only());
+        let code = code.filter(|c| c.metadata().is_compatible_with_current_vm() && !c.osr_only());
         if let Some(c) = &code {
             self.jit_code_cache = Some((fid, c.clone()));
         } else {
@@ -515,11 +516,12 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
+            && code.metadata().is_compatible_with_current_vm()
         {
             return Some(code.clone());
         }
         let code = self.jit_code.get(&fid)?.clone()?;
-        if code.osr_only() {
+        if code.osr_only() || !code.metadata().is_compatible_with_current_vm() {
             return None;
         }
         self.jit_code_cache = Some((fid, code.clone()));
@@ -530,7 +532,7 @@ impl Interpreter {
         function: &crate::executable::CodeBlock,
         code: &dyn jit::JitFunctionCode,
     ) -> Option<jit::JitDirectCallPlan> {
-        if code.safepoint_count() != 0 {
+        if !code.metadata().is_compatible_with_current_vm() || code.safepoint_count() != 0 {
             return None;
         }
         Some(jit::JitDirectCallPlan {

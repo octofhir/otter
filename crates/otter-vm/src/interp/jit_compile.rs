@@ -126,35 +126,14 @@ impl Interpreter {
         }
     }
 
-    /// Bake the static heap-layout offsets for the JIT's inline typed-array
-    /// element fast path, and ensure `cage_base` is set so the emitter enables
-    /// inline `LoadElement`/`StoreElement` (the offsets are isolate-independent
-    /// `#[repr(C)]` constants, but inline access still needs the cage base to
-    /// decompress receiver / buffer pointers).
+    /// Bake fixed Array-body fields used by native guards. Element backing
+    /// stores remain behind runtime stubs and are deliberately absent here.
     pub(crate) fn bake_typed_array_layout(view: &mut jit::JitCompileSnapshot) {
-        use crate::binary::array_buffer as ab;
-        use crate::binary::typed_array as ta;
         let header = otter_gc::header::HEADER_SIZE as u32;
-        let buffer_base = header + ta::TYPED_ARRAY_BODY_BUFFER_OFFSET as u32;
-        view.ta_layout = jit::JitTypedArrayLayout {
-            ta_type_tag: ta::TYPED_ARRAY_BODY_TYPE_TAG,
-            local_buffer_type_tag: ab::LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG,
-            kind_float64: ta::TypedArrayKind::Float64 as u32,
-            kind_int32: ta::TypedArrayKind::Int32 as u32,
-            buffer_local_tag: ab::BUFFER_STORAGE_LOCAL_TAG,
-            ta_kind_byte: header + ta::TYPED_ARRAY_BODY_KIND_OFFSET as u32,
-            ta_byte_offset_byte: header + ta::TYPED_ARRAY_BODY_BYTE_OFFSET_OFFSET as u32,
-            ta_length_byte: header + ta::TYPED_ARRAY_BODY_LENGTH_OFFSET as u32,
-            ta_length_tracking_byte: header + ta::TYPED_ARRAY_BODY_LENGTH_TRACKING_OFFSET as u32,
-            buffer_disc_byte: buffer_base + ab::BUFFER_STORAGE_DISCRIMINANT_OFFSET as u32,
-            buffer_handle_byte: buffer_base + ab::BUFFER_STORAGE_HANDLE_OFFSET as u32,
-            // Vec<u8> base; otter-jit adds the probed ptr/len word sub-offsets.
-            buf_bytes_byte: header + ab::LOCAL_ARRAY_BUFFER_BODY_BYTES_OFFSET as u32,
-            array_type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
-            array_elements_byte: header + crate::array::ARRAY_BODY_ELEMENTS_OFFSET as u32,
-            array_length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
-            array_exotic_byte: header
-                + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+        view.array_layout = jit::JitArrayLayout {
+            type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+            length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
+            exotic_byte: header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }

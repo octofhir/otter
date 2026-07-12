@@ -53,10 +53,9 @@ pub struct ArrayBody {
     /// Dense element storage. Crate-internal callers must go through
     /// this module's helpers so growth is heap-accounted.
     ///
-    /// A plain `Vec<Value>` (not `SmallVec`) so the baseline JIT can read
-    /// the backing data pointer and length at a stable, probe-discovered
-    /// layout — the same mechanism it uses for typed-array buffers — and
-    /// inline dense element loads without re-entering the interpreter.
+    /// This Rust container is deliberately private to the VM. Native code uses
+    /// classified runtime stubs for element access and never observes `Vec`
+    /// field layout.
     pub(crate) elements: Vec<Value>,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
@@ -134,12 +133,6 @@ pub(crate) struct ArrayExoticSlots {
     prototype_override: Option<Value>,
 }
 
-/// Byte offset of [`ArrayBody::elements`] from the body start (after the GC
-/// header). `offset_of!`-derived, so it reflects the actual `repr(Rust)`
-/// placement; the baseline JIT adds the GC header size and the probed
-/// `Vec<Value>` data-pointer / length sub-offsets to read dense elements
-/// inline.
-pub const ARRAY_BODY_ELEMENTS_OFFSET: usize = std::mem::offset_of!(ArrayBody, elements);
 /// Byte offset of [`ArrayBody::length`] from the body start (after the GC
 /// header). The baseline JIT reads this for the `arr.length` fast path after
 /// guarding the receiver body tag.

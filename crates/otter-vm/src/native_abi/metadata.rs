@@ -18,13 +18,13 @@
 //! - [`super::frame::NativeFrame`] for the active code-object id.
 
 /// Native VM ABI layout version.
-pub const VM_LAYOUT_VERSION: u32 = 3;
+pub const VM_LAYOUT_VERSION: u32 = 4;
 /// Runtime-stub table version.
 pub const RUNTIME_STUB_TABLE_VERSION: u32 = 2;
 /// Code-object metadata layout version.
-pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 1;
+pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 2;
 /// Reproducible build identity for transient native code.
-pub const VM_BUILD_VERSION: u64 = 0x4f54_5445_525f_0002;
+pub const VM_BUILD_VERSION: u64 = 0x4f54_5445_525f_0003;
 
 /// Complete native-layout compatibility record.
 #[repr(C)]
@@ -86,6 +86,22 @@ pub struct CodeObjectMetadata {
     pub layout: LayoutVersionRecord,
     /// Required build and target identity.
     pub build: BuildVersionRecord,
+}
+
+impl CodeObjectMetadata {
+    /// Whether this immutable code object can enter the current VM build.
+    #[must_use]
+    pub const fn is_compatible_with_current_vm(self) -> bool {
+        self.id != 0
+            && self.code_size != 0
+            && self.layout.vm_layout == VM_LAYOUT_VERSION
+            && self.layout.runtime_stubs == RUNTIME_STUB_TABLE_VERSION
+            && self.layout.code_object == CODE_OBJECT_LAYOUT_VERSION
+            && self.layout.reserved == 0
+            && self.build.vm_build == VM_BUILD_VERSION
+            && self.build.target_abi != 0
+            && self.reserved == 0
+    }
 }
 
 /// Kind of assumption that can invalidate installed native code.
@@ -155,5 +171,31 @@ mod tests {
             LayoutVersionRecord::CURRENT.code_object,
             CODE_OBJECT_LAYOUT_VERSION
         );
+    }
+
+    #[test]
+    fn code_metadata_rejects_stale_layout_or_build() {
+        let mut metadata = CodeObjectMetadata {
+            id: 1,
+            code_block_id: 0,
+            entry_offset: 0,
+            code_size: 64,
+            safepoint_count: 0,
+            frame_map_count: 0,
+            spill_map_count: 0,
+            dependency_count: 0,
+            reserved: 0,
+            layout: LayoutVersionRecord::CURRENT,
+            build: BuildVersionRecord {
+                vm_build: VM_BUILD_VERSION,
+                target_abi: 1,
+            },
+        };
+        assert!(metadata.is_compatible_with_current_vm());
+        metadata.layout.vm_layout -= 1;
+        assert!(!metadata.is_compatible_with_current_vm());
+        metadata.layout = LayoutVersionRecord::CURRENT;
+        metadata.build.vm_build -= 1;
+        assert!(!metadata.is_compatible_with_current_vm());
     }
 }

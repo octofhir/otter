@@ -56,17 +56,13 @@ pub struct BaselineCode {
     /// ownership / stability contract as [`Self::load_ic_cells`].
     #[allow(dead_code)]
     store_ic_cells: Box<[WhiskerIcCell]>,
-    /// Stable decoded source-register tables for `NewArray` sites. Emitted code
-    /// passes pointers into these boxed slices to [`jit_new_array_stub`], so the
-    /// tables must live exactly as long as the executable mapping.
+    /// Stable decoded register buffer shared by variadic operation sites.
+    /// Emitted code passes pointers into this boxed slice to runtime stubs.
     #[allow(dead_code)]
-    array_literal_regs: Box<[Box<[u16]>]>,
-    /// Stable decoded parent-upvalue index tables for `MakeClosure` sites.
+    register_operands: Box<[u16]>,
+    /// Stable decoded parent-upvalue index buffer for `MakeClosure` sites.
     #[allow(dead_code)]
-    closure_parent_indices: Box<[Box<[u32]>]>,
-    /// Stable decoded argument-register tables for non-leaf `MathCall` sites.
-    #[allow(dead_code)]
-    math_argument_regs: Box<[Box<[u16]>]>,
+    index_operands: Box<[u32]>,
     /// Stable backing store for code-object-owned allocating safepoints.
     safepoint_records: Box<[SafepointRecord]>,
     /// Every op in the body addresses registers through the window
@@ -95,9 +91,8 @@ impl BaselineCode {
             osr_only,
             load_ic_cells: artifacts.load_ic_cells,
             store_ic_cells: artifacts.store_ic_cells,
-            array_literal_regs: artifacts.array_literal_regs.into_boxed_slice(),
-            closure_parent_indices: artifacts.closure_parent_indices.into_boxed_slice(),
-            math_argument_regs: artifacts.math_argument_regs.into_boxed_slice(),
+            register_operands: artifacts.register_operands,
+            index_operands: artifacts.index_operands,
             safepoint_records,
             frameless_entry_safe,
         }

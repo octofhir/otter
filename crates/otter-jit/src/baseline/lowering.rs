@@ -143,6 +143,50 @@ pub(crate) struct UpvalueOperands {
     pub(crate) index: i32,
 }
 
+/// Range into a plan-owned homogeneous operand side buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperandRange {
+    start: u32,
+    len: u32,
+}
+
+/// Typed array-literal operands backed by the plan's register side buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NewArrayOperands {
+    pub(crate) dst: u16,
+    pub(crate) elements: OperandRange,
+}
+
+/// Typed math-call operands backed by the plan's register side buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MathCallOperands {
+    pub(crate) dst: u16,
+    pub(crate) method: u32,
+    pub(crate) arguments: OperandRange,
+}
+
+/// Typed closure-construction operands backed by the plan's index side buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MakeClosureOperands {
+    pub(crate) dst: u16,
+    pub(crate) function: u32,
+    pub(crate) parents: OperandRange,
+}
+
+/// Typed single immediate operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImmediateOperands {
+    pub(crate) value: i32,
+}
+
+/// Typed generic three-register operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TripleOperands {
+    pub(crate) first: u16,
+    pub(crate) second: u16,
+    pub(crate) third: u16,
+}
+
 /// Canonical control-flow target resolved to a verified logical PC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BranchOperands {
@@ -172,6 +216,11 @@ enum LoweredOperands {
     PropertyLoad(PropertyLoadOperands),
     PropertyStore(PropertyStoreOperands),
     Upvalue(UpvalueOperands),
+    NewArray(NewArrayOperands),
+    MathCall(MathCallOperands),
+    MakeClosure(MakeClosureOperands),
+    Immediate(ImmediateOperands),
+    Triple(TripleOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
 }
@@ -277,6 +326,41 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn new_array_operands(self) -> Result<NewArrayOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::NewArray(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered NewArray operands")),
+        }
+    }
+
+    pub(crate) fn math_call_operands(self) -> Result<MathCallOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::MathCall(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered MathCall operands")),
+        }
+    }
+
+    pub(crate) fn make_closure_operands(self) -> Result<MakeClosureOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::MakeClosure(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered MakeClosure operands")),
+        }
+    }
+
+    pub(crate) fn immediate_operands(self) -> Result<ImmediateOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Immediate(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered immediate operands")),
+        }
+    }
+
+    pub(crate) fn triple_operands(self) -> Result<TripleOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Triple(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered triple operands")),
+        }
+    }
+
     pub(crate) fn branch_operands(self) -> Result<BranchOperands, Unsupported> {
         match self.operands {
             LoweredOperands::Branch(operands) => Ok(operands),
@@ -306,6 +390,9 @@ impl LoweredInstr {
             LoweredOperands::ElementLoad(operands) => Some(operands.dst),
             LoweredOperands::Increment(operands) => Some(operands.dst),
             LoweredOperands::PropertyLoad(operands) => Some(operands.dst),
+            LoweredOperands::NewArray(operands) => Some(operands.dst),
+            LoweredOperands::MathCall(operands) => Some(operands.dst),
+            LoweredOperands::MakeClosure(operands) => Some(operands.dst),
             LoweredOperands::Upvalue(operands) if self.op == Op::LoadUpvalue => {
                 Some(operands.value)
             }
@@ -321,6 +408,8 @@ impl LoweredInstr {
 /// control flow after it has already emitted part of a function.
 pub(crate) struct BaselinePlan {
     pub(crate) instructions: Vec<LoweredInstr>,
+    register_operands: Box<[u16]>,
+    index_operands: Box<[u32]>,
     pub(crate) enable_float_residency: bool,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
@@ -337,6 +426,8 @@ impl BaselinePlan {
         let mut enable_float_residency = false;
         let mut load_property_count = 0;
         let mut store_property_count = 0;
+        let mut register_operands = Vec::new();
+        let mut index_operands = Vec::new();
         for instr in &view.instructions {
             let op = instr.op(code_block);
             let pc = instr.instruction_pc(code_block);
@@ -373,6 +464,7 @@ impl BaselinePlan {
                 }),
                 Op::MakeFunction
                 | Op::LoadString
+                | Op::LoadBigInt
                 | Op::LoadGlobalOrThrow
                 | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
@@ -419,6 +511,64 @@ impl BaselinePlan {
                     value: reg(operands, 2)?,
                     scratch: reg(operands, 3)?,
                 }),
+                Op::NewArray => {
+                    let count = const_index(operands, 1)? as usize;
+                    let elements = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        2,
+                        count,
+                        "NewArray register tail",
+                    )?;
+                    LoweredOperands::NewArray(NewArrayOperands {
+                        dst: reg(operands, 0)?,
+                        elements,
+                    })
+                }
+                Op::MathCall => {
+                    let count = const_index(operands, 2)? as usize;
+                    let arguments = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        3,
+                        count,
+                        "MathCall register tail",
+                    )?;
+                    LoweredOperands::MathCall(MathCallOperands {
+                        dst: reg(operands, 0)?,
+                        method: const_index(operands, 1)?,
+                        arguments,
+                    })
+                }
+                Op::MakeClosure => {
+                    let count = const_index(operands, 2)? as usize;
+                    let parents = append_index_tail(
+                        &mut index_operands,
+                        operands,
+                        operands.len(),
+                        3,
+                        count,
+                        "MakeClosure upvalue tail",
+                    )?;
+                    LoweredOperands::MakeClosure(MakeClosureOperands {
+                        dst: reg(operands, 0)?,
+                        function: const_index(operands, 1)?,
+                        parents,
+                    })
+                }
+                Op::FreshUpvalue => LoweredOperands::Immediate(ImmediateOperands {
+                    value: imm32(operands, 0)?,
+                }),
+                Op::DefineDataProperty | Op::DefineOwnProperty => {
+                    let (first, second, third) = reg3(operands)?;
+                    LoweredOperands::Triple(TripleOperands {
+                        first,
+                        second,
+                        third,
+                    })
+                }
                 Op::LoadProperty => LoweredOperands::PropertyLoad(PropertyLoadOperands {
                     dst: reg(operands, 0)?,
                     object: reg(operands, 1)?,
@@ -533,6 +683,8 @@ impl BaselinePlan {
 
         Ok(Self {
             instructions,
+            register_operands: register_operands.into_boxed_slice(),
+            index_operands: index_operands.into_boxed_slice(),
             enable_float_residency,
             load_property_count,
             store_property_count,
@@ -541,6 +693,29 @@ impl BaselinePlan {
             method_alloc_safepoints,
         })
     }
+
+    pub(crate) fn register_tail(&self, range: OperandRange) -> Result<&[u16], Unsupported> {
+        slice_range(&self.register_operands, range)
+    }
+
+    pub(crate) fn index_tail(&self, range: OperandRange) -> Result<&[u32], Unsupported> {
+        slice_range(&self.index_operands, range)
+    }
+
+    pub(crate) fn take_operand_buffers(&mut self) -> (Box<[u16]>, Box<[u32]>) {
+        (
+            std::mem::take(&mut self.register_operands),
+            std::mem::take(&mut self.index_operands),
+        )
+    }
+}
+
+fn slice_range<T>(storage: &[T], range: OperandRange) -> Result<&[T], Unsupported> {
+    let start = range.start as usize;
+    let len = range.len as usize;
+    storage
+        .get(start..start.saturating_add(len))
+        .ok_or(Unsupported::OperandShape("lowered operand range"))
 }
 
 /// Pack method-call argument register indices into one word.
@@ -582,6 +757,51 @@ pub(crate) fn branch_target(
 
 pub(crate) trait WordOperands: Copy {
     fn get(self, index: usize) -> Option<Operand>;
+}
+
+fn append_register_tail(
+    storage: &mut Vec<u16>,
+    operands: impl WordOperands,
+    operand_len: usize,
+    tail_start: usize,
+    count: usize,
+    shape: &'static str,
+) -> Result<OperandRange, Unsupported> {
+    if operand_len != tail_start.saturating_add(count) {
+        return Err(Unsupported::OperandShape(shape));
+    }
+    let start = u32::try_from(storage.len())
+        .map_err(|_| Unsupported::OperandShape("lowered register side buffer"))?;
+    for slot in 0..count {
+        storage.push(reg(operands, tail_start + slot)?);
+    }
+    let len =
+        u32::try_from(count).map_err(|_| Unsupported::OperandShape("lowered register tail"))?;
+    Ok(OperandRange { start, len })
+}
+
+fn append_index_tail(
+    storage: &mut Vec<u32>,
+    operands: impl WordOperands,
+    operand_len: usize,
+    tail_start: usize,
+    count: usize,
+    shape: &'static str,
+) -> Result<OperandRange, Unsupported> {
+    if operand_len != tail_start.saturating_add(count) {
+        return Err(Unsupported::OperandShape(shape));
+    }
+    let start = u32::try_from(storage.len())
+        .map_err(|_| Unsupported::OperandShape("lowered index side buffer"))?;
+    for slot in 0..count {
+        let index = imm32(operands, tail_start + slot)?;
+        storage.push(
+            u32::try_from(index)
+                .map_err(|_| Unsupported::OperandShape("MakeClosure parent upvalue"))?,
+        );
+    }
+    let len = u32::try_from(count).map_err(|_| Unsupported::OperandShape("lowered index tail"))?;
+    Ok(OperandRange { start, len })
 }
 
 impl WordOperands for otter_vm::OperandView<'_> {

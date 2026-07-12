@@ -1047,6 +1047,78 @@ mod tests {
     }
 
     #[test]
+    fn lowering_plan_owns_variadic_operand_tails() {
+        let v = view(&[
+            (
+                Op::NewArray,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(2),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::MathCall,
+                vec![
+                    Operand::Register(3),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(2),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::MakeClosure,
+                vec![
+                    Operand::Register(4),
+                    Operand::ConstIndex(9),
+                    Operand::ConstIndex(2),
+                    Operand::Imm32(0),
+                    Operand::Imm32(1),
+                ],
+            ),
+            (Op::FreshUpvalue, vec![Operand::Imm32(6)]),
+            (
+                Op::DefineDataProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+
+        let array = plan.instructions[0]
+            .new_array_operands()
+            .expect("NewArray operands");
+        assert_eq!(array.dst, 0);
+        assert_eq!(plan.register_tail(array.elements), Ok(&[1, 2][..]));
+        let math = plan.instructions[1]
+            .math_call_operands()
+            .expect("MathCall operands");
+        assert_eq!((math.dst, math.method), (3, 0));
+        assert_eq!(plan.register_tail(math.arguments), Ok(&[1, 2][..]));
+        let closure = plan.instructions[2]
+            .make_closure_operands()
+            .expect("MakeClosure operands");
+        assert_eq!((closure.dst, closure.function), (4, 9));
+        assert_eq!(plan.index_tail(closure.parents), Ok(&[0, 1][..]));
+        assert_eq!(
+            plan.instructions[3]
+                .immediate_operands()
+                .map(|operands| operands.value),
+            Ok(6)
+        );
+        let triple = plan.instructions[4]
+            .triple_operands()
+            .expect("DefineDataProperty operands");
+        assert_eq!((triple.first, triple.second, triple.third), (0, 1, 2));
+    }
+
+    #[test]
     fn method_call_uses_full_packed_argument_abi() {
         let four_args = view(&[
             (

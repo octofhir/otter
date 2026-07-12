@@ -32,6 +32,7 @@
 
 mod arith;
 mod calls;
+mod properties;
 mod transitions;
 mod values;
 
@@ -71,6 +72,17 @@ pub(super) fn compile(
     let transitions = TransitionTable::resolve();
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let code_block_id = view.code_block.id;
+    // Self-patching property IC cells: allocated address-stable before any
+    // pointer is baked, consumed strictly in emission order, owned by the
+    // finalized code object.
+    let mut load_ic_cells =
+        vec![crate::baseline::WhiskerIcCell::default(); plan.load_property_count]
+            .into_boxed_slice();
+    let mut store_ic_cells =
+        vec![crate::baseline::WhiskerIcCell::default(); plan.store_property_count]
+            .into_boxed_slice();
+    let mut next_load_ic = 0usize;
+    let mut next_store_ic = 0usize;
     let mut ops = Assembler::new().expect("assembler alloc");
     let bail = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
@@ -342,6 +354,52 @@ pub(super) fn compile(
             TemplateOp::StoreUpvalueChecked { src, index } => {
                 transitions::emit_store_upvalue(&mut ops, &transitions, src, index, true, threw);
             }
+            TemplateOp::LoadProperty {
+                dst,
+                object,
+                name,
+                site,
+                array_length,
+            } => {
+                let cell = &mut load_ic_cells[next_load_ic];
+                next_load_ic += 1;
+                let cell_addr = cell as *mut crate::baseline::WhiskerIcCell as usize;
+                properties::emit_load_property(
+                    &mut ops,
+                    &transitions,
+                    view,
+                    dst,
+                    object,
+                    name,
+                    site,
+                    array_length,
+                    cell_addr,
+                    bail,
+                    threw,
+                )?;
+            }
+            TemplateOp::StoreProperty {
+                object,
+                name,
+                value,
+                site,
+            } => {
+                let cell = &mut store_ic_cells[next_store_ic];
+                next_store_ic += 1;
+                let cell_addr = cell as *mut crate::baseline::WhiskerIcCell as usize;
+                properties::emit_store_property(
+                    &mut ops,
+                    &transitions,
+                    view,
+                    object,
+                    name,
+                    value,
+                    site,
+                    cell_addr,
+                    bail,
+                    threw,
+                )?;
+            }
             TemplateOp::Call {
                 dst,
                 callee,
@@ -415,6 +473,12 @@ pub(super) fn compile(
     );
     emit_epilogue(&mut ops);
 
+    assert_eq!(next_load_ic, load_ic_cells.len(), "LoadProperty IC count");
+    assert_eq!(
+        next_store_ic,
+        store_ic_cells.len(),
+        "StoreProperty IC count"
+    );
     let buf = ops.finalize().expect("finalize");
     let TemplatePlan {
         register_count,
@@ -431,6 +495,8 @@ pub(super) fn compile(
         register_count,
         register_operands,
         index_operands,
+        load_ic_cells,
+        store_ic_cells,
         safepoint_records.into_boxed_slice(),
     ))
 }

@@ -187,7 +187,6 @@ impl Interpreter {
             load_property_ics: Vec::new(),
             store_property_ics: Vec::new(),
             method_call_ics: Vec::new(),
-            jit_collection_method_ics: Vec::new(),
             has_property_ics: Vec::new(),
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
@@ -208,7 +207,6 @@ impl Interpreter {
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_direct_code_anchors: Vec::new(),
             jit_direct_method_cache: Vec::new(),
-            jit_direct_method_inline_slots: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
             holt_pool: Vec::new(),
             register_stack: register_stack::RegisterStack::new(),
@@ -813,26 +811,24 @@ impl Interpreter {
         self.jit_runtime_stats
     }
 
-    /// Return the current VM-published collection method IC mirror summary.
+    /// Return the current collection method IC summary.
     #[must_use]
     pub fn jit_collection_method_ic_stats(&self) -> JitCollectionMethodIcStats {
         let mut stats = JitCollectionMethodIcStats {
-            slots: self.jit_collection_method_ics.len() as u64,
+            slots: self.method_call_ics.len() as u64,
             ..JitCollectionMethodIcStats::default()
         };
-        for slot in &self.jit_collection_method_ics {
-            if slot.state == jit::JIT_COLLECTION_METHOD_IC_EMPTY {
-                stats.empty_slots = stats.empty_slots.saturating_add(1);
-                continue;
-            }
-            if slot.is_collection() {
+        for slot in &self.method_call_ics {
+            if let Some(method_ops::MethodCallIc::Collection(ic)) = slot {
                 stats.collection_slots = stats.collection_slots.saturating_add(1);
-                if slot.leaf_stub_id != jit::JIT_COLLECTION_METHOD_IC_NO_STUB {
+                if ic.leaf_stub_id.is_some() {
                     stats.leaf_stub_slots = stats.leaf_stub_slots.saturating_add(1);
                 }
-                if slot.alloc_stub_id != jit::JIT_COLLECTION_METHOD_IC_NO_STUB {
+                if ic.alloc_stub_id.is_some() {
                     stats.alloc_stub_slots = stats.alloc_stub_slots.saturating_add(1);
                 }
+            } else {
+                stats.empty_slots = stats.empty_slots.saturating_add(1);
             }
         }
         stats

@@ -1193,7 +1193,6 @@ impl Interpreter {
                 proto_slot: hit.slot,
                 tag,
             }));
-            self.clear_jit_collection_method_ic(site);
         }
         Some(self.dispatch_array_builtin_rooted(context, tag, recv, args))
     }
@@ -1267,7 +1266,6 @@ impl Interpreter {
         let proto = if let Some(map) = recv.as_map() {
             if !ic.op.is_map() {
                 self.method_call_ics[site] = None;
-                self.clear_jit_collection_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.map_prototype?;
@@ -1282,7 +1280,6 @@ impl Interpreter {
         } else if let Some(set) = recv.as_set() {
             if !ic.op.is_set() {
                 self.method_call_ics[site] = None;
-                self.clear_jit_collection_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.set_prototype?;
@@ -1296,7 +1293,6 @@ impl Interpreter {
             proto
         } else {
             self.method_call_ics[site] = None;
-            self.clear_jit_collection_method_ic(site);
             return None;
         };
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
@@ -1389,7 +1385,6 @@ impl Interpreter {
                 alloc_stub_id: op.alloc_stub_id(),
             };
             self.method_call_ics[site] = Some(MethodCallIc::Collection(ic));
-            self.publish_jit_collection_method_ic(site, ic);
         }
         Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))
     }

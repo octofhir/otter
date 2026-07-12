@@ -40,10 +40,7 @@
 #![allow(clippy::useless_conversion)]
 
 use otter_bytecode::Op;
-use otter_vm::{
-    Interpreter, JitCompileSnapshot,
-    runtime_stubs::{alloc_value_stub_trampoline_pair, leaf_no_alloc_stub2_trampoline_pair},
-};
+use otter_vm::{JitCompileSnapshot, runtime_stubs::leaf_no_alloc_stub2_trampoline_pair};
 
 mod abi;
 mod artifacts;
@@ -69,15 +66,6 @@ pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
 /// resolved method's `function_id` so a native callable cell is never misread
 /// as a bytecode closure.
 pub(crate) const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
-
-fn refresh_jit_collection_method_ics(ctx: &mut JitCtx, vm: &Interpreter) {
-    ctx.collection_method_ics = vm.jit_collection_method_ics_ptr();
-    ctx.collection_method_ic_count = vm.jit_collection_method_ics_len();
-    // The direct-method inline table can reallocate too; refresh its base with the
-    // collection ICs at every reentry so a bridge that grew it leaves the compiled
-    // caller a valid pointer.
-    ctx.direct_method_inline = vm.jit_direct_method_inline_ptr();
-}
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
@@ -270,9 +258,6 @@ mod tests {
             sync_reentry_depth_ptr: std::ptr::null_mut(),
             sync_reentry_limit: 0,
             array_index_accessor_protector_ptr: &array_index_accessor_protector,
-            collection_method_ics: std::ptr::null(),
-            collection_method_ic_count: 0,
-            direct_method_inline: std::ptr::null(),
             gc_heap: std::ptr::null(),
             interrupt_flag: &interrupt_probe,
             backedge_fuel: &mut backedge_fuel_probe,

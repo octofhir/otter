@@ -57,10 +57,13 @@ const ELEMENT_UNSEEN: u8 = 0;
 const ELEMENT_FLOAT64: u8 = 1;
 const ELEMENT_INT32: u8 = 2;
 const ELEMENT_GENERIC: u8 = 3;
+const ELEMENT_MASK: u8 = 0b0000_0011;
 
 const CALL_UNSEEN: u8 = 0;
 const CALL_MONO: u8 = 1;
 const CALL_POLY: u8 = 2;
+const CALL_SHIFT: u8 = 2;
+const CALL_MASK: u8 = 0b0000_1100;
 
 /// OR-accumulated representation feedback for one numeric-specialized bytecode
 /// site.
@@ -133,8 +136,9 @@ impl ArithFeedback {
 #[derive(Debug, Default)]
 pub struct InstructionFeedback {
     arith: AtomicU8,
-    element_load: AtomicU8,
-    call_state: AtomicU8,
+    states: AtomicU8,
+    branch_taken: AtomicU8,
+    branch_total: AtomicU8,
     call_target: AtomicU32,
 }
 
@@ -142,14 +146,41 @@ impl Clone for InstructionFeedback {
     fn clone(&self) -> Self {
         Self {
             arith: AtomicU8::new(self.arith.load(Ordering::Relaxed)),
-            element_load: AtomicU8::new(self.element_load.load(Ordering::Relaxed)),
-            call_state: AtomicU8::new(self.call_state.load(Ordering::Acquire)),
+            states: AtomicU8::new(self.states.load(Ordering::Acquire)),
+            branch_taken: AtomicU8::new(self.branch_taken.load(Ordering::Relaxed)),
+            branch_total: AtomicU8::new(self.branch_total.load(Ordering::Relaxed)),
             call_target: AtomicU32::new(self.call_target.load(Ordering::Relaxed)),
         }
     }
 }
 
 impl InstructionFeedback {
+    /// Record one conditional-branch outcome in this instruction's dense cell.
+    pub fn record_branch(&self, taken: bool) {
+        let saturating_increment = |value: u8| Some(value.saturating_add(1));
+        let _ = self.branch_total.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            saturating_increment,
+        );
+        if taken {
+            let _ = self.branch_taken.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                saturating_increment,
+            );
+        }
+    }
+
+    /// `(taken, total)` conditional-branch observations.
+    #[must_use]
+    pub fn branch_counts(&self) -> (u8, u8) {
+        (
+            self.branch_taken.load(Ordering::Relaxed),
+            self.branch_total.load(Ordering::Relaxed),
+        )
+    }
+
     /// Fold one observed arithmetic operand pair into this instruction cell.
     #[inline]
     pub fn record_arith(&self, lhs: Value, rhs: Value) {
@@ -179,9 +210,13 @@ impl InstructionFeedback {
     /// mixed or unsupported typed-array kinds become permanently generic.
     pub fn record_element_load(&self, observed: Option<JitElementLoadKind>) {
         let Some(observed) = observed else {
-            let current = self.element_load.load(Ordering::Relaxed);
+            let current = self.states.load(Ordering::Relaxed) & ELEMENT_MASK;
             if current != ELEMENT_UNSEEN {
-                self.element_load.store(ELEMENT_GENERIC, Ordering::Relaxed);
+                self.states
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |states| {
+                        Some((states & !ELEMENT_MASK) | ELEMENT_GENERIC)
+                    })
+                    .ok();
             }
             return;
         };
@@ -190,24 +225,26 @@ impl InstructionFeedback {
             JitElementLoadKind::Float64 => ELEMENT_FLOAT64,
             JitElementLoadKind::Int32 => ELEMENT_INT32,
         };
-        let mut current = self.element_load.load(Ordering::Relaxed);
+        let mut states = self.states.load(Ordering::Relaxed);
         loop {
-            let next = match current {
+            let current = states & ELEMENT_MASK;
+            let next_element = match current {
                 ELEMENT_UNSEEN => observed,
                 value if value == observed => value,
                 _ => ELEMENT_GENERIC,
             };
-            if next == current {
+            if next_element == current {
                 return;
             }
-            match self.element_load.compare_exchange_weak(
-                current,
+            let next = (states & !ELEMENT_MASK) | next_element;
+            match self.states.compare_exchange_weak(
+                states,
                 next,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return,
-                Err(actual) => current = actual,
+                Err(actual) => states = actual,
             }
         }
     }
@@ -215,7 +252,7 @@ impl InstructionFeedback {
     /// Element-load specialization consumed by a compile snapshot.
     #[must_use]
     pub fn element_load_kind(&self) -> JitElementLoadKind {
-        match self.element_load.load(Ordering::Relaxed) {
+        match self.states.load(Ordering::Relaxed) & ELEMENT_MASK {
             ELEMENT_FLOAT64 => JitElementLoadKind::Float64,
             ELEMENT_INT32 => JitElementLoadKind::Int32,
             _ => JitElementLoadKind::Any,
@@ -225,14 +262,22 @@ impl InstructionFeedback {
     /// Record one bytecode callee at an ordinary `Call` instruction.
     /// Returns `true` only when the previously unseen cell becomes monomorphic.
     pub(crate) fn record_call_target(&self, callee_fid: u32) -> bool {
-        match self.call_state.load(Ordering::Acquire) {
+        match (self.states.load(Ordering::Acquire) & CALL_MASK) >> CALL_SHIFT {
             CALL_UNSEEN => {
                 self.call_target.store(callee_fid, Ordering::Relaxed);
-                self.call_state.store(CALL_MONO, Ordering::Release);
+                self.states
+                    .fetch_update(Ordering::Release, Ordering::Acquire, |states| {
+                        Some((states & !CALL_MASK) | (CALL_MONO << CALL_SHIFT))
+                    })
+                    .ok();
                 true
             }
             CALL_MONO if self.call_target.load(Ordering::Relaxed) != callee_fid => {
-                self.call_state.store(CALL_POLY, Ordering::Release);
+                self.states
+                    .fetch_update(Ordering::Release, Ordering::Acquire, |states| {
+                        Some((states & !CALL_MASK) | (CALL_POLY << CALL_SHIFT))
+                    })
+                    .ok();
                 false
             }
             _ => false,
@@ -242,7 +287,7 @@ impl InstructionFeedback {
     /// Monomorphic/polymorphic call target observed at this instruction.
     #[must_use]
     pub(crate) fn call_target(&self) -> Option<CallTargetFeedback> {
-        match self.call_state.load(Ordering::Acquire) {
+        match (self.states.load(Ordering::Acquire) & CALL_MASK) >> CALL_SHIFT {
             CALL_UNSEEN => None,
             CALL_MONO => Some(CallTargetFeedback::Mono(
                 self.call_target.load(Ordering::Relaxed),
@@ -324,6 +369,16 @@ mod tests {
     #[test]
     fn dense_cell_layout_stays_compact() {
         assert_eq!(std::mem::size_of::<InstructionFeedback>(), 8);
+    }
+
+    #[test]
+    fn branch_feedback_counts_taken_and_total_compactly() {
+        let cell = InstructionFeedback::default();
+        cell.record_branch(true);
+        cell.record_branch(false);
+        cell.record_branch(true);
+        assert_eq!(cell.branch_counts(), (2, 3));
+        assert_eq!(cell.clone().branch_counts(), (2, 3));
     }
 
     #[test]

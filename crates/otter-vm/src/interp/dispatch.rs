@@ -2370,7 +2370,11 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    if read_register(frame, cond)?.to_boolean(&self.gc_heap) {
+                    let taken = read_register(frame, cond)?.to_boolean(&self.gc_heap);
+                    if jit_installed && let Some(cell) = feedback {
+                        cell.record_branch(taken);
+                    }
+                    if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
                         if offset < 0
                             && let Some(Some(value)) =
@@ -2391,7 +2395,11 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    if !read_register(frame, cond)?.to_boolean(&self.gc_heap) {
+                    let taken = !read_register(frame, cond)?.to_boolean(&self.gc_heap);
+                    if jit_installed && let Some(cell) = feedback {
+                        cell.record_branch(taken);
+                    }
+                    if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
                         if offset < 0
                             && let Some(Some(value)) =

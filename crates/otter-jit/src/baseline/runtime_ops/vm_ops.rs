@@ -14,7 +14,7 @@
 
 use otter_vm::Value;
 
-use super::super::{JitCtx, refresh_jit_collection_method_ics, unpack_method_arg_regs};
+use super::super::{JitCtx, unpack_method_arg_regs};
 use super::park_jit_error;
 
 /// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
@@ -329,7 +329,7 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
-    let status = match vm.jit_runtime_try_collection_method_ic(
+    match vm.jit_runtime_try_collection_method_ic(
         stack,
         ctx.frame_index,
         dst as u16,
@@ -343,9 +343,7 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
             park_jit_error(ctx, err);
             1
         }
-    };
-    refresh_jit_collection_method_ics(ctx, vm);
-    status
+    }
 }
 
 /// Bridge stub: perform a computed `StoreElement` (`recv[idx] = src`) from

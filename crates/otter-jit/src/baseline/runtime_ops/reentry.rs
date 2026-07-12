@@ -14,10 +14,7 @@
 
 use otter_vm::{Value, VmError};
 
-use super::super::{
-    JitCtx, JitRet, STATUS_RETURNED, STATUS_THREW, refresh_jit_collection_method_ics,
-    unpack_method_arg_regs,
-};
+use super::super::{JitCtx, JitRet, STATUS_RETURNED, STATUS_THREW, unpack_method_arg_regs};
 
 pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     // SAFETY: every `JitCtx` is built with an initialized error slot that lives
@@ -100,7 +97,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     let context = unsafe { &*ctx.activation().context_ptr() };
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
-    let status = match vm.jit_prepare_direct_method_call(
+    match vm.jit_prepare_direct_method_call(
         context,
         stack,
         ctx.frame_index,
@@ -124,9 +121,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
             park_jit_error(ctx, err);
             1
         }
-    };
-    refresh_jit_collection_method_ics(ctx, vm);
-    status
+    }
 }
 
 pub(crate) extern "C" fn jit_finish_direct_call_returned_stub(
@@ -213,43 +208,6 @@ pub(crate) extern "C" fn jit_self_call_bail_stub(
         ctx.frame_index,
         resume_pc as u32,
         regcount as usize,
-    ) {
-        Ok(value) => JitRet {
-            value: value.to_bits(),
-            status: STATUS_RETURNED,
-        },
-        Err(err) => {
-            park_jit_error(ctx, err);
-            JitRet {
-                value: 0,
-                status: STATUS_THREW,
-            }
-        }
-    }
-}
-
-/// Complete a frameless direct-method callee after its compiled entry bailed.
-/// The VM rebuilds the callee frame from the rooted flat register window and
-/// the already-resolved method value; no bytecode instruction is decoded here.
-pub(crate) extern "C" fn jit_direct_method_call_bail_stub(
-    ctx: *mut JitCtx,
-    resume_pc: u64,
-    regcount: u64,
-    callee: u64,
-    this: u64,
-) -> JitRet {
-    // SAFETY: the live `JitCtx` reentry contract.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_direct_method_call_bail(
-        context,
-        stack,
-        resume_pc as u32,
-        regcount as usize,
-        Value::from_bits(callee),
-        Value::from_bits(this),
     ) {
         Ok(value) => JitRet {
             value: value.to_bits(),

@@ -284,19 +284,9 @@ impl Interpreter {
             self.jit_method_site_feedback
                 .resize_with(site_count, || None);
         }
-        if self.jit_collection_method_ics.len() < site_count {
-            self.jit_collection_method_ics
-                .resize(site_count, jit::JitCollectionMethodIcSlot::EMPTY);
-        }
         if self.jit_direct_method_cache.len() < site_count {
             self.jit_direct_method_cache
                 .resize_with(site_count, Vec::new);
-        }
-        if self.jit_direct_method_inline_slots.len() < site_count * MAX_DIRECT_METHOD_WAYS {
-            self.jit_direct_method_inline_slots.resize(
-                site_count * MAX_DIRECT_METHOD_WAYS,
-                JitDirectMethodInline::EMPTY,
-            );
         }
     }
 }

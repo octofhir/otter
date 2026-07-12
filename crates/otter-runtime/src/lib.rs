@@ -1842,58 +1842,15 @@ impl Runtime {
         // every value they build is reachable from a scanned register —
         // a native-nested `eval` (the former lazy-global getter) strands
         // objects allocated mid-evaluation under GC pressure.
-        let (pending_class_js, pending_extension_js) = interp.with_runtime_roots(
-            |interp| -> Result<
-                (Vec<(&'static str, &'static str)>, Vec<(String, String)>),
-                OtterError,
-            > {
-                let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
-                let mut pending_extension_js: Vec<(String, String)> = Vec::new();
-                for spec in &config.global_classes {
-                    match spec.inner {
-                        GlobalClassInner::Spec(raw) => {
-                            interp.install_global_class(raw).map_err(|err| {
-                                OtterError::Internal {
-                                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                    message: err.to_string(),
-                                }
-                            })?;
-                        }
-                        GlobalClassInner::Intrinsic {
-                            install,
-                            install_well_knowns,
-                            js_glue,
-                            name,
-                        } => {
-                            if let Some(source) = js_glue {
-                                pending_class_js.push((name, source));
-                            }
-                            let global = *interp.global_this();
-                            install(interp.gc_heap_mut(), global).map_err(|err| {
-                                OtterError::Internal {
-                                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                    message: err.to_string(),
-                                }
-                            })?;
-                            // Second phase, mirroring the bootstrap registry walk:
-                            // symbol-keyed members (@@toStringTag) resolve against
-                            // the realm's already-materialized well-known table.
-                            interp
-                                .run_install_well_knowns(install_well_knowns, global)
-                                .map_err(|err| OtterError::Internal {
-                                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                    message: err.to_string(),
-                                })?;
-                        }
-                    }
-                }
-                // Declared extensions: native classes ride the identical
-                // install path (declaration order, parents before subclasses),
-                // then every JS source of the extension registers as one lazy
-                // group under its declared names.
-                let extensions = config.extensions.clone();
-                for extension in extensions {
-                    for spec in extension.classes {
+        let (pending_class_js, pending_extension_js) =
+            interp.with_runtime_roots(
+                |interp| -> Result<
+                    (Vec<(&'static str, &'static str)>, Vec<(String, String)>),
+                    OtterError,
+                > {
+                    let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
+                    let mut pending_extension_js: Vec<(String, String)> = Vec::new();
+                    for spec in &config.global_classes {
                         match spec.inner {
                             GlobalClassInner::Spec(raw) => {
                                 interp.install_global_class(raw).map_err(|err| {
@@ -1923,6 +1880,9 @@ impl Runtime {
                                         message: err.to_string(),
                                     }
                                 })?;
+                                // Second phase, mirroring the bootstrap registry walk:
+                                // symbol-keyed members (@@toStringTag) resolve against
+                                // the realm's already-materialized well-known table.
                                 interp
                                     .run_install_well_knowns(install_well_knowns, global)
                                     .map_err(|err| OtterError::Internal {
@@ -1934,88 +1894,137 @@ impl Runtime {
                             }
                         }
                     }
-                    if !extension.js.is_empty() {
-                        let mut source = String::new();
-                        for entry in extension.js {
-                            source.push_str(entry.source);
-                            // Guard against a source omitting its own
-                            // statement terminator.
-                            source.push_str("\n;\n");
+                    // Declared extensions: native classes ride the identical
+                    // install path (declaration order, parents before subclasses),
+                    // then every JS source of the extension registers as one lazy
+                    // group under its declared names.
+                    let extensions = config.extensions.clone();
+                    for extension in extensions {
+                        for spec in extension.classes {
+                            match spec.inner {
+                                GlobalClassInner::Spec(raw) => {
+                                    interp.install_global_class(raw).map_err(|err| {
+                                        OtterError::Internal {
+                                            code: DiagnosticCode::GlobalClassBootstrap
+                                                .as_str()
+                                                .to_string(),
+                                            message: err.to_string(),
+                                        }
+                                    })?;
+                                }
+                                GlobalClassInner::Intrinsic {
+                                    install,
+                                    install_well_knowns,
+                                    js_glue,
+                                    name,
+                                } => {
+                                    if let Some(source) = js_glue {
+                                        pending_class_js.push((name, source));
+                                    }
+                                    let global = *interp.global_this();
+                                    install(interp.gc_heap_mut(), global).map_err(|err| {
+                                        OtterError::Internal {
+                                            code: DiagnosticCode::GlobalClassBootstrap
+                                                .as_str()
+                                                .to_string(),
+                                            message: err.to_string(),
+                                        }
+                                    })?;
+                                    interp
+                                        .run_install_well_knowns(install_well_knowns, global)
+                                        .map_err(|err| OtterError::Internal {
+                                            code: DiagnosticCode::GlobalClassBootstrap
+                                                .as_str()
+                                                .to_string(),
+                                            message: err.to_string(),
+                                        })?;
+                                }
+                            }
                         }
-                        pending_extension_js.push((extension.name.to_string(), source));
+                        if !extension.js.is_empty() {
+                            let mut source = String::new();
+                            for entry in extension.js {
+                                source.push_str(entry.source);
+                                // Guard against a source omitting its own
+                                // statement terminator.
+                                source.push_str("\n;\n");
+                            }
+                            pending_extension_js.push((extension.name.to_string(), source));
+                        }
                     }
-                }
-                if config.install_process_global {
-                    process::install_global(
-                        &mut *interp,
-                        &config.process_argv,
-                        &config.process_cwd,
-                        &config.capabilities,
-                    )?;
-                }
-                // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
-                // `new Function(...)` reach a real parse + compile path.
-                // The closure is reusable across calls; each invocation
-                // builds a fresh `BytecodeModule`.
-                let hook: otter_vm::EvalHook =
-                    std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
-                        // §16.1.6 ScriptEvaluation — host-requested script
-                        // execution ($262.evalScript) compiles under script
-                        // GDI semantics, not eval semantics.
-                        if options.script_goal {
-                            return otter_compiler::compile_script_source(
+                    if config.install_process_global {
+                        process::install_global(
+                            &mut *interp,
+                            &config.process_argv,
+                            &config.process_cwd,
+                            &config.capabilities,
+                        )?;
+                    }
+                    // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
+                    // `new Function(...)` reach a real parse + compile path.
+                    // The closure is reusable across calls; each invocation
+                    // builds a fresh `BytecodeModule`.
+                    let hook: otter_vm::EvalHook =
+                        std::sync::Arc::new(|source: &str, options: EvalCompileOptions| {
+                            // §16.1.6 ScriptEvaluation — host-requested script
+                            // execution ($262.evalScript) compiles under script
+                            // GDI semantics, not eval semantics.
+                            if options.script_goal {
+                                return otter_compiler::compile_script_source(
+                                    source,
+                                    SourceKind::JavaScript,
+                                    "<evalScript>",
+                                )
+                                .map_err(|e| format!("compile error: {e:?}"));
+                            }
+                            // §19.2.1.3 — a direct eval inside a function carries
+                            // its caller variable environment binding list.
+                            let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
+                                options.caller_scope.map(|bindings| {
+                                    bindings
+                                        .into_iter()
+                                        .map(|binding| otter_compiler::EvalCallerBinding {
+                                            name: binding.name,
+                                            lexical: binding.lexical,
+                                            captured: binding.captured,
+                                            is_const: binding.is_const,
+                                            fn_self_name: binding.fn_self_name,
+                                        })
+                                        .collect()
+                                });
+                            otter_compiler::compile_eval_source(
                                 source,
                                 SourceKind::JavaScript,
-                                "<evalScript>",
+                                "<eval>",
+                                options.force_strict,
+                                options.forbid_var_arguments,
+                                caller_scope.as_deref(),
+                                options.new_target_allowed,
+                                options.in_class_field_initializer,
+                                options.super_property_allowed,
                             )
-                            .map_err(|e| format!("compile error: {e:?}"));
-                        }
-                        // §19.2.1.3 — a direct eval inside a function carries
-                        // its caller variable environment binding list.
-                        let caller_scope: Option<Vec<otter_compiler::EvalCallerBinding>> =
-                            options.caller_scope.map(|bindings| {
-                                bindings
-                                    .into_iter()
-                                    .map(|binding| otter_compiler::EvalCallerBinding {
-                                        name: binding.name,
-                                        lexical: binding.lexical,
-                                        captured: binding.captured,
-                                        is_const: binding.is_const,
-                                        fn_self_name: binding.fn_self_name,
-                                    })
-                                    .collect()
-                            });
-                        otter_compiler::compile_eval_source(
-                            source,
-                            SourceKind::JavaScript,
-                            "<eval>",
-                            options.force_strict,
-                            options.forbid_var_arguments,
-                            caller_scope.as_deref(),
-                            options.new_target_allowed,
-                            options.in_class_field_initializer,
-                            options.super_property_allowed,
-                        )
-                        .map_err(|e| format!("compile error: {e:?}"))
-                    });
-                interp.set_eval_hook(Some(hook));
-                // The JIT is the default execution path: functions start in the
-                // interpreter and tier up through the baseline/optimizing JIT.
-                // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
-                if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
-                    interp.set_jit_compiler(Some(std::sync::Arc::new(
-                        otter_jit::BaselineJitCompiler::new(),
-                    )));
-                }
-                if let Some(factory) = &config.tracer_factory {
-                    interp.set_tracer(Some(factory.build()));
-                }
-                interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
-                    queue: layer_a_dynamic_imports.clone(),
-                }));
-                Ok((pending_class_js, pending_extension_js))
-            },
-        )?;
+                            .map_err(|e| format!("compile error: {e:?}"))
+                        });
+                    interp.set_eval_hook(Some(hook));
+                    // The JIT is the default execution path: functions start in the
+                    // interpreter and tier up through the baseline/optimizing JIT.
+                    // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
+                    if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
+                        interp.set_jit_compiler(Some(std::sync::Arc::new(
+                            otter_jit::BaselineJitCompiler::new(),
+                        )));
+                    }
+                    if let Some(factory) = &config.tracer_factory {
+                        interp.set_tracer(Some(factory.build()));
+                    }
+                    interp.set_dynamic_import_loader(std::sync::Arc::new(
+                        LayerADynamicImportLoader {
+                            queue: layer_a_dynamic_imports.clone(),
+                        },
+                    ));
+                    Ok((pending_class_js, pending_extension_js))
+                },
+            )?;
         let mut runtime = Runtime {
             interp,
             config,

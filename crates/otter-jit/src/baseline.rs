@@ -41,8 +41,8 @@
 
 use otter_bytecode::{Op, Operand};
 use otter_vm::{
-    HoltStack, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFunctionCode,
-    RuntimeStubAllocContext, SafepointRecord, Value, VmError, VmRuntimeActivation,
+    HoltStack, Interpreter, JitCompileSnapshot, JitExecOutcome, JitFunctionCode, SafepointRecord,
+    Value, VmError, VmRuntimeActivation,
     native_abi::{
         CodeRegistryView, NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread,
     },
@@ -51,8 +51,10 @@ use otter_vm::{
 
 use crate::CompiledCode;
 
+mod abi;
 mod runtime_ops;
 mod value_abi;
+use abi::*;
 use runtime_ops::{
     jit_add_stub, jit_define_data_property_stub, jit_define_own_property_stub,
     jit_fresh_upvalue_stub, jit_load_builtin_error_stub, jit_load_string_stub,
@@ -102,227 +104,6 @@ fn unpack_method_arg_regs(packed: u64) -> [u16; MAX_METHOD_ARGS] {
         ((packed >> 48) & 0xffff) as u16,
     ]
 }
-
-/// Re-entry context handed to compiled code. The machine code reads `regs`
-/// (offset 0) and `self_closure` (offset 8) directly by offset — keep those two
-/// first. The full struct is machine-constructible: nested direct calls copy
-/// plain pointers/scalars and share the caller's initialized `error` slot.
-#[repr(C)]
-pub struct JitCtx {
-    /// Base of the executing frame's register window (`*mut u64` over Values).
-    regs: *mut u64,
-    /// Boxed `Value` bits of this frame's SELF closure (the named-function self
-    /// binding). Read directly by a `MakeFunction`-of-self at offset 8.
-    self_closure: u64,
-    /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
-    /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
-    this_value: u64,
-    /// Logical PC of the instruction currently executing, written by compiled
-    /// code before each op (offset [`RESUME_PC_OFFSET`]). On a guard bail the
-    /// interpreter resumes here — the exact instruction, not the entry/loop
-    /// header — which is what makes bailing out of a loop body that has
-    /// already committed side effects (or out of an unsupported opcode)
-    /// correct. Read by `enter_at` on `STATUS_BAILED`.
-    resume_pc: u32,
-    /// Sole machine-visible VM state pointer.
-    thread: *mut VmThread,
-    /// Published authoritative activation.
-    native_frame: *mut NativeFrame,
-    /// Index of the executing frame within `stack`.
-    frame_index: usize,
-    /// Base of this frame's upvalue spine (`Box<[UpvalueCell]>` data; each a
-    /// 4-byte compressed cell handle), or `0` when the frame captures nothing
-    /// or the function captures nothing. Inline `LoadUpvalue` /
-    /// `StoreUpvalue` read `[upvalues_ptr + idx*4]`.
-    upvalues_ptr: usize,
-    /// Error slot shared by direct callees and bridge stubs when a re-entered
-    /// operation throws. Pointer form keeps `JitCtx` constructible by emitted
-    /// code; assembly never initializes a Rust enum in place.
-    error: *mut Option<VmError>,
-    /// Prepared direct-call callee entry address.
-    direct_entry_addr: usize,
-    /// Prepared direct-call callee register base.
-    direct_regs: *mut u64,
-    /// Prepared direct-call callee SELF bits.
-    direct_self_closure: u64,
-    /// Prepared direct-call callee `this` bits.
-    direct_this_value: u64,
-    /// Prepared direct-call callee frame index.
-    direct_frame_index: usize,
-    /// Prepared direct-call callee upvalue-spine base (staged from
-    /// [`otter_vm::JitPreparedDirectCall::upvalues_ptr`]); the dispatch tail
-    /// copies it into the callee `JitCtx.upvalues_ptr`.
-    direct_upvalues_ptr: usize,
-    /// Base of the interpreter's flat JIT register stack
-    /// (`reg_stack[0]`). Compiled code builds a self-recursive callee window at
-    /// `reg_stack_base + reg_top*8` without a Rust frame-build bridge.
-    reg_stack_base: *mut u64,
-    /// Address of the interpreter's `reg_top` (live extent of the flat register
-    /// stack, in slots). Compiled code loads it, reserves a callee window by
-    /// adding the callee register count, and stores it back; the matching pop on
-    /// return restores it.
-    reg_top_ptr: *mut usize,
-    /// Shared synchronous native-reentry depth counter.
-    sync_reentry_depth_ptr: *mut u32,
-    /// Effective limit checked before a frameless native call mutates state.
-    sync_reentry_limit: u32,
-    /// Address of the live array-index accessor protector. Dense array stores
-    /// read through this pointer at the store site, not at entry, because a
-    /// re-entered VM call can invalidate the protector before later stores.
-    array_index_accessor_protector_ptr: *const bool,
-    /// Base of the VM-published live collection method IC slots.
-    collection_method_ics: *const otter_vm::JitCollectionMethodIcSlot,
-    /// Number of live collection method IC slots.
-    collection_method_ic_count: u32,
-    /// Base of the VM-published flat direct-method inline-link table (indexed by
-    /// IC site). Baseline code reads a slot to build the callee window and
-    /// branch to a compiled method with no Rust bridge.
-    direct_method_inline: *const otter_vm::JitDirectMethodInline,
-    /// Opaque heap pointer for native leaf runtime stubs.
-    gc_heap: *const std::ffi::c_void,
-    /// Address of the cooperative interrupt flag's backing byte. Compiled code
-    /// polls this inline at every back-edge and re-enters only when it is set.
-    interrupt_flag: *const u8,
-    /// Address of the VM's back-edge fuel counter. Compiled code decrements it
-    /// inline per back-edge and re-enters the poll stub when it reaches zero,
-    /// batching the budget checkpoint across the whole run of iterations.
-    backedge_fuel: *mut u64,
-}
-
-impl JitCtx {
-    /// VM-owned activation published through the sole machine-visible thread
-    /// pointer. Runtime stubs use this explicitly; emitted code never observes
-    /// its Rust pointers or container types.
-    fn activation(&self) -> &VmRuntimeActivation {
-        // SAFETY: runtime-capable contexts point at the VmThread built for the
-        // current entry, whose runtime_context retains VmRuntimeActivation.
-        unsafe { &*((*self.thread).runtime_context as *const VmRuntimeActivation) }
-    }
-}
-
-/// Two-word return of compiled code (`x0`/`x1` on arm64).
-#[repr(C)]
-pub(crate) struct JitRet {
-    value: u64,
-    status: u64,
-}
-
-/// `status` discriminants in [`JitRet`].
-pub(crate) const STATUS_RETURNED: u64 = 0;
-pub(crate) const STATUS_BAILED: u64 = 1;
-pub(crate) const STATUS_THREW: u64 = 2;
-
-/// Byte offset of [`JitCtx::resume_pc`] — where compiled code stamps the
-/// current logical PC before each op so a bail resumes at the exact site.
-pub(crate) const RESUME_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, resume_pc) as u32;
-/// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
-#[allow(dead_code)]
-pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
-pub(crate) const THREAD_OFFSET: u32 = std::mem::offset_of!(JitCtx, thread) as u32;
-pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_frame) as u32;
-pub(crate) const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, code_object_id) as u32;
-/// Byte offset of [`JitCtx::interrupt_flag`] — the inline back-edge interrupt poll.
-pub(crate) const INTERRUPT_FLAG_OFFSET: u32 = std::mem::offset_of!(JitCtx, interrupt_flag) as u32;
-/// Byte offset of [`JitCtx::backedge_fuel`] — the inline back-edge fuel counter.
-pub(crate) const BACKEDGE_FUEL_OFFSET: u32 = std::mem::offset_of!(JitCtx, backedge_fuel) as u32;
-pub(crate) const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
-/// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
-pub(crate) const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
-/// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
-/// used to build a self-recursive callee window inline.
-pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) as u32;
-/// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
-/// `reg_top`, bumped to reserve a callee window and restored on return.
-pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
-pub(crate) const SYNC_REENTRY_DEPTH_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, sync_reentry_depth_ptr) as u32;
-pub(crate) const SYNC_REENTRY_LIMIT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, sync_reentry_limit) as u32;
-pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
-pub(crate) const COLLECTION_METHOD_ICS_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, collection_method_ics) as u32;
-pub(crate) const COLLECTION_METHOD_IC_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, collection_method_ic_count) as u32;
-pub(crate) const COLLECTION_METHOD_IC_SLOT_SIZE: u32 =
-    std::mem::size_of::<otter_vm::JitCollectionMethodIcSlot>() as u32;
-/// Byte offset of [`JitCtx::direct_method_inline`] (the direct-method link table
-/// base) and the flat slot layout baseline code reads.
-pub(crate) const DIRECT_METHOD_INLINE_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_method_inline) as u32;
-pub(crate) const DIRECT_METHOD_INLINE_SLOT_SIZE: u32 =
-    std::mem::size_of::<otter_vm::JitDirectMethodInline>() as u32;
-pub(crate) const DIRECT_METHOD_ENTRY_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, entry_addr) as u32;
-pub(crate) const DIRECT_METHOD_REGISTER_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, register_count) as u32;
-pub(crate) const DIRECT_METHOD_RECV_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, recv_shape_offset) as u32;
-pub(crate) const DIRECT_METHOD_PROTO_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, proto_shape_offset) as u32;
-pub(crate) const DIRECT_METHOD_ON_RECEIVER_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_on_receiver) as u32;
-pub(crate) const DIRECT_METHOD_VALUE_BYTE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_value_byte) as u32;
-pub(crate) const DIRECT_METHOD_FID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_fid) as u32;
-pub(crate) const COLLECTION_METHOD_IC_STATE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, state) as u32;
-pub(crate) const COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, receiver_type_tag) as u32;
-pub(crate) const COLLECTION_METHOD_IC_PROTO_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, proto_offset) as u32;
-pub(crate) const COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, proto_shape) as u32;
-pub(crate) const COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, method_value_byte) as u32;
-pub(crate) const COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, leaf_stub_id) as u32;
-pub(crate) const COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, alloc_stub_id) as u32;
-pub(crate) const COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, builtin_fn_addr) as u32;
-#[allow(dead_code)]
-pub(crate) const GC_HEAP_OFFSET: u32 = std::mem::offset_of!(JitCtx, gc_heap) as u32;
-pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, thread) as u32;
-pub(crate) const ALLOC_CTX_FRAME_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, frame) as u32;
-pub(crate) const ALLOC_CTX_CODE_OBJECT_ID_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, code_object_id) as u32;
-pub(crate) const ALLOC_CTX_SAFEPOINT_ID_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, safepoint_id) as u32;
-pub(crate) const ALLOC_CTX_RESERVED0_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, reserved0) as u32;
-pub(crate) const ALLOC_CTX_RESERVED1_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, reserved1) as u32;
-pub(crate) const ALLOC_CTX_SPILL_SLOTS_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, spill_slots) as u32;
-pub(crate) const ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, spill_slot_count) as u32;
-pub(crate) const ALLOC_CTX_STACK_SIZE: u32 =
-    ((std::mem::size_of::<RuntimeStubAllocContext>() + 15) & !15) as u32;
-/// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
-pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
-/// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
-/// decompressed pointer (just past the 8-byte `GcHeader`).
-pub(crate) const UPVALUE_VALUE_OFFSET: u32 = 8;
-pub(crate) const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
-pub(crate) const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
-pub(crate) const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
-pub(crate) const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
-/// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
-/// `LoadThis` in baseline entries.
-pub(crate) const THIS_VALUE_OFFSET: u32 = std::mem::offset_of!(JitCtx, this_value) as u32;
-pub(crate) const DIRECT_FRAME_INDEX_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
-pub(crate) const DIRECT_UPVALUES_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
-pub(crate) const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
-
-/// Compiled-code entry signature.
-type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
 
 fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     // SAFETY: every `JitCtx` is built with an initialized error slot that lives

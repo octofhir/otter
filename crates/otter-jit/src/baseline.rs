@@ -226,14 +226,31 @@ mod tests {
     }
 
     fn run(view: &JitCompileSnapshot, regs: &mut [u64]) -> Exit {
+        exec(view, regs, 0, 0, 1 << 30)
+    }
+
+    /// Drive one compiled entry with explicit boundary probes: the SELF
+    /// closure bits (self-recursive call guard), the interrupt byte, and the
+    /// back-edge fuel budget. A local register-stack probe backs inline
+    /// self-recursive callee windows.
+    fn exec(
+        view: &JitCompileSnapshot,
+        regs: &mut [u64],
+        self_closure: u64,
+        interrupt: u8,
+        fuel: u64,
+    ) -> Exit {
         let code = compile(view).expect("compiles");
         let mut error = None;
-        // Probe cells published through the test `VmThread`: an unset interrupt
-        // byte and a fuel counter high enough that these small test loops never
-        // reach the (null-`vm`) re-entry stub.
-        let interrupt_probe: u8 = 0;
-        let mut backedge_fuel_probe: u64 = 1 << 30;
+        // Probe cells published through the test `VmThread`. The null-`vm`
+        // poll stub treats a taken slow path as "continue", so an exhausted
+        // fuel budget or a set interrupt byte exercises the boundary without
+        // a live interpreter.
+        let interrupt_probe: u8 = interrupt;
+        let mut backedge_fuel_probe: u64 = fuel;
         let mut sync_reentry_depth_probe: u32 = 0;
+        let mut reg_stack_probe = [0u64; 512];
+        let mut reg_top_probe: usize = 0;
         let mut native_frame = otter_vm::native_abi::NativeFrame {
             header: otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
             previous_frame: 0,
@@ -257,7 +274,7 @@ mod tests {
         thread.sync_reentry_limit = u32::MAX;
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
-            self_closure: 0,
+            self_closure,
             this_value: 0,
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: &mut native_frame,
@@ -270,8 +287,8 @@ mod tests {
             direct_this_value: 0,
             direct_frame_index: 0,
             direct_upvalues_ptr: 0,
-            reg_stack_base: std::ptr::null_mut(),
-            reg_top_ptr: std::ptr::null_mut(),
+            reg_stack_base: reg_stack_probe.as_mut_ptr(),
+            reg_top_ptr: std::ptr::addr_of_mut!(reg_top_probe),
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.entry_ptr_for_test()) };
@@ -1249,5 +1266,158 @@ mod tests {
             compile(&store).is_ok(),
             "the emitted dense/typed-array fast path and typed runtime miss must be reachable"
         );
+    }
+
+    // Opcode-boundary contract (JIT_REFACTOR_PLAN.md Phase 4 audit matrix).
+    // The uncommitted-guard-exit row is covered by
+    // `side_exit_publishes_exact_instruction_pc_after_committed_effects`;
+    // below: interrupt polls carry zero partial effects, and nested
+    // self-recursive calls bail at the call boundary on a guard miss and
+    // return through nested frames when the guard holds.
+
+    #[test]
+    fn interrupt_and_fuel_polls_carry_no_partial_effects() {
+        // Triangular-sum loop; every back-edge takes the slow poll path
+        // (exhausted fuel, then a set interrupt byte). The null-`vm` poll
+        // treats both as "continue", so the loop must still complete with the
+        // exact same result: the poll boundary observes no partial state.
+        let v = view(&[
+            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+            (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(1)]),
+            (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(1)]),
+            (
+                Op::LessEq,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(0),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(4, 8)), Operand::Register(3)],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(2),
+                    Operand::Register(4),
+                ],
+            ),
+            (Op::Jump, vec![Operand::Imm32(rel(7, 3))]),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        for (interrupt, fuel) in [(0u8, 1u64), (1u8, 1 << 30)] {
+            let mut regs = [box_i32(100), 0, 0, 0, 0, 0, 0, 0];
+            match exec(&v, &mut regs, 0, interrupt, fuel) {
+                Exit::Returned(bits) => assert_eq!(unbox_i32(bits), 5050),
+                Exit::Bailed(pc) => panic!("poll boundary bailed at {pc}"),
+            }
+        }
+    }
+
+    /// Countdown-sum body eligible for the inline self-recursive call path:
+    /// `f(n) = n <= 0 ? 0 : f(n - 1) + n`, with the SELF binding materialized
+    /// through a `make_self` `MakeFunction`.
+    fn self_recursive_sum_view() -> JitCompileSnapshot {
+        let mut v = view(&[
+            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+            (
+                Op::LessEq,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(2, 4)), Operand::Register(2)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+            (
+                Op::MakeFunction,
+                vec![Operand::Register(6), Operand::ConstIndex(0)],
+            ),
+            (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(1)]),
+            (
+                Op::Sub,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::Register(4),
+                ],
+            ),
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(6),
+                    Operand::ConstIndex(1),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(7),
+                    Operand::Register(5),
+                    Operand::Register(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(7)]),
+        ]);
+        v.instructions[4].make_self = true;
+        v
+    }
+
+    #[test]
+    fn self_call_guard_miss_bails_at_the_call_boundary() {
+        // The callee register holds undefined, never the entry's self-closure
+        // sentinel, so the self-call identity guard misses and the exit lands
+        // AT the call with every earlier effect committed.
+        let miss = view(&[
+            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(6),
+                    Operand::ConstIndex(1),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(5)]),
+        ]);
+        let sentinel_self = box_i32(777);
+        let mut regs = [0, 0, 0, 0, 0, 0, VALUE_UNDEFINED, 0];
+        match exec(&miss, &mut regs, sentinel_self, 0, 1 << 30) {
+            Exit::Bailed(pc) => assert_eq!(pc, 1, "guard miss exits at the call"),
+            Exit::Returned(bits) => panic!("expected call-boundary bail, returned {bits:#x}"),
+        }
+        assert_eq!(regs[1], box_i32(0), "committed effect before the call");
+    }
+
+    #[test]
+    fn self_recursive_call_returns_through_nested_frames() {
+        let v = self_recursive_sum_view();
+        // The make_self op loads the entry's self-closure bits into the
+        // callee register, so the call guard holds and recursion runs inline
+        // through nested windows: f(10) = 55.
+        let sentinel_self = box_i32(777);
+        let mut regs = [box_i32(10), 0, 0, 0, 0, 0, 0, 0];
+        match exec(&v, &mut regs, sentinel_self, 0, 1 << 30) {
+            Exit::Returned(bits) => assert_eq!(unbox_i32(bits), 55),
+            Exit::Bailed(pc) => panic!("self-recursive sum bailed at {pc}"),
+        }
     }
 }

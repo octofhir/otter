@@ -79,6 +79,25 @@ impl JitCtx {
         // current entry, whose runtime_context retains VmRuntimeActivation.
         unsafe { &*((*self.thread).runtime_context as *const VmRuntimeActivation) }
     }
+
+    /// Published activation, or `None` when this entry carries no runtime
+    /// context (fixture entries drive pure compiled code with no interpreter).
+    /// The cooperative poll boundary must stay sound for such entries instead
+    /// of dereferencing an absent activation.
+    pub(super) fn checked_activation(&self) -> Option<&VmRuntimeActivation> {
+        if self.thread.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null thread points at the VmThread built for the
+        // current entry.
+        let runtime_context = unsafe { (*self.thread).runtime_context };
+        if runtime_context == 0 {
+            return None;
+        }
+        // SAFETY: a nonzero runtime_context retains VmRuntimeActivation for
+        // this entry's dynamic extent.
+        Some(unsafe { &*(runtime_context as *const VmRuntimeActivation) })
+    }
 }
 
 /// Two-word return of compiled code (`x0`/`x1` on arm64).

@@ -5023,51 +5023,6 @@ fn interrupt_handle_breaks_loop() {
 }
 
 #[test]
-fn call_target_feedback_tracks_mono_then_poly() {
-    let mut interp = Interpreter::new();
-    // Two distinct call sites in caller fid 7.
-    let site_a = 12u32;
-    let site_b = 40u32;
-
-    // Site A only ever sees callee 3 → stays Mono(3).
-    interp.note_call_target(7, site_a, 3);
-    interp.note_call_target(7, site_a, 3);
-    interp.note_call_target(7, site_a, 3);
-    assert_eq!(
-        interp.jit_call_site_feedback.get(&(7, site_a)),
-        Some(&CallTargetFeedback::Mono(3))
-    );
-
-    // Site B sees 3 then 9 → promotes to Poly and stays there.
-    interp.note_call_target(7, site_b, 3);
-    assert_eq!(
-        interp.jit_call_site_feedback.get(&(7, site_b)),
-        Some(&CallTargetFeedback::Mono(3))
-    );
-    interp.note_call_target(7, site_b, 9);
-    assert_eq!(
-        interp.jit_call_site_feedback.get(&(7, site_b)),
-        Some(&CallTargetFeedback::Poly)
-    );
-    interp.note_call_target(7, site_b, 3);
-    assert_eq!(
-        interp.jit_call_site_feedback.get(&(7, site_b)),
-        Some(&CallTargetFeedback::Poly)
-    );
-
-    // Same site PC under a different caller is independent.
-    interp.note_call_target(99, site_a, 5);
-    assert_eq!(
-        interp.jit_call_site_feedback.get(&(99, site_a)),
-        Some(&CallTargetFeedback::Mono(5))
-    );
-    assert_eq!(
-        interp.jit_call_site_feedback.get(&(7, site_a)),
-        Some(&CallTargetFeedback::Mono(3))
-    );
-}
-
-#[test]
 fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
     let seed = jit::JitCompileSnapshot::without_feedback(
         5,

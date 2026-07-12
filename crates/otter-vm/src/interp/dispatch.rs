@@ -234,7 +234,9 @@ impl Interpreter {
                         // before the tier-up hook may consume the freshly pushed
                         // frame.
                         let callee_fid = stack[stack.len() - 1].function_id;
-                        self.note_call_target(function_id, pc, callee_fid);
+                        if feedback.is_some_and(|cell| cell.record_call_target(callee_fid)) {
+                            self.evict_compiled_for_reopt(function_id);
+                        }
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {
                             return Ok(value);
                         }

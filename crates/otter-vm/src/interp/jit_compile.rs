@@ -89,12 +89,18 @@ impl Interpreter {
                 .iter()
                 .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
                 .count();
+            let call_feedback = view
+                .instructions
+                .iter()
+                .filter(|instr| {
+                    view.code_block
+                        .feedback_at(instr.instruction_pc(&view.code_block) as usize)
+                        .is_some_and(|cell| cell.call_target().is_some())
+                })
+                .count();
             eprintln!(
                 "[otter-jit] view fid {fid} {function_name}: call_feedback={} method_feedback={} inline_callees={} inline_methods={}",
-                self.jit_call_site_feedback
-                    .iter()
-                    .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
-                    .count(),
+                call_feedback,
                 method_feedback,
                 view.inline_callees.len(),
                 view.inline_methods.len()
@@ -523,41 +529,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Record a `Mono`/`Poly` observation for one `Op::Call` site, the feedback
-    /// the baseline reads to decide whether to inline a tiny leaf callee. First
-    /// sighting at a site is `Mono(callee)`; a later sighting of the *same*
-    /// callee is a no-op; any *different* callee promotes the site to `Poly`
-    /// permanently. Only reached when a JIT hook is installed (the `Op::Call`
-    /// arm gates it), so interpreter-only execution pays nothing.
-    pub(crate) fn note_call_target(
-        &mut self,
-        caller_fid: u32,
-        call_instruction_pc: u32,
-        callee_fid: u32,
-    ) {
-        use std::collections::hash_map::Entry;
-        let newly_mono = match self
-            .jit_call_site_feedback
-            .entry((caller_fid, call_instruction_pc))
-        {
-            Entry::Vacant(slot) => {
-                slot.insert(CallTargetFeedback::Mono(callee_fid));
-                true
-            }
-            Entry::Occupied(mut slot) => {
-                if let CallTargetFeedback::Mono(seen) = *slot.get()
-                    && seen != callee_fid
-                {
-                    slot.insert(CallTargetFeedback::Poly);
-                }
-                false
-            }
-        };
-        if newly_mono {
-            self.evict_compiled_for_reopt(caller_fid);
-        }
-    }
-
     /// Whether a method-call site's feedback has already saturated to
     /// `Megamorphic`. Once it has, further [`Self::note_method_target`]
     /// observations are no-ops, so a caller can skip the receiver/prototype
@@ -730,19 +701,20 @@ impl Interpreter {
         fid: u32,
     ) {
         let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
-        for (&(caller_fid, instruction_pc), state) in &self.jit_call_site_feedback {
-            if caller_fid != fid {
-                continue;
-            }
-            let Some(call_byte_pc) = view
-                .instructions
-                .iter()
-                .find(|instr| instr.instruction_pc(&view.code_block) == instruction_pc)
-                .map(|instr| instr.byte_pc)
-            else {
-                continue;
-            };
-            let CallTargetFeedback::Mono(callee_fid) = *state else {
+        let call_sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter_map(|instr| {
+                let instruction_pc = instr.instruction_pc(&view.code_block);
+                let state = view
+                    .code_block
+                    .feedback_at(instruction_pc as usize)?
+                    .call_target()?;
+                Some((instruction_pc, instr.byte_pc, state))
+            })
+            .collect();
+        for (instruction_pc, call_byte_pc, state) in call_sites {
+            let CallTargetFeedback::Mono(callee_fid) = state else {
                 if trace {
                     eprintln!("[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: poly");
                 }

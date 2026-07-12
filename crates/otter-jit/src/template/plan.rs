@@ -810,6 +810,141 @@ mod tests {
     }
 
     #[test]
+    fn plan_maps_calls_properties_and_transitions() {
+        let v = view(&[
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(2),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(1),
+                    Operand::ConstIndex(7),
+                    Operand::ConstIndex(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(1),
+                    Operand::ConstIndex(3),
+                ],
+            ),
+            (
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstIndex(3),
+                    Operand::Register(5),
+                    Operand::Register(6),
+                ],
+            ),
+            (
+                Op::NewArray,
+                vec![
+                    Operand::Register(7),
+                    Operand::ConstIndex(2),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("plan");
+        match plan.instructions[0].op {
+            TemplateOp::Call {
+                dst,
+                callee,
+                argc,
+                packed_args,
+            } => {
+                assert_eq!((dst, callee, argc), (0, 1, 2));
+                assert_eq!(packed_args & 0xffff, 2);
+                assert_eq!((packed_args >> 16) & 0xffff, 3);
+            }
+            other => panic!("expected Call, got {other:?}"),
+        }
+        match plan.instructions[1].op {
+            TemplateOp::MethodCall {
+                dst,
+                receiver,
+                name,
+                argc,
+                arg0,
+                ..
+            } => {
+                assert_eq!((dst, receiver, name, argc), (4, 1, 7, 1));
+                assert_eq!(arg0, Some(2));
+            }
+            other => panic!("expected MethodCall, got {other:?}"),
+        }
+        assert!(matches!(
+            plan.instructions[2].op,
+            TemplateOp::LoadProperty {
+                dst: 5,
+                object: 1,
+                name: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            plan.instructions[3].op,
+            TemplateOp::StoreProperty {
+                object: 1,
+                name: 3,
+                value: 5,
+                ..
+            }
+        ));
+        match plan.instructions[4].op {
+            TemplateOp::NewArray { dst, elements } => {
+                assert_eq!(dst, 7);
+                assert_eq!(plan.register_tail(elements), &[2, 3]);
+            }
+            other => panic!("expected NewArray, got {other:?}"),
+        }
+        assert_eq!(plan.load_property_count, 1);
+        assert_eq!(plan.store_property_count, 1);
+    }
+
+    #[test]
+    fn plan_assigns_a_concat_safepoint_to_every_add() {
+        let v = view(&[
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("plan");
+        let TemplateOp::AddGeneric {
+            concat_safepoint, ..
+        } = plan.instructions[0].op
+        else {
+            panic!("expected AddGeneric");
+        };
+        assert!(
+            plan.safepoint_records
+                .iter()
+                .any(|record| record.id == concat_safepoint)
+        );
+    }
+
+    #[test]
     fn plan_rejects_non_boundary_branch_targets() {
         let v = view(&[
             (Op::Jump, vec![Operand::Imm32(8)]),

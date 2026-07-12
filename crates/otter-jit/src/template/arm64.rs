@@ -3,8 +3,10 @@
 //! # Contents
 //! - Code-buffer ownership, per-PC labels, and branch fixups.
 //! - Prologue/epilogue establishing the shared compiled-entry ABI.
-//! - One emit routine per [`TemplateOp`], including inline tagged truthiness.
+//! - One emit dispatch per [`TemplateOp`], including inline tagged truthiness.
 //! - Cooperative back-edge interrupt/fuel polling.
+//! - [`values`] — tagged encode/decode primitives.
+//! - [`arith`] — numeric, comparison, and bitwise emitters.
 //!
 //! # Invariants
 //! - Every instruction stamps its canonical resume PC into the published
@@ -28,11 +30,19 @@
 // intentionally redundant and outside the source-level emitter's control.
 #![allow(clippy::useless_conversion)]
 
+mod arith;
+mod values;
+
 use std::collections::BTreeMap;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 
+use self::arith::{
+    emit_binary_arith, emit_compare, emit_increment, emit_int_bitwise, emit_loose_compare,
+    emit_negate, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
+};
+use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::baseline::{
@@ -123,6 +133,53 @@ pub(super) fn compile(
                 }
                 emit_store_reg(&mut ops, 9, dst)?;
             }
+            TemplateOp::BinaryArith {
+                dst,
+                lhs,
+                rhs,
+                kind,
+            } => {
+                emit_binary_arith(&mut ops, dst, lhs, rhs, kind, bail)?;
+            }
+            TemplateOp::Compare {
+                dst,
+                lhs,
+                rhs,
+                kind,
+            } => {
+                emit_compare(&mut ops, dst, lhs, rhs, kind, bail)?;
+            }
+            TemplateOp::LooseCompare {
+                dst,
+                lhs,
+                rhs,
+                negate,
+            } => {
+                emit_loose_compare(&mut ops, dst, lhs, rhs, negate, bail)?;
+            }
+            TemplateOp::IntBitwise {
+                dst,
+                lhs,
+                rhs,
+                kind,
+            } => {
+                emit_int_bitwise(&mut ops, dst, lhs, rhs, kind, bail)?;
+            }
+            TemplateOp::UnsignedShiftRight { dst, lhs, rhs } => {
+                emit_unsigned_shift_right(&mut ops, dst, lhs, rhs, bail)?;
+            }
+            TemplateOp::Increment { dst, src, delta } => {
+                emit_increment(&mut ops, dst, src, delta, bail)?;
+            }
+            TemplateOp::Negate { dst, src } => {
+                emit_negate(&mut ops, dst, src, bail)?;
+            }
+            TemplateOp::ToNumeric { dst, src } => {
+                emit_to_numeric(&mut ops, dst, src, bail)?;
+            }
+            TemplateOp::ToPrimitive { dst, src } => {
+                emit_to_primitive(&mut ops, dst, src, bail)?;
+            }
             TemplateOp::Return { src } => {
                 let off = reg_offset(src)?;
                 dynasm!(ops
@@ -190,34 +247,6 @@ fn emit_epilogue(ops: &mut Assembler) {
         ; ldp x29, x30, [sp], #32
         ; ret
     );
-}
-
-/// Materialize a 64-bit constant into x-register `t` via movz/movk.
-fn emit_load_u64(ops: &mut Assembler, t: u8, v: u64) {
-    dynasm!(ops ; .arch aarch64 ; movz X(t), (v & 0xFFFF) as u32);
-    if (v >> 16) & 0xFFFF != 0 {
-        dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 16) & 0xFFFF) as u32, lsl #16);
-    }
-    if (v >> 32) & 0xFFFF != 0 {
-        dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 32) & 0xFFFF) as u32, lsl #32);
-    }
-    if (v >> 48) & 0xFFFF != 0 {
-        dynasm!(ops ; .arch aarch64 ; movk X(t), ((v >> 48) & 0xFFFF) as u32, lsl #48);
-    }
-}
-
-/// `ldr X(t), [x19, #idx*8]`.
-fn emit_load_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
-    let off = reg_offset(idx)?;
-    dynasm!(ops ; .arch aarch64 ; ldr X(t), [x19, off]);
-    Ok(())
-}
-
-/// `str X(t), [x19, #idx*8]`.
-fn emit_store_reg(ops: &mut Assembler, t: u8, idx: u16) -> Result<(), Unsupported> {
-    let off = reg_offset(idx)?;
-    dynasm!(ops ; .arch aarch64 ; str X(t), [x19, off]);
-    Ok(())
 }
 
 /// Publish the canonical instruction-index PC into the active native frame.

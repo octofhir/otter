@@ -28,6 +28,37 @@ use otter_vm::{JitCompileSnapshot, Value};
 
 use crate::baseline::{BaselinePlan, Unsupported, value_tag};
 
+/// Numeric binary operators lowered to the shared int32/double template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArithKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+/// Comparison operators lowered to the shared int32/double template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompareKind {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// Int32 bitwise/shift operators sharing the `ToInt32` fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BitwiseKind {
+    Or,
+    And,
+    Xor,
+    Shl,
+    Shr,
+}
+
 /// One machine-independent template operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TemplateOp {
@@ -47,6 +78,54 @@ pub(crate) enum TemplateOp {
     },
     /// `r<dst> = ToBoolean(r<src>)`, inverted when `negate` is set.
     Truthiness { dst: u16, src: u16, negate: bool },
+    /// `r<dst> = r<lhs> <op> r<rhs>` over tagged numbers: int32 fast path with
+    /// overflow promotion to double, full double path, exact side exit on a
+    /// non-number operand.
+    BinaryArith {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        kind: ArithKind,
+    },
+    /// `r<dst> = r<lhs> <cmp> r<rhs>` producing a boolean. Strict (in)equality
+    /// additionally decides non-number immediates by raw identity; heap cells
+    /// side-exit to the interpreter, which owns content equality.
+    Compare {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        kind: CompareKind,
+    },
+    /// Abstract (in)equality over numbers and the null/undefined equivalence
+    /// class; every coercive case takes an exact side exit.
+    LooseCompare {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        negate: bool,
+    },
+    /// Int32 bitwise/shift with the full finite-double `ToInt32` fast path.
+    IntBitwise {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        kind: BitwiseKind,
+    },
+    /// `r<dst> = r<lhs> >>> r<rhs>` with the full finite-double `ToUint32`
+    /// fast path; the result boxes as a double (uint32-valued Number).
+    UnsignedShiftRight { dst: u16, lhs: u16, rhs: u16 },
+    /// `r<dst> = ToNumeric(r<src>) + delta` (update expressions).
+    Increment { dst: u16, src: u16, delta: i32 },
+    /// `r<dst> = -ToNumeric(r<src>)` including the `-0` and `-i32::MIN`
+    /// double promotions.
+    Negate { dst: u16, src: u16 },
+    /// `r<dst> = ToNumeric(r<src>)` — identity on numbers, side exit
+    /// otherwise.
+    ToNumeric { dst: u16, src: u16 },
+    /// `r<dst> = ToPrimitive(r<src>)` — identity on primitives, side exit on
+    /// heap cells and function references so observable coercion hooks run in
+    /// the interpreter.
+    ToPrimitive { dst: u16, src: u16 },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -154,6 +233,103 @@ impl TemplatePlan {
                         dst: operands.dst,
                         src: operands.src,
                         negate: true,
+                    }
+                }
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
+                    let operands = lowered.binary_operands()?;
+                    TemplateOp::BinaryArith {
+                        dst: operands.dst,
+                        lhs: operands.lhs,
+                        rhs: operands.rhs,
+                        kind: match lowered.op {
+                            Op::Add => ArithKind::Add,
+                            Op::Sub => ArithKind::Sub,
+                            Op::Mul => ArithKind::Mul,
+                            Op::Div => ArithKind::Div,
+                            _ => ArithKind::Rem,
+                        },
+                    }
+                }
+                Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual => {
+                    let operands = lowered.binary_operands()?;
+                    TemplateOp::Compare {
+                        dst: operands.dst,
+                        lhs: operands.lhs,
+                        rhs: operands.rhs,
+                        kind: match lowered.op {
+                            Op::LessThan => CompareKind::Lt,
+                            Op::LessEq => CompareKind::Le,
+                            Op::GreaterThan => CompareKind::Gt,
+                            Op::GreaterEq => CompareKind::Ge,
+                            Op::Equal => CompareKind::Eq,
+                            _ => CompareKind::Ne,
+                        },
+                    }
+                }
+                Op::LooseEqual | Op::LooseNotEqual => {
+                    let operands = lowered.binary_operands()?;
+                    TemplateOp::LooseCompare {
+                        dst: operands.dst,
+                        lhs: operands.lhs,
+                        rhs: operands.rhs,
+                        negate: lowered.op == Op::LooseNotEqual,
+                    }
+                }
+                Op::BitwiseOr | Op::BitwiseAnd | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                    let operands = lowered.binary_operands()?;
+                    TemplateOp::IntBitwise {
+                        dst: operands.dst,
+                        lhs: operands.lhs,
+                        rhs: operands.rhs,
+                        kind: match lowered.op {
+                            Op::BitwiseOr => BitwiseKind::Or,
+                            Op::BitwiseAnd => BitwiseKind::And,
+                            Op::BitwiseXor => BitwiseKind::Xor,
+                            Op::Shl => BitwiseKind::Shl,
+                            _ => BitwiseKind::Shr,
+                        },
+                    }
+                }
+                Op::Ushr => {
+                    let operands = lowered.binary_operands()?;
+                    TemplateOp::UnsignedShiftRight {
+                        dst: operands.dst,
+                        lhs: operands.lhs,
+                        rhs: operands.rhs,
+                    }
+                }
+                Op::Increment => {
+                    let operands = lowered.increment_operands()?;
+                    TemplateOp::Increment {
+                        dst: operands.dst,
+                        src: operands.src,
+                        delta: operands.delta,
+                    }
+                }
+                Op::Neg => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::Negate {
+                        dst: operands.dst,
+                        src: operands.src,
+                    }
+                }
+                Op::ToNumeric => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ToNumeric {
+                        dst: operands.dst,
+                        src: operands.src,
+                    }
+                }
+                Op::ToPrimitive => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ToPrimitive {
+                        dst: operands.dst,
+                        src: operands.src,
                     }
                 }
                 Op::Return | Op::ReturnValue => TemplateOp::Return {
@@ -271,19 +447,12 @@ mod tests {
     fn plan_rejects_the_whole_function_on_an_unsupported_opcode() {
         let v = view(&[
             (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
-            (
-                Op::Add,
-                vec![
-                    Operand::Register(1),
-                    Operand::Register(0),
-                    Operand::Register(0),
-                ],
-            ),
+            (Op::NewObject, vec![Operand::Register(1)]),
             (Op::ReturnValue, vec![Operand::Register(1)]),
         ]);
         assert_eq!(
             TemplatePlan::build(&v).err(),
-            Some(Unsupported::Opcode(Op::Add))
+            Some(Unsupported::Opcode(Op::NewObject))
         );
     }
 

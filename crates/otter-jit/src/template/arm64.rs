@@ -31,6 +31,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod arith;
+mod calls;
 mod transitions;
 mod values;
 
@@ -340,6 +341,44 @@ pub(super) fn compile(
             }
             TemplateOp::StoreUpvalueChecked { src, index } => {
                 transitions::emit_store_upvalue(&mut ops, &transitions, src, index, true, threw);
+            }
+            TemplateOp::Call {
+                dst,
+                callee,
+                argc,
+                packed_args,
+            } => {
+                calls::emit_call(
+                    &mut ops,
+                    &transitions,
+                    dst,
+                    callee,
+                    argc,
+                    packed_args,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::MethodCall {
+                dst,
+                receiver,
+                name,
+                site,
+                argc,
+                packed_args,
+            } => {
+                calls::emit_method_call(
+                    &mut ops,
+                    &transitions,
+                    dst,
+                    receiver,
+                    name,
+                    site,
+                    argc,
+                    packed_args,
+                    bail,
+                    threw,
+                );
             }
             TemplateOp::Return { src } => {
                 let off = reg_offset(src)?;

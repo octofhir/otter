@@ -137,9 +137,9 @@ impl JsString {
     /// and never change under a move, so only the handle needs updating. Used
     /// where a `JsString` is stored in a collector-visited slot that is not a
     /// `Value` (e.g. `MapKey::String`).
-    pub(crate) fn trace_handle_slot(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    pub(crate) fn trace_handle_slot(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if !self.handle.is_null() {
-            let p = std::ptr::addr_of_mut!(self.handle) as *mut otter_gc::raw::RawGc;
+            let p = std::ptr::addr_of!(self.handle) as *mut otter_gc::raw::RawGc;
             visitor(p);
         }
     }

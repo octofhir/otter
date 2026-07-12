@@ -66,12 +66,16 @@ pub fn alloc_symbol(
     well_known: Option<WellKnown>,
     registered: bool,
 ) -> Result<SymbolHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(SymbolBody {
+    let inner = heap.alloc_old(SymbolBody {
         description,
         well_known,
         registered,
         private_name: false,
-    })
+    })?;
+    if let Some(description) = description {
+        heap.record_write(inner, &description.handle());
+    }
+    Ok(inner)
 }
 
 /// Allocate a Private Name carrier — same identity semantics as an
@@ -81,12 +85,16 @@ pub fn alloc_private_name_symbol(
     heap: &mut otter_gc::GcHeap,
     description: Option<JsString>,
 ) -> Result<SymbolHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(SymbolBody {
+    let inner = heap.alloc_old(SymbolBody {
         description,
         well_known: None,
         registered: false,
         private_name: true,
-    })
+    })?;
+    if let Some(description) = description {
+        heap.record_write(inner, &description.handle());
+    }
+    Ok(inner)
 }
 
 /// One `Symbol` body — the GC-allocated identity bearer plus the
@@ -101,10 +109,9 @@ pub struct SymbolBody {
     /// `Symbol(<desc>)`. `None` means "no description" — distinct
     /// from a description that is the empty string.
     //
-    // `JsString` lives outside the cage today (`Arc<StringRepr>`); once
-    // it migrates to a GC body the `#[pelt(skip)]` here drops and the
-    // derive will emit the handle visit automatically.
-    #[pelt(skip)]
+    // Symbol bodies are identity-stable old-space cells. The description is a
+    // moving string handle, so the derive traces it and constructors record
+    // the old-to-young edge immediately after allocation.
     pub description: Option<JsString>,
     /// Stable tag identifying which well-known slot this symbol
     /// belongs to. `None` for ordinary `Symbol(...)` calls and
@@ -313,6 +320,9 @@ impl JsSymbol {
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = &self.inner as *const SymbolHandle as *mut otter_gc::raw::RawGc;
         visitor(p);
+        if let Some(description) = &self.description {
+            description.trace_handle_slot(visitor);
+        }
     }
 
     /// Render the symbol per `Symbol.prototype.toString` —
@@ -643,6 +653,28 @@ mod tests {
         assert_eq!(s.descriptive_string(&gc), "Symbol(x)");
         let none = JsSymbol::new(&mut gc, None).unwrap();
         assert_eq!(none.descriptive_string(&gc), "Symbol()");
+    }
+
+    #[test]
+    fn old_symbol_description_survives_minor_and_full_gc() {
+        let mut gc = fresh_gc_heap();
+        let desc = JsString::from_str("rooted-description", &mut gc).unwrap();
+        let symbol = JsSymbol::new(&mut gc, Some(desc)).unwrap();
+        let mut root = symbol.handle();
+
+        gc.collect_minor_with_roots(&mut |visitor| {
+            visitor(&mut root as *mut SymbolHandle as *mut otter_gc::raw::RawGc);
+        })
+        .expect("minor GC");
+        let symbol = JsSymbol::from_handle(&gc, root);
+        assert_eq!(symbol.descriptive_string(&gc), "Symbol(rooted-description)");
+
+        gc.collect_full(&mut |visitor| {
+            visitor(&mut root as *mut SymbolHandle as *mut otter_gc::raw::RawGc);
+        })
+        .expect("full GC");
+        let symbol = JsSymbol::from_handle(&gc, root);
+        assert_eq!(symbol.descriptive_string(&gc), "Symbol(rooted-description)");
     }
 
     #[test]

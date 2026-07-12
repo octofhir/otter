@@ -41,7 +41,7 @@ use std::cell::RefCell;
 
 use otter_gc::raw::{RawGc, SlotVisitor};
 
-use crate::Value;
+use crate::{Value, string::JsString};
 
 /// Field-level hook the [`Pelt`](otter_macros::Pelt) derive
 /// dispatches on. Implementors yield one slot pointer per outgoing
@@ -55,6 +55,13 @@ impl PeltField for Value {
     #[inline]
     fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
         self.trace_value_slot_mut(visitor);
+    }
+}
+
+impl PeltField for JsString {
+    #[inline]
+    fn pelt_trace(&mut self, visitor: &mut SlotVisitor<'_>) {
+        self.trace_handle_slot(visitor);
     }
 }
 

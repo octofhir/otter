@@ -1,11 +1,15 @@
 //! Template compiler built on backend-neutral [`TemplatePlan`] operations.
 //!
-//! A second, deliberately small native compiler that lives beside the
-//! established baseline emitter and shares its frozen entry contract
-//! (`JitCtx`/`JitRet`, `otter_vm::native_abi`). It compiles exactly the
-//! constants / register-move / branch / tagged-truthiness / return subset and
-//! rejects every other opcode with a whole-function [`Unsupported`] — a
-//! template compile never produces partially executable code.
+//! A second native compiler beside the established baseline emitter, sharing
+//! its frozen entry contract (`JitCtx`/`JitRet`, `otter_vm::native_abi`). It
+//! compiles constants, register moves, branches, tagged truthiness, the full
+//! tagged numeric/comparison/bitwise set, `+` with allocating string concat,
+//! descriptor-resolved runtime transitions, ordinary and method calls with
+//! callee-owned frames, named-property IC probes, and guarded Map/Set builtin
+//! fast paths. Every opcode outside the subset rejects the whole function
+//! with [`Unsupported`] — a template compile never produces partially
+//! executable code. Deliberately absent (later, measured slices): inlining,
+//! OSR entries, and FP residency.
 //!
 //! # Contents
 //! - [`plan`] — machine-independent operation stream over typed lowering.

@@ -23,66 +23,66 @@ use otter_vm::{
 #[repr(C)]
 pub(crate) struct JitCtx {
     /// Base of the executing frame's register window (`*mut u64` over Values).
-    pub(super) regs: *mut u64,
+    pub(crate) regs: *mut u64,
     /// Boxed `Value` bits of this frame's SELF closure (the named-function self
     /// binding). Read directly by a `MakeFunction`-of-self at offset 8.
-    pub(super) self_closure: u64,
+    pub(crate) self_closure: u64,
     /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
     /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
-    pub(super) this_value: u64,
+    pub(crate) this_value: u64,
     /// Sole machine-visible VM state pointer.
-    pub(super) thread: *mut VmThread,
+    pub(crate) thread: *mut VmThread,
     /// Published authoritative activation.
-    pub(super) native_frame: *mut NativeFrame,
+    pub(crate) native_frame: *mut NativeFrame,
     /// Index of the executing frame within `stack`.
-    pub(super) frame_index: usize,
+    pub(crate) frame_index: usize,
     /// Base of this frame's upvalue spine (`Box<[UpvalueCell]>` data; each a
     /// 4-byte compressed cell handle), or `0` when the frame captures nothing
     /// or the function captures nothing. Inline `LoadUpvalue` /
     /// `StoreUpvalue` read `[upvalues_ptr + idx*4]`.
-    pub(super) upvalues_ptr: usize,
+    pub(crate) upvalues_ptr: usize,
     /// Error slot shared by direct callees and bridge stubs when a re-entered
     /// operation throws. Pointer form keeps `JitCtx` constructible by emitted
     /// code; assembly never initializes a Rust enum in place.
-    pub(super) error: *mut Option<VmError>,
+    pub(crate) error: *mut Option<VmError>,
     /// Prepared direct-call callee entry address.
-    pub(super) direct_entry_addr: usize,
+    pub(crate) direct_entry_addr: usize,
     /// Prepared direct-call callee register base.
-    pub(super) direct_regs: *mut u64,
+    pub(crate) direct_regs: *mut u64,
     /// Prepared direct-call callee SELF bits.
-    pub(super) direct_self_closure: u64,
+    pub(crate) direct_self_closure: u64,
     /// Prepared direct-call callee `this` bits.
-    pub(super) direct_this_value: u64,
+    pub(crate) direct_this_value: u64,
     /// Prepared direct-call callee frame index.
-    pub(super) direct_frame_index: usize,
+    pub(crate) direct_frame_index: usize,
     /// Prepared direct-call callee upvalue-spine base (staged from
     /// [`otter_vm::JitPreparedDirectCall::upvalues_ptr`]); the dispatch tail
     /// copies it into the callee `JitCtx.upvalues_ptr`.
-    pub(super) direct_upvalues_ptr: usize,
+    pub(crate) direct_upvalues_ptr: usize,
     /// Prepared callee native-frame identity word (`function_id |
     /// code_block_id << 32`).
-    pub(super) direct_frame_ids: u64,
+    pub(crate) direct_frame_ids: u64,
     /// Prepared callee native-frame header word at byte 8 with `pc = 0`
     /// (`register_count << 32 | kind << 48 | flags << 56`).
-    pub(super) direct_frame_meta: u64,
+    pub(crate) direct_frame_meta: u64,
     /// Prepared callee installed code-object identity.
-    pub(super) direct_code_object_id: u64,
+    pub(crate) direct_code_object_id: u64,
     /// Base of the interpreter's flat JIT register stack
     /// (`reg_stack[0]`). Compiled code builds a self-recursive callee window at
     /// `reg_stack_base + reg_top*8` without a Rust frame-build bridge.
-    pub(super) reg_stack_base: *mut u64,
+    pub(crate) reg_stack_base: *mut u64,
     /// Address of the interpreter's `reg_top` (live extent of the flat register
     /// stack, in slots). Compiled code loads it, reserves a callee window by
     /// adding the callee register count, and stores it back; the matching pop on
     /// return restores it.
-    pub(super) reg_top_ptr: *mut usize,
+    pub(crate) reg_top_ptr: *mut usize,
 }
 
 impl JitCtx {
     /// VM-owned activation published through the sole machine-visible thread
     /// pointer. Runtime stubs use this explicitly; emitted code never observes
     /// its Rust pointers or container types.
-    pub(super) fn activation(&self) -> &VmRuntimeActivation {
+    pub(crate) fn activation(&self) -> &VmRuntimeActivation {
         // SAFETY: runtime-capable contexts point at the VmThread built for the
         // current entry, whose runtime_context retains VmRuntimeActivation.
         unsafe { &*((*self.thread).runtime_context as *const VmRuntimeActivation) }
@@ -92,7 +92,7 @@ impl JitCtx {
     /// context (fixture entries drive pure compiled code with no interpreter).
     /// The cooperative poll boundary must stay sound for such entries instead
     /// of dereferencing an absent activation.
-    pub(super) fn checked_activation(&self) -> Option<&VmRuntimeActivation> {
+    pub(crate) fn checked_activation(&self) -> Option<&VmRuntimeActivation> {
         if self.thread.is_null() {
             return None;
         }
@@ -111,8 +111,8 @@ impl JitCtx {
 /// Two-word return of compiled code (`x0`/`x1` on arm64).
 #[repr(C)]
 pub(crate) struct JitRet {
-    pub(super) value: u64,
-    pub(super) status: u64,
+    pub(crate) value: u64,
+    pub(crate) status: u64,
 }
 
 /// `status` discriminants in [`JitRet`].
@@ -221,4 +221,4 @@ pub(crate) const NATIVE_FRAME_TAIL_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, argument_count) as u32;
 
 /// Compiled-code entry signature.
-pub(super) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;
+pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

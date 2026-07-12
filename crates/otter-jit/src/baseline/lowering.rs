@@ -526,7 +526,7 @@ impl BaselinePlan {
                     value: reg(operands, 0)?,
                     local: local_index(operands, 1)?,
                 }),
-                Op::ToPrimitive | Op::ToNumeric | Op::Neg => {
+                Op::ToPrimitive | Op::ToNumeric | Op::Neg | Op::ToBoolean | Op::LogicalNot => {
                     LoweredOperands::Unary(UnaryOperands {
                         dst: reg(operands, 0)?,
                         src: reg(operands, 1)?,

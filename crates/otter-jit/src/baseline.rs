@@ -56,11 +56,14 @@ mod code;
 mod lowering;
 mod runtime_ops;
 mod value_abi;
-use abi::*;
+pub(crate) use abi::*;
 use artifacts::*;
 pub use code::BaselineCode;
+pub(crate) use code::enter_compiled;
 pub use lowering::Unsupported;
 use lowering::*;
+pub(crate) use lowering::{BaselinePlan, reg_offset};
+pub(crate) use runtime_ops::jit_backedge_poll_stub;
 use runtime_ops::*;
 pub(crate) use value_abi::*;
 

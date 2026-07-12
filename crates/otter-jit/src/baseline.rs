@@ -374,7 +374,7 @@ pub(crate) mod arm64 {
         ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET,
         ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE,
         ALLOC_CTX_THREAD_OFFSET, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET, BACKEDGE_FUEL_OFFSET,
-        BaselineCode, CANONICAL_NAN_HI16, COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET,
+        BaselineCode, BaselinePlan, CANONICAL_NAN_HI16, COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET,
         COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET, COLLECTION_METHOD_IC_COUNT_OFFSET,
         COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET, COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET,
         COLLECTION_METHOD_IC_PROTO_OFFSET, COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET,
@@ -389,12 +389,11 @@ pub(crate) mod arm64 {
         FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET,
         JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS,
         NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16,
-        OBJECT_BODY_TYPE_TAG, Op, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET,
-        RESUME_PC_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-        SYNC_REENTRY_DEPTH_PTR_OFFSET, SYNC_REENTRY_LIMIT_OFFSET, THIS_VALUE_OFFSET, THREAD_OFFSET,
-        UPVALUE_CELL_SIZE, UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE,
-        VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WhiskerIcCell,
-        WordOperands,
+        OBJECT_BODY_TYPE_TAG, Op, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, RESUME_PC_OFFSET,
+        STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, SYNC_REENTRY_DEPTH_PTR_OFFSET,
+        SYNC_REENTRY_LIMIT_OFFSET, THIS_VALUE_OFFSET, THREAD_OFFSET, UPVALUE_CELL_SIZE,
+        UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW,
+        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WhiskerIcCell, WordOperands,
         alloc_value_stub_trampoline_pair, branch_target, const_index, imm32,
         jit_abort_direct_call_stub, jit_add_stub, jit_backedge_poll_stub,
         jit_call_collection_method_ic_stub, jit_define_data_property_stub,
@@ -1059,24 +1058,8 @@ pub(crate) mod arm64 {
     }
 
     pub(super) fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
+        let plan = BaselinePlan::build(view)?;
         let code_block = view.code_block.as_ref();
-        if let Some(instr) = view.instructions.iter().find(|instr| {
-            matches!(
-                instr.op(code_block),
-                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally
-            )
-        }) {
-            return Err(Unsupported::Opcode(instr.op(code_block)));
-        }
-        if let Some(argc) = view
-            .instructions
-            .iter()
-            .filter(|instr| instr.op(code_block) == Op::CallMethodValue)
-            .filter_map(|instr| instr.const_index(code_block, 3))
-            .find(|&argc| argc as usize > super::MAX_METHOD_ARGS)
-        {
-            return Err(Unsupported::ArgCount(argc as usize));
-        }
 
         let mut ops = Assembler::new().expect("assembler alloc");
         let bail = ops.new_dynamic_label();
@@ -1085,8 +1068,8 @@ pub(crate) mod arm64 {
         // A dynamic label per canonical instruction PC. Byte PCs remain side
         // metadata for bailout/OSR records only.
         let mut labels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
-        for instr in &view.instructions {
-            labels.insert(instr.instruction_pc(code_block), ops.new_dynamic_label());
+        for &instruction_pc in &plan.instruction_pcs {
+            labels.insert(instruction_pc, ops.new_dynamic_label());
         }
         let target_label = |instruction_pc: i64| -> Result<DynamicLabel, Unsupported> {
             u32::try_from(instruction_pc)
@@ -1150,10 +1133,7 @@ pub(crate) mod arm64 {
         // never slow a non-dividing function. `Op::Div` always produces a
         // Number via `f64`, so a function that contains one already runs its
         // arithmetic through the double path on the hot values.
-        let enable_fres = view
-            .instructions
-            .iter()
-            .any(|i| i.op(code_block) == Op::Div);
+        let enable_fres = plan.enable_float_residency;
         let mut fres = FloatResidency::default();
 
         // One self-patching WhiskerIC cell per `LoadProperty` op. Allocated up
@@ -1162,25 +1142,15 @@ pub(crate) mod arm64 {
         // inline-slot hit. `as_mut_ptr` gives a write-provenance base that
         // outlives every execution (the buffer is owned by the returned
         // `BaselineCode` and never re-formed as a `&[_]` slice).
-        let load_property_count = view
-            .instructions
-            .iter()
-            .filter(|i| i.op(code_block) == Op::LoadProperty)
-            .count();
         let mut load_ic_cells: Box<[WhiskerIcCell]> =
-            vec![WhiskerIcCell::default(); load_property_count].into_boxed_slice();
+            vec![WhiskerIcCell::default(); plan.load_property_count].into_boxed_slice();
         let cell_base = load_ic_cells.as_mut_ptr() as usize;
         let mut load_ic_idx: usize = 0;
 
         // One self-patching WhiskerIC cell per `StoreProperty` op, same scheme
         // as the load cells above.
-        let store_property_count = view
-            .instructions
-            .iter()
-            .filter(|i| i.op(code_block) == Op::StoreProperty)
-            .count();
         let mut store_ic_cells: Box<[WhiskerIcCell]> =
-            vec![WhiskerIcCell::default(); store_property_count].into_boxed_slice();
+            vec![WhiskerIcCell::default(); plan.store_property_count].into_boxed_slice();
         let store_cell_base = store_ic_cells.as_mut_ptr() as usize;
         let mut store_ic_idx: usize = 0;
 
@@ -6138,8 +6108,8 @@ mod tests {
     //! keeps branch byte-deltas trivial (`rel = (target - next) * 4`).
 
     use super::{
-        JitCtx, JitEntry, JitRet, STATUS_RETURNED, VALUE_FALSE, VALUE_NULL, VALUE_TRUE,
-        VALUE_UNDEFINED, compile, value_tag,
+        BaselinePlan, JitCtx, JitEntry, JitRet, STATUS_RETURNED, Unsupported, VALUE_FALSE,
+        VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, compile, value_tag,
     };
     use otter_bytecode::{Op, Operand};
     use otter_vm::{JitCompileSnapshot, JitFunctionCode, jit::JitTestInstruction};
@@ -6883,6 +6853,18 @@ mod tests {
             ],
         )]);
         assert!(compile(&v).is_err());
+    }
+
+    #[test]
+    fn lowering_plan_rejects_non_boundary_branch_target() {
+        let v = view(&[
+            (Op::Jump, vec![Operand::Imm32(8)]),
+            (Op::ReturnUndefined, vec![]),
+        ]);
+        assert_eq!(
+            BaselinePlan::build(&v).err(),
+            Some(Unsupported::BranchTarget(9))
+        );
     }
 
     #[test]

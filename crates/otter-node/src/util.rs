@@ -11,6 +11,7 @@ use otter_vm::{JsString, NativeCtx, NativeError, Value, native_function};
 
 /// Embedded `util` implementation.
 const SHIM: &str = include_str!("util.js");
+const UTIL_EXPORT_CACHE_KEY: &str = "otter-internal:node-util-export";
 
 /// Native backing for `util.getCallSites`: capture the live JS call
 /// stack as a JSON array of call-site records. `args[0]` is the number
@@ -49,10 +50,41 @@ fn capture_call_sites(
 
 /// CommonJS export: the `util` namespace.
 pub fn util_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
+    if let Some(cached) = ctx
+        .interp_mut()
+        .host_module_env_cached(UTIL_EXPORT_CACHE_KEY)
+    {
+        return Ok(Value::object(cached));
+    }
     let callsites =
         native_function::native_value(ctx.heap_mut(), "captureCallSites", capture_call_sites)
             .map_err(|err| err.to_string())?;
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:util", SHIM, &[("__otter_callsites", callsites)])
+    let export = otter_runtime::run_builtin_cjs_shim(
+        ctx,
+        "node:util",
+        SHIM,
+        &[("__otter_callsites", callsites)],
+    )?;
+    let export_object = export
+        .as_object()
+        .ok_or_else(|| "node:util shim did not return an object".to_string())?;
+    ctx.interp_mut()
+        .cache_host_module_env(std::sync::Arc::from(UTIL_EXPORT_CACHE_KEY), export_object);
+    Ok(export)
+}
+
+/// CommonJS `util/types` export. Node exposes the same object by identity as
+/// `require('util').types`.
+pub fn util_types_cjs_value(
+    ctx: &mut NativeCtx<'_>,
+    caps: &CapabilitySet,
+) -> Result<Value, String> {
+    let util = util_cjs_value(ctx, caps)?;
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| "missing execution context for util/types".to_string())?;
+    interp
+        .get_property(&exec, util, "types")
+        .map_err(|err| err.to_string())
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

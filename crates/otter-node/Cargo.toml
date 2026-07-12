@@ -17,6 +17,7 @@ sha1 = { workspace = true }
 md-5 = "0.10"
 getrandom = { workspace = true }
 flate2 = { workspace = true }
+idna = "1.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

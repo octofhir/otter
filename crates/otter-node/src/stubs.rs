@@ -43,9 +43,3 @@ pub fn install_worker_threads(ctx: &mut HostedModuleCtx<'_>) -> Result<(), Strin
     ctx.builtin_method("Worker", 1, not_implemented)?;
     Ok(())
 }
-
-/// `node:url` — `pathToFileURL` is destructured by `tmpdir.js`.
-pub fn install_url(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    ctx.builtin_method("pathToFileURL", 1, not_implemented)?;
-    Ok(())
-}

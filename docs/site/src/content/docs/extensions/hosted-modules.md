@@ -102,5 +102,25 @@ The current active slices are:
 - `otter:sql`: `openSql` / `sql`, backed by SQLite.
 - `otter:ffi`: `dlopen`, permission-checked library loading metadata.
 
+Node compatibility is opt-in through `otter_node::NodeApiBuilderExt`:
+
+```rust,ignore
+let mut runtime = otter_runtime::Runtime::builder()
+    .with_node_apis()
+    .build()?;
+```
+
+The Node crate registers both `node:` and bare CommonJS aliases. Current
+ecosystem-facing modules include `fs`, `path`, `url`, `util`, `util/types`,
+`tty`, `events`, `buffer`, `os`, `querystring`, timers, streams, crypto, and
+zlib. `node:url` supports WHATWG constructors plus file-URL conversion in
+CommonJS; `pathToFileURL` and `fileURLToPath` are also named ESM exports.
+`node:tty` deliberately exposes deterministic non-TTY streams and does not
+open or inspect host descriptors.
+
+The pure `path`, `url`, `util`, and TTY-shape helpers require no capability.
+Resource modules still enforce deny-by-default capabilities at their native
+Rust boundary (`fs` for paths and `child_process` for subprocesses).
+
 `otter:kv` and `otter:sql` have module-graph tests that import the module
 specifier and execute the exported native functions.

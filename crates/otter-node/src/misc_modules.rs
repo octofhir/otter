@@ -9,6 +9,7 @@ const MODULE_SHIM: &str = include_str!("module_builtin.js");
 const CLUSTER_SHIM: &str = include_str!("cluster.js");
 const INTERNAL_UTIL_SHIM: &str = include_str!("internal_util.js");
 const VM_SHIM: &str = include_str!("vm.js");
+const INTERNAL_URL_SHIM: &str = "'use strict'; module.exports = { isURL(value) { return typeof URL !== 'undefined' && value instanceof URL; } };";
 
 /// `internal/event_target` (exposed under `--expose-internals`) — re-exports the
 /// `Event` / `EventTarget` / `CustomEvent` globals (installed by the Web API
@@ -81,6 +82,14 @@ pub fn internal_util_cjs_value(
 /// `node:vm` — best-effort in-realm sandbox (with-scoped Proxy).
 pub fn vm_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
     otter_runtime::run_builtin_cjs_shim(ctx, "node:vm", VM_SHIM, &[])
+}
+
+/// `internal/url` brand predicate used by Node's own URL tests.
+pub fn internal_url_cjs_value(
+    ctx: &mut NativeCtx<'_>,
+    _caps: &CapabilitySet,
+) -> Result<Value, String> {
+    otter_runtime::run_builtin_cjs_shim(ctx, "internal/url", INTERNAL_URL_SHIM, &[])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

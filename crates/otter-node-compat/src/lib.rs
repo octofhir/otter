@@ -296,6 +296,11 @@ fn run_one_test(
         // when it detects them; otter is a different engine and rejects those
         // flags, so disable the flag-reexec path.
         .env("NODE_SKIP_FLAG_CHECK", "1")
+        // Color-control variables are test inputs in the official util/TTY
+        // suite. Host shell preferences must not leak into its clean baseline.
+        .env_remove("NO_COLOR")
+        .env_remove("NODE_DISABLE_COLORS")
+        .env_remove("FORCE_COLOR")
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     configure_watchdog_process_group(&mut command);

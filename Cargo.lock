@@ -2466,6 +2466,7 @@ dependencies = [
  "flate2",
  "getrandom 0.3.4",
  "globset",
+ "idna",
  "libc",
  "md-5",
  "otter-gc",

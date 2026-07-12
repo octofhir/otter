@@ -603,6 +603,29 @@ impl<'rt> NativeCtx<'rt> {
             .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "construct"))
     }
 
+    /// Test whether `value` is an instance of `constructor` using the VM's
+    /// ordinary `instanceof` semantics and the active execution context.
+    ///
+    /// Native platform adapters use this for branded arguments such as URL
+    /// objects instead of accepting arbitrary duck-typed host objects.
+    pub fn is_instance_of(
+        &mut self,
+        value: Value,
+        constructor: Value,
+    ) -> Result<bool, NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "instanceof",
+                reason: "missing execution context".to_string(),
+            })?;
+        self.cx
+            .interp
+            .ordinary_has_instance(&context, &constructor, &value)
+            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "instanceof"))
+    }
+
     /// Resolve a `globalThis.<name>` value (e.g. a constructor) for native use.
     #[must_use]
     pub fn global_value(&self, name: &str) -> Option<Value> {

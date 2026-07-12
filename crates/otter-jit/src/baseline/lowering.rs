@@ -50,6 +50,19 @@ pub(crate) struct DestinationOperands {
     pub(crate) dst: u16,
 }
 
+/// Typed source register for return-like operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SourceOperands {
+    pub(crate) src: u16,
+}
+
+/// Typed destination plus constant-pool index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConstantOperands {
+    pub(crate) dst: u16,
+    pub(crate) constant: u32,
+}
+
 /// Typed immediate load operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LoadInt32Operands {
@@ -80,6 +93,31 @@ pub(crate) struct BinaryOperands {
     pub(crate) rhs: u16,
 }
 
+/// Typed element-load operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ElementLoadOperands {
+    pub(crate) dst: u16,
+    pub(crate) receiver: u16,
+    pub(crate) index: u16,
+}
+
+/// Typed element-store operands including the bytecode scratch slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ElementStoreOperands {
+    pub(crate) receiver: u16,
+    pub(crate) index: u16,
+    pub(crate) value: u16,
+    pub(crate) scratch: u16,
+}
+
+/// Typed update-expression operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IncrementOperands {
+    pub(crate) dst: u16,
+    pub(crate) src: u16,
+    pub(crate) delta: i32,
+}
+
 /// Canonical control-flow target resolved to a verified logical PC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BranchOperands {
@@ -97,10 +135,15 @@ pub(crate) struct ConditionalBranchOperands {
 enum LoweredOperands {
     Raw,
     Destination(DestinationOperands),
+    Source(SourceOperands),
+    Constant(ConstantOperands),
     LoadInt32(LoadInt32Operands),
     Local(LocalOperands),
     Unary(UnaryOperands),
     Binary(BinaryOperands),
+    ElementLoad(ElementLoadOperands),
+    ElementStore(ElementStoreOperands),
+    Increment(IncrementOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
 }
@@ -119,6 +162,20 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Destination(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered destination operands")),
+        }
+    }
+
+    pub(crate) fn source_operands(self) -> Result<SourceOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Source(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered source operands")),
+        }
+    }
+
+    pub(crate) fn constant_operands(self) -> Result<ConstantOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Constant(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered constant operands")),
         }
     }
 
@@ -150,6 +207,27 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn element_load_operands(self) -> Result<ElementLoadOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ElementLoad(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered element-load operands")),
+        }
+    }
+
+    pub(crate) fn element_store_operands(self) -> Result<ElementStoreOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ElementStore(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered element-store operands")),
+        }
+    }
+
+    pub(crate) fn increment_operands(self) -> Result<IncrementOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Increment(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered increment operands")),
+        }
+    }
+
     pub(crate) fn branch_operands(self) -> Result<BranchOperands, Unsupported> {
         match self.operands {
             LoweredOperands::Branch(operands) => Ok(operands),
@@ -171,10 +249,13 @@ impl LoweredInstr {
     pub(crate) fn written_register(self) -> Option<u16> {
         match self.operands {
             LoweredOperands::Destination(operands) => Some(operands.dst),
+            LoweredOperands::Constant(operands) => Some(operands.dst),
             LoweredOperands::LoadInt32(operands) => Some(operands.dst),
             LoweredOperands::Local(operands) if self.op == Op::LoadLocal => Some(operands.value),
             LoweredOperands::Unary(operands) => Some(operands.dst),
             LoweredOperands::Binary(operands) => Some(operands.dst),
+            LoweredOperands::ElementLoad(operands) => Some(operands.dst),
+            LoweredOperands::Increment(operands) => Some(operands.dst),
             _ => None,
         }
     }
@@ -229,6 +310,21 @@ impl BaselinePlan {
 
             let operands = instr.operand_view(code_block);
             let operands = match op {
+                Op::MakeFunction | Op::MakeClosure if instr.make_self => {
+                    LoweredOperands::Destination(DestinationOperands {
+                        dst: reg(operands, 0)?,
+                    })
+                }
+                Op::NewObject | Op::LoadThis => LoweredOperands::Destination(DestinationOperands {
+                    dst: reg(operands, 0)?,
+                }),
+                Op::MakeFunction | Op::LoadString => LoweredOperands::Constant(ConstantOperands {
+                    dst: reg(operands, 0)?,
+                    constant: const_index(operands, 1)?,
+                }),
+                Op::Return | Op::ReturnValue => LoweredOperands::Source(SourceOperands {
+                    src: reg(operands, 0)?,
+                }),
                 Op::LoadInt32 => LoweredOperands::LoadInt32(LoadInt32Operands {
                     dst: reg(operands, 0)?,
                     value: imm32(operands, 1)?,
@@ -251,6 +347,22 @@ impl BaselinePlan {
                         src: reg(operands, 1)?,
                     })
                 }
+                Op::Increment => LoweredOperands::Increment(IncrementOperands {
+                    dst: reg(operands, 0)?,
+                    src: reg(operands, 1)?,
+                    delta: imm32(operands, 2)?,
+                }),
+                Op::LoadElement => LoweredOperands::ElementLoad(ElementLoadOperands {
+                    dst: reg(operands, 0)?,
+                    receiver: reg(operands, 1)?,
+                    index: reg(operands, 2)?,
+                }),
+                Op::StoreElement => LoweredOperands::ElementStore(ElementStoreOperands {
+                    receiver: reg(operands, 0)?,
+                    index: reg(operands, 1)?,
+                    value: reg(operands, 2)?,
+                    scratch: reg(operands, 3)?,
+                }),
                 Op::Add
                 | Op::Sub
                 | Op::Mul

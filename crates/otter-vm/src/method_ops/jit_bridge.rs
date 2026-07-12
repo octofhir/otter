@@ -5,7 +5,7 @@
 
 use smallvec::SmallVec;
 
-use super::{CollectionMethodCallIc, MethodCallIc};
+use super::MethodCallIc;
 use crate::holt_stack::HoltStack;
 use crate::native_abi::RuntimeStubId;
 use crate::{Interpreter, Value, VmError, read_register, write_register};
@@ -357,67 +357,6 @@ impl Interpreter {
             alloc_stub_id: stub_id,
             safepoint_id,
             value_arg_count: 3,
-        })
-    }
-
-    pub(crate) fn clear_jit_collection_method_ic(&mut self, site: usize) {
-        if let Some(slot) = self.jit_collection_method_ics.get_mut(site) {
-            *slot = crate::jit::JitCollectionMethodIcSlot::EMPTY;
-        }
-    }
-
-    pub(crate) fn publish_jit_collection_method_ic(
-        &mut self,
-        site: usize,
-        ic: CollectionMethodCallIc,
-    ) {
-        let slot = self
-            .jit_collection_method_ic_slot(ic)
-            .unwrap_or(crate::jit::JitCollectionMethodIcSlot::EMPTY);
-        if let Some(dst) = self.jit_collection_method_ics.get_mut(site) {
-            *dst = slot;
-        }
-    }
-
-    pub(crate) fn jit_collection_method_ic_slot(
-        &self,
-        ic: CollectionMethodCallIc,
-    ) -> Option<crate::jit::JitCollectionMethodIcSlot> {
-        let (proto, receiver_type_tag) = if ic.op.is_map() {
-            (
-                self.realm_intrinsics.map_prototype?,
-                crate::collections::MAP_BODY_TYPE_TAG,
-            )
-        } else {
-            (
-                self.realm_intrinsics.set_prototype?,
-                crate::collections::SET_BODY_TYPE_TAG,
-            )
-        };
-        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
-            return None;
-        }
-        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
-        if !ic.op.matches_builtin(method, &self.gc_heap) {
-            return None;
-        }
-        let builtin_fn_addr = method
-            .as_native_function()
-            .and_then(|native| native.jit_static_fn_addr(&self.gc_heap))?;
-        Some(crate::jit::JitCollectionMethodIcSlot {
-            state: crate::jit::JIT_COLLECTION_METHOD_IC_COLLECTION,
-            receiver_type_tag,
-            reserved0: 0,
-            proto_offset: proto.offset(),
-            proto_shape: crate::object::shape(proto, &self.gc_heap).offset(),
-            method_value_byte: u32::from(ic.proto_slot) * std::mem::size_of::<Value>() as u32,
-            leaf_stub_id: ic
-                .leaf_stub_id
-                .unwrap_or(crate::jit::JIT_COLLECTION_METHOD_IC_NO_STUB),
-            alloc_stub_id: ic
-                .alloc_stub_id
-                .unwrap_or(crate::jit::JIT_COLLECTION_METHOD_IC_NO_STUB),
-            builtin_fn_addr,
         })
     }
 }

@@ -83,14 +83,6 @@ pub(crate) struct JitCtx {
     /// read through this pointer at the store site, not at entry, because a
     /// re-entered VM call can invalidate the protector before later stores.
     pub(super) array_index_accessor_protector_ptr: *const bool,
-    /// Base of the VM-published live collection method IC slots.
-    pub(super) collection_method_ics: *const otter_vm::JitCollectionMethodIcSlot,
-    /// Number of live collection method IC slots.
-    pub(super) collection_method_ic_count: u32,
-    /// Base of the VM-published flat direct-method inline-link table (indexed by
-    /// IC site). Baseline code reads a slot to build the callee window and
-    /// branch to a compiled method with no Rust bridge.
-    pub(super) direct_method_inline: *const otter_vm::JitDirectMethodInline,
     /// Opaque heap pointer for native leaf runtime stubs.
     pub(super) gc_heap: *const std::ffi::c_void,
     /// Address of the cooperative interrupt flag's backing byte. Compiled code
@@ -154,48 +146,6 @@ pub(crate) const SYNC_REENTRY_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, sync_reentry_limit) as u32;
 pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
-pub(crate) const COLLECTION_METHOD_ICS_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, collection_method_ics) as u32;
-pub(crate) const COLLECTION_METHOD_IC_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, collection_method_ic_count) as u32;
-pub(crate) const COLLECTION_METHOD_IC_SLOT_SIZE: u32 =
-    std::mem::size_of::<otter_vm::JitCollectionMethodIcSlot>() as u32;
-/// Byte offset of [`JitCtx::direct_method_inline`] (the direct-method link table
-/// base) and the flat slot layout baseline code reads.
-pub(crate) const DIRECT_METHOD_INLINE_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_method_inline) as u32;
-pub(crate) const DIRECT_METHOD_INLINE_SLOT_SIZE: u32 =
-    std::mem::size_of::<otter_vm::JitDirectMethodInline>() as u32;
-pub(crate) const DIRECT_METHOD_ENTRY_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, entry_addr) as u32;
-pub(crate) const DIRECT_METHOD_REGISTER_COUNT_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, register_count) as u32;
-pub(crate) const DIRECT_METHOD_RECV_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, recv_shape_offset) as u32;
-pub(crate) const DIRECT_METHOD_PROTO_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, proto_shape_offset) as u32;
-pub(crate) const DIRECT_METHOD_ON_RECEIVER_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_on_receiver) as u32;
-pub(crate) const DIRECT_METHOD_VALUE_BYTE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_value_byte) as u32;
-pub(crate) const DIRECT_METHOD_FID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitDirectMethodInline, method_fid) as u32;
-pub(crate) const COLLECTION_METHOD_IC_STATE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, state) as u32;
-pub(crate) const COLLECTION_METHOD_IC_RECEIVER_TYPE_TAG_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, receiver_type_tag) as u32;
-pub(crate) const COLLECTION_METHOD_IC_PROTO_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, proto_offset) as u32;
-pub(crate) const COLLECTION_METHOD_IC_PROTO_SHAPE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, proto_shape) as u32;
-pub(crate) const COLLECTION_METHOD_IC_METHOD_VALUE_BYTE_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, method_value_byte) as u32;
-pub(crate) const COLLECTION_METHOD_IC_LEAF_STUB_ID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, leaf_stub_id) as u32;
-pub(crate) const COLLECTION_METHOD_IC_ALLOC_STUB_ID_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, alloc_stub_id) as u32;
-pub(crate) const COLLECTION_METHOD_IC_BUILTIN_FN_ADDR_OFFSET: u32 =
-    std::mem::offset_of!(otter_vm::JitCollectionMethodIcSlot, builtin_fn_addr) as u32;
 #[allow(dead_code)]
 pub(crate) const GC_HEAP_OFFSET: u32 = std::mem::offset_of!(JitCtx, gc_heap) as u32;
 pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =

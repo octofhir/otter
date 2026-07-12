@@ -541,30 +541,15 @@ impl Interpreter {
         })
     }
 
-    /// Drop only the cached direct-method ways whose callee is `fid`, and re-mirror
-    /// the flat table for the sites they occupied. A recompile/invalidation of one
+    /// Drop only the cached direct-method ways whose callee is `fid`. A
+    /// recompile/invalidation of one
     /// function only invalidates the entries that point at *its* code (stale entry
     /// address); wiping the whole cache instead makes a call site with churning
     /// receiver feedback re-resolve and re-install every call (the cache is cleared
     /// out from under it before it can be hit).
     pub(crate) fn clear_jit_direct_method_cache_for_fid(&mut self, fid: u32) {
-        for site_idx in 0..self.jit_direct_method_cache.len() {
-            let set = &mut self.jit_direct_method_cache[site_idx];
-            let before = set.len();
+        for set in &mut self.jit_direct_method_cache {
             set.retain(|c| c.function_id != fid);
-            if set.len() == before {
-                continue;
-            }
-            let base = site_idx * MAX_DIRECT_METHOD_WAYS;
-            for way in 0..MAX_DIRECT_METHOD_WAYS {
-                let value = self.jit_direct_method_cache[site_idx]
-                    .get(way)
-                    .map(|c| c.inline)
-                    .unwrap_or(JitDirectMethodInline::EMPTY);
-                if let Some(flat) = self.jit_direct_method_inline_slots.get_mut(base + way) {
-                    *flat = value;
-                }
-            }
         }
     }
 
@@ -837,28 +822,8 @@ impl Interpreter {
         method: Value,
         function_id: u32,
         code: std::sync::Arc<dyn jit::JitFunctionCode>,
-        entry_addr: usize,
-        register_count: u32,
-        // `true` when the callee allocates no OWN upvalue cells
-        // (`own_upvalue_count == 0`): the callee's spine is exactly its captured
-        // spine, so the emitted call can pass a closure's live spine (or the
-        // baked plain-fn value) verbatim without the bridge's
-        // `build_upvalues_for_exec`. A callee that builds own cells stays on the
-        // bridge.
-        frameless_upvalues_ok: bool,
     ) {
-        // A closure method is eligible for the bridge-free asm flat-table link
-        // (machine-code callee window + branch to the compiled entry, no VM frame
-        // build) only when the compiled body itself is sound to run frameless:
-        // every op addresses registers through the window, never through
-        // `JitCtx.frame_index` (which would name the compiled *caller's* frame).
-        // On top of that, a closure method must build no own upvalue cells — the
-        // emitted call reads its captured spine LIVE from the resolved closure
-        // body. A bare function has no spine constraint.
         let method_is_plain_function = method == Value::function(function_id);
-        let asm_link_eligible = code.frameless_entry_safe()
-            && code.safepoint_count() == 0
-            && (method_is_plain_function || frameless_upvalues_ok);
         // A closure method only caches at a monomorphic site. A polymorphic receiver
         // family (one `arr[i].run()` site over sibling classes) exposes no single
         // stable own/direct-prototype stub to cache, so the shape-walk loop below
@@ -925,48 +890,6 @@ impl Interpreter {
             }
         }
         if let Some(hit) = cached_hit {
-            // Derive the inline-link fields from the already-resolved hit (no
-            // second shape walk): the receiver-shape guard, the prototype-shape
-            // guard and method-slot byte offset for the identity walk, plus the
-            // callee entry / window / SELF / upvalue-spine the emitted call needs.
-            let cv = std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-            // A dictionary-mode shape handle is null (compressed offset 0) —
-            // the same value every dictionary-mode object stores in its shape
-            // field — so an inline guard baked from it would match any
-            // dictionary receiver and trust a slot offset that is not
-            // shape-stable. Such a hit keeps the bridge path.
-            let shapes_guardable = match &hit {
-                JitDirectMethodHit::Own(h) => !h.shape.is_null(),
-                JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
-                    !object::shape(obj, &self.gc_heap).is_null() && !prototype_hit.shape.is_null()
-                }
-            };
-            let inline = if !asm_link_eligible || !shapes_guardable {
-                JitDirectMethodInline::EMPTY
-            } else {
-                match &hit {
-                    JitDirectMethodHit::Own(h) => JitDirectMethodInline {
-                        entry_addr,
-                        register_count,
-                        recv_shape_offset: h.shape.offset(),
-                        proto_shape_offset: 0,
-                        method_on_receiver: 1,
-                        method_value_byte: u32::from(h.slot) * cv,
-                        method_fid: function_id,
-                    },
-                    JitDirectMethodHit::DirectPrototype { prototype_hit, .. } => {
-                        JitDirectMethodInline {
-                            entry_addr,
-                            register_count,
-                            recv_shape_offset: object::shape(obj, &self.gc_heap).offset(),
-                            proto_shape_offset: prototype_hit.shape.offset(),
-                            method_on_receiver: 0,
-                            method_value_byte: u32::from(prototype_hit.slot) * cv,
-                            method_fid: function_id,
-                        }
-                    }
-                }
-            };
             let new_shape = match &hit {
                 JitDirectMethodHit::Own(h) => h.shape_id,
                 JitDirectMethodHit::DirectPrototype {
@@ -979,7 +902,6 @@ impl Interpreter {
                     function_id,
                     method_value: method,
                     code,
-                    inline,
                 };
                 // Replace a same-receiver-shape entry (method reassigned) in place;
                 // otherwise append while the site stays within the way budget.
@@ -996,19 +918,6 @@ impl Interpreter {
                     Some(i) => set[i] = entry,
                     None if set.len() < MAX_DIRECT_METHOD_WAYS => set.push(entry),
                     None => {}
-                }
-                // Mirror every cached way into the flat table the JIT walks.
-                let base = site * MAX_DIRECT_METHOD_WAYS;
-                for way in 0..MAX_DIRECT_METHOD_WAYS {
-                    let value = self
-                        .jit_direct_method_cache
-                        .get(site)
-                        .and_then(|s| s.get(way))
-                        .map(|c| c.inline)
-                        .unwrap_or(JitDirectMethodInline::EMPTY);
-                    if let Some(flat) = self.jit_direct_method_inline_slots.get_mut(base + way) {
-                        *flat = value;
-                    }
                 }
             }
         }
@@ -1119,22 +1028,7 @@ impl Interpreter {
         let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
-        // Frameless closure eligibility: (1) builds no own upvalue cells, so its
-        // captured spine passes verbatim (no `build_upvalues_for_exec`), and
-        // (2) is a leaf — a non-leaf callee's nested call would read a
-        // `JitCtx.frame_index` frame the frameless callee does not own.
-        let frameless_upvalues_ok = function.own_upvalue_count == 0 && function.is_leaf;
-        self.install_jit_direct_method_cache(
-            site,
-            obj,
-            key,
-            method,
-            function_id,
-            code.clone(),
-            plan.entry_addr,
-            u32::from(plan.register_count),
-            frameless_upvalues_ok,
-        );
+        self.install_jit_direct_method_cache(site, obj, key, method, function_id, code.clone());
 
         self.enter_sync_reentry()?;
         match self.prepare_jit_direct_call_frame(
@@ -1230,54 +1124,6 @@ impl Interpreter {
             Value::undefined(),
             window,
         );
-        frame.pc = bail_pc;
-        let initial_stack_len = stack.len();
-        stack.push(frame);
-        let result = self.dispatch_loop(context, stack);
-        while stack.len() > initial_stack_len {
-            if let Some(mut frame) = stack.pop() {
-                self.frame_release_cold(&mut frame);
-                self.reclaim_registers(&mut frame);
-            }
-        }
-        result
-    }
-
-    /// Rebuild and run the interpreter frame for a bridge-free *direct-method*
-    /// callee that bailed out of its compiled entry. Unlike
-    /// [`Self::jit_self_call_bail`] the callee is a different function from the
-    /// compiled caller, so the caller frame names the wrong body: the frame is
-    /// rebuilt from the method value itself (`callee`, the inline link's SELF
-    /// bits — a closure carrying fid + captured spine, or a bare interned
-    /// function) with the receiver the inline path bound as `this`. The window
-    /// was built on the flat register stack by emitted code and becomes the
-    /// active frame window exactly like the self-call path.
-    pub fn jit_direct_method_call_bail(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut HoltStack,
-        bail_pc: u32,
-        regcount: usize,
-        callee: Value,
-        this: Value,
-    ) -> Result<Value, VmError> {
-        let window = self.register_stack.top_window(regcount)?;
-
-        let (fid, upvalues) = match callee.as_closure(&self.gc_heap) {
-            Some(c) => (
-                c.function_id(),
-                self.gc_heap
-                    .read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice()),
-            ),
-            None => (
-                callee.as_function().ok_or(VmError::InvalidOperand)?,
-                Vec::new().into_boxed_slice(),
-            ),
-        };
-        self.note_jit_entry_bail(fid);
-        let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
-        let mut frame =
-            Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this, window);
         frame.pc = bail_pc;
         let initial_stack_len = stack.len();
         stack.push(frame);

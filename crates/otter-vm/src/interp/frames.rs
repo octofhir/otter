@@ -201,33 +201,6 @@ impl Interpreter {
         std::ptr::addr_of!(self.gc_heap).cast::<std::ffi::c_void>()
     }
 
-    /// Base of the JIT-readable live collection method IC table.
-    ///
-    /// The pointer is stable until the table grows. Compiled entries must read
-    /// the pointer from `JitCtx` for each entry/reentry, not retain it outside
-    /// the dynamic compiled-call extent.
-    pub fn jit_collection_method_ics_ptr(&self) -> *const jit::JitCollectionMethodIcSlot {
-        self.jit_collection_method_ics.as_ptr()
-    }
-
-    /// Number of slots starting at [`Self::jit_collection_method_ics_ptr`].
-    pub fn jit_collection_method_ics_len(&self) -> u32 {
-        self.jit_collection_method_ics.len() as u32
-    }
-
-    /// Base of the flat direct-method inline-link table. Baseline code reads
-    /// a slot by IC site to build the callee window and branch with no bridge; the
-    /// pointer is refreshed into `JitCtx` on every entry/reentry because the table
-    /// can grow (reallocate).
-    pub fn jit_direct_method_inline_ptr(&self) -> *const JitDirectMethodInline {
-        self.jit_direct_method_inline_slots.as_ptr()
-    }
-
-    /// Number of slots starting at [`Self::jit_direct_method_inline_ptr`].
-    pub fn jit_direct_method_inline_len(&self) -> u32 {
-        self.jit_direct_method_inline_slots.len() as u32
-    }
-
     /// Capacity of the flat JIT register stack in slots — the overflow bound
     /// compiled code checks before reserving a callee window.
     #[must_use]

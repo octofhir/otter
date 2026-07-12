@@ -198,10 +198,10 @@ pub use holt_stack::HoltStack;
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
-    JitCollectionLayout, JitCollectionLeafMethod, JitCollectionMethodIcSlot, JitCompileError,
-    JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
-    JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
-    JitPrimitiveMethodGuard, JitStringLayout, JitTypedArrayLayout, VmRuntimeActivation,
+    JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
+    JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFunctionCode,
+    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPrimitiveMethodGuard,
+    JitStringLayout, JitTypedArrayLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -634,9 +634,6 @@ struct JitDirectMethodCache {
     /// re-resolves rather than reading a dangling pointer.
     method_value: Value,
     code: std::sync::Arc<dyn jit::JitFunctionCode>,
-    /// Inline-link fields for this shape, mirrored into the flat per-way table the
-    /// baseline tier walks to take the bridge-free call.
-    inline: JitDirectMethodInline,
 }
 
 impl JitDirectMethodCache {
@@ -656,43 +653,6 @@ impl JitDirectMethodCache {
 /// four task classes) keeps every observed shape so each call hits the cache
 /// instead of re-resolving the method every time.
 const MAX_DIRECT_METHOD_WAYS: usize = jit::JIT_DIRECT_METHOD_WAYS;
-
-/// Inline-readable direct-method-call link, mirroring the collection-method IC:
-/// baseline code guards the receiver shape, then builds the callee window
-/// and branches to `entry_addr` with no bridge.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct JitDirectMethodInline {
-    /// Compiled callee entry address (non-OSR body). `0` marks an empty/invalid
-    /// slot: the inline guard bails to the bridge.
-    pub entry_addr: usize,
-    /// Callee register-window length.
-    pub register_count: u32,
-    /// Receiver shape compressed offset the inline guard compares against (own
-    /// method → receiver's shape; prototype method → receiver's shape).
-    pub recv_shape_offset: u32,
-    /// Prototype shape compressed offset for a prototype-method identity walk.
-    pub proto_shape_offset: u32,
-    /// `1` when the method slot is an own property on the receiver.
-    pub method_on_receiver: u32,
-    /// Byte offset of the method slot in the (proto or receiver) value slab.
-    pub method_value_byte: u32,
-    /// Expected method function id the identity walk compares against.
-    pub method_fid: u32,
-}
-
-impl JitDirectMethodInline {
-    /// An empty slot: `entry_addr == 0` so the inline guard falls to the bridge.
-    pub const EMPTY: Self = Self {
-        entry_addr: 0,
-        register_count: 0,
-        recv_shape_offset: 0,
-        proto_shape_offset: 0,
-        method_on_receiver: 0,
-        method_value_byte: 0,
-        method_fid: 0,
-    };
-}
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
@@ -923,11 +883,6 @@ pub struct Interpreter {
     /// by a prototype shape + slot-identity guard. See
     /// [`method_ops::MethodCallIc`].
     method_call_ics: Vec<Option<method_ops::MethodCallIc>>,
-    /// JIT-readable C-layout mirror for live collection method IC entries,
-    /// keyed by the same dense executable IC site id as [`Self::method_call_ics`].
-    /// Non-collection and empty entries are represented as
-    /// [`jit::JitCollectionMethodIcSlot::EMPTY`].
-    jit_collection_method_ics: Vec<jit::JitCollectionMethodIcSlot>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
     /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
@@ -1013,12 +968,6 @@ pub struct Interpreter {
     /// the same shape/slot metadata as the load IC and re-reads the method value
     /// before entry, so overwriting a method slot falls back to full resolution.
     jit_direct_method_cache: Vec<Vec<JitDirectMethodCache>>,
-    /// Flat, `#[repr(C)]` inline-readable mirror of the direct-method cache,
-    /// indexed by IC site. The optimizing tier reads a slot directly from compiled
-    /// code (base pointer in `JitCtx`) to build the callee window and branch with
-    /// no Rust bridge; `entry_addr == 0` marks an empty/invalid slot. Kept in sync
-    /// with `jit_direct_method_cache` (populated together, cleared together).
-    jit_direct_method_inline_slots: Vec<JitDirectMethodInline>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
     /// Pool of reservation-stable [`HoltStack`]s reused for synchronous callable

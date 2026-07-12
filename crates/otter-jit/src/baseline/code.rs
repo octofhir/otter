@@ -250,9 +250,6 @@ pub(crate) unsafe fn enter_compiled(
         let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
         let array_index_accessor_protector_ptr =
             unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
-        let collection_method_ics = unsafe { (*vm).jit_collection_method_ics_ptr() };
-        let collection_method_ic_count = unsafe { (*vm).jit_collection_method_ics_len() };
-        let direct_method_inline = unsafe { (*vm).jit_direct_method_inline_ptr() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
@@ -319,9 +316,6 @@ pub(crate) unsafe fn enter_compiled(
             sync_reentry_depth_ptr,
             sync_reentry_limit,
             array_index_accessor_protector_ptr,
-            collection_method_ics,
-            collection_method_ic_count,
-            direct_method_inline,
             gc_heap,
             interrupt_flag,
             backedge_fuel,

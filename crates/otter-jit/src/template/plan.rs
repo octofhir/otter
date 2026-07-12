@@ -221,8 +221,11 @@ pub(crate) enum TemplateOp {
         argc: u16,
         packed_args: u64,
     },
-    /// `r<dst> = r<receiver>.name(args…)` through the collection-method IC
-    /// and the direct-method prepare transition.
+    /// `r<dst> = r<receiver>.name(args…)` through the guarded collection
+    /// fast paths, the collection-method IC, and the direct-method prepare
+    /// transition. `byte_pc` keys the snapshot's per-site collection-method
+    /// metadata; `arg0`/`arg1` are the first argument registers for the
+    /// guarded typed-entry calls.
     MethodCall {
         dst: u16,
         receiver: u16,
@@ -230,6 +233,9 @@ pub(crate) enum TemplateOp {
         site: u64,
         argc: u16,
         packed_args: u64,
+        byte_pc: u32,
+        arg0: Option<u16>,
+        arg1: Option<u16>,
     },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
@@ -587,6 +593,9 @@ impl TemplatePlan {
                         site,
                         argc: arguments.len() as u16,
                         packed_args: pack_method_arg_regs(arguments),
+                        byte_pc: lowered.byte_pc,
+                        arg0: arguments.first().copied(),
+                        arg1: arguments.get(1).copied(),
                     }
                 }
                 Op::LessThan

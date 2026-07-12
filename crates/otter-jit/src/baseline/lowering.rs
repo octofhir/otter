@@ -14,6 +14,8 @@
 //! - [`super::arm64`], the first machine-code consumer of these rules.
 
 use otter_bytecode::{Op, Operand};
+use otter_vm::JitCompileSnapshot;
+use std::collections::BTreeSet;
 
 /// Largest argument count the `Call` emitter inlines.
 pub(crate) const MAX_INLINE_ARGS: usize = 4;
@@ -39,6 +41,78 @@ pub enum Unsupported {
     RegisterRange(u16),
     /// A call with more arguments than baseline lowering inlines.
     ArgCount(usize),
+}
+
+/// Backend-neutral facts established before machine-code emission starts.
+///
+/// Keeping this pass allocation-light makes it suitable for every future
+/// baseline backend while ensuring the assembler never discovers malformed
+/// control flow after it has already emitted part of a function.
+pub(crate) struct BaselinePlan {
+    pub(crate) instruction_pcs: Vec<u32>,
+    pub(crate) enable_float_residency: bool,
+    pub(crate) load_property_count: usize,
+    pub(crate) store_property_count: usize,
+}
+
+impl BaselinePlan {
+    pub(crate) fn build(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
+        let code_block = view.code_block.as_ref();
+        let mut instruction_pcs = Vec::with_capacity(view.instructions.len());
+        let mut boundaries = BTreeSet::new();
+        let mut enable_float_residency = false;
+        let mut load_property_count = 0;
+        let mut store_property_count = 0;
+
+        for instr in &view.instructions {
+            let op = instr.op(code_block);
+            let pc = instr.instruction_pc(code_block);
+            if !boundaries.insert(pc) {
+                return Err(Unsupported::OperandShape("duplicate instruction pc"));
+            }
+            instruction_pcs.push(pc);
+
+            match op {
+                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally => {
+                    return Err(Unsupported::Opcode(op));
+                }
+                Op::Div => enable_float_residency = true,
+                Op::LoadProperty => load_property_count += 1,
+                Op::StoreProperty => store_property_count += 1,
+                Op::CallMethodValue => {
+                    if let Some(argc) = instr.const_index(code_block, 3)
+                        && argc as usize > MAX_METHOD_ARGS
+                    {
+                        return Err(Unsupported::ArgCount(argc as usize));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for instr in &view.instructions {
+            if matches!(
+                instr.op(code_block),
+                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
+            ) {
+                let rel = imm32(instr.operand_view(code_block), 0)?;
+                let target = branch_target(code_block, instr, rel);
+                let valid = u32::try_from(target)
+                    .ok()
+                    .is_some_and(|pc| boundaries.contains(&pc));
+                if !valid {
+                    return Err(Unsupported::BranchTarget(target));
+                }
+            }
+        }
+
+        Ok(Self {
+            instruction_pcs,
+            enable_float_residency,
+            load_property_count,
+            store_property_count,
+        })
+    }
 }
 
 /// Pack method-call argument register indices into one word.

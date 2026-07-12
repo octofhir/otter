@@ -70,8 +70,6 @@ impl Interpreter {
         let mut view = context.jit_compile_snapshot(fid)?;
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
-        self.bake_property_feedback(&mut view);
-        self.bake_object_literals(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid);
         self.bake_collection_leaf_methods(&mut view);
         self.bake_collection_alloc_methods(&mut view);
@@ -174,331 +172,24 @@ impl Interpreter {
         view.cage_base = otter_gc::cage_base() as usize;
     }
 
-    /// Copy JIT-readable property IC cases into the compile snapshot. Own-data
-    /// loads/stores bake as receiver-shape slot accesses; a single direct
-    /// prototype data load bakes as receiver/prototype shape guards plus the
-    /// prototype slot. Megamorphic, accessor, dictionary, mixed, and deeper
-    /// prototype sites stay empty and lower through the property bridge.
-    pub(crate) fn bake_property_feedback(&self, view: &mut jit::JitCompileSnapshot) {
-        // Byte size of one compressed slot — a `hit.slot` index scales by this to
-        // the value's byte offset inside the object's value slab.
+    /// Read a monomorphic own-data case directly from the shared interpreter PIC.
+    fn monomorphic_own_property_feedback(&self, op: Op, site: usize) -> Option<(u32, u32)> {
         const SLOT_BYTES: u32 =
             std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-        let code_block = std::sync::Arc::clone(&view.code_block);
-        for instr in &mut view.instructions {
-            let Some(site) = instr.property_ic_site(&code_block) else {
-                continue;
-            };
-            // Collect every entry's own-data `(shape_offset, slot_byte)` case, or
-            // `None` if any entry is not an own-data hit (a prototype / accessor /
-            // transition stub the guard chain cannot represent) — in which case the
-            // whole site is left uncached for the tier. A dictionary-mode hit
-            // carries a null shape handle; its compressed offset is 0, which is
-            // also what every dictionary-mode object stores in its shape field, so
-            // baking it would produce a guard that matches *any* dictionary object
-            // and an inline slot access against a layout that is not
-            // shape-stable. Such a hit disqualifies the whole site.
-            let jit_hit = |hit: crate::object::AtomOwnPropertyHit| {
-                (!hit.shape.is_null())
-                    .then_some((hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
-            };
-            let cases: Option<Vec<(u32, u32)>> = match instr.op(&code_block) {
-                otter_bytecode::Op::LoadProperty => self.load_property_ics.get(site).map(|e| {
-                    e.entries()
-                        .iter()
-                        .map(|stub| stub.own_data_hit().and_then(jit_hit))
-                        .collect::<Option<Vec<_>>>()
-                }),
-                otter_bytecode::Op::StoreProperty => self.store_property_ics.get(site).map(|e| {
-                    e.entries()
-                        .iter()
-                        .map(|stub| stub.store_own_data_hit().and_then(jit_hit))
-                        .collect::<Option<Vec<_>>>()
-                }),
-                _ => None,
-            }
-            .flatten();
-
-            // One own-data shape → the monomorphic guard the tier already lowers.
-            // 2..=cap own-data shapes → the polymorphic guard chain. Beyond the cap
-            // (or a non-own-data mix) both stay empty and the site keeps the
-            // interpreter IC.
-            match cases.as_deref() {
-                Some([one]) => {
-                    instr.property_feedback = Some(*one);
-                    instr.property_feedback_poly = Vec::new();
-                    instr.property_proto_feedback = None;
-                }
-                Some(many) if (2..=MAX_POLY_PROPERTY_CASES).contains(&many.len()) => {
-                    instr.property_feedback = None;
-                    instr.property_feedback_poly = many.to_vec();
-                    instr.property_proto_feedback = None;
-                }
-                _ => {
-                    instr.property_feedback = None;
-                    instr.property_feedback_poly = Vec::new();
-                    instr.property_proto_feedback = None;
-                }
-            }
-
-            if !matches!(instr.op(&code_block), otter_bytecode::Op::LoadProperty)
-                || instr.property_feedback.is_some()
-                || !instr.property_feedback_poly.is_empty()
-            {
-                continue;
-            }
-
-            let proto_cases = self.load_property_ics.get(site).map(|e| {
-                e.entries()
-                    .iter()
-                    .map(|stub| {
-                        stub.direct_prototype_load_jit()
-                            .and_then(|(recv_shape, hit)| {
-                                // Same null-shape rule as the own-data cases above:
-                                // a dictionary-mode receiver or holder cannot be
-                                // shape-guarded, so it disqualifies the site.
-                                (!recv_shape.is_null() && !hit.shape.is_null()).then_some((
-                                    recv_shape.offset(),
-                                    hit.shape.offset(),
-                                    u32::from(hit.slot) * SLOT_BYTES,
-                                ))
-                            })
-                    })
-                    .collect::<Option<Vec<_>>>()
-            });
-            if let Some(Some(proto_cases)) = proto_cases
-                && let [one] = proto_cases.as_slice()
-            {
-                instr.property_proto_feedback = Some(*one);
-            }
-        }
-    }
-
-    /// Replay an object literal's shape transitions from the empty root,
-    /// returning the hidden class the literal's object ends up in after its
-    /// `keys` are defined in order with default data attributes — the same
-    /// transitions `set_property` performs at construction time. `None` if any
-    /// transition fails to allocate.
-    pub(crate) fn shape_after_keys(&mut self, keys: &[&str]) -> Option<object::ShapeHandle> {
-        let roots = self.collect_runtime_roots_without_shape_runtime();
-        let mut shape = self.shape_runtime.root();
-        let flags = object::PropertyFlags::data_default();
-        for &key in keys {
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-            };
-            shape = self
-                .shape_runtime
-                .child_with_roots(
-                    &mut self.gc_heap,
-                    shape,
-                    key,
-                    flags,
-                    false,
-                    &mut external_visit,
-                )
-                .ok()?;
-        }
-        Some(shape)
-    }
-
-    /// Bake object-literal allocation plans into `view`: for each `NewObject`
-    /// that begins a single-block run of `DefineDataProperty` with constant
-    /// string keys, record the literal's final hidden class (computed by
-    /// replaying its shape transitions) so the optimizing tier can allocate it in
-    /// one shaped allocation instead of per-property shape walks.
-    ///
-    /// A plan is recorded only for a literal that is provably the simple case:
-    /// every property is a distinct, non-`__proto__`, non-index string key whose
-    /// slot lands in definition order, the whole run is straight-line (no
-    /// branch), and there are at most four properties (the register-passed value
-    /// budget). Anything else is left unplanned and lowers on the baseline.
-    pub(crate) fn bake_object_literals(
-        &mut self,
-        view: &mut jit::JitCompileSnapshot,
-        context: &ExecutionContext,
-    ) {
-        use otter_bytecode::{Op, Operand};
-        const MAX_PROPS: usize = 4;
-        let code_block = std::sync::Arc::clone(&view.code_block);
-        let reg_op =
-            |instr: &jit::JitInstructionMetadata, i: usize| match instr.operand(&code_block, i) {
-                Some(Operand::Register(r)) => Some(r),
-                _ => None,
-            };
-        let const_op =
-            |instr: &jit::JitInstructionMetadata, i: usize| match instr.operand(&code_block, i) {
-                Some(Operand::ConstIndex(n)) => Some(n),
-                _ => None,
-            };
-        let uses_reg = |instr: &jit::JitInstructionMetadata, reg: u16| {
-            instr
-                .operand_view(&code_block)
-                .iter()
-                .any(|o| matches!(o, Operand::Register(r) if r == reg))
+        let entry = match op {
+            Op::LoadProperty => self.load_property_ics.get(site)?,
+            Op::StoreProperty => self.store_property_ics.get(site)?,
+            _ => return None,
         };
-
-        let fid = view.code_block.id;
-        let mut plans: Vec<(usize, jit::ObjectLiteralPlan)> = Vec::new();
-        let instrs = &view.instructions;
-        for i in 0..instrs.len() {
-            if instrs[i].op(&code_block) != Op::NewObject {
-                continue;
-            }
-            let Some(obj_reg) = reg_op(&instrs[i], 0) else {
-                continue;
-            };
-            let mut defines: Vec<jit::ObjectLiteralProp> = Vec::new();
-            let mut key_pcs: Vec<u32> = Vec::new();
-            let mut keys: Vec<String> = Vec::new();
-            let mut ok = true;
-            let mut j = i + 1;
-            while j < instrs.len() {
-                let instr = &instrs[j];
-                // A `__proto__`-free data property defined on this literal:
-                // `LoadString key` immediately followed by `DefineDataProperty
-                // obj, key, value`.
-                if instr.op(&code_block) == Op::DefineDataProperty
-                    && reg_op(instr, 0) == Some(obj_reg)
-                {
-                    let (Some(key_reg), Some(val_reg)) = (reg_op(instr, 1), reg_op(instr, 2))
-                    else {
-                        ok = false;
-                        break;
-                    };
-                    if j == 0 {
-                        ok = false;
-                        break;
-                    }
-                    let prev = &instrs[j - 1];
-                    if prev.op(&code_block) != Op::LoadString || reg_op(prev, 0) != Some(key_reg) {
-                        ok = false;
-                        break;
-                    }
-                    let Some(kidx) = const_op(prev, 1) else {
-                        ok = false;
-                        break;
-                    };
-                    let Some(key) = context.string_constant_str_for_function(fid, kidx) else {
-                        ok = false;
-                        break;
-                    };
-                    // `__proto__` mutates the prototype, not a slot, so its shape
-                    // does not match a replayed data transition. A duplicate key
-                    // would not advance the slot count. Both abort the plan.
-                    if key == "__proto__" || keys.iter().any(|k| k == key) {
-                        ok = false;
-                        break;
-                    }
-                    keys.push(key.to_string());
-                    defines.push(jit::ObjectLiteralProp {
-                        define_pc: instr.byte_pc,
-                        value_reg: val_reg,
-                    });
-                    key_pcs.push(prev.byte_pc);
-                    j += 1;
-                    continue;
-                }
-                // The literal ends when the object first escapes (is read), and a
-                // branch would split the run across blocks — neither is foldable.
-                if uses_reg(instr, obj_reg) {
-                    break;
-                }
-                if matches!(
-                    instr.op(&code_block),
-                    Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse
-                ) {
-                    ok = false;
-                    break;
-                }
-                j += 1;
-            }
-            if !ok || keys.is_empty() || keys.len() > MAX_PROPS {
-                continue;
-            }
-            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            let Some(shape) = self.shape_after_keys(&key_refs) else {
-                continue;
-            };
-            // The replayed shape must assign each key the slot matching its
-            // definition order, so the bulk slot-initializer fills values that
-            // line up with the literal's value list.
-            let mut valid = true;
-            for (idx, key) in key_refs.iter().enumerate() {
-                if self.shape_offset_of(shape, key) != Some(idx as u32) {
-                    valid = false;
-                    break;
-                }
-            }
-            if !valid {
-                continue;
-            }
-            plans.push((
-                i,
-                jit::ObjectLiteralPlan {
-                    obj_reg,
-                    shape_offset: shape.offset(),
-                    defines,
-                    key_pcs,
-                },
-            ));
-        }
-        for (i, plan) in plans {
-            view.instructions[i].object_literal = Some(plan);
-        }
-    }
-
-    /// JIT bridge: allocate an object literal directly in its baked final hidden
-    /// class for the optimizing tier's `AllocObjectLiteral`. `values_bits` are
-    /// the NaN-boxed property values in slot order (passed by value from compiled
-    /// code). The values are rooted across the allocation, then bulk-written into
-    /// the shaped object's slots (generational write barriers applied in
-    /// [`object::initialize_shaped_data_slots`]), and `%Object.prototype%` is
-    /// installed — matching the interpreter's per-property construction result.
-    ///
-    /// # Errors
-    /// Propagates allocation failure (heap-cap `RangeError` / cage exhaustion).
-    pub fn jit_runtime_alloc_object_literal(
-        &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
-        dst: u16,
-        shape_offset: u32,
-        values_bits: &[u64],
-    ) -> Result<(), VmError> {
-        // Decode the boxed values out of the transient JIT argument registers
-        // before any allocation can run a scavenge.
-        let values: smallvec::SmallVec<[Value; 4]> =
-            values_bits.iter().map(|&b| Value::from_bits(b)).collect();
-        // SAFETY: `shape_offset` is a compressed `Gc<ShapeBody>` offset baked from
-        // a live shape during compilation; shapes are interned for the isolate's
-        // life, so the offset still decompresses to that shape. The cage is
-        // initialised (we are executing JS).
-        let shape = unsafe { object::ShapeHandle::from_offset(shape_offset) };
-        let roots = self.collect_allocation_roots(stack);
-        let obj = {
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-                for value in values.iter() {
-                    value.trace_value_slots(visitor);
-                }
-            };
-            object::alloc_object_with_shape_roots(&mut self.gc_heap, shape, &mut external_visit)
-                .map_err(VmError::from)?
+        let [stub] = entry.entries() else {
+            return None;
         };
-        // The slow alloc path above may have scavenged; read the relocated realm
-        // prototype handle afterwards (mirrors `run_new_object_reg`).
-        if let Some(proto) = self.object_prototype_object_opt() {
-            object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        }
-        object::initialize_shaped_data_slots(obj, &mut self.gc_heap, &values);
-        let frame = &mut stack[frame_index];
-        write_register(frame, dst, Value::object(obj))?;
-        Ok(())
+        let hit = match op {
+            Op::LoadProperty => stub.own_data_hit()?,
+            Op::StoreProperty => stub.store_own_data_hit()?,
+            _ => unreachable!(),
+        };
+        (!hit.shape.is_null()).then_some((hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
     }
 
     /// Whether a method-call site's feedback has already saturated to
@@ -864,12 +555,7 @@ impl Interpreter {
         {
             return None;
         }
-        let mut method_view = context.jit_compile_snapshot(target.method_fid)?;
-        // Populate each body op's site feedback so the inliner can lower it: the
-        // property `(shape, slot)` for a non-receiver access, and the arithmetic /
-        // element-load kind so a body `|`/`&`/`x[i]` lowers to a typed node
-        // instead of declining on empty feedback.
-        self.bake_property_feedback(&mut method_view);
+        let method_view = context.jit_compile_snapshot(target.method_fid)?;
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
         // byte offset; bail out if any property is absent, an accessor, or spills
         // past the inline value capacity. A receiver property resolves against
@@ -900,7 +586,9 @@ impl Interpreter {
             // Not a receiver property: use the op's own monomorphic own-data site
             // feedback (shape offset, slot byte). Anything else — polymorphic,
             // prototype, accessor, or unobserved — is not inlinable.
-            let (shape_off, value_byte) = instr.property_feedback?;
+            let site = instr.property_ic_site(&method_view.code_block)?;
+            let (shape_off, value_byte) =
+                self.monomorphic_own_property_feedback(instr.op(&method_view.code_block), site)?;
             prop_offsets.insert(instr.byte_pc, value_byte);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }

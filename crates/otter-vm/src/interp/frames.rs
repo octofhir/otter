@@ -186,13 +186,6 @@ impl Interpreter {
             .min(crate::run_control::DEFAULT_MAX_SYNC_REENTRY_DEPTH)
     }
 
-    /// Address of the live array-index accessor protector. Compiled dense-array
-    /// stores read this on every store attempt because a VM call inside the same
-    /// compiled entry can invalidate the protector before a later store.
-    pub fn jit_array_index_accessor_protector_ptr(&mut self) -> *const bool {
-        &self.array_index_accessor_protector
-    }
-
     /// Opaque heap pointer for native leaf runtime stubs.
     ///
     /// Compiled code may pass this to `LeafNoAlloc` ABI entries only. Those

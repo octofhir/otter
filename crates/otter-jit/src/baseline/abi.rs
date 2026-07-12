@@ -68,23 +68,6 @@ pub(crate) struct JitCtx {
     /// adding the callee register count, and stores it back; the matching pop on
     /// return restores it.
     pub(super) reg_top_ptr: *mut usize,
-    /// Shared synchronous native-reentry depth counter.
-    pub(super) sync_reentry_depth_ptr: *mut u32,
-    /// Effective limit checked before a frameless native call mutates state.
-    pub(super) sync_reentry_limit: u32,
-    /// Address of the live array-index accessor protector. Dense array stores
-    /// read through this pointer at the store site, not at entry, because a
-    /// re-entered VM call can invalidate the protector before later stores.
-    pub(super) array_index_accessor_protector_ptr: *const bool,
-    /// Opaque heap pointer for native leaf runtime stubs.
-    pub(super) gc_heap: *const std::ffi::c_void,
-    /// Address of the cooperative interrupt flag's backing byte. Compiled code
-    /// polls this inline at every back-edge and re-enters only when it is set.
-    pub(super) interrupt_flag: *const u8,
-    /// Address of the VM's back-edge fuel counter. Compiled code decrements it
-    /// inline per back-edge and re-enters the poll stub when it reaches zero,
-    /// batching the budget checkpoint across the whole run of iterations.
-    pub(super) backedge_fuel: *mut u64,
 }
 
 impl JitCtx {
@@ -123,11 +106,19 @@ pub(crate) const NATIVE_FRAME_PC_OFFSET: u32 = (std::mem::offset_of!(NativeFrame
     as u32;
 pub(crate) const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, code_object_id) as u32;
-/// Byte offset of [`JitCtx::interrupt_flag`] — the inline back-edge interrupt poll.
-pub(crate) const INTERRUPT_FLAG_OFFSET: u32 = std::mem::offset_of!(JitCtx, interrupt_flag) as u32;
-/// Byte offset of [`JitCtx::backedge_fuel`] — the inline back-edge fuel counter.
-pub(crate) const BACKEDGE_FUEL_OFFSET: u32 = std::mem::offset_of!(JitCtx, backedge_fuel) as u32;
 pub(crate) const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
+/// Byte offsets of the isolate-published cells on [`VmThread`] read by
+/// emitted code: interrupt poll byte, back-edge fuel counter, leaf-stub heap
+/// pointer, and the synchronous-reentry depth/limit pair.
+pub(crate) const VM_THREAD_INTERRUPT_CELL_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, interrupt_cell) as u32;
+pub(crate) const VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, backedge_fuel_cell) as u32;
+pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, gc_heap) as u32;
+pub(crate) const VM_THREAD_SYNC_REENTRY_DEPTH_CELL_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, sync_reentry_depth_cell) as u32;
+pub(crate) const VM_THREAD_SYNC_REENTRY_LIMIT_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, sync_reentry_limit) as u32;
 /// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
 pub(crate) const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
 /// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
@@ -136,14 +127,6 @@ pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_s
 /// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
 /// `reg_top`, bumped to reserve a callee window and restored on return.
 pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
-pub(crate) const SYNC_REENTRY_DEPTH_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, sync_reentry_depth_ptr) as u32;
-pub(crate) const SYNC_REENTRY_LIMIT_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, sync_reentry_limit) as u32;
-pub(crate) const ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, array_index_accessor_protector_ptr) as u32;
-#[allow(dead_code)]
-pub(crate) const GC_HEAP_OFFSET: u32 = std::mem::offset_of!(JitCtx, gc_heap) as u32;
 pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, thread) as u32;
 pub(crate) const ALLOC_CTX_FRAME_OFFSET: u32 =

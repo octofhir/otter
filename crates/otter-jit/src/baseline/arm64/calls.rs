@@ -1314,19 +1314,9 @@ pub(super) fn emit_copy_shared_execution_context(ops: &mut Assembler) {
         ERROR_SLOT_OFFSET,
         REG_STACK_BASE_OFFSET,
         REG_TOP_PTR_OFFSET,
-        SYNC_REENTRY_DEPTH_PTR_OFFSET,
-        ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET,
-        GC_HEAP_OFFSET,
-        INTERRUPT_FLAG_OFFSET,
-        BACKEDGE_FUEL_OFFSET,
     ] {
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w9, [x20, SYNC_REENTRY_LIMIT_OFFSET]
-        ; str w9, [sp, SYNC_REENTRY_LIMIT_OFFSET]
-    );
 }
 
 /// Emit a self-recursive `Op::Call` inline, with no Rust frame-build bridge:
@@ -1389,9 +1379,10 @@ pub(super) fn emit_self_recursive_call(
         ; .arch aarch64
         ; cmp x13, x9
         ; b.hi =>bail
-        ; ldr x17, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+        ; ldr x16, [x20, THREAD_OFFSET]
+        ; ldr x17, [x16, VM_THREAD_SYNC_REENTRY_DEPTH_CELL_OFFSET]
         ; ldr w9, [x17]
-        ; ldr w10, [x20, SYNC_REENTRY_LIMIT_OFFSET]
+        ; ldr w10, [x16, VM_THREAD_SYNC_REENTRY_LIMIT_OFFSET]
         ; cmp w9, w10
         ; b.hs =>bail
         ; add w9, w9, #1
@@ -1454,7 +1445,8 @@ pub(super) fn emit_self_recursive_call(
         ; .arch aarch64
         ; sub x13, x13, x9
         ; str x13, [x12]
-        ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+        ; ldr x12, [x20, THREAD_OFFSET]
+        ; ldr x12, [x12, VM_THREAD_SYNC_REENTRY_DEPTH_CELL_OFFSET]
         ; ldr w13, [x12]
         ; sub w13, w13, #1
         ; str w13, [x12]
@@ -1472,7 +1464,8 @@ pub(super) fn emit_self_recursive_call(
         ; .arch aarch64
         ; sub x13, x13, x9
         ; str x13, [x12]
-        ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+        ; ldr x12, [x20, THREAD_OFFSET]
+        ; ldr x12, [x12, VM_THREAD_SYNC_REENTRY_DEPTH_CELL_OFFSET]
         ; ldr w13, [x12]
         ; sub w13, w13, #1
         ; str w13, [x12]
@@ -1498,7 +1491,8 @@ pub(super) fn emit_self_recursive_call(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; ldr x12, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
+        ; ldr x12, [x20, THREAD_OFFSET]
+        ; ldr x12, [x12, VM_THREAD_SYNC_REENTRY_DEPTH_CELL_OFFSET]
         ; ldr w13, [x12]
         ; sub w13, w13, #1
         ; str w13, [x12]
@@ -1596,18 +1590,6 @@ pub(crate) fn emit_direct_call_tail(
         ; str x9, [sp, REG_STACK_BASE_OFFSET]
         ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
         ; str x9, [sp, REG_TOP_PTR_OFFSET]
-        ; ldr x9, [x20, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; str x9, [sp, SYNC_REENTRY_DEPTH_PTR_OFFSET]
-        ; ldr w9, [x20, SYNC_REENTRY_LIMIT_OFFSET]
-        ; str w9, [sp, SYNC_REENTRY_LIMIT_OFFSET]
-        ; ldr x9, [x20, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
-        ; str x9, [sp, ARRAY_INDEX_ACCESSOR_PROTECTOR_PTR_OFFSET]
-        ; ldr x9, [x20, GC_HEAP_OFFSET]
-        ; str x9, [sp, GC_HEAP_OFFSET]
-        ; ldr x9, [x20, INTERRUPT_FLAG_OFFSET]
-        ; str x9, [sp, INTERRUPT_FLAG_OFFSET]
-        ; ldr x9, [x20, BACKEDGE_FUEL_OFFSET]
-        ; str x9, [sp, BACKEDGE_FUEL_OFFSET]
         ; mov x0, sp
     );
     emit_load_u64(ops, 16, jit_push_native_activation_stub as *const () as u64);
@@ -1714,7 +1696,8 @@ pub(super) fn emit_leaf_value2_stub_call(
 ) -> Result<(), Unsupported> {
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x0, [x20, GC_HEAP_OFFSET]
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
     );
     load_reg(ops, 1, recv)?;
     if let Some(key) = key {

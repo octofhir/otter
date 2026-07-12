@@ -280,8 +280,6 @@ pub(crate) unsafe fn enter_compiled(
         let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
         let sync_reentry_depth_ptr = unsafe { (*vm).jit_sync_reentry_depth_ptr() };
         let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
-        let array_index_accessor_protector_ptr =
-            unsafe { (*vm).jit_array_index_accessor_protector_ptr() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
@@ -329,6 +327,10 @@ pub(crate) unsafe fn enter_compiled(
         thread.runtime_stub_table = unsafe { (*vm).jit_runtime_stub_table_addr() };
         thread.code_registry = std::ptr::addr_of!(registry) as u64;
         thread.interrupt_cell = interrupt_flag as u64;
+        thread.gc_heap = gc_heap as u64;
+        thread.backedge_fuel_cell = backedge_fuel as u64;
+        thread.sync_reentry_depth_cell = sync_reentry_depth_ptr as u64;
+        thread.sync_reentry_limit = sync_reentry_limit;
         let mut error = None;
         let mut ctx = JitCtx {
             regs,
@@ -347,12 +349,6 @@ pub(crate) unsafe fn enter_compiled(
             direct_upvalues_ptr: 0,
             reg_stack_base,
             reg_top_ptr,
-            sync_reentry_depth_ptr,
-            sync_reentry_limit,
-            array_index_accessor_protector_ptr,
-            gc_heap,
-            interrupt_flag,
-            backedge_fuel,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.

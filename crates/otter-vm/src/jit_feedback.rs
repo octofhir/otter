@@ -27,7 +27,7 @@
 //!   payload. Older feedback remains sound through guards and deoptimization.
 //!
 //! # See also
-//! - [`crate::jit::JitInstructionMetadata`] — compile-time snapshot metadata.
+//! - [`crate::CodeBlock`] — owner of the live feedback vector.
 
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 

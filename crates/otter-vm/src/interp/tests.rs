@@ -5052,17 +5052,16 @@ fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
     num_site.record_arith(Value::number_i32(1), Value::number_f64(2.5));
     assert!(code_block.feedback_at(2).unwrap().widen_arith_to_float());
 
-    let view = code_block.jit_compile_snapshot();
     assert_eq!(
-        view.instructions[0].arith_feedback,
+        code_block.feedback_at(0).unwrap().arith_bits(),
         jit_feedback::ARITH_INT32
     );
     assert_eq!(
-        view.instructions[1].arith_feedback,
+        code_block.feedback_at(1).unwrap().arith_bits(),
         jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64
     );
     assert_eq!(
-        view.instructions[2].arith_feedback,
+        code_block.feedback_at(2).unwrap().arith_bits(),
         jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64
     );
 
@@ -5081,5 +5080,5 @@ fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
             ],
         )],
     );
-    assert_eq!(other.instructions[0].arith_feedback, 0);
+    assert_eq!(other.code_block.feedback_at(0).unwrap().arith_bits(), 0);
 }

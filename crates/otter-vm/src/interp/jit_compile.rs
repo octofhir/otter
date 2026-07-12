@@ -125,6 +125,11 @@ impl Interpreter {
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => {
                 self.jit_next_code_object_id += 1;
+                // Sweep before registering: every live use of a code object —
+                // an entered frame, a direct-call anchor, a map or cache slot —
+                // holds its own `Arc`, so only invalid code whose last anchor
+                // is the registry itself retires here.
+                self.jit_code_registry.retire_unreferenced();
                 self.jit_code_registry
                     .register(code_object_id, code.clone());
                 Some(code)
@@ -322,6 +327,7 @@ impl Interpreter {
         self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
         self.clear_jit_direct_method_cache_for_fid(fid);
+        self.jit_code_registry.invalidate_function(fid);
         self.jit_osr_code.retain(|&(f, _), _| f != fid);
         self.jit_osr_disabled.retain(|&(f, _)| f != fid);
         self.jit_osr_counts.retain(|&(f, _), _| f != fid);

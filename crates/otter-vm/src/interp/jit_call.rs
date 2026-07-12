@@ -358,6 +358,7 @@ impl Interpreter {
         self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
         self.clear_jit_direct_method_cache_for_fid(fid);
+        self.jit_code_registry.invalidate_function(fid);
         self.jit_osr_code
             .retain(|(entry_fid, _), _| *entry_fid != fid);
         self.jit_osr_disabled

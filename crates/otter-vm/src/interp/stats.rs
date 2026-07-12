@@ -114,7 +114,7 @@ impl Interpreter {
     /// checkpoint. This keeps timeout/budget semantics independent of whether a
     /// hot loop has OSR'd into native code.
     pub fn jit_backedge_poll(&mut self) -> Result<(), VmError> {
-        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_BACKEDGE_POLL);
+        self.record_jit_runtime_stub_class(native_abi::STUB_JIT_BACKEDGE_POLL.class);
         // The interrupt flag is polled inline at every back-edge, so reaching
         // this re-entry with the flag set means a cancellation is pending.
         if self.interrupt.is_set() {
@@ -144,7 +144,7 @@ impl Interpreter {
     }
 
     pub(crate) fn record_jit_runtime_property_stub(&mut self) {
-        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PROPERTY_FALLBACK);
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
         self.jit_runtime_stats.runtime_property_stubs = self
             .jit_runtime_stats
             .runtime_property_stubs
@@ -152,22 +152,19 @@ impl Interpreter {
     }
 
     pub(crate) fn record_jit_runtime_collection_method_ic_stub(&mut self) {
-        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_COLLECTION_METHOD_IC);
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
         self.jit_runtime_stats.runtime_collection_method_ic_stubs = self
             .jit_runtime_stats
             .runtime_collection_method_ic_stubs
             .saturating_add(1);
     }
 
-    pub(crate) fn record_jit_runtime_stub_descriptor(
-        &mut self,
-        desc: native_abi::RuntimeStubDescriptor,
-    ) {
+    pub(crate) fn record_jit_runtime_stub_class(&mut self, class: native_abi::RuntimeStubClass) {
         self.jit_runtime_stats.runtime_stub_transitions = self
             .jit_runtime_stats
             .runtime_stub_transitions
             .saturating_add(1);
-        match desc.class {
+        match class {
             native_abi::RuntimeStubClass::LeafNoAlloc => {
                 self.jit_runtime_stats.leaf_stub_transitions = self
                     .jit_runtime_stats

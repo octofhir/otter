@@ -59,6 +59,10 @@ impl BaselineJitCompiler {
 }
 
 impl otter_vm::JitCompilerHook for BaselineJitCompiler {
+    fn runtime_stub_bindings(&self) -> Vec<otter_vm::JitRuntimeStubBinding> {
+        baseline::runtime_stub_bindings()
+    }
+
     fn compile_function(
         &self,
         request: otter_vm::JitCompileRequest,

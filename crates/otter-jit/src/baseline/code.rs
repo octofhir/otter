@@ -324,6 +324,9 @@ pub(crate) unsafe fn enter_compiled(
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.runtime_context = std::ptr::addr_of!(activation) as u64;
+        // SAFETY: `vm` is a valid `*mut Interpreter` for this entry; the header
+        // and entry columns are isolate-owned and outlive every activation.
+        thread.runtime_stub_table = unsafe { (*vm).jit_runtime_stub_table_addr() };
         thread.code_registry = std::ptr::addr_of!(registry) as u64;
         thread.interrupt_cell = interrupt_flag as u64;
         let mut error = None;

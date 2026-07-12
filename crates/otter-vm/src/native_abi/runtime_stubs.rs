@@ -146,10 +146,11 @@ pub enum RuntimeStubException {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeStubResultAbi {
-    /// [`super::RuntimeStubResult`] C-layout record.
-    Full = 0,
     /// [`super::RuntimeStubResultPair`] two-register encoding.
-    StatusPair = 1,
+    StatusPair = 0,
+    /// Single status word; any value result is written through the call
+    /// packet or the published frame before the stub returns.
+    StatusWord = 1,
 }
 
 /// Machine-callable runtime-stub descriptor.
@@ -170,11 +171,11 @@ pub struct RuntimeStubDescriptor {
     pub exception: RuntimeStubException,
     /// Result encoding.
     pub result_abi: RuntimeStubResultAbi,
-    /// Reserved; zero in stub-table version 2.
+    /// Reserved; zero in version 1.
     pub reserved: u8,
     /// Declared observable effects.
     pub effects: RuntimeStubEffects,
-    /// Reserved; zero in stub-table version 2.
+    /// Reserved; zero in version 1.
     pub reserved2: u16,
 }
 
@@ -205,7 +206,7 @@ const fn descriptor(
     }
 }
 
-/// Fixed C-layout header for the process-local runtime-stub table.
+/// Fixed C-layout header for one isolate-owned runtime-stub table.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeStubTable {
@@ -220,7 +221,7 @@ pub struct RuntimeStubTable {
 }
 
 impl RuntimeStubTable {
-    /// Construct a table header for already-owned process-local arrays.
+    /// Construct a table header for an already-owned stable entry array.
     #[must_use]
     pub const fn new(entries_address: u64, descriptors_address: u64, count: u32) -> Self {
         Self {
@@ -244,11 +245,11 @@ pub struct RuntimeStubAllocContext {
     pub code_object_id: u64,
     /// Dense safepoint id within the code object.
     pub safepoint_id: SafepointId,
-    /// Reserved; zero in layout version 2.
+    /// Reserved; zero in version 1.
     pub reserved0: u32,
     /// Number of native spill slots.
     pub spill_slot_count: u16,
-    /// Reserved; zero in layout version 2.
+    /// Reserved; zero in version 1.
     pub reserved1: u16,
     /// Base of tagged native spill slots.
     pub spill_slots: *mut u64,
@@ -307,79 +308,49 @@ impl RuntimeStubAllocContext {
     }
 }
 
-/// VM-published collection/method inline-cache probe and refresh operation.
-pub const STUB_JIT_COLLECTION_METHOD_IC: RuntimeStubDescriptor = descriptor(
-    1,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::Full,
-);
-/// Direct compiled method-call frame preparation.
-pub const STUB_JIT_PREPARE_DIRECT_METHOD_CALL: RuntimeStubDescriptor = descriptor(
-    2,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::Full,
-);
-/// Compiled property runtime fallback bucket.
-pub const STUB_JIT_PROPERTY_FALLBACK: RuntimeStubDescriptor = descriptor(
-    3,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::Full,
-);
 /// Leaf compiled-loop backedge poll.
 pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = descriptor(
-    4,
+    1,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::Poll1,
     1,
     RuntimeStubEffects::none(),
     RuntimeStubException::Never,
-    RuntimeStubResultAbi::Full,
+    RuntimeStubResultAbi::StatusWord,
 );
 /// Leaf `Map.prototype.get` probe.
 pub const STUB_COLLECTION_MAP_GET_LEAF: RuntimeStubDescriptor = descriptor(
-    5,
+    2,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
     RuntimeStubEffects::none(),
     RuntimeStubException::Never,
-    RuntimeStubResultAbi::Full,
+    RuntimeStubResultAbi::StatusPair,
 );
 /// Leaf `Map.prototype.has` probe.
 pub const STUB_COLLECTION_MAP_HAS_LEAF: RuntimeStubDescriptor = descriptor(
-    6,
+    3,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
     RuntimeStubEffects::none(),
     RuntimeStubException::Never,
-    RuntimeStubResultAbi::Full,
+    RuntimeStubResultAbi::StatusPair,
 );
 /// Leaf `Set.prototype.has` probe.
 pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = descriptor(
-    7,
+    4,
     RuntimeStubClass::LeafNoAlloc,
     RuntimeStubSignature::LeafValue2,
     2,
     RuntimeStubEffects::none(),
     RuntimeStubException::Never,
-    RuntimeStubResultAbi::Full,
+    RuntimeStubResultAbi::StatusPair,
 );
 /// Allocating `Map.prototype.set` mutation.
 pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = descriptor(
-    8,
+    5,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -389,7 +360,7 @@ pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating `Set.prototype.add` mutation.
 pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = descriptor(
-    9,
+    6,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -399,7 +370,7 @@ pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating `Map.prototype.get` lookup.
 pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = descriptor(
-    10,
+    7,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -409,7 +380,7 @@ pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating `Map.prototype.has` lookup.
 pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = descriptor(
-    11,
+    8,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -419,7 +390,7 @@ pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating `Set.prototype.has` lookup.
 pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = descriptor(
-    12,
+    9,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -429,7 +400,7 @@ pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating `Map.prototype.delete` mutation.
 pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = descriptor(
-    13,
+    10,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -439,7 +410,7 @@ pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating `Set.prototype.delete` mutation.
 pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = descriptor(
-    14,
+    11,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -449,7 +420,7 @@ pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 /// Allocating primitive string-concat operation.
 pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = descriptor(
-    15,
+    12,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::AllocValue3,
     3,
@@ -462,30 +433,24 @@ pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = descriptor(
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
     match id {
-        1 => "jit_collection_method_ic",
-        2 => "jit_prepare_direct_method_call",
-        3 => "jit_property_fallback",
-        4 => "jit_backedge_poll",
-        5 => "collection_map_get_leaf",
-        6 => "collection_map_has_leaf",
-        7 => "collection_set_has_leaf",
-        8 => "collection_map_set_alloc",
-        9 => "collection_set_add_alloc",
-        10 => "collection_map_get_alloc",
-        11 => "collection_map_has_alloc",
-        12 => "collection_set_has_alloc",
-        13 => "collection_map_delete_alloc",
-        14 => "collection_set_delete_alloc",
-        15 => "string_concat_alloc",
+        1 => "jit_backedge_poll",
+        2 => "collection_map_get_leaf",
+        3 => "collection_map_has_leaf",
+        4 => "collection_set_has_leaf",
+        5 => "collection_map_set_alloc",
+        6 => "collection_set_add_alloc",
+        7 => "collection_map_get_alloc",
+        8 => "collection_map_has_alloc",
+        9 => "collection_set_has_alloc",
+        10 => "collection_map_delete_alloc",
+        11 => "collection_set_delete_alloc",
+        12 => "string_concat_alloc",
         _ => "unknown_runtime_stub",
     }
 }
 
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
-    STUB_JIT_COLLECTION_METHOD_IC,
-    STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
-    STUB_JIT_PROPERTY_FALLBACK,
     STUB_JIT_BACKEDGE_POLL,
     STUB_COLLECTION_MAP_GET_LEAF,
     STUB_COLLECTION_MAP_HAS_LEAF,
@@ -510,10 +475,12 @@ pub const fn validate_stub_descriptor(
     let throwing_matches = desc.effects.contains(RuntimeStubEffects::MAY_THROW)
         == matches!(desc.exception, RuntimeStubException::Status);
     let result_matches = match desc.signature {
-        RuntimeStubSignature::AllocValue3 => {
+        RuntimeStubSignature::LeafValue2 | RuntimeStubSignature::AllocValue3 => {
             matches!(desc.result_abi, RuntimeStubResultAbi::StatusPair)
         }
-        _ => matches!(desc.result_abi, RuntimeStubResultAbi::Full),
+        RuntimeStubSignature::Poll1 | RuntimeStubSignature::Variadic => {
+            matches!(desc.result_abi, RuntimeStubResultAbi::StatusWord)
+        }
     };
     if !throwing_matches || !result_matches || desc.reserved != 0 || desc.reserved2 != 0 {
         return false;
@@ -592,11 +559,6 @@ mod tests {
             NO_SAFEPOINT
         ));
         assert!(validate_stub_descriptor(STUB_COLLECTION_MAP_SET_ALLOC, 7));
-        assert!(!validate_stub_descriptor(
-            STUB_JIT_COLLECTION_METHOD_IC,
-            NO_SAFEPOINT
-        ));
-        assert!(validate_stub_descriptor(STUB_JIT_COLLECTION_METHOD_IC, 7));
     }
 
     #[test]

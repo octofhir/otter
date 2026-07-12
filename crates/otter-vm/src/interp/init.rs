@@ -147,6 +147,16 @@ impl Interpreter {
         drop(global_scope);
         drop(error_scope);
         drop(well_known_scope);
+        // VM-owned phase of the isolate runtime-stub table. JIT-owned slots
+        // stay vacant until explicit compiler-hook installation.
+        let jit_runtime_stub_entries = crate::runtime_stubs::vm_runtime_stub_entries();
+        let jit_runtime_stub_machine_entries =
+            crate::runtime_stubs::machine_stub_entries(&jit_runtime_stub_entries);
+        let jit_runtime_stub_table = crate::native_abi::RuntimeStubTable::new(
+            jit_runtime_stub_machine_entries.as_ptr() as u64,
+            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.as_ptr() as u64,
+            jit_runtime_stub_machine_entries.len() as u32,
+        );
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
@@ -208,6 +218,9 @@ impl Interpreter {
             jit_direct_code_anchors: Vec::new(),
             jit_direct_method_cache: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
+            jit_runtime_stub_entries,
+            jit_runtime_stub_machine_entries,
+            jit_runtime_stub_table,
             holt_pool: Vec::new(),
             register_stack: register_stack::RegisterStack::new(),
             jit_native_activations: vec![
@@ -795,8 +808,69 @@ impl Interpreter {
     /// `None` keeps interpreter-only behavior. A hook returning
     /// [`JitCompileStatus::Unavailable`] or [`JitCompileStatus::Unsupported`]
     /// must also leave execution on the interpreter fallback path.
+    ///
+    /// Installation is the second phase of the isolate runtime-stub table:
+    /// VM-owned entries are rebuilt, then every JIT-owned transition binding is
+    /// validated against the descriptor inventory (dense id, matching signature
+    /// family, nonzero entry, vacant slot) and installed. With a hook present
+    /// no slot may stay vacant; a bad binding fails here, never at a call.
     pub fn set_jit_compiler(&mut self, hook: Option<std::sync::Arc<dyn jit::JitCompilerHook>>) {
+        let mut entries = crate::runtime_stubs::vm_runtime_stub_entries();
+        if let Some(compiler) = &hook {
+            for binding in compiler.runtime_stub_bindings() {
+                let index = binding
+                    .id
+                    .checked_sub(1)
+                    .map(|index| index as usize)
+                    .expect("JIT runtime-stub id is 1-based");
+                let descriptor = crate::native_abi::RUNTIME_STUB_DESCRIPTORS
+                    .get(index)
+                    .expect("JIT runtime-stub id names a VM descriptor");
+                assert_eq!(descriptor.id, binding.id);
+                assert_eq!(
+                    descriptor.signature, binding.signature,
+                    "JIT runtime-stub binding {} declares the descriptor signature family",
+                    binding.id
+                );
+                assert_ne!(binding.entry_addr, 0);
+                assert!(
+                    matches!(
+                        entries[index],
+                        crate::runtime_stubs::RuntimeStubEntry::Vacant
+                    ),
+                    "JIT runtime-stub binding {} may only fill a JIT-owned slot",
+                    binding.id
+                );
+                entries[index] = crate::runtime_stubs::RuntimeStubEntry::JitOwned {
+                    signature: binding.signature,
+                    entry_addr: binding.entry_addr,
+                };
+            }
+            for (index, entry) in entries.iter().enumerate() {
+                assert!(
+                    !matches!(entry, crate::runtime_stubs::RuntimeStubEntry::Vacant),
+                    "runtime stub {} left vacant after JIT installation",
+                    index + 1
+                );
+            }
+        }
+        self.jit_runtime_stub_entries = entries;
+        self.jit_runtime_stub_machine_entries =
+            crate::runtime_stubs::machine_stub_entries(&self.jit_runtime_stub_entries);
+        self.jit_runtime_stub_table = crate::native_abi::RuntimeStubTable::new(
+            self.jit_runtime_stub_machine_entries.as_ptr() as u64,
+            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.as_ptr() as u64,
+            self.jit_runtime_stub_machine_entries.len() as u32,
+        );
         self.jit_hook = hook;
+    }
+
+    /// Address of the published C-layout header over the isolate-owned
+    /// machine entry column. The header and both columns live as long as the
+    /// interpreter and are replaced only by [`Self::set_jit_compiler`].
+    #[must_use]
+    pub fn jit_runtime_stub_table_addr(&self) -> u64 {
+        std::ptr::from_ref(&self.jit_runtime_stub_table) as u64
     }
 
     /// `true` when a JIT compiler hook has been installed.

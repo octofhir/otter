@@ -77,7 +77,7 @@ pub enum TaggedLocationKind {
 pub struct TaggedLocation {
     /// Storage class.
     pub kind: TaggedLocationKind,
-    /// Reserved; zero in layout version 2.
+    /// Reserved; zero in version 1.
     pub reserved: u8,
     /// Register, frame-slot, or spill-slot index.
     pub index: u16,
@@ -139,7 +139,7 @@ pub struct SpillMap {
     pub location_offset: u32,
     /// Number of tagged spill locations.
     pub location_count: u16,
-    /// Reserved; zero in layout version 2.
+    /// Reserved; zero in version 1.
     pub reserved: u16,
 }
 
@@ -161,7 +161,7 @@ pub struct SafepointEntry {
     pub frame_state_id: FrameStateId,
     /// Runtime stub invoked at this return PC.
     pub stub_id: RuntimeStubId,
-    /// Reserved; zero in layout version 2.
+    /// Reserved; zero in version 1.
     pub reserved: u32,
 }
 

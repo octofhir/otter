@@ -167,7 +167,7 @@ pub struct NativeFrame {
     pub cold_state_index: u32,
     /// Number of argument slots.
     pub argument_count: u16,
-    /// Reserved; zero in layout version 3.
+    /// Reserved; zero in version 1.
     pub reserved0: u16,
     /// Dense feedback-vector identity.
     pub feedback_id: u32,

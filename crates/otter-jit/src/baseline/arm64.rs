@@ -40,8 +40,8 @@ use super::{
     jit_pop_native_activation_stub, jit_prepare_direct_method_call_stub,
     jit_push_native_activation_stub, jit_self_call_bail_stub, jit_store_element_stub,
     jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
-    jit_write_barrier_stub, jit_write_barrier_window_stub, leaf_no_alloc_stub2_trampoline_pair,
-    local_index, otter_jit_math_random, pack_method_arg_regs, reg, reg_offset, reg3, value_tag,
+    jit_write_barrier_stub, jit_write_barrier_window_stub, local_index, otter_jit_math_random,
+    pack_method_arg_regs, reg, reg_offset, reg3, value_tag,
 };
 use crate::CompiledCode;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -49,7 +49,7 @@ use otter_vm::Interpreter;
 use otter_vm::{
     JitCollectionAllocMethod, JitCollectionLeafMethod, JitCompileSnapshot, JitInlineCallee,
     JitInlineMethod, STUB_COLLECTION_SET_ADD_ALLOC, STUB_STRING_CONCAT_ALLOC, SafepointId,
-    runtime_stubs::alloc_value_stub_by_id,
+    runtime_stubs::{alloc_value_stub_by_id, leaf_no_alloc_stub2_by_id},
 };
 use std::collections::BTreeMap;
 

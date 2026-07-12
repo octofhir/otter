@@ -18,11 +18,11 @@
 //! - [`super::frame::NativeFrame`] for the active code-object id.
 
 /// Native VM ABI layout version.
-pub const VM_LAYOUT_VERSION: u32 = 4;
+pub const VM_LAYOUT_VERSION: u32 = 1;
 /// Runtime-stub table version.
-pub const RUNTIME_STUB_TABLE_VERSION: u32 = 2;
+pub const RUNTIME_STUB_TABLE_VERSION: u32 = 1;
 /// Code-object metadata layout version.
-pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 2;
+pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 1;
 /// Reproducible build identity for transient native code.
 pub const VM_BUILD_VERSION: u64 = 0x4f54_5445_525f_0003;
 
@@ -36,7 +36,7 @@ pub struct LayoutVersionRecord {
     pub runtime_stubs: u32,
     /// Code-object metadata layout.
     pub code_object: u32,
-    /// Reserved; zero in version 2.
+    /// Reserved; zero in version 1.
     pub reserved: u32,
 }
 
@@ -80,7 +80,7 @@ pub struct CodeObjectMetadata {
     pub spill_map_count: u32,
     /// Number of validity dependencies.
     pub dependency_count: u32,
-    /// Reserved; zero in layout version 1.
+    /// Reserved; zero in version 1.
     pub reserved: u32,
     /// Required native-layout versions.
     pub layout: LayoutVersionRecord,
@@ -128,7 +128,7 @@ pub enum CodeDependencyKind {
 pub struct CodeDependency {
     /// Dependency family.
     pub kind: CodeDependencyKind,
-    /// Reserved flags; zero in layout version 2.
+    /// Reserved flags; zero in version 1.
     pub flags: u16,
     /// Isolate-local stable identity.
     pub identity: u32,

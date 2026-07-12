@@ -1,19 +1,24 @@
-//! VM-native runtime stub entrypoints.
+//! VM-native runtime stub entrypoints and the isolate-owned entry table.
 //!
-//! These functions are the reusable implementation layer behind
-//! [`crate::native_abi`] descriptors. The current interpreter can call them
-//! directly, and generated code can later call the same entrypoints instead of
-//! reimplementing equivalent fast paths.
+//! These functions are the machine-callable implementation layer behind
+//! [`crate::native_abi`] descriptors. The interpreter calls them directly and
+//! generated code calls the same entrypoints, resolved by descriptor id at
+//! compile time.
 //!
 //! # Contents
 //! - Leaf/no-allocation collection probes for `Map.get`, `Map.has`, and
 //!   `Set.has`.
-//! - Allocating collection mutation ABI descriptors for `Map.set` and
-//!   `Set.add`.
+//! - Allocating collection mutation and string-concat entries.
+//! - [`RuntimeStubEntry`] — the typed per-signature-family entry table built
+//!   in two phases: VM-owned entries at interpreter construction, JIT-owned
+//!   transitions at [`crate::Interpreter::set_jit_compiler`].
 //!
 //! # Invariants
 //! - Arguments are boxed [`crate::Value`] raw ABI bits.
-//! - Results are returned as [`crate::native_abi::RuntimeStubResult`].
+//! - Machine results use the two-register
+//!   [`crate::native_abi::RuntimeStubResultPair`] encoding; Rust-facing
+//!   helpers expose [`crate::native_abi::RuntimeStubResult`].
+//! - Signature families are never mixed behind one untyped address array.
 //! - `LeafNoAlloc` stubs must not allocate, trigger GC, call JS, flatten
 //!   strings, or mutate heap state.
 //! - `Alloc` stubs must publish their current safepoint roots before any
@@ -39,8 +44,11 @@ use std::cell::UnsafeCell;
 ///
 /// The heap pointer is opaque to generated code. It must name the current
 /// isolate heap and must remain valid for the duration of the call. The callee
-/// must not allocate, trigger GC, or retain the pointer.
-pub type LeafNoAllocStub2Fn = extern "C" fn(*const otter_gc::GcHeap, u64, u64) -> RuntimeStubResult;
+/// must not allocate, trigger GC, or retain the pointer. The result is the
+/// two-register [`RuntimeStubResultPair`] encoding, so generated code never
+/// needs a memory-returned record for a leaf probe.
+pub type LeafNoAllocStub2Fn =
+    extern "C" fn(*const otter_gc::GcHeap, u64, u64) -> RuntimeStubResultPair;
 
 /// Callable leaf/no-allocation stub entry with its ABI descriptor.
 #[derive(Clone, Copy)]
@@ -73,7 +81,7 @@ impl LeafNoAllocStub2 {
         a0_bits: u64,
         a1_bits: u64,
     ) -> RuntimeStubResult {
-        (self.entry)(heap, a0_bits, a1_bits)
+        (self.entry)(heap, a0_bits, a1_bits).into_result()
     }
 }
 
@@ -466,13 +474,94 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
     }
 }
 
+/// One resolved isolate-owned runtime-stub entry.
+///
+/// The dense entry table mirrors [`crate::native_abi::RUNTIME_STUB_DESCRIPTORS`]
+/// by `id - 1`. Every entry is typed by its descriptor's signature family;
+/// signature families are never mixed behind one untyped address array.
+#[derive(Clone, Copy)]
+pub enum RuntimeStubEntry {
+    /// Slot reserved for a JIT-owned transition until compiler-hook install.
+    Vacant,
+    /// VM-owned `(heap, v0, v1) -> RuntimeStubResultPair` leaf probe.
+    LeafValue2(LeafNoAllocStub2Fn),
+    /// VM-owned allocating `(alloc_ctx, safepoint, recv, a0, a1) -> pair` entry.
+    AllocValue3(AllocValueStubFn),
+    /// JIT-owned transition. The installing compiler owns both the call-packet
+    /// layout of the descriptor-declared signature family and every call site,
+    /// so the pairing is validated at install and consistent by construction.
+    JitOwned {
+        /// Descriptor signature family declared by the installing compiler.
+        signature: crate::native_abi::RuntimeStubSignature,
+        /// Nonzero machine entry address.
+        entry_addr: usize,
+    },
+}
+
+impl RuntimeStubEntry {
+    /// Machine entry address for the published
+    /// [`crate::native_abi::RuntimeStubTable`]; zero for a vacant slot.
+    #[must_use]
+    pub fn machine_addr(self) -> u64 {
+        match self {
+            Self::Vacant => 0,
+            Self::LeafValue2(entry) => entry as usize as u64,
+            Self::AllocValue3(entry) => entry as usize as u64,
+            Self::JitOwned { entry_addr, .. } => entry_addr as u64,
+        }
+    }
+
+    /// Signature family this entry satisfies, or `None` while vacant.
+    #[must_use]
+    pub fn signature(self) -> Option<crate::native_abi::RuntimeStubSignature> {
+        match self {
+            Self::Vacant => None,
+            Self::LeafValue2(_) => Some(crate::native_abi::RuntimeStubSignature::LeafValue2),
+            Self::AllocValue3(_) => Some(crate::native_abi::RuntimeStubSignature::AllocValue3),
+            Self::JitOwned { signature, .. } => Some(signature),
+        }
+    }
+}
+
+/// Build the VM-owned phase of the isolate runtime-entry table.
+///
+/// JIT-owned transition slots stay [`RuntimeStubEntry::Vacant`] until explicit
+/// compiler-hook installation. No process-global storage or lazy
+/// synchronization is used.
+pub(crate) fn vm_runtime_stub_entries() -> Box<[RuntimeStubEntry]> {
+    crate::native_abi::RUNTIME_STUB_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            if let Some(stub) = leaf_no_alloc_stub2_by_id(descriptor.id) {
+                debug_assert!(stub.is_valid());
+                RuntimeStubEntry::LeafValue2(stub.entry)
+            } else if let Some(entry) = alloc_value_stub_by_id(descriptor.id).and_then(|s| s.entry)
+            {
+                RuntimeStubEntry::AllocValue3(entry)
+            } else {
+                RuntimeStubEntry::Vacant
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+/// Derive the machine-visible address column of an isolate entry table.
+pub(crate) fn machine_stub_entries(entries: &[RuntimeStubEntry]) -> Box<[u64]> {
+    entries
+        .iter()
+        .map(|entry| entry.machine_addr())
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 /// Invoke a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
 ///
-/// This is the reusable VM-side equivalent of the machine-code call sequence a
-/// native tier will eventually emit directly: resolve descriptor id, pass raw
-/// boxed value bits, receive a fixed [`RuntimeStubResult`]. It intentionally
-/// takes no root scope or safepoint because the descriptor class is
-/// `LeafNoAlloc`.
+/// Rust-facing dynamic-id dispatch over the static typed inventory, used by
+/// interpreter fast paths that carry a stub id in feedback. Generated code
+/// resolves the id at compile time instead and calls the typed entry directly.
+/// It intentionally takes no root scope or safepoint because the descriptor
+/// class is `LeafNoAlloc`.
 #[must_use]
 pub fn invoke_leaf_no_alloc_stub2(
     heap: &otter_gc::GcHeap,
@@ -480,58 +569,14 @@ pub fn invoke_leaf_no_alloc_stub2(
     a0: Value,
     a1: Value,
 ) -> RuntimeStubResult {
-    leaf_no_alloc_stub2_trampoline(
-        heap as *const otter_gc::GcHeap,
-        id,
-        a0.to_abi_bits(),
-        a1.to_abi_bits(),
-    )
-}
-
-/// Generic native trampoline for fixed two-argument leaf/no-allocation stubs.
-///
-/// Generated code can call this while it still carries a dynamic
-/// [`RuntimeStubId`] in feedback. A later codegen slice can resolve the id at
-/// compile time and call [`LeafNoAllocStub2::entry_addr`] directly.
-#[must_use]
-pub extern "C" fn leaf_no_alloc_stub2_trampoline(
-    heap: *const otter_gc::GcHeap,
-    id: RuntimeStubId,
-    a0_bits: u64,
-    a1_bits: u64,
-) -> RuntimeStubResult {
     let Some(stub) = leaf_no_alloc_stub2_by_id(id) else {
         return RuntimeStubResult::miss();
     };
-    stub.invoke_raw(heap, a0_bits, a1_bits)
-}
-
-/// Two-register result variant of [`leaf_no_alloc_stub2_trampoline`].
-#[must_use]
-pub extern "C" fn leaf_no_alloc_stub2_trampoline_pair(
-    heap: *const otter_gc::GcHeap,
-    id: RuntimeStubId,
-    a0_bits: u64,
-    a1_bits: u64,
-) -> RuntimeStubResultPair {
-    RuntimeStubResultPair::from_result(leaf_no_alloc_stub2_trampoline(heap, id, a0_bits, a1_bits))
-}
-
-/// Dynamic trampoline for fixed-value allocating runtime stubs.
-#[must_use]
-pub extern "C" fn alloc_value_stub_trampoline_pair(
-    ctx: *mut RuntimeStubAllocContext,
-    id: RuntimeStubId,
-    safepoint: SafepointId,
-    recv_bits: u64,
-    arg0_bits: u64,
-    arg1_bits: u64,
-) -> RuntimeStubResultPair {
-    let Some(stub) = alloc_value_stub_by_id(id) else {
-        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
-    };
-    stub.invoke_raw(ctx, safepoint, recv_bits, arg0_bits, arg1_bits)
-        .unwrap_or_else(|| RuntimeStubResultPair::from_result(RuntimeStubResult::miss()))
+    stub.invoke_raw(
+        heap as *const otter_gc::GcHeap,
+        a0.to_abi_bits(),
+        a1.to_abi_bits(),
+    )
 }
 
 fn alloc_value_stub_result_pair(
@@ -678,6 +723,14 @@ pub extern "C" fn collection_map_get_leaf(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_get_leaf_inner(heap, recv_bits, key_bits))
+}
+
+fn collection_map_get_leaf_inner(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    key_bits: u64,
 ) -> RuntimeStubResult {
     let Some(heap) = heap_ref(heap) else {
         return RuntimeStubResult::miss();
@@ -704,6 +757,14 @@ pub extern "C" fn collection_map_has_leaf(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_map_has_leaf_inner(heap, recv_bits, key_bits))
+}
+
+fn collection_map_has_leaf_inner(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    key_bits: u64,
 ) -> RuntimeStubResult {
     let Some(heap) = heap_ref(heap) else {
         return RuntimeStubResult::miss();
@@ -725,6 +786,14 @@ pub extern "C" fn collection_map_has_leaf(
 /// materialisation/flattening before a no-GC lookup is safe.
 #[must_use]
 pub extern "C" fn collection_set_has_leaf(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    key_bits: u64,
+) -> RuntimeStubResultPair {
+    RuntimeStubResultPair::from_result(collection_set_has_leaf_inner(heap, recv_bits, key_bits))
+}
+
+fn collection_set_has_leaf_inner(
     heap: *const otter_gc::GcHeap,
     recv_bits: u64,
     key_bits: u64,
@@ -1711,13 +1780,13 @@ mod tests {
         let key = crate::string::JsString::from_str("k", &mut heap).expect("key");
         collections::map_set(map, &mut heap, Value::string(key), n(42)).expect("set");
 
-        let result = collection_map_get_leaf(
+        let pair = collection_map_get_leaf(
             &heap as *const otter_gc::GcHeap,
             Value::map(map).to_abi_bits(),
             Value::string(key).to_abi_bits(),
         );
-        assert_eq!(result.status, RuntimeStubStatus::Ok);
-        assert_eq!(result.into_value(), Some(n(42)));
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        assert_eq!(pair.into_result().into_value(), Some(n(42)));
 
         let result = invoke_leaf_no_alloc_stub2(
             &heap,
@@ -1727,24 +1796,6 @@ mod tests {
         );
         assert_eq!(result.status, RuntimeStubStatus::Ok);
         assert_eq!(result.into_value(), Some(n(42)));
-
-        let result = leaf_no_alloc_stub2_trampoline(
-            &heap as *const otter_gc::GcHeap,
-            STUB_COLLECTION_MAP_GET_LEAF.id,
-            Value::map(map).to_abi_bits(),
-            Value::string(key).to_abi_bits(),
-        );
-        assert_eq!(result.status, RuntimeStubStatus::Ok);
-        assert_eq!(result.into_value(), Some(n(42)));
-
-        let pair = leaf_no_alloc_stub2_trampoline_pair(
-            &heap as *const otter_gc::GcHeap,
-            STUB_COLLECTION_MAP_GET_LEAF.id,
-            Value::map(map).to_abi_bits(),
-            Value::string(key).to_abi_bits(),
-        );
-        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
-        assert_eq!(pair.into_result().into_value(), Some(n(42)));
     }
 
     #[test]
@@ -1758,13 +1809,13 @@ mod tests {
             crate::string::JsString::from_str("1111111111111111", &mut heap).expect("right");
         let rope = crate::string::JsString::concat(left, right, &mut heap).expect("rope");
 
-        let result = collection_map_has_leaf(
+        let pair = collection_map_has_leaf(
             &heap as *const otter_gc::GcHeap,
             Value::map(map).to_abi_bits(),
             Value::string(rope).to_abi_bits(),
         );
-        assert_eq!(result.status, RuntimeStubStatus::Miss);
-        assert_eq!(result.into_value(), None);
+        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        assert_eq!(pair.into_result().into_value(), None);
     }
 
     #[test]
@@ -1836,7 +1887,7 @@ mod tests {
             Value::map(map).to_abi_bits(),
             Value::string(lookup_rope).to_abi_bits(),
         );
-        assert_eq!(leaf.status, RuntimeStubStatus::Miss);
+        assert_eq!(leaf.status(), RuntimeStubStatus::Miss);
 
         let mut map_slots = [
             Value::map(map).to_abi_bits(),
@@ -1893,23 +1944,133 @@ mod tests {
         let set = collections::alloc_set(&mut heap).expect("set");
         collections::set_add(set, &mut heap, n(7)).expect("add");
 
-        let result = collection_set_has_leaf(
+        let pair = collection_set_has_leaf(
             &heap as *const otter_gc::GcHeap,
             Value::set(set).to_abi_bits(),
             n(7).to_abi_bits(),
         );
-        assert_eq!(result.status, RuntimeStubStatus::Ok);
-        assert_eq!(result.into_value(), Some(Value::boolean(true)));
+        assert_eq!(pair.status(), RuntimeStubStatus::Ok);
+        assert_eq!(pair.into_result().into_value(), Some(Value::boolean(true)));
     }
 
     #[test]
     fn leaf_stub_entries_miss_null_heap() {
-        let result = collection_map_get_leaf(
+        let pair = collection_map_get_leaf(
             std::ptr::null(),
             Value::undefined().to_abi_bits(),
             Value::undefined().to_abi_bits(),
         );
-        assert_eq!(result.status, RuntimeStubStatus::Miss);
-        assert_eq!(result.into_value(), None);
+        assert_eq!(pair.status(), RuntimeStubStatus::Miss);
+        assert_eq!(pair.into_result().into_value(), None);
+    }
+
+    #[test]
+    fn vm_phase_types_every_vm_owned_slot() {
+        let entries = vm_runtime_stub_entries();
+        assert_eq!(
+            entries.len(),
+            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.len()
+        );
+        for (entry, descriptor) in entries
+            .iter()
+            .zip(crate::native_abi::RUNTIME_STUB_DESCRIPTORS)
+        {
+            match entry.signature() {
+                Some(signature) => {
+                    assert_eq!(signature, descriptor.signature);
+                    assert_ne!(entry.machine_addr(), 0);
+                }
+                // Only JIT-owned transitions stay vacant before hook install.
+                None => {
+                    assert_eq!(descriptor.id, crate::native_abi::STUB_JIT_BACKEDGE_POLL.id);
+                    assert_eq!(entry.machine_addr(), 0);
+                }
+            }
+        }
+    }
+
+    struct BindingHook(Vec<crate::jit::JitRuntimeStubBinding>);
+
+    impl crate::jit::JitCompilerHook for BindingHook {
+        fn runtime_stub_bindings(&self) -> Vec<crate::jit::JitRuntimeStubBinding> {
+            self.0.clone()
+        }
+
+        fn compile_function(
+            &self,
+            _request: crate::jit::JitCompileRequest,
+        ) -> Result<crate::jit::JitCompileStatus, crate::jit::JitCompileError> {
+            Ok(crate::jit::JitCompileStatus::Unavailable)
+        }
+    }
+
+    fn poll_binding() -> crate::jit::JitRuntimeStubBinding {
+        let descriptor = crate::native_abi::STUB_JIT_BACKEDGE_POLL;
+        crate::jit::JitRuntimeStubBinding {
+            id: descriptor.id,
+            signature: descriptor.signature,
+            entry_addr: 0x1000,
+        }
+    }
+
+    fn published_machine_entries(interp: &Interpreter) -> Vec<u64> {
+        // SAFETY: the header and machine column are isolate-owned and live.
+        let table = unsafe {
+            *(interp.jit_runtime_stub_table_addr() as *const crate::native_abi::RuntimeStubTable)
+        };
+        assert_eq!(table.version, crate::native_abi::RUNTIME_STUB_TABLE_VERSION);
+        assert_eq!(
+            table.count as usize,
+            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.len()
+        );
+        // SAFETY: the header names the live machine entry column.
+        unsafe {
+            std::slice::from_raw_parts(table.entries_address as *const u64, table.count as usize)
+        }
+        .to_vec()
+    }
+
+    #[test]
+    fn jit_binding_installation_fills_every_slot_and_uninstall_revacates() {
+        let mut interp = Interpreter::new();
+        let poll_index = crate::native_abi::STUB_JIT_BACKEDGE_POLL.id as usize - 1;
+
+        let before = published_machine_entries(&interp);
+        assert_eq!(before[poll_index], 0);
+
+        interp.set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![poll_binding()]))));
+        let installed = published_machine_entries(&interp);
+        assert!(installed.iter().all(|&addr| addr != 0));
+        assert_eq!(installed[poll_index], 0x1000);
+
+        interp.set_jit_compiler(None);
+        let after = published_machine_entries(&interp);
+        assert_eq!(after[poll_index], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "signature family")]
+    fn jit_binding_with_wrong_signature_family_panics() {
+        let mut binding = poll_binding();
+        binding.signature = crate::native_abi::RuntimeStubSignature::LeafValue2;
+        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![binding]))));
+    }
+
+    #[test]
+    #[should_panic(expected = "JIT-owned slot")]
+    fn jit_binding_cannot_overwrite_vm_owned_slot() {
+        let descriptor = crate::native_abi::STUB_COLLECTION_MAP_GET_LEAF;
+        let binding = crate::jit::JitRuntimeStubBinding {
+            id: descriptor.id,
+            signature: descriptor.signature,
+            entry_addr: 0x1000,
+        };
+        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(vec![binding]))));
+    }
+
+    #[test]
+    #[should_panic(expected = "left vacant")]
+    fn jit_installation_requires_complete_inventory() {
+        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(Vec::new()))));
     }
 }

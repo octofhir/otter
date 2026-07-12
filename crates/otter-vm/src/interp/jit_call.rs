@@ -960,7 +960,7 @@ impl Interpreter {
         // from here, not `stack[frame_index]`, so a frameless caller works.
         caller_regs: *const Value,
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
-        self.record_jit_runtime_stub_descriptor(native_abi::STUB_JIT_PREPARE_DIRECT_METHOD_CALL);
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Alloc);
         self.jit_runtime_stats.runtime_calls =
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
         // A site with a live native prototype-method IC resolved to a builtin

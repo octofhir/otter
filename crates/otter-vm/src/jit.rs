@@ -591,7 +591,7 @@ pub struct JitGcBarrierLayout {
 pub struct JitInstructionMetadata {
     /// Dense instruction index into the owning compile snapshot's CodeBlock.
     pub(crate) instruction_index: u32,
-    /// Cold serialized byte PC used only by profiling and legacy feedback maps.
+    /// Cold serialized byte PC used by profiling and diagnostics.
     pub byte_pc: u32,
     /// `true` for a `MakeFunction` / `MakeClosure` whose target is the function
     /// being compiled (the named-function SELF binding). The emitter
@@ -614,9 +614,8 @@ pub struct JitInstructionMetadata {
     /// site (see [`crate::jit_feedback`]). `0` for non-arithmetic instructions
     /// and for sites the interpreter never observed; the optimizing tier reads
     /// it to choose an unboxed `Int32` / `Float64` lowering and emit the
-    /// matching speculation guard. Populated by
-    /// `Interpreter::bake_arith_feedback` at tier-up; the raw compile snapshot
-    /// snapshot leaves it `0`.
+    /// matching speculation guard. Snapshotted directly from the owning
+    /// CodeBlock's dense feedback cell when the compile view is built.
     pub arith_feedback: u8,
     /// Monomorphic own-data property feedback for a `LoadProperty` /
     /// `StoreProperty` site: `Some((shape_offset, slot_byte))` when the
@@ -659,7 +658,7 @@ pub struct JitInstructionMetadata {
     /// representation (an FP register for `Float64`, a raw int for `Int32`),
     /// skipping the box on load and the matching unbox in the numeric consumer.
     /// [`JitElementLoadKind::Any`] (the default) keeps the generic boxed load.
-    /// Baked by `Interpreter::bake_element_load_kind`.
+    /// Snapshotted directly from the owning CodeBlock's dense feedback cell.
     pub element_load_kind: JitElementLoadKind,
     /// For a `LoadGlobalOrThrow` site whose free identifier resolves to a
     /// global declarative-record (lexical) cell, the cell's compressed `Gc`

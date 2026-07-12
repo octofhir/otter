@@ -783,11 +783,6 @@ pub struct Interpreter {
     /// unit at a time per iteration. Reset to [`JIT_BACKEDGE_POLL_BATCH`] by the
     /// checkpoint.
     jit_backedge_fuel: u64,
-    /// Global function id and canonical instruction PC currently dispatched.
-    /// Stashed only while a JIT hook is installed so feedback helpers need not
-    /// thread frame coordinates through every opcode-specific signature.
-    current_function_id: u32,
-    current_instruction_pc: u32,
     /// Per-isolate GC heap. Owned here so allocator-bearing
     /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since
     /// task 76) reach it through `&mut self`. The `Runtime`
@@ -964,28 +959,6 @@ pub struct Interpreter {
     /// `Op::CallMethodValue` arm during warmup and read at compile time
     /// (`bake_inline_callees`). Only mutated when a JIT hook is installed.
     jit_method_site_feedback: rustc_hash::FxHashMap<(u32, u32), MethodCallFeedback>,
-    /// Per-site operand-representation feedback driving the optimizing tier's
-    /// type speculation, keyed `(function_id, instruction_pc)`. Recorded by the
-    /// interpreter arithmetic / relational arms during the warmup runs that
-    /// precede tier-up, and baked into the compile snapshot
-    /// (`JitInstructionMetadata::arith_feedback`) so the compiler can choose an
-    /// unboxed `Int32` / `Float64` lowering and insert the matching guard. Only
-    /// mutated when a JIT hook is installed.
-    jit_arith_feedback: rustc_hash::FxHashMap<(u32, u32), jit_feedback::ArithFeedback>,
-    /// Observed unboxable typed-array kind at each `LoadElement` site, keyed
-    /// `(function_id, instruction_pc)`. A site that only ever reads from one of
-    /// `Float64Array` / `Int32Array` records that kind; any other receiver
-    /// (dense array, mixed typed-array kinds, object) demotes it to
-    /// [`jit::JitElementLoadKind::Any`]. Baked into
-    /// `JitInstructionMetadata::element_load_kind` so the compiler can lower the
-    /// site to a kind-guarded native-representation load (no box/unbox).
-    jit_element_load_kind: rustc_hash::FxHashMap<(u32, u32), jit::JitElementLoadKind>,
-    /// Arithmetic bytecode sites that already overflow-deoptimized once and
-    /// should be recompiled through the optimizing tier's float path. Keyed by
-    /// `(function_id, instruction_pc)`. This is compile policy, not observed operand
-    /// feedback: operands may still be int32-only while the result no longer
-    /// fits int32.
-    jit_arith_widen_float: rustc_hash::FxHashSet<(u32, u32)>,
     /// Per-function count of *entry* bails out of an installed compiled body
     /// (function-entry, sync-entry, and direct-call callee entries alike). A
     /// body that bails on every call — typically compiled early against

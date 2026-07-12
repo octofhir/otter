@@ -1,9 +1,9 @@
-//! Optimizing-tier compile requests and profile-feedback baking.
+//! JIT compile requests and cold profile-feedback baking.
 //!
 //! # Contents
 //! - `jit_code_residency` — opt-in whole-isolate executable-code snapshot.
-//! - `compile_jit_function` and feedback baking into the instruction view
-//!   (arith/element/property/global-cell/object-literal/inline-callee tables).
+//! - `compile_jit_function` and cold feedback baking into the instruction view
+//!   (property/global-cell/object-literal/inline-callee tables).
 //! - Call/method target profiling and reoptimization eviction.
 //!
 //! # Invariants
@@ -70,8 +70,6 @@ impl Interpreter {
         let mut view = context.jit_compile_snapshot(fid)?;
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
-        self.bake_arith_feedback(&mut view, fid);
-        self.bake_element_load_kind(&mut view, fid);
         self.bake_property_feedback(&mut view);
         self.bake_global_lex_cells(&mut view, context);
         self.bake_object_literals(&mut view, context);
@@ -161,92 +159,6 @@ impl Interpreter {
             string_len_byte: header + std::mem::offset_of!(crate::string::JsStringBody, len) as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
-    }
-
-    /// Fold the operand representations of one observed arithmetic / relational
-    /// execution into the optimizing-tier type-feedback cell for the currently
-    /// dispatching site (`current_function_id`, `current_instruction_pc`). Called from
-    /// the arithmetic opcode helpers; gated by the caller on a JIT hook being
-    /// installed, so interpreter-only execution records nothing. The cell is
-    /// baked into the compile snapshot at tier-up.
-    #[inline]
-    pub(crate) fn note_arith(&mut self, lhs: Value, rhs: Value) {
-        self.jit_arith_feedback
-            .entry((self.current_function_id, self.current_instruction_pc))
-            .or_default()
-            .record(lhs, rhs);
-    }
-
-    /// Record the receiver kind observed at the current `LoadElement` site so a
-    /// site that reads only from a single unboxable typed-array kind
-    /// (`Float64Array` / `Int32Array`) can lower to a native-representation load.
-    /// Any other receiver demotes the site to
-    /// [`jit::JitElementLoadKind::Any`] (generic boxed load), and that demotion
-    /// is sticky — a mixed site never re-specializes.
-    pub(crate) fn note_element_load(&mut self, recv: Value) {
-        let key = (self.current_function_id, self.current_instruction_pc);
-        let observed = match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
-            Some(crate::binary::TypedArrayKind::Float64) => jit::JitElementLoadKind::Float64,
-            Some(crate::binary::TypedArrayKind::Int32) => jit::JitElementLoadKind::Int32,
-            Some(_) => jit::JitElementLoadKind::Any,
-            None => {
-                // A non-typed-array receiver only matters if the site had already
-                // specialized: demote it so the tier keeps the generic load.
-                if let Some(slot) = self.jit_element_load_kind.get_mut(&key) {
-                    *slot = jit::JitElementLoadKind::Any;
-                }
-                return;
-            }
-        };
-        self.jit_element_load_kind
-            .entry(key)
-            .and_modify(|slot| {
-                if *slot != observed {
-                    *slot = jit::JitElementLoadKind::Any;
-                }
-            })
-            .or_insert(observed);
-    }
-
-    /// Copy the warmup element-load kind feedback recorded for `fid`'s
-    /// `LoadElement` sites into the compile snapshot, keyed by instruction PC. Sites the
-    /// interpreter never observed (or observed with mixed receivers) stay
-    /// [`jit::JitElementLoadKind::Any`], which lowers as the generic boxed load.
-    pub(crate) fn bake_element_load_kind(&self, view: &mut jit::JitCompileSnapshot, fid: u32) {
-        if self.jit_element_load_kind.is_empty() {
-            return;
-        }
-        let code_block = std::sync::Arc::clone(&view.code_block);
-        for instr in &mut view.instructions {
-            if instr.op(&code_block) != Op::LoadElement {
-                continue;
-            }
-            if let Some(kind) = self
-                .jit_element_load_kind
-                .get(&(fid, instr.instruction_pc(&code_block)))
-            {
-                instr.element_load_kind = *kind;
-            }
-        }
-    }
-
-    /// Copy the warmup value-representation feedback recorded for `fid`'s
-    /// numeric-specialized sites into the compile snapshot, keyed by each
-    /// instruction's canonical PC. Sites the interpreter never observed stay `0`
-    /// (unknown), which the optimizing tier lowers generically.
-    pub(crate) fn bake_arith_feedback(&self, view: &mut jit::JitCompileSnapshot, fid: u32) {
-        if self.jit_arith_feedback.is_empty() && self.jit_arith_widen_float.is_empty() {
-            return;
-        }
-        let code_block = std::sync::Arc::clone(&view.code_block);
-        for instr in &mut view.instructions {
-            let instruction_pc = instr.instruction_pc(&code_block);
-            if self.jit_arith_widen_float.contains(&(fid, instruction_pc)) {
-                instr.arith_feedback = jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64;
-            } else if let Some(fb) = self.jit_arith_feedback.get(&(fid, instruction_pc)) {
-                instr.arith_feedback = fb.bits();
-            }
-        }
     }
 
     /// Copy JIT-readable property IC cases into the compile snapshot. Own-data
@@ -1020,8 +932,6 @@ impl Interpreter {
         // element-load kind so a body `|`/`&`/`x[i]` lowers to a typed node
         // instead of declining on empty feedback.
         self.bake_property_feedback(&mut method_view);
-        self.bake_arith_feedback(&mut method_view, target.method_fid);
-        self.bake_element_load_kind(&mut method_view, target.method_fid);
         // Resolve every body `LoadProperty`/`StoreProperty` to a sealed value
         // byte offset; bail out if any property is absent, an accessor, or spills
         // past the inline value capacity. A receiver property resolves against

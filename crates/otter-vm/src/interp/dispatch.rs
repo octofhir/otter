@@ -155,15 +155,13 @@ impl Interpreter {
                 };
             let instr = function.instr_at_index(idx).ok_or(VmError::MissingReturn)?;
             let op = function.op(instr);
-            // `current_function_id` / `current_instruction_pc` exist only to key the
-            // optimizing-tier arithmetic type-feedback cell (`note_arith`),
-            // which the arith opcode helpers record only when a JIT hook is
-            // installed. With no hook there is no reader, so skip the two
-            // per-instruction stores entirely on the interpreter-only path.
-            if jit_installed {
-                self.current_function_id = function_id;
-                self.current_instruction_pc = pc;
-            }
+            // Feedback is dense in the owning CodeBlock. Interpreter-only
+            // execution keeps the cell untouched and pays no atomic update.
+            let feedback = if jit_installed {
+                function.feedback_at(idx)
+            } else {
+                None
+            };
             // Per-instruction reduction metering. Reductions accumulate exactly
             // as before; the max-stack-depth sample moved to the frame-resolution
             // miss branch (depth changes only across frame transitions), and the
@@ -706,7 +704,19 @@ impl Interpreter {
                         && let Ok(recv) = read_register(&stack[top_idx], recv_reg)
                     {
                         let recv = *recv;
-                        self.note_element_load(recv);
+                        let observed = match recv.as_typed_array(&self.gc_heap).map(|t| t.kind()) {
+                            Some(crate::binary::TypedArrayKind::Float64) => {
+                                Some(jit::JitElementLoadKind::Float64)
+                            }
+                            Some(crate::binary::TypedArrayKind::Int32) => {
+                                Some(jit::JitElementLoadKind::Int32)
+                            }
+                            Some(_) => Some(jit::JitElementLoadKind::Any),
+                            None => None,
+                        };
+                        if let Some(feedback) = feedback {
+                            feedback.record_element_load(observed);
+                        }
                     }
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
@@ -841,9 +851,9 @@ impl Interpreter {
                     let src_reg = context
                         .exec_register(instr, 2)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    if self.jit_hook.is_some() {
+                    if let Some(feedback) = feedback {
                         let value = *read_register(&stack[top_idx], src_reg)?;
-                        self.note_arith(value, value);
+                        feedback.record_arith(value, value);
                     }
                     if self.drive_store_element(stack, context, operands)? {
                         continue;
@@ -2035,8 +2045,8 @@ impl Interpreter {
                     // updated operand against the int32 step. A counting loop's
                     // `i++` thus reads as int32-only and lowers to a guarded
                     // `Int32Add`.
-                    if jit_installed {
-                        self.note_arith(value, Value::number_i32(delta));
+                    if let Some(feedback) = feedback {
+                        feedback.record_arith(value, Value::number_i32(delta));
                     }
                     let primitive = self.evaluate_to_primitive(
                         context,
@@ -2444,7 +2454,7 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_add_regs(frame, dst, lhs, rhs)?;
+                    self.run_add_regs(frame, dst, lhs, rhs, feedback)?;
                     continue;
                 }
                 Op::Sub => {
@@ -2452,7 +2462,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::sub, bigint_sub_op)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::sub,
+                        bigint_sub_op,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::Mul => {
@@ -2460,7 +2478,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::mul, bigint_mul_op)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::mul,
+                        bigint_mul_op,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::Div => {
@@ -2468,7 +2494,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::div, bigint::ops::div)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::div,
+                        bigint::ops::div,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::Rem => {
@@ -2476,7 +2510,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::rem, bigint::ops::rem)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::rem,
+                        bigint::ops::rem,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::Pow => {
@@ -2484,7 +2526,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::pow, bigint::ops::pow)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::pow,
+                        bigint::ops::pow,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::BitwiseAnd => {
@@ -2499,6 +2549,7 @@ impl Interpreter {
                         rhs,
                         number::bitwise_and,
                         bigint_and_op,
+                        feedback,
                     )?;
                     continue;
                 }
@@ -2507,7 +2558,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::bitwise_or, bigint_or_op)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::bitwise_or,
+                        bigint_or_op,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::BitwiseXor => {
@@ -2522,6 +2581,7 @@ impl Interpreter {
                         rhs,
                         number::bitwise_xor,
                         bigint_xor_op,
+                        feedback,
                     )?;
                     continue;
                 }
@@ -2530,7 +2590,15 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_numeric_regs(frame, dst, lhs, rhs, number::shl, bigint::ops::shl)?;
+                    self.run_numeric_regs(
+                        frame,
+                        dst,
+                        lhs,
+                        rhs,
+                        number::shl,
+                        bigint::ops::shl,
+                        feedback,
+                    )?;
                     continue;
                 }
                 Op::Shr => {
@@ -2545,6 +2613,7 @@ impl Interpreter {
                         rhs,
                         number::shr_arith,
                         bigint::ops::shr,
+                        feedback,
                     )?;
                     continue;
                 }
@@ -2553,7 +2622,7 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_compare_regs(frame, dst, lhs, rhs, op)?;
+                    self.run_compare_regs(frame, dst, lhs, rhs, op, feedback)?;
                     continue;
                 }
                 Op::Ushr => {
@@ -2561,7 +2630,7 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_ushr_regs(frame, dst, lhs, rhs)?;
+                    self.run_ushr_regs(frame, dst, lhs, rhs, feedback)?;
                     continue;
                 }
                 Op::Neg => {
@@ -2592,13 +2661,19 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     match op {
-                        Op::Equal => self.run_equal_regs(frame, dst, lhs, rhs, false)?,
-                        Op::NotEqual => self.run_equal_regs(frame, dst, lhs, rhs, true)?,
+                        Op::Equal => self.run_equal_regs(frame, dst, lhs, rhs, false, feedback)?,
+                        Op::NotEqual => {
+                            self.run_equal_regs(frame, dst, lhs, rhs, true, feedback)?
+                        }
                         Op::LooseEqual => {
-                            self.run_loose_equal_regs(context, frame, dst, lhs, rhs, false)?;
+                            self.run_loose_equal_regs(
+                                context, frame, dst, lhs, rhs, false, feedback,
+                            )?;
                         }
                         Op::LooseNotEqual => {
-                            self.run_loose_equal_regs(context, frame, dst, lhs, rhs, true)?;
+                            self.run_loose_equal_regs(
+                                context, frame, dst, lhs, rhs, true, feedback,
+                            )?;
                         }
                         Op::SameValue => self.run_same_value_regs(frame, dst, lhs, rhs)?,
                         _ => unreachable!("equality opcode group"),

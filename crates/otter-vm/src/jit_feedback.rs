@@ -1,17 +1,14 @@
-//! Runtime value-representation feedback consumed by the optimizing JIT tier.
+//! Dense instruction feedback shared by the interpreter and baseline JIT.
 //!
 //! The interpreter records observed operand/value representations at numeric
-//! bytecode sites while a hot function is still warming up (before it tiers up
-//! to compiled code). The optimizing tier reads these cells to pick a node
-//! representation — `Int32`, `Float64`, or fully generic `Tagged` — and to
-//! insert the matching speculation guard. Once a function is compiled the
-//! interpreter arms no longer run for it, so steady-state execution records
-//! nothing: the cost is bounded to the warm-up window.
+//! bytecode sites while a hot function is still warming up. Cells live in the
+//! owning [`crate::CodeBlock`] at the canonical instruction index, so recording
+//! and compilation never hash `(function_id, pc)` pairs or copy feedback into a
+//! parallel interpreter-owned map.
 //!
 //! # Contents
-//! - [`ArithFeedback`] — an OR-accumulated representation bitset for one
-//!   numeric-specialized bytecode site, keyed in the interpreter by
-//!   `(function_id, byte_pc)`.
+//! - [`ArithFeedback`] — decoded arithmetic representation bits.
+//! - [`InstructionFeedback`] — one dense atomic cell per CodeBlock instruction.
 //!
 //! # Invariants
 //! - **Monotonic.** Bits are only ever set, never cleared. A site that has ever
@@ -24,12 +21,17 @@
 //!   only less fast.
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
+//! - Atomic ordering is relaxed: feedback is advisory and monotonic. A compiler
+//!   may observe an older, narrower state; emitted guards and deoptimization
+//!   preserve correctness when later executions disagree.
 //!
 //! # See also
-//! - [`crate::jit::JitInstructionMetadata::arith_feedback`] — baked per-instruction
-//!   copy the optimizing tier consumes at compile time.
+//! - [`crate::jit::JitInstructionMetadata`] — compile-time snapshot metadata.
+
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::Value;
+use crate::jit::JitElementLoadKind;
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -48,6 +50,12 @@ pub const ARITH_OTHER: u8 = 1 << 4;
 /// Non-numeric observation bits. A site with any of these set can never be
 /// speculated as a pure numeric operation.
 const NON_NUMERIC: u8 = ARITH_STRING | ARITH_BIGINT | ARITH_OTHER;
+const ARITH_WIDEN_FLOAT: u8 = 1 << 7;
+
+const ELEMENT_UNSEEN: u8 = 0;
+const ELEMENT_FLOAT64: u8 = 1;
+const ELEMENT_INT32: u8 = 2;
+const ELEMENT_GENERIC: u8 = 3;
 
 /// OR-accumulated representation feedback for one numeric-specialized bytecode
 /// site.
@@ -116,6 +124,96 @@ impl ArithFeedback {
     }
 }
 
+/// Dense feedback owned by one canonical CodeBlock instruction.
+#[derive(Debug, Default)]
+pub struct InstructionFeedback {
+    arith: AtomicU8,
+    element_load: AtomicU8,
+}
+
+impl Clone for InstructionFeedback {
+    fn clone(&self) -> Self {
+        Self {
+            arith: AtomicU8::new(self.arith.load(Ordering::Relaxed)),
+            element_load: AtomicU8::new(self.element_load.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl InstructionFeedback {
+    /// Fold one observed arithmetic operand pair into this instruction cell.
+    #[inline]
+    pub fn record_arith(&self, lhs: Value, rhs: Value) {
+        let bits = ArithFeedback::classify(lhs) | ArithFeedback::classify(rhs);
+        self.arith.fetch_or(bits, Ordering::Relaxed);
+    }
+
+    /// Mark an arithmetic site for float widening after its first overflow bail.
+    /// Returns `true` exactly once for the cell.
+    pub fn widen_arith_to_float(&self) -> bool {
+        self.arith.fetch_or(ARITH_WIDEN_FLOAT, Ordering::Relaxed) & ARITH_WIDEN_FLOAT == 0
+    }
+
+    /// Arithmetic bits consumed by a compile snapshot.
+    #[must_use]
+    pub fn arith_bits(&self) -> u8 {
+        let bits = self.arith.load(Ordering::Relaxed);
+        if bits & ARITH_WIDEN_FLOAT != 0 {
+            ARITH_INT32 | ARITH_FLOAT64
+        } else {
+            bits & !ARITH_WIDEN_FLOAT
+        }
+    }
+
+    /// Record the receiver family observed at one `LoadElement` instruction.
+    /// `None` preserves an unseen cell for an ordinary non-typed receiver;
+    /// mixed or unsupported typed-array kinds become permanently generic.
+    pub fn record_element_load(&self, observed: Option<JitElementLoadKind>) {
+        let Some(observed) = observed else {
+            let current = self.element_load.load(Ordering::Relaxed);
+            if current != ELEMENT_UNSEEN {
+                self.element_load.store(ELEMENT_GENERIC, Ordering::Relaxed);
+            }
+            return;
+        };
+        let observed = match observed {
+            JitElementLoadKind::Any => ELEMENT_GENERIC,
+            JitElementLoadKind::Float64 => ELEMENT_FLOAT64,
+            JitElementLoadKind::Int32 => ELEMENT_INT32,
+        };
+        let mut current = self.element_load.load(Ordering::Relaxed);
+        loop {
+            let next = match current {
+                ELEMENT_UNSEEN => observed,
+                value if value == observed => value,
+                _ => ELEMENT_GENERIC,
+            };
+            if next == current {
+                return;
+            }
+            match self.element_load.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Element-load specialization consumed by a compile snapshot.
+    #[must_use]
+    pub fn element_load_kind(&self) -> JitElementLoadKind {
+        match self.element_load.load(Ordering::Relaxed) {
+            ELEMENT_FLOAT64 => JitElementLoadKind::Float64,
+            ELEMENT_INT32 => JitElementLoadKind::Int32,
+            _ => JitElementLoadKind::Any,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +251,35 @@ mod tests {
         assert!(!fb.is_numeric_only());
         assert!(!fb.is_int32_only());
         assert_eq!(fb.bits() & ARITH_OTHER, ARITH_OTHER);
+    }
+
+    #[test]
+    fn dense_cell_widens_once_and_keeps_element_demotion_sticky() {
+        let cell = InstructionFeedback::default();
+        cell.record_arith(Value::number_i32(1), Value::number_i32(2));
+        assert_eq!(cell.arith_bits(), ARITH_INT32);
+        assert!(cell.widen_arith_to_float());
+        assert!(!cell.widen_arith_to_float());
+        assert_eq!(cell.arith_bits(), ARITH_INT32 | ARITH_FLOAT64);
+
+        cell.record_element_load(Some(JitElementLoadKind::Float64));
+        assert_eq!(cell.element_load_kind(), JitElementLoadKind::Float64);
+        cell.record_element_load(Some(JitElementLoadKind::Int32));
+        assert_eq!(cell.element_load_kind(), JitElementLoadKind::Any);
+        cell.record_element_load(Some(JitElementLoadKind::Float64));
+        assert_eq!(cell.element_load_kind(), JitElementLoadKind::Any);
+
+        let ordinary_then_typed = InstructionFeedback::default();
+        ordinary_then_typed.record_element_load(None);
+        ordinary_then_typed.record_element_load(Some(JitElementLoadKind::Int32));
+        assert_eq!(
+            ordinary_then_typed.element_load_kind(),
+            JitElementLoadKind::Int32
+        );
+        ordinary_then_typed.record_element_load(None);
+        assert_eq!(
+            ordinary_then_typed.element_load_kind(),
+            JitElementLoadKind::Any
+        );
     }
 }

@@ -43,6 +43,51 @@ pub enum Unsupported {
     ArgCount(usize),
 }
 
+/// Typed destination register for fixed-operand loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DestinationOperands {
+    pub(crate) dst: u16,
+}
+
+/// Typed immediate load operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoadInt32Operands {
+    pub(crate) dst: u16,
+    pub(crate) value: i32,
+}
+
+/// Typed local-window transfer operands. `value` is the loaded destination or
+/// stored source according to the opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalOperands {
+    pub(crate) value: u16,
+    pub(crate) local: u16,
+}
+
+/// Typed two-register operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnaryOperands {
+    pub(crate) dst: u16,
+    pub(crate) src: u16,
+}
+
+/// Typed three-register operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BinaryOperands {
+    pub(crate) dst: u16,
+    pub(crate) lhs: u16,
+    pub(crate) rhs: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedOperands {
+    Destination(DestinationOperands),
+    LoadInt32(LoadInt32Operands),
+    Local(LocalOperands),
+    Unary(UnaryOperands),
+    Binary(BinaryOperands),
+}
+
 /// Backend-neutral facts established before machine-code emission starts.
 ///
 /// Keeping this pass allocation-light makes it suitable for every future
@@ -54,6 +99,7 @@ pub(crate) struct BaselinePlan {
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
     branch_targets: BTreeMap<u32, u32>,
+    planned_operands: BTreeMap<u32, PlannedOperands>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
     pub(crate) method_alloc_safepoints: BTreeMap<u32, SafepointId>,
@@ -67,6 +113,7 @@ impl BaselinePlan {
         let mut enable_float_residency = false;
         let mut load_property_count = 0;
         let mut store_property_count = 0;
+        let mut planned_operands = BTreeMap::new();
 
         let mut branch_targets = BTreeMap::new();
         for instr in &view.instructions {
@@ -92,6 +139,58 @@ impl BaselinePlan {
                     }
                 }
                 _ => {}
+            }
+
+            let operands = instr.operand_view(code_block);
+            let planned = match op {
+                Op::LoadInt32 => Some(PlannedOperands::LoadInt32(LoadInt32Operands {
+                    dst: reg(operands, 0)?,
+                    value: imm32(operands, 1)?,
+                })),
+                Op::LoadNumber
+                | Op::LoadUndefined
+                | Op::LoadNull
+                | Op::LoadHole
+                | Op::LoadTrue
+                | Op::LoadFalse => Some(PlannedOperands::Destination(DestinationOperands {
+                    dst: reg(operands, 0)?,
+                })),
+                Op::LoadLocal | Op::StoreLocal => Some(PlannedOperands::Local(LocalOperands {
+                    value: reg(operands, 0)?,
+                    local: local_index(operands, 1)?,
+                })),
+                Op::ToPrimitive | Op::ToNumeric | Op::Neg => {
+                    Some(PlannedOperands::Unary(UnaryOperands {
+                        dst: reg(operands, 0)?,
+                        src: reg(operands, 1)?,
+                    }))
+                }
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual
+                | Op::LooseEqual
+                | Op::LooseNotEqual
+                | Op::BitwiseOr
+                | Op::BitwiseAnd
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Ushr => {
+                    let (dst, lhs, rhs) = reg3(operands)?;
+                    Some(PlannedOperands::Binary(BinaryOperands { dst, lhs, rhs }))
+                }
+                _ => None,
+            };
+            if let Some(planned) = planned {
+                planned_operands.insert(instr.byte_pc, planned);
             }
         }
 
@@ -158,6 +257,7 @@ impl BaselinePlan {
             load_property_count,
             store_property_count,
             branch_targets,
+            planned_operands,
             safepoint_records,
             add_alloc_safepoints,
             method_alloc_safepoints,
@@ -170,6 +270,54 @@ impl BaselinePlan {
             .get(&byte_pc)
             .copied()
             .ok_or(Unsupported::OperandShape("missing planned branch target"))
+    }
+
+    fn planned_operands(&self, byte_pc: u32) -> Result<PlannedOperands, Unsupported> {
+        self.planned_operands
+            .get(&byte_pc)
+            .copied()
+            .ok_or(Unsupported::OperandShape("missing planned operands"))
+    }
+
+    pub(crate) fn destination_operands(
+        &self,
+        byte_pc: u32,
+    ) -> Result<DestinationOperands, Unsupported> {
+        match self.planned_operands(byte_pc)? {
+            PlannedOperands::Destination(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("planned destination operands")),
+        }
+    }
+
+    pub(crate) fn load_int32_operands(
+        &self,
+        byte_pc: u32,
+    ) -> Result<LoadInt32Operands, Unsupported> {
+        match self.planned_operands(byte_pc)? {
+            PlannedOperands::LoadInt32(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("planned LoadInt32 operands")),
+        }
+    }
+
+    pub(crate) fn local_operands(&self, byte_pc: u32) -> Result<LocalOperands, Unsupported> {
+        match self.planned_operands(byte_pc)? {
+            PlannedOperands::Local(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("planned local operands")),
+        }
+    }
+
+    pub(crate) fn unary_operands(&self, byte_pc: u32) -> Result<UnaryOperands, Unsupported> {
+        match self.planned_operands(byte_pc)? {
+            PlannedOperands::Unary(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("planned unary operands")),
+        }
+    }
+
+    pub(crate) fn binary_operands(&self, byte_pc: u32) -> Result<BinaryOperands, Unsupported> {
+        match self.planned_operands(byte_pc)? {
+            PlannedOperands::Binary(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("planned binary operands")),
+        }
     }
 }
 
@@ -229,6 +377,17 @@ impl WordOperands for &[Operand] {
 impl<const N: usize> WordOperands for &[Operand; N] {
     fn get(self, index: usize) -> Option<Operand> {
         self.as_slice().get(index).copied()
+    }
+}
+
+impl WordOperands for BinaryOperands {
+    fn get(self, index: usize) -> Option<Operand> {
+        match index {
+            0 => Some(Operand::Register(self.dst)),
+            1 => Some(Operand::Register(self.lhs)),
+            2 => Some(Operand::Register(self.rhs)),
+            _ => None,
+        }
     }
 }
 

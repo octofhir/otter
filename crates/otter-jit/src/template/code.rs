@@ -123,6 +123,13 @@ impl JitFunctionCode for TemplateCode {
         self.code.len()
     }
 
+    fn entry_addr(&self) -> Option<usize> {
+        // SAFETY: the mapping is live for `self`; callers must keep the owning
+        // code object installed while using this address (the direct-call
+        // prepare path anchors it through the code registry).
+        Some(unsafe { self.code.entry_ptr() as usize })
+    }
+
     fn safepoint_count(&self) -> u32 {
         self.safepoint_records.len() as u32
     }

@@ -805,6 +805,18 @@ impl Interpreter {
         self.property_ic_stats
     }
 
+    /// Override the back-edge count at which a hot loop tiers up via OSR.
+    ///
+    /// Structured counterpart of the `OTTER_JIT_OSR_THRESHOLD` conformance
+    /// knob for embedders and differential harnesses that must force loop
+    /// tier-up without touching the process environment. Zero is rejected;
+    /// the current threshold is kept.
+    pub fn set_jit_osr_threshold(&mut self, threshold: u32) {
+        if threshold > 0 {
+            self.jit_osr_threshold = threshold;
+        }
+    }
+
     /// Install or remove the runtime-owned JIT compiler hook.
     ///
     /// `None` keeps interpreter-only behavior. A hook returning

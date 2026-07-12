@@ -1305,6 +1305,26 @@ pub(crate) struct RuntimeConfig {
     process_argv: Vec<String>,
     process_cwd: PathBuf,
     tracer_factory: Option<TracerFactory>,
+    jit_selection: JitSelection,
+    jit_osr_threshold: Option<u32>,
+}
+
+/// Which execution tiers a runtime installs at construction.
+///
+/// A structured embedder/harness selection: differential tests build one
+/// runtime per tier and compare observable behavior against the
+/// interpreter-only semantic oracle. The default installs the production
+/// compiler; there is no environment toggle for tier selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JitSelection {
+    /// Interpreter plus the production baseline compiler.
+    #[default]
+    Baseline,
+    /// Interpreter plus the template compiler. Functions outside its subset
+    /// report `Unsupported` and stay on the interpreter.
+    Template,
+    /// Interpreter only — the semantic oracle for differential runs.
+    InterpreterOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -1508,6 +1528,8 @@ impl Default for RuntimeConfig {
             process_argv: process::default_argv(),
             process_cwd: process::default_cwd(),
             tracer_factory: None,
+            jit_selection: JitSelection::default(),
+            jit_osr_threshold: None,
         }
     }
 }
@@ -1772,6 +1794,24 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Select which execution tiers the runtime installs. Differential
+    /// harnesses build one runtime per [`JitSelection`] and compare
+    /// observable behavior; production embedders keep the default.
+    #[must_use]
+    pub fn jit_selection(mut self, selection: JitSelection) -> Self {
+        self.config.jit_selection = selection;
+        self
+    }
+
+    /// Override the back-edge count at which a hot loop tiers up via OSR.
+    /// Differential and conformance harnesses set `1` to force compiled loop
+    /// coverage; production embedders keep the default.
+    #[must_use]
+    pub fn jit_osr_threshold(mut self, threshold: u32) -> Self {
+        self.config.jit_osr_threshold = Some(threshold);
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -2007,12 +2047,27 @@ impl Runtime {
                         });
                     interp.set_eval_hook(Some(hook));
                     // The JIT is the default execution path: functions start in the
-                    // interpreter and tier up through the baseline/optimizing JIT.
+                    // interpreter and tier up through the configured compiler.
                     // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
+                    if let Some(threshold) = config.jit_osr_threshold {
+                        interp.set_jit_osr_threshold(threshold);
+                    }
                     if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
-                        interp.set_jit_compiler(Some(std::sync::Arc::new(
-                            otter_jit::BaselineJitCompiler::new(),
-                        )));
+                        match config.jit_selection {
+                            JitSelection::Baseline => {
+                                interp.set_jit_compiler(Some(std::sync::Arc::new(
+                                    otter_jit::BaselineJitCompiler::new(),
+                                )));
+                            }
+                            JitSelection::Template => {
+                                interp.set_jit_compiler(Some(std::sync::Arc::new(
+                                    otter_jit::BaselineJitCompiler::with_kind(
+                                        otter_jit::BaselineCompilerKind::Template,
+                                    ),
+                                )));
+                            }
+                            JitSelection::InterpreterOnly => {}
+                        }
                     }
                     if let Some(factory) = &config.tracer_factory {
                         interp.set_tracer(Some(factory.build()));
@@ -4226,6 +4281,20 @@ impl OtterBuilder {
     #[must_use]
     pub fn tracer_factory(mut self, factory: Option<TracerFactory>) -> Self {
         self.runtime = self.runtime.tracer_factory(factory);
+        self
+    }
+
+    /// [`RuntimeBuilder::jit_selection`].
+    #[must_use]
+    pub fn jit_selection(mut self, selection: JitSelection) -> Self {
+        self.runtime = self.runtime.jit_selection(selection);
+        self
+    }
+
+    /// [`RuntimeBuilder::jit_osr_threshold`].
+    #[must_use]
+    pub fn jit_osr_threshold(mut self, threshold: u32) -> Self {
+        self.runtime = self.runtime.jit_osr_threshold(threshold);
         self
     }
 

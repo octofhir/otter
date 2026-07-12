@@ -21,7 +21,9 @@ use otter_vm::VmError;
 use super::JitCtx;
 
 mod reentry;
+mod vm_ops;
 pub(super) use reentry::*;
+pub(super) use vm_ops::*;
 
 fn park_result(ctx: &mut JitCtx, result: Result<(), VmError>) -> u64 {
     match result {

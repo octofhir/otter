@@ -113,14 +113,13 @@ impl EmissionSession {
             let ops_ref = instr.operand_view(code_block);
             match instr.op(code_block) {
                 Op::LoadInt32 => {
-                    let dst = reg(ops_ref, 0)?;
-                    let v = imm32(ops_ref, 1)?;
-                    let boxed = value_tag::NUMBER_TAG | u64::from(v as u32);
+                    let operands = plan.load_int32_operands(instr.byte_pc)?;
+                    let boxed = value_tag::NUMBER_TAG | u64::from(operands.value as u32);
                     emit_load_u64(ops, 9, boxed);
-                    store_reg(ops, 9, dst)?;
+                    store_reg(ops, 9, operands.dst)?;
                 }
                 Op::LoadNumber => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
                     let Some(value) = instr.load_number else {
                         return Err(Unsupported::OperandShape("load-number constant"));
                     };
@@ -132,59 +131,68 @@ impl EmissionSession {
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadLocal => {
-                    let dst = reg(ops_ref, 0)?;
-                    let idx = local_index(ops_ref, 1)?;
-                    load_reg(ops, 9, idx)?;
-                    store_reg(ops, 9, dst)?;
+                    let operands = plan.local_operands(instr.byte_pc)?;
+                    load_reg(ops, 9, operands.local)?;
+                    store_reg(ops, 9, operands.value)?;
                 }
                 Op::LoadUndefined => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
                     // SPECIAL payload 0 == undefined.
                     emit_load_u64(ops, 9, VALUE_UNDEFINED);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadNull => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
                     emit_load_u64(ops, 9, VALUE_NULL);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadHole => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
                     // SPECIAL payload `SPECIAL_HOLE` == the TDZ/uninitialized hole.
                     emit_load_u64(ops, 9, VALUE_HOLE);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadTrue => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
                     emit_load_u64(ops, 9, VALUE_TRUE);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadFalse => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
                     emit_load_u64(ops, 9, VALUE_FALSE);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::StoreLocal => {
-                    let src = reg(ops_ref, 0)?;
-                    let idx = local_index(ops_ref, 1)?;
-                    load_reg(ops, 9, src)?;
-                    store_reg(ops, 9, idx)?;
+                    let operands = plan.local_operands(instr.byte_pc)?;
+                    load_reg(ops, 9, operands.value)?;
+                    store_reg(ops, 9, operands.local)?;
                 }
                 Op::Add => emit_add_with_runtime_fallback(
                     ops,
-                    ops_ref,
+                    plan.binary_operands(instr.byte_pc)?,
                     plan.add_alloc_safepoints.get(&instr.byte_pc).copied(),
                     view.code_block.register_count,
                     threw,
                 )?,
                 Op::Sub | Op::Mul | Op::Div if enable_fres => {
-                    emit_float_binop_res(ops, ops_ref, bail, instr.op(code_block), fres)?;
+                    emit_float_binop_res(
+                        ops,
+                        plan.binary_operands(instr.byte_pc)?,
+                        bail,
+                        instr.op(code_block),
+                        fres,
+                    )?;
                 }
                 Op::Sub | Op::Mul => {
-                    emit_add_sub_mul(ops, ops_ref, bail, instr.op(code_block))?;
+                    emit_add_sub_mul(
+                        ops,
+                        plan.binary_operands(instr.byte_pc)?,
+                        bail,
+                        instr.op(code_block),
+                    )?;
                 }
-                Op::Div => emit_div(ops, ops_ref, bail)?,
-                Op::Rem => emit_rem(ops, ops_ref, bail)?,
+                Op::Div => emit_div(ops, plan.binary_operands(instr.byte_pc)?, bail)?,
+                Op::Rem => emit_rem(ops, plan.binary_operands(instr.byte_pc)?, bail)?,
                 Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan
@@ -201,29 +209,31 @@ impl EmissionSession {
                         Op::Equal => Cmp::Eq,
                         _ => Cmp::Ne,
                     };
-                    emit_cmp_res(ops, ops_ref, bail, cmp, fres)?;
+                    emit_cmp_res(ops, plan.binary_operands(instr.byte_pc)?, bail, cmp, fres)?;
                 }
-                Op::LessThan => emit_cmp(ops, ops_ref, bail, Cmp::Lt)?,
-                Op::LessEq => emit_cmp(ops, ops_ref, bail, Cmp::Le)?,
-                Op::GreaterThan => emit_cmp(ops, ops_ref, bail, Cmp::Gt)?,
-                Op::GreaterEq => emit_cmp(ops, ops_ref, bail, Cmp::Ge)?,
-                Op::Equal => emit_cmp(ops, ops_ref, bail, Cmp::Eq)?,
-                Op::NotEqual => emit_cmp(ops, ops_ref, bail, Cmp::Ne)?,
+                Op::LessThan => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Lt)?,
+                Op::LessEq => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Le)?,
+                Op::GreaterThan => {
+                    emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Gt)?
+                }
+                Op::GreaterEq => {
+                    emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Ge)?
+                }
+                Op::Equal => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Eq)?,
+                Op::NotEqual => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Ne)?,
                 // `ToPrimitive` is identity on primitives. Object/function
                 // families bail so observable coercion hooks run in the VM.
                 Op::ToPrimitive => {
-                    let dst = reg(ops_ref, 0)?;
-                    let src = reg(ops_ref, 1)?;
-                    emit_to_primitive_identity(ops, dst, src, bail)?;
+                    let operands = plan.unary_operands(instr.byte_pc)?;
+                    emit_to_primitive_identity(ops, operands.dst, operands.src, bail)?;
                 }
                 // `ToNumeric` is identity on a number (int32 or double); emit
                 // a guarded move. Other primitives/objects need the VM path.
                 Op::ToNumeric => {
-                    let dst = reg(ops_ref, 0)?;
-                    let src = reg(ops_ref, 1)?;
-                    load_reg(ops, 9, src)?;
+                    let operands = plan.unary_operands(instr.byte_pc)?;
+                    load_reg(ops, 9, operands.src)?;
                     guard_number!(ops, 9, bail);
-                    store_reg(ops, 9, dst)?;
+                    store_reg(ops, 9, operands.dst)?;
                 }
                 Op::Jump => {
                     let target = plan.branch_target(instr.byte_pc)?;
@@ -984,12 +994,37 @@ impl EmissionSession {
                     );
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
-                Op::BitwiseOr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Or)?,
-                Op::BitwiseAnd => emit_int_binop(ops, ops_ref, bail, IntBinOp::And)?,
-                Op::BitwiseXor => emit_int_binop(ops, ops_ref, bail, IntBinOp::Xor)?,
-                Op::Shl => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shl)?,
-                Op::Shr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shr)?,
-                Op::Ushr => emit_ushr(ops, ops_ref, bail)?,
+                Op::BitwiseOr => emit_int_binop(
+                    ops,
+                    plan.binary_operands(instr.byte_pc)?,
+                    bail,
+                    IntBinOp::Or,
+                )?,
+                Op::BitwiseAnd => emit_int_binop(
+                    ops,
+                    plan.binary_operands(instr.byte_pc)?,
+                    bail,
+                    IntBinOp::And,
+                )?,
+                Op::BitwiseXor => emit_int_binop(
+                    ops,
+                    plan.binary_operands(instr.byte_pc)?,
+                    bail,
+                    IntBinOp::Xor,
+                )?,
+                Op::Shl => emit_int_binop(
+                    ops,
+                    plan.binary_operands(instr.byte_pc)?,
+                    bail,
+                    IntBinOp::Shl,
+                )?,
+                Op::Shr => emit_int_binop(
+                    ops,
+                    plan.binary_operands(instr.byte_pc)?,
+                    bail,
+                    IntBinOp::Shr,
+                )?,
+                Op::Ushr => emit_ushr(ops, plan.binary_operands(instr.byte_pc)?, bail)?,
                 Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
                     let off = reg_offset(src)?;
@@ -1107,20 +1142,19 @@ impl EmissionSession {
                     );
                 }
                 Op::Neg => {
-                    let dst = reg(ops_ref, 0)?;
-                    let src = reg(ops_ref, 1)?;
+                    let operands = plan.unary_operands(instr.byte_pc)?;
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
-                        ; movz x1, dst as u32
-                        ; movz x2, src as u32
+                        ; movz x1, operands.dst as u32
+                        ; movz x2, operands.src as u32
                     );
                     emit_call_stub(ops, jit_neg_stub as *const () as usize, threw);
                 }
                 Op::LooseEqual | Op::LooseNotEqual => {
                     emit_loose_cmp(
                         ops,
-                        ops_ref,
+                        plan.binary_operands(instr.byte_pc)?,
                         instr.op(code_block) == Op::LooseNotEqual,
                         bail,
                     )?;

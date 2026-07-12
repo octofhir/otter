@@ -896,6 +896,49 @@ mod tests {
     }
 
     #[test]
+    fn lowering_plan_publishes_typed_fixed_operands() {
+        let v = view(&[
+            (
+                Op::LoadInt32,
+                vec![Operand::Register(0), Operand::Imm32(42)],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::Neg, vec![Operand::Register(3), Operand::Register(2)]),
+            (
+                Op::StoreLocal,
+                vec![Operand::Register(3), Operand::Imm32(7)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+        ]);
+        let byte_pcs: Vec<_> = v
+            .instructions
+            .iter()
+            .map(|instruction| instruction.byte_pc)
+            .collect();
+        let plan = BaselinePlan::build(&v).expect("plan");
+
+        let load = plan
+            .load_int32_operands(byte_pcs[0])
+            .expect("LoadInt32 operands");
+        assert_eq!((load.dst, load.value), (0, 42));
+        let add = plan.binary_operands(byte_pcs[1]).expect("Add operands");
+        assert_eq!((add.dst, add.lhs, add.rhs), (2, 0, 1));
+        let neg = plan.unary_operands(byte_pcs[2]).expect("Neg operands");
+        assert_eq!((neg.dst, neg.src), (3, 2));
+        let store = plan
+            .local_operands(byte_pcs[3])
+            .expect("StoreLocal operands");
+        assert_eq!((store.value, store.local), (3, 7));
+    }
+
+    #[test]
     fn method_call_uses_full_packed_argument_abi() {
         let four_args = view(&[
             (

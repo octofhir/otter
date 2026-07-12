@@ -201,7 +201,7 @@ pub use jit::{
     JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
     JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFunctionCode,
     JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPrimitiveMethodGuard,
-    JitStringLayout, VmRuntimeActivation,
+    JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -216,9 +216,8 @@ pub use native_abi::{
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_JIT_COLLECTION_METHOD_IC, STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_PROPERTY_FALLBACK,
-    STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord, TaggedLocation, TaggedLocationKind,
-    VARIADIC_STUB_ARGUMENTS, VmFrameHeader, validate_stub_descriptor,
+    STUB_JIT_BACKEDGE_POLL, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord, TaggedLocation,
+    TaggedLocationKind, VARIADIC_STUB_ARGUMENTS, VmFrameHeader, validate_stub_descriptor,
 };
 pub use native_function::{
     NativeCall, NativeError, NativeFastFn, NativeFn, NativeFunction, VmIntrinsicFunction,
@@ -970,6 +969,14 @@ pub struct Interpreter {
     jit_direct_method_cache: Vec<Vec<JitDirectMethodCache>>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
+    /// Stable isolate-owned descriptor-indexed runtime entries, typed per
+    /// signature family. VM-owned entries are installed at construction;
+    /// JIT-owned transitions at [`Interpreter::set_jit_compiler`].
+    jit_runtime_stub_entries: Box<[runtime_stubs::RuntimeStubEntry]>,
+    /// Machine-visible address column derived from the typed entries.
+    jit_runtime_stub_machine_entries: Box<[u64]>,
+    /// Published C-layout header over the machine entry column.
+    jit_runtime_stub_table: native_abi::RuntimeStubTable,
     /// Pool of reservation-stable [`HoltStack`]s reused for synchronous callable
     /// re-entry (Array / collection callbacks, comparators, sync `@@iterator`
     /// drives). Every re-entry needs a stack whose frames never move, so a

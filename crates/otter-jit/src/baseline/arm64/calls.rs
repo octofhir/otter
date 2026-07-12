@@ -1691,17 +1691,18 @@ pub(crate) fn emit_direct_call_tail(
     dynasm!(ops ; .arch aarch64 ; b =>threw);
 }
 
-/// Emit the reusable baseline ABI call sequence for
-/// `leaf_no_alloc_stub2_trampoline_pair`.
+/// Emit the baseline call sequence for a compile-time-resolved
+/// `LeafValue2` runtime-stub entry.
 ///
-/// Inputs are the current `JitCtx` in `x20`, frame register window in
-/// `x19`, and a previously resolved nonzero `RuntimeStubId` in
-/// `stub_id_x`. The helper reads the opaque GC heap pointer from `JitCtx`,
-/// passes raw boxed receiver/key bits from the frame window, writes `dst`
-/// on `Ok`, and branches to `miss` for every non-`Ok` status.
-pub(super) fn emit_leaf_no_alloc_stub2_pair_call(
+/// Inputs are the current `JitCtx` in `x20` and the frame register window in
+/// `x19`. `entry_addr` is a nonzero typed `(heap, v0, v1) -> pair` entry the
+/// compiler resolved and validated through the VM descriptor inventory. The
+/// helper reads the opaque GC heap pointer from `JitCtx`, passes raw boxed
+/// receiver/key bits from the frame window, writes `dst` on `Ok`, and
+/// branches to `miss` for every non-`Ok` status.
+pub(super) fn emit_leaf_value2_stub_call(
     ops: &mut Assembler,
-    stub_id_x: u8,
+    entry_addr: usize,
     dst: u16,
     recv: u16,
     key: Option<u16>,
@@ -1710,19 +1711,14 @@ pub(super) fn emit_leaf_no_alloc_stub2_pair_call(
     dynasm!(ops
         ; .arch aarch64
         ; ldr x0, [x20, GC_HEAP_OFFSET]
-        ; mov x1, X(stub_id_x)
     );
-    load_reg(ops, 2, recv)?;
+    load_reg(ops, 1, recv)?;
     if let Some(key) = key {
-        load_reg(ops, 3, key)?;
+        load_reg(ops, 2, key)?;
     } else {
-        emit_load_u64(ops, 3, VALUE_UNDEFINED);
+        emit_load_u64(ops, 2, VALUE_UNDEFINED);
     }
-    emit_load_u64(
-        ops,
-        16,
-        leaf_no_alloc_stub2_trampoline_pair as *const () as u64,
-    );
+    emit_load_u64(ops, 16, entry_addr as u64);
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -1824,8 +1820,11 @@ pub(super) fn emit_collection_leaf_method_guarded_call(
         ; cmp x14, x15
         ; b.ne =>miss
     );
-    emit_load_u64(ops, 11, u64::from(leaf.leaf_stub_id));
-    emit_leaf_no_alloc_stub2_pair_call(ops, 11, dst, recv, key, miss)?;
+    let Some(stub) = leaf_no_alloc_stub2_by_id(leaf.leaf_stub_id) else {
+        return Ok(false);
+    };
+    debug_assert!(stub.is_valid());
+    emit_leaf_value2_stub_call(ops, stub.entry_addr(), dst, recv, key, miss)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(true)
 }

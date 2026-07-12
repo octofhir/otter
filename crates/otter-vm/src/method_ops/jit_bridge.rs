@@ -125,12 +125,8 @@ impl Interpreter {
         } else {
             Value::undefined()
         };
-        let result = crate::runtime_stubs::leaf_no_alloc_stub2_trampoline(
-            &self.gc_heap as *const otter_gc::GcHeap,
-            stub_id,
-            recv.to_abi_bits(),
-            key.to_abi_bits(),
-        );
+        let result =
+            crate::runtime_stubs::invoke_leaf_no_alloc_stub2(&self.gc_heap, stub_id, recv, key);
         let Some(value) = result.into_value() else {
             return Ok(false);
         };

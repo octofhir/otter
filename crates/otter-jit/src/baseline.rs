@@ -48,7 +48,7 @@
 #![allow(clippy::useless_conversion)]
 
 use otter_bytecode::Op;
-use otter_vm::{JitCompileSnapshot, runtime_stubs::leaf_no_alloc_stub2_trampoline_pair};
+use otter_vm::JitCompileSnapshot;
 
 mod abi;
 mod artifacts;
@@ -82,6 +82,18 @@ pub(crate) mod arm64;
 #[cfg(target_arch = "aarch64")]
 pub fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
     arm64::compile(view)
+}
+
+/// JIT-owned runtime transitions installed into the isolate entry table at
+/// compiler-hook install. Each binding names its VM descriptor id and
+/// signature family; the VM validates the pairing before installation.
+pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
+    let descriptor = otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL;
+    vec![otter_vm::JitRuntimeStubBinding {
+        id: descriptor.id,
+        signature: descriptor.signature,
+        entry_addr: jit_backedge_poll_stub as *const () as usize,
+    }]
 }
 
 /// Non-arm64 stub: the emitter is arm64-only for now.

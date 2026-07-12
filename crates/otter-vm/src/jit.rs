@@ -925,6 +925,17 @@ pub struct JitCompileError {
     pub message: String,
 }
 
+/// One typed machine entry supplied during explicit JIT installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitRuntimeStubBinding {
+    /// VM-owned dense descriptor id.
+    pub id: crate::native_abi::RuntimeStubId,
+    /// Descriptor signature family compiled at the call site.
+    pub signature: crate::native_abi::RuntimeStubSignature,
+    /// Nonzero machine entry address.
+    pub entry_addr: usize,
+}
+
 impl JitCompileError {
     /// Construct an internal compile error.
     #[must_use]
@@ -948,6 +959,11 @@ impl std::error::Error for JitCompileError {}
 /// `otter-runtime` wires an implementation from `otter-jit`; `otter-vm` only
 /// owns this trait object and supplies owned compile-input DTOs.
 pub trait JitCompilerHook: Send + Sync {
+    /// JIT-owned runtime transitions installed once into the target VM.
+    fn runtime_stub_bindings(&self) -> Vec<JitRuntimeStubBinding> {
+        Vec::new()
+    }
+
     /// Attempt to compile one function snapshot.
     ///
     /// Returning [`JitCompileStatus::Unavailable`] or

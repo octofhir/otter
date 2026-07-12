@@ -30,9 +30,9 @@ impl EmissionSession {
         let bail = ops.new_dynamic_label();
         let threw = ops.new_dynamic_label();
         let labels = plan
-            .instruction_pcs
+            .instructions
             .iter()
-            .map(|&pc| (pc, ops.new_dynamic_label()))
+            .map(|instruction| (instruction.instruction_pc, ops.new_dynamic_label()))
             .collect();
         Self {
             ops,
@@ -95,8 +95,8 @@ impl EmissionSession {
         // when `cage_base != 0` (i.e. baked by the real compile path).
         let ta_layout = view.ta_layout;
 
-        for instr in &view.instructions {
-            let instruction_pc = instr.instruction_pc(code_block);
+        for (instr, lowered) in view.instructions.iter().zip(&plan.instructions) {
+            let instruction_pc = lowered.instruction_pc;
             dynasm!(ops ; .arch aarch64 ; =>labels[&instruction_pc]);
             // A branch target is a block boundary: control can arrive here from
             // elsewhere with unknown register state (and OSR enters loop headers
@@ -111,15 +111,15 @@ impl EmissionSession {
             emit_load_u64(ops, 9, u64::from(instruction_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, RESUME_PC_OFFSET]);
             let ops_ref = instr.operand_view(code_block);
-            match instr.op(code_block) {
+            match lowered.op {
                 Op::LoadInt32 => {
-                    let operands = plan.load_int32_operands(instr.byte_pc)?;
+                    let operands = lowered.load_int32_operands()?;
                     let boxed = value_tag::NUMBER_TAG | u64::from(operands.value as u32);
                     emit_load_u64(ops, 9, boxed);
                     store_reg(ops, 9, operands.dst)?;
                 }
                 Op::LoadNumber => {
-                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
+                    let dst = lowered.destination_operands()?.dst;
                     let Some(value) = instr.load_number else {
                         return Err(Unsupported::OperandShape("load-number constant"));
                     };
@@ -131,68 +131,57 @@ impl EmissionSession {
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadLocal => {
-                    let operands = plan.local_operands(instr.byte_pc)?;
+                    let operands = lowered.local_operands()?;
                     load_reg(ops, 9, operands.local)?;
                     store_reg(ops, 9, operands.value)?;
                 }
                 Op::LoadUndefined => {
-                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
+                    let dst = lowered.destination_operands()?.dst;
                     // SPECIAL payload 0 == undefined.
                     emit_load_u64(ops, 9, VALUE_UNDEFINED);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadNull => {
-                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
+                    let dst = lowered.destination_operands()?.dst;
                     emit_load_u64(ops, 9, VALUE_NULL);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadHole => {
-                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
+                    let dst = lowered.destination_operands()?.dst;
                     // SPECIAL payload `SPECIAL_HOLE` == the TDZ/uninitialized hole.
                     emit_load_u64(ops, 9, VALUE_HOLE);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadTrue => {
-                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
+                    let dst = lowered.destination_operands()?.dst;
                     emit_load_u64(ops, 9, VALUE_TRUE);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::LoadFalse => {
-                    let dst = plan.destination_operands(instr.byte_pc)?.dst;
+                    let dst = lowered.destination_operands()?.dst;
                     emit_load_u64(ops, 9, VALUE_FALSE);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::StoreLocal => {
-                    let operands = plan.local_operands(instr.byte_pc)?;
+                    let operands = lowered.local_operands()?;
                     load_reg(ops, 9, operands.value)?;
                     store_reg(ops, 9, operands.local)?;
                 }
                 Op::Add => emit_add_with_runtime_fallback(
                     ops,
-                    plan.binary_operands(instr.byte_pc)?,
-                    plan.add_alloc_safepoints.get(&instr.byte_pc).copied(),
+                    lowered.binary_operands()?,
+                    plan.add_alloc_safepoints.get(&lowered.byte_pc).copied(),
                     view.code_block.register_count,
                     threw,
                 )?,
                 Op::Sub | Op::Mul | Op::Div if enable_fres => {
-                    emit_float_binop_res(
-                        ops,
-                        plan.binary_operands(instr.byte_pc)?,
-                        bail,
-                        instr.op(code_block),
-                        fres,
-                    )?;
+                    emit_float_binop_res(ops, lowered.binary_operands()?, bail, lowered.op, fres)?;
                 }
                 Op::Sub | Op::Mul => {
-                    emit_add_sub_mul(
-                        ops,
-                        plan.binary_operands(instr.byte_pc)?,
-                        bail,
-                        instr.op(code_block),
-                    )?;
+                    emit_add_sub_mul(ops, lowered.binary_operands()?, bail, lowered.op)?;
                 }
-                Op::Div => emit_div(ops, plan.binary_operands(instr.byte_pc)?, bail)?,
-                Op::Rem => emit_rem(ops, plan.binary_operands(instr.byte_pc)?, bail)?,
+                Op::Div => emit_div(ops, lowered.binary_operands()?, bail)?,
+                Op::Rem => emit_rem(ops, lowered.binary_operands()?, bail)?,
                 Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan
@@ -201,7 +190,7 @@ impl EmissionSession {
                 | Op::NotEqual
                     if enable_fres =>
                 {
-                    let cmp = match instr.op(code_block) {
+                    let cmp = match lowered.op {
                         Op::LessThan => Cmp::Lt,
                         Op::LessEq => Cmp::Le,
                         Op::GreaterThan => Cmp::Gt,
@@ -209,34 +198,30 @@ impl EmissionSession {
                         Op::Equal => Cmp::Eq,
                         _ => Cmp::Ne,
                     };
-                    emit_cmp_res(ops, plan.binary_operands(instr.byte_pc)?, bail, cmp, fres)?;
+                    emit_cmp_res(ops, lowered.binary_operands()?, bail, cmp, fres)?;
                 }
-                Op::LessThan => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Lt)?,
-                Op::LessEq => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Le)?,
-                Op::GreaterThan => {
-                    emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Gt)?
-                }
-                Op::GreaterEq => {
-                    emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Ge)?
-                }
-                Op::Equal => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Eq)?,
-                Op::NotEqual => emit_cmp(ops, plan.binary_operands(instr.byte_pc)?, bail, Cmp::Ne)?,
+                Op::LessThan => emit_cmp(ops, lowered.binary_operands()?, bail, Cmp::Lt)?,
+                Op::LessEq => emit_cmp(ops, lowered.binary_operands()?, bail, Cmp::Le)?,
+                Op::GreaterThan => emit_cmp(ops, lowered.binary_operands()?, bail, Cmp::Gt)?,
+                Op::GreaterEq => emit_cmp(ops, lowered.binary_operands()?, bail, Cmp::Ge)?,
+                Op::Equal => emit_cmp(ops, lowered.binary_operands()?, bail, Cmp::Eq)?,
+                Op::NotEqual => emit_cmp(ops, lowered.binary_operands()?, bail, Cmp::Ne)?,
                 // `ToPrimitive` is identity on primitives. Object/function
                 // families bail so observable coercion hooks run in the VM.
                 Op::ToPrimitive => {
-                    let operands = plan.unary_operands(instr.byte_pc)?;
+                    let operands = lowered.unary_operands()?;
                     emit_to_primitive_identity(ops, operands.dst, operands.src, bail)?;
                 }
                 // `ToNumeric` is identity on a number (int32 or double); emit
                 // a guarded move. Other primitives/objects need the VM path.
                 Op::ToNumeric => {
-                    let operands = plan.unary_operands(instr.byte_pc)?;
+                    let operands = lowered.unary_operands()?;
                     load_reg(ops, 9, operands.src)?;
                     guard_number!(ops, 9, bail);
                     store_reg(ops, 9, operands.dst)?;
                 }
                 Op::Jump => {
-                    let target = plan.branch_target(instr.byte_pc)?;
+                    let target = lowered.branch_operands()?.target;
                     let tgt = labels[&target];
                     if target <= instruction_pc {
                         emit_backedge_interrupt_check(ops, threw);
@@ -244,8 +229,9 @@ impl EmissionSession {
                     dynasm!(ops ; .arch aarch64 ; b =>tgt);
                 }
                 Op::JumpIfFalse | Op::JumpIfTrue => {
-                    let cond = reg(ops_ref, 1)?;
-                    let target = plan.branch_target(instr.byte_pc)?;
+                    let operands = lowered.conditional_branch_operands()?;
+                    let cond = operands.condition;
+                    let target = operands.target;
                     let tgt = labels[&target];
                     load_reg(ops, 9, cond)?;
                     // Only boolean conditions are supported in this subset.
@@ -259,7 +245,7 @@ impl EmissionSession {
                     if target <= instruction_pc {
                         let taken = ops.new_dynamic_label();
                         let fallthrough = ops.new_dynamic_label();
-                        if matches!(instr.op(code_block), Op::JumpIfFalse) {
+                        if matches!(lowered.op, Op::JumpIfFalse) {
                             dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
                         } else {
                             dynasm!(ops ; .arch aarch64 ; b.eq =>taken);
@@ -267,7 +253,7 @@ impl EmissionSession {
                         dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
                         emit_backedge_interrupt_check(ops, threw);
                         dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
-                    } else if matches!(instr.op(code_block), Op::JumpIfFalse) {
+                    } else if matches!(lowered.op, Op::JumpIfFalse) {
                         dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
                     } else {
                         dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -994,37 +980,18 @@ impl EmissionSession {
                     );
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
-                Op::BitwiseOr => emit_int_binop(
-                    ops,
-                    plan.binary_operands(instr.byte_pc)?,
-                    bail,
-                    IntBinOp::Or,
-                )?,
-                Op::BitwiseAnd => emit_int_binop(
-                    ops,
-                    plan.binary_operands(instr.byte_pc)?,
-                    bail,
-                    IntBinOp::And,
-                )?,
-                Op::BitwiseXor => emit_int_binop(
-                    ops,
-                    plan.binary_operands(instr.byte_pc)?,
-                    bail,
-                    IntBinOp::Xor,
-                )?,
-                Op::Shl => emit_int_binop(
-                    ops,
-                    plan.binary_operands(instr.byte_pc)?,
-                    bail,
-                    IntBinOp::Shl,
-                )?,
-                Op::Shr => emit_int_binop(
-                    ops,
-                    plan.binary_operands(instr.byte_pc)?,
-                    bail,
-                    IntBinOp::Shr,
-                )?,
-                Op::Ushr => emit_ushr(ops, plan.binary_operands(instr.byte_pc)?, bail)?,
+                Op::BitwiseOr => {
+                    emit_int_binop(ops, lowered.binary_operands()?, bail, IntBinOp::Or)?
+                }
+                Op::BitwiseAnd => {
+                    emit_int_binop(ops, lowered.binary_operands()?, bail, IntBinOp::And)?
+                }
+                Op::BitwiseXor => {
+                    emit_int_binop(ops, lowered.binary_operands()?, bail, IntBinOp::Xor)?
+                }
+                Op::Shl => emit_int_binop(ops, lowered.binary_operands()?, bail, IntBinOp::Shl)?,
+                Op::Shr => emit_int_binop(ops, lowered.binary_operands()?, bail, IntBinOp::Shr)?,
+                Op::Ushr => emit_ushr(ops, lowered.binary_operands()?, bail)?,
                 Op::Return | Op::ReturnValue => {
                     let src = reg(ops_ref, 0)?;
                     let off = reg_offset(src)?;
@@ -1142,7 +1109,7 @@ impl EmissionSession {
                     );
                 }
                 Op::Neg => {
-                    let operands = plan.unary_operands(instr.byte_pc)?;
+                    let operands = lowered.unary_operands()?;
                     dynasm!(ops
                         ; .arch aarch64
                         ; mov x0, x20
@@ -1154,8 +1121,8 @@ impl EmissionSession {
                 Op::LooseEqual | Op::LooseNotEqual => {
                     emit_loose_cmp(
                         ops,
-                        plan.binary_operands(instr.byte_pc)?,
-                        instr.op(code_block) == Op::LooseNotEqual,
+                        lowered.binary_operands()?,
+                        lowered.op == Op::LooseNotEqual,
                         bail,
                     )?;
                 }
@@ -1192,7 +1159,7 @@ impl EmissionSession {
             // values around it in a numeric cluster); anything else is a
             // boundary or writes a slot the cache cannot track, so drop all.
             if enable_fres {
-                match instr.op(code_block) {
+                match lowered.op {
                     Op::Sub
                     | Op::Mul
                     | Op::Div
@@ -1205,12 +1172,15 @@ impl EmissionSession {
                     Op::LoadInt32
                     | Op::LoadLocal
                     | Op::LoadNumber
-                    | Op::LoadString
                     | Op::LoadTrue
                     | Op::LoadFalse
                     | Op::LoadUndefined
-                    | Op::LoadHole
-                    | Op::LoadBigInt => {
+                    | Op::LoadHole => {
+                        if let Some(dst) = lowered.written_register() {
+                            fres.invalidate(dst);
+                        }
+                    }
+                    Op::LoadString | Op::LoadBigInt => {
                         if let Ok(dst) = reg(ops_ref, 0) {
                             fres.invalidate(dst);
                         }

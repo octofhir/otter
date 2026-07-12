@@ -870,7 +870,12 @@ mod tests {
             (Op::ReturnUndefined, vec![]),
         ]);
         let plan = BaselinePlan::build(&v).expect("plan");
-        assert_eq!(plan.branch_target(0), Ok(1));
+        assert_eq!(
+            plan.instructions[0]
+                .branch_operands()
+                .map(|operands| operands.target),
+            Ok(1)
+        );
     }
 
     #[test]
@@ -917,23 +922,23 @@ mod tests {
             ),
             (Op::ReturnValue, vec![Operand::Register(3)]),
         ]);
-        let byte_pcs: Vec<_> = v
-            .instructions
-            .iter()
-            .map(|instruction| instruction.byte_pc)
-            .collect();
         let plan = BaselinePlan::build(&v).expect("plan");
 
-        let load = plan
-            .load_int32_operands(byte_pcs[0])
+        assert_eq!(plan.instructions.len(), v.instructions.len());
+        assert_eq!(plan.instructions[0].op, Op::LoadInt32);
+        assert_eq!(plan.instructions[0].byte_pc, v.instructions[0].byte_pc);
+        let load = plan.instructions[0]
+            .load_int32_operands()
             .expect("LoadInt32 operands");
         assert_eq!((load.dst, load.value), (0, 42));
-        let add = plan.binary_operands(byte_pcs[1]).expect("Add operands");
+        let add = plan.instructions[1]
+            .binary_operands()
+            .expect("Add operands");
         assert_eq!((add.dst, add.lhs, add.rhs), (2, 0, 1));
-        let neg = plan.unary_operands(byte_pcs[2]).expect("Neg operands");
+        let neg = plan.instructions[2].unary_operands().expect("Neg operands");
         assert_eq!((neg.dst, neg.src), (3, 2));
-        let store = plan
-            .local_operands(byte_pcs[3])
+        let store = plan.instructions[3]
+            .local_operands()
             .expect("StoreLocal operands");
         assert_eq!((store.value, store.local), (3, 7));
     }

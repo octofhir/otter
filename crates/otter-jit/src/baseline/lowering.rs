@@ -3,7 +3,8 @@
 //! # Contents
 //! - Whole-function fallback reasons shared by baseline backends.
 //! - Call-site argument packing policy.
-//! - Typed bytecode operand decoding and branch/register validation.
+//! - A linear typed instruction stream with canonical branch targets.
+//! - Bytecode operand decoding and branch/register validation.
 //!
 //! # Invariants
 //! - Invalid bytecode shapes reject the whole baseline compilation.
@@ -79,13 +80,104 @@ pub(crate) struct BinaryOperands {
     pub(crate) rhs: u16,
 }
 
+/// Canonical control-flow target resolved to a verified logical PC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlannedOperands {
+pub(crate) struct BranchOperands {
+    pub(crate) target: u32,
+}
+
+/// Conditional control-flow operands with a verified canonical target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConditionalBranchOperands {
+    pub(crate) target: u32,
+    pub(crate) condition: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoweredOperands {
+    Raw,
     Destination(DestinationOperands),
     LoadInt32(LoadInt32Operands),
     Local(LocalOperands),
     Unary(UnaryOperands),
     Binary(BinaryOperands),
+    Branch(BranchOperands),
+    ConditionalBranch(ConditionalBranchOperands),
+}
+
+/// One backend-neutral instruction in canonical emission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoweredInstr {
+    pub(crate) byte_pc: u32,
+    pub(crate) instruction_pc: u32,
+    pub(crate) op: Op,
+    operands: LoweredOperands,
+}
+
+impl LoweredInstr {
+    pub(crate) fn destination_operands(self) -> Result<DestinationOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Destination(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered destination operands")),
+        }
+    }
+
+    pub(crate) fn load_int32_operands(self) -> Result<LoadInt32Operands, Unsupported> {
+        match self.operands {
+            LoweredOperands::LoadInt32(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered LoadInt32 operands")),
+        }
+    }
+
+    pub(crate) fn local_operands(self) -> Result<LocalOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Local(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered local operands")),
+        }
+    }
+
+    pub(crate) fn unary_operands(self) -> Result<UnaryOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Unary(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered unary operands")),
+        }
+    }
+
+    pub(crate) fn binary_operands(self) -> Result<BinaryOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Binary(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered binary operands")),
+        }
+    }
+
+    pub(crate) fn branch_operands(self) -> Result<BranchOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Branch(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered branch operands")),
+        }
+    }
+
+    pub(crate) fn conditional_branch_operands(
+        self,
+    ) -> Result<ConditionalBranchOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ConditionalBranch(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape(
+                "lowered conditional branch operands",
+            )),
+        }
+    }
+
+    pub(crate) fn written_register(self) -> Option<u16> {
+        match self.operands {
+            LoweredOperands::Destination(operands) => Some(operands.dst),
+            LoweredOperands::LoadInt32(operands) => Some(operands.dst),
+            LoweredOperands::Local(operands) if self.op == Op::LoadLocal => Some(operands.value),
+            LoweredOperands::Unary(operands) => Some(operands.dst),
+            LoweredOperands::Binary(operands) => Some(operands.dst),
+            _ => None,
+        }
+    }
 }
 
 /// Backend-neutral facts established before machine-code emission starts.
@@ -94,12 +186,10 @@ enum PlannedOperands {
 /// baseline backend while ensuring the assembler never discovers malformed
 /// control flow after it has already emitted part of a function.
 pub(crate) struct BaselinePlan {
-    pub(crate) instruction_pcs: Vec<u32>,
+    pub(crate) instructions: Vec<LoweredInstr>,
     pub(crate) enable_float_residency: bool,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
-    branch_targets: BTreeMap<u32, u32>,
-    planned_operands: BTreeMap<u32, PlannedOperands>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
     pub(crate) method_alloc_safepoints: BTreeMap<u32, SafepointId>,
@@ -108,21 +198,17 @@ pub(crate) struct BaselinePlan {
 impl BaselinePlan {
     pub(crate) fn build(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
         let code_block = view.code_block.as_ref();
-        let mut instruction_pcs = Vec::with_capacity(view.instructions.len());
+        let mut instructions = Vec::with_capacity(view.instructions.len());
         let mut boundaries = BTreeSet::new();
         let mut enable_float_residency = false;
         let mut load_property_count = 0;
         let mut store_property_count = 0;
-        let mut planned_operands = BTreeMap::new();
-
-        let mut branch_targets = BTreeMap::new();
         for instr in &view.instructions {
             let op = instr.op(code_block);
             let pc = instr.instruction_pc(code_block);
             if !boundaries.insert(pc) {
                 return Err(Unsupported::OperandShape("duplicate instruction pc"));
             }
-            instruction_pcs.push(pc);
 
             match op {
                 Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally => {
@@ -142,28 +228,28 @@ impl BaselinePlan {
             }
 
             let operands = instr.operand_view(code_block);
-            let planned = match op {
-                Op::LoadInt32 => Some(PlannedOperands::LoadInt32(LoadInt32Operands {
+            let operands = match op {
+                Op::LoadInt32 => LoweredOperands::LoadInt32(LoadInt32Operands {
                     dst: reg(operands, 0)?,
                     value: imm32(operands, 1)?,
-                })),
+                }),
                 Op::LoadNumber
                 | Op::LoadUndefined
                 | Op::LoadNull
                 | Op::LoadHole
                 | Op::LoadTrue
-                | Op::LoadFalse => Some(PlannedOperands::Destination(DestinationOperands {
+                | Op::LoadFalse => LoweredOperands::Destination(DestinationOperands {
                     dst: reg(operands, 0)?,
-                })),
-                Op::LoadLocal | Op::StoreLocal => Some(PlannedOperands::Local(LocalOperands {
+                }),
+                Op::LoadLocal | Op::StoreLocal => LoweredOperands::Local(LocalOperands {
                     value: reg(operands, 0)?,
                     local: local_index(operands, 1)?,
-                })),
+                }),
                 Op::ToPrimitive | Op::ToNumeric | Op::Neg => {
-                    Some(PlannedOperands::Unary(UnaryOperands {
+                    LoweredOperands::Unary(UnaryOperands {
                         dst: reg(operands, 0)?,
                         src: reg(operands, 1)?,
-                    }))
+                    })
                 }
                 Op::Add
                 | Op::Sub
@@ -185,27 +271,36 @@ impl BaselinePlan {
                 | Op::Shr
                 | Op::Ushr => {
                     let (dst, lhs, rhs) = reg3(operands)?;
-                    Some(PlannedOperands::Binary(BinaryOperands { dst, lhs, rhs }))
+                    LoweredOperands::Binary(BinaryOperands { dst, lhs, rhs })
                 }
-                _ => None,
+                _ => LoweredOperands::Raw,
             };
-            if let Some(planned) = planned {
-                planned_operands.insert(instr.byte_pc, planned);
-            }
+            instructions.push(LoweredInstr {
+                byte_pc: instr.byte_pc,
+                instruction_pc: pc,
+                op,
+                operands,
+            });
         }
 
-        for instr in &view.instructions {
-            if matches!(
-                instr.op(code_block),
-                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue
-            ) {
+        for (instr, lowered) in view.instructions.iter().zip(&mut instructions) {
+            if matches!(lowered.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
                 let rel = imm32(instr.operand_view(code_block), 0)?;
                 let target = branch_target(code_block, instr, rel);
                 let target_pc = u32::try_from(target)
                     .ok()
                     .filter(|pc| boundaries.contains(pc))
                     .ok_or(Unsupported::BranchTarget(target))?;
-                branch_targets.insert(instr.byte_pc, target_pc);
+                lowered.operands = match lowered.op {
+                    Op::Jump => LoweredOperands::Branch(BranchOperands { target: target_pc }),
+                    Op::JumpIfFalse | Op::JumpIfTrue => {
+                        LoweredOperands::ConditionalBranch(ConditionalBranchOperands {
+                            target: target_pc,
+                            condition: reg(instr.operand_view(code_block), 1)?,
+                        })
+                    }
+                    _ => unreachable!("branch opcode was filtered above"),
+                };
             }
         }
 
@@ -218,12 +313,12 @@ impl BaselinePlan {
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
         let mut method_alloc_safepoints = BTreeMap::new();
-        for instr in &view.instructions {
-            match instr.op(code_block) {
+        for lowered in &instructions {
+            match lowered.op {
                 Op::CallMethodValue => {
                     let safepoint = view
                         .collection_alloc_methods
-                        .get(&instr.byte_pc)
+                        .get(&lowered.byte_pc)
                         .map(|alloc| alloc.safepoint_id)
                         .unwrap_or_else(|| {
                             let id = next_safepoint;
@@ -235,12 +330,12 @@ impl BaselinePlan {
                             ));
                             id
                         });
-                    method_alloc_safepoints.insert(instr.byte_pc, safepoint);
+                    method_alloc_safepoints.insert(lowered.byte_pc, safepoint);
                 }
                 Op::Add => {
                     let safepoint = next_safepoint;
                     next_safepoint = next_safepoint.saturating_add(1);
-                    add_alloc_safepoints.insert(instr.byte_pc, safepoint);
+                    add_alloc_safepoints.insert(lowered.byte_pc, safepoint);
                     safepoint_records.push(SafepointRecord::frame_slot_window(
                         safepoint,
                         NO_FRAME_STATE,
@@ -252,72 +347,14 @@ impl BaselinePlan {
         }
 
         Ok(Self {
-            instruction_pcs,
+            instructions,
             enable_float_residency,
             load_property_count,
             store_property_count,
-            branch_targets,
-            planned_operands,
             safepoint_records,
             add_alloc_safepoints,
             method_alloc_safepoints,
         })
-    }
-
-    /// Canonical target PC resolved and verified for a branch bytecode site.
-    pub(crate) fn branch_target(&self, byte_pc: u32) -> Result<u32, Unsupported> {
-        self.branch_targets
-            .get(&byte_pc)
-            .copied()
-            .ok_or(Unsupported::OperandShape("missing planned branch target"))
-    }
-
-    fn planned_operands(&self, byte_pc: u32) -> Result<PlannedOperands, Unsupported> {
-        self.planned_operands
-            .get(&byte_pc)
-            .copied()
-            .ok_or(Unsupported::OperandShape("missing planned operands"))
-    }
-
-    pub(crate) fn destination_operands(
-        &self,
-        byte_pc: u32,
-    ) -> Result<DestinationOperands, Unsupported> {
-        match self.planned_operands(byte_pc)? {
-            PlannedOperands::Destination(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("planned destination operands")),
-        }
-    }
-
-    pub(crate) fn load_int32_operands(
-        &self,
-        byte_pc: u32,
-    ) -> Result<LoadInt32Operands, Unsupported> {
-        match self.planned_operands(byte_pc)? {
-            PlannedOperands::LoadInt32(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("planned LoadInt32 operands")),
-        }
-    }
-
-    pub(crate) fn local_operands(&self, byte_pc: u32) -> Result<LocalOperands, Unsupported> {
-        match self.planned_operands(byte_pc)? {
-            PlannedOperands::Local(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("planned local operands")),
-        }
-    }
-
-    pub(crate) fn unary_operands(&self, byte_pc: u32) -> Result<UnaryOperands, Unsupported> {
-        match self.planned_operands(byte_pc)? {
-            PlannedOperands::Unary(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("planned unary operands")),
-        }
-    }
-
-    pub(crate) fn binary_operands(&self, byte_pc: u32) -> Result<BinaryOperands, Unsupported> {
-        match self.planned_operands(byte_pc)? {
-            PlannedOperands::Binary(operands) => Ok(operands),
-            _ => Err(Unsupported::OperandShape("planned binary operands")),
-        }
     }
 }
 

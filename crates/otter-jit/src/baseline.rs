@@ -994,6 +994,59 @@ mod tests {
     }
 
     #[test]
+    fn lowering_plan_publishes_property_and_upvalue_operands() {
+        let v = view(&[
+            (
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(7),
+                ],
+            ),
+            (
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(7),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::LoadUpvalue,
+                vec![Operand::Register(4), Operand::Imm32(5)],
+            ),
+            (
+                Op::StoreUpvalueChecked,
+                vec![Operand::Register(4), Operand::Imm32(5)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(4)]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+
+        let load = plan.instructions[0]
+            .property_load_operands()
+            .expect("LoadProperty operands");
+        assert_eq!((load.dst, load.object, load.name), (2, 0, 7));
+        let store = plan.instructions[1]
+            .property_store_operands()
+            .expect("StoreProperty operands");
+        assert_eq!(
+            (store.object, store.name, store.value, store.scratch),
+            (0, 7, 2, 3)
+        );
+        let load_upvalue = plan.instructions[2]
+            .upvalue_operands()
+            .expect("LoadUpvalue operands");
+        assert_eq!((load_upvalue.value, load_upvalue.index), (4, 5));
+        let store_upvalue = plan.instructions[3]
+            .upvalue_operands()
+            .expect("StoreUpvalueChecked operands");
+        assert_eq!((store_upvalue.value, store_upvalue.index), (4, 5));
+    }
+
+    #[test]
     fn method_call_uses_full_packed_argument_abi() {
         let four_args = view(&[
             (

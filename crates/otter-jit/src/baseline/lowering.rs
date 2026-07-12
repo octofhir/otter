@@ -118,6 +118,31 @@ pub(crate) struct IncrementOperands {
     pub(crate) delta: i32,
 }
 
+/// Typed named-property load operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropertyLoadOperands {
+    pub(crate) dst: u16,
+    pub(crate) object: u16,
+    pub(crate) name: u32,
+}
+
+/// Typed named-property store operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropertyStoreOperands {
+    pub(crate) object: u16,
+    pub(crate) name: u32,
+    pub(crate) value: u16,
+    pub(crate) scratch: u16,
+}
+
+/// Typed captured-binding transfer operands. `value` is the load destination
+/// or store source according to the opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpvalueOperands {
+    pub(crate) value: u16,
+    pub(crate) index: i32,
+}
+
 /// Canonical control-flow target resolved to a verified logical PC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BranchOperands {
@@ -144,6 +169,9 @@ enum LoweredOperands {
     ElementLoad(ElementLoadOperands),
     ElementStore(ElementStoreOperands),
     Increment(IncrementOperands),
+    PropertyLoad(PropertyLoadOperands),
+    PropertyStore(PropertyStoreOperands),
+    Upvalue(UpvalueOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
 }
@@ -228,6 +256,27 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn property_load_operands(self) -> Result<PropertyLoadOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::PropertyLoad(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered property-load operands")),
+        }
+    }
+
+    pub(crate) fn property_store_operands(self) -> Result<PropertyStoreOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::PropertyStore(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered property-store operands")),
+        }
+    }
+
+    pub(crate) fn upvalue_operands(self) -> Result<UpvalueOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Upvalue(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered upvalue operands")),
+        }
+    }
+
     pub(crate) fn branch_operands(self) -> Result<BranchOperands, Unsupported> {
         match self.operands {
             LoweredOperands::Branch(operands) => Ok(operands),
@@ -256,6 +305,10 @@ impl LoweredInstr {
             LoweredOperands::Binary(operands) => Some(operands.dst),
             LoweredOperands::ElementLoad(operands) => Some(operands.dst),
             LoweredOperands::Increment(operands) => Some(operands.dst),
+            LoweredOperands::PropertyLoad(operands) => Some(operands.dst),
+            LoweredOperands::Upvalue(operands) if self.op == Op::LoadUpvalue => {
+                Some(operands.value)
+            }
             _ => None,
         }
     }
@@ -318,7 +371,10 @@ impl BaselinePlan {
                 Op::NewObject | Op::LoadThis => LoweredOperands::Destination(DestinationOperands {
                     dst: reg(operands, 0)?,
                 }),
-                Op::MakeFunction | Op::LoadString => LoweredOperands::Constant(ConstantOperands {
+                Op::MakeFunction
+                | Op::LoadString
+                | Op::LoadGlobalOrThrow
+                | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,
                 }),
@@ -363,6 +419,23 @@ impl BaselinePlan {
                     value: reg(operands, 2)?,
                     scratch: reg(operands, 3)?,
                 }),
+                Op::LoadProperty => LoweredOperands::PropertyLoad(PropertyLoadOperands {
+                    dst: reg(operands, 0)?,
+                    object: reg(operands, 1)?,
+                    name: const_index(operands, 2)?,
+                }),
+                Op::StoreProperty => LoweredOperands::PropertyStore(PropertyStoreOperands {
+                    object: reg(operands, 0)?,
+                    name: const_index(operands, 1)?,
+                    value: reg(operands, 2)?,
+                    scratch: reg(operands, 3)?,
+                }),
+                Op::LoadUpvalue | Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                    LoweredOperands::Upvalue(UpvalueOperands {
+                        value: reg(operands, 0)?,
+                        index: imm32(operands, 1)?,
+                    })
+                }
                 Op::Add
                 | Op::Sub
                 | Op::Mul

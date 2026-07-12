@@ -31,6 +31,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod arith;
+mod transitions;
 mod values;
 
 use std::collections::BTreeMap;
@@ -39,18 +40,21 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::JitCompileSnapshot;
 
 use self::arith::{
-    emit_binary_arith, emit_compare, emit_increment, emit_int_bitwise, emit_loose_compare,
-    emit_negate, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
+    emit_add_generic, emit_binary_arith, emit_compare, emit_increment, emit_int_bitwise,
+    emit_loose_compare, emit_negate, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
+use self::transitions::TransitionTable;
 use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::baseline::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-    NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, Unsupported,
-    VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-    VM_THREAD_INTERRUPT_CELL_OFFSET, jit_backedge_poll_stub, reg_offset,
+    NUMBER_TAG_HI16, SELF_CLOSURE_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
+    THIS_VALUE_OFFSET, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
+    VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+    reg_offset,
 };
+use otter_vm::native_abi as abi;
 
 /// Boolean/nullish immediates as 32-bit `dynasm` operands.
 const VALUE_TRUE_IMM: u32 = VALUE_TRUE as u32;
@@ -63,6 +67,9 @@ pub(super) fn compile(
     code_object_id: u64,
 ) -> Result<TemplateCode, Unsupported> {
     let plan = TemplatePlan::build(view)?;
+    let transitions = TransitionTable::resolve();
+    let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
+    let code_block_id = view.code_block.id;
     let mut ops = Assembler::new().expect("assembler alloc");
     let bail = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
@@ -93,7 +100,7 @@ pub(super) fn compile(
             TemplateOp::Jump { target, back_edge } => {
                 let tgt = labels[&target];
                 if back_edge {
-                    emit_backedge_poll(&mut ops, threw);
+                    emit_backedge_poll(&mut ops, poll_entry, threw);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt);
             }
@@ -116,7 +123,7 @@ pub(super) fn compile(
                         dynasm!(ops ; .arch aarch64 ; b.ne =>taken);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                    emit_backedge_poll(&mut ops, threw);
+                    emit_backedge_poll(&mut ops, poll_entry, threw);
                     dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
                 } else if when_truthy {
                     dynasm!(ops ; .arch aarch64 ; b.eq =>tgt);
@@ -180,6 +187,160 @@ pub(super) fn compile(
             TemplateOp::ToPrimitive { dst, src } => {
                 emit_to_primitive(&mut ops, dst, src, bail)?;
             }
+            TemplateOp::AddGeneric {
+                dst,
+                lhs,
+                rhs,
+                concat_safepoint,
+            } => {
+                emit_add_generic(
+                    &mut ops,
+                    &transitions,
+                    dst,
+                    lhs,
+                    rhs,
+                    concat_safepoint,
+                    threw,
+                )?;
+            }
+            TemplateOp::LoadThis { dst } => {
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
+                emit_load_u64(&mut ops, 12, VALUE_HOLE);
+                // A derived-ctor `this`-before-`super` hole resolves in the
+                // interpreter.
+                dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
+                emit_store_reg(&mut ops, 9, dst)?;
+            }
+            TemplateOp::LoadSelfClosure { dst } => {
+                dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, SELF_CLOSURE_OFFSET]);
+                emit_store_reg(&mut ops, 9, dst)?;
+            }
+            TemplateOp::MakeFunction { dst, constant } => {
+                transitions::emit_make_function(&mut ops, &transitions, dst, constant, threw);
+            }
+            TemplateOp::MakeClosure {
+                dst,
+                function,
+                parents,
+            } => {
+                transitions::emit_make_closure(
+                    &mut ops,
+                    &transitions,
+                    code_block_id,
+                    dst,
+                    function,
+                    plan.index_tail(parents),
+                    threw,
+                );
+            }
+            TemplateOp::LoadString { dst, constant } => {
+                transitions::emit_load_string(
+                    &mut ops,
+                    &transitions,
+                    code_block_id,
+                    dst,
+                    constant,
+                    threw,
+                );
+            }
+            TemplateOp::LoadGlobal { dst, name } => {
+                transitions::emit_load_global(
+                    &mut ops,
+                    &transitions,
+                    dst,
+                    name,
+                    code_block_id,
+                    threw,
+                );
+            }
+            TemplateOp::LoadBuiltinError { dst, constant } => {
+                transitions::emit_load_builtin_error(&mut ops, &transitions, dst, constant, threw);
+            }
+            TemplateOp::NewObject { dst } => {
+                transitions::emit_new_object(&mut ops, &transitions, dst, threw);
+            }
+            TemplateOp::NewArray { dst, elements } => {
+                transitions::emit_new_array(
+                    &mut ops,
+                    &transitions,
+                    dst,
+                    plan.register_tail(elements),
+                    threw,
+                );
+            }
+            TemplateOp::MathCall {
+                dst,
+                method,
+                arguments,
+            } => {
+                transitions::emit_math_call(
+                    &mut ops,
+                    &transitions,
+                    dst,
+                    method,
+                    plan.register_tail(arguments),
+                    threw,
+                )?;
+            }
+            TemplateOp::FreshUpvalue { index } => {
+                transitions::emit_fresh_upvalue(&mut ops, &transitions, index, threw);
+            }
+            TemplateOp::DefineDataProperty { object, key, value } => {
+                transitions::emit_define_data_property(
+                    &mut ops,
+                    &transitions,
+                    object,
+                    key,
+                    value,
+                    threw,
+                );
+            }
+            TemplateOp::DefineOwnProperty {
+                target,
+                key,
+                descriptor,
+            } => {
+                transitions::emit_define_own_property(
+                    &mut ops,
+                    &transitions,
+                    target,
+                    key,
+                    descriptor,
+                    threw,
+                );
+            }
+            TemplateOp::LoadElement {
+                dst,
+                receiver,
+                index,
+            } => {
+                transitions::emit_load_element(&mut ops, &transitions, dst, receiver, index, threw);
+            }
+            TemplateOp::StoreElement {
+                receiver,
+                index,
+                value,
+                scratch,
+            } => {
+                transitions::emit_store_element(
+                    &mut ops,
+                    &transitions,
+                    receiver,
+                    index,
+                    value,
+                    scratch,
+                    threw,
+                );
+            }
+            TemplateOp::LoadUpvalue { dst, index } => {
+                transitions::emit_load_upvalue(&mut ops, &transitions, dst, index, threw);
+            }
+            TemplateOp::StoreUpvalue { src, index } => {
+                transitions::emit_store_upvalue(&mut ops, &transitions, src, index, false, threw);
+            }
+            TemplateOp::StoreUpvalueChecked { src, index } => {
+                transitions::emit_store_upvalue(&mut ops, &transitions, src, index, true, threw);
+            }
             TemplateOp::Return { src } => {
                 let off = reg_offset(src)?;
                 dynasm!(ops
@@ -216,11 +377,22 @@ pub(super) fn compile(
     emit_epilogue(&mut ops);
 
     let buf = ops.finalize().expect("finalize");
+    let TemplatePlan {
+        register_count,
+        register_operands,
+        index_operands,
+        mut safepoint_records,
+        ..
+    } = plan;
+    safepoint_records.sort_by_key(|record| record.id);
     Ok(TemplateCode::from_emission(
         CompiledCode::new(buf, entry),
         code_object_id,
         view.code_block.id,
-        plan.register_count,
+        register_count,
+        register_operands,
+        index_operands,
+        safepoint_records.into_boxed_slice(),
     ))
 }
 
@@ -310,9 +482,10 @@ fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
 
 /// Inline cooperative poll at a back edge: read the interrupt byte and
 /// decrement the fuel counter, re-entering the poll stub only when the
-/// interrupt is set or the counter reaches zero. A nonzero stub status
-/// branches to the throw epilogue.
-fn emit_backedge_poll(ops: &mut Assembler, threw: DynamicLabel) {
+/// interrupt is set or the counter reaches zero. `poll_entry` is the
+/// descriptor-resolved poll transition; a nonzero status branches to the
+/// throw epilogue.
+fn emit_backedge_poll(ops: &mut Assembler, poll_entry: u64, threw: DynamicLabel) {
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
     dynasm!(ops
@@ -329,7 +502,7 @@ fn emit_backedge_poll(ops: &mut Assembler, threw: DynamicLabel) {
         ; =>slow
         ; mov x0, x20
     );
-    emit_load_u64(ops, 16, jit_backedge_poll_stub as *const () as u64);
+    emit_load_u64(ops, 16, poll_entry);
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

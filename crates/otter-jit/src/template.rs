@@ -334,12 +334,12 @@ mod tests {
     #[test]
     fn unsupported_opcodes_reject_the_whole_function() {
         let v = view(&[
-            (Op::NewObject, vec![Operand::Register(2)]),
+            (Op::Throw, vec![Operand::Register(2)]),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
         assert_eq!(
             compile(&v).err(),
-            Some(super::Unsupported::Opcode(Op::NewObject))
+            Some(super::Unsupported::Opcode(Op::Throw))
         );
     }
 

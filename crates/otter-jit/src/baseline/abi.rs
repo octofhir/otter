@@ -124,6 +124,9 @@ pub(crate) const STATUS_THREW: u64 = 2;
 #[allow(dead_code)]
 pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
 pub(crate) const THREAD_OFFSET: u32 = std::mem::offset_of!(JitCtx, thread) as u32;
+/// Byte offset of the SELF-closure bits in [`JitCtx`], for inline
+/// named-function self bindings.
+pub(crate) const SELF_CLOSURE_OFFSET: u32 = std::mem::offset_of!(JitCtx, self_closure) as u32;
 pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_frame) as u32;
 /// Byte offset of the canonical instruction-index PC in the published native
 /// frame. Generated code updates this together with its nested-call exit

@@ -8,8 +8,8 @@
 //! # Invariants
 //! - The executable mapping and the entry pointer share one owner; entries run
 //!   only through the frozen `JitCtx`/`JitRet` contract.
-//! - Template code allocates nothing and owns no safepoints; it exits at exact
-//!   instruction boundaries, so the safepoint surface is legitimately empty.
+//! - Allocating runtime calls name a concrete code-object-owned safepoint;
+//!   the sorted record table resolves ids for the moving collector.
 //! - Metadata versions are validated before every entry selection, exactly as
 //!   for the baseline emitter's code objects.
 //!
@@ -22,7 +22,7 @@ use crate::baseline::enter_compiled;
 use otter_vm::native_abi::{
     BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION,
 };
-use otter_vm::{JitExecOutcome, JitFunctionCode, VmRuntimeActivation};
+use otter_vm::{JitExecOutcome, JitFunctionCode, SafepointRecord, VmRuntimeActivation};
 
 /// Finalized template machine code for one function.
 pub struct TemplateCode {
@@ -35,14 +35,29 @@ pub struct TemplateCode {
     function_id: u32,
     /// Tagged register-window width published in the native frame.
     register_count: u16,
+    /// Stable decoded register buffer shared by variadic operation sites.
+    /// Emitted code passes pointers into this boxed slice to runtime
+    /// transitions, so the allocation must live exactly as long as the code.
+    #[allow(dead_code)]
+    register_operands: Box<[u16]>,
+    /// Stable decoded parent-upvalue index buffer for closure sites; same
+    /// ownership contract as [`Self::register_operands`].
+    #[allow(dead_code)]
+    index_operands: Box<[u32]>,
+    /// Code-object-owned allocating safepoints, sorted by id.
+    safepoint_records: Box<[SafepointRecord]>,
 }
 
 impl TemplateCode {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_emission(
         code: CompiledCode,
         code_object_id: u64,
         function_id: u32,
         register_count: u16,
+        register_operands: Box<[u16]>,
+        index_operands: Box<[u32]>,
+        safepoint_records: Box<[SafepointRecord]>,
     ) -> Self {
         const AARCH64_TEMPLATE_ABI: u64 = 0x4136_3454_504c_0001;
         let metadata = CodeObjectMetadata {
@@ -50,8 +65,8 @@ impl TemplateCode {
             code_block_id: function_id,
             entry_offset: 0,
             code_size: code.len() as u32,
-            safepoint_count: 0,
-            frame_map_count: 0,
+            safepoint_count: safepoint_records.len() as u32,
+            frame_map_count: safepoint_records.len() as u32,
             spill_map_count: 0,
             dependency_count: 0,
             reserved: 0,
@@ -67,6 +82,9 @@ impl TemplateCode {
             code_object_id,
             function_id,
             register_count,
+            register_operands,
+            index_operands,
+            safepoint_records,
         }
     }
 
@@ -94,6 +112,17 @@ impl JitFunctionCode for TemplateCode {
         self.code.len()
     }
 
+    fn safepoint_count(&self) -> u32 {
+        self.safepoint_records.len() as u32
+    }
+
+    fn safepoint_record(&self, safepoint_id: u32) -> Option<&SafepointRecord> {
+        self.safepoint_records
+            .binary_search_by_key(&safepoint_id, |record| record.id)
+            .ok()
+            .map(|index| &self.safepoint_records[index])
+    }
+
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
         assert!(
             self.metadata.is_compatible_with_current_vm(),
@@ -103,8 +132,7 @@ impl JitFunctionCode for TemplateCode {
         // shared compiled-entry ABI.
         let entry = unsafe { self.code.entry_ptr() };
         // SAFETY: `entry` points into the live mapping; `activation` upholds
-        // the reentry contract (valid, non-aliased for the call). Template
-        // code owns no safepoints, so the frame publishes none.
+        // the reentry contract (valid, non-aliased for the call).
         unsafe {
             enter_compiled(
                 activation,
@@ -112,7 +140,7 @@ impl JitFunctionCode for TemplateCode {
                 self.code_object_id,
                 self.function_id,
                 self.register_count,
-                false,
+                !self.safepoint_records.is_empty(),
             )
         }
     }

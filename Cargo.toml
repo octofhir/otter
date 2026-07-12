@@ -35,15 +35,14 @@ license = "MIT"
 
 [workspace.dependencies]
 rustc-hash      = "2.1"
-oxc_allocator   = "0.136"
-oxc_span        = "0.136"
-oxc_syntax      = "0.136"
-oxc_ast         = "0.136"
-oxc_parser      = "0.136"
-oxc_ast_visit   = "0.136"
-oxc_diagnostics = "0.136"
-oxc_codegen     = "0.136"
-oxc_resolver    = "11.19"
+oxc_allocator   = "0.139"
+oxc_span        = "0.139"
+oxc_syntax      = "0.139"
+oxc_ast         = "0.139"
+oxc_parser      = "0.139"
+oxc_ast_visit   = "0.139"
+oxc_diagnostics = "0.139"
+oxc_resolver    = "11.23"
 
 # Errors and serialization.
 anyhow      = "1"
@@ -82,7 +81,7 @@ syn         = { version = "2", features = ["full", "parsing", "printing"] }
 num-bigint  = "0.4"
 num-traits  = "0.2"
 
-temporal_rs = { version = "0.2.3", features = ["sys-local", "compiled_data"] }
+temporal_rs = { version = "0.2.4", features = ["sys-local", "compiled_data"] }
 
 icu_collator = { version = "2.1", features = ["compiled_data"] }
 icu_normalizer = { version = "2.1", features = ["compiled_data"] }
@@ -104,7 +103,6 @@ otter-syntax    = { path = "crates/otter-syntax" }
 otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
 otter-jit       = { path = "crates/otter-jit" }
-otter-benchmark = { path = "crates/otter-benchmark" }
 otter-regex     = { path = "crates/otter-regex" }
 otter-macros    = { path = "crates/otter-macros" }
 otter-vm        = { path = "crates/otter-vm" }

@@ -36,6 +36,8 @@ pub mod stream;
 pub mod string_decoder;
 pub mod stubs;
 pub mod timers;
+pub mod tty;
+pub mod url;
 pub mod util;
 pub mod zlib;
 
@@ -98,6 +100,11 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "internal/event_target",
         HostedModuleInstall::new(misc_modules::install_noop),
         misc_modules::internal_event_target_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "internal/url",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::internal_url_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "internal/errors",
@@ -339,6 +346,26 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         HostedModuleInstall::new(util::install_util_module),
         util::util_cjs_value,
     ),
+    HostedModule::new_with_cjs_value(
+        "node:util/types",
+        HostedModuleInstall::new(util::install_util_module),
+        util::util_types_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "util/types",
+        HostedModuleInstall::new(util::install_util_module),
+        util::util_types_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:tty",
+        HostedModuleInstall::new(tty::install_tty_module),
+        tty::tty_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "tty",
+        HostedModuleInstall::new(tty::install_tty_module),
+        tty::tty_cjs_value,
+    ),
     HostedModule::new("node:net", HostedModuleInstall::new(stubs::install_net)),
     HostedModule::new("net", HostedModuleInstall::new(stubs::install_net)),
     HostedModule::new(
@@ -359,8 +386,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         HostedModuleInstall::new(buffer::install_buffer_module),
         buffer::buffer_cjs_value,
     ),
-    HostedModule::new("node:url", HostedModuleInstall::new(stubs::install_url)),
-    HostedModule::new("url", HostedModuleInstall::new(stubs::install_url)),
+    HostedModule::new_with_cjs_value(
+        "node:url",
+        HostedModuleInstall::new(url::install_url_module),
+        url::url_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "url",
+        HostedModuleInstall::new(url::install_url_module),
+        url::url_cjs_value,
+    ),
     HostedModule::new_with_cjs_value(
         "node:child_process",
         HostedModuleInstall::new(child_process::install_child_process_module),

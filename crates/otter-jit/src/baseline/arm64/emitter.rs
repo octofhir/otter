@@ -523,8 +523,9 @@ impl EmissionSession {
                 }
                 // `dst = global[name]` or throw — delegate to the safe bridge.
                 Op::LoadGlobalOrThrow => {
-                    let dst = reg(ops_ref, 0)?;
-                    let name = const_index(ops_ref, 1)?;
+                    let operands = lowered.constant_operands()?;
+                    let dst = operands.dst;
+                    let name = operands.constant;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(ops, 2, u64::from(name));
                     emit_load_u64(ops, 3, u64::from(view.code_block.id));
@@ -537,8 +538,9 @@ impl EmissionSession {
                 // bridge stub, which raises the `ReferenceError`. `idx` is the
                 // signed bytecode index, passed as u32 bits and re-read as i32.
                 Op::LoadUpvalue => {
-                    let dst = reg(ops_ref, 0)?;
-                    let idx = imm32(ops_ref, 1)?;
+                    let operands = lowered.upvalue_operands()?;
+                    let dst = operands.value;
+                    let idx = operands.index;
                     let up_miss = ops.new_dynamic_label();
                     let up_done = ops.new_dynamic_label();
 
@@ -577,8 +579,9 @@ impl EmissionSession {
                 // needs no write barrier. A pointer value or `0` spine base
                 // misses to the bridge stub, which performs the barriered store.
                 Op::StoreUpvalue => {
-                    let src = reg(ops_ref, 0)?;
-                    let idx = imm32(ops_ref, 1)?;
+                    let operands = lowered.upvalue_operands()?;
+                    let src = operands.value;
+                    let idx = operands.index;
                     let up_miss = ops.new_dynamic_label();
                     let up_done = ops.new_dynamic_label();
 
@@ -616,8 +619,9 @@ impl EmissionSession {
                 // `ReferenceError`). Inlines only the primitive store; a pointer
                 // value misses to the bridge (barriered store inside).
                 Op::StoreUpvalueChecked => {
-                    let src = reg(ops_ref, 0)?;
-                    let idx = imm32(ops_ref, 1)?;
+                    let operands = lowered.upvalue_operands()?;
+                    let src = operands.value;
+                    let idx = operands.index;
                     let up_miss = ops.new_dynamic_label();
                     let up_done = ops.new_dynamic_label();
 
@@ -708,9 +712,10 @@ impl EmissionSession {
                     // the bridge for the monomorphic fast path (PC-keyed lookup
                     // is unavailable at PC 0); `usize::MAX` means "no site".
                     // `cell` is this site's self-patching WhiskerIC cell.
-                    let dst = reg(ops_ref, 0)?;
-                    let obj = reg(ops_ref, 1)?;
-                    let name = const_index(ops_ref, 2)?;
+                    let operands = lowered.property_load_operands()?;
+                    let dst = operands.dst;
+                    let obj = operands.object;
+                    let name = operands.name;
                     let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
 
                     // This site's WhiskerIC cell address (stable for the code's
@@ -857,9 +862,10 @@ impl EmissionSession {
                 Op::StoreProperty => {
                     // Operands: obj, name_const, src, scratch_dst.
                     // jit_store_prop_window_stub(ctx=x20, obj, name_idx, src, site, cell).
-                    let obj = reg(ops_ref, 0)?;
-                    let name = const_index(ops_ref, 1)?;
-                    let src = reg(ops_ref, 2)?;
+                    let operands = lowered.property_store_operands()?;
+                    let obj = operands.object;
+                    let name = operands.name;
+                    let src = operands.value;
                     let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
 
                     let cell_addr = artifacts.next_store_ic_addr();
@@ -1103,8 +1109,9 @@ impl EmissionSession {
                     emit_call_stub(ops, jit_fresh_upvalue_stub as *const () as usize, threw);
                 }
                 Op::LoadBuiltinError => {
-                    let dst = reg(ops_ref, 0)?;
-                    let kind_index = const_index(ops_ref, 1)?;
+                    let operands = lowered.constant_operands()?;
+                    let dst = operands.dst;
+                    let kind_index = operands.constant;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(ops, 2, u64::from(kind_index));
                     emit_call_stub(

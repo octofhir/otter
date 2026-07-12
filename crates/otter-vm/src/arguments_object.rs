@@ -50,7 +50,7 @@ pub(crate) fn initialize_unmapped(
     mut args: SmallVec<[Value; 4]>,
     mut throw_type_error: Value,
     iterator: Option<(JsSymbol, Value)>,
-) {
+) -> JsObject {
     let (iterator_symbol, mut iterator_method) = match iterator {
         Some((symbol, method)) => (Some(symbol), method),
         None => (None, Value::undefined()),
@@ -99,6 +99,10 @@ pub(crate) fn initialize_unmapped(
         );
     }
     drop(scope);
+    // `obj` was forwarded in place by the rooted scope across the
+    // property definitions above; hand the current handle back so the
+    // caller writes the live object into its register, not a stale copy.
+    obj
 }
 
 /// Populate a sloppy mapped `arguments` object from a captured argv
@@ -110,7 +114,7 @@ pub(crate) fn initialize_mapped(
     mut callee: Value,
     mut mapped_entries: Vec<MappedArgumentEntry>,
     iterator: Option<(JsSymbol, Value)>,
-) {
+) -> JsObject {
     let (iterator_symbol, mut iterator_method) = match iterator {
         Some((symbol, method)) => (Some(symbol), method),
         None => (None, Value::undefined()),
@@ -169,4 +173,5 @@ pub(crate) fn initialize_mapped(
     // then `obj` and the cells are current.
     drop(scope);
     object::install_mapped_arguments(obj, heap, mapped_entries);
+    obj
 }

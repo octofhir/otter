@@ -584,6 +584,22 @@ impl Interpreter {
         let call = native.call_target(&self.gc_heap);
         let call_info = NativeCallInfo::construct(*this_value, Some(*new_target));
         self.record_runtime_native_call();
+        // Same root coverage as the call path (`invoke_native_call_with_roots`):
+        // trace the interpreter's full root set (crucially the scope-handle
+        // arena, so a native constructor's `scoped_*` handles stay live) and
+        // pin `this`, `new.target`, and the argument slice across every
+        // scavenge the constructor triggers. Without this a native `new X(…)`
+        // ran fully unrooted — e.g. `new Set([...])` stranded its iterable.
+        let this_root = *this_value;
+        let new_target_root = *new_target;
+        let roots = SyncNativeCallRoots {
+            interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
+            value_roots: smallvec::smallvec![&this_root, &new_target_root],
+            slice_roots: smallvec::smallvec![args],
+        };
+        let _roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
         let mut ctx = NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
         let result = raw.map_err(|e| native_to_vm_error(self, e))?;

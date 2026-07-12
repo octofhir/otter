@@ -1108,8 +1108,7 @@ impl Interpreter {
                             callee,
                             mapped_entries,
                             iterator_descriptor,
-                        );
-                        obj
+                        )
                     } else {
                         let thrower = self.restricted_throw_type_error()?;
                         let obj = self.alloc_stack_rooted_object_with_value_roots(
@@ -1126,8 +1125,7 @@ impl Interpreter {
                             elements,
                             thrower,
                             iterator_descriptor,
-                        );
-                        obj
+                        )
                     };
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
                     write_register(frame, dst, Value::object(obj))?;

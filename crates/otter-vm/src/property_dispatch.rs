@@ -3809,6 +3809,13 @@ impl Interpreter {
                     PropertyIcKind::Load,
                 );
             }
+            // The IC probing / miss bookkeeping above can materialise a rope
+            // key and scavenge, relocating the receiver; re-read it from its
+            // rooted register before the stub install and the slow-path get
+            // both read its shape.
+            let obj = read_register(&stack[top_idx], obj_reg)?
+                .as_object()
+                .unwrap_or(obj);
             if !site_disabled
                 && let Some((ic, value)) =
                     cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
@@ -5432,12 +5439,27 @@ impl Interpreter {
                 } else {
                     None
                 };
-                if transition.is_none() && !self.ordinary_set_data_property(obj, name, value)? {
-                    return self.finish_failed_set(
-                        stack,
-                        context,
-                        format!("Cannot assign to property '{name}'"),
-                    );
+                if transition.is_none() {
+                    // `capture_store_property_transition_with_stack_roots` above
+                    // roots the stack but not this local `obj`; a scavenge there
+                    // relocates the receiver, so re-read it from its rooted
+                    // register before the ordinary (shape-advancing) store. Only
+                    // plain-object receivers live in `obj_reg` — statics/function
+                    // bags are derived from the receiver and keep their handle.
+                    let store_obj = if receiver.is_object() {
+                        read_register(&stack[top_idx], obj_reg)?
+                            .as_object()
+                            .unwrap_or(obj)
+                    } else {
+                        obj
+                    };
+                    if !self.ordinary_set_data_property(store_obj, name, value)? {
+                        return self.finish_failed_set(
+                            stack,
+                            context,
+                            format!("Cannot assign to property '{name}'"),
+                        );
+                    }
                 }
                 if receiver.is_object() {
                     // The store (or transition capture) may have scavenged,

@@ -246,7 +246,6 @@ impl Interpreter {
             console_sink: console::default_console_sink(),
             timer_scheduler: None,
             host_completion_sink: None,
-            lazy_global_groups: Vec::new(),
             timer_callbacks: timers::TimerCallbacks::new(),
             dynamic_import_loader: None,
             dynamic_import_registry: dynamic_import::DynamicImportRegistry::new(),

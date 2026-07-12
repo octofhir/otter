@@ -1835,12 +1835,20 @@ impl Runtime {
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
         let layer_a_dynamic_imports = LayerADynamicImportQueue::default();
-        // Attached class glue is deferred until the runtime is fully
-        // assembled: the sources may reference lazily installed
-        // globals, and evaluation needs the compile pipeline.
-        let pending_class_js = interp.with_runtime_roots(
-            |interp| -> Result<Vec<(&'static str, &'static str)>, OtterError> {
+        // Attached class glue and extension JS are deferred until the
+        // runtime is fully assembled: the sources reference globals
+        // installed later in this build, and evaluation needs the
+        // compile pipeline. Both are evaluated at a top-level frame so
+        // every value they build is reachable from a scanned register —
+        // a native-nested `eval` (the former lazy-global getter) strands
+        // objects allocated mid-evaluation under GC pressure.
+        let (pending_class_js, pending_extension_js) = interp.with_runtime_roots(
+            |interp| -> Result<
+                (Vec<(&'static str, &'static str)>, Vec<(String, String)>),
+                OtterError,
+            > {
                 let mut pending_class_js: Vec<(&'static str, &'static str)> = Vec::new();
+                let mut pending_extension_js: Vec<(String, String)> = Vec::new();
                 for spec in &config.global_classes {
                     match spec.inner {
                         GlobalClassInner::Spec(raw) => {
@@ -1927,7 +1935,6 @@ impl Runtime {
                         }
                     }
                     if !extension.js.is_empty() {
-                        let names: Vec<&'static str> = extension.lazy_names().collect();
                         let mut source = String::new();
                         for entry in extension.js {
                             source.push_str(entry.source);
@@ -1935,15 +1942,7 @@ impl Runtime {
                             // statement terminator.
                             source.push_str("\n;\n");
                         }
-                        interp
-                            .register_lazy_global_group(names, source)
-                            .map_err(|err| OtterError::Internal {
-                                code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                                message: format!(
-                                    "extension `{}` lazy globals failed: {err}",
-                                    extension.name
-                                ),
-                            })?;
+                        pending_extension_js.push((extension.name.to_string(), source));
                     }
                 }
                 if config.install_process_global {
@@ -2014,7 +2013,7 @@ impl Runtime {
                 interp.set_dynamic_import_loader(std::sync::Arc::new(LayerADynamicImportLoader {
                     queue: layer_a_dynamic_imports.clone(),
                 }));
-                Ok(pending_class_js)
+                Ok((pending_class_js, pending_extension_js))
             },
         )?;
         let mut runtime = Runtime {
@@ -2037,6 +2036,21 @@ impl Runtime {
         let global_installers = runtime.config.global_installers.clone();
         for installer in global_installers {
             installer.install(&mut runtime)?;
+        }
+        // Extension JS (Web platform shims, etc.) installs its globals
+        // eagerly, in declaration order, after the native function
+        // installers above so it can reference `self`/`structuredClone`
+        // and before the class glue below so that glue sees the real
+        // globals. Each source is a self-contained installer IIFE that
+        // attaches to `globalThis`; evaluating here — at a top-level
+        // frame — keeps every object it allocates rooted through GC.
+        for (name, source) in pending_extension_js {
+            runtime
+                .eval(SourceInput::from_javascript(source))
+                .map_err(|err| OtterError::Internal {
+                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                    message: format!("extension `{name}` globals failed: {err}"),
+                })?;
         }
         // Co-located class glue: the JS half of a declared class
         // installs in the same build as its native half, in class

@@ -35,6 +35,7 @@
 use smallvec::SmallVec;
 
 use crate::collections::{self, CollectionError};
+use crate::handles::{HandleScope, Scoped};
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor};
 use crate::{
@@ -420,8 +421,18 @@ fn construct_collection(
     if iterable.is_undefined() || iterable.is_null() {
         return Ok(target);
     }
-    add_entries_from_iterable(ctx, &target, &iterable, kind)?;
-    Ok(target)
+    // §24.1.1.1 step 8 — AddEntriesFromIterable. The adder lookup and
+    // every entry insertion allocate, so the receiver and the source
+    // iterable are parked in the handle scope: the scope keeps both live
+    // and re-readable across those collections. Escaping `target` at the
+    // end hands the (possibly relocated) receiver to the caller, which
+    // roots the native return value.
+    ctx.scope(|ctx, s| {
+        let target_h = ctx.scoped_value(s, target);
+        let iterable_h = ctx.scoped_value(s, iterable);
+        add_entries_from_iterable(ctx, s, target_h, iterable_h, kind)?;
+        Ok(ctx.escape(target_h))
+    })
 }
 
 fn alloc_collection(ctx: &mut NativeCtx<'_>, kind: CollectionKind) -> Result<Value, NativeError> {
@@ -512,10 +523,11 @@ fn apply_collection_new_target_prototype(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-add-entries-from-iterable>
-fn add_entries_from_iterable(
+fn add_entries_from_iterable<'s>(
     ctx: &mut NativeCtx<'_>,
-    target: &Value,
-    iterable: &Value,
+    s: &'s HandleScope,
+    target_h: Scoped<'s>,
+    iterable_h: Scoped<'s>,
     kind: CollectionKind,
 ) -> Result<(), NativeError> {
     let ctor_name = kind.name();
@@ -530,12 +542,13 @@ fn add_entries_from_iterable(
     // Spec step 6 — adder = ? Get(target, kind.adder_name())
     let adder_name = kind.adder_name();
     let adder = {
+        let target = ctx.escape(target_h);
         let interp = ctx.interp_mut();
         let outcome = interp
             .ordinary_get_value(
                 &context,
-                *target,
-                *target,
+                target,
+                target,
                 &VmPropertyKey::String(adder_name),
                 0,
             )
@@ -543,7 +556,7 @@ fn add_entries_from_iterable(
         match outcome {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => interp
-                .run_callable_sync(&context, &getter, *target, SmallVec::new())
+                .run_callable_sync(&context, &getter, target, SmallVec::new())
                 .map_err(|e| vm_to_native(interp, e, ctor_name))?,
         }
     };
@@ -553,11 +566,13 @@ fn add_entries_from_iterable(
             reason: format!("{adder_name} method is not callable"),
         });
     }
+    let adder_h = ctx.scoped_value(s, adder);
 
-    if iterable_uses_fast_materialization(iterable) {
-        return add_entries_eager(ctx, &context, target, iterable, kind, &adder);
+    let iterable = ctx.escape(iterable_h);
+    if iterable_uses_fast_materialization(&iterable) {
+        return add_entries_eager(ctx, s, &context, target_h, iterable_h, kind, adder_h);
     }
-    add_entries_lazy(ctx, &context, target, iterable, kind, &adder)
+    add_entries_lazy(ctx, s, &context, target_h, iterable_h, kind, adder_h)
 }
 
 /// `true` when the iterable matches one of
@@ -571,49 +586,68 @@ fn iterable_uses_fast_materialization(iterable: &Value) -> bool {
         || iterable.is_generator()
 }
 
-fn add_entries_eager(
+fn add_entries_eager<'s>(
     ctx: &mut NativeCtx<'_>,
+    s: &'s HandleScope,
     context: &crate::ExecutionContext,
-    target: &Value,
-    iterable: &Value,
+    target_h: Scoped<'s>,
+    iterable_h: Scoped<'s>,
     kind: CollectionKind,
-    adder: &Value,
+    adder_h: Scoped<'s>,
 ) -> Result<(), NativeError> {
     let ctor_name = kind.name();
+    // Materialise the entry list, then park every entry immediately:
+    // each adder call below allocates, and an un-parked entry (e.g. a
+    // string key) held only in the native `Vec` would strand.
+    let iterable = ctx.escape(iterable_h);
     let entries = {
         let interp = ctx.interp_mut();
         interp
-            .iterator_to_list_sync(context, iterable)
+            .iterator_to_list_sync(context, &iterable)
             .map_err(|e| vm_to_native(interp, e, ctor_name))?
     };
-    for next in entries {
-        let call_args = build_adder_args(ctx, context, &next, kind, None)?;
+    let entry_handles: Vec<Scoped<'s>> = entries
+        .into_iter()
+        .map(|entry| ctx.scoped_value(s, entry))
+        .collect();
+    for entry_h in entry_handles {
+        let call_args = build_adder_args(ctx, s, context, entry_h, kind, None)?;
+        let target = ctx.escape(target_h);
+        let adder = ctx.escape(adder_h);
         let interp = ctx.interp_mut();
         interp
-            .run_callable_sync(context, adder, *target, call_args)
+            .run_callable_sync(context, &adder, target, call_args)
             .map_err(|e| vm_to_native(interp, e, ctor_name))?;
     }
     Ok(())
 }
 
-fn add_entries_lazy(
+fn add_entries_lazy<'s>(
     ctx: &mut NativeCtx<'_>,
+    s: &'s HandleScope,
     context: &crate::ExecutionContext,
-    target: &Value,
-    iterable: &Value,
+    target_h: Scoped<'s>,
+    iterable_h: Scoped<'s>,
     kind: CollectionKind,
-    adder: &Value,
+    adder_h: Scoped<'s>,
 ) -> Result<(), NativeError> {
     let ctor_name = kind.name();
+    let iterable = ctx.escape(iterable_h);
     let (iterator, next_method) = {
         let interp = ctx.interp_mut();
         interp
-            .get_iterator_sync(context, iterable)
+            .get_iterator_sync(context, &iterable)
             .map_err(|e| vm_to_native(interp, e, ctor_name))?
     };
+    // The iterator and its `next` method live across every step and
+    // adder call — both allocate — so both are parked.
+    let iterator_h = ctx.scoped_value(s, iterator);
+    let next_method_h = ctx.scoped_value(s, next_method);
 
     loop {
         let stepped = {
+            let iterator = ctx.escape(iterator_h);
+            let next_method = ctx.escape(next_method_h);
             let interp = ctx.interp_mut();
             interp.iterator_step_sync(context, &iterator, &next_method)
         };
@@ -622,15 +656,22 @@ fn add_entries_lazy(
             Ok(None) => return Ok(()),
             Err(err) => return Err(vm_to_native(ctx.interp_mut(), err, ctor_name)),
         };
+        let next_h = ctx.scoped_value(s, next);
 
-        let call_args = build_adder_args(ctx, context, &next, kind, Some(&iterator))?;
+        let call_args = {
+            let iterator = ctx.escape(iterator_h);
+            build_adder_args(ctx, s, context, next_h, kind, Some(&iterator))?
+        };
 
         let call_result = {
+            let target = ctx.escape(target_h);
+            let adder = ctx.escape(adder_h);
             let interp = ctx.interp_mut();
-            interp.run_callable_sync(context, adder, *target, call_args)
+            interp.run_callable_sync(context, &adder, target, call_args)
         };
         if let Err(err) = call_result {
             let original_throw = ctx.interp_mut().take_pending_uncaught_throw();
+            let iterator = ctx.escape(iterator_h);
             let _ = ctx.interp_mut().iterator_close_sync(context, &iterator);
             if let Some(value) = original_throw {
                 ctx.interp_mut().set_pending_uncaught_throw(value);
@@ -644,18 +685,19 @@ fn add_entries_lazy(
 /// `[v]` (Set/WeakSet) argument list for the adder. When
 /// `iterator_for_close` is provided, the iterator is closed before
 /// returning an abrupt completion.
-fn build_adder_args(
+fn build_adder_args<'s>(
     ctx: &mut NativeCtx<'_>,
+    s: &'s HandleScope,
     context: &crate::ExecutionContext,
-    next: &Value,
+    next_h: Scoped<'s>,
     kind: CollectionKind,
     iterator_for_close: Option<&Value>,
 ) -> Result<SmallVec<[Value; 8]>, NativeError> {
     if !kind.is_pair() {
-        return Ok(smallvec::smallvec![*next]);
+        return Ok(smallvec::smallvec![ctx.escape(next_h)]);
     }
     let ctor_name = kind.name();
-    if !value_is_object_like(next) {
+    if !value_is_object_like(&ctx.escape(next_h)) {
         if let Some(iterator) = iterator_for_close {
             let _ = ctx.interp_mut().iterator_close_sync(context, iterator);
         }
@@ -664,7 +706,7 @@ fn build_adder_args(
             reason: "iterator value is not an object".to_string(),
         });
     }
-    let key = match read_indexed_property(ctx, context, next, "0") {
+    let key = match read_indexed_property(ctx, context, next_h, "0") {
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
@@ -677,7 +719,10 @@ fn build_adder_args(
             return Err(vm_to_native(ctx.interp_mut(), err, ctor_name));
         }
     };
-    let value = match read_indexed_property(ctx, context, next, "1") {
+    // Park the key: reading index `1` allocates and would otherwise
+    // strand the key value held only in this local.
+    let key_h = ctx.scoped_value(s, key);
+    let value = match read_indexed_property(ctx, context, next_h, "1") {
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
@@ -690,22 +735,23 @@ fn build_adder_args(
             return Err(vm_to_native(ctx.interp_mut(), err, ctor_name));
         }
     };
-    Ok(smallvec::smallvec![key, value])
+    Ok(smallvec::smallvec![ctx.escape(key_h), value])
 }
 
 fn read_indexed_property(
     ctx: &mut NativeCtx<'_>,
     context: &crate::ExecutionContext,
-    target: &Value,
+    target_h: Scoped<'_>,
     name: &str,
 ) -> Result<Value, VmError> {
+    let target = ctx.escape(target_h);
     let interp = ctx.interp_mut();
     let outcome =
-        interp.ordinary_get_value(context, *target, *target, &VmPropertyKey::String(name), 0)?;
+        interp.ordinary_get_value(context, target, target, &VmPropertyKey::String(name), 0)?;
     match outcome {
         VmGetOutcome::Value(v) => Ok(v),
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, *target, SmallVec::new())
+            interp.run_callable_sync(context, &getter, target, SmallVec::new())
         }
     }
 }

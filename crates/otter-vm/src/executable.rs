@@ -238,17 +238,12 @@ impl CodeBlock {
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
-                    arith_feedback: self.feedback[index].arith_bits(),
                     // Baked by `Interpreter::bake_property_feedback` from the
                     // live per-site property IC; the raw snapshot carries none.
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
-                    element_load_kind: self.feedback[index].element_load_kind(),
-                    // Baked by `Interpreter::bake_global_lex_cells` once the
-                    // lexical binding exists; the raw snapshot carries none.
-                    global_lex_cell: None,
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

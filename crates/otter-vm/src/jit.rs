@@ -610,13 +610,6 @@ pub struct JitInstructionMetadata {
     /// `ConstF64` node without reaching back into the constant pool. `None` for
     /// every other opcode.
     pub load_number: Option<f64>,
-    /// Baked operand-representation feedback bits for an arithmetic / relational
-    /// site (see [`crate::jit_feedback`]). `0` for non-arithmetic instructions
-    /// and for sites the interpreter never observed; the optimizing tier reads
-    /// it to choose an unboxed `Int32` / `Float64` lowering and emit the
-    /// matching speculation guard. Snapshotted directly from the owning
-    /// CodeBlock's dense feedback cell when the compile view is built.
-    pub arith_feedback: u8,
     /// Monomorphic own-data property feedback for a `LoadProperty` /
     /// `StoreProperty` site: `Some((shape_offset, slot_byte))` when the
     /// interpreter observed exactly one receiver shape that owns the named slot
@@ -651,27 +644,6 @@ pub struct JitInstructionMetadata {
     /// for every other `NewObject` and every non-`NewObject` op. Baked by
     /// `Interpreter::bake_object_literals`.
     pub object_literal: Option<ObjectLiteralPlan>,
-    /// Baked element-load specialization for a `LoadElement` site the interpreter
-    /// observed loading exclusively from one unboxable typed-array kind
-    /// (`Float64Array` / `Int32Array`). The optimizing tier lowers such a site to
-    /// a kind-guarded load that leaves the element in a register in its native
-    /// representation (an FP register for `Float64`, a raw int for `Int32`),
-    /// skipping the box on load and the matching unbox in the numeric consumer.
-    /// [`JitElementLoadKind::Any`] (the default) keeps the generic boxed load.
-    /// Snapshotted directly from the owning CodeBlock's dense feedback cell.
-    pub element_load_kind: JitElementLoadKind,
-    /// For a `LoadGlobalOrThrow` site whose free identifier resolves to a
-    /// global declarative-record (lexical) cell, the cell's compressed `Gc`
-    /// offset. The optimizing tier bakes `cage_base + offset` and reads the
-    /// cell's value inline (one load + a TDZ-hole guard) instead of calling the
-    /// per-access global-load bridge, which re-decodes the operand, hashes the
-    /// name, and spills/reloads the live set around a full VM reentry. `None`
-    /// when the name is not a lexical binding (a `var` / global-object property,
-    /// left to the bridge) or the binding was unbound at compile time. The cell
-    /// is a permanent, non-moving old-space allocation rooted by
-    /// `global_lexicals`, so the baked offset stays valid for the code's life.
-    /// Baked by `Interpreter::bake_global_lex_cells`.
-    pub global_lex_cell: Option<u32>,
 }
 
 impl JitInstructionMetadata {
@@ -683,13 +655,10 @@ impl JitInstructionMetadata {
             load_array_length: false,
             method_hint: JitMethodHint::None,
             load_number: None,
-            arith_feedback: 0,
             property_feedback: None,
             property_feedback_poly: Vec::new(),
             property_proto_feedback: None,
             object_literal: None,
-            element_load_kind: JitElementLoadKind::Any,
-            global_lex_cell: None,
         }
     }
 }

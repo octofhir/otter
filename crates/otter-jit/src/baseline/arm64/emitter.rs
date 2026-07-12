@@ -110,7 +110,6 @@ impl EmissionSession {
             // exact instruction, preserving committed side effects.
             emit_load_u64(ops, 9, u64::from(instruction_pc));
             dynasm!(ops ; .arch aarch64 ; str w9, [x20, RESUME_PC_OFFSET]);
-            let ops_ref = instr.operand_view(code_block);
             match lowered.op {
                 Op::LoadInt32 => {
                     let operands = lowered.load_int32_operands()?;
@@ -294,12 +293,17 @@ impl EmissionSession {
                     emit_call_stub(ops, jit_new_array_stub as *const () as usize, threw);
                 }
                 Op::Call => {
+                    let call = lowered.call_operands()?;
+                    let call_operands = CallOperandView::Plain {
+                        call,
+                        arguments: plan.register_tail(call.arguments)?,
+                    };
                     // Splice a tiny monomorphic leaf callee inline under an
                     // identity guard (no per-call bridge); fall back to the
                     // direct-call bridge for absent / ineligible sites.
-                    let inlined = match view.inline_callees.get(&instr.byte_pc) {
+                    let inlined = match view.inline_callees.get(&lowered.byte_pc) {
                         Some(callee) => {
-                            try_emit_inline_call(ops, callee, ops_ref, cage_base, bail)?
+                            try_emit_inline_call(ops, callee, call_operands, cage_base, bail)?
                         }
                         None => false,
                     };
@@ -311,14 +315,14 @@ impl EmissionSession {
                         if self_call_safe {
                             emit_self_recursive_call(
                                 ops,
-                                ops_ref,
+                                call_operands,
                                 view.code_block.register_count,
                                 self_entry,
                                 bail,
                                 threw,
                             )?;
                         } else {
-                            emit_call(ops, ops_ref, bail, threw)?;
+                            emit_call(ops, call_operands, bail, threw)?;
                         }
                     }
                 }
@@ -326,15 +330,20 @@ impl EmissionSession {
                 // its compiled entry (WhiskerIC method call), falling back to the
                 // in-place full method-call stub when ineligible.
                 Op::CallMethodValue => {
+                    let call = lowered.method_call_operands()?;
+                    let call_operands = CallOperandView::Method {
+                        call,
+                        arguments: plan.register_tail(call.arguments)?,
+                    };
                     let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
                     // Splice a tiny monomorphic read-only method inline under an
                     // identity + receiver-shape guard; fall back to the method
                     // bridge for absent / ineligible sites.
-                    let inlined = match view.inline_methods.get(&instr.byte_pc) {
+                    let inlined = match view.inline_methods.get(&lowered.byte_pc) {
                         Some(method) => try_emit_inline_method_call(
                             ops,
                             method,
-                            ops_ref,
+                            call_operands,
                             site,
                             cage_base,
                             view.object_shape_byte,
@@ -347,11 +356,11 @@ impl EmissionSession {
                         // A polymorphic site (no single monomorphic entry) emits a
                         // most-frequent-first guard chain over its observed
                         // receiver shapes, bridging only when none match.
-                        None => match view.inline_poly_methods.get(&instr.byte_pc) {
+                        None => match view.inline_poly_methods.get(&lowered.byte_pc) {
                             Some(methods) => try_emit_poly_inline_method_call(
                                 ops,
                                 methods,
-                                ops_ref,
+                                call_operands,
                                 site,
                                 cage_base,
                                 view.object_shape_byte,
@@ -370,14 +379,25 @@ impl EmissionSession {
                         // the bridge, a hit jumps past it.
                         let array_done = ops.new_dynamic_label();
                         let mut spliced_array = false;
-                        if let Some(am) = view.array_methods.get(&instr.byte_pc).copied() {
+                        if let Some(am) = view.array_methods.get(&lowered.byte_pc).copied() {
                             let array_miss = ops.new_dynamic_label();
                             let emitted = match am.kind {
                                 JitArrayMethodKind::Pop => emit_array_pop_inline(
-                                    ops, ops_ref, &am, view, array_miss, array_done,
+                                    ops,
+                                    call_operands,
+                                    &am,
+                                    view,
+                                    array_miss,
+                                    array_done,
                                 )?,
                                 JitArrayMethodKind::Push => emit_array_push_inline(
-                                    ops, ops_ref, &am, view, array_miss, array_done, threw,
+                                    ops,
+                                    call_operands,
+                                    &am,
+                                    view,
+                                    array_miss,
+                                    array_done,
+                                    threw,
                                 )?,
                             };
                             if emitted {
@@ -387,12 +407,12 @@ impl EmissionSession {
                         }
                         emit_method_call(
                             ops,
-                            ops_ref,
+                            call_operands,
                             site,
-                            view.collection_leaf_methods.get(&instr.byte_pc),
-                            view.collection_alloc_methods.get(&instr.byte_pc),
+                            view.collection_leaf_methods.get(&lowered.byte_pc),
+                            view.collection_alloc_methods.get(&lowered.byte_pc),
                             Some(view),
-                            plan.method_alloc_safepoints.get(&instr.byte_pc).copied(),
+                            plan.method_alloc_safepoints.get(&lowered.byte_pc).copied(),
                             bail,
                             threw,
                         )?;

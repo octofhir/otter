@@ -104,8 +104,8 @@ mod tests {
     //! keeps branch byte-deltas trivial (`rel = (target - next) * 4`).
 
     use super::{
-        BaselinePlan, JitCtx, JitEntry, JitRet, STATUS_RETURNED, Unsupported, VALUE_FALSE,
-        VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, compile, value_tag,
+        BaselinePlan, CallOperandView, JitCtx, JitEntry, JitRet, STATUS_RETURNED, Unsupported,
+        VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, compile, const_index, reg, value_tag,
     };
     use otter_bytecode::{Op, Operand};
     use otter_vm::{JitCompileSnapshot, JitFunctionCode, jit::JitTestInstruction};
@@ -1116,6 +1116,56 @@ mod tests {
             .triple_operands()
             .expect("DefineDataProperty operands");
         assert_eq!((triple.first, triple.second, triple.third), (0, 1, 2));
+    }
+
+    #[test]
+    fn lowering_plan_owns_call_operand_tails() {
+        let v = view(&[
+            (
+                Op::Call,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(2),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(1),
+                    Operand::ConstIndex(7),
+                    Operand::ConstIndex(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+
+        let call = plan.instructions[0].call_operands().expect("Call operands");
+        assert_eq!((call.dst, call.callee), (0, 1));
+        let call_view = CallOperandView::Plain {
+            call,
+            arguments: plan.register_tail(call.arguments).expect("Call arguments"),
+        };
+        assert_eq!(const_index(call_view, 2), Ok(2));
+        assert_eq!((reg(call_view, 3), reg(call_view, 4)), (Ok(2), Ok(3)));
+
+        let method = plan.instructions[1]
+            .method_call_operands()
+            .expect("CallMethodValue operands");
+        assert_eq!((method.dst, method.receiver, method.name), (4, 1, 7));
+        let method_view = CallOperandView::Method {
+            call: method,
+            arguments: plan
+                .register_tail(method.arguments)
+                .expect("method arguments"),
+        };
+        assert_eq!(const_index(method_view, 3), Ok(1));
+        assert_eq!(reg(method_view, 4), Ok(2));
     }
 
     #[test]

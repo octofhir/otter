@@ -195,6 +195,23 @@ pub(crate) enum TemplateOp {
     StoreUpvalue { src: u16, index: i32 },
     /// `upvalue[index] = r<src>` with the TDZ read guard.
     StoreUpvalueChecked { src: u16, index: i32 },
+    /// `r<dst> = r<object>.name` through the inline WhiskerIC probe and the
+    /// window transition.
+    LoadProperty {
+        dst: u16,
+        object: u16,
+        name: u32,
+        site: u64,
+        array_length: bool,
+    },
+    /// `r<object>.name = r<value>` through the inline WhiskerIC probe and the
+    /// window transition.
+    StoreProperty {
+        object: u16,
+        name: u32,
+        value: u16,
+        site: u64,
+    },
     /// `r<dst> = r<callee>(args…)` through the direct-call prepare
     /// transition; ineligible callees take an exact side exit to normal
     /// dispatch. Argument register indices are packed one per 16-bit lane.
@@ -245,6 +262,8 @@ pub(crate) struct TemplatePlan {
     pub(crate) register_operands: Box<[u16]>,
     pub(crate) index_operands: Box<[u32]>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
+    pub(crate) load_property_count: usize,
+    pub(crate) store_property_count: usize,
 }
 
 impl TemplatePlan {
@@ -514,6 +533,31 @@ impl TemplatePlan {
                         index: operands.index,
                     }
                 }
+                Op::LoadProperty => {
+                    let operands = lowered.property_load_operands()?;
+                    let site = meta
+                        .property_ic_site(view.code_block.as_ref())
+                        .unwrap_or(usize::MAX) as u64;
+                    TemplateOp::LoadProperty {
+                        dst: operands.dst,
+                        object: operands.object,
+                        name: operands.name,
+                        site,
+                        array_length: meta.load_array_length,
+                    }
+                }
+                Op::StoreProperty => {
+                    let operands = lowered.property_store_operands()?;
+                    let site = meta
+                        .property_ic_site(view.code_block.as_ref())
+                        .unwrap_or(usize::MAX) as u64;
+                    TemplateOp::StoreProperty {
+                        object: operands.object,
+                        name: operands.name,
+                        value: operands.value,
+                        site,
+                    }
+                }
                 Op::Call => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
@@ -640,6 +684,8 @@ impl TemplatePlan {
             register_count: view.code_block.register_count,
             register_operands: register_operands.into_boxed_slice(),
             index_operands: index_operands.into_boxed_slice(),
+            load_property_count: lowering.load_property_count,
+            store_property_count: lowering.store_property_count,
             safepoint_records: lowering.safepoint_records,
         })
     }

@@ -63,8 +63,8 @@ pub(crate) use code::enter_compiled;
 pub use lowering::Unsupported;
 use lowering::*;
 pub(crate) use lowering::{BaselinePlan, MAX_METHOD_ARGS, pack_method_arg_regs, reg_offset};
-pub(crate) use runtime_ops::jit_backedge_poll_stub;
 use runtime_ops::*;
+pub(crate) use runtime_ops::{IC_WAYS, WhiskerIcCell, jit_backedge_poll_stub};
 pub(crate) use value_abi::*;
 
 /// GC header type tag for an ordinary `ObjectBody` (mirrors

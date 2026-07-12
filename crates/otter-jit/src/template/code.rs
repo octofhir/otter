@@ -44,6 +44,13 @@ pub struct TemplateCode {
     /// ownership contract as [`Self::register_operands`].
     #[allow(dead_code)]
     index_operands: Box<[u32]>,
+    /// Stable backing store for the self-patching `LoadProperty` IC cells;
+    /// emitted code holds raw addresses into this slice.
+    #[allow(dead_code)]
+    load_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
+    /// Stable backing store for the self-patching `StoreProperty` IC cells.
+    #[allow(dead_code)]
+    store_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
     /// Code-object-owned allocating safepoints, sorted by id.
     safepoint_records: Box<[SafepointRecord]>,
 }
@@ -57,6 +64,8 @@ impl TemplateCode {
         register_count: u16,
         register_operands: Box<[u16]>,
         index_operands: Box<[u32]>,
+        load_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
+        store_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
         safepoint_records: Box<[SafepointRecord]>,
     ) -> Self {
         const AARCH64_TEMPLATE_ABI: u64 = 0x4136_3454_504c_0001;
@@ -84,6 +93,8 @@ impl TemplateCode {
             register_count,
             register_operands,
             index_operands,
+            load_ic_cells,
+            store_ic_cells,
             safepoint_records,
         }
     }

@@ -373,6 +373,10 @@ pub struct JitDirectCallPlan {
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
+    /// Installed code-object identity published in the callee's native frame.
+    pub code_object_id: u64,
+    /// Whether the callee owns precise safepoint maps.
+    pub has_safepoints: bool,
 }
 
 /// VM-owned root descriptor for one native JIT activation.
@@ -432,6 +436,13 @@ pub struct JitPreparedDirectCall {
     /// `0` when it captures nothing — lets emitted upvalue ops in the direct
     /// callee read its cells inline instead of routing through the stub.
     pub upvalues_ptr: usize,
+    /// Callee native-frame identity word: `function_id | code_block_id << 32`.
+    pub frame_ids: u64,
+    /// Callee native-frame header word at byte 8 with `pc = 0`:
+    /// `register_count << 32 | kind << 48 | flags << 56`.
+    pub frame_meta: u64,
+    /// Installed code-object identity for the callee's native frame.
+    pub code_object_id: u64,
 }
 
 /// Versioned offsets needed by native Array guards.

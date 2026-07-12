@@ -327,6 +327,9 @@ pub(crate) unsafe fn enter_compiled(
             direct_this_value: 0,
             direct_frame_index: 0,
             direct_upvalues_ptr: 0,
+            direct_frame_ids: 0,
+            direct_frame_meta: 0,
+            direct_code_object_id: 0,
             reg_stack_base,
             reg_top_ptr,
         };

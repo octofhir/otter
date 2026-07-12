@@ -59,6 +59,14 @@ pub(crate) struct JitCtx {
     /// [`otter_vm::JitPreparedDirectCall::upvalues_ptr`]); the dispatch tail
     /// copies it into the callee `JitCtx.upvalues_ptr`.
     pub(super) direct_upvalues_ptr: usize,
+    /// Prepared callee native-frame identity word (`function_id |
+    /// code_block_id << 32`).
+    pub(super) direct_frame_ids: u64,
+    /// Prepared callee native-frame header word at byte 8 with `pc = 0`
+    /// (`register_count << 32 | kind << 48 | flags << 56`).
+    pub(super) direct_frame_meta: u64,
+    /// Prepared callee installed code-object identity.
+    pub(super) direct_code_object_id: u64,
     /// Base of the interpreter's flat JIT register stack
     /// (`reg_stack[0]`). Compiled code builds a self-recursive callee window at
     /// `reg_stack_base + reg_top*8` without a Rust frame-build bridge.
@@ -180,7 +188,37 @@ pub(crate) const DIRECT_FRAME_INDEX_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
 pub(crate) const DIRECT_UPVALUES_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
+pub(crate) const DIRECT_FRAME_IDS_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_frame_ids) as u32;
+pub(crate) const DIRECT_FRAME_META_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_frame_meta) as u32;
+pub(crate) const DIRECT_CODE_OBJECT_ID_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, direct_code_object_id) as u32;
 pub(crate) const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
+/// 16-aligned machine-stack reservation for a nested callee's own published
+/// [`NativeFrame`], placed immediately above its `JitCtx`.
+pub(crate) const NATIVE_FRAME_STACK_SIZE: u32 =
+    ((std::mem::size_of::<NativeFrame>() + 15) & !15) as u32;
+/// Combined nested-call reservation: callee `JitCtx` at `sp`, callee
+/// `NativeFrame` at `sp + JIT_CTX_STACK_SIZE`.
+pub(crate) const CTX_PLUS_FRAME_STACK_SIZE: u32 = JIT_CTX_STACK_SIZE + NATIVE_FRAME_STACK_SIZE;
+/// Byte offsets of the callee-frame fields emitted nested-call sequences fill.
+pub(crate) const NATIVE_FRAME_PREVIOUS_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, previous_frame) as u32;
+pub(crate) const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, register_base) as u32;
+pub(crate) const NATIVE_FRAME_ARGUMENT_BASE_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, argument_base) as u32;
+pub(crate) const NATIVE_FRAME_FEEDBACK_BASE_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, feedback_base) as u32;
+pub(crate) const NATIVE_FRAME_THIS_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, this_value_bits) as u32;
+pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
+pub(crate) const NATIVE_FRAME_RETURN_REGISTER_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, return_register) as u32;
+pub(crate) const NATIVE_FRAME_TAIL_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, argument_count) as u32;
 
 /// Compiled-code entry signature.
 pub(super) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

@@ -299,6 +299,9 @@ mod tests {
             direct_this_value: 0,
             direct_frame_index: 0,
             direct_upvalues_ptr: 0,
+            direct_frame_ids: 0,
+            direct_frame_meta: 0,
+            direct_code_object_id: 0,
             reg_stack_base: reg_stack_probe.as_mut_ptr(),
             reg_top_ptr: std::ptr::addr_of_mut!(reg_top_probe),
         };

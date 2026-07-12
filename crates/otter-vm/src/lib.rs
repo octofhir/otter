@@ -486,14 +486,6 @@ pub(crate) enum CallTargetFeedback {
 /// baked shapes are walked), so raising it only helps wider sites.
 pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 
-/// Largest number of receiver shapes the optimizing tier bakes into an inline
-/// polymorphic property-access guard chain (a JSC `MultiGetByOffset` /
-/// `MultiPutByOffset`). Above this a site is treated as megamorphic and keeps
-/// the interpreter IC path — the guard chain would cost more than the generic
-/// lookup, and each extra baked shape is another reoptimization eviction as the
-/// site's shape set grows.
-pub(crate) const MAX_POLY_PROPERTY_CASES: usize = 4;
-
 /// Longest prototype chain a method-call site's inline identity guard walks
 /// from the receiver to the object holding the method slot. Deeper
 /// resolutions stay on the bridge (a chain this long is already rare; each

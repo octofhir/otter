@@ -264,20 +264,21 @@ impl EmissionSession {
                     // `JitCtx.self_closure` (offset 8 from x20), so read it
                     // straight into `dst` — no Rust round-trip through
                     // the function/closure builder.
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = lowered.destination_operands()?.dst;
                     dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, #8]);
                     store_reg(ops, 9, dst)?;
                 }
                 Op::MakeFunction => {
-                    let dst = reg(ops_ref, 0)?;
-                    let idx = const_index(ops_ref, 1)?;
+                    let operands = lowered.constant_operands()?;
+                    let dst = operands.dst;
+                    let idx = operands.constant;
                     // jit_make_fn_stub(ctx=x20, dst, idx) -> status in x0.
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(ops, 2, u64::from(idx));
                     emit_call_stub(ops, jit_make_fn_stub as *const () as usize, threw);
                 }
                 Op::NewObject => {
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = lowered.destination_operands()?.dst;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_call_stub(ops, jit_new_object_stub as *const () as usize, threw);
                 }
@@ -411,9 +412,10 @@ impl EmissionSession {
                 // `[[Get]]`, polymorphic/detached/OOB) misses to the safe
                 // element-load bridge, which owns the spec-correct semantics.
                 Op::LoadElement => {
-                    let dst = reg(ops_ref, 0)?;
-                    let recv = reg(ops_ref, 1)?;
-                    let idx = reg(ops_ref, 2)?;
+                    let operands = lowered.element_load_operands()?;
+                    let dst = operands.dst;
+                    let recv = operands.receiver;
+                    let idx = operands.index;
                     let el_miss = ops.new_dynamic_label();
                     let el_done = ops.new_dynamic_label();
 
@@ -443,10 +445,11 @@ impl EmissionSession {
                 // safepoint); every other case misses to the safe element-store
                 // bridge. Operands: recv, idx, src, scratch.
                 Op::StoreElement => {
-                    let recv = reg(ops_ref, 0)?;
-                    let idx = reg(ops_ref, 1)?;
-                    let src = reg(ops_ref, 2)?;
-                    let scratch = reg(ops_ref, 3)?;
+                    let operands = lowered.element_store_operands()?;
+                    let recv = operands.receiver;
+                    let idx = operands.index;
+                    let src = operands.value;
+                    let scratch = operands.scratch;
                     let el_miss = ops.new_dynamic_label();
                     let el_done = ops.new_dynamic_label();
 
@@ -662,9 +665,10 @@ impl EmissionSession {
                 // `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression). Int32
                 // fast path with overflow → double; double path otherwise.
                 Op::Increment => {
-                    let dst = reg(ops_ref, 0)?;
-                    let src = reg(ops_ref, 1)?;
-                    let delta = imm32(ops_ref, 2)?;
+                    let operands = lowered.increment_operands()?;
+                    let dst = operands.dst;
+                    let src = operands.src;
+                    let delta = operands.delta;
                     load_reg(ops, 9, src)?;
                     emit_load_u64(ops, 12, u64::from(delta as u32));
                     let float_path = ops.new_dynamic_label();
@@ -691,7 +695,7 @@ impl EmissionSession {
                     // `this` bits are precomputed in `JitCtx.this_value`
                     // (offset 16 from x20). Bail on a hole — a derived-ctor
                     // `this`-before-super, which the interpreter resolves.
-                    let dst = reg(ops_ref, 0)?;
+                    let dst = lowered.destination_operands()?.dst;
                     let hole = VALUE_HOLE;
                     dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
                     emit_load_u64(ops, 12, hole);
@@ -993,7 +997,7 @@ impl EmissionSession {
                 Op::Shr => emit_int_binop(ops, lowered.binary_operands()?, bail, IntBinOp::Shr)?,
                 Op::Ushr => emit_ushr(ops, lowered.binary_operands()?, bail)?,
                 Op::Return | Op::ReturnValue => {
-                    let src = reg(ops_ref, 0)?;
+                    let src = lowered.source_operands()?.src;
                     let off = reg_offset(src)?;
                     dynasm!(ops
                         ; .arch aarch64
@@ -1068,8 +1072,9 @@ impl EmissionSession {
                     emit_call_stub(ops, jit_make_closure_stub as *const () as usize, threw);
                 }
                 Op::LoadString => {
-                    let dst = reg(ops_ref, 0)?;
-                    let constant_index = const_index(ops_ref, 1)?;
+                    let operands = lowered.constant_operands()?;
+                    let dst = operands.dst;
+                    let constant_index = operands.constant;
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                     emit_load_u64(ops, 1, u64::from(view.code_block.id));
                     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
@@ -1172,6 +1177,7 @@ impl EmissionSession {
                     Op::LoadInt32
                     | Op::LoadLocal
                     | Op::LoadNumber
+                    | Op::LoadString
                     | Op::LoadTrue
                     | Op::LoadFalse
                     | Op::LoadUndefined
@@ -1180,7 +1186,7 @@ impl EmissionSession {
                             fres.invalidate(dst);
                         }
                     }
-                    Op::LoadString | Op::LoadBigInt => {
+                    Op::LoadBigInt => {
                         if let Ok(dst) = reg(ops_ref, 0) {
                             fres.invalidate(dst);
                         }

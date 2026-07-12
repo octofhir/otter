@@ -908,6 +908,10 @@ mod tests {
                 vec![Operand::Register(0), Operand::Imm32(42)],
             ),
             (
+                Op::LoadString,
+                vec![Operand::Register(1), Operand::ConstIndex(0)],
+            ),
+            (
                 Op::Add,
                 vec![
                     Operand::Register(2),
@@ -920,6 +924,23 @@ mod tests {
                 Op::StoreLocal,
                 vec![Operand::Register(3), Operand::Imm32(7)],
             ),
+            (
+                Op::LoadElement,
+                vec![
+                    Operand::Register(4),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::StoreElement,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(3),
+                    Operand::Register(5),
+                ],
+            ),
             (Op::ReturnValue, vec![Operand::Register(3)]),
         ]);
         let plan = BaselinePlan::build(&v).expect("plan");
@@ -931,16 +952,45 @@ mod tests {
             .load_int32_operands()
             .expect("LoadInt32 operands");
         assert_eq!((load.dst, load.value), (0, 42));
-        let add = plan.instructions[1]
+        let string = plan.instructions[1]
+            .constant_operands()
+            .expect("LoadString operands");
+        assert_eq!((string.dst, string.constant), (1, 0));
+        let add = plan.instructions[2]
             .binary_operands()
             .expect("Add operands");
         assert_eq!((add.dst, add.lhs, add.rhs), (2, 0, 1));
-        let neg = plan.instructions[2].unary_operands().expect("Neg operands");
+        let neg = plan.instructions[3].unary_operands().expect("Neg operands");
         assert_eq!((neg.dst, neg.src), (3, 2));
-        let store = plan.instructions[3]
+        let store = plan.instructions[4]
             .local_operands()
             .expect("StoreLocal operands");
         assert_eq!((store.value, store.local), (3, 7));
+        let load_element = plan.instructions[5]
+            .element_load_operands()
+            .expect("LoadElement operands");
+        assert_eq!(
+            (load_element.dst, load_element.receiver, load_element.index),
+            (4, 0, 1)
+        );
+        let store_element = plan.instructions[6]
+            .element_store_operands()
+            .expect("StoreElement operands");
+        assert_eq!(
+            (
+                store_element.receiver,
+                store_element.index,
+                store_element.value,
+                store_element.scratch
+            ),
+            (0, 1, 3, 5)
+        );
+        assert_eq!(
+            plan.instructions[7]
+                .source_operands()
+                .map(|operands| operands.src),
+            Ok(3)
+        );
     }
 
     #[test]

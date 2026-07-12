@@ -30,16 +30,29 @@ pub struct VmThread {
     pub runtime_stub_table: u64,
     /// Address of the active [`super::CodeRegistryView`].
     pub code_registry: u64,
-    /// Address of the interrupt/budget cell.
+    /// Address of the cooperative interrupt flag's backing byte, polled
+    /// inline at every compiled back-edge.
     pub interrupt_cell: u64,
     /// Rooted pending exception as boxed `Value` bits, or zero when absent.
     pub pending_exception_bits: u64,
     /// Current code invalidation epoch.
     pub code_epoch: u64,
+    /// Opaque isolate heap address passed to leaf runtime stubs.
+    pub gc_heap: u64,
+    /// Address of the back-edge fuel counter, decremented inline per
+    /// back-edge; reaching zero re-enters the poll stub.
+    pub backedge_fuel_cell: u64,
+    /// Address of the shared synchronous native-reentry depth counter.
+    pub sync_reentry_depth_cell: u64,
     /// VM-native layout version observed by entered code.
     pub layout_version: u32,
     /// Runtime-stub inventory version observed by entered code.
     pub stub_table_version: u32,
+    /// Effective synchronous-reentry limit checked before a frameless native
+    /// call mutates state.
+    pub sync_reentry_limit: u32,
+    /// Reserved; zero in version 1.
+    pub reserved0: u32,
 }
 
 impl VmThread {
@@ -54,8 +67,13 @@ impl VmThread {
             interrupt_cell: 0,
             pending_exception_bits: 0,
             code_epoch: 0,
+            gc_heap: 0,
+            backedge_fuel_cell: 0,
+            sync_reentry_depth_cell: 0,
             layout_version: VM_LAYOUT_VERSION,
             stub_table_version: RUNTIME_STUB_TABLE_VERSION,
+            sync_reentry_limit: 0,
+            reserved0: 0,
         }
     }
 }
@@ -173,14 +191,18 @@ pub struct NativeFrame {
     pub feedback_id: u32,
 }
 
-const _: [(); 64] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 96] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 16] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 88] = [(); std::mem::size_of::<NativeFrame>()];
 const _: [(); 8] = [(); std::mem::align_of::<NativeFrame>()];
 const _: [(); 0] = [(); std::mem::offset_of!(VmThread, current_frame)];
 const _: [(); 40] = [(); std::mem::offset_of!(VmThread, pending_exception_bits)];
-const _: [(); 56] = [(); std::mem::offset_of!(VmThread, layout_version)];
+const _: [(); 56] = [(); std::mem::offset_of!(VmThread, gc_heap)];
+const _: [(); 64] = [(); std::mem::offset_of!(VmThread, backedge_fuel_cell)];
+const _: [(); 72] = [(); std::mem::offset_of!(VmThread, sync_reentry_depth_cell)];
+const _: [(); 80] = [(); std::mem::offset_of!(VmThread, layout_version)];
+const _: [(); 88] = [(); std::mem::offset_of!(VmThread, sync_reentry_limit)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 12] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 15] = [(); std::mem::offset_of!(VmFrameHeader, flags)];

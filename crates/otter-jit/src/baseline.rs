@@ -228,12 +228,12 @@ mod tests {
     fn run(view: &JitCompileSnapshot, regs: &mut [u64]) -> Exit {
         let code = compile(view).expect("compiles");
         let mut error = None;
-        let array_index_accessor_protector = false;
-        // Probe storage for the inline back-edge poll: an unset interrupt byte
-        // and a fuel counter high enough that these small test loops never reach
-        // the (null-`vm`) re-entry stub.
+        // Probe cells published through the test `VmThread`: an unset interrupt
+        // byte and a fuel counter high enough that these small test loops never
+        // reach the (null-`vm`) re-entry stub.
         let interrupt_probe: u8 = 0;
         let mut backedge_fuel_probe: u64 = 1 << 30;
+        let mut sync_reentry_depth_probe: u32 = 0;
         let mut native_frame = otter_vm::native_abi::NativeFrame {
             header: otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
             previous_frame: 0,
@@ -249,11 +249,17 @@ mod tests {
             reserved0: 0,
             feedback_id: 0,
         };
+        let mut thread = otter_vm::native_abi::VmThread::empty();
+        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
+        thread.interrupt_cell = std::ptr::addr_of!(interrupt_probe) as u64;
+        thread.backedge_fuel_cell = std::ptr::addr_of_mut!(backedge_fuel_probe) as u64;
+        thread.sync_reentry_depth_cell = std::ptr::addr_of_mut!(sync_reentry_depth_probe) as u64;
+        thread.sync_reentry_limit = u32::MAX;
         let mut ctx = JitCtx {
             regs: regs.as_mut_ptr(),
             self_closure: 0,
             this_value: 0,
-            thread: std::ptr::null_mut(),
+            thread: std::ptr::addr_of_mut!(thread),
             native_frame: &mut native_frame,
             frame_index: 0,
             upvalues_ptr: 0,
@@ -266,12 +272,6 @@ mod tests {
             direct_upvalues_ptr: 0,
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
-            sync_reentry_depth_ptr: std::ptr::null_mut(),
-            sync_reentry_limit: 0,
-            array_index_accessor_protector_ptr: &array_index_accessor_protector,
-            gc_heap: std::ptr::null(),
-            interrupt_flag: &interrupt_probe,
-            backedge_fuel: &mut backedge_fuel_probe,
         };
         // SAFETY: integer-only function; never dereferences the null vm/stack.
         let entry: JitEntry = unsafe { std::mem::transmute(code.entry_ptr_for_test()) };

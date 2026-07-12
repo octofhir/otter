@@ -118,10 +118,11 @@ pub(super) fn emit_backedge_interrupt_check(ops: &mut Assembler, threw: DynamicL
     // across a block boundary in the baseline register-window model).
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x9, [x20, INTERRUPT_FLAG_OFFSET]
+        ; ldr x17, [x20, THREAD_OFFSET]
+        ; ldr x9, [x17, VM_THREAD_INTERRUPT_CELL_OFFSET]
         ; ldrb w9, [x9]
         ; cbnz w9, =>slow
-        ; ldr x9, [x20, BACKEDGE_FUEL_OFFSET]
+        ; ldr x9, [x17, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
         ; subs x10, x10, #1
         ; str x10, [x9]

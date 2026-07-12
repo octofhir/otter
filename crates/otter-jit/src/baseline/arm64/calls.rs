@@ -403,7 +403,7 @@ pub(super) fn classify_inline_call(callee: &JitInlineCallee) -> Option<InlineCal
 /// Emit one op of an inlined callee body. The frame-register base `x19`
 /// already points at the callee scratch window, so `load_reg`/`store_reg`
 /// address callee registers. Bails route to `bail` (the site's scratch-aware
-/// bail) without restamping `resume_pc`, so a bail re-runs the whole call in
+/// bail) without restamping the published frame PC, so a bail re-runs the whole call in
 /// the interpreter. `Return*` leaves the result in `x9` and branches to
 /// `inline_done`. Internal branches resolve through `clabels` (one private
 /// label per callee logical PC).
@@ -625,7 +625,7 @@ pub(super) fn emit_inline_pure_op(
 /// native-stack scratch window the frame-register base `x19` is repointed at;
 /// `x19` (from the ctx) and `sp` are restored on every exit, including the
 /// bail path. Because the body has no GC point and commits nothing
-/// observable before a possible bail — and never restamps `resume_pc` — a guard
+/// observable before a possible bail — and never restamps the published frame PC — a guard
 /// or body bail re-runs the whole call in the interpreter, idempotently.
 pub(super) fn try_emit_inline_call(
     ops: &mut Assembler,
@@ -1424,7 +1424,7 @@ pub(super) fn emit_self_recursive_call(
     // Build the callee `JitCtx` on the native stack and re-enter `self_entry`.
     // regs = window; self_closure / upvalues / vm / stack / context /
     // frame_index / error / reg-stack pointers copy from the caller ctx
-    // (self-recursion shares them); this = undefined; resume_pc = 0.
+    // (self-recursion shares them); this = undefined.
     dynasm!(ops
         ; .arch aarch64
         ; sub sp, sp, JIT_CTX_STACK_SIZE
@@ -1432,7 +1432,7 @@ pub(super) fn emit_self_recursive_call(
         ; ldr x9, [x20, #8] ; str x9, [sp, #8]
     );
     emit_load_u64(ops, 9, undef_bits);
-    dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16] ; str wzr, [sp, RESUME_PC_OFFSET]);
+    dynasm!(ops ; .arch aarch64 ; str x9, [sp, #16]);
     emit_copy_shared_execution_context(ops);
     for off in [FRAME_INDEX_OFFSET, UPVALUES_PTR_OFFSET] {
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, off] ; str x9, [sp, off]);
@@ -1479,14 +1479,16 @@ pub(super) fn emit_self_recursive_call(
     );
     store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
-    // Bailed: read the callee's resume PC, drop the native ctx, and run the
-    // bailed callee to completion through the bail helper (which rebuilds an
-    // interpreter frame from the live window and pops it). Helper returns the
-    // value in x0 and status in x1.
+    // Bailed: read the callee's exact bail PC from the shared published
+    // frame (the callee stamped it before exiting), drop the native ctx, and
+    // run the bailed callee to completion through the bail helper (which
+    // rebuilds an interpreter frame from the live window and pops it).
+    // Helper returns the value in x0 and status in x1.
     dynasm!(ops
         ; .arch aarch64
         ; =>bailed
-    ; ldr w2, [sp, RESUME_PC_OFFSET]
+        ; ldr x2, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr w2, [x2, NATIVE_FRAME_PC_OFFSET]
         ; add sp, sp, JIT_CTX_STACK_SIZE
         ; mov x0, x20
         ; mov w1, w2
@@ -1576,7 +1578,6 @@ pub(crate) fn emit_direct_call_tail(
         ; str x9, [sp, #8]
         ; ldr x9, [x20, DIRECT_THIS_OFFSET]
         ; str x9, [sp, #16]
-    ; str wzr, [sp, RESUME_PC_OFFSET]
         ; ldr x9, [x20, THREAD_OFFSET]
         ; str x9, [sp, THREAD_OFFSET]
         ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
@@ -1648,7 +1649,10 @@ pub(crate) fn emit_direct_call_tail(
     dynasm!(ops
         ; .arch aarch64
         ; =>direct_bailed
-    ; ldr w9, [sp, RESUME_PC_OFFSET]
+        // The callee shares the published frame and stamped its exact bail PC
+        // there; park it in the spent entry slot across the activation pop.
+        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr w9, [x9, NATIVE_FRAME_PC_OFFSET]
         ; str w9, [sp, DIRECT_ENTRY_OFFSET]
         ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
         ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]

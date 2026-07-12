@@ -102,14 +102,13 @@ impl EmissionSession {
                 fres.clear();
             }
             // Publish this op's logical PC before any guard, mutation, call, or
-            // allocation. The NativeFrame copy is authoritative to GC,
-            // diagnostics, and top-level dispatch. The context copy is the
-            // machine-local payload retained by nested compiled calls while
-            // their parent NativeFrame is restored by the call tail.
+            // allocation. The published NativeFrame PC is the one canonical
+            // logical PC: GC, diagnostics, dispatch, and every bail path read
+            // it — including nested direct/self calls, whose callee shares the
+            // frame and leaves its exact bail PC here.
             emit_load_u64(ops, 9, u64::from(instruction_pc));
             dynasm!(ops
                 ; .arch aarch64
-                ; str w9, [x20, RESUME_PC_OFFSET]
                 ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
                 ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
             );

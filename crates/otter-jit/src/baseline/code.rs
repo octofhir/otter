@@ -338,7 +338,6 @@ pub(crate) unsafe fn enter_compiled(
             native_frame: std::ptr::addr_of_mut!(native_frame),
             frame_index: activation.frame_index(),
             upvalues_ptr,
-            resume_pc: 0,
             error: &mut error,
             direct_entry_addr: 0,
             direct_regs: std::ptr::null_mut(),
@@ -364,10 +363,6 @@ pub(crate) unsafe fn enter_compiled(
         }
         let ret = entry(&mut ctx);
         let _ = jit_pop_native_activation_stub(&mut ctx);
-        debug_assert!(
-            ret.status != STATUS_BAILED || native_frame.header.pc == ctx.resume_pc,
-            "compiled side exit published divergent logical PCs"
-        );
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
             STATUS_BAILED => JitExecOutcome::Bailed(native_frame.header.pc),

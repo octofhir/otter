@@ -257,7 +257,6 @@ mod tests {
             native_frame: &mut native_frame,
             frame_index: 0,
             upvalues_ptr: 0,
-            resume_pc: 0,
             error: &mut error,
             direct_entry_addr: 0,
             direct_regs: std::ptr::null_mut(),
@@ -280,8 +279,7 @@ mod tests {
         if status == STATUS_RETURNED {
             Exit::Returned(value)
         } else {
-            assert_eq!(ctx.resume_pc, native_frame.header.pc);
-            Exit::Bailed(ctx.resume_pc)
+            Exit::Bailed(native_frame.header.pc)
         }
     }
 

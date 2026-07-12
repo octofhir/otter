@@ -36,7 +36,7 @@ mod code;
 mod plan;
 
 pub use code::TemplateCode;
-pub(crate) use plan::{TemplateOp, TemplatePlan};
+pub(crate) use plan::{ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan};
 
 use crate::baseline::Unsupported;
 
@@ -334,17 +334,13 @@ mod tests {
     #[test]
     fn unsupported_opcodes_reject_the_whole_function() {
         let v = view(&[
-            (
-                Op::Add,
-                vec![
-                    Operand::Register(2),
-                    Operand::Register(0),
-                    Operand::Register(1),
-                ],
-            ),
+            (Op::NewObject, vec![Operand::Register(2)]),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
-        assert_eq!(compile(&v).err(), Some(super::Unsupported::Opcode(Op::Add)));
+        assert_eq!(
+            compile(&v).err(),
+            Some(super::Unsupported::Opcode(Op::NewObject))
+        );
     }
 
     #[test]
@@ -463,5 +459,268 @@ mod tests {
     #[test]
     fn unboxes_are_consistent_with_the_vm_encoding() {
         assert_eq!(unbox_i32(box_i32(-7)), -7);
+    }
+
+    fn unbox_f64(bits: u64) -> f64 {
+        f64::from_bits(value_tag::unbox_double(bits))
+    }
+
+    fn binary_view(op: Op) -> JitCompileSnapshot {
+        view(&[
+            (
+                op,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ])
+    }
+
+    fn run_binary(op: Op, lhs: u64, rhs: u64) -> Exit {
+        let v = binary_view(op);
+        let mut regs = [lhs, rhs, 0, 0, 0, 0, 0, 0];
+        run(&v, &mut regs)
+    }
+
+    fn expect_binary_int(op: Op, lhs: u64, rhs: u64, expected: i32) {
+        match run_binary(op, lhs, rhs) {
+            Exit::Returned(bits) => assert_eq!(unbox_i32(bits), expected, "{op:?}"),
+            Exit::Bailed(pc) => panic!("{op:?} bailed at {pc}"),
+        }
+    }
+
+    fn expect_binary_f64(op: Op, lhs: u64, rhs: u64, expected: f64) {
+        match run_binary(op, lhs, rhs) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), expected, "{op:?}"),
+            Exit::Bailed(pc) => panic!("{op:?} bailed at {pc}"),
+        }
+    }
+
+    #[test]
+    fn arithmetic_int_double_and_overflow_paths() {
+        expect_binary_int(Op::Add, box_i32(10), box_i32(20), 30);
+        expect_binary_int(Op::Sub, box_i32(10), box_i32(42), -32);
+        expect_binary_int(Op::Mul, box_i32(-6), box_i32(7), -42);
+        expect_binary_f64(Op::Add, box_f64(1.5), box_f64(2.25), 3.75);
+        expect_binary_f64(Op::Add, box_i32(10), box_f64(2.5), 12.5);
+        expect_binary_f64(
+            Op::Add,
+            box_i32(i32::MAX),
+            box_i32(1),
+            i32::MAX as f64 + 1.0,
+        );
+        expect_binary_f64(
+            Op::Mul,
+            box_i32(100_000),
+            box_i32(100_000),
+            10_000_000_000.0,
+        );
+        expect_binary_f64(Op::Div, box_i32(6), box_i32(2), 3.0);
+        expect_binary_f64(Op::Div, box_f64(7.0), box_f64(2.0), 3.5);
+        expect_binary_int(Op::Rem, box_i32(7), box_i32(3), 1);
+        expect_binary_int(Op::Rem, box_i32(-7), box_i32(3), -1);
+        expect_binary_int(Op::Rem, box_i32(6), box_i32(3), 0);
+        // Cases int32 cannot represent side-exit: NaN divisor, -0 remainder.
+        assert!(matches!(
+            run_binary(Op::Rem, box_i32(7), box_i32(0)),
+            Exit::Bailed(_)
+        ));
+        assert!(matches!(
+            run_binary(Op::Rem, box_i32(-6), box_i32(3)),
+            Exit::Bailed(_)
+        ));
+        // Non-number operands side-exit for exact coercion.
+        assert!(matches!(
+            run_binary(Op::Sub, box_i32(1), VALUE_UNDEFINED),
+            Exit::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn bitwise_full_to_int32_semantics() {
+        expect_binary_int(Op::BitwiseOr, box_f64(123.9), box_i32(0), 123);
+        expect_binary_int(
+            Op::BitwiseOr,
+            box_f64(2_147_483_648.0),
+            box_i32(0),
+            i32::MIN,
+        );
+        expect_binary_int(Op::BitwiseOr, box_f64(4_294_967_301.0), box_i32(0), 5);
+        expect_binary_int(Op::BitwiseAnd, box_i32(0b1100), box_i32(0b1010), 0b1000);
+        expect_binary_int(Op::BitwiseXor, box_i32(0b1100), box_i32(0b1010), 0b0110);
+        expect_binary_int(Op::Shl, box_i32(1), box_i32(33), 2);
+        expect_binary_int(Op::Shr, box_i32(-8), box_i32(1), -4);
+        expect_binary_f64(Op::Ushr, box_i32(-1), box_i32(0), 4_294_967_295.0);
+        expect_binary_f64(Op::Ushr, box_f64(-1.0), box_i32(0), 4_294_967_295.0);
+        // Non-finite doubles saturate fcvtzs → exact side exit.
+        assert!(matches!(
+            run_binary(Op::BitwiseOr, box_f64(f64::INFINITY), box_i32(0)),
+            Exit::Bailed(_)
+        ));
+        assert!(matches!(
+            run_binary(Op::BitwiseOr, box_f64(f64::NAN), box_i32(0)),
+            Exit::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn comparisons_including_nan_and_strict_identity() {
+        let t = VALUE_TRUE;
+        let f = VALUE_FALSE;
+        let expect = |op: Op, lhs: u64, rhs: u64, expected: u64| match run_binary(op, lhs, rhs) {
+            Exit::Returned(bits) => assert_eq!(bits, expected, "{op:?}"),
+            Exit::Bailed(pc) => panic!("{op:?} bailed at {pc}"),
+        };
+        expect(Op::LessThan, box_i32(3), box_i32(9), t);
+        expect(Op::LessThan, box_f64(2.5), box_f64(1.5), f);
+        expect(Op::LessEq, box_f64(2.5), box_f64(2.5), t);
+        expect(Op::GreaterThan, box_i32(9), box_i32(3), t);
+        expect(Op::GreaterEq, box_f64(4.0), box_i32(4), t);
+        let nan = box_f64(f64::NAN);
+        expect(Op::LessThan, nan, box_f64(1.0), f);
+        expect(Op::Equal, nan, nan, f);
+        expect(Op::NotEqual, nan, box_f64(1.0), t);
+        // Strict identity on non-number immediates.
+        expect(Op::Equal, t, t, t);
+        expect(Op::Equal, t, f, f);
+        expect(Op::Equal, VALUE_NULL, VALUE_UNDEFINED, f);
+        expect(Op::Equal, box_i32(1), VALUE_TRUE, f);
+        // Heap cells side-exit; the interpreter owns content equality.
+        assert!(matches!(
+            run_binary(Op::Equal, 0x1234, 0x1234),
+            Exit::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn loose_equality_numbers_and_nullish() {
+        let t = VALUE_TRUE;
+        let f = VALUE_FALSE;
+        let expect = |op: Op, lhs: u64, rhs: u64, expected: u64| match run_binary(op, lhs, rhs) {
+            Exit::Returned(bits) => assert_eq!(bits, expected, "{op:?}"),
+            Exit::Bailed(pc) => panic!("{op:?} bailed at {pc}"),
+        };
+        expect(Op::LooseEqual, VALUE_NULL, VALUE_UNDEFINED, t);
+        expect(Op::LooseEqual, VALUE_NULL, box_i32(0), f);
+        expect(Op::LooseEqual, box_i32(1), box_f64(1.0), t);
+        expect(Op::LooseNotEqual, box_i32(1), box_i32(2), t);
+        // Coercive cases (booleans, strings) side-exit.
+        assert!(matches!(
+            run_binary(Op::LooseEqual, VALUE_TRUE, box_i32(1)),
+            Exit::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn increment_negate_and_conversions() {
+        let increment = |delta: i32, input: u64| {
+            let v = view(&[
+                (
+                    Op::Increment,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(0),
+                        Operand::Imm32(delta),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ]);
+            let mut regs = [input, 0, 0, 0, 0, 0, 0, 0];
+            run(&v, &mut regs)
+        };
+        assert_eq!(increment(1, box_i32(41)), Exit::Returned(box_i32(42)));
+        assert_eq!(increment(-1, box_i32(10)), Exit::Returned(box_i32(9)));
+        match increment(1, box_i32(i32::MAX)) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), i32::MAX as f64 + 1.0),
+            Exit::Bailed(pc) => panic!("overflow increment bailed at {pc}"),
+        }
+        match increment(1, box_f64(2.5)) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 3.5),
+            Exit::Bailed(pc) => panic!("double increment bailed at {pc}"),
+        }
+        assert!(matches!(increment(1, VALUE_UNDEFINED), Exit::Bailed(_)));
+
+        let unary = |op: Op, input: u64| {
+            let v = view(&[
+                (op, vec![Operand::Register(1), Operand::Register(0)]),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ]);
+            let mut regs = [input, 0, 0, 0, 0, 0, 0, 0];
+            run(&v, &mut regs)
+        };
+        assert_eq!(unary(Op::Neg, box_i32(42)), Exit::Returned(box_i32(-42)));
+        match unary(Op::Neg, box_i32(0)) {
+            Exit::Returned(bits) => {
+                assert_eq!(unbox_f64(bits), 0.0);
+                assert!(unbox_f64(bits).is_sign_negative(), "-0 must stay signed");
+            }
+            Exit::Bailed(pc) => panic!("-0 negate bailed at {pc}"),
+        }
+        match unary(Op::Neg, box_i32(i32::MIN)) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 2_147_483_648.0),
+            Exit::Bailed(pc) => panic!("-i32::MIN negate bailed at {pc}"),
+        }
+        match unary(Op::Neg, box_f64(2.5)) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), -2.5),
+            Exit::Bailed(pc) => panic!("double negate bailed at {pc}"),
+        }
+        assert!(matches!(unary(Op::Neg, VALUE_NULL), Exit::Bailed(_)));
+
+        match unary(Op::ToNumeric, box_f64(2.5)) {
+            Exit::Returned(bits) => assert_eq!(unbox_f64(bits), 2.5),
+            Exit::Bailed(pc) => panic!("ToNumeric bailed at {pc}"),
+        }
+        assert!(matches!(
+            unary(Op::ToNumeric, VALUE_UNDEFINED),
+            Exit::Bailed(_)
+        ));
+    }
+
+    #[test]
+    fn triangular_sum_loop_runs_fully_compiled() {
+        // r0=n; sum=r1, i=r2, one=r4, cond=r3 — the arithmetic + branch mix
+        // proving the numeric subset composes across a real loop.
+        let v = view(&[
+            (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+            (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(1)]),
+            (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(1)]),
+            (
+                Op::LessEq,
+                vec![
+                    Operand::Register(3),
+                    Operand::Register(2),
+                    Operand::Register(0),
+                ],
+            ),
+            (
+                Op::JumpIfFalse,
+                vec![Operand::Imm32(rel(4, 8)), Operand::Register(3)],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(2),
+                    Operand::Register(4),
+                ],
+            ),
+            (Op::Jump, vec![Operand::Imm32(rel(7, 3))]),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        for (n, expected) in [(0, 0), (1, 1), (5, 15), (10, 55), (100, 5050)] {
+            let mut regs = [box_i32(n), 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(run(&v, &mut regs), Exit::Returned(box_i32(expected)));
+        }
     }
 }

@@ -72,7 +72,7 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         // OSR trampoline per back-edge target, so a hot loop the optimizing tier
         // declined (an unsupported opcode or not-yet-int32 feedback in its
         // region) still tiers up to a native loop body instead of interpreting.
-        match baseline::compile(&request.snapshot) {
+        match baseline::compile(&request.snapshot, request.code_object_id) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),

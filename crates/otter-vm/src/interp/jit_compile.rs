@@ -113,15 +113,22 @@ impl Interpreter {
         }
         let (regs, params) = (view.code_block.register_count, view.code_block.param_count);
         let hook = self.jit_hook.as_ref()?.clone();
+        let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_function(jit::JitCompileRequest {
             snapshot: view,
             osr_pc,
+            code_object_id,
         });
         if trace {
             eprintln!("[jit] compile fid={fid} regs={regs} params={params} -> {status:?}");
         }
         match status {
-            Ok(jit::JitCompileStatus::Compiled { code }) => Some(code),
+            Ok(jit::JitCompileStatus::Compiled { code }) => {
+                self.jit_next_code_object_id += 1;
+                self.jit_code_registry
+                    .register(code_object_id, code.clone());
+                Some(code)
+            }
             _ => None,
         }
     }

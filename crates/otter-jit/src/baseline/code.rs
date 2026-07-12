@@ -23,8 +23,8 @@ use otter_vm::{
     HoltStack, Interpreter, JitExecOutcome, JitFunctionCode, SafepointRecord, Value, VmError,
     VmRuntimeActivation,
     native_abi::{
-        BuildVersionRecord, CodeObjectMetadata, CodeRegistryView, LayoutVersionRecord, NativeFrame,
-        NativeFrameFlags, NativeFrameKind, VM_BUILD_VERSION, VmFrameHeader, VmThread,
+        BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, NativeFrame, NativeFrameFlags,
+        NativeFrameKind, VM_BUILD_VERSION, VmFrameHeader, VmThread,
     },
 };
 
@@ -35,6 +35,8 @@ pub struct BaselineCode {
     metadata: CodeObjectMetadata,
     /// Installed code-object identity used for safepoint lookup.
     code_object_id: u64,
+    /// Source function id published in this code's native frames.
+    function_id: u32,
     /// Tagged register-window width published in the native frame.
     register_count: u16,
     /// Loop-header logical PC → assembler offset of its OSR-entry trampoline.
@@ -79,6 +81,7 @@ impl BaselineCode {
     pub(super) fn from_emission(
         code: CompiledCode,
         code_object_id: u64,
+        function_id: u32,
         register_count: u16,
         osr_entries: std::collections::BTreeMap<u32, usize>,
         osr_only: bool,
@@ -89,7 +92,7 @@ impl BaselineCode {
         const AARCH64_BASELINE_ABI: u64 = 0x4136_3442_4c4e_0001;
         let metadata = CodeObjectMetadata {
             id: code_object_id,
-            code_block_id: code_object_id.saturating_sub(1) as u32,
+            code_block_id: function_id,
             entry_offset: 0,
             code_size: code.len() as u32,
             safepoint_count: safepoint_records.len() as u32,
@@ -107,6 +110,7 @@ impl BaselineCode {
             code,
             metadata,
             code_object_id,
+            function_id,
             register_count,
             osr_entries,
             osr_only,
@@ -161,6 +165,13 @@ impl JitFunctionCode for BaselineCode {
         self.safepoint_records.len() as u32
     }
 
+    fn safepoint_record(&self, safepoint_id: u32) -> Option<&SafepointRecord> {
+        self.safepoint_records
+            .binary_search_by_key(&safepoint_id, |record| record.id)
+            .ok()
+            .map(|index| &self.safepoint_records[index])
+    }
+
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
         assert!(
             self.metadata.is_compatible_with_current_vm(),
@@ -176,8 +187,9 @@ impl JitFunctionCode for BaselineCode {
                 activation,
                 entry,
                 self.code_object_id,
+                self.function_id,
                 self.register_count,
-                &self.safepoint_records,
+                !self.safepoint_records.is_empty(),
             )
         }
     }
@@ -200,8 +212,9 @@ impl JitFunctionCode for BaselineCode {
                 activation,
                 entry,
                 self.code_object_id,
+                self.function_id,
                 self.register_count,
-                &self.safepoint_records,
+                !self.safepoint_records.is_empty(),
             )
         })
     }
@@ -221,40 +234,13 @@ impl JitFunctionCode for BaselineCode {
 /// `entry` must point at a prologue emitted with the [`JitEntry`] ABI inside a
 /// live executable mapping that outlives the call, and `activation` must uphold the
 /// [`VmRuntimeActivation`](otter_vm::VmRuntimeActivation) contract.
-#[repr(C)]
-struct ActiveSafepoints {
-    code_object_id: u64,
-    records: *const SafepointRecord,
-    count: u32,
-}
-
-unsafe extern "C" fn resolve_active_safepoint(
-    context: u64,
-    code_object_id: u64,
-    safepoint_id: u32,
-) -> *const SafepointRecord {
-    if context == 0 {
-        return std::ptr::null();
-    }
-    // SAFETY: enter_compiled retains the registry and record slice for the call.
-    let active = unsafe { &*(context as *const ActiveSafepoints) };
-    if active.code_object_id != code_object_id || active.records.is_null() {
-        return std::ptr::null();
-    }
-    // SAFETY: publisher records the exact live boxed-slice extent.
-    let records = unsafe { std::slice::from_raw_parts(active.records, active.count as usize) };
-    records
-        .binary_search_by_key(&safepoint_id, |record| record.id)
-        .ok()
-        .map_or(std::ptr::null(), |index| &raw const records[index])
-}
-
 pub(crate) unsafe fn enter_compiled(
     activation: VmRuntimeActivation,
     entry: *const u8,
     code_object_id: u64,
+    function_id: u32,
     register_count: u16,
-    safepoint_records: &[SafepointRecord],
+    has_safepoints: bool,
 ) -> JitExecOutcome {
     {
         let stack = activation.stack_ptr().cast::<HoltStack>();
@@ -283,24 +269,15 @@ pub(crate) unsafe fn enter_compiled(
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
-        let active_safepoints = ActiveSafepoints {
-            code_object_id,
-            records: safepoint_records.as_ptr(),
-            count: safepoint_records.len() as u32,
-        };
-        let registry = CodeRegistryView {
-            context: std::ptr::addr_of!(active_safepoints) as u64,
-            resolve_safepoint: resolve_active_safepoint as *const () as u64,
-        };
-        let flags = if safepoint_records.is_empty() {
-            NativeFrameFlags::empty()
-        } else {
+        let flags = if has_safepoints {
             NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS)
+        } else {
+            NativeFrameFlags::empty()
         };
         let mut native_frame = NativeFrame {
             header: VmFrameHeader {
-                function_id: code_object_id.saturating_sub(1) as u32,
-                code_block_id: code_object_id.saturating_sub(1) as u32,
+                function_id,
+                code_block_id: function_id,
                 pc: 0,
                 register_count,
                 kind: NativeFrameKind::Baseline,
@@ -325,7 +302,10 @@ pub(crate) unsafe fn enter_compiled(
         // SAFETY: `vm` is a valid `*mut Interpreter` for this entry; the header
         // and entry columns are isolate-owned and outlive every activation.
         thread.runtime_stub_table = unsafe { (*vm).jit_runtime_stub_table_addr() };
-        thread.code_registry = std::ptr::addr_of!(registry) as u64;
+        // SAFETY: the boxed registry cell is isolate-owned and address-stable;
+        // its view resolves safepoints for any installed code object, so a
+        // nested compiled callee's allocating stubs root through real maps.
+        thread.code_registry = unsafe { (*vm).jit_code_registry_view_addr() };
         thread.interrupt_cell = interrupt_flag as u64;
         thread.gc_heap = gc_heap as u64;
         thread.backedge_fuel_cell = backedge_fuel as u64;

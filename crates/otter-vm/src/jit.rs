@@ -46,6 +46,11 @@ pub struct JitCompileRequest {
     /// Loop-header logical PC for an OSR-target compile. `None` means normal
     /// function-entry compilation.
     pub osr_pc: Option<u32>,
+    /// Unique isolate-assigned identity for the produced code object. The
+    /// emitter stamps it into the code metadata and every published frame, so
+    /// the isolate code registry can resolve safepoints for any installed
+    /// object — including a nested callee's — from `(id, safepoint_id)`.
+    pub code_object_id: u64,
 }
 
 /// Owned snapshot of one executable function body.
@@ -854,6 +859,17 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Number of safepoints owned by this installed code object.
     fn safepoint_count(&self) -> u32 {
         0
+    }
+
+    /// Resolve one code-object-owned safepoint record by dense id.
+    ///
+    /// The returned reference is owned by this code object; the isolate code
+    /// registry keeps the object alive while any native frame can name it.
+    fn safepoint_record(
+        &self,
+        _safepoint_id: crate::native_abi::SafepointId,
+    ) -> Option<&crate::native_abi::SafepointRecord> {
+        None
     }
 
     /// Execute the compiled function for the frame at

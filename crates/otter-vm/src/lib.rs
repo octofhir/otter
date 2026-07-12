@@ -102,6 +102,7 @@ mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
 pub mod jit_feedback;
+pub mod jit_registry;
 mod jit_runtime_ops;
 pub mod js_surface;
 pub mod json;
@@ -969,6 +970,12 @@ pub struct Interpreter {
     jit_direct_method_cache: Vec<Vec<JitDirectMethodCache>>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
+    /// Address-stable registry of installed code objects behind the one
+    /// published safepoint-resolver view; entries are registered at compile
+    /// install and retained while any native frame can name them.
+    jit_code_registry: Box<jit_registry::JitCodeRegistry>,
+    /// Next unique code-object identity handed to a compile request.
+    jit_next_code_object_id: u64,
     /// Stable isolate-owned descriptor-indexed runtime entries, typed per
     /// signature family. VM-owned entries are installed at construction;
     /// JIT-owned transitions at [`Interpreter::set_jit_compiler`].

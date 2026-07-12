@@ -46,9 +46,12 @@ impl EmissionSession {
     }
 }
 
-pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
+pub(in crate::baseline) fn compile(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+) -> Result<BaselineCode, Unsupported> {
     let plan = BaselinePlan::build(view)?;
-    EmissionSession::new(&plan).emit(view, plan)
+    EmissionSession::new(&plan).emit(view, plan, code_object_id)
 }
 
 impl EmissionSession {
@@ -56,6 +59,7 @@ impl EmissionSession {
         mut self,
         view: &JitCompileSnapshot,
         mut plan: BaselinePlan,
+        code_object_id: u64,
     ) -> Result<BaselineCode, Unsupported> {
         let code_block = view.code_block.as_ref();
 
@@ -1125,7 +1129,8 @@ impl EmissionSession {
         let buf = self.ops.finalize().expect("finalize");
         Ok(BaselineCode::from_emission(
             CompiledCode::new(buf, entry),
-            u64::from(view.code_block.id) + 1,
+            code_object_id,
+            view.code_block.id,
             view.code_block.register_count,
             osr_entries,
             osr_only,

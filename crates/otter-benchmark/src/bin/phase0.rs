@@ -552,7 +552,7 @@ fn run_jit_compile(
         }
     }
     for _ in 0..warmup {
-        if let Err(error) = compile(&view) {
+        if let Err(error) = compile(&view, 1) {
             return result(
                 benchmark,
                 RuntimeMode::Vm,
@@ -568,7 +568,7 @@ fn run_jit_compile(
     let mut code_bytes = None;
     for _ in 0..samples {
         let started = Instant::now();
-        let code = match compile(&view) {
+        let code = match compile(&view, 1) {
             Ok(code) => code,
             Err(error) => {
                 return result(

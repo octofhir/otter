@@ -78,10 +78,14 @@ pub(crate) const JS_CLOSURE_BODY_TYPE_TAG: u32 = 0x23;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
 
-/// Compile a function view to baseline arm64 code, or report why not.
+/// Compile a function view to baseline arm64 code under the isolate-assigned
+/// unique code-object identity, or report why not.
 #[cfg(target_arch = "aarch64")]
-pub fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
-    arm64::compile(view)
+pub fn compile(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+) -> Result<BaselineCode, Unsupported> {
+    arm64::compile(view, code_object_id)
 }
 
 /// JIT-owned runtime transitions installed into the isolate entry table at
@@ -98,8 +102,11 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
 
 /// Non-arm64 stub: the emitter is arm64-only for now.
 #[cfg(not(target_arch = "aarch64"))]
-pub fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
-    let _ = view;
+pub fn compile(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+) -> Result<BaselineCode, Unsupported> {
+    let _ = (view, code_object_id);
     Err(Unsupported::OperandShape("baseline emitter is arm64-only"))
 }
 
@@ -112,13 +119,18 @@ mod tests {
     //! keeps branch byte-deltas trivial (`rel = (target - next) * 4`).
 
     use super::{
-        BaselinePlan, CallOperandView, JitCtx, JitEntry, JitRet, STATUS_RETURNED, Unsupported,
-        VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, compile, const_index, reg, value_tag,
+        BaselineCode, BaselinePlan, CallOperandView, JitCtx, JitEntry, JitRet, STATUS_RETURNED,
+        Unsupported, VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, const_index, reg,
+        value_tag,
     };
     use otter_bytecode::{Op, Operand};
     use otter_vm::{JitCompileSnapshot, JitFunctionCode, jit::JitTestInstruction};
 
     const STRIDE: u32 = 4;
+
+    fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
+        super::compile(view, 1)
+    }
 
     enum Exit {
         Returned(u64),

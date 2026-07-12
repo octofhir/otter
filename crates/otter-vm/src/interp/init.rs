@@ -218,6 +218,8 @@ impl Interpreter {
             jit_direct_code_anchors: Vec::new(),
             jit_direct_method_cache: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
+            jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
+            jit_next_code_object_id: 1,
             jit_runtime_stub_entries,
             jit_runtime_stub_machine_entries,
             jit_runtime_stub_table,
@@ -871,6 +873,15 @@ impl Interpreter {
     #[must_use]
     pub fn jit_runtime_stub_table_addr(&self) -> u64 {
         std::ptr::from_ref(&self.jit_runtime_stub_table) as u64
+    }
+
+    /// Address of the published isolate code-registry view. The boxed registry
+    /// cell is address-stable for the interpreter's lifetime, so the view
+    /// survives interpreter moves and resolves safepoints for any installed
+    /// code object.
+    #[must_use]
+    pub fn jit_code_registry_view_addr(&self) -> u64 {
+        self.jit_code_registry.view_addr()
     }
 
     /// `true` when a JIT compiler hook has been installed.

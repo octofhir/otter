@@ -414,8 +414,8 @@ pub(crate) mod arm64 {
     use otter_vm::Interpreter;
     use otter_vm::{
         JitArrayMethod, JitArrayMethodKind, JitCollectionAllocMethod, JitCollectionLeafMethod,
-        JitCompileSnapshot, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout, NO_FRAME_STATE,
-        STUB_COLLECTION_SET_ADD_ALLOC, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
+        JitCompileSnapshot, JitInlineCallee, JitInlineMethod, JitTypedArrayLayout,
+        STUB_COLLECTION_SET_ADD_ALLOC, STUB_STRING_CONCAT_ALLOC, SafepointId,
         jit::{JIT_COLLECTION_METHOD_IC_COLLECTION, JIT_COLLECTION_METHOD_IC_NO_STUB},
         runtime_stubs::alloc_value_stub_by_id,
     };
@@ -1058,7 +1058,7 @@ pub(crate) mod arm64 {
     }
 
     pub(super) fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
-        let plan = BaselinePlan::build(view)?;
+        let mut plan = BaselinePlan::build(view)?;
         let code_block = view.code_block.as_ref();
 
         let mut ops = Assembler::new().expect("assembler alloc");
@@ -1084,42 +1084,6 @@ pub(crate) mod arm64 {
         let mut array_literal_regs: Vec<Box<[u16]>> = Vec::new();
         let mut closure_parent_indices: Vec<Box<[u32]>> = Vec::new();
         let mut math_argument_regs: Vec<Box<[u16]>> = Vec::new();
-
-        let mut safepoint_records: Vec<_> = view.safepoints.values().cloned().collect();
-        let mut next_safepoint = safepoint_records
-            .iter()
-            .map(|record| record.id)
-            .max()
-            .map_or(1, |id| id.saturating_add(1))
-            .max(1);
-        let mut add_alloc_safepoints: BTreeMap<u32, SafepointId> = BTreeMap::new();
-        let mut live_method_alloc_safepoints: BTreeMap<u32, SafepointId> = BTreeMap::new();
-        for instr in &view.instructions {
-            if instr.op(code_block) == Op::CallMethodValue {
-                if let Some(alloc) = view.collection_alloc_methods.get(&instr.byte_pc) {
-                    live_method_alloc_safepoints.insert(instr.byte_pc, alloc.safepoint_id);
-                } else {
-                    let safepoint = next_safepoint;
-                    next_safepoint = next_safepoint.saturating_add(1);
-                    live_method_alloc_safepoints.insert(instr.byte_pc, safepoint);
-                    safepoint_records.push(SafepointRecord::frame_slot_window(
-                        safepoint,
-                        NO_FRAME_STATE,
-                        view.code_block.register_count,
-                    ));
-                }
-            }
-            if instr.op(code_block) == Op::Add {
-                let safepoint = next_safepoint;
-                next_safepoint = next_safepoint.saturating_add(1);
-                add_alloc_safepoints.insert(instr.byte_pc, safepoint);
-                safepoint_records.push(SafepointRecord::frame_slot_window(
-                    safepoint,
-                    NO_FRAME_STATE,
-                    view.code_block.register_count,
-                ));
-            }
-        }
 
         // Loop headers are verified once by the owning CodeBlock.
         let loop_headers = code_block.loop_headers();
@@ -1247,7 +1211,7 @@ pub(crate) mod arm64 {
                 Op::Add => emit_add_with_runtime_fallback(
                     &mut ops,
                     ops_ref,
-                    add_alloc_safepoints.get(&instr.byte_pc).copied(),
+                    plan.add_alloc_safepoints.get(&instr.byte_pc).copied(),
                     view.code_block.register_count,
                     threw,
                 )?,
@@ -1477,7 +1441,7 @@ pub(crate) mod arm64 {
                             view.collection_leaf_methods.get(&instr.byte_pc),
                             view.collection_alloc_methods.get(&instr.byte_pc),
                             Some(view),
-                            live_method_alloc_safepoints.get(&instr.byte_pc).copied(),
+                            plan.method_alloc_safepoints.get(&instr.byte_pc).copied(),
                             bail,
                             threw,
                         )?;
@@ -2308,8 +2272,8 @@ pub(crate) mod arm64 {
             osr_entries.insert(instruction_pc, off);
         }
 
-        safepoint_records.sort_by_key(|record| record.id);
-        let safepoint_records = safepoint_records.into_boxed_slice();
+        plan.safepoint_records.sort_by_key(|record| record.id);
+        let safepoint_records = plan.safepoint_records.into_boxed_slice();
         let buf = ops.finalize().expect("finalize");
         Ok(BaselineCode {
             code: CompiledCode::new(buf, entry),
@@ -6865,6 +6829,28 @@ mod tests {
             BaselinePlan::build(&v).err(),
             Some(Unsupported::BranchTarget(9))
         );
+    }
+
+    #[test]
+    fn lowering_plan_assigns_allocating_add_safepoint() {
+        let v = view(&[
+            (
+                Op::Add,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(2)]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+        let id = plan
+            .add_alloc_safepoints
+            .get(&0)
+            .copied()
+            .expect("add safepoint");
+        assert!(plan.safepoint_records.iter().any(|record| record.id == id));
     }
 
     #[test]

@@ -14,8 +14,8 @@
 //! - [`super::arm64`], the first machine-code consumer of these rules.
 
 use otter_bytecode::{Op, Operand};
-use otter_vm::JitCompileSnapshot;
-use std::collections::BTreeSet;
+use otter_vm::{JitCompileSnapshot, NO_FRAME_STATE, SafepointId, SafepointRecord};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Largest argument count the `Call` emitter inlines.
 pub(crate) const MAX_INLINE_ARGS: usize = 4;
@@ -53,6 +53,9 @@ pub(crate) struct BaselinePlan {
     pub(crate) enable_float_residency: bool,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
+    pub(crate) safepoint_records: Vec<SafepointRecord>,
+    pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
+    pub(crate) method_alloc_safepoints: BTreeMap<u32, SafepointId>,
 }
 
 impl BaselinePlan {
@@ -106,11 +109,56 @@ impl BaselinePlan {
             }
         }
 
+        let mut safepoint_records: Vec<_> = view.safepoints.values().cloned().collect();
+        let mut next_safepoint = safepoint_records
+            .iter()
+            .map(|record| record.id)
+            .max()
+            .map_or(1, |id| id.saturating_add(1))
+            .max(1);
+        let mut add_alloc_safepoints = BTreeMap::new();
+        let mut method_alloc_safepoints = BTreeMap::new();
+        for instr in &view.instructions {
+            match instr.op(code_block) {
+                Op::CallMethodValue => {
+                    let safepoint = view
+                        .collection_alloc_methods
+                        .get(&instr.byte_pc)
+                        .map(|alloc| alloc.safepoint_id)
+                        .unwrap_or_else(|| {
+                            let id = next_safepoint;
+                            next_safepoint = next_safepoint.saturating_add(1);
+                            safepoint_records.push(SafepointRecord::frame_slot_window(
+                                id,
+                                NO_FRAME_STATE,
+                                view.code_block.register_count,
+                            ));
+                            id
+                        });
+                    method_alloc_safepoints.insert(instr.byte_pc, safepoint);
+                }
+                Op::Add => {
+                    let safepoint = next_safepoint;
+                    next_safepoint = next_safepoint.saturating_add(1);
+                    add_alloc_safepoints.insert(instr.byte_pc, safepoint);
+                    safepoint_records.push(SafepointRecord::frame_slot_window(
+                        safepoint,
+                        NO_FRAME_STATE,
+                        view.code_block.register_count,
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         Ok(Self {
             instruction_pcs,
             enable_float_residency,
             load_property_count,
             store_property_count,
+            safepoint_records,
+            add_alloc_safepoints,
+            method_alloc_safepoints,
         })
     }
 }

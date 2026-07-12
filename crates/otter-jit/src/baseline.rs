@@ -52,10 +52,12 @@ use otter_vm::{
 use crate::CompiledCode;
 
 mod abi;
+mod artifacts;
 mod lowering;
 mod runtime_ops;
 mod value_abi;
 use abi::*;
+use artifacts::*;
 pub use lowering::Unsupported;
 use lowering::*;
 use runtime_ops::*;
@@ -386,14 +388,14 @@ pub(crate) mod arm64 {
         DIRECT_METHOD_RECV_SHAPE_OFFSET, DIRECT_METHOD_REGISTER_COUNT_OFFSET,
         DIRECT_METHOD_VALUE_BYTE_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET,
         DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET, DOUBLE_OFFSET_HI16, ERROR_SLOT_OFFSET,
-        FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS, INTERRUPT_FLAG_OFFSET,
-        JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS, MAX_METHOD_ARGS,
-        NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16,
+        EmissionArtifacts, FRAME_INDEX_OFFSET, FUNCTION_ID_TAG, GC_HEAP_OFFSET, IC_WAYS,
+        INTERRUPT_FLAG_OFFSET, JIT_CTX_STACK_SIZE, JS_CLOSURE_BODY_TYPE_TAG, MAX_INLINE_ARGS,
+        MAX_METHOD_ARGS, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16,
         OBJECT_BODY_TYPE_TAG, Op, REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, RESUME_PC_OFFSET,
         STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, SYNC_REENTRY_DEPTH_PTR_OFFSET,
         SYNC_REENTRY_LIMIT_OFFSET, THIS_VALUE_OFFSET, THREAD_OFFSET, UPVALUE_CELL_SIZE,
         UPVALUE_VALUE_OFFSET, UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW,
-        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WhiskerIcCell, WordOperands,
+        VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, WordOperands,
         alloc_value_stub_trampoline_pair, branch_target, const_index, imm32,
         jit_abort_direct_call_stub, jit_add_stub, jit_backedge_poll_stub,
         jit_call_collection_method_ic_stub, jit_define_data_property_stub,
@@ -1081,9 +1083,8 @@ pub(crate) mod arm64 {
         // Set when an unsupported opcode is emitted as a bail (see the catch-all
         // arm); such code is OSR-only.
         let mut osr_only = false;
-        let mut array_literal_regs: Vec<Box<[u16]>> = Vec::new();
-        let mut closure_parent_indices: Vec<Box<[u32]>> = Vec::new();
-        let mut math_argument_regs: Vec<Box<[u16]>> = Vec::new();
+        let mut artifacts =
+            EmissionArtifacts::new(plan.load_property_count, plan.store_property_count);
 
         // Loop headers are verified once by the owning CodeBlock.
         let loop_headers = code_block.loop_headers();
@@ -1099,24 +1100,6 @@ pub(crate) mod arm64 {
         // arithmetic through the double path on the hot values.
         let enable_fres = plan.enable_float_residency;
         let mut fres = FloatResidency::default();
-
-        // One self-patching WhiskerIC cell per `LoadProperty` op. Allocated up
-        // front (stable boxed buffer) so each site can bake its cell address;
-        // filled at runtime by `jit_load_prop_window_stub` on a monomorphic own-data
-        // inline-slot hit. `as_mut_ptr` gives a write-provenance base that
-        // outlives every execution (the buffer is owned by the returned
-        // `BaselineCode` and never re-formed as a `&[_]` slice).
-        let mut load_ic_cells: Box<[WhiskerIcCell]> =
-            vec![WhiskerIcCell::default(); plan.load_property_count].into_boxed_slice();
-        let cell_base = load_ic_cells.as_mut_ptr() as usize;
-        let mut load_ic_idx: usize = 0;
-
-        // One self-patching WhiskerIC cell per `StoreProperty` op, same scheme
-        // as the load cells above.
-        let mut store_ic_cells: Box<[WhiskerIcCell]> =
-            vec![WhiskerIcCell::default(); plan.store_property_count].into_boxed_slice();
-        let store_cell_base = store_ic_cells.as_mut_ptr() as usize;
-        let mut store_ic_idx: usize = 0;
 
         let entry = ops.offset();
         // Self-recursion target: a direct `Op::Call` to the running closure
@@ -1335,8 +1318,7 @@ pub(crate) mod arm64 {
                         .map(|slot| reg(ops_ref, slot + 2))
                         .collect::<Result<Vec<_>, _>>()?
                         .into_boxed_slice();
-                    let source_regs_ptr = source_regs.as_ptr();
-                    array_literal_regs.push(source_regs);
+                    let source_regs_ptr = artifacts.retain_array_literal_regs(source_regs);
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
                     emit_load_u64(&mut ops, 2, source_regs_ptr as u64);
                     emit_load_u64(&mut ops, 3, count as u64);
@@ -1764,8 +1746,7 @@ pub(crate) mod arm64 {
 
                     // This site's WhiskerIC cell address (stable for the code's
                     // life). Filled by the stub on a monomorphic own-data hit.
-                    let cell_addr = cell_base + load_ic_idx * std::mem::size_of::<WhiskerIcCell>();
-                    load_ic_idx += 1;
+                    let cell_addr = artifacts.next_load_ic_addr();
 
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
@@ -1912,9 +1893,7 @@ pub(crate) mod arm64 {
                     let src = reg(ops_ref, 2)?;
                     let site = instr.property_ic_site(code_block).unwrap_or(usize::MAX) as u64;
 
-                    let cell_addr =
-                        store_cell_base + store_ic_idx * std::mem::size_of::<WhiskerIcCell>();
-                    store_ic_idx += 1;
+                    let cell_addr = artifacts.next_store_ic_addr();
 
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
@@ -2079,8 +2058,7 @@ pub(crate) mod arm64 {
                             .map(|slot| reg(ops_ref, slot + 3))
                             .collect::<Result<Vec<_>, _>>()?
                             .into_boxed_slice();
-                        let argument_regs_ptr = argument_regs.as_ptr();
-                        math_argument_regs.push(argument_regs);
+                        let argument_regs_ptr = artifacts.retain_math_argument_regs(argument_regs);
                         dynasm!(ops
                             ; .arch aarch64
                             ; mov x0, x20
@@ -2108,8 +2086,8 @@ pub(crate) mod arm64 {
                         })
                         .collect::<Result<Vec<_>, _>>()?
                         .into_boxed_slice();
-                    let parent_indices_ptr = parent_indices.as_ptr();
-                    closure_parent_indices.push(parent_indices);
+                    let parent_indices_ptr =
+                        artifacts.retain_closure_parent_indices(parent_indices);
                     dynasm!(ops ; .arch aarch64 ; mov x0, x20);
                     emit_load_u64(&mut ops, 1, u64::from(view.code_block.id));
                     dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
@@ -2274,6 +2252,7 @@ pub(crate) mod arm64 {
 
         plan.safepoint_records.sort_by_key(|record| record.id);
         let safepoint_records = plan.safepoint_records.into_boxed_slice();
+        let artifacts = artifacts.finish();
         let buf = ops.finalize().expect("finalize");
         Ok(BaselineCode {
             code: CompiledCode::new(buf, entry),
@@ -2281,11 +2260,11 @@ pub(crate) mod arm64 {
             register_count: view.code_block.register_count,
             osr_entries,
             osr_only,
-            load_ic_cells,
-            store_ic_cells,
-            array_literal_regs: array_literal_regs.into_boxed_slice(),
-            closure_parent_indices: closure_parent_indices.into_boxed_slice(),
-            math_argument_regs: math_argument_regs.into_boxed_slice(),
+            load_ic_cells: artifacts.load_ic_cells,
+            store_ic_cells: artifacts.store_ic_cells,
+            array_literal_regs: artifacts.array_literal_regs.into_boxed_slice(),
+            closure_parent_indices: artifacts.closure_parent_indices.into_boxed_slice(),
+            math_argument_regs: artifacts.math_argument_regs.into_boxed_slice(),
             safepoint_records,
             frameless_entry_safe: self_call_safe,
         })

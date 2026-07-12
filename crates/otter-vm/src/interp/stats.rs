@@ -280,6 +280,10 @@ impl Interpreter {
         if self.method_call_ics.len() < site_count {
             self.method_call_ics.resize(site_count, None);
         }
+        if self.jit_method_site_feedback.len() < site_count {
+            self.jit_method_site_feedback
+                .resize_with(site_count, || None);
+        }
         if self.jit_collection_method_ics.len() < site_count {
             self.jit_collection_method_ics
                 .resize(site_count, jit::JitCollectionMethodIcSlot::EMPTY);

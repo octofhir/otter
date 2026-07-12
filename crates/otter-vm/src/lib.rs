@@ -946,11 +946,10 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// Per-call-site method-call feedback driving baseline method inlining,
-    /// keyed `(caller_fid, call_instruction_pc)`. Recorded by the interpreter
-    /// `Op::CallMethodValue` arm during warmup and read at compile time
-    /// (`bake_inline_callees`). Only mutated when a JIT hook is installed.
-    jit_method_site_feedback: rustc_hash::FxHashMap<(u32, u32), MethodCallFeedback>,
+    /// Dense method-call feedback driving baseline method inlining, keyed by
+    /// the same executable IC site id as `method_call_ics`. Only mutated when a
+    /// JIT hook is installed.
+    jit_method_site_feedback: Vec<Option<MethodCallFeedback>>,
     /// Per-function count of *entry* bails out of an installed compiled body
     /// (function-entry, sync-entry, and direct-call callee entries alike). A
     /// body that bails on every call — typically compiled early against

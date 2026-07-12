@@ -256,43 +256,46 @@ impl Interpreter {
                 Op::CallMethodValue => {
                     let operands = function.operand_view(instr);
                     let depth_before = stack.len();
+                    let feedback_site = instr.property_ic_site();
                     // Capture the receiver/prototype layout before the call for
                     // method-inline feedback (the receiver register lives in the
                     // caller frame, which `do_call_method_value` leaves in place
                     // under the new callee frame; the receiver handle may move
                     // during the call, so the prototype shape and method slot are
                     // resolved here while it is still valid).
-                    let method_site =
-                        if jit_installed && !self.method_site_feedback_saturated(function_id, pc) {
-                            register_operand(function.operand(instr, 1))
-                                .ok()
-                                .and_then(|r| {
-                                    stack
-                                        .get(top_idx)
-                                        .and_then(|f| f.registers.get(r as usize).copied())
-                                })
-                                .and_then(|recv| {
-                                    const_operand(function.operand(instr, 2)).ok().and_then(
-                                        |name_idx| {
-                                            self.method_site_for_receiver(
-                                                context,
-                                                function_id,
-                                                name_idx,
-                                                recv,
-                                            )
-                                        },
-                                    )
-                                })
-                        } else {
-                            None
-                        };
+                    let method_site = if jit_installed
+                        && feedback_site
+                            .is_some_and(|site| !self.method_site_feedback_saturated(site))
+                    {
+                        register_operand(function.operand(instr, 1))
+                            .ok()
+                            .and_then(|r| {
+                                stack
+                                    .get(top_idx)
+                                    .and_then(|f| f.registers.get(r as usize).copied())
+                            })
+                            .and_then(|recv| {
+                                const_operand(function.operand(instr, 2)).ok().and_then(
+                                    |name_idx| {
+                                        self.method_site_for_receiver(
+                                            context,
+                                            function_id,
+                                            name_idx,
+                                            recv,
+                                        )
+                                    },
+                                )
+                            })
+                    } else {
+                        None
+                    };
                     self.do_call_method_value(stack, context, operands)?;
                     // Tier-up hook, mirroring `Op::Call`: a bytecode method
                     // callee pushed via `invoke` lands as a fresh pc==0 frame.
                     if jit_installed && stack.len() > depth_before {
                         let method_fid = stack[stack.len() - 1].function_id;
-                        if let Some(site) = method_site {
-                            self.note_method_target(function_id, pc, method_fid, site);
+                        if let (Some(feedback_site), Some(site)) = (feedback_site, method_site) {
+                            self.note_method_target(feedback_site, method_fid, site);
                         }
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {
                             return Ok(value);

@@ -84,10 +84,18 @@ impl Interpreter {
                 .function(fid)
                 .map(|function| function.name.as_str())
                 .unwrap_or("<unknown>");
-            let method_feedback = self
-                .jit_method_site_feedback
+            let method_feedback = view
+                .instructions
                 .iter()
-                .filter(|&(&(caller_fid, _), _)| caller_fid == fid)
+                .filter(|instr| {
+                    instr
+                        .property_ic_site(&view.code_block)
+                        .is_some_and(|site| {
+                            self.jit_method_site_feedback
+                                .get(site)
+                                .is_some_and(Option::is_some)
+                        })
+                })
                 .count();
             let call_feedback = view
                 .instructions
@@ -534,15 +542,10 @@ impl Interpreter {
     /// observations are no-ops, so a caller can skip the receiver/prototype
     /// shape walk that only exists to build the `MethodSite` argument — the hot
     /// path for a megamorphic site (e.g. one `arr[i].run()` over many classes).
-    pub(crate) fn method_site_feedback_saturated(
-        &self,
-        caller_fid: u32,
-        call_instruction_pc: u32,
-    ) -> bool {
+    pub(crate) fn method_site_feedback_saturated(&self, site: usize) -> bool {
         matches!(
-            self.jit_method_site_feedback
-                .get(&(caller_fid, call_instruction_pc)),
-            Some(MethodCallFeedback::Megamorphic)
+            self.jit_method_site_feedback.get(site),
+            Some(Some(MethodCallFeedback::Megamorphic))
         )
     }
 
@@ -557,12 +560,10 @@ impl Interpreter {
     /// a fresh compilation is warranted.
     pub(crate) fn note_method_target(
         &mut self,
-        caller_fid: u32,
-        call_instruction_pc: u32,
+        feedback_site: usize,
         method_fid: u32,
         site: MethodSite,
     ) {
-        use std::collections::hash_map::Entry;
         let new_target = PolyMethodTarget {
             method_fid,
             recv_shape: site.recv_shape,
@@ -570,19 +571,19 @@ impl Interpreter {
             method_value_byte: site.method_value_byte,
             hits: 1,
         };
-        match self
-            .jit_method_site_feedback
-            .entry((caller_fid, call_instruction_pc))
-        {
-            Entry::Vacant(slot) => {
-                slot.insert(MethodCallFeedback::Mono {
+        let Some(slot) = self.jit_method_site_feedback.get_mut(feedback_site) else {
+            return;
+        };
+        match slot {
+            None => {
+                *slot = Some(MethodCallFeedback::Mono {
                     method_fid,
                     recv_shape: site.recv_shape,
                     proto_chain: site.proto_chain,
                     method_value_byte: site.method_value_byte,
                 });
             }
-            Entry::Occupied(mut slot) => match slot.get_mut() {
+            Some(state) => match state {
                 MethodCallFeedback::Mono {
                     method_fid: seen_fid,
                     recv_shape: seen_shape,
@@ -605,7 +606,7 @@ impl Interpreter {
                             SmallVec::new();
                         targets.push(prior);
                         targets.push(new_target);
-                        *slot.get_mut() = MethodCallFeedback::Poly(Box::new(targets));
+                        *state = MethodCallFeedback::Poly(Box::new(targets));
                     }
                 }
                 MethodCallFeedback::Poly(targets) => {
@@ -616,7 +617,7 @@ impl Interpreter {
                     } else if targets.len() < MAX_POLY_METHOD_TARGETS {
                         targets.push(new_target);
                     } else {
-                        *slot.get_mut() = MethodCallFeedback::Megamorphic;
+                        *state = MethodCallFeedback::Megamorphic;
                     }
                 }
                 MethodCallFeedback::Megamorphic => {}
@@ -786,13 +787,14 @@ impl Interpreter {
             instruction_pc: u32,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
         }
-        let method_sites: Vec<PolySnapshot> = self
-            .jit_method_site_feedback
+        let method_feedback = &self.jit_method_site_feedback;
+        let method_sites: Vec<PolySnapshot> = view
+            .instructions
             .iter()
-            .filter_map(|(&(caller_fid, instruction_pc), state)| {
-                if caller_fid != fid {
-                    return None;
-                }
+            .filter_map(|instr| {
+                let instruction_pc = instr.instruction_pc(&view.code_block);
+                let site = instr.property_ic_site(&view.code_block)?;
+                let state = method_feedback.get(site)?.as_ref()?;
                 match state {
                     MethodCallFeedback::Mono {
                         method_fid,
@@ -949,15 +951,19 @@ impl Interpreter {
                 if instr.op(&method_view.code_block) != Op::CallMethodValue {
                     continue;
                 }
+                let Some(site) = instr.property_ic_site(&method_view.code_block) else {
+                    continue;
+                };
                 if let Some(MethodCallFeedback::Mono {
                     method_fid,
                     recv_shape,
                     proto_chain,
                     method_value_byte,
-                }) = self.jit_method_site_feedback.get(&(
-                    target.method_fid,
-                    instr.instruction_pc(&method_view.code_block),
-                )) {
+                }) = self
+                    .jit_method_site_feedback
+                    .get(site)
+                    .and_then(Option::as_ref)
+                {
                     nested_targets.push((
                         instr.byte_pc,
                         PolyMethodTarget {

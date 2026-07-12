@@ -36,25 +36,53 @@
 
 mod baseline;
 mod code;
+mod template;
 
 pub use baseline::{BaselineCode, Unsupported, compile};
 pub use code::CompiledCode;
+pub use template::TemplateCode;
+
+/// Which native compiler implementation the installed hook drives.
+///
+/// This is the explicit code-level wiring point for compiler selection: hosts
+/// and differential tests construct the hook with the kind they want, and the
+/// default construction always drives the production emitter. There is no
+/// environment or runtime toggle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BaselineCompilerKind {
+    /// The full-subset production baseline emitter.
+    #[default]
+    Legacy,
+    /// The [`template`]-plan compiler: constants, register moves, branches,
+    /// tagged truthiness, and returns; every other shape reports
+    /// `Unsupported` and execution stays on the interpreter.
+    Template,
+}
 
 /// Baseline JIT compiler implementation wired into `otter-vm` through the
 /// VM-owned [`otter_vm::JitCompilerHook`] trait.
 ///
-/// Step 1 installs the dependency-inverted contract and compile-input DTOs.
-/// Real bytecode lowering lands in the following Phase 1 step, so this hook
-/// currently reports `Unsupported` and leaves execution on the interpreter
-/// fallback path.
+/// Both compiler implementations share the frozen entry ABI, the classified
+/// runtime-stub inventory, and the exact-PC exit contract, so the hook's stub
+/// bindings are identical regardless of the selected kind.
 #[derive(Debug, Default)]
-pub struct BaselineJitCompiler;
+pub struct BaselineJitCompiler {
+    kind: BaselineCompilerKind,
+}
 
 impl BaselineJitCompiler {
-    /// Construct a baseline JIT compiler hook.
+    /// Construct the production baseline JIT compiler hook.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            kind: BaselineCompilerKind::Legacy,
+        }
+    }
+
+    /// Construct a hook driving the selected compiler implementation.
+    #[must_use]
+    pub const fn with_kind(kind: BaselineCompilerKind) -> Self {
+        Self { kind }
     }
 }
 
@@ -68,17 +96,31 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
-        // The baseline tier serves OSR requests too: it builds a loop-header
-        // OSR trampoline per back-edge target, so a hot loop the optimizing tier
-        // declined (an unsupported opcode or not-yet-int32 feedback in its
-        // region) still tiers up to a native loop body instead of interpreting.
-        match baseline::compile(&request.snapshot, request.code_object_id) {
-            Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
-                code: std::sync::Arc::new(code),
-            }),
-            Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
-                reason: format!("function {fid} not in baseline subset: {reason:?}"),
-            }),
+        match self.kind {
+            // The baseline tier serves OSR requests too: it builds a loop-header
+            // OSR trampoline per back-edge target, so a hot loop the optimizing tier
+            // declined (an unsupported opcode or not-yet-int32 feedback in its
+            // region) still tiers up to a native loop body instead of interpreting.
+            BaselineCompilerKind::Legacy => {
+                match baseline::compile(&request.snapshot, request.code_object_id) {
+                    Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
+                        code: std::sync::Arc::new(code),
+                    }),
+                    Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
+                        reason: format!("function {fid} not in baseline subset: {reason:?}"),
+                    }),
+                }
+            }
+            BaselineCompilerKind::Template => {
+                match template::compile(&request.snapshot, request.code_object_id) {
+                    Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
+                        code: std::sync::Arc::new(code),
+                    }),
+                    Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
+                        reason: format!("function {fid} not in template subset: {reason:?}"),
+                    }),
+                }
+            }
         }
     }
 }

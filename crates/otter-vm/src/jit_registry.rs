@@ -26,15 +26,21 @@
 //! - `JIT_REFACTOR_PLAN.md` Phase 4 for the lifetime states this backs.
 
 use crate::jit::JitFunctionCode;
-use crate::native_abi::{CodeRegistryView, SafepointId, SafepointRecord};
+use crate::native_abi::{CodeLifetimeState, CodeRegistryView, SafepointId, SafepointRecord};
 use std::sync::Arc;
+
+/// One registered code object with its lifecycle state.
+struct RegisteredCode {
+    code: Arc<dyn JitFunctionCode>,
+    state: CodeLifetimeState,
+}
 
 /// Isolate-owned installed-code registry behind a stable published view.
 pub struct JitCodeRegistry {
     /// Published C-layout lookup surface; `context` names this registry.
     view: CodeRegistryView,
     /// Installed code objects by unique code-object id.
-    codes: rustc_hash::FxHashMap<u64, Arc<dyn JitFunctionCode>>,
+    codes: rustc_hash::FxHashMap<u64, RegisteredCode>,
 }
 
 impl JitCodeRegistry {
@@ -56,7 +62,40 @@ impl JitCodeRegistry {
     pub(crate) fn register(&mut self, code_object_id: u64, code: Arc<dyn JitFunctionCode>) {
         debug_assert_ne!(code_object_id, 0);
         debug_assert_eq!(code.metadata().id, code_object_id);
-        self.codes.insert(code_object_id, code);
+        let replaced = self.codes.insert(
+            code_object_id,
+            RegisteredCode {
+                code,
+                state: CodeLifetimeState::Installed,
+            },
+        );
+        debug_assert!(replaced.is_none(), "code-object ids are never reused");
+    }
+
+    /// Unlink every installed body compiled from `function_id`: the code takes
+    /// no new entries, while active frames keep returning through it via their
+    /// `Arc` anchors.
+    pub(crate) fn invalidate_function(&mut self, function_id: u32) {
+        for registered in self.codes.values_mut() {
+            if registered.state == CodeLifetimeState::Installed
+                && registered.code.metadata().code_block_id == function_id
+            {
+                registered.state = CodeLifetimeState::Invalid;
+            }
+        }
+    }
+
+    /// Retire invalid code whose last anchor is the registry itself: no map
+    /// entry, cache, direct-call anchor, or active frame still references it,
+    /// so the executable mapping is safe to reclaim. Returns how many objects
+    /// retired.
+    pub(crate) fn retire_unreferenced(&mut self) -> usize {
+        let before = self.codes.len();
+        self.codes.retain(|_, registered| {
+            registered.state != CodeLifetimeState::Invalid
+                || Arc::strong_count(&registered.code) > 1
+        });
+        before - self.codes.len()
     }
 
     /// Address of the published view for [`crate::native_abi::VmThread`].
@@ -66,9 +105,11 @@ impl JitCodeRegistry {
     }
 
     fn resolve(&self, code_object_id: u64, safepoint_id: SafepointId) -> *const SafepointRecord {
+        // Invalid code still resolves: an active frame may be executing it and
+        // its allocating stubs must keep rooting precisely until it retires.
         self.codes
             .get(&code_object_id)
-            .and_then(|code| code.safepoint_record(safepoint_id))
+            .and_then(|registered| registered.code.safepoint_record(safepoint_id))
             .map_or(std::ptr::null(), std::ptr::from_ref)
     }
 }
@@ -176,5 +217,27 @@ mod tests {
         assert_eq!(unsafe { (*other).id }, 3);
         assert!(unsafe { view.resolve(7, 5) }.is_none(), "id is per-object");
         assert!(unsafe { view.resolve(8, 3) }.is_none(), "unknown object");
+    }
+
+    #[test]
+    fn invalid_code_resolves_until_last_anchor_drops() {
+        let mut registry = JitCodeRegistry::new_boxed();
+        let code: Arc<dyn JitFunctionCode> = Arc::new(FakeCode {
+            id: 11,
+            records: vec![SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 2)],
+        });
+        let anchor = code.clone();
+        registry.register(11, code);
+
+        registry.invalidate_function(0);
+        // An active anchor (a frame or direct-call pin) keeps invalid code
+        // registered and resolvable.
+        assert_eq!(registry.retire_unreferenced(), 0);
+        let view = unsafe { *(registry.view_addr() as *const CodeRegistryView) };
+        assert!(unsafe { view.resolve(11, 1) }.is_some());
+
+        drop(anchor);
+        assert_eq!(registry.retire_unreferenced(), 1);
+        assert!(unsafe { view.resolve(11, 1) }.is_none());
     }
 }

@@ -53,6 +53,7 @@ pub(crate) struct BaselinePlan {
     pub(crate) enable_float_residency: bool,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
+    branch_targets: BTreeMap<u32, u32>,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
     pub(crate) method_alloc_safepoints: BTreeMap<u32, SafepointId>,
@@ -67,6 +68,7 @@ impl BaselinePlan {
         let mut load_property_count = 0;
         let mut store_property_count = 0;
 
+        let mut branch_targets = BTreeMap::new();
         for instr in &view.instructions {
             let op = instr.op(code_block);
             let pc = instr.instruction_pc(code_block);
@@ -100,12 +102,11 @@ impl BaselinePlan {
             ) {
                 let rel = imm32(instr.operand_view(code_block), 0)?;
                 let target = branch_target(code_block, instr, rel);
-                let valid = u32::try_from(target)
+                let target_pc = u32::try_from(target)
                     .ok()
-                    .is_some_and(|pc| boundaries.contains(&pc));
-                if !valid {
-                    return Err(Unsupported::BranchTarget(target));
-                }
+                    .filter(|pc| boundaries.contains(pc))
+                    .ok_or(Unsupported::BranchTarget(target))?;
+                branch_targets.insert(instr.byte_pc, target_pc);
             }
         }
 
@@ -156,10 +157,19 @@ impl BaselinePlan {
             enable_float_residency,
             load_property_count,
             store_property_count,
+            branch_targets,
             safepoint_records,
             add_alloc_safepoints,
             method_alloc_safepoints,
         })
+    }
+
+    /// Canonical target PC resolved and verified for a branch bytecode site.
+    pub(crate) fn branch_target(&self, byte_pc: u32) -> Result<u32, Unsupported> {
+        self.branch_targets
+            .get(&byte_pc)
+            .copied()
+            .ok_or(Unsupported::OperandShape("missing planned branch target"))
     }
 }
 

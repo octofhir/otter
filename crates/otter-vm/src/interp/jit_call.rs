@@ -295,10 +295,10 @@ impl Interpreter {
         if !matches!(function.op(instr), Op::Add | Op::Sub | Op::Mul) {
             return false;
         }
-        if !self
-            .jit_arith_widen_float
-            .insert((fid, instr.instruction_pc))
-        {
+        let Some(feedback) = function.feedback_at(instr.instruction_pc as usize) else {
+            return false;
+        };
+        if !feedback.widen_arith_to_float() {
             return false;
         }
         self.invalidate_jit_function(fid);

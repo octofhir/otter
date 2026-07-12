@@ -7,9 +7,8 @@
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
-//! - [`CodeBlock`] — one immutable verified function body: authoritative
-//!   wordcode, dense site metadata, precomputed control flow, and cold source
-//!   metadata.
+//! - [`CodeBlock`] — one verified function body: immutable wordcode/control
+//!   flow plus dense advisory feedback cells keyed by logical PC.
 //! - [`CodeBlockInstruction`] — compact site identity selecting one wordcode
 //!   record and its VM-local IC metadata.
 //!
@@ -239,18 +238,14 @@ impl CodeBlock {
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
-                    // Baked by `Interpreter::bake_arith_feedback` from the live
-                    // per-site warmup feedback; the raw snapshot carries none.
-                    arith_feedback: 0,
+                    arith_feedback: self.feedback[index].arith_bits(),
                     // Baked by `Interpreter::bake_property_feedback` from the
                     // live per-site property IC; the raw snapshot carries none.
                     property_feedback: None,
                     property_feedback_poly: Vec::new(),
                     property_proto_feedback: None,
                     object_literal: None,
-                    // Baked by `Interpreter::bake_element_load_kind` from the
-                    // live per-site warmup feedback; the raw snapshot carries none.
-                    element_load_kind: crate::jit::JitElementLoadKind::Any,
+                    element_load_kind: self.feedback[index].element_load_kind(),
                     // Baked by `Interpreter::bake_global_lex_cells` once the
                     // lexical binding exists; the raw snapshot carries none.
                     global_lex_cell: None,
@@ -299,6 +294,10 @@ impl CodeBlock {
                 )
             })
             .collect();
+        let feedback = (0..code.len())
+            .map(|_| crate::jit_feedback::InstructionFeedback::default())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
         Arc::new(Self {
             id,
@@ -326,6 +325,7 @@ impl CodeBlock {
             code: code.into_boxed_slice(),
             wordcode,
             control_flow,
+            feedback,
             byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
         })
@@ -342,6 +342,15 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn instr_at_index(&self, index: usize) -> Option<&CodeBlockInstruction> {
         self.code.get(index)
+    }
+
+    /// Dense feedback cell at canonical logical `index`.
+    #[must_use]
+    pub(crate) fn feedback_at(
+        &self,
+        index: usize,
+    ) -> Option<&crate::jit_feedback::InstructionFeedback> {
+        self.feedback.get(index)
     }
 
     /// Cold serialized byte PC for one logical instruction index.
@@ -666,6 +675,8 @@ pub struct CodeBlock {
     wordcode: FunctionCode,
     /// Precomputed logical-PC block, loop, and exception-region tables.
     control_flow: CodeBlockControlFlow,
+    /// Advisory feedback parallel to `code`, shared without hash lookup.
+    feedback: Box<[crate::jit_feedback::InstructionFeedback]>,
     /// Cold serialized byte PCs parallel to `code`.
     byte_pcs: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
@@ -718,6 +729,10 @@ impl CodeBlock {
                     property_ic_site,
                 )
             })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let feedback = (0..code.len())
+            .map(|_| crate::jit_feedback::InstructionFeedback::default())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let mapped_argument_bindings = function
@@ -804,6 +819,7 @@ impl CodeBlock {
             code,
             wordcode,
             control_flow,
+            feedback,
             byte_pcs: instr_to_byte_pc,
             byte_spans,
         }

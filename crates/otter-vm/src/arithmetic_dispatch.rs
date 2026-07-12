@@ -27,8 +27,8 @@
 use otter_bytecode::Op;
 
 use crate::{
-    Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint, number,
-    oom_to_vm, read_register, write_register,
+    Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint,
+    jit_feedback::InstructionFeedback, number, oom_to_vm, read_register, write_register,
 };
 
 /// Signature of every BigInt binary op routed through this module.
@@ -52,10 +52,11 @@ impl Interpreter {
         rhs: u16,
         op: fn(NumberValue, NumberValue) -> NumberValue,
         bigint_op: BigIntBinop,
+        feedback: Option<&InstructionFeedback>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        if self.jit_hook.is_some() {
-            self.note_arith(lhs, rhs);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lhs, rhs);
         }
         run_numeric_values(self, frame, dst, lhs, rhs, op, bigint_op)
     }
@@ -66,10 +67,11 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         rhs: u16,
+        feedback: Option<&InstructionFeedback>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        if self.jit_hook.is_some() {
-            self.note_arith(lhs, rhs);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lhs, rhs);
         }
         self.run_add_values(frame, dst, lhs, rhs)
     }
@@ -130,10 +132,11 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         op: Op,
+        feedback: Option<&InstructionFeedback>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        if self.jit_hook.is_some() {
-            self.note_arith(lhs, rhs);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lhs, rhs);
         }
         run_compare_values(&self.gc_heap, frame, dst, lhs, rhs, op)
     }
@@ -144,10 +147,11 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         rhs: u16,
+        feedback: Option<&InstructionFeedback>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        if self.jit_hook.is_some() {
-            self.note_arith(lhs, rhs);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lhs, rhs);
         }
         let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
@@ -213,6 +217,7 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         negate: bool,
+        feedback: Option<&InstructionFeedback>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         // Record operand-type feedback like the relational path: a `===` / `!==`
@@ -220,8 +225,8 @@ impl Interpreter {
         // speculate an int32 / float compare (the operand guards deopt a
         // mismatched type). Without this a strict-equality site stays unfed and
         // declines at tier-up.
-        if self.jit_hook.is_some() {
-            self.note_arith(lhs, rhs);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lhs, rhs);
         }
         let eq = abstract_ops::is_strictly_equal(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
@@ -237,10 +242,11 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         negate: bool,
+        feedback: Option<&InstructionFeedback>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        if self.jit_hook.is_some() {
-            self.note_arith(lhs, rhs);
+        if let Some(feedback) = feedback {
+            feedback.record_arith(lhs, rhs);
         }
         let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
         write_register(frame, dst, Value::boolean(eq ^ negate))?;

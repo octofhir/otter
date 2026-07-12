@@ -5068,31 +5068,8 @@ fn call_target_feedback_tracks_mono_then_poly() {
 }
 
 #[test]
-fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
-    let mut interp = Interpreter::new();
-
-    // A pure-int32 site under fid 5 at instruction PC 1.
-    interp.current_function_id = 5;
-    interp.current_instruction_pc = 1;
-    interp.note_arith(Value::number_i32(1), Value::number_i32(2));
-    interp.note_arith(Value::number_i32(7), Value::number_i32(-3));
-    let int_site = interp.jit_arith_feedback.get(&(5, 1)).copied().unwrap();
-    assert!(int_site.is_int32_only());
-    assert!(int_site.is_numeric_only());
-
-    // A second site that mixes int32 and double → numeric but not int32.
-    interp.current_instruction_pc = 2;
-    interp.note_arith(Value::number_i32(1), Value::number_f64(2.5));
-    let num_site = interp.jit_arith_feedback.get(&(5, 2)).copied().unwrap();
-    assert!(!num_site.is_int32_only());
-    assert!(num_site.is_numeric_only());
-
-    // Same instruction PC under a different fid is independent (never recorded).
-    assert!(!interp.jit_arith_feedback.contains_key(&(9, 1)));
-
-    // Baking copies each site's bits into the matching instruction by
-    // instruction PC; unobserved instructions stay 0.
-    let mut view = jit::JitCompileSnapshot::without_feedback(
+fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
+    let seed = jit::JitCompileSnapshot::without_feedback(
         5,
         0,
         4,
@@ -5112,22 +5089,42 @@ fn arith_feedback_accumulates_per_site_and_bakes_into_view() {
             })
             .collect(),
     );
-    interp.bake_arith_feedback(&mut view, 5);
-    assert_eq!(view.instructions[0].arith_feedback, int_site.bits());
-    assert_eq!(view.instructions[1].arith_feedback, num_site.bits());
-    assert_eq!(view.instructions[2].arith_feedback, 0);
+    let code_block = seed.code_block;
+    let int_site = code_block.feedback_at(0).unwrap();
+    int_site.record_arith(Value::number_i32(1), Value::number_i32(2));
+    int_site.record_arith(Value::number_i32(7), Value::number_i32(-3));
+    let num_site = code_block.feedback_at(1).unwrap();
+    num_site.record_arith(Value::number_i32(1), Value::number_f64(2.5));
+    assert!(code_block.feedback_at(2).unwrap().widen_arith_to_float());
 
-    // A widened overflow site forces numeric mixed feedback even if the
-    // interpreter never observed a double operand there.
-    interp.jit_arith_widen_float.insert((5, 3));
-    for instr in &mut view.instructions {
-        instr.arith_feedback = 0;
-    }
-    interp.bake_arith_feedback(&mut view, 5);
-    assert_eq!(view.instructions[0].arith_feedback, int_site.bits());
-    assert_eq!(view.instructions[1].arith_feedback, num_site.bits());
+    let view = code_block.jit_compile_snapshot();
+    assert_eq!(
+        view.instructions[0].arith_feedback,
+        jit_feedback::ARITH_INT32
+    );
+    assert_eq!(
+        view.instructions[1].arith_feedback,
+        jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64
+    );
     assert_eq!(
         view.instructions[2].arith_feedback,
         jit_feedback::ARITH_INT32 | jit_feedback::ARITH_FLOAT64
     );
+
+    let other = jit::JitCompileSnapshot::without_feedback(
+        9,
+        0,
+        1,
+        vec![jit::JitTestInstruction::new(
+            Op::Add,
+            1,
+            16,
+            vec![
+                Operand::Register(0),
+                Operand::Register(0),
+                Operand::Register(0),
+            ],
+        )],
+    );
+    assert_eq!(other.instructions[0].arith_feedback, 0);
 }

@@ -30,7 +30,7 @@ impl Interpreter {
         rhs: u16,
     ) -> Result<(), VmError> {
         let saved_pc = stack[frame_index].pc;
-        let result = self.run_add_regs(&mut stack[frame_index], dst, lhs, rhs);
+        let result = self.run_add_regs(&mut stack[frame_index], dst, lhs, rhs, None);
         stack[frame_index].pc = saved_pc;
         result
     }

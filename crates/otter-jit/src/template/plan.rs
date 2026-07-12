@@ -26,7 +26,9 @@
 use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
 
-use crate::baseline::{BaselinePlan, Unsupported, value_tag};
+use crate::baseline::{
+    BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag,
+};
 
 /// Numeric binary operators lowered to the shared int32/double template.
 /// `+` has its own operation ([`TemplateOp::AddGeneric`]) because its
@@ -193,6 +195,25 @@ pub(crate) enum TemplateOp {
     StoreUpvalue { src: u16, index: i32 },
     /// `upvalue[index] = r<src>` with the TDZ read guard.
     StoreUpvalueChecked { src: u16, index: i32 },
+    /// `r<dst> = r<callee>(args…)` through the direct-call prepare
+    /// transition; ineligible callees take an exact side exit to normal
+    /// dispatch. Argument register indices are packed one per 16-bit lane.
+    Call {
+        dst: u16,
+        callee: u16,
+        argc: u16,
+        packed_args: u64,
+    },
+    /// `r<dst> = r<receiver>.name(args…)` through the collection-method IC
+    /// and the direct-method prepare transition.
+    MethodCall {
+        dst: u16,
+        receiver: u16,
+        name: u32,
+        site: u64,
+        argc: u16,
+        packed_args: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -491,6 +512,37 @@ impl TemplatePlan {
                     TemplateOp::StoreUpvalueChecked {
                         src: operands.value,
                         index: operands.index,
+                    }
+                }
+                Op::Call => {
+                    let operands = lowered.call_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        return Err(Unsupported::ArgCount(arguments.len()));
+                    }
+                    TemplateOp::Call {
+                        dst: operands.dst,
+                        callee: operands.callee,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_method_arg_regs(arguments),
+                    }
+                }
+                Op::CallMethodValue => {
+                    let operands = lowered.method_call_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        return Err(Unsupported::ArgCount(arguments.len()));
+                    }
+                    let site = meta
+                        .property_ic_site(view.code_block.as_ref())
+                        .unwrap_or(usize::MAX) as u64;
+                    TemplateOp::MethodCall {
+                        dst: operands.dst,
+                        receiver: operands.receiver,
+                        name: operands.name,
+                        site,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_method_arg_regs(arguments),
                     }
                 }
                 Op::LessThan

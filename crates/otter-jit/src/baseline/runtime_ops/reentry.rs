@@ -76,6 +76,52 @@ pub(crate) extern "C" fn jit_inline_closure_upvalues_stub(
         .unwrap_or(0)
 }
 
+/// Prepare a direct compiled **plain** call (`callee(args…)`).
+///
+/// Fills `ctx.direct_*` and returns `0` on success; `1` parks a thrown error
+/// in the ctx; `2` means "ineligible — bail to the interpreter", which runs
+/// the call with full semantics.
+pub(crate) extern "C" fn jit_prepare_direct_call_stub(
+    ctx: *mut JitCtx,
+    callee_reg: u64,
+    argc: u64,
+    packed_args: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
+    let all = unpack_method_arg_regs(packed_args);
+    let argc = (argc as usize).min(all.len());
+    match vm.jit_prepare_direct_call(
+        context,
+        stack,
+        ctx.frame_index,
+        callee_reg as u16,
+        &all[..argc],
+        ctx.regs.cast::<otter_vm::Value>().cast_const(),
+    ) {
+        Ok(Some(prepared)) => {
+            ctx.direct_entry_addr = prepared.entry_addr;
+            ctx.direct_regs = prepared.regs;
+            ctx.direct_self_closure = prepared.self_closure;
+            ctx.direct_this_value = prepared.this_value;
+            ctx.direct_frame_index = prepared.frame_index;
+            ctx.direct_upvalues_ptr = prepared.upvalues_ptr;
+            ctx.direct_frame_ids = prepared.frame_ids;
+            ctx.direct_frame_meta = prepared.frame_meta;
+            ctx.direct_code_object_id = prepared.code_object_id;
+            0
+        }
+        Ok(None) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Prepare a direct compiled **method** call (`recv.name(args…)`). Same
 /// `ctx.direct_*` / status contract as [`jit_prepare_direct_call_stub`], but
 /// status `2` means "ineligible — use the in-place full method-call stub"

@@ -1071,6 +1071,86 @@ impl Interpreter {
         }
     }
 
+    /// Prepare a direct compiled **plain** call (`callee(args…)`) from the
+    /// callee value in a caller register. Returns `Ok(None)` when the callee
+    /// is not an eligible installed bytecode function — the emitted site bails
+    /// to the interpreter, which runs the call with full semantics.
+    ///
+    /// # Safety-adjacent contract
+    /// `caller_regs` is the caller's live register window
+    /// (`JitCtx.regs`); compiled code guarantees `callee_reg`/argument
+    /// registers are in bounds for that window.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn jit_prepare_direct_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        callee_reg: u16,
+        arg_regs: &[u16],
+        caller_regs: *const Value,
+    ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Alloc);
+        self.jit_runtime_stats.runtime_calls =
+            self.jit_runtime_stats.runtime_calls.saturating_add(1);
+        // SAFETY: `callee_reg` is a compiler-emitted index into the caller window.
+        let callee = unsafe { *caller_regs.add(callee_reg as usize) };
+        let Ok((function_id, parent_upvalues, this0, new_target, derived_this, eval_env)) =
+            Self::bytecode_call_target_parts(callee, Value::undefined(), &self.gc_heap)
+        else {
+            return Ok(None);
+        };
+        if new_target.is_some() || derived_this.is_some() || eval_env.is_some() {
+            return Ok(None);
+        }
+        let Some(function) = context.exec_function(function_id) else {
+            return Ok(None);
+        };
+        if function.is_generator
+            || function.is_async
+            || function.is_async_generator
+            || function.needs_arguments
+            || function.has_rest
+            || function.contains_direct_eval
+            || function.is_derived_constructor
+        {
+            return Ok(None);
+        }
+        let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
+            return Ok(None);
+        };
+        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+            return Ok(None);
+        };
+        self.enter_sync_reentry()?;
+        match self.prepare_jit_direct_call_frame(
+            context,
+            stack,
+            frame_index,
+            function,
+            parent_upvalues,
+            this0,
+            plan,
+            // The callee closure lives in a caller register: prepare re-reads
+            // it post-allocation for the named-function SELF binding, so
+            // `makes_function` callees stay eligible on this path.
+            Some(callee_reg),
+            arg_regs,
+            caller_regs,
+        ) {
+            Ok(prepared) => {
+                self.pin_jit_direct_code(prepared.frame_index, code.clone());
+                self.jit_runtime_stats.direct_calls =
+                    self.jit_runtime_stats.direct_calls.saturating_add(1);
+                Ok(Some(prepared))
+            }
+            Err(err) => {
+                self.leave_sync_reentry();
+                Err(err)
+            }
+        }
+    }
+
     /// Finish a direct compiled call that returned normally.
     ///
     /// Pops and reclaims the published callee frame, stores `value` into the

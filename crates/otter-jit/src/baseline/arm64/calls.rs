@@ -1558,22 +1558,53 @@ pub(super) fn is_self_call_safe(view: &JitCompileSnapshot) -> bool {
     })
 }
 
-/// Emit a direct `Call`: ask the VM to publish an eligible callee frame,
-/// build the callee `JitCtx` on the native stack, branch to the compiled
-/// entry, then finish/pop/store through the narrow direct-call ABI. Cold or
-/// ineligible calls bail to the interpreter instead of using the generic
-/// runtime call bridge.
+/// Emit a direct `Call`: ask the VM to publish an eligible callee frame
+/// (`jit_prepare_direct_call_stub`), then run the shared direct-call dispatch
+/// tail — callee `JitCtx` + published `NativeFrame` on the native stack and a
+/// branch to the compiled entry. Cold or ineligible callees bail to the
+/// interpreter, which runs the call with full semantics.
 pub(super) fn emit_call(
     ops: &mut Assembler,
-    _operands: impl WordOperands,
+    operands: impl WordOperands,
     bail: DynamicLabel,
-    _threw: DynamicLabel,
+    threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
-    // The former direct-call ABI asked the interpreter to materialize a
-    // HoltStack frame, then re-entered native code. That is neither a
-    // native calling convention nor a useful boundary: plain calls bail
-    // until they have a frameless native link.
-    dynasm!(ops ; .arch aarch64 ; b =>bail);
+    let dst = reg(operands, 0)?;
+    let callee = reg(operands, 1)?;
+    let argc = const_index(operands, 2)? as usize;
+    if argc > MAX_METHOD_ARGS {
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
+        return Ok(());
+    }
+    let mut arg_regs = [0u16; MAX_METHOD_ARGS];
+    for (slot, arg) in arg_regs.iter_mut().enumerate().take(argc) {
+        *arg = reg(operands, 3 + slot)?;
+    }
+    let packed_args = pack_method_arg_regs(&arg_regs[..argc]);
+    let done = ops.new_dynamic_label();
+
+    // jit_prepare_direct_call_stub(ctx, callee_reg, argc, packed_args)
+    // -> 0 = direct prepared, 1 = throw, 2 = ineligible → interpreter.
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x0, x20
+        ; movz x1, callee as u32
+        ; movz x2, argc as u32
+    );
+    emit_load_u64(ops, 3, packed_args);
+    emit_load_u64(ops, 16, jit_prepare_direct_call_stub as *const () as u64);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, #1
+        ; b.eq =>threw
+        ; cmp x0, #2
+        ; b.eq =>bail
+    );
+
+    // Direct prepared (status 0): shared dispatch tail.
+    emit_direct_call_tail(ops, dst, threw, done);
+    dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }
 

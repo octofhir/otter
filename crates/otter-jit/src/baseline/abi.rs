@@ -30,13 +30,6 @@ pub(crate) struct JitCtx {
     /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
     /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
     pub(super) this_value: u64,
-    /// Logical PC of the instruction currently executing, written by compiled
-    /// code before each op (offset [`RESUME_PC_OFFSET`]). On a guard bail the
-    /// interpreter resumes here — the exact instruction, not the entry/loop
-    /// header — which is what makes bailing out of a loop body that has
-    /// already committed side effects (or out of an unsupported opcode)
-    /// correct. Read by `enter_at` on `STATUS_BAILED`.
-    pub(super) resume_pc: u32,
     /// Sole machine-visible VM state pointer.
     pub(super) thread: *mut VmThread,
     /// Published authoritative activation.
@@ -117,9 +110,6 @@ pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
 pub(crate) const STATUS_THREW: u64 = 2;
 
-/// Byte offset of [`JitCtx::resume_pc`] — where compiled code stamps the
-/// current logical PC before each op so a bail resumes at the exact site.
-pub(crate) const RESUME_PC_OFFSET: u32 = std::mem::offset_of!(JitCtx, resume_pc) as u32;
 /// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
 #[allow(dead_code)]
 pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;

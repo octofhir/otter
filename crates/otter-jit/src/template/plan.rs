@@ -24,14 +24,15 @@
 //! - [`super::arm64`] — the first machine-code consumer of these operations.
 
 use otter_bytecode::Op;
-use otter_vm::{JitCompileSnapshot, Value};
+use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
 
 use crate::baseline::{BaselinePlan, Unsupported, value_tag};
 
 /// Numeric binary operators lowered to the shared int32/double template.
+/// `+` has its own operation ([`TemplateOp::AddGeneric`]) because its
+/// non-numeric semantics are additive, not a side exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArithKind {
-    Add,
     Sub,
     Mul,
     Div,
@@ -126,10 +127,83 @@ pub(crate) enum TemplateOp {
     /// heap cells and function references so observable coercion hooks run in
     /// the interpreter.
     ToPrimitive { dst: u16, src: u16 },
+    /// `r<dst> = r<lhs> + r<rhs>` with the full `+` semantics: inline numeric
+    /// paths, an allocating string-concat runtime call rooted through the
+    /// published frame at `concat_safepoint`, and the interpreter-completing
+    /// delegate for every remaining coercive case.
+    AddGeneric {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+        concat_safepoint: SafepointId,
+    },
+    /// `r<dst>` = this-binding read from the entry context; a derived-ctor
+    /// hole takes an exact side exit.
+    LoadThis { dst: u16 },
+    /// `r<dst>` = the running function's SELF closure bits from the entry
+    /// context (named-function self binding).
+    LoadSelfClosure { dst: u16 },
+    /// `r<dst>` = materialized function object for `constants[constant]`.
+    MakeFunction { dst: u16, constant: u32 },
+    /// `r<dst>` = closure over `function` capturing `parents` upvalues.
+    MakeClosure {
+        dst: u16,
+        function: u32,
+        parents: TemplateTail,
+    },
+    /// `r<dst> = constants[constant]` (string constant).
+    LoadString { dst: u16, constant: u32 },
+    /// `r<dst> = global[name]` or throw.
+    LoadGlobal { dst: u16, name: u32 },
+    /// `r<dst>` = builtin error constructor for `constant`.
+    LoadBuiltinError { dst: u16, constant: u32 },
+    /// `r<dst> = {}`.
+    NewObject { dst: u16 },
+    /// `r<dst> = [elements…]` from the plan-owned register tail.
+    NewArray { dst: u16, elements: TemplateTail },
+    /// `r<dst> = Math.<method>(arguments…)`.
+    MathCall {
+        dst: u16,
+        method: u32,
+        arguments: TemplateTail,
+    },
+    /// Refresh the captured binding cell at `index` (per-iteration bindings).
+    FreshUpvalue { index: i32 },
+    /// `object[key] = value` as a data property definition.
+    DefineDataProperty { object: u16, key: u16, value: u16 },
+    /// `DefineOwnProperty(target, key, descriptor)`.
+    DefineOwnProperty {
+        target: u16,
+        key: u16,
+        descriptor: u16,
+    },
+    /// `r<dst> = r<receiver>[r<index>]`.
+    LoadElement { dst: u16, receiver: u16, index: u16 },
+    /// `r<receiver>[r<index>] = r<value>` (`scratch` is the bytecode scratch
+    /// slot the runtime operation owns).
+    StoreElement {
+        receiver: u16,
+        index: u16,
+        value: u16,
+        scratch: u16,
+    },
+    /// `r<dst> = upvalue[index]` (captured binding; TDZ raises in the VM).
+    LoadUpvalue { dst: u16, index: i32 },
+    /// `upvalue[index] = r<src>` (barriered store in the VM).
+    StoreUpvalue { src: u16, index: i32 },
+    /// `upvalue[index] = r<src>` with the TDZ read guard.
+    StoreUpvalueChecked { src: u16, index: i32 },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
     ReturnUndefined,
+}
+
+/// Range into a plan-owned homogeneous operand side buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TemplateTail {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
 }
 
 /// One template operation at its canonical instruction PC.
@@ -140,15 +214,34 @@ pub(crate) struct TemplateInstr {
 }
 
 /// Backend-neutral facts established before template emission starts.
+///
+/// The boxed operand buffers are address-stable: emitted variadic operations
+/// bake pointers into them, and the finalized code object takes ownership of
+/// the same allocations.
 pub(crate) struct TemplatePlan {
     pub(crate) instructions: Vec<TemplateInstr>,
     pub(crate) register_count: u16,
+    pub(crate) register_operands: Box<[u16]>,
+    pub(crate) index_operands: Box<[u32]>,
+    pub(crate) safepoint_records: Vec<SafepointRecord>,
+}
+
+impl TemplatePlan {
+    pub(crate) fn register_tail(&self, tail: TemplateTail) -> &[u16] {
+        &self.register_operands[tail.start..tail.start + tail.len]
+    }
+
+    pub(crate) fn index_tail(&self, tail: TemplateTail) -> &[u32] {
+        &self.index_operands[tail.start..tail.start + tail.len]
+    }
 }
 
 impl TemplatePlan {
     pub(crate) fn build(view: &JitCompileSnapshot) -> Result<Self, Unsupported> {
         let lowering = BaselinePlan::build(view)?;
         let mut instructions = Vec::with_capacity(lowering.instructions.len());
+        let mut register_operands: Vec<u16> = Vec::new();
+        let mut index_operands: Vec<u32> = Vec::new();
         for (meta, lowered) in view.instructions.iter().zip(&lowering.instructions) {
             let pc = lowered.instruction_pc;
             let op = match lowered.op {
@@ -235,19 +328,169 @@ impl TemplatePlan {
                         negate: true,
                     }
                 }
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
+                Op::Add => {
+                    let operands = lowered.binary_operands()?;
+                    let concat_safepoint = lowering
+                        .add_alloc_safepoints
+                        .get(&lowered.byte_pc)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape("Add without a safepoint"))?;
+                    TemplateOp::AddGeneric {
+                        dst: operands.dst,
+                        lhs: operands.lhs,
+                        rhs: operands.rhs,
+                        concat_safepoint,
+                    }
+                }
+                Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let operands = lowered.binary_operands()?;
                     TemplateOp::BinaryArith {
                         dst: operands.dst,
                         lhs: operands.lhs,
                         rhs: operands.rhs,
                         kind: match lowered.op {
-                            Op::Add => ArithKind::Add,
                             Op::Sub => ArithKind::Sub,
                             Op::Mul => ArithKind::Mul,
                             Op::Div => ArithKind::Div,
                             _ => ArithKind::Rem,
                         },
+                    }
+                }
+                Op::MakeFunction | Op::MakeClosure if meta.make_self => {
+                    TemplateOp::LoadSelfClosure {
+                        dst: lowered.destination_operands()?.dst,
+                    }
+                }
+                Op::MakeFunction => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::MakeFunction {
+                        dst: operands.dst,
+                        constant: operands.constant,
+                    }
+                }
+                Op::MakeClosure => {
+                    let operands = lowered.make_closure_operands()?;
+                    let slice = lowering.index_tail(operands.parents)?;
+                    let start = index_operands.len();
+                    index_operands.extend_from_slice(slice);
+                    TemplateOp::MakeClosure {
+                        dst: operands.dst,
+                        function: operands.function,
+                        parents: TemplateTail {
+                            start,
+                            len: slice.len(),
+                        },
+                    }
+                }
+                Op::LoadThis => TemplateOp::LoadThis {
+                    dst: lowered.destination_operands()?.dst,
+                },
+                Op::LoadString => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::LoadString {
+                        dst: operands.dst,
+                        constant: operands.constant,
+                    }
+                }
+                Op::LoadGlobalOrThrow => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::LoadGlobal {
+                        dst: operands.dst,
+                        name: operands.constant,
+                    }
+                }
+                Op::LoadBuiltinError => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::LoadBuiltinError {
+                        dst: operands.dst,
+                        constant: operands.constant,
+                    }
+                }
+                Op::NewObject => TemplateOp::NewObject {
+                    dst: lowered.destination_operands()?.dst,
+                },
+                Op::NewArray => {
+                    let operands = lowered.new_array_operands()?;
+                    let slice = lowering.register_tail(operands.elements)?;
+                    let start = register_operands.len();
+                    register_operands.extend_from_slice(slice);
+                    TemplateOp::NewArray {
+                        dst: operands.dst,
+                        elements: TemplateTail {
+                            start,
+                            len: slice.len(),
+                        },
+                    }
+                }
+                Op::MathCall => {
+                    let operands = lowered.math_call_operands()?;
+                    let slice = lowering.register_tail(operands.arguments)?;
+                    let start = register_operands.len();
+                    register_operands.extend_from_slice(slice);
+                    TemplateOp::MathCall {
+                        dst: operands.dst,
+                        method: operands.method,
+                        arguments: TemplateTail {
+                            start,
+                            len: slice.len(),
+                        },
+                    }
+                }
+                Op::FreshUpvalue => TemplateOp::FreshUpvalue {
+                    index: lowered.immediate_operands()?.value,
+                },
+                Op::DefineDataProperty => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::DefineDataProperty {
+                        object: operands.first,
+                        key: operands.second,
+                        value: operands.third,
+                    }
+                }
+                Op::DefineOwnProperty => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::DefineOwnProperty {
+                        target: operands.first,
+                        key: operands.second,
+                        descriptor: operands.third,
+                    }
+                }
+                Op::LoadElement => {
+                    let operands = lowered.element_load_operands()?;
+                    TemplateOp::LoadElement {
+                        dst: operands.dst,
+                        receiver: operands.receiver,
+                        index: operands.index,
+                    }
+                }
+                Op::StoreElement => {
+                    let operands = lowered.element_store_operands()?;
+                    TemplateOp::StoreElement {
+                        receiver: operands.receiver,
+                        index: operands.index,
+                        value: operands.value,
+                        scratch: operands.scratch,
+                    }
+                }
+                Op::LoadUpvalue => {
+                    let operands = lowered.upvalue_operands()?;
+                    TemplateOp::LoadUpvalue {
+                        dst: operands.value,
+                        index: operands.index,
+                    }
+                }
+                Op::StoreUpvalue => {
+                    let operands = lowered.upvalue_operands()?;
+                    TemplateOp::StoreUpvalue {
+                        src: operands.value,
+                        index: operands.index,
+                    }
+                }
+                Op::StoreUpvalueChecked => {
+                    let operands = lowered.upvalue_operands()?;
+                    TemplateOp::StoreUpvalueChecked {
+                        src: operands.value,
+                        index: operands.index,
                     }
                 }
                 Op::LessThan
@@ -343,6 +586,9 @@ impl TemplatePlan {
         Ok(Self {
             instructions,
             register_count: view.code_block.register_count,
+            register_operands: register_operands.into_boxed_slice(),
+            index_operands: index_operands.into_boxed_slice(),
+            safepoint_records: lowering.safepoint_records,
         })
     }
 }
@@ -447,12 +693,12 @@ mod tests {
     fn plan_rejects_the_whole_function_on_an_unsupported_opcode() {
         let v = view(&[
             (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
-            (Op::NewObject, vec![Operand::Register(1)]),
+            (Op::Throw, vec![Operand::Register(1)]),
             (Op::ReturnValue, vec![Operand::Register(1)]),
         ]);
         assert_eq!(
             TemplatePlan::build(&v).err(),
-            Some(Unsupported::Opcode(Op::NewObject))
+            Some(Unsupported::Opcode(Op::Throw))
         );
     }
 

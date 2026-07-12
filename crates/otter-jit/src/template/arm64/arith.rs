@@ -18,6 +18,7 @@
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 
+use super::transitions::{TransitionTable, emit_add_delegate, emit_string_concat_alloc_call};
 use super::values::{
     emit_box_bool, emit_box_double, emit_box_int32, emit_guard_int32, emit_guard_number,
     emit_load_reg, emit_load_u64, emit_num_to_double, emit_store_reg, emit_to_int32_fast,
@@ -74,7 +75,7 @@ pub(super) fn emit_binary_arith(
             emit_box_int32(ops, 13, 12);
             return emit_store_reg(ops, 13, dst);
         }
-        ArithKind::Add | ArithKind::Sub | ArithKind::Mul => {}
+        ArithKind::Sub | ArithKind::Mul => {}
     }
     let float_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -89,7 +90,6 @@ pub(super) fn emit_binary_arith(
         ; b.ne =>float_path
     );
     match kind {
-        ArithKind::Add => dynasm!(ops ; .arch aarch64 ; adds w13, w9, w10 ; b.vs =>float_path),
         ArithKind::Sub => dynasm!(ops ; .arch aarch64 ; subs w13, w9, w10 ; b.vs =>float_path),
         ArithKind::Mul => dynasm!(ops
             ; .arch aarch64
@@ -105,13 +105,61 @@ pub(super) fn emit_binary_arith(
     emit_num_to_double(ops, 9, 0, bail);
     emit_num_to_double(ops, 10, 1, bail);
     match kind {
-        ArithKind::Add => dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1),
         ArithKind::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
         ArithKind::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
         _ => unreachable!("Div/Rem returned above"),
     }
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
+}
+
+/// Emit `+` with the full ECMAScript semantics: the inline numeric paths of
+/// [`emit_binary_arith`], then the allocating string-concat runtime call
+/// rooted at `concat_safepoint`, then the interpreter-completing delegate for
+/// every remaining coercive case. Non-number operands never side-exit — `+`
+/// stays resident in compiled code.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_add_generic(
+    ops: &mut Assembler,
+    table: &TransitionTable,
+    dst: u16,
+    lhs: u16,
+    rhs: u16,
+    concat_safepoint: otter_vm::SafepointId,
+    threw: DynamicLabel,
+) -> Result<(), Unsupported> {
+    emit_load_reg(ops, 9, lhs)?;
+    emit_load_reg(ops, 10, rhs)?;
+    let float_path = ops.new_dynamic_label();
+    let runtime_path = ops.new_dynamic_label();
+    let delegate_path = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; and x14, x9, x15
+        ; cmp x14, x15
+        ; b.ne =>float_path
+        ; and x14, x10, x15
+        ; cmp x14, x15
+        ; b.ne =>float_path
+        ; adds w13, w9, w10
+        ; b.vs =>float_path
+    );
+    emit_box_int32(ops, 13, 12);
+    emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
+    emit_num_to_double(ops, 9, 0, runtime_path);
+    emit_num_to_double(ops, 10, 1, runtime_path);
+    dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1);
+    emit_box_double(ops, 2, 13);
+    emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path);
+    emit_string_concat_alloc_call(ops, dst, lhs, rhs, concat_safepoint, delegate_path, done)?;
+    dynasm!(ops ; .arch aarch64 ; =>delegate_path);
+    emit_add_delegate(ops, table, dst, lhs, rhs, threw);
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())
 }

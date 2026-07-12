@@ -19,8 +19,12 @@
 //! - `crates/otter-vm/src/native_abi/frame.rs` — the published activation.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use otter_vm::JitCompileSnapshot;
 use otter_vm::native_abi as abi;
 
+use super::collections::{
+    MethodSite, emit_alloc_method_guarded_call, emit_leaf_method_guarded_call,
+};
 use super::transitions::TransitionTable;
 use super::values::emit_load_u64;
 use crate::baseline::{
@@ -84,16 +88,41 @@ pub(super) fn emit_call(
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     dst: u16,
     receiver: u16,
     name: u32,
     site: u64,
     argc: u16,
     packed_args: u64,
+    byte_pc: u32,
+    arg0: Option<u16>,
+    arg1: Option<u16>,
     bail: DynamicLabel,
     threw: DynamicLabel,
-) {
+) -> Result<(), crate::baseline::Unsupported> {
     let done = ops.new_dynamic_label();
+    let method_site = MethodSite {
+        dst,
+        receiver,
+        argc,
+        arg0,
+        arg1,
+    };
+    // Guarded monomorphic collection fast paths precede the shared bridge;
+    // every guard miss lands on the next layer.
+    if let Some(leaf) = view.collection_leaf_methods.get(&byte_pc) {
+        let after_leaf = ops.new_dynamic_label();
+        if emit_leaf_method_guarded_call(ops, view, leaf, &method_site, after_leaf, done)? {
+            dynasm!(ops ; .arch aarch64 ; =>after_leaf);
+        }
+    }
+    if let Some(alloc) = view.collection_alloc_methods.get(&byte_pc) {
+        let after_alloc = ops.new_dynamic_label();
+        if emit_alloc_method_guarded_call(ops, view, alloc, &method_site, after_alloc, done)? {
+            dynasm!(ops ; .arch aarch64 ; =>after_alloc);
+        }
+    }
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, x20
@@ -136,6 +165,7 @@ pub(super) fn emit_method_call(
     );
     emit_direct_call_tail(ops, table, dst, threw, done);
     dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 /// Shared direct-call dispatch tail used after a prepare transition returned

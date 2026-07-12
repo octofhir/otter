@@ -32,6 +32,7 @@
 
 mod arith;
 mod calls;
+mod collections;
 mod properties;
 mod transitions;
 mod values;
@@ -424,19 +425,26 @@ pub(super) fn compile(
                 site,
                 argc,
                 packed_args,
+                byte_pc,
+                arg0,
+                arg1,
             } => {
                 calls::emit_method_call(
                     &mut ops,
                     &transitions,
+                    view,
                     dst,
                     receiver,
                     name,
                     site,
                     argc,
                     packed_args,
+                    byte_pc,
+                    arg0,
+                    arg1,
                     bail,
                     threw,
-                );
+                )?;
             }
             TemplateOp::Return { src } => {
                 let off = reg_offset(src)?;

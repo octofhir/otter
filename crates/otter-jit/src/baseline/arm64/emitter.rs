@@ -13,31 +13,57 @@
 
 use super::*;
 
+/// Mutable state owned for exactly one baseline compilation.
+struct EmissionSession {
+    ops: Assembler,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+    labels: BTreeMap<u32, DynamicLabel>,
+    artifacts: EmissionArtifacts,
+    fres: FloatResidency,
+    osr_only: bool,
+}
+
+impl EmissionSession {
+    fn new(plan: &BaselinePlan) -> Self {
+        let mut ops = Assembler::new().expect("assembler alloc");
+        let bail = ops.new_dynamic_label();
+        let threw = ops.new_dynamic_label();
+        let labels = plan
+            .instruction_pcs
+            .iter()
+            .map(|&pc| (pc, ops.new_dynamic_label()))
+            .collect();
+        Self {
+            ops,
+            bail,
+            threw,
+            labels,
+            artifacts: EmissionArtifacts::new(plan.load_property_count, plan.store_property_count),
+            fres: FloatResidency::default(),
+            osr_only: false,
+        }
+    }
+}
+
 pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<BaselineCode, Unsupported> {
     let mut plan = BaselinePlan::build(view)?;
     let code_block = view.code_block.as_ref();
 
-    let mut ops = Assembler::new().expect("assembler alloc");
-    let bail = ops.new_dynamic_label();
-    let threw = ops.new_dynamic_label();
-
-    // A dynamic label per canonical instruction PC. Byte PCs remain side
-    // metadata for bailout/OSR records only.
-    let mut labels: BTreeMap<u32, DynamicLabel> = BTreeMap::new();
-    for &instruction_pc in &plan.instruction_pcs {
-        labels.insert(instruction_pc, ops.new_dynamic_label());
-    }
+    let mut session = EmissionSession::new(&plan);
+    let ops = &mut session.ops;
+    let bail = session.bail;
+    let threw = session.threw;
+    let labels = &session.labels;
+    let artifacts = &mut session.artifacts;
+    let fres = &mut session.fres;
+    let osr_only = &mut session.osr_only;
     let target_label = |instruction_pc: i64| -> Result<DynamicLabel, Unsupported> {
         u32::try_from(instruction_pc)
             .ok()
             .and_then(|pc| labels.get(&pc).copied())
             .ok_or(Unsupported::BranchTarget(instruction_pc))
     };
-
-    // Set when an unsupported opcode is emitted as a bail (see the catch-all
-    // arm); such code is OSR-only.
-    let mut osr_only = false;
-    let mut artifacts = EmissionArtifacts::new(plan.load_property_count, plan.store_property_count);
 
     // Loop headers are verified once by the owning CodeBlock.
     let loop_headers = code_block.loop_headers();
@@ -52,8 +78,6 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
     // Number via `f64`, so a function that contains one already runs its
     // arithmetic through the double path on the hot values.
     let enable_fres = plan.enable_float_residency;
-    let mut fres = FloatResidency::default();
-
     let entry = ops.offset();
     // Self-recursion target: a direct `Op::Call` to the running closure
     // re-enters here (a fresh callee `JitCtx` in `x0`) without a Rust
@@ -61,7 +85,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
     let self_call_safe = is_self_call_safe(view);
     let self_entry = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>self_entry);
-    emit_prologue(&mut ops);
+    emit_prologue(ops);
 
     // Stable GC cage base, baked for inline property-load decompression.
     let cage_base = view.cage_base;
@@ -82,7 +106,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
         // Stamp this op's logical PC into the context so any bail (guard
         // failure or unsupported opcode) resumes the interpreter at the
         // exact instruction, preserving committed side effects.
-        emit_load_u64(&mut ops, 9, u64::from(instruction_pc));
+        emit_load_u64(ops, 9, u64::from(instruction_pc));
         dynasm!(ops ; .arch aarch64 ; str w9, [x20, RESUME_PC_OFFSET]);
         let ops_ref = instr.operand_view(code_block);
         match instr.op(code_block) {
@@ -90,8 +114,8 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 let dst = reg(ops_ref, 0)?;
                 let v = imm32(ops_ref, 1)?;
                 let boxed = value_tag::NUMBER_TAG | u64::from(v as u32);
-                emit_load_u64(&mut ops, 9, boxed);
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, boxed);
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadNumber => {
                 let dst = reg(ops_ref, 0)?;
@@ -102,63 +126,63 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 // instead of re-running the constant load through the delegate
                 // bridge: a float literal in a numeric loop otherwise pays a VM
                 // round-trip on every execution.
-                emit_load_u64(&mut ops, 9, otter_vm::Value::number_f64(value).to_bits());
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, otter_vm::Value::number_f64(value).to_bits());
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadLocal => {
                 let dst = reg(ops_ref, 0)?;
                 let idx = local_index(ops_ref, 1)?;
-                load_reg(&mut ops, 9, idx)?;
-                store_reg(&mut ops, 9, dst)?;
+                load_reg(ops, 9, idx)?;
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadUndefined => {
                 let dst = reg(ops_ref, 0)?;
                 // SPECIAL payload 0 == undefined.
-                emit_load_u64(&mut ops, 9, VALUE_UNDEFINED);
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, VALUE_UNDEFINED);
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadNull => {
                 let dst = reg(ops_ref, 0)?;
-                emit_load_u64(&mut ops, 9, VALUE_NULL);
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, VALUE_NULL);
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadHole => {
                 let dst = reg(ops_ref, 0)?;
                 // SPECIAL payload `SPECIAL_HOLE` == the TDZ/uninitialized hole.
-                emit_load_u64(&mut ops, 9, VALUE_HOLE);
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, VALUE_HOLE);
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadTrue => {
                 let dst = reg(ops_ref, 0)?;
-                emit_load_u64(&mut ops, 9, VALUE_TRUE);
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, VALUE_TRUE);
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadFalse => {
                 let dst = reg(ops_ref, 0)?;
-                emit_load_u64(&mut ops, 9, VALUE_FALSE);
-                store_reg(&mut ops, 9, dst)?;
+                emit_load_u64(ops, 9, VALUE_FALSE);
+                store_reg(ops, 9, dst)?;
             }
             Op::StoreLocal => {
                 let src = reg(ops_ref, 0)?;
                 let idx = local_index(ops_ref, 1)?;
-                load_reg(&mut ops, 9, src)?;
-                store_reg(&mut ops, 9, idx)?;
+                load_reg(ops, 9, src)?;
+                store_reg(ops, 9, idx)?;
             }
             Op::Add => emit_add_with_runtime_fallback(
-                &mut ops,
+                ops,
                 ops_ref,
                 plan.add_alloc_safepoints.get(&instr.byte_pc).copied(),
                 view.code_block.register_count,
                 threw,
             )?,
             Op::Sub | Op::Mul | Op::Div if enable_fres => {
-                emit_float_binop_res(&mut ops, ops_ref, bail, instr.op(code_block), &mut fres)?;
+                emit_float_binop_res(ops, ops_ref, bail, instr.op(code_block), fres)?;
             }
             Op::Sub | Op::Mul => {
-                emit_add_sub_mul(&mut ops, ops_ref, bail, instr.op(code_block))?;
+                emit_add_sub_mul(ops, ops_ref, bail, instr.op(code_block))?;
             }
-            Op::Div => emit_div(&mut ops, ops_ref, bail)?,
-            Op::Rem => emit_rem(&mut ops, ops_ref, bail)?,
+            Op::Div => emit_div(ops, ops_ref, bail)?,
+            Op::Rem => emit_rem(ops, ops_ref, bail)?,
             Op::LessThan
             | Op::LessEq
             | Op::GreaterThan
@@ -175,36 +199,36 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     Op::Equal => Cmp::Eq,
                     _ => Cmp::Ne,
                 };
-                emit_cmp_res(&mut ops, ops_ref, bail, cmp, &mut fres)?;
+                emit_cmp_res(ops, ops_ref, bail, cmp, fres)?;
             }
-            Op::LessThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Lt)?,
-            Op::LessEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Le)?,
-            Op::GreaterThan => emit_cmp(&mut ops, ops_ref, bail, Cmp::Gt)?,
-            Op::GreaterEq => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ge)?,
-            Op::Equal => emit_cmp(&mut ops, ops_ref, bail, Cmp::Eq)?,
-            Op::NotEqual => emit_cmp(&mut ops, ops_ref, bail, Cmp::Ne)?,
+            Op::LessThan => emit_cmp(ops, ops_ref, bail, Cmp::Lt)?,
+            Op::LessEq => emit_cmp(ops, ops_ref, bail, Cmp::Le)?,
+            Op::GreaterThan => emit_cmp(ops, ops_ref, bail, Cmp::Gt)?,
+            Op::GreaterEq => emit_cmp(ops, ops_ref, bail, Cmp::Ge)?,
+            Op::Equal => emit_cmp(ops, ops_ref, bail, Cmp::Eq)?,
+            Op::NotEqual => emit_cmp(ops, ops_ref, bail, Cmp::Ne)?,
             // `ToPrimitive` is identity on primitives. Object/function
             // families bail so observable coercion hooks run in the VM.
             Op::ToPrimitive => {
                 let dst = reg(ops_ref, 0)?;
                 let src = reg(ops_ref, 1)?;
-                emit_to_primitive_identity(&mut ops, dst, src, bail)?;
+                emit_to_primitive_identity(ops, dst, src, bail)?;
             }
             // `ToNumeric` is identity on a number (int32 or double); emit
             // a guarded move. Other primitives/objects need the VM path.
             Op::ToNumeric => {
                 let dst = reg(ops_ref, 0)?;
                 let src = reg(ops_ref, 1)?;
-                load_reg(&mut ops, 9, src)?;
+                load_reg(ops, 9, src)?;
                 guard_number!(ops, 9, bail);
-                store_reg(&mut ops, 9, dst)?;
+                store_reg(ops, 9, dst)?;
             }
             Op::Jump => {
                 let rel = imm32(ops_ref, 0)?;
                 let target = branch_target(code_block, instr, rel);
                 let tgt = target_label(target)?;
                 if target <= i64::from(instruction_pc) {
-                    emit_backedge_interrupt_check(&mut ops, threw);
+                    emit_backedge_interrupt_check(ops, threw);
                 }
                 dynasm!(ops ; .arch aarch64 ; b =>tgt);
             }
@@ -213,7 +237,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 let cond = reg(ops_ref, 1)?;
                 let target = branch_target(code_block, instr, rel);
                 let tgt = target_label(target)?;
-                load_reg(&mut ops, 9, cond)?;
+                load_reg(ops, 9, cond)?;
                 // Only boolean conditions are supported in this subset.
                 dynasm!(ops
                     ; .arch aarch64
@@ -231,7 +255,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         dynasm!(ops ; .arch aarch64 ; b.eq =>taken);
                     }
                     dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
-                    emit_backedge_interrupt_check(&mut ops, threw);
+                    emit_backedge_interrupt_check(ops, threw);
                     dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
                 } else if matches!(instr.op(code_block), Op::JumpIfFalse) {
                     dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
@@ -246,20 +270,20 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 // the function/closure builder.
                 let dst = reg(ops_ref, 0)?;
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, #8]);
-                store_reg(&mut ops, 9, dst)?;
+                store_reg(ops, 9, dst)?;
             }
             Op::MakeFunction => {
                 let dst = reg(ops_ref, 0)?;
                 let idx = const_index(ops_ref, 1)?;
                 // jit_make_fn_stub(ctx=x20, dst, idx) -> status in x0.
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
-                emit_load_u64(&mut ops, 2, u64::from(idx));
-                emit_call_stub(&mut ops, jit_make_fn_stub as *const () as usize, threw);
+                emit_load_u64(ops, 2, u64::from(idx));
+                emit_call_stub(ops, jit_make_fn_stub as *const () as usize, threw);
             }
             Op::NewObject => {
                 let dst = reg(ops_ref, 0)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
-                emit_call_stub(&mut ops, jit_new_object_stub as *const () as usize, threw);
+                emit_call_stub(ops, jit_new_object_stub as *const () as usize, threw);
             }
             Op::NewArray => {
                 let dst = reg(ops_ref, 0)?;
@@ -273,18 +297,16 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     .into_boxed_slice();
                 let source_regs_ptr = artifacts.retain_array_literal_regs(source_regs);
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
-                emit_load_u64(&mut ops, 2, source_regs_ptr as u64);
-                emit_load_u64(&mut ops, 3, count as u64);
-                emit_call_stub(&mut ops, jit_new_array_stub as *const () as usize, threw);
+                emit_load_u64(ops, 2, source_regs_ptr as u64);
+                emit_load_u64(ops, 3, count as u64);
+                emit_call_stub(ops, jit_new_array_stub as *const () as usize, threw);
             }
             Op::Call => {
                 // Splice a tiny monomorphic leaf callee inline under an
                 // identity guard (no per-call bridge); fall back to the
                 // direct-call bridge for absent / ineligible sites.
                 let inlined = match view.inline_callees.get(&instr.byte_pc) {
-                    Some(callee) => {
-                        try_emit_inline_call(&mut ops, callee, ops_ref, cage_base, bail)?
-                    }
+                    Some(callee) => try_emit_inline_call(ops, callee, ops_ref, cage_base, bail)?,
                     None => false,
                 };
                 if !inlined {
@@ -294,7 +316,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     // bridge.
                     if self_call_safe {
                         emit_self_recursive_call(
-                            &mut ops,
+                            ops,
                             ops_ref,
                             view.code_block.register_count,
                             self_entry,
@@ -302,7 +324,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                             threw,
                         )?;
                     } else {
-                        emit_call(&mut ops, ops_ref, bail, threw)?;
+                        emit_call(ops, ops_ref, bail, threw)?;
                     }
                 }
             }
@@ -316,7 +338,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 // bridge for absent / ineligible sites.
                 let inlined = match view.inline_methods.get(&instr.byte_pc) {
                     Some(method) => try_emit_inline_method_call(
-                        &mut ops,
+                        ops,
                         method,
                         ops_ref,
                         site,
@@ -333,7 +355,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     // receiver shapes, bridging only when none match.
                     None => match view.inline_poly_methods.get(&instr.byte_pc) {
                         Some(methods) => try_emit_poly_inline_method_call(
-                            &mut ops,
+                            ops,
                             methods,
                             ops_ref,
                             site,
@@ -358,10 +380,10 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         let array_miss = ops.new_dynamic_label();
                         let emitted = match am.kind {
                             JitArrayMethodKind::Pop => emit_array_pop_inline(
-                                &mut ops, ops_ref, &am, view, array_miss, array_done,
+                                ops, ops_ref, &am, view, array_miss, array_done,
                             )?,
                             JitArrayMethodKind::Push => emit_array_push_inline(
-                                &mut ops, ops_ref, &am, view, array_miss, array_done, threw,
+                                ops, ops_ref, &am, view, array_miss, array_done, threw,
                             )?,
                         };
                         if emitted {
@@ -370,7 +392,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         }
                     }
                     emit_method_call(
-                        &mut ops,
+                        ops,
                         ops_ref,
                         site,
                         view.collection_leaf_methods.get(&instr.byte_pc),
@@ -402,8 +424,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     let idx_off = reg_offset(idx)?;
                     let dst_off = reg_offset(dst)?;
                     emit_element_load(
-                        &mut ops, &ta_layout, cage_base, recv_off, idx_off, dst_off, el_miss,
-                        el_done,
+                        ops, &ta_layout, cage_base, recv_off, idx_off, dst_off, el_miss, el_done,
                     );
                 }
 
@@ -415,7 +436,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; movz x2, recv as u32
                     ; movz x3, idx as u32
                 );
-                emit_call_stub(&mut ops, jit_load_element_stub as *const () as usize, threw);
+                emit_call_stub(ops, jit_load_element_stub as *const () as usize, threw);
                 dynasm!(ops ; .arch aarch64 ; =>el_done);
             }
             // `recv[idx] = src` — inline plain dense `Array` stores and
@@ -436,7 +457,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     let src_off = reg_offset(src)?;
                     let array_miss = ops.new_dynamic_label();
                     emit_array_store(
-                        &mut ops, &ta_layout, cage_base, recv_off, idx_off, src_off, array_miss,
+                        ops, &ta_layout, cage_base, recv_off, idx_off, src_off, array_miss,
                         el_done, threw, recv, src,
                     );
                     dynasm!(ops ; .arch aarch64 ; =>array_miss);
@@ -444,8 +465,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     let f64_path = ops.new_dynamic_label();
                     let i32_path = ops.new_dynamic_label();
                     emit_ta_guard_chain(
-                        &mut ops, &ta_layout, cage_base, recv_off, idx_off, el_miss, f64_path,
-                        i32_path,
+                        ops, &ta_layout, cage_base, recv_off, idx_off, el_miss, f64_path, i32_path,
                     );
                     // Float64Array: coerce src to f64 (int32 or double; any
                     // other tag misses to the stub for full ToNumber), store.
@@ -462,7 +482,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; add x10, x13, x10           // element address
                         ; ldr x9, [x19, src_off]
                     );
-                    emit_num_to_double(&mut ops, 9, 0, el_miss);
+                    emit_num_to_double(ops, 9, 0, el_miss);
                     dynasm!(ops
                         ; .arch aarch64
                         ; str d0, [x10]
@@ -495,11 +515,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; movz x3, src as u32
                     ; movz x4, scratch as u32
                 );
-                emit_call_stub(
-                    &mut ops,
-                    jit_store_element_stub as *const () as usize,
-                    threw,
-                );
+                emit_call_stub(ops, jit_store_element_stub as *const () as usize, threw);
                 dynasm!(ops ; .arch aarch64 ; =>el_done);
             }
             // `dst = global[name]` or throw — delegate to the safe bridge.
@@ -507,9 +523,9 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 let dst = reg(ops_ref, 0)?;
                 let name = const_index(ops_ref, 1)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
-                emit_load_u64(&mut ops, 2, u64::from(name));
-                emit_load_u64(&mut ops, 3, u64::from(view.code_block.id));
-                emit_call_stub(&mut ops, jit_load_global_stub as *const () as usize, threw);
+                emit_load_u64(ops, 2, u64::from(name));
+                emit_load_u64(ops, 3, u64::from(view.code_block.id));
+                emit_call_stub(ops, jit_load_global_stub as *const () as usize, threw);
             }
             // `dst = upvalue[idx]` (captured binding). Inline: read the cell
             // handle from the frame's upvalue spine, decompress (cells are
@@ -532,13 +548,13 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; cbz x9, =>up_miss
                         ; ldr w10, [x9, idx_off]             // 4-byte cell handle
                     );
-                    emit_load_u64(&mut ops, 13, cage_base as u64);
+                    emit_load_u64(ops, 13, cage_base as u64);
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x10                  // cell body ptr
                         ; ldr x9, [x13, UPVALUE_VALUE_OFFSET] // captured Value
                     );
-                    emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                    emit_load_u64(ops, 11, VALUE_HOLE);
                     dynasm!(ops
                         ; .arch aarch64
                         ; cmp x9, x11                        // TDZ hole?
@@ -549,8 +565,8 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 }
 
                 dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20 ; movz x1, dst as u32);
-                emit_load_u64(&mut ops, 2, u64::from(idx as u32));
-                emit_call_stub(&mut ops, jit_load_upvalue_stub as *const () as usize, threw);
+                emit_load_u64(ops, 2, u64::from(idx as u32));
+                emit_call_stub(ops, jit_load_upvalue_stub as *const () as usize, threw);
                 dynasm!(ops ; .arch aarch64 ; =>up_done);
             }
             // `upvalue[idx] = src` (captured binding). Inline the primitive
@@ -577,7 +593,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; b.eq =>up_miss                     // pointer -> barriered stub
                         ; ldr w10, [x9, idx_off]             // 4-byte cell handle
                     );
-                    emit_load_u64(&mut ops, 13, cage_base as u64);
+                    emit_load_u64(ops, 13, cage_base as u64);
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x10                  // cell body ptr
@@ -587,12 +603,8 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 }
 
                 dynasm!(ops ; .arch aarch64 ; =>up_miss ; mov x0, x20 ; movz x1, src as u32);
-                emit_load_u64(&mut ops, 2, u64::from(idx as u32));
-                emit_call_stub(
-                    &mut ops,
-                    jit_store_upvalue_stub as *const () as usize,
-                    threw,
-                );
+                emit_load_u64(ops, 2, u64::from(idx as u32));
+                emit_call_stub(ops, jit_store_upvalue_stub as *const () as usize, threw);
                 dynasm!(ops ; .arch aarch64 ; =>up_done);
             }
             // `upvalue[idx] = src` with a TDZ guard (assignment to a captured
@@ -620,8 +632,8 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; b.eq =>up_miss                     // pointer -> barriered bridge
                         ; ldr w10, [x9, idx_off]             // 4-byte cell handle
                     );
-                    emit_load_u64(&mut ops, 13, cage_base as u64);
-                    emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                    emit_load_u64(ops, 13, cage_base as u64);
+                    emit_load_u64(ops, 11, VALUE_HOLE);
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x10                  // cell body ptr
@@ -639,9 +651,9 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; mov x0, x20
                     ; movz x1, src as u32
                 );
-                emit_load_u64(&mut ops, 2, u64::from(idx as u32));
+                emit_load_u64(ops, 2, u64::from(idx as u32));
                 emit_call_stub(
-                    &mut ops,
+                    ops,
                     jit_store_upvalue_checked_stub as *const () as usize,
                     threw,
                 );
@@ -653,8 +665,8 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 let dst = reg(ops_ref, 0)?;
                 let src = reg(ops_ref, 1)?;
                 let delta = imm32(ops_ref, 2)?;
-                load_reg(&mut ops, 9, src)?;
-                emit_load_u64(&mut ops, 12, u64::from(delta as u32));
+                load_reg(ops, 9, src)?;
+                emit_load_u64(ops, 12, u64::from(delta as u32));
                 let float_path = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 dynasm!(ops
@@ -667,12 +679,12 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; b.vs =>float_path
                 );
                 box_int32!(ops, 13, 11);
-                store_reg(&mut ops, 13, dst)?;
+                store_reg(ops, 13, dst)?;
                 dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-                emit_num_to_double(&mut ops, 9, 0, bail);
+                emit_num_to_double(ops, 9, 0, bail);
                 dynasm!(ops ; .arch aarch64 ; scvtf d1, w12 ; fadd d2, d0, d1);
-                emit_box_double(&mut ops, 2, 13);
-                store_reg(&mut ops, 13, dst)?;
+                emit_box_double(ops, 2, 13);
+                store_reg(ops, 13, dst)?;
                 dynasm!(ops ; .arch aarch64 ; =>done);
             }
             Op::LoadThis => {
@@ -682,9 +694,9 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 let dst = reg(ops_ref, 0)?;
                 let hole = VALUE_HOLE;
                 dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
-                emit_load_u64(&mut ops, 12, hole);
+                emit_load_u64(ops, 12, hole);
                 dynasm!(ops ; .arch aarch64 ; cmp x9, x12 ; b.eq =>bail);
-                store_reg(&mut ops, 9, dst)?;
+                store_reg(ops, 9, dst)?;
             }
             Op::LoadProperty => {
                 // jit_load_prop_window_stub(ctx=x20, dst, obj, name_idx, site, cell).
@@ -718,7 +730,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; b.ne =>miss
                         ; mov w12, w9              // low-32 Gc offset
                     );
-                    emit_load_u64(&mut ops, 13, cage_base as u64);
+                    emit_load_u64(ops, 13, cage_base as u64);
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -727,7 +739,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; b.ne =>miss
                         ; ldr x9, [x13, length_byte]
                     );
-                    emit_load_u64(&mut ops, 12, i32::MAX as u64);
+                    emit_load_u64(ops, 12, i32::MAX as u64);
                     dynasm!(ops
                         ; .arch aarch64
                         ; cmp x9, x12
@@ -763,7 +775,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; b.ne =>miss
                         ; mov w12, w9              // low-32 Gc offset (zero-ext)
                     );
-                    emit_load_u64(&mut ops, 13, cage_base as u64);
+                    emit_load_u64(ops, 13, cage_base as u64);
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -773,7 +785,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; ldr w14, [x13, shape_byte] // receiver shape handle
                         ; cbz w14, =>miss
                     );
-                    emit_load_u64(&mut ops, 15, cell_addr as u64);
+                    emit_load_u64(ops, 15, cell_addr as u64);
                     // Walk the IC ways. The `cbz` above prevents empty ways
                     // (`shape == 0`) from matching a live shape-0 object.
                     // A hit loads that way's value byte into w17 and shares
@@ -796,13 +808,13 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_load);
                     // Slab base from the fresh header (inline) or stable
                     // out-of-line `values_ptr` — never the cached body pointer.
-                    emit_slab_base(&mut ops, view, 13, 14);
+                    emit_slab_base(ops, view, 13, 14);
                     dynasm!(ops
                         ; .arch aarch64
                         ; cbz x13, =>miss
                         ; ldr w9, [x13, x17]       // 4-byte compressed slot
                     );
-                    emit_decompress_slot(&mut ops, cage_base as u64, miss);
+                    emit_decompress_slot(ops, cage_base as u64, miss);
                     dynasm!(ops
                         ; .arch aarch64
                         ; str x9, [x19, dst_off]
@@ -819,15 +831,15 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; movz x1, dst as u32
                     ; movz x2, obj as u32
                 );
-                emit_load_u64(&mut ops, 3, u64::from(name));
-                emit_load_u64(&mut ops, 4, site);
-                emit_load_u64(&mut ops, 5, cell_addr as u64);
-                emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
+                emit_load_u64(ops, 3, u64::from(name));
+                emit_load_u64(ops, 4, site);
+                emit_load_u64(ops, 5, cell_addr as u64);
+                emit_load_u64(ops, 6, u64::from(view.code_block.id));
                 // The typed window operation handles only own-data IC
                 // resolution and self-patching. Full `[[Get]]` semantics
                 // bail to normal dispatch instead of re-entering one
                 // interpreter opcode through a framed bridge.
-                emit_load_u64(&mut ops, 16, jit_load_prop_window_stub as *const () as u64);
+                emit_load_u64(ops, 16, jit_load_prop_window_stub as *const () as u64);
                 dynasm!(ops
                     ; .arch aarch64
                     ; blr x16
@@ -872,7 +884,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; b.ne =>miss
                         ; mov w12, w9              // low-32 Gc offset
                     );
-                    emit_load_u64(&mut ops, 13, cage_base as u64);
+                    emit_load_u64(ops, 13, cage_base as u64);
                     dynasm!(ops
                         ; .arch aarch64
                         ; add x13, x13, x12        // x13 = GcHeader ptr
@@ -882,7 +894,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; ldr w14, [x13, shape_byte] // receiver shape handle
                         ; cbz w14, =>miss
                     );
-                    emit_load_u64(&mut ops, 15, cell_addr as u64);
+                    emit_load_u64(ops, 15, cell_addr as u64);
                     // N-way IC walk (see `LoadProperty`): match a way's shape,
                     // load its value byte into w17, then share the slab write.
                     let do_store = ops.new_dynamic_label();
@@ -909,7 +921,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     );
                     // Slab base from the fresh header (inline) or stable
                     // out-of-line `values_ptr` — never the cached body pointer.
-                    emit_slab_base(&mut ops, view, 13, 14);
+                    emit_slab_base(ops, view, 13, 14);
                     dynasm!(ops
                         ; .arch aarch64
                         ; cbz x13, =>miss
@@ -936,11 +948,11 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     } else {
                         jit_write_barrier_stub as *const () as usize
                     };
-                    emit_call_stub(&mut ops, barrier, threw);
+                    emit_call_stub(ops, barrier, threw);
                     dynasm!(ops ; .arch aarch64 ; b =>done ; =>store_prim);
                     // A wide int / double / function id cannot inline-compress
                     // (a boxed number allocates); the runtime store handles it.
-                    emit_compress_slot_or_bail(&mut ops, miss);
+                    emit_compress_slot_or_bail(ops, miss);
                     dynasm!(ops ; .arch aarch64 ; str w10, [x13, x17] ; b =>done);
                 }
 
@@ -952,12 +964,12 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; mov x0, x20
                     ; movz x1, obj as u32
                 );
-                emit_load_u64(&mut ops, 2, u64::from(name));
+                emit_load_u64(ops, 2, u64::from(name));
                 dynasm!(ops ; .arch aarch64 ; movz x3, src as u32);
-                emit_load_u64(&mut ops, 4, site);
-                emit_load_u64(&mut ops, 5, cell_addr as u64);
-                emit_load_u64(&mut ops, 6, u64::from(view.code_block.id));
-                emit_load_u64(&mut ops, 16, jit_store_prop_window_stub as *const () as u64);
+                emit_load_u64(ops, 4, site);
+                emit_load_u64(ops, 5, cell_addr as u64);
+                emit_load_u64(ops, 6, u64::from(view.code_block.id));
+                emit_load_u64(ops, 16, jit_store_prop_window_stub as *const () as u64);
                 dynasm!(ops
                     ; .arch aarch64
                     ; blr x16
@@ -968,12 +980,12 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 );
                 dynasm!(ops ; .arch aarch64 ; =>done);
             }
-            Op::BitwiseOr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Or)?,
-            Op::BitwiseAnd => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::And)?,
-            Op::BitwiseXor => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Xor)?,
-            Op::Shl => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Shl)?,
-            Op::Shr => emit_int_binop(&mut ops, ops_ref, bail, IntBinOp::Shr)?,
-            Op::Ushr => emit_ushr(&mut ops, ops_ref, bail)?,
+            Op::BitwiseOr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Or)?,
+            Op::BitwiseAnd => emit_int_binop(ops, ops_ref, bail, IntBinOp::And)?,
+            Op::BitwiseXor => emit_int_binop(ops, ops_ref, bail, IntBinOp::Xor)?,
+            Op::Shl => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shl)?,
+            Op::Shr => emit_int_binop(ops, ops_ref, bail, IntBinOp::Shr)?,
+            Op::Ushr => emit_ushr(ops, ops_ref, bail)?,
             Op::Return | Op::ReturnValue => {
                 let src = reg(ops_ref, 0)?;
                 let off = reg_offset(src)?;
@@ -982,13 +994,13 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; ldr x0, [x19, off]
                     ; movz x1, STATUS_RETURNED as u32
                 );
-                emit_epilogue(&mut ops);
+                emit_epilogue(ops);
             }
             Op::ReturnUndefined => {
                 let undef = VALUE_UNDEFINED; // SPECIAL_UNDEFINED == 0
-                emit_load_u64(&mut ops, 0, undef);
+                emit_load_u64(ops, 0, undef);
                 dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
-                emit_epilogue(&mut ops);
+                emit_epilogue(ops);
             }
             // Variadic operations still using compile-owned decoded operand
             // metadata. Fixed-operand slow paths below use typed ABI stubs.
@@ -1000,9 +1012,9 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     && otter_bytecode::method_id::MathMethod::from_u32(method_id)
                         == Some(otter_bytecode::method_id::MathMethod::Random)
                 {
-                    emit_load_u64(&mut ops, 16, otter_jit_math_random as *const () as u64);
+                    emit_load_u64(ops, 16, otter_jit_math_random as *const () as u64);
                     dynasm!(ops ; .arch aarch64 ; blr x16);
-                    store_reg(&mut ops, 0, dst)?;
+                    store_reg(ops, 0, dst)?;
                 } else {
                     if ops_ref.len() != argc + 3 {
                         return Err(Unsupported::OperandShape("MathCall register tail"));
@@ -1017,10 +1029,10 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                         ; mov x0, x20
                         ; movz x1, dst as u32
                     );
-                    emit_load_u64(&mut ops, 2, u64::from(method_id));
-                    emit_load_u64(&mut ops, 3, argument_regs_ptr as u64);
-                    emit_load_u64(&mut ops, 4, argc as u64);
-                    emit_call_stub(&mut ops, jit_math_call_stub as *const () as usize, threw);
+                    emit_load_u64(ops, 2, u64::from(method_id));
+                    emit_load_u64(ops, 3, argument_regs_ptr as u64);
+                    emit_load_u64(ops, 4, argc as u64);
+                    emit_call_stub(ops, jit_math_call_stub as *const () as usize, threw);
                 }
             }
             Op::MakeClosure => {
@@ -1040,21 +1052,21 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     .into_boxed_slice();
                 let parent_indices_ptr = artifacts.retain_closure_parent_indices(parent_indices);
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                emit_load_u64(&mut ops, 1, u64::from(view.code_block.id));
+                emit_load_u64(ops, 1, u64::from(view.code_block.id));
                 dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
-                emit_load_u64(&mut ops, 3, u64::from(function_index));
-                emit_load_u64(&mut ops, 4, parent_indices_ptr as u64);
-                emit_load_u64(&mut ops, 5, count as u64);
-                emit_call_stub(&mut ops, jit_make_closure_stub as *const () as usize, threw);
+                emit_load_u64(ops, 3, u64::from(function_index));
+                emit_load_u64(ops, 4, parent_indices_ptr as u64);
+                emit_load_u64(ops, 5, count as u64);
+                emit_call_stub(ops, jit_make_closure_stub as *const () as usize, threw);
             }
             Op::LoadString => {
                 let dst = reg(ops_ref, 0)?;
                 let constant_index = const_index(ops_ref, 1)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                emit_load_u64(&mut ops, 1, u64::from(view.code_block.id));
+                emit_load_u64(ops, 1, u64::from(view.code_block.id));
                 dynasm!(ops ; .arch aarch64 ; movz x2, dst as u32);
-                emit_load_u64(&mut ops, 3, u64::from(constant_index));
-                emit_call_stub(&mut ops, jit_load_string_stub as *const () as usize, threw);
+                emit_load_u64(ops, 3, u64::from(constant_index));
+                emit_call_stub(ops, jit_load_string_stub as *const () as usize, threw);
             }
             Op::DefineDataProperty => {
                 let (object, key, value) = reg3(ops_ref)?;
@@ -1066,7 +1078,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; movz x3, value as u32
                 );
                 emit_call_stub(
-                    &mut ops,
+                    ops,
                     jit_define_data_property_stub as *const () as usize,
                     threw,
                 );
@@ -1074,20 +1086,16 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
             Op::FreshUpvalue => {
                 let idx = imm32(ops_ref, 0)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20);
-                emit_load_u64(&mut ops, 1, u64::from(idx as u32));
-                emit_call_stub(
-                    &mut ops,
-                    jit_fresh_upvalue_stub as *const () as usize,
-                    threw,
-                );
+                emit_load_u64(ops, 1, u64::from(idx as u32));
+                emit_call_stub(ops, jit_fresh_upvalue_stub as *const () as usize, threw);
             }
             Op::LoadBuiltinError => {
                 let dst = reg(ops_ref, 0)?;
                 let kind_index = const_index(ops_ref, 1)?;
                 dynasm!(ops ; .arch aarch64 ; mov x0, x20 ; movz x1, dst as u32);
-                emit_load_u64(&mut ops, 2, u64::from(kind_index));
+                emit_load_u64(ops, 2, u64::from(kind_index));
                 emit_call_stub(
-                    &mut ops,
+                    ops,
                     jit_load_builtin_error_stub as *const () as usize,
                     threw,
                 );
@@ -1101,11 +1109,11 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; movz x1, dst as u32
                     ; movz x2, src as u32
                 );
-                emit_call_stub(&mut ops, jit_neg_stub as *const () as usize, threw);
+                emit_call_stub(ops, jit_neg_stub as *const () as usize, threw);
             }
             Op::LooseEqual | Op::LooseNotEqual => {
                 emit_loose_cmp(
-                    &mut ops,
+                    ops,
                     ops_ref,
                     instr.op(code_block) == Op::LooseNotEqual,
                     bail,
@@ -1121,7 +1129,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                     ; movz x3, descriptor as u32
                 );
                 emit_call_stub(
-                    &mut ops,
+                    ops,
                     jit_define_own_property_stub as *const () as usize,
                     threw,
                 );
@@ -1134,7 +1142,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
                 // unsupported opcodes (class definition, `new`, globals,
                 // etc.). Marked `osr_only` so the function-entry path skips
                 // it (entering at PC 0 would bail immediately).
-                osr_only = true;
+                *osr_only = true;
                 dynasm!(ops ; .arch aarch64 ; b =>bail);
             }
         }
@@ -1179,7 +1187,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
         ; movz x0, #0
         ; movz x1, STATUS_BAILED as u32
     );
-    emit_epilogue(&mut ops);
+    emit_epilogue(ops);
     // Shared throw epilogue: status = 2 (error parked in ctx by the stub).
     dynasm!(ops
         ; .arch aarch64
@@ -1187,7 +1195,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
         ; movz x0, #0
         ; movz x1, STATUS_THREW as u32
     );
-    emit_epilogue(&mut ops);
+    emit_epilogue(ops);
 
     // OSR trampolines: one per loop header. Each runs the standard prologue
     // (set up x19/x20 from the ctx arg) then branches to the header's body
@@ -1195,7 +1203,7 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
     let mut osr_entries: BTreeMap<u32, usize> = BTreeMap::new();
     for &instruction_pc in loop_headers {
         let off = ops.offset().0;
-        emit_prologue(&mut ops);
+        emit_prologue(ops);
         let tgt = labels[&instruction_pc];
         dynasm!(ops ; .arch aarch64 ; b =>tgt);
         osr_entries.insert(instruction_pc, off);
@@ -1203,8 +1211,9 @@ pub(in crate::baseline) fn compile(view: &JitCompileSnapshot) -> Result<Baseline
 
     plan.safepoint_records.sort_by_key(|record| record.id);
     let safepoint_records = plan.safepoint_records.into_boxed_slice();
-    let artifacts = artifacts.finish();
-    let buf = ops.finalize().expect("finalize");
+    let osr_only = session.osr_only;
+    let artifacts = session.artifacts.finish();
+    let buf = session.ops.finalize().expect("finalize");
     Ok(BaselineCode::from_emission(
         CompiledCode::new(buf, entry),
         u64::from(view.code_block.id) + 1,

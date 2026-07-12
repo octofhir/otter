@@ -452,7 +452,7 @@ pub struct JitCollectionMethodIcStats {
 /// Observed-callee state for one bytecode `Op::Call` site, the feedback the
 /// baseline reads to decide whether to inline a tiny leaf callee.
 ///
-/// Absence from the feedback map means *unobserved*. `Mono(fid)` means every
+/// An empty dense feedback cell means *unobserved*. `Mono(fid)` means every
 /// observed call resolved to the same bytecode callee — the inlinable case.
 /// `Poly` means two or more distinct callees were seen; such a site is never
 /// inlined.
@@ -947,13 +947,6 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// Per-call-site monomorphic-callee feedback driving baseline leaf-inlining.
-    /// Keyed `(caller_fid, call_instruction_pc)`; recorded by the interpreter
-    /// `Op::Call` arm during the warmup interpreter runs that precede tier-up,
-    /// and read at compile time (`bake_inline_callees`) so the baseline knows
-    /// which sites have a single observed callee. Only mutated when a JIT hook
-    /// is installed.
-    jit_call_site_feedback: rustc_hash::FxHashMap<(u32, u32), CallTargetFeedback>,
     /// Per-call-site method-call feedback driving baseline method inlining,
     /// keyed `(caller_fid, call_instruction_pc)`. Recorded by the interpreter
     /// `Op::CallMethodValue` arm during warmup and read at compile time

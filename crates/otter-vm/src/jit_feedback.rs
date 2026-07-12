@@ -21,17 +21,18 @@
 //!   only less fast.
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
-//! - Atomic ordering is relaxed: feedback is advisory and monotonic. A compiler
-//!   may observe an older, narrower state; emitted guards and deoptimization
-//!   preserve correctness when later executions disagree.
+//! - The isolate's VM thread is the sole writer. Arithmetic/element bits use
+//!   relaxed atomics because they are advisory and monotonic; call state uses a
+//!   release/acquire publication edge because its function id is a separate
+//!   payload. Older feedback remains sound through guards and deoptimization.
 //!
 //! # See also
 //! - [`crate::jit::JitInstructionMetadata`] — compile-time snapshot metadata.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use crate::Value;
 use crate::jit::JitElementLoadKind;
+use crate::{CallTargetFeedback, Value};
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -56,6 +57,10 @@ const ELEMENT_UNSEEN: u8 = 0;
 const ELEMENT_FLOAT64: u8 = 1;
 const ELEMENT_INT32: u8 = 2;
 const ELEMENT_GENERIC: u8 = 3;
+
+const CALL_UNSEEN: u8 = 0;
+const CALL_MONO: u8 = 1;
+const CALL_POLY: u8 = 2;
 
 /// OR-accumulated representation feedback for one numeric-specialized bytecode
 /// site.
@@ -129,6 +134,8 @@ impl ArithFeedback {
 pub struct InstructionFeedback {
     arith: AtomicU8,
     element_load: AtomicU8,
+    call_state: AtomicU8,
+    call_target: AtomicU32,
 }
 
 impl Clone for InstructionFeedback {
@@ -136,6 +143,8 @@ impl Clone for InstructionFeedback {
         Self {
             arith: AtomicU8::new(self.arith.load(Ordering::Relaxed)),
             element_load: AtomicU8::new(self.element_load.load(Ordering::Relaxed)),
+            call_state: AtomicU8::new(self.call_state.load(Ordering::Acquire)),
+            call_target: AtomicU32::new(self.call_target.load(Ordering::Relaxed)),
         }
     }
 }
@@ -212,6 +221,35 @@ impl InstructionFeedback {
             _ => JitElementLoadKind::Any,
         }
     }
+
+    /// Record one bytecode callee at an ordinary `Call` instruction.
+    /// Returns `true` only when the previously unseen cell becomes monomorphic.
+    pub(crate) fn record_call_target(&self, callee_fid: u32) -> bool {
+        match self.call_state.load(Ordering::Acquire) {
+            CALL_UNSEEN => {
+                self.call_target.store(callee_fid, Ordering::Relaxed);
+                self.call_state.store(CALL_MONO, Ordering::Release);
+                true
+            }
+            CALL_MONO if self.call_target.load(Ordering::Relaxed) != callee_fid => {
+                self.call_state.store(CALL_POLY, Ordering::Release);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Monomorphic/polymorphic call target observed at this instruction.
+    #[must_use]
+    pub(crate) fn call_target(&self) -> Option<CallTargetFeedback> {
+        match self.call_state.load(Ordering::Acquire) {
+            CALL_UNSEEN => None,
+            CALL_MONO => Some(CallTargetFeedback::Mono(
+                self.call_target.load(Ordering::Relaxed),
+            )),
+            _ => Some(CallTargetFeedback::Poly),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -281,5 +319,29 @@ mod tests {
             ordinary_then_typed.element_load_kind(),
             JitElementLoadKind::Any
         );
+    }
+
+    #[test]
+    fn dense_cell_layout_stays_compact() {
+        assert_eq!(std::mem::size_of::<InstructionFeedback>(), 8);
+    }
+
+    #[test]
+    fn call_target_tracks_mono_then_poly_without_truncating_ids() {
+        let max_id = InstructionFeedback::default();
+        assert!(max_id.record_call_target(u32::MAX));
+        assert_eq!(
+            max_id.call_target(),
+            Some(CallTargetFeedback::Mono(u32::MAX))
+        );
+
+        let cell = InstructionFeedback::default();
+        assert!(cell.record_call_target(7));
+        assert!(!cell.record_call_target(7));
+        assert_eq!(cell.call_target(), Some(CallTargetFeedback::Mono(7)));
+        assert!(!cell.record_call_target(9));
+        assert_eq!(cell.call_target(), Some(CallTargetFeedback::Poly));
+        assert!(!cell.record_call_target(7));
+        assert_eq!(cell.call_target(), Some(CallTargetFeedback::Poly));
     }
 }

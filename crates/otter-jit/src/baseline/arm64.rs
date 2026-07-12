@@ -42,11 +42,11 @@ use super::{
     jit_load_builtin_error_stub, jit_load_element_stub, jit_load_global_stub,
     jit_load_prop_window_stub, jit_load_string_stub, jit_load_upvalue_stub, jit_make_closure_stub,
     jit_make_fn_stub, jit_math_call_stub, jit_neg_stub, jit_new_array_stub, jit_new_object_stub,
-    jit_pop_native_activation_stub, jit_prepare_direct_method_call_stub,
-    jit_push_native_activation_stub, jit_self_call_bail_stub, jit_store_element_stub,
-    jit_store_prop_window_stub, jit_store_upvalue_checked_stub, jit_store_upvalue_stub,
-    jit_write_barrier_stub, jit_write_barrier_window_stub, local_index, otter_jit_math_random,
-    pack_method_arg_regs, reg, reg_offset, reg3, value_tag,
+    jit_pop_native_activation_stub, jit_prepare_direct_call_stub,
+    jit_prepare_direct_method_call_stub, jit_push_native_activation_stub, jit_self_call_bail_stub,
+    jit_store_element_stub, jit_store_prop_window_stub, jit_store_upvalue_checked_stub,
+    jit_store_upvalue_stub, jit_write_barrier_stub, jit_write_barrier_window_stub, local_index,
+    otter_jit_math_random, pack_method_arg_regs, reg, reg_offset, reg3, value_tag,
 };
 use crate::CompiledCode;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};

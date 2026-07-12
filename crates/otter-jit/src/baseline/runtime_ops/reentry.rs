@@ -246,10 +246,14 @@ pub(crate) extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) 
 pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    if ctx.activation().vm_ptr().is_null() {
+    let vm_ptr = ctx
+        .checked_activation()
+        .map_or(std::ptr::null_mut(), |activation| activation.vm_ptr());
+    if vm_ptr.is_null() {
         return 0;
     }
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    // SAFETY: a published activation names a live interpreter for this entry.
+    let vm = unsafe { &mut *vm_ptr };
     match vm.jit_backedge_poll() {
         Ok(()) => 0,
         Err(err) => {

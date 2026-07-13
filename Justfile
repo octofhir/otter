@@ -196,9 +196,14 @@ test262-next-safe *args:
 node-compat-fetch:
     bash scripts/fetch-node-tests.sh
 
-# Run Node.js compatibility tests. Pass extra args, for example:
-#   just node-compat process --limit 25
+# Run the default Node.js compatibility baseline. With no arguments this covers
+# the implemented foundation modules; explicit arguments still select exactly
+# the requested modules/flags (for example `just node-compat process --limit 25`).
 node-compat *args:
+    if [ -z "{{args}}" ]; then cargo run -p otter-node-compat -- napi querystring url util path os buffer assert events process; else cargo run -p otter-node-compat -- {{args}}; fi
+
+# Run every configured module, including experimental node:test and node:net.
+node-compat-all *args:
     cargo run -p otter-node-compat -- {{args}}
 
 # Run Node.js compatibility tests with a substring filter.

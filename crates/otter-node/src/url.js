@@ -200,60 +200,9 @@ function urlToHttpOptions(url) {
   return options;
 }
 
-function parse(input) {
-  if (typeof input !== 'string') throw invalidArgType('url', input);
-  const value = new URLCtor(input, 'file:///');
-  return {
-    protocol: value.protocol,
-    slashes: input.includes('//'),
-    auth: value.username ? `${value.username}:${value.password}` : null,
-    host: value.host || null,
-    port: value.port || null,
-    hostname: value.hostname || null,
-    hash: value.hash || null,
-    search: value.search || null,
-    query: value.search ? value.search.slice(1) : null,
-    pathname: value.pathname || null,
-    path: `${value.pathname || ''}${value.search || ''}`,
-    href: value.href,
-  };
-}
-
 function format(value, options) {
   if (typeof value === 'string') {
-    const authority = value.indexOf('://');
-    if (authority >= 0) {
-      let authorityEnd = value.length;
-      for (let index = authority + 3; index < value.length; index++) {
-        const char = value[index];
-        if ('/?#'.includes(char)) {
-          authorityEnd = index;
-          break;
-        }
-        if ('\" <>\\^`{|}'.includes(char)) {
-          return value.slice(0, index) + '/' + encodePath(value.slice(index));
-        }
-      }
-      let authorityText = value.slice(authority + 3, authorityEnd);
-      const at = authorityText.lastIndexOf('@');
-      if (at >= 0) authorityText = authorityText.slice(at + 1);
-      const colon = authorityText.lastIndexOf(':');
-      const hostname = colon > 0 ? authorityText.slice(0, colon) : authorityText;
-      if (hostname.length > 255) {
-        return value.slice(0, authority + 3) + value.slice(authorityEnd);
-      }
-      const pathStart = value.indexOf('/', authority + 3);
-      const queryStart = value.indexOf('?', authority + 3);
-      const fragmentStart = value.indexOf('#', authority + 3);
-      let suffixStart = queryStart;
-      if (suffixStart < 0 || (fragmentStart >= 0 && fragmentStart < suffixStart)) {
-        suffixStart = fragmentStart;
-      }
-      if (suffixStart >= 0 && (pathStart < 0 || suffixStart < pathStart)) {
-        return value.slice(0, suffixStart) + '/' + value.slice(suffixStart);
-      }
-    }
-    return value;
+    return legacyParse(value).format();
   }
   if (!value || typeof value !== 'object') {
     throw invalidArgType('urlObject', value);
@@ -286,55 +235,17 @@ function format(value, options) {
     }
     return href;
   }
-  let protocol = value.protocol || '';
-  if (protocol && !protocol.endsWith(':')) protocol += ':';
-  let out = protocol;
-  let hostname = value.hostname || '';
-  if (hostname.includes(':') && !(hostname.startsWith('[') && hostname.endsWith(']'))) {
-    hostname = `[${hostname}]`;
-  }
-  const host = value.host || `${hostname}${value.port ? `:${value.port}` : ''}`;
-  const slashed = value.slashes ||
-    ['http:', 'https:', 'ftp:', 'gopher:', 'file:', 'ws:', 'wss:'].includes(protocol);
-  if (slashed) out += '//';
-  if (host) {
-    const auth = value.auth ? `${encodeURIComponent(value.auth).replace('%3A', ':')}@` : '';
-    out += `${auth}${host}`;
-  }
-  let pathname = value.pathname || '';
-  pathname = String(pathname).split('#').join('%23').split('?').join('%3F');
-  if (slashed && host && pathname && !pathname.startsWith('/')) pathname = '/' + pathname;
-  out += pathname;
-  let query = '';
-  if (value.query && typeof value.query === 'object') {
-    query = Object.keys(value.query).map((key) => {
-      const item = value.query[key];
-      return `${encodeURIComponent(key)}=${encodeURIComponent(item == null ? '' : item)}`;
-    }).join('&');
-  } else if (value.query) {
-    query = String(value.query);
-  }
-  let search = value.search || query;
-  if (search && !search.startsWith('?')) search = '?' + search;
-  search = search.split('#').join('%23');
-  out += search;
-  let hash = value.hash || '';
-  if (hash && !hash.startsWith('#')) hash = '#' + hash;
-  out += hash;
-  return out;
+  return Url.prototype.format.call(value);
 }
-
-function resolve(from, to) { return new URLCtor(String(to), String(from)).href; }
-function resolveObject(from, to) { return parse(resolve(from, to)); }
 
 module.exports = {
   URL: URLCtor,
   URLSearchParams: URLSearchParamsCtor,
-  Url: URLCtor,
-  parse,
+  Url,
+  parse: legacyParse,
   format,
-  resolve,
-  resolveObject,
+  resolve: legacyResolve,
+  resolveObject: legacyResolveObject,
   domainToASCII,
   domainToUnicode,
   pathToFileURL,

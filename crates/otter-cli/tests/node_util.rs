@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - `util/types` reference identity with `util.types`.
+//! - Dotenv parsing and USV-string normalization.
 //! - ANSI named, nested, and hexadecimal style composition.
 //! - Deterministic non-TTY stream behavior.
 //!
@@ -19,6 +20,13 @@ fn node_util_aliases_and_styles_match_node_shape() {
         r#"
 const util = require('node:util');
 if (require('util/types') !== util.types) throw new Error('util/types identity');
+const env = util.parseEnv('A=plain # comment\nB="line\\nnext"\nA=last\n');
+if (env.A !== 'last' || env.B !== 'line\nnext') throw new Error('parseEnv');
+if (util.toUSVString('x\ud801') !== 'x\ufffd') throw new Error('toUSVString');
+if (!util.types.isNativeError(new Error()) ||
+    util.types.isNativeError({ __proto__: Error.prototype })) {
+  throw new Error('isNativeError internal slot');
+}
 if (util.styleText('#ffcc00', 'x', { validateStream: false }) !==
     '\x1b[38;2;255;204;0mx\x1b[39m') throw new Error('hex style');
 if (util.styleText(['bold', 'red'], 'x', { validateStream: false }) !==

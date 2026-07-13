@@ -438,7 +438,17 @@ impl Interpreter {
         scope: &'s HandleScope,
         n: i64,
     ) -> Result<Scoped<'s>, VmError> {
-        let bigint = crate::bigint::BigIntValue::from_i128(&mut self.gc_heap, i128::from(n))?;
+        self.scoped_bigint_i128(scope, i128::from(n))
+    }
+
+    /// Park a `BigInt` built from a signed 128-bit integer. This is the
+    /// allocation-safe host path for integral counters that can exceed `i64`.
+    pub(crate) fn scoped_bigint_i128<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        n: i128,
+    ) -> Result<Scoped<'s>, VmError> {
+        let bigint = crate::bigint::BigIntValue::from_i128(&mut self.gc_heap, n)?;
         Ok(self.scoped_value(scope, Value::big_int(bigint)))
     }
 
@@ -680,6 +690,49 @@ impl Interpreter {
         }
     }
 
+    /// Make the object handle `obj` callable through the native callable held
+    /// by `call`, resolving both handles through the arena at mutation time.
+    pub(crate) fn scoped_set_call_native(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        call: Scoped<'_>,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let call = self.handle_arena.get(call.index());
+        crate::object::set_call_native(object, &mut self.gc_heap, call);
+        Ok(())
+    }
+
+    /// Set an object's prototype from scoped handles. `None` installs a null
+    /// prototype; a non-object prototype is rejected.
+    pub(crate) fn scoped_set_prototype(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        prototype: Option<Scoped<'_>>,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let prototype = prototype
+            .map(|handle| {
+                self.handle_arena
+                    .get(handle.index())
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)
+            })
+            .transpose()?;
+        crate::object::set_prototype(object, &mut self.gc_heap, prototype);
+        Ok(())
+    }
+
     /// Store `value` at array index `index` on the array handle `arr`,
     /// resolving both handles through the arena at call time. The array shell
     /// keeps its identity across the store, so the collector-tracked arena slot
@@ -727,6 +780,17 @@ impl Interpreter {
                 .unwrap_or_else(Value::undefined)
         });
         Ok(self.scoped_value(scope, value))
+    }
+
+    /// Read the current logical length of the array behind `arr`, resolving
+    /// the handle through the arena at call time.
+    pub(crate) fn scoped_array_length(&self, arr: Scoped<'_>) -> Result<usize, VmError> {
+        let array = self
+            .handle_arena
+            .get(arr.index())
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        Ok(crate::array::len(array, &self.gc_heap))
     }
 
     /// Read the current raw `Value` behind a scope handle for immediate

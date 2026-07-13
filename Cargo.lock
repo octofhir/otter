@@ -2551,6 +2551,7 @@ name = "otter-runtime"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "nix",
  "otter-bytecode",
  "otter-compiler",
  "otter-gc",

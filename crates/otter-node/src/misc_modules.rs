@@ -87,7 +87,7 @@ pub fn process_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Resu
 }
 
 /// `internal/util` — the `--expose-internals` subset (sleep,
-/// emitExperimentalWarning, deprecate, kEmptyObject).
+/// warnings, deprecation wrappers, and kEmptyObject).
 pub fn internal_util_cjs_value(
     ctx: &mut NativeCtx<'_>,
     _caps: &CapabilitySet,

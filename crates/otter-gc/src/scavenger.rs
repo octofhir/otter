@@ -112,6 +112,11 @@ struct ScavCtx {
     /// local snapshot; [`remember_parent`] pushes fresh old→young parents
     /// here so they survive to the next scavenge.
     remembered: NonNull<Vec<RawGc>>,
+    /// Cage offsets of objects promoted to old-space this scavenge and not
+    /// yet Cheney-scanned. An explicit worklist — not a bump-cursor
+    /// watermark — because promotion allocates through the old-space free
+    /// list, which can place a survivor below any page's bump cursor.
+    promoted_unscanned: Vec<u32>,
 }
 
 impl ScavCtx {
@@ -200,16 +205,8 @@ pub unsafe fn scavenge(
     let reserve_count = promotion_pages
         .saturating_mul(2)
         .saturating_add(copy_overflow);
-    let promotion_reserve_start = old_space.reserve_promotion_pages(reserve_count)?;
+    old_space.reserve_promotion_pages(reserve_count)?;
 
-    // Promotions can append survivors to old-space pages while processing
-    // roots. Snapshot pre-scavenge watermarks so Cheney scans those newly
-    // promoted payloads instead of starting at the post-promotion bump cursor.
-    let mut old_scan_cursors: smallvec::SmallVec<[usize; 16]> = old_space
-        .pages()
-        .iter()
-        .map(|p| p.header().bump_cursor)
-        .collect();
     // Snapshot the remembered parents recorded by the mutator since the last
     // scavenge, then leave the live buffer empty so `remember_parent` can
     // re-fill it with the parents that still hold an old→young edge after
@@ -224,6 +221,7 @@ pub unsafe fn scavenge(
         stats: ScavengeStats::default(),
         in_dirty_scan: false,
         remembered: unsafe { NonNull::new_unchecked(remembered_parents as *mut _) },
+        promoted_unscanned: Vec::new(),
     };
 
     // 1) Explicit root slots.
@@ -249,13 +247,13 @@ pub unsafe fn scavenge(
     // 4) Cheney scan to-space (and freshly-promoted bytes in
     // old-space) until convergence.
     // SAFETY: STW + raw-pointer state.
-    unsafe { cheney_scan(&mut ctx, &mut old_scan_cursors) };
+    unsafe { cheney_scan(&mut ctx) };
 
     // 5) Run minor-GC ephemeron processing. This may evacuate values for
     // keys that were already kept alive by ordinary reachability.
     // SAFETY: registry slots are valid non-root slots supplied by the heap.
     unsafe {
-        process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots, &mut old_scan_cursors)
+        process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots)
     };
 
     // 6) Rewrite non-root weak registry entries after all strong and
@@ -288,8 +286,7 @@ pub unsafe fn scavenge(
     ctx.new_space().flip();
 
     let stats = ctx.stats;
-    ctx.old_space()
-        .release_unused_promotion_pages(promotion_reserve_start);
+    ctx.old_space().release_unused_promotion_pages();
     Ok(stats)
 }
 
@@ -566,11 +563,7 @@ unsafe fn process_ephemeron_key_slot(ctx: &mut ScavCtx, slot: *mut RawGc) -> boo
 /// # Safety
 ///
 /// `ephemeron_registry_slots` must address valid non-root registry slots.
-unsafe fn process_ephemeron_fixpoint(
-    ctx: &mut ScavCtx,
-    ephemeron_registry_slots: &[*mut RawGc],
-    old_scan_cursors: &mut smallvec::SmallVec<[usize; 16]>,
-) {
+unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots: &[*mut RawGc]) {
     // SAFETY: caller guarantees slot validity under STW.
     unsafe {
         loop {
@@ -595,7 +588,7 @@ unsafe fn process_ephemeron_fixpoint(
                 trace_ephemeron_table(ctx, header_ptr);
             }
 
-            cheney_scan(ctx, old_scan_cursors);
+            cheney_scan(ctx);
 
             if (ctx.stats.copied_bytes, ctx.stats.promoted_bytes) == before {
                 break;
@@ -689,6 +682,7 @@ unsafe fn evacuate(ctx: &mut ScavCtx, header: *mut GcHeader) -> u32 {
         if promoted {
             (*dest_header).promote_to_old();
             ctx.stats.promoted_bytes += size;
+            ctx.promoted_unscanned.push(new_offset);
         } else {
             ctx.stats.copied_bytes += size;
         }
@@ -746,16 +740,16 @@ unsafe fn scan_remembered_parents(ctx: &mut ScavCtx, snapshot: &[RawGc]) {
     }
 }
 
-/// Cheney scan to convergence. Walks to-space pages (and
-/// freshly-promoted bytes in old-space pages) and traces every
-/// new object, evacuating any from-space children. Iterates
-/// until no page advances its bump cursor in a pass — that's
-/// when all reachable objects have been copied.
+/// Cheney scan to convergence. Walks to-space pages and drains the
+/// promoted-object worklist, tracing every new object and evacuating any
+/// from-space children. Iterates until a pass neither advances a to-space
+/// bump cursor nor pops a promoted entry — that's when all reachable
+/// objects have been copied.
 ///
 /// # Safety
 ///
 /// STW pause + valid pages.
-unsafe fn cheney_scan(ctx: &mut ScavCtx, old_cursors: &mut smallvec::SmallVec<[usize; 16]>) {
+unsafe fn cheney_scan(ctx: &mut ScavCtx) {
     // Per-page scan cursors.
     let to_count = ctx.new_space().to_pages().len();
     let mut to_cursors: smallvec::SmallVec<[usize; 16]> =
@@ -788,33 +782,19 @@ unsafe fn cheney_scan(ctx: &mut ScavCtx, old_cursors: &mut smallvec::SmallVec<[u
                 }
             }
 
-            // Old-space scan: walk newly-promoted bytes.
-            let cur_old_count = ctx.old_space().page_count();
-            // Extend cursors for any new pages added during this
-            // pass.
-            while old_cursors.len() < cur_old_count {
-                old_cursors.push(PAGE_HEADER_SIZE);
-            }
-            for idx in 0..cur_old_count {
-                let (base, limit) = {
-                    let page = &ctx.old_space().pages()[idx];
-                    (page.base_ptr(), page.header().bump_cursor)
-                };
-                let scan_from = old_cursors[idx];
-                if scan_from >= limit {
-                    continue;
-                }
+            // Promoted-object scan: drain the explicit worklist. Children
+            // of freshly-promoted objects promote too (same policy as the
+            // dirty re-trace): leaving them young would re-remember every
+            // promoted parent and re-trace it on all later scavenges — the
+            // transitive closure of an old graph must reach old space
+            // within THIS scavenge.
+            while let Some(offset) = ctx.promoted_unscanned.pop() {
                 progress = true;
-                // Children of freshly-promoted objects promote too (same
-                // policy as the dirty re-trace): leaving them young would
-                // re-remember every promoted parent and re-trace it on all
-                // later scavenges — the transitive closure of an old graph
-                // must reach old space within THIS scavenge.
+                let header_ptr = cage_base().add(offset as usize) as *mut GcHeader;
                 let was_dirty = ctx.in_dirty_scan;
                 ctx.in_dirty_scan = true;
-                scan_range_raw(ctx, base, scan_from, limit);
+                trace_one(ctx, header_ptr);
                 ctx.in_dirty_scan = was_dirty;
-                old_cursors[idx] = limit;
             }
 
             if !progress {

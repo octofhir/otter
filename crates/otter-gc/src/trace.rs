@@ -224,6 +224,10 @@ impl TraceTable {
     /// `trace_wrapper` casts the raw header pointer to `*mut T`
     /// (skipping the header) and forwards to `T::trace_slots`.
     pub fn register<T: Traceable>(&mut self) {
+        debug_assert!(
+            T::TYPE_TAG != crate::header::FREE_TAG,
+            "FREE_TAG is reserved for free-space fillers"
+        );
         unsafe fn trace_wrapper<T: Traceable>(
             header: *mut GcHeader,
             visitor: &mut SlotVisitor<'_>,

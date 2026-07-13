@@ -306,6 +306,40 @@ impl<'rt> NativeCtx<'rt> {
             .reserve_external_with_roots(bytes, &mut external_visit)
     }
 
+    /// Adjust the cumulative amount of memory retained outside GC cells.
+    ///
+    /// This is the high-level host-ABI counterpart to [`Self::reserve_external`]
+    /// for APIs such as Node-API whose contract reports signed deltas rather
+    /// than transferring ownership of one RAII token. Positive adjustments are
+    /// booked against the heap cap and can trigger collection; negative
+    /// adjustments release the same reservation. A host is expected not to
+    /// release more than it previously reserved.
+    pub fn adjust_external_memory(
+        &mut self,
+        change_in_bytes: i64,
+    ) -> Result<i64, otter_gc::OutOfMemory> {
+        let current = self
+            .cx
+            .interp
+            .external_memory_adjustment
+            .as_ref()
+            .map_or(0, otter_gc::ExternalMemory::bytes);
+        let adjusted = (i128::from(current) + i128::from(change_in_bytes))
+            .clamp(0, i128::from(i64::MAX)) as u64;
+
+        if let Some(reservation) = self.cx.interp.external_memory_adjustment.as_mut() {
+            reservation.resize(adjusted)?;
+            if adjusted == 0 {
+                self.cx.interp.external_memory_adjustment = None;
+            }
+        } else if adjusted != 0 {
+            let reservation = self.reserve_external(adjusted)?;
+            self.cx.interp.external_memory_adjustment = Some(reservation);
+        }
+
+        Ok(adjusted as i64)
+    }
+
     /// Allocate an ordinary object through the native root contract.
     pub fn alloc_object(&mut self) -> Result<object::JsObject, otter_gc::OutOfMemory> {
         self.alloc_object_with_roots(&[], &[])

@@ -135,9 +135,12 @@ Otter implements the stable Node-API C ABI directly over its own VM. Addon
 values are persistent-root handles rather than raw moving-GC values, and
 asynchronous completion returns through the runtime microtask checkpoint. The
 CLI exports the `napi_*` symbols needed by dynamically loaded addons. This path
-has been exercised against a C ABI fixture and the current napi-rs Rollup
-native package, including synchronous parsing, async parsing, hashing, and a
-complete `rollup(...).generate(...)` run.
+has been exercised against a C ABI fixture, the current napi-rs Rollup native
+package, and the current `@swc/core` native package. The validation includes
+synchronous and asynchronous Rollup parsing, hashing, a complete
+`rollup(...).generate(...)` run, and a native SWC TypeScript transform. Buffer
+views and addon-reported external memory use the VM's typed-array and heap
+accounting APIs rather than detached shadow storage.
 
 Node and napi-rs themselves are not embedded. An addon must use Node-API; a
 binary linked directly against V8 or private Node internals is a different ABI

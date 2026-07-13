@@ -9,8 +9,8 @@
 //! - [`load_addon`] opens a capability-approved library and runs registration.
 //! - [`NapiEnv`] owns stable C handles backed by Otter persistent roots.
 //! - Exported `napi_*` functions implement the initial Node-API value,
-//!   property, callback, exception, Promise, async-work, and handle-scope
-//!   surface.
+//!   property, callback, exception, external-memory, buffer, Promise,
+//!   async-work, and handle-scope surface.
 //!
 //! # Invariants
 //! - Both `read` and `ffi` capabilities are checked before native code loads.
@@ -76,6 +76,8 @@ const NAPI_NUMBER: c_int = 3;
 const NAPI_STRING: c_int = 4;
 const NAPI_OBJECT: c_int = 6;
 const NAPI_FUNCTION: c_int = 7;
+const NAPI_EXTERNAL: c_int = 8;
+const NAPI_UINT8_ARRAY: u32 = 1;
 const NAPI_AUTO_LENGTH: usize = usize::MAX;
 const NAPI_STATIC: c_int = 1 << 10;
 
@@ -115,10 +117,16 @@ pub struct NapiAsyncWork {
 #[derive(Default)]
 struct NapiState {
     wraps: Mutex<Vec<NapiWrap>>,
+    externals: Mutex<Vec<NapiExternal>>,
 }
 
 struct NapiWrap {
     object: PersistentRootId,
+    data: usize,
+}
+
+struct NapiExternal {
+    value: PersistentRootId,
     data: usize,
 }
 
@@ -226,6 +234,23 @@ fn make_uint8_array(ctx: &mut NativeCtx<'_>, bytes: &[u8]) -> Result<Value, Nati
             ctx.scoped_set_index(scope, array, index, value)?;
         }
         ctx.construct(ctx.escape(constructor), &[ctx.escape(array)])
+    })
+}
+
+unsafe fn find_external(env: &mut NapiEnv, value: Value) -> Option<usize> {
+    let externals: Vec<(PersistentRootId, usize)> = env
+        .state
+        .externals
+        .lock()
+        .expect("napi externals lock")
+        .iter()
+        .map(|external| (external.value, external.data))
+        .collect();
+    externals.into_iter().find_map(|(root, data)| {
+        unsafe { env.ctx() }
+            .persistent_root_get(root)
+            .filter(|candidate| *candidate == value)
+            .map(|_| data)
     })
 }
 
@@ -528,12 +553,115 @@ pub unsafe extern "C" fn napi_typeof(
         NAPI_NUMBER
     } else if value.is_string() {
         NAPI_STRING
+    } else if unsafe { find_external(env, value) }.is_some() {
+        NAPI_EXTERNAL
     } else if value.is_callable() {
         NAPI_FUNCTION
     } else {
         NAPI_OBJECT
     };
     unsafe { *result = kind };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_coerce_to_object(
+    env: napi_env,
+    value: napi_value,
+    result: *mut napi_value,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if value.is_null() || value.is_undefined() {
+        return env.fail(invalid(
+            "napi_coerce_to_object",
+            "cannot convert null or undefined to an object",
+        ));
+    }
+    if value.is_object_type() || value.is_callable() {
+        unsafe { *result = env.root(value) };
+        return NAPI_OK;
+    }
+    let Some(constructor) = (unsafe { env.ctx() }).global_value("Object") else {
+        return env.fail(invalid(
+            "napi_coerce_to_object",
+            "Object constructor is unavailable",
+        ));
+    };
+    let converted = unsafe { env.ctx() }.scope(|ctx, scope| {
+        let constructor = ctx.scoped_value(scope, constructor);
+        let value = ctx.scoped_value(scope, value);
+        ctx.call(
+            ctx.escape(constructor),
+            Value::undefined(),
+            &[ctx.escape(value)],
+        )
+    });
+    match converted {
+        Ok(value) => {
+            unsafe { *result = env.root(value) };
+            NAPI_OK
+        }
+        Err(error) => env.fail(error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_create_external(
+    env: napi_env,
+    data: *mut c_void,
+    _finalize: *mut c_void,
+    _hint: *mut c_void,
+    result: *mut napi_value,
+) -> napi_status {
+    if env.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
+        let value = ctx.scoped_object_bare(scope)?;
+        Ok::<Value, NativeError>(ctx.escape(value))
+    });
+    match created {
+        Ok(value) => {
+            let root = unsafe { env.ctx() }.persistent_root_insert(value);
+            env.state
+                .externals
+                .lock()
+                .expect("napi externals lock")
+                .push(NapiExternal {
+                    value: root,
+                    data: data as usize,
+                });
+            unsafe { *result = env.root(value) };
+            NAPI_OK
+        }
+        Err(error) => env.fail(error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_get_value_external(
+    env: napi_env,
+    value: napi_value,
+    result: *mut *mut c_void,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(data) = (unsafe { find_external(env, value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    unsafe { *result = data as *mut c_void };
     NAPI_OK
 }
 
@@ -1483,6 +1611,82 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_get_buffer_info(
+    env: napi_env,
+    value: napi_value,
+    data: *mut *mut c_void,
+    length: *mut usize,
+) -> napi_status {
+    if env.is_null() || value.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some((kind, element_length, pointer, _, _)) =
+        (unsafe { env.ctx() }).typed_array_info(value)
+    else {
+        return NAPI_INVALID_ARG;
+    };
+    if kind != NAPI_UINT8_ARRAY {
+        return NAPI_INVALID_ARG;
+    }
+    if !data.is_null() {
+        unsafe { *data = pointer.cast() };
+    }
+    if !length.is_null() {
+        unsafe { *length = element_length };
+    }
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_is_buffer(
+    env: napi_env,
+    value: napi_value,
+    result: *mut bool,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    unsafe {
+        *result = env
+            .ctx()
+            .typed_array_info(value)
+            .is_some_and(|(kind, _, _, _, _)| kind == NAPI_UINT8_ARRAY)
+    };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_adjust_external_memory(
+    env: napi_env,
+    change_in_bytes: i64,
+    result: *mut i64,
+) -> napi_status {
+    if env.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    match unsafe { env.ctx() }.adjust_external_memory(change_in_bytes) {
+        Ok(adjusted) => {
+            unsafe { *result = adjusted };
+            NAPI_OK
+        }
+        Err(error) => env.fail(NativeError::OutOfMemory {
+            name: "napi_adjust_external_memory",
+            requested_bytes: error.requested_bytes(),
+            heap_limit_bytes: error.heap_limit_bytes(),
+        }),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_create_async_work(
     _env: napi_env,
     _resource: napi_value,
@@ -1746,6 +1950,9 @@ pub fn keep_napi_exports() {
         napi_create_array_with_length as *const (),
         napi_create_function as *const (),
         napi_typeof as *const (),
+        napi_coerce_to_object as *const (),
+        napi_create_external as *const (),
+        napi_get_value_external as *const (),
         napi_get_value_double as *const (),
         napi_get_value_int32 as *const (),
         napi_get_value_uint32 as *const (),
@@ -1787,6 +1994,9 @@ pub fn keep_napi_exports() {
         napi_create_buffer_copy as *const (),
         napi_create_external_buffer as *const (),
         napi_get_typedarray_info as *const (),
+        napi_get_buffer_info as *const (),
+        napi_is_buffer as *const (),
+        napi_adjust_external_memory as *const (),
         napi_create_async_work as *const (),
         napi_queue_async_work as *const (),
         napi_cancel_async_work as *const (),

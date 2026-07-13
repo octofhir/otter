@@ -1449,6 +1449,17 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp.scoped_boolean(s, b)
     }
 
+    /// Allocate a `BigInt` from a signed 128-bit host counter and park it in
+    /// scope `s` before any later allocation can relocate it.
+    pub fn scoped_bigint_i128<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        n: i128,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_bigint_i128(s, n);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_bigint_i128"))
+    }
+
     /// Park the `undefined` immediate in scope `s`.
     #[must_use]
     pub fn scoped_undefined<'s>(&mut self, s: &'s HandleScope) -> Scoped<'s> {
@@ -1510,6 +1521,29 @@ impl<'rt> NativeCtx<'rt> {
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_define_data"))
     }
 
+    /// Make `obj` callable through the native function held by `call`.
+    pub fn scoped_set_call_native(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        call: Scoped<'_>,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_set_call_native(s, obj, call);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set_call_native"))
+    }
+
+    /// Set `obj`'s prototype from a scoped object handle, or install a null
+    /// prototype with `None`.
+    pub fn scoped_set_prototype(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        prototype: Option<Scoped<'_>>,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_set_prototype(s, obj, prototype);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set_prototype"))
+    }
+
     /// Allocate an ordinary object whose prototype is the object held by the
     /// `proto` handle (e.g. a class's `.prototype`), and park it in scope `s`.
     /// Use this to build a native instance that must carry a specific prototype
@@ -1567,6 +1601,12 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<Scoped<'s>, NativeError> {
         let result = self.cx.interp.scoped_get_index(s, arr, index);
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_get_index"))
+    }
+
+    /// Read the current logical length of the array handle `arr`.
+    pub fn scoped_array_length(&self, arr: Scoped<'_>) -> Result<usize, NativeError> {
+        let result = self.cx.interp.scoped_array_length(arr);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_array_length"))
     }
 
     /// Allocate a host-data object through the native root contract and park it

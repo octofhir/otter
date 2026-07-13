@@ -740,19 +740,32 @@ function inherits(ctor, superCtor) {
 }
 
 // ---------- deprecate ----------
-function deprecate(fn, msg, code) {
+const emittedDeprecationCodes = new Set();
+function deprecate(fn, msg, code, options) {
+  if (typeof fn !== 'function') {
+    throw argTypeError('fn', 'argument must be of type function', fn);
+  }
   if (code !== undefined && typeof code !== 'string') {
     throw argTypeError('code', 'argument must be of type string', code);
   }
   let warned = false;
   function deprecated(...args) {
-    if (!warned) {
+    if (!warned && (code === undefined || !emittedDeprecationCodes.has(code))) {
       warned = true;
+      if (code !== undefined) emittedDeprecationCodes.add(code);
       if (typeof process !== 'undefined' && process.emitWarning) {
         process.emitWarning(msg, 'DeprecationWarning', code);
       }
     }
     return fn.apply(this, args);
+  }
+  Object.defineProperty(deprecated, 'length', {
+    value: fn.length,
+    configurable: true,
+  });
+  if (!options || options.modifyPrototype !== false) {
+    Object.setPrototypeOf(deprecated, fn);
+    deprecated.prototype = fn.prototype;
   }
   return deprecated;
 }

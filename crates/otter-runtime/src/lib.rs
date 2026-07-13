@@ -67,6 +67,7 @@ mod module_records;
 pub mod module_scope;
 mod package_graph_resolver;
 mod process;
+mod process_events;
 pub mod promise_registry;
 mod runtime_activity;
 pub mod structured_clone;

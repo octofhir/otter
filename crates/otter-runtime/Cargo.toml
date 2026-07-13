@@ -28,6 +28,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 url = "2"
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 otter-macros = { workspace = true }

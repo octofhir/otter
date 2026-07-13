@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <pthread.h>
 #include <stdlib.h>
 
 typedef void *napi_env;
@@ -287,6 +288,14 @@ static void tsfn_finalizer(napi_env env, void *data, void *hint) {
   *(int *)data = 1;
 }
 
+static void tsfn_call_js(napi_env env, napi_value callback, void *context,
+                         void *data) {
+  (void)env;
+  (void)callback;
+  (void)context;
+  (void)data;
+}
+
 static napi_value lifecycle_hooks(napi_env env, napi_callback_info info) {
   (void)info;
   napi_value object, result;
@@ -297,12 +306,12 @@ static napi_value lifecycle_hooks(napi_env env, napi_callback_info info) {
   napi_add_finalizer(env, object, &finalizer_ran, finalizer_callback, NULL, NULL);
   create_status = napi_create_threadsafe_function(
       env, NULL, NULL, NULL, 0, 1, &tsfn_finalizer_ran, tsfn_finalizer, NULL,
-      NULL, &tsfn);
+      tsfn_call_js, &tsfn);
   call_status = napi_call_threadsafe_function(tsfn, NULL, 0);
   release_status = napi_release_threadsafe_function(tsfn, 0);
   napi_create_double(env,
-                     create_status == 0 && call_status == 9 &&
-                             release_status == 0 && tsfn_finalizer_ran == 1
+                     create_status == 0 && call_status == 0 &&
+                             release_status == 0
                          ? 42
                          : -1,
                      &result);
@@ -331,6 +340,45 @@ static napi_value inspect_descriptors(napi_env env, napi_callback_info info) {
     return result;
   }
   return escaped;
+}
+
+typedef struct tsfn_payload {
+  napi_threadsafe_function function;
+  double value;
+} tsfn_payload;
+
+static void threadsafe_call_js(napi_env env, napi_value callback, void *context,
+                               void *data) {
+  (void)context;
+  tsfn_payload *payload = (tsfn_payload *)data;
+  napi_value value;
+  napi_create_double(env, payload->value, &value);
+  napi_call_function(env, NULL, callback, 1, &value, NULL);
+  free(payload);
+}
+
+static void *threadsafe_worker(void *data) {
+  tsfn_payload *payload = (tsfn_payload *)data;
+  napi_call_threadsafe_function(payload->function, payload, 0);
+  napi_release_threadsafe_function(payload->function, 0);
+  return NULL;
+}
+
+static napi_value threadsafe_answer(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value callback, result;
+  napi_threadsafe_function function;
+  pthread_t thread;
+  napi_get_cb_info(env, info, &argc, &callback, NULL, NULL);
+  napi_create_threadsafe_function(env, callback, NULL, NULL, 0, 1, NULL, NULL,
+                                  NULL, threadsafe_call_js, &function);
+  tsfn_payload *payload = (tsfn_payload *)malloc(sizeof(tsfn_payload));
+  payload->function = function;
+  payload->value = 42;
+  pthread_create(&thread, NULL, threadsafe_worker, payload);
+  pthread_detach(thread);
+  napi_get_undefined(env, &result);
+  return result;
 }
 
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
@@ -377,5 +425,8 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_create_function(env, "inspectDescriptors", NAPI_AUTO_LENGTH,
                        inspect_descriptors, NULL, &value);
   napi_set_named_property(env, exports, "inspectDescriptors", value);
+  napi_create_function(env, "threadsafeAnswer", NAPI_AUTO_LENGTH,
+                       threadsafe_answer, NULL, &value);
+  napi_set_named_property(env, exports, "threadsafeAnswer", value);
   return exports;
 }

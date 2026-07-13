@@ -330,11 +330,13 @@ pub type HostedModuleValueInstall =
 /// The Node compatibility product installs this hook; the core runtime keeps
 /// native code loading opt-in and has no dependency on a particular addon ABI.
 /// Implementations must enforce the separate `ffi` capability before opening
-/// the library.
+/// the library. The optional task spawner is the owned, sendable route for
+/// addon worker callbacks to re-enter a handle-backed isolate.
 pub type CommonJsAddonLoader = for<'rt> fn(
     &mut otter_vm::NativeCtx<'rt>,
     &Path,
     &CapabilitySet,
+    Option<RuntimeTaskSpawner>,
 ) -> Result<otter_vm::Value, otter_vm::NativeError>;
 
 /// One runtime-hosted module.

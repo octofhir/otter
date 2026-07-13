@@ -220,7 +220,41 @@ function parse(input) {
 }
 
 function format(value, options) {
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') {
+    const authority = value.indexOf('://');
+    if (authority >= 0) {
+      let authorityEnd = value.length;
+      for (let index = authority + 3; index < value.length; index++) {
+        const char = value[index];
+        if ('/?#'.includes(char)) {
+          authorityEnd = index;
+          break;
+        }
+        if ('\" <>\\^`{|}'.includes(char)) {
+          return value.slice(0, index) + '/' + encodePath(value.slice(index));
+        }
+      }
+      let authorityText = value.slice(authority + 3, authorityEnd);
+      const at = authorityText.lastIndexOf('@');
+      if (at >= 0) authorityText = authorityText.slice(at + 1);
+      const colon = authorityText.lastIndexOf(':');
+      const hostname = colon > 0 ? authorityText.slice(0, colon) : authorityText;
+      if (hostname.length > 255) {
+        return value.slice(0, authority + 3) + value.slice(authorityEnd);
+      }
+      const pathStart = value.indexOf('/', authority + 3);
+      const queryStart = value.indexOf('?', authority + 3);
+      const fragmentStart = value.indexOf('#', authority + 3);
+      let suffixStart = queryStart;
+      if (suffixStart < 0 || (fragmentStart >= 0 && fragmentStart < suffixStart)) {
+        suffixStart = fragmentStart;
+      }
+      if (suffixStart >= 0 && (pathStart < 0 || suffixStart < pathStart)) {
+        return value.slice(0, suffixStart) + '/' + value.slice(suffixStart);
+      }
+    }
+    return value;
+  }
   if (!value || typeof value !== 'object') {
     throw invalidArgType('urlObject', value);
   }
@@ -230,13 +264,13 @@ function format(value, options) {
     }
     const opts = options || {};
     let href = value.href;
-    if (opts.auth === false) {
+    if (opts.auth !== undefined && !opts.auth) {
       const scheme = href.indexOf('//');
       const at = href.indexOf('@', scheme + 2);
       if (scheme >= 0 && at >= 0) href = href.slice(0, scheme + 2) + href.slice(at + 1);
     }
-    if (opts.search === false) href = href.replace(/\?[^#]*/, '');
-    if (opts.fragment === false) href = href.replace(/#.*/, '');
+    if (opts.search !== undefined && !opts.search) href = href.replace(/\?[^#]*/, '');
+    if (opts.fragment !== undefined && !opts.fragment) href = href.replace(/#.*/, '');
     if (opts.unicode) {
       const scheme = href.indexOf('//');
       const end = href.indexOf('/', scheme + 2);
@@ -252,15 +286,41 @@ function format(value, options) {
     }
     return href;
   }
-  let out = value.protocol || '';
-  if (value.slashes || value.host || value.hostname) {
-    const auth = value.auth ? `${encodeURIComponent(value.auth).replace('%3A', ':')}@` : '';
-    const host = value.host || `${value.hostname || ''}${value.port ? `:${value.port}` : ''}`;
-    out += `//${auth}${host}`;
+  let protocol = value.protocol || '';
+  if (protocol && !protocol.endsWith(':')) protocol += ':';
+  let out = protocol;
+  let hostname = value.hostname || '';
+  if (hostname.includes(':') && !(hostname.startsWith('[') && hostname.endsWith(']'))) {
+    hostname = `[${hostname}]`;
   }
-  out += value.pathname || '';
-  out += value.search || (value.query ? `?${value.query}` : '');
-  out += value.hash || '';
+  const host = value.host || `${hostname}${value.port ? `:${value.port}` : ''}`;
+  const slashed = value.slashes ||
+    ['http:', 'https:', 'ftp:', 'gopher:', 'file:', 'ws:', 'wss:'].includes(protocol);
+  if (slashed) out += '//';
+  if (host) {
+    const auth = value.auth ? `${encodeURIComponent(value.auth).replace('%3A', ':')}@` : '';
+    out += `${auth}${host}`;
+  }
+  let pathname = value.pathname || '';
+  pathname = String(pathname).split('#').join('%23').split('?').join('%3F');
+  if (slashed && host && pathname && !pathname.startsWith('/')) pathname = '/' + pathname;
+  out += pathname;
+  let query = '';
+  if (value.query && typeof value.query === 'object') {
+    query = Object.keys(value.query).map((key) => {
+      const item = value.query[key];
+      return `${encodeURIComponent(key)}=${encodeURIComponent(item == null ? '' : item)}`;
+    }).join('&');
+  } else if (value.query) {
+    query = String(value.query);
+  }
+  let search = value.search || query;
+  if (search && !search.startsWith('?')) search = '?' + search;
+  search = search.split('#').join('%23');
+  out += search;
+  let hash = value.hash || '';
+  if (hash && !hash.startsWith('#')) hash = '#' + hash;
+  out += hash;
   return out;
 }
 

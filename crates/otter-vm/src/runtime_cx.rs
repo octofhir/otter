@@ -779,6 +779,27 @@ impl<'rt> NativeCtx<'rt> {
             .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "get property"))
     }
 
+    /// Return enumerable own string keys through the target's JavaScript
+    /// internal methods, including Proxy `ownKeys` and descriptor traps.
+    pub fn enumerable_own_string_keys(
+        &mut self,
+        target: Value,
+    ) -> Result<Vec<String>, NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "enumerate properties",
+                reason: "missing execution context".to_string(),
+            })?;
+        self.cx
+            .interp
+            .enumerable_own_string_keys_for_value(&context, target, 0)
+            .map_err(|err| {
+                native_function::vm_to_native_error(self.cx.interp, err, "enumerate properties")
+            })
+    }
+
     /// Perform JavaScript `Set(receiver, key, value, true)` through the active
     /// execution context, including callable and exotic receivers.
     pub fn set_value_property(
@@ -1433,6 +1454,17 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<Scoped<'s>, NativeError> {
         let result = self.cx.interp.scoped_array(s, len);
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_array"))
+    }
+
+    /// Allocate a Proxy over scoped target and handler handles.
+    pub fn scoped_proxy<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        target: Scoped<'_>,
+        handler: Scoped<'_>,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_proxy(s, target, handler);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_proxy"))
     }
 
     /// Park an `f64` number in scope `s`. Numbers are NaN-boxed immediates, so

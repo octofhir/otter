@@ -67,6 +67,7 @@ mod module_records;
 pub mod module_scope;
 mod package_graph_resolver;
 mod process;
+mod process_env;
 mod process_events;
 pub mod promise_registry;
 mod runtime_activity;
@@ -927,10 +928,8 @@ impl CapabilitySet {
     /// `Permission::AllowAll`.
     #[must_use]
     pub fn env_allows(&self, name: &str) -> bool {
-        for pattern in ENV_BUILTIN_DENY_PATTERNS {
-            if glob_match_string(pattern, name) {
-                return false;
-            }
+        if env_name_is_builtin_denied(name) {
+            return false;
         }
         self.env.matches(name)
     }
@@ -962,6 +961,12 @@ impl CapabilitySet {
             ffi: Permission::AllowAll,
         }
     }
+}
+
+fn env_name_is_builtin_denied(name: &str) -> bool {
+    ENV_BUILTIN_DENY_PATTERNS
+        .iter()
+        .any(|pattern| glob_match_string(pattern, name))
 }
 
 /// Per-resource permission state.
@@ -2026,6 +2031,7 @@ impl Runtime {
                             &config.process_argv,
                             &config.process_cwd,
                             &config.capabilities,
+                            &config.hooks,
                         )?;
                     }
                     // §19.4.1 / §20.2.1.1 — wire the eval hook so `eval(src)` /
@@ -3313,10 +3319,12 @@ impl Runtime {
         capability: RuntimeCapability,
         request: &CapabilityRequest<'_>,
     ) -> bool {
-        if let Some(hook) = self.config.hooks.capability_hook() {
-            return hook.check_capability(&self.config.capabilities, capability, request);
-        }
-        default_check_capability(&self.config.capabilities, capability, request)
+        hooks::check_capability_with_hooks(
+            &self.config.hooks,
+            &self.config.capabilities,
+            capability,
+            request,
+        )
     }
 
     /// Emit a structured diagnostic through the configured runtime hook.
@@ -4198,6 +4206,14 @@ impl OtterBuilder {
         self
     }
 
+    /// Override capability decisions while retaining runtime-level mandatory
+    /// filters such as the environment secret denylist.
+    #[must_use]
+    pub fn capability_hook(mut self, hook: impl RuntimeCapabilityHook) -> Self {
+        self.runtime = self.runtime.capability_hook(hook);
+        self
+    }
+
     /// Hard heap cap. `0` disables the cap.
     #[must_use]
     pub fn max_heap_bytes(mut self, bytes: u64) -> Self {
@@ -4990,23 +5006,24 @@ mod tests {
 
     #[test]
     fn runtime_capability_hook_can_override_default_policy() {
-        struct AllowExampleNet;
+        struct AllowExampleNetAndEnv;
 
-        impl RuntimeCapabilityHook for AllowExampleNet {
+        impl RuntimeCapabilityHook for AllowExampleNetAndEnv {
             fn check_capability(
                 &self,
                 _capabilities: &CapabilitySet,
                 capability: RuntimeCapability,
                 request: &CapabilityRequest<'_>,
             ) -> bool {
-                capability == RuntimeCapability::Net
-                    && matches!(request, CapabilityRequest::Host("example.com"))
+                (capability == RuntimeCapability::Net
+                    && matches!(request, CapabilityRequest::Host("example.com")))
+                    || capability == RuntimeCapability::Env
             }
         }
 
         let runtime = Runtime::builder()
             .capabilities(CapabilitySet::sandbox())
-            .capability_hook(AllowExampleNet)
+            .capability_hook(AllowExampleNetAndEnv)
             .build()
             .unwrap();
 
@@ -5015,8 +5032,12 @@ mod tests {
             &CapabilityRequest::Host("example.com")
         ));
         assert!(
-            !runtime.check_capability(RuntimeCapability::Env, &CapabilityRequest::EnvVar("HOME"))
+            runtime.check_capability(RuntimeCapability::Env, &CapabilityRequest::EnvVar("HOME"))
         );
+        assert!(!runtime.check_capability(
+            RuntimeCapability::Env,
+            &CapabilityRequest::EnvVar("OPENAI_API_KEY")
+        ));
     }
 
     #[test]

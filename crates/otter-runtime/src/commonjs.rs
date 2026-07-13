@@ -19,6 +19,9 @@
 //!   `module.exports` values stay rooted by GC. A module is inserted into the
 //!   cache *before* its body runs so circular `require` returns the partial
 //!   exports (Node behaviour).
+//! - Cache handles enter a [`NativeCtx`] handle scope before hosted-module
+//!   installers run because an installer may trigger a moving collection
+//!   before its exports are stored.
 //! - Filesystem capabilities are checked before any module or package manifest
 //!   is read; native addons additionally pass through the configured loader's
 //!   FFI capability check.
@@ -297,7 +300,7 @@ fn make_require(
 pub(crate) fn cjs_load(
     ctx: &mut NativeCtx<'_>,
     cfg: &Arc<CjsConfig>,
-    mut cache: object::JsObject,
+    cache: object::JsObject,
     dir: &Path,
     spec: &str,
 ) -> Result<Value, NativeError> {
@@ -307,35 +310,38 @@ pub(crate) fn cjs_load(
         if let Some(cached) = object::get(cache, ctx.heap(), &key) {
             return Ok(cached);
         }
-        let value = if let Some(value_install) = hm.cjs_value() {
-            // Value installers (e.g. `assert`) build via `ModuleScope`, which
-            // pops its roots on return — so root the export across the cache
-            // store, which itself may allocate.
-            value_install(ctx, &cfg.capabilities)
-                .map_err(|err| runtime_type_error("require", err))?
-        } else {
-            // Shared with the ESM loader: one namespace object (and one run
-            // of the installer's side effects) per builtin specifier per
-            // isolate, whichever loader touches it first.
-            let interp = ctx.interp_mut();
-            let namespace = match interp.host_module_env_cached(hm.specifier()) {
-                Some(env) => env,
-                None => {
-                    let env = hm
-                        .install(interp, &cfg.capabilities, cfg.runtime_task_spawner.clone())
-                        .map_err(|err| runtime_type_error("require", err))?;
-                    interp.cache_host_module_env(Arc::from(hm.specifier()), env);
-                    env
-                }
+        return ctx.scope(|ctx, scope| {
+            // Installing a hosted module can allocate enough to move the
+            // require cache. Adopt it into the public handle arena before
+            // entering the installer and use scoped access for the store.
+            let cache = ctx.scoped_value(scope, Value::object(cache));
+            let value = if let Some(value_install) = hm.cjs_value() {
+                // Value installers (e.g. `assert`) build via `ModuleScope`,
+                // which pops its roots on return. Adopt the export below
+                // before the scoped cache store, which may allocate.
+                value_install(ctx, &cfg.capabilities)
+                    .map_err(|err| runtime_type_error("require", err))?
+            } else {
+                // Shared with the ESM loader: one namespace object (and one run
+                // of the installer's side effects) per builtin specifier per
+                // isolate, whichever loader touches it first.
+                let interp = ctx.interp_mut();
+                let namespace = match interp.host_module_env_cached(hm.specifier()) {
+                    Some(env) => env,
+                    None => {
+                        let env = hm
+                            .install(interp, &cfg.capabilities, cfg.runtime_task_spawner.clone())
+                            .map_err(|err| runtime_type_error("require", err))?;
+                        interp.cache_host_module_env(Arc::from(hm.specifier()), env);
+                        env
+                    }
+                };
+                Value::object(namespace)
             };
-            Value::object(namespace)
-        };
-        let depth = ctx.interp_mut().push_module_root(value);
-        let value = ctx.interp_mut().module_root(depth - 1);
-        object::set(&mut cache, ctx.heap_mut(), &key, value);
-        let value = object::get(cache, ctx.heap(), &key).unwrap_or(value);
-        ctx.interp_mut().pop_module_roots_to(depth - 1);
-        return Ok(value);
+            let value = ctx.scoped_value(scope, value);
+            ctx.scoped_set(scope, cache, &key, value)?;
+            Ok(ctx.escape(value))
+        });
     }
 
     // 2. File module.

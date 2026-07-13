@@ -29,25 +29,34 @@ const MYERS_DIFF_JS: &str = include_str!("myers_diff.js");
 
 /// CommonJS export: the callable `assert` namespace.
 pub fn assert_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let util = crate::util::util_cjs_value(ctx, caps)?;
-    let calltracker = otter_runtime::run_builtin_cjs_shim(
-        ctx,
-        "internal/assert/calltracker",
-        CALLTRACKER_JS,
-        &[],
-    )?;
-    let myers =
-        otter_runtime::run_builtin_cjs_shim(ctx, "internal/assert/myers_diff", MYERS_DIFF_JS, &[])?;
-    otter_runtime::run_builtin_cjs_shim(
-        ctx,
-        "assert",
-        ASSERT_JS,
-        &[
-            ("util", util),
-            ("internal/assert/calltracker", calltracker),
-            ("internal/assert/myers_diff", myers),
-        ],
-    )
+    ctx.scope(|ctx, scope| {
+        let util = crate::util::util_cjs_value(ctx, caps)?;
+        let util = ctx.scoped_value(scope, util);
+        let calltracker = otter_runtime::run_builtin_cjs_shim(
+            ctx,
+            "internal/assert/calltracker",
+            CALLTRACKER_JS,
+            &[],
+        )?;
+        let calltracker = ctx.scoped_value(scope, calltracker);
+        let myers = otter_runtime::run_builtin_cjs_shim(
+            ctx,
+            "internal/assert/myers_diff",
+            MYERS_DIFF_JS,
+            &[],
+        )?;
+        let myers = ctx.scoped_value(scope, myers);
+        otter_runtime::run_builtin_cjs_shim(
+            ctx,
+            "assert",
+            ASSERT_JS,
+            &[
+                ("util", ctx.escape(util)),
+                ("internal/assert/calltracker", ctx.escape(calltracker)),
+                ("internal/assert/myers_diff", ctx.escape(myers)),
+            ],
+        )
+    })
 }
 
 /// CommonJS export: strict assert namespace (`node:assert/strict`).

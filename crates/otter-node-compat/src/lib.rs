@@ -8,6 +8,7 @@
 //!
 //! # Invariants
 //! - Only tests selected by `node_compat_config.toml` enter the report.
+//! - The default tested Otter binary is always rebuilt in release mode.
 //! - Every child runs in its own process group and is terminated by the
 //!   external watchdog on timeout.
 //! - Configured commands use owned strings and never cross VM/GC boundaries.
@@ -84,6 +85,7 @@ impl RunOptions {
 pub struct RunReport {
     pub timestamp: DateTime<Utc>,
     pub otter_version: String,
+    pub otter_binary: String,
     pub duration_secs: f64,
     pub summary: RunSummary,
     pub results: Vec<TestResult>,
@@ -108,6 +110,8 @@ pub struct ModuleSummary {
     pub passed: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub timeout: usize,
+    pub crashed: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -182,6 +186,7 @@ pub fn run(options: RunOptions) -> Result<RunReport> {
     let report = RunReport {
         timestamp: Utc::now(),
         otter_version: env!("CARGO_PKG_VERSION").to_string(),
+        otter_binary: otter_bin.display().to_string(),
         duration_secs: started_at.elapsed().as_secs_f64(),
         summary: summarize_results(&results),
         results,
@@ -213,20 +218,18 @@ fn ensure_otter_binary(options: &RunOptions) -> Result<PathBuf> {
         return Ok(path.clone());
     }
 
-    let binary = options.workspace_root.join("target/debug/otter");
-    if binary.exists() {
-        return Ok(binary);
-    }
+    let binary = options.workspace_root.join("target/release/otter");
 
     let status = Command::new("cargo")
         .arg("build")
+        .arg("--release")
         .arg("-p")
         .arg("otter-cli")
         .current_dir(&options.workspace_root)
         .status()
-        .context("failed to spawn `cargo build -p otter-cli`")?;
+        .context("failed to spawn `cargo build --release -p otter-cli`")?;
     if !status.success() {
-        bail!("`cargo build -p otter-cli` failed while preparing node-compat runner");
+        bail!("`cargo build --release -p otter-cli` failed while preparing node-compat runner");
     }
     Ok(binary)
 }
@@ -509,6 +512,7 @@ fn kill_with_watchdog(child: &mut std::process::Child) {
 fn is_timeout_error(message: &str) -> bool {
     message.contains("Interrupted")
         || message.contains("timed out")
+        || message.contains("timeout after")
         || message.contains("execution timed out")
 }
 
@@ -544,9 +548,11 @@ fn summarize_results(results: &[TestResult]) -> RunSummary {
             }
             Outcome::Timeout => {
                 summary.timeout += 1;
+                module_summary.timeout += 1;
             }
             Outcome::Crashed => {
                 summary.crashed += 1;
+                module_summary.crashed += 1;
             }
         }
 
@@ -599,6 +605,7 @@ fn write_conformance_markdown(workspace_root: &Path, report: &RunReport) -> Resu
         report.timestamp.format("%Y-%m-%d %H:%M:%SZ")
     ));
     out.push_str(&format!("- Otter version: `{}`\n", report.otter_version));
+    out.push_str(&format!("- Otter binary: `{}`\n", report.otter_binary));
     out.push_str(&format!("- Duration: {:.1}s\n\n", report.duration_secs));
 
     out.push_str("## Summary\n\n");
@@ -614,7 +621,10 @@ fn write_conformance_markdown(workspace_root: &Path, report: &RunReport) -> Resu
     out.push_str(&format!("| skipped | {} |\n\n", s.skipped));
 
     out.push_str("## By module\n\n");
-    out.push_str("| Module | Pass | Total | Pass rate |\n|---|---|---|---|\n");
+    out.push_str(
+        "| Module | Pass | Fail | Timeout | Crashed | Total | Pass rate |\n\
+         |---|---|---|---|---|---|---|\n",
+    );
     for (module, m) in &s.by_module {
         let rate = if m.total > 0 {
             (m.passed as f64 / m.total as f64) * 100.0
@@ -622,11 +632,41 @@ fn write_conformance_markdown(workspace_root: &Path, report: &RunReport) -> Resu
             0.0
         };
         out.push_str(&format!(
-            "| {module} | {} | {} | {rate:.1}% |\n",
-            m.passed, m.total
+            "| {module} | {} | {} | {} | {} | {} | {rate:.1}% |\n",
+            m.passed, m.failed, m.timeout, m.crashed, m.total
         ));
     }
     out.push('\n');
+
+    let timeouts: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == Outcome::Timeout)
+        .collect();
+    if !timeouts.is_empty() {
+        out.push_str("## Timeouts\n\n");
+        for result in timeouts {
+            out.push_str(&format!(
+                "- `{}` ({:.1}s)\n",
+                result.path,
+                result.duration_ms as f64 / 1_000.0
+            ));
+        }
+        out.push('\n');
+    }
+
+    let crashes: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == Outcome::Crashed)
+        .collect();
+    if !crashes.is_empty() {
+        out.push_str("## Crashes\n\n");
+        for result in crashes {
+            out.push_str(&format!("- `{}`\n", result.path));
+        }
+        out.push('\n');
+    }
 
     std::fs::write(workspace_root.join("NODE_CONFORMANCE.md"), out)
         .context("failed to write NODE_CONFORMANCE.md")?;
@@ -645,6 +685,11 @@ mod tests {
         assert!(wildcard_matches("test-path.js", "test-path.js"));
         assert!(!wildcard_matches("test-path.js", "test-path-extra.js"));
         assert!(wildcard_matches("test-?-x.js", "test-a-x.js"));
+    }
+
+    #[test]
+    fn cli_timeout_diagnostic_is_classified_as_timeout() {
+        assert!(super::is_timeout_error("error: timeout after 10000 ms"));
     }
 
     fn temp_test_root(name: &str) -> std::path::PathBuf {

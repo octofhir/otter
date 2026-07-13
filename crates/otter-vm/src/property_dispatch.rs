@@ -5980,14 +5980,13 @@ pub(crate) fn generator_ensure_expando_pub(
 /// As [`map_ensure_expando_pub`] for a Set.
 pub(crate) fn set_ensure_expando_pub(
     heap: &mut otter_gc::GcHeap,
-    s: crate::collections::JsSet,
+    mut s: crate::collections::JsSet,
 ) -> Result<JsObject, VmError> {
     if let Some(existing) = crate::collections::set_expando(s, heap) {
         return Ok(existing);
     }
-    let recv = Value::set(s);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        recv.trace_value_slots(visitor);
+        visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     crate::collections::set_set_expando(s, heap, bag);

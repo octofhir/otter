@@ -36,6 +36,8 @@ const codes = {
     (encoding) => `Unknown encoding: ${encoding}`),
   ERR_BUFFER_OUT_OF_BOUNDS: makeNodeError(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS',
     (name = 'offset') => `"${name}" is outside of buffer bounds`),
+  ERR_IPC_CHANNEL_CLOSED: makeNodeError(Error, 'ERR_IPC_CHANNEL_CLOSED',
+    () => 'Channel closed'),
 };
 
 class AbortError extends Error {

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Fetch official Node.js test files via sparse checkout.
-# Only downloads test/parallel/ and test/common/ (~50MB vs 300MB+ full repo).
+# Downloads the parallel suite, its common harness, official fixtures used by
+# selected tests, and CLI documentation consumed by process flag conformance.
 #
 # Usage:
 #   bash scripts/fetch-node-tests.sh          # default: v24.x branch
@@ -16,14 +17,18 @@ if [ -d "$TARGET/.git" ]; then
     echo "Updating existing Node.js test checkout (branch: $BRANCH)..."
     cd "$TARGET"
     git fetch --depth=1 origin "$BRANCH"
-    git checkout "origin/$BRANCH" -- test/parallel test/common
+    git sparse-checkout set --skip-checks \
+        test/parallel test/common test/fixtures doc/api/cli.md
+    git checkout "origin/$BRANCH" -- \
+        test/parallel test/common test/fixtures doc/api/cli.md
     echo "Updated."
 else
     echo "Cloning Node.js tests (branch: $BRANCH, sparse checkout)..."
     git clone --depth=1 --sparse --filter=blob:none \
         --branch "$BRANCH" "$REPO" "$TARGET"
     cd "$TARGET"
-    git sparse-checkout set test/parallel test/common
+    git sparse-checkout set --skip-checks \
+        test/parallel test/common test/fixtures doc/api/cli.md
     echo "Done. Tests available at $TARGET/test/parallel/"
 fi
 

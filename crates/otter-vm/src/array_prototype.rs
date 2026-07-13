@@ -22,6 +22,8 @@
 //! - Live drivers use VM property operations so accessors, inherited
 //!   indices, proxies, callbacks, and comparator calls re-enter through
 //!   the active [`ExecutionContext`].
+//! - Species-created arrays and their receivers stay in the interpreter handle
+//!   arena across every allocating property operation.
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
@@ -3189,50 +3191,93 @@ impl Interpreter {
             return Err(self.err_type(("Invalid array length".to_string()).into()));
         }
 
-        let removed = self.array_species_create(context, o, actual_delete_count, roots)?;
-        if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN || o.is_proxy() {
-            let copy_count = actual_delete_count.min(MAX_ARRAY_LIKE_PROBE_LEN);
-            for n in 0..copy_count {
-                self.splice_copy_deleted_index(context, o, removed, actual_start + n, n)?;
-            }
-        } else {
-            for n in self.splice_sparse_offsets(o, len, actual_start, actual_delete_count)? {
-                self.splice_copy_deleted_index(context, o, removed, actual_start + n, n)?;
-            }
-        }
-        self.array_set_property_throwing(
-            context,
-            removed,
-            "length",
-            Value::number(NumberValue::from_f64(actual_delete_count as f64)),
-        )?;
-
-        if insert_count < actual_delete_count {
-            self.splice_shift_left(
+        // `ArraySpeciesCreate` and every property operation below can
+        // scavenge. Adopt the receiver and result into the high-level handle
+        // arena, then resolve each immediately before use.
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, o);
+            let current_receiver = interp.escape_scoped(receiver);
+            let removed = interp.array_species_create(
                 context,
-                o,
-                len,
-                actual_start,
+                current_receiver,
                 actual_delete_count,
-                insert_count,
+                roots,
             )?;
-        } else if insert_count > actual_delete_count {
-            self.splice_shift_right(
+            let removed = interp.scoped_value(scope, removed);
+            if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN
+                || interp.escape_scoped(receiver).is_proxy()
+            {
+                let copy_count = actual_delete_count.min(MAX_ARRAY_LIKE_PROBE_LEN);
+                for n in 0..copy_count {
+                    let current_receiver = interp.escape_scoped(receiver);
+                    let current_removed = interp.escape_scoped(removed);
+                    interp.splice_copy_deleted_index(
+                        context,
+                        current_receiver,
+                        current_removed,
+                        actual_start + n,
+                        n,
+                    )?;
+                }
+            } else {
+                let current_receiver = interp.escape_scoped(receiver);
+                let offsets = interp.splice_sparse_offsets(
+                    current_receiver,
+                    len,
+                    actual_start,
+                    actual_delete_count,
+                )?;
+                for n in offsets {
+                    let current_receiver = interp.escape_scoped(receiver);
+                    let current_removed = interp.escape_scoped(removed);
+                    interp.splice_copy_deleted_index(
+                        context,
+                        current_receiver,
+                        current_removed,
+                        actual_start + n,
+                        n,
+                    )?;
+                }
+            }
+            let current_removed = interp.escape_scoped(removed);
+            interp.array_set_property_throwing(
                 context,
-                o,
-                len,
-                actual_start,
-                actual_delete_count,
-                insert_count,
+                current_removed,
+                "length",
+                Value::number(NumberValue::from_f64(actual_delete_count as f64)),
             )?;
-        }
 
-        for (offset, value) in args.iter().skip(2).copied().enumerate() {
-            let key = format_index_key((actual_start + offset) as f64);
-            self.array_set_property_throwing(context, o, &key, value)?;
-        }
-        self.array_set_length_throwing(context, o, new_len as f64)?;
-        Ok(removed)
+            if insert_count < actual_delete_count {
+                let current_receiver = interp.escape_scoped(receiver);
+                interp.splice_shift_left(
+                    context,
+                    current_receiver,
+                    len,
+                    actual_start,
+                    actual_delete_count,
+                    insert_count,
+                )?;
+            } else if insert_count > actual_delete_count {
+                let current_receiver = interp.escape_scoped(receiver);
+                interp.splice_shift_right(
+                    context,
+                    current_receiver,
+                    len,
+                    actual_start,
+                    actual_delete_count,
+                    insert_count,
+                )?;
+            }
+
+            for (offset, value) in args.iter().skip(2).copied().enumerate() {
+                let key = format_index_key((actual_start + offset) as f64);
+                let current_receiver = interp.escape_scoped(receiver);
+                interp.array_set_property_throwing(context, current_receiver, &key, value)?;
+            }
+            let current_receiver = interp.escape_scoped(receiver);
+            interp.array_set_length_throwing(context, current_receiver, new_len as f64)?;
+            Ok(interp.escape_scoped(removed))
+        })
     }
 
     fn splice_copy_deleted_index(

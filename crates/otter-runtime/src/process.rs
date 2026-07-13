@@ -4,12 +4,17 @@
 //! - [`default_argv`] builds the runtime's default `process.argv` snapshot.
 //! - [`default_cwd`] builds the runtime's default `process.cwd()` snapshot.
 //! - [`install_global`] materializes the JS-visible `process` object.
+//! - [`crate::process_events`] owns EventEmitter and warning behavior.
+//! - [`crate::process_flags`] owns the immutable NODE_OPTIONS allowlist.
 //!
 //! # Invariants
 //! - `process.env` is capability-filtered at install time and never bypasses
 //!   the runtime's deny-by-default policy or secret denylist.
 //! - Host data is copied into JS-owned values. This module does not expose VM
 //!   internals across the public runtime boundary.
+//! - `process.binding()` is present for Node shape compatibility but remains
+//!   deny-by-default; it never exposes Otter or host internals.
+//! - Event listeners and warning jobs use scoped handles and JS-owned records.
 //!
 //! # See also
 //! - [`crate::RuntimeBuilder::process_argv`]
@@ -23,10 +28,7 @@ use otter_vm::{
 };
 use sysinfo::{ProcessesToUpdate, System};
 
-use crate::{
-    CapabilityRequest, CapabilitySet, DiagnosticCode, OtterError, RuntimeCapability,
-    default_check_capability,
-};
+use crate::{CapabilitySet, DiagnosticCode, OtterError, RuntimeHooks};
 
 pub(crate) fn default_argv() -> Vec<String> {
     vec![runtime_process_snapshot().exec_path]
@@ -41,6 +43,7 @@ pub(crate) fn install_global(
     process_argv: &[String],
     process_cwd: &Path,
     capabilities: &CapabilitySet,
+    hooks: &RuntimeHooks,
 ) -> Result<(), OtterError> {
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
@@ -119,18 +122,10 @@ pub(crate) fn install_global(
         let undefined = ctx.scoped_undefined(scope);
         ctx.scoped_set(scope, process, "exitCode", undefined)?;
 
-        let env = ctx.scoped_object_bare(scope)?;
-        for (name, value) in std::env::vars() {
-            if default_check_capability(
-                capabilities,
-                RuntimeCapability::Env,
-                &CapabilityRequest::EnvVar(&name),
-            ) {
-                let value = ctx.scoped_string(scope, &value)?;
-                ctx.scoped_set(scope, env, &name, value)?;
-            }
-        }
+        let env = crate::process_env::build(ctx, scope, capabilities, hooks)?;
         ctx.scoped_set(scope, process, "env", env)?;
+        let allowed_flags = crate::process_flags::build(ctx, scope)?;
+        ctx.scoped_set(scope, process, "allowedNodeEnvironmentFlags", allowed_flags)?;
 
         for (name, length, call) in [
             (
@@ -140,8 +135,20 @@ pub(crate) fn install_global(
             ),
             ("exit", 1, NativeCall::Static(process_exit)),
             ("nextTick", 1, NativeCall::Static(process_next_tick)),
+            ("binding", 1, NativeCall::Static(process_binding)),
             ("uptime", 0, uptime_call(start, uptime_base_secs)),
+            ("cpuUsage", 1, NativeCall::Static(process_cpu_usage)),
             ("memoryUsage", 0, NativeCall::Static(process_memory_usage)),
+            (
+                "availableMemory",
+                0,
+                NativeCall::Static(process_available_memory),
+            ),
+            (
+                "constrainedMemory",
+                0,
+                NativeCall::Static(process_constrained_memory),
+            ),
         ] {
             define_process_method(ctx, scope, process, name, length, call)?;
         }
@@ -157,35 +164,24 @@ pub(crate) fn install_global(
             NativeCall::Static(process_umask),
         )?;
 
-        for name in [
-            "on",
-            "once",
-            "off",
-            "addListener",
-            "removeListener",
-            "prependListener",
-            "prependOnceListener",
-            "removeAllListeners",
-            "emit",
-            "listenerCount",
-            "listeners",
-            "setMaxListeners",
-        ] {
-            define_process_method(
-                ctx,
-                scope,
-                process,
-                name,
-                1,
-                NativeCall::Static(process_event_noop),
-            )?;
-        }
+        crate::process_events::install(ctx, scope, process)?;
 
         let config = ctx.scoped_object_bare(scope)?;
         let variables = ctx.scoped_object_bare(scope)?;
         let disabled = ctx.scoped_boolean(scope, false);
         ctx.scoped_set(scope, variables, "v8_enable_i18n_support", disabled)?;
-        ctx.scoped_set(scope, config, "variables", variables)?;
+        ctx.scoped_define_data(
+            scope,
+            config,
+            "variables",
+            variables,
+            Attr {
+                writable: false,
+                enumerable: true,
+                configurable: false,
+            }
+            .to_flags(),
+        )?;
         ctx.scoped_set(scope, process, "config", config)?;
 
         let features = ctx.scoped_object_bare(scope)?;
@@ -196,6 +192,10 @@ pub(crate) fn install_global(
             ("debug", false),
             ("uv", true),
             ("ipv6", true),
+            ("openssl_is_boringssl", false),
+            ("tls_alpn", false),
+            ("tls_sni", false),
+            ("tls_ocsp", false),
             ("cached_builtins", false),
             ("require_module", true),
             ("typescript", false),
@@ -232,15 +232,6 @@ fn process_umask(
     _args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     Ok(Value::number(NumberValue::from_i32(0)))
-}
-
-/// Placeholder for the `process` EventEmitter methods — accepts the call and
-/// does nothing. Returns `process` so chained calls work.
-fn process_event_noop(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[otter_vm::Value],
-) -> Result<otter_vm::Value, NativeError> {
-    Ok(*ctx.this_value())
 }
 
 /// Install `process.stdout` / `process.stderr` / `process.stdin` as minimal
@@ -439,11 +430,20 @@ fn process_next_tick(
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     let Some(callee) = args.first().cloned() else {
-        return Err(NativeError::TypeError {
-            name: "process.nextTick",
-            reason: "callback is required".to_string(),
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: "The \"callback\" argument must be of type function. Received undefined"
+                .to_string(),
         });
     };
+    if !callee.is_callable() {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: "The \"callback\" argument must be of type function".to_string(),
+        });
+    }
     ctx.queue_microtask(callee, args.iter().skip(1).cloned())
         .map_err(|err| match err {
             NativeError::TypeError { reason, .. } => NativeError::TypeError {
@@ -471,14 +471,153 @@ fn process_memory_usage(
     let rss = snapshot.memory_bytes.unwrap_or(0) as f64;
     let heap_used = ctx.interp_mut().gc_heap_mut().gc_stats().live_bytes as f64;
     let heap_total = heap_used;
-    let object = ctx.alloc_object()?;
-    let interp = ctx.interp_mut();
-    set_number_property(interp, object, "rss", rss);
-    set_number_property(interp, object, "heapTotal", heap_total);
-    set_number_property(interp, object, "heapUsed", heap_used);
-    set_number_property(interp, object, "external", 0.0);
-    set_number_property(interp, object, "arrayBuffers", 0.0);
-    Ok(Value::object(object))
+    ctx.scope(|ctx, scope| {
+        let object = ctx.scoped_object_bare(scope)?;
+        for (name, value) in [
+            ("rss", rss),
+            ("heapTotal", heap_total),
+            ("heapUsed", heap_used),
+            ("external", 0.0),
+            ("arrayBuffers", 0.0),
+        ] {
+            let value = ctx.scoped_number(scope, value);
+            ctx.scoped_set(scope, object, name, value)?;
+        }
+        Ok(ctx.escape(object))
+    })
+}
+
+fn process_binding(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let name = args.first().copied().unwrap_or_else(Value::undefined);
+    if !name.is_string() {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"module\" argument must be of type string.{}",
+                invalid_arg_type_suffix(&name, ctx.heap())
+            ),
+        });
+    }
+    Err(NativeError::Error {
+        message: format!("No such module: {}", name.display_string(ctx.heap())),
+    })
+}
+
+fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let previous = match args.first() {
+        None => None,
+        Some(value) => {
+            let Some(object) = value.as_object() else {
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::TypeError,
+                    code: "ERR_INVALID_ARG_TYPE",
+                    message: format!(
+                        "The \"prevValue\" argument must be of type object.{}",
+                        invalid_arg_type_suffix(value, ctx.heap())
+                    ),
+                });
+            };
+            let user =
+                otter_vm::object::get(object, ctx.heap(), "user").unwrap_or_else(Value::undefined);
+            let system = otter_vm::object::get(object, ctx.heap(), "system")
+                .unwrap_or_else(Value::undefined);
+            let user = cpu_usage_field(ctx, "user", user)?;
+            let system = cpu_usage_field(ctx, "system", system)?;
+            Some((user, system))
+        }
+    };
+
+    let (mut user, mut system) = process_cpu_times_micros();
+    if let Some((previous_user, previous_system)) = previous {
+        user = (user - previous_user).max(0.0);
+        system = (system - previous_system).max(0.0);
+    }
+
+    ctx.scope(|ctx, scope| {
+        let result = ctx.scoped_object_bare(scope)?;
+        let user = ctx.scoped_number(scope, user);
+        ctx.scoped_set(scope, result, "user", user)?;
+        let system = ctx.scoped_number(scope, system);
+        ctx.scoped_set(scope, result, "system", system)?;
+        Ok(ctx.escape(result))
+    })
+}
+
+fn cpu_usage_field(ctx: &NativeCtx<'_>, name: &str, value: Value) -> Result<f64, NativeError> {
+    let Some(value_number) = value.as_number() else {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"prevValue.{name}\" property must be of type number.{}",
+                invalid_arg_type_suffix(&value, ctx.heap())
+            ),
+        });
+    };
+    let number = match value_number {
+        NumberValue::Smi(value) => f64::from(value),
+        NumberValue::Double(value) => value,
+    };
+    if !number.is_finite() || number < 0.0 {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::RangeError,
+            code: "ERR_INVALID_ARG_VALUE",
+            message: format!(
+                "The property 'prevValue.{name}' is invalid. Received {}",
+                value.display_string(ctx.heap())
+            ),
+        });
+    }
+    Ok(number)
+}
+
+#[cfg(unix)]
+fn process_cpu_times_micros() -> (f64, f64) {
+    use nix::sys::time::TimeValLike;
+
+    nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF)
+        .map(|usage| {
+            (
+                usage.user_time().num_microseconds().max(0) as f64,
+                usage.system_time().num_microseconds().max(0) as f64,
+            )
+        })
+        .unwrap_or((0.0, 0.0))
+}
+
+#[cfg(not(unix))]
+fn process_cpu_times_micros() -> (f64, f64) {
+    let mut system = System::new();
+    system.refresh_processes(
+        ProcessesToUpdate::Some(&[sysinfo::get_current_pid().unwrap()]),
+        true,
+    );
+    let total = sysinfo::get_current_pid()
+        .ok()
+        .and_then(|pid| system.process(pid))
+        .map(|process| process.accumulated_cpu_time() as f64 * 1_000.0)
+        .unwrap_or(0.0);
+    // `sysinfo` exposes a portable total but no portable user/system split.
+    (total, 0.0)
+}
+
+fn process_available_memory(
+    _ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let mut system = System::new();
+    system.refresh_memory();
+    Ok(Value::number_f64(system.available_memory() as f64))
+}
+
+fn process_constrained_memory(
+    _ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    // Zero is Node's documented sentinel when no cgroup/job-object limit is
+    // visible to the runtime.
+    Ok(Value::number_f64(0.0))
 }
 
 /// Resolve `%Function.prototype%` through the realm's `Function`
@@ -512,15 +651,7 @@ fn hrtime_value<'s>(
     let function = ctx.scoped_native_call(scope, "hrtime", 1, hrtime_call(start))?;
     let bigint = ctx.scoped_native_call(scope, "bigint", 0, hrtime_bigint_call(start))?;
     let object = ctx.scoped_object_bare(scope)?;
-    let object_value = ctx.escape(object);
-    let object_handle = object_value
-        .as_object()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "process.hrtime",
-            reason: "callable object allocation failed".to_string(),
-        })?;
-    let function_value = ctx.escape(function);
-    otter_vm::object::set_call_native(object_handle, ctx.heap_mut(), function_value);
+    ctx.scoped_set_call_native(scope, object, function)?;
     ctx.scoped_set(scope, object, "bigint", bigint)?;
     // `process.hrtime` is a callable host object (so it can carry the
     // `.bigint` own property), but a host object defaults to a null
@@ -530,11 +661,8 @@ fn hrtime_value<'s>(
     // form. Re-seat it on `%Function.prototype%` to match an ordinary
     // function object.
     if let Some(function_prototype) = function_prototype_object(ctx.interp_mut()) {
-        let object = ctx
-            .escape(object)
-            .as_object()
-            .expect("scoped hrtime object remains an object");
-        otter_vm::object::set_prototype(object, ctx.heap_mut(), Some(function_prototype));
+        let function_prototype = ctx.scoped_value(scope, Value::object(function_prototype));
+        ctx.scoped_set_prototype(scope, object, Some(function_prototype))?;
     }
     Ok(object)
 }
@@ -544,7 +672,27 @@ fn hrtime_call(start: Instant) -> NativeCall {
         let elapsed = start.elapsed();
         let mut seconds = elapsed.as_secs() as i64;
         let mut nanos = elapsed.subsec_nanos() as i64;
-        if let Some(previous) = args.first().and_then(|v| v.as_array()) {
+        if let Some(argument) = args.first() {
+            let Some(previous) = argument.as_array() else {
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::TypeError,
+                    code: "ERR_INVALID_ARG_TYPE",
+                    message: format!(
+                        "The \"time\" argument must be an instance of Array.{}",
+                        invalid_arg_type_suffix(argument, ctx.heap())
+                    ),
+                });
+            };
+            let length = otter_vm::array::len(previous, ctx.heap());
+            if length != 2 {
+                return Err(NativeError::Coded {
+                    kind: otter_vm::ErrorKind::RangeError,
+                    code: "ERR_OUT_OF_RANGE",
+                    message: format!(
+                        "The value of \"time\" is out of range. It must be 2. Received {length}"
+                    ),
+                });
+            }
             let heap = ctx.heap_mut();
             let prev_seconds = number_to_i64(&otter_vm::array::get(previous, heap, 0));
             let prev_nanos = number_to_i64(&otter_vm::array::get(previous, heap, 1));
@@ -570,17 +718,10 @@ fn hrtime_call(start: Instant) -> NativeCall {
 fn hrtime_bigint_call(start: Instant) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
         let nanos = start.elapsed().as_nanos().min(i128::MAX as u128) as i128;
-        let handle =
-            otter_vm::bigint::BigIntValue::from_i128(ctx.interp_mut().gc_heap_mut(), nanos)
-                .map_err(|e| otter_vm::NativeError::TypeError {
-                    name: "process.hrtime.bigint",
-                    reason: format!(
-                        "out of memory: {} bytes requested, limit {}",
-                        e.requested_bytes(),
-                        e.heap_limit_bytes(),
-                    ),
-                })?;
-        Ok(Value::big_int(handle))
+        ctx.scope(|ctx, scope| {
+            let value = ctx.scoped_bigint_i128(scope, nanos)?;
+            Ok(ctx.escape(value))
+        })
     });
     NativeCall::Dynamic(call)
 }
@@ -596,25 +737,27 @@ fn normalize_exit_code(value: &Value) -> Option<u8> {
     }
 }
 
-fn set_number_property(
-    interp: &mut Interpreter,
-    mut object: otter_vm::JsObject,
-    name: &str,
-    value: f64,
-) {
-    otter_vm::object::set(
-        &mut object,
-        interp.gc_heap_mut(),
-        name,
-        Value::number(NumberValue::from_f64(value)),
-    );
-}
-
 fn number_to_i64(value: &Value) -> Option<i64> {
     match value.as_number()? {
         NumberValue::Smi(n) => Some(i64::from(n)),
         NumberValue::Double(n) if n.is_finite() => Some(n as i64),
         _ => None,
+    }
+}
+
+fn invalid_arg_type_suffix(value: &Value, heap: &otter_gc::GcHeap) -> String {
+    if value.is_undefined() {
+        " Received undefined".to_string()
+    } else if value.is_null() {
+        " Received null".to_string()
+    } else if value.is_string() {
+        format!(" Received type string ('{}')", value.display_string(heap))
+    } else if value.is_boolean() {
+        format!(" Received type boolean ({})", value.display_string(heap))
+    } else if value.is_number() {
+        format!(" Received type number ({})", value.display_string(heap))
+    } else {
+        format!(" Received {}", value.display_string(heap))
     }
 }
 
@@ -741,6 +884,116 @@ mod tests {
     }
 
     #[test]
+    fn process_env_capability_hook_cannot_bypass_secret_filter() {
+        if std::env::var_os("PATH").is_none() {
+            return;
+        }
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::sandbox())
+            .capability_hook(
+                |_capabilities: &CapabilitySet,
+                 capability: crate::RuntimeCapability,
+                 _request: &crate::CapabilityRequest<'_>| {
+                    capability == crate::RuntimeCapability::Env
+                },
+            )
+            .build()
+            .unwrap();
+        let result = otter
+            .blocking_run_script(
+                "typeof process.env.PATH + ':' + typeof process.env.OPENAI_API_KEY",
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "string:undefined");
+    }
+
+    #[test]
+    fn process_env_coerces_values_and_deletes_properties() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+process.env.TEXT = 'value';
+process.env.NUMBER = 42;
+process.env.BOOLEAN = false;
+process.env.MISSING = undefined;
+delete process.env.TEXT;
+[
+  process.env.TEXT,
+  process.env.NUMBER,
+  process.env.BOOLEAN,
+  process.env.MISSING,
+  Object.getPrototypeOf(process.env) === Object.prototype
+].join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), ":42:false:undefined:true");
+    }
+
+    #[test]
+    fn process_env_rejects_symbols_and_restricted_descriptors() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const symbol = Symbol('env');
+const results = [];
+try { process.env[symbol] = 1; } catch (error) { results.push(error.name); }
+try { process.env.VALUE = symbol; } catch (error) { results.push(error.name); }
+try {
+  Object.defineProperty(process.env, 'BAD', { value: 'bad' });
+} catch (error) {
+  results.push(error.code);
+}
+Object.defineProperty(process.env, 'GOOD', {
+  value: 7,
+  configurable: true,
+  writable: true,
+  enumerable: true
+});
+results.push(process.env.GOOD, symbol in process.env, delete process.env[symbol]);
+results.join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "TypeError:TypeError:ERR_INVALID_OBJECT_DEFINE_PROPERTY:7:false:true"
+        );
+    }
+
+    #[test]
+    fn process_allowed_node_environment_flags_is_readonly() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const flags = process.allowedNodeEnvironmentFlags;
+const size = flags.size;
+flags.add('foo');
+Set.prototype.add.call(flags, 'bar');
+flags.delete('-r');
+Set.prototype.clear.call(flags);
+[
+  Object.isFrozen(flags),
+  flags.size === size,
+  flags.has('-r'),
+  flags.has('r'),
+  flags.has('--perf_basic_prof'),
+  flags.has('--stack-trace-limit=100'),
+  flags.has('--cheeseburgers')
+].join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "true:true:true:true:true:true:false"
+        );
+    }
+
+    #[test]
     fn process_minimum_node_shape_is_available() {
         let otter = Otter::builder()
             .process_argv(["custom-otter", "entry.ts"])
@@ -764,8 +1017,12 @@ mod tests {
   process.release.name,
   typeof process.exitCode,
   typeof process.nextTick,
+  typeof process.binding,
   typeof process.uptime,
+  typeof process.cpuUsage,
   typeof process.memoryUsage,
+  typeof process.availableMemory,
+  typeof process.constrainedMemory,
   typeof process.hrtime,
   typeof process.hrtime.bigint
 ].join(":")
@@ -774,7 +1031,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.completion_string(),
-            "string:custom-otter:string:0:string:string:number:number:v:string:string:node:undefined:function:function:function:function:function"
+            "string:custom-otter:string:0:string:string:number:number:v:string:string:node:undefined:function:function:function:function:function:function:function:function:function"
         );
     }
 
@@ -785,14 +1042,22 @@ mod tests {
             .blocking_run_script(
                 r#"
 const memory = process.memoryUsage();
+const usage = process.cpuUsage();
+const diff = process.cpuUsage(usage);
 const hrtime = process.hrtime();
 [
   typeof process.uptime(),
+  typeof usage.user,
+  typeof usage.system,
+  typeof diff.user,
+  typeof diff.system,
   typeof memory.rss,
   typeof memory.heapTotal,
   typeof memory.heapUsed,
   typeof memory.external,
   typeof memory.arrayBuffers,
+  typeof process.availableMemory(),
+  typeof process.constrainedMemory(),
   hrtime.length,
   typeof hrtime[0],
   typeof hrtime[1],
@@ -803,7 +1068,37 @@ const hrtime = process.hrtime();
             .unwrap();
         assert_eq!(
             result.completion_string(),
-            "number:number:number:number:number:number:2:number:number:bigint"
+            "number:number:number:number:number:number:number:number:number:number:number:number:2:number:number:bigint"
+        );
+    }
+
+    #[test]
+    fn process_cpu_usage_validates_previous_snapshot() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const errors = [];
+for (const value of [
+  1,
+  {},
+  { user: 1, system: null },
+  { user: -1, system: 0 },
+  { user: 1, system: -1 }
+]) {
+  try {
+    process.cpuUsage(value);
+  } catch (error) {
+    errors.push(error.name + ':' + error.code);
+  }
+}
+errors.join(',')
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "TypeError:ERR_INVALID_ARG_TYPE,TypeError:ERR_INVALID_ARG_TYPE,TypeError:ERR_INVALID_ARG_TYPE,RangeError:ERR_INVALID_ARG_VALUE,RangeError:ERR_INVALID_ARG_VALUE"
         );
     }
 
@@ -820,6 +1115,81 @@ const diff = process.hrtime(previous);
             )
             .unwrap();
         assert_eq!(result.completion_string(), "2:number:number");
+    }
+
+    #[test]
+    fn process_hrtime_validates_previous_tuple() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const codes = [];
+for (const value of [1, [], [1], [1, 2, 3]]) {
+  try {
+    process.hrtime(value);
+  } catch (error) {
+    codes.push(error.name + ':' + error.code);
+  }
+}
+codes.join(',')
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "TypeError:ERR_INVALID_ARG_TYPE,RangeError:ERR_OUT_OF_RANGE,RangeError:ERR_OUT_OF_RANGE,RangeError:ERR_OUT_OF_RANGE"
+        );
+    }
+
+    #[test]
+    fn process_features_match_the_supported_node_shape() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script("Object.keys(process.features).sort().join(',')")
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "cached_builtins,debug,inspector,ipv6,openssl_is_boringssl,quic,require_module,tls,tls_alpn,tls_ocsp,tls_sni,typescript,uv"
+        );
+    }
+
+    #[test]
+    fn process_config_variables_cannot_be_replaced() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+'use strict';
+let errorName;
+try {
+  process.config.variables = 42;
+} catch (error) {
+  errorName = error.name;
+}
+[errorName, typeof process.config.variables].join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "TypeError:object");
+    }
+
+    #[test]
+    fn process_binding_is_present_but_does_not_expose_internals() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+let message;
+try {
+  process.binding('test');
+} catch (error) {
+  message = error.message;
+}
+message
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "No such module: test");
     }
 
     #[test]
@@ -879,5 +1249,56 @@ const diff = process.hrtime(previous);
             )
             .unwrap();
         assert_eq!(result.exit_code(), 11);
+    }
+
+    #[test]
+    fn process_event_emitter_preserves_order_once_and_symbols() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const seen = [];
+const symbol = Symbol('event');
+const removed = () => seen.push('removed');
+process.on('data', () => seen.push('tail'));
+process.prependOnceListener('data', () => seen.push('once'));
+process.on('data', removed);
+process.removeListener('data', removed);
+process.once(symbol, (value) => seen.push(value));
+process.emit('data');
+process.emit('data');
+process.emit(symbol, 'symbol');
+process.emit(symbol, 'again');
+[seen.join(','), process.listenerCount('data'), process.eventNames().length,
+ process._eventsCount].join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "once,tail,tail,symbol:1:1:1");
+    }
+
+    #[test]
+    fn process_emit_warning_is_deferred_and_coded() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+let observed = 'pending';
+process.emitWarning('careful', {
+  type: 'CustomWarning',
+  code: 'OTTER001',
+  detail: 'detail'
+});
+process.once('warning', (warning) => {
+  observed = [warning.name, warning.message, warning.code, warning.detail].join(':');
+});
+process.nextTick(() => { process.exitCode = observed ===
+  'CustomWarning:careful:OTTER001:detail' ? 0 : 91; });
+observed
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "pending");
+        assert_eq!(result.exit_code(), 0);
     }
 }

@@ -1,11 +1,12 @@
 //! `node:url` / `url` hosted module.
 //!
-//! The CommonJS surface is implemented by a JS shim over the runtime's WHATWG
-//! URL globals. Named ESM imports for the file-URL helpers use small native
-//! adapters so Vite-style bootstrap code does not depend on CommonJS interop.
+//! The CommonJS surface combines a dedicated legacy `Url` implementation with
+//! the runtime's WHATWG URL globals. Named ESM imports for the file-URL helpers
+//! use small native adapters so Vite-style bootstrap code does not depend on
+//! CommonJS interop.
 //!
 //! # Contents
-//! - [`url_cjs_value`] installs WHATWG constructors and Node URL helpers.
+//! - [`url_cjs_value`] installs legacy and WHATWG Node URL helpers.
 //! - [`install_url_module`] exposes the file-URL helpers to ESM.
 //! - Native file-path conversion helpers use scoped handles for all results.
 //!
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use otter_runtime::CapabilitySet;
 use otter_vm::{NativeCtx, NativeError, Value};
 
-const SHIM: &str = include_str!("url.js");
+const SHIM: &str = concat!(include_str!("url.js"), "\n", include_str!("url_legacy.js"));
 
 /// CommonJS export containing WHATWG constructors, legacy helpers, and file
 /// URL conversion functions.

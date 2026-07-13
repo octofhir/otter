@@ -9,6 +9,7 @@
 //! # Contents
 //! - [`JsProxy`] — cheap-to-clone handle.
 //! - [`ProxyBody`] — internal storage.
+//! - [`alloc_proxy_with_roots`] — allocation-safe host construction path.
 //!
 //! # Invariants
 //! - `target` is any Object-like [`Value`] accepted by §7.2.4
@@ -89,14 +90,29 @@ pub fn alloc_proxy(
     target: Value,
     handler: Value,
 ) -> Result<ProxyHandle, otter_gc::OutOfMemory> {
+    let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+    alloc_proxy_with_roots(heap, target, handler, &mut no_extra_roots)
+}
+
+/// Allocate a Proxy body while tracing caller roots and the pending
+/// target/handler payload across a cap-triggered full collection.
+pub fn alloc_proxy_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    target: Value,
+    handler: Value,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<ProxyHandle, otter_gc::OutOfMemory> {
     let callable = proxy_target_callable(heap, &target);
-    heap.alloc_old(ProxyBodyGc {
-        target,
-        handler,
-        revoked: false,
-        callable,
-        private_elements: None,
-    })
+    heap.alloc_old_with_roots(
+        ProxyBodyGc {
+            target,
+            handler,
+            revoked: false,
+            callable,
+            private_elements: None,
+        },
+        external_visit,
+    )
 }
 
 /// Callability of a prospective proxy target: function-family value

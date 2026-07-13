@@ -417,6 +417,52 @@ impl Interpreter {
         Ok(handle)
     }
 
+    /// Allocate a Set collection and park it in the current scope.
+    pub(crate) fn scoped_collection_set<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+    ) -> Result<Scoped<'s>, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let set = crate::collections::alloc_set_with_roots(&mut self.gc_heap, &mut external_visit)?;
+        Ok(self.scoped_value(scope, Value::set(set)))
+    }
+
+    /// Allocate a Proxy over scoped target and handler handles, keeping both
+    /// live and relocatable across old-space allocation.
+    pub(crate) fn scoped_proxy<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        target: Scoped<'_>,
+        handler: Scoped<'_>,
+    ) -> Result<Scoped<'s>, VmError> {
+        let target = self.handle_arena.get(target.index());
+        let handler = self.handle_arena.get(handler.index());
+        if !target.is_object_type() || !handler.is_object_type() {
+            return Err(VmError::TypeMismatch);
+        }
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let proxy = crate::proxy::alloc_proxy_with_roots(
+            &mut self.gc_heap,
+            target,
+            handler,
+            &mut external_visit,
+        )?;
+        Ok(self.scoped_value(
+            scope,
+            Value::proxy(crate::proxy::JsProxy::from_handle(proxy)),
+        ))
+    }
+
     /// Park an `f64` number in the current scope. Numbers are NaN-boxed
     /// immediates, so this never allocates; it exists so number construction
     /// reads the same as every other scoped creation.
@@ -438,7 +484,17 @@ impl Interpreter {
         scope: &'s HandleScope,
         n: i64,
     ) -> Result<Scoped<'s>, VmError> {
-        let bigint = crate::bigint::BigIntValue::from_i128(&mut self.gc_heap, i128::from(n))?;
+        self.scoped_bigint_i128(scope, i128::from(n))
+    }
+
+    /// Park a `BigInt` built from a signed 128-bit integer. This is the
+    /// allocation-safe host path for integral counters that can exceed `i64`.
+    pub(crate) fn scoped_bigint_i128<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        n: i128,
+    ) -> Result<Scoped<'s>, VmError> {
+        let bigint = crate::bigint::BigIntValue::from_i128(&mut self.gc_heap, n)?;
         Ok(self.scoped_value(scope, Value::big_int(bigint)))
     }
 
@@ -663,11 +719,14 @@ impl Interpreter {
         value: Scoped<'_>,
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
-        let object = self
-            .handle_arena
-            .get(obj.index())
-            .as_object()
-            .ok_or(VmError::TypeMismatch)?;
+        let receiver = self.handle_arena.get(obj.index());
+        let object = if let Some(object) = receiver.as_object() {
+            object
+        } else if let Some(set) = receiver.as_set() {
+            crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, set)?
+        } else {
+            return Err(VmError::TypeMismatch);
+        };
         let stored = self.handle_arena.get(value.index());
         let descriptor = crate::object::PropertyDescriptor {
             kind: crate::object::DescriptorKind::Data { value: stored },
@@ -678,6 +737,49 @@ impl Interpreter {
         } else {
             Err(VmError::TypeMismatch)
         }
+    }
+
+    /// Make the object handle `obj` callable through the native callable held
+    /// by `call`, resolving both handles through the arena at mutation time.
+    pub(crate) fn scoped_set_call_native(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        call: Scoped<'_>,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let call = self.handle_arena.get(call.index());
+        crate::object::set_call_native(object, &mut self.gc_heap, call);
+        Ok(())
+    }
+
+    /// Set an object's prototype from scoped handles. `None` installs a null
+    /// prototype; a non-object prototype is rejected.
+    pub(crate) fn scoped_set_prototype(
+        &mut self,
+        _scope: &HandleScope,
+        obj: Scoped<'_>,
+        prototype: Option<Scoped<'_>>,
+    ) -> Result<(), VmError> {
+        let object = self
+            .handle_arena
+            .get(obj.index())
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let prototype = prototype
+            .map(|handle| {
+                self.handle_arena
+                    .get(handle.index())
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)
+            })
+            .transpose()?;
+        crate::object::set_prototype(object, &mut self.gc_heap, prototype);
+        Ok(())
     }
 
     /// Store `value` at array index `index` on the array handle `arr`,
@@ -727,6 +829,17 @@ impl Interpreter {
                 .unwrap_or_else(Value::undefined)
         });
         Ok(self.scoped_value(scope, value))
+    }
+
+    /// Read the current logical length of the array behind `arr`, resolving
+    /// the handle through the arena at call time.
+    pub(crate) fn scoped_array_length(&self, arr: Scoped<'_>) -> Result<usize, VmError> {
+        let array = self
+            .handle_arena
+            .get(arr.index())
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        Ok(crate::array::len(array, &self.gc_heap))
     }
 
     /// Read the current raw `Value` behind a scope handle for immediate

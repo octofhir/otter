@@ -805,6 +805,29 @@ pub const STUB_JIT_CALL_GENERIC: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
+/// Leaf §7.2.15 IsStrictlyEqual probe over two raw operand words: never
+/// throws, never allocates; a null heap reports a miss so probe harnesses
+/// without a live isolate fall back to normal dispatch.
+pub const STUB_STRICT_EQ_LEAF: RuntimeStubDescriptor = descriptor(
+    48,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::StatusPair,
+);
+/// Completes one full loose-equality opcode in the VM; object-to-primitive
+/// coercion may re-enter JS.
+pub const STUB_JIT_LOOSE_EQ: RuntimeStubDescriptor = descriptor(
+    49,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
 
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
@@ -857,6 +880,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         45 => "jit_math_random",
         46 => "jit_call_method_generic",
         47 => "jit_call_generic",
+        48 => "strict_eq_leaf",
+        49 => "jit_loose_eq",
         _ => "unknown_runtime_stub",
     }
 }
@@ -910,6 +935,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_MATH_RANDOM,
     STUB_JIT_CALL_METHOD_GENERIC,
     STUB_JIT_CALL_GENERIC,
+    STUB_STRICT_EQ_LEAF,
+    STUB_JIT_LOOSE_EQ,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

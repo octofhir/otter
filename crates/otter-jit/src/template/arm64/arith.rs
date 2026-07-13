@@ -10,8 +10,10 @@
 //! - An overflowing int32 result is its exact f64 value, never a side exit.
 //! - A non-number operand on a numeric-only path takes an exact side exit
 //!   before any observable effect; the interpreter re-executes the opcode.
-//! - Heap cells never decide equality inline; the interpreter owns object
-//!   identity and string/BigInt content equality.
+//! - Heap-cell equality decides reference identity inline and completes
+//!   content equality through the leaf strict-equality probe and the
+//!   reentrant loose-equality transition; no equality opcode side-exits on
+//!   a live isolate.
 //!
 //! # See also
 //! - [`super::values`] — the tagged encode/decode primitives used here.
@@ -25,8 +27,10 @@ use super::values::{
     emit_to_uint32_fast,
 };
 use crate::entry::{
-    DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, Unsupported, VALUE_NULL, VALUE_UNDEFINED,
+    DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_NULL,
+    VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
 };
+use otter_vm::native_abi as abi;
 
 /// Function-id immediate low tag as a 32-bit `dynasm` operand.
 const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
@@ -201,9 +205,11 @@ pub(super) fn emit_compare(
         let number_path = ops.new_dynamic_label();
         let strict_false = ops.new_dynamic_label();
         // Strict equality on non-number immediates (null / undefined /
-        // boolean / hole / function id) decides by raw bit identity. Any
-        // heap cell (object, string, BigInt, …) side-exits: the interpreter
-        // owns object identity and string / BigInt content equality.
+        // boolean / hole / function id) decides by raw bit identity. Heap
+        // cells decide reference identity inline; distinct cells complete
+        // content equality (strings, BigInts) through the leaf probe.
+        let cell_path = ops.new_dynamic_label();
+        let leaf_call = ops.new_dynamic_label();
         dynasm!(ops
             ; .arch aarch64
             ; movz x11, NUMBER_TAG_HI16, lsl #48
@@ -217,11 +223,45 @@ pub(super) fn emit_compare(
             ; b.ne =>strict_false        // non-number !== number
             ; orr x11, x11, #0x2         // NOT_CELL_MASK (OTHER_TAG)
             ; tst x9, x11
-            ; b.eq =>bail                // lhs heap cell → interpreter
+            ; b.eq =>cell_path           // lhs heap cell
             ; tst x10, x11
-            ; b.eq =>bail                // rhs heap cell → interpreter
+            ; b.eq =>cell_path           // rhs heap cell
             ; cmp x9, x10
         );
+        emit_cset(ops, kind, IntCondition);
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>have_bool
+            // Identical bits are the same cell — strictly equal without a
+            // probe; distinct cells ask the leaf `(heap, lhs, rhs)` probe,
+            // whose only miss is a null heap (isolate-less test harness).
+            ; =>cell_path
+            ; cmp x9, x10
+            ; b.ne =>leaf_call
+        );
+        emit_cset(ops, kind, IntCondition);
+        dynasm!(ops
+            ; .arch aarch64
+            ; b =>have_bool
+            ; =>leaf_call
+            ; ldr x0, [x20, THREAD_OFFSET]
+            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+            ; mov x1, x9
+            ; mov x2, x10
+        );
+        emit_load_u64(
+            ops,
+            16,
+            otter_vm::runtime_stubs::STRICT_EQ_LEAF.entry_addr() as u64,
+        );
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; and x1, x1, #0xff
+            ; cbnz x1, =>bail
+        );
+        emit_load_u64(ops, 11, VALUE_TRUE);
+        dynasm!(ops ; .arch aarch64 ; cmp x0, x11);
         emit_cset(ops, kind, IntCondition);
         let false_value = match kind {
             CompareKind::Eq => 0,
@@ -288,19 +328,24 @@ fn emit_cset<C: ConditionSet>(ops: &mut Assembler, kind: CompareKind, _condition
 
 /// Emit abstract (in)equality for numbers and the null/undefined equivalence
 /// class. String/object/coercive cases side-exit before observable work.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_loose_compare(
     ops: &mut Assembler,
+    table: &TransitionTable,
     dst: u16,
     lhs: u16,
     rhs: u16,
     negate: bool,
     bail: DynamicLabel,
+    threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
     let lhs_nullish = ops.new_dynamic_label();
     let rhs_nullish = ops.new_dynamic_label();
     let have_bool = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
     emit_load_u64(ops, 11, VALUE_NULL);
     dynasm!(ops ; .arch aarch64 ; cmp x9, x11 ; b.eq =>lhs_nullish);
     emit_load_u64(ops, 11, VALUE_UNDEFINED);
@@ -310,8 +355,8 @@ pub(super) fn emit_loose_compare(
     emit_load_u64(ops, 11, VALUE_UNDEFINED);
     dynasm!(ops ; .arch aarch64 ; cmp x10, x11 ; b.eq =>rhs_nullish);
 
-    emit_num_to_double(ops, 9, 0, bail);
-    emit_num_to_double(ops, 10, 1, bail);
+    emit_num_to_double(ops, 9, 0, slow);
+    emit_num_to_double(ops, 10, 1, slow);
     dynasm!(ops ; .arch aarch64 ; fcmp d0, d1 ; cset w13, eq ; b =>have_bool);
 
     dynasm!(ops ; .arch aarch64 ; =>lhs_nullish);
@@ -334,7 +379,31 @@ pub(super) fn emit_loose_compare(
         dynasm!(ops ; .arch aarch64 ; eor w13, w13, #1);
     }
     emit_box_bool(ops, 13, 12);
-    emit_store_reg(ops, 13, dst)
+    emit_store_reg(ops, 13, dst)?;
+    // Coercive operands (strings, booleans, objects) complete the whole
+    // opcode through the reentrant loose-equality transition; the stub
+    // writes the (negated) boolean into the destination register.
+    dynasm!(ops
+        ; .arch aarch64
+        ; b =>done
+        ; =>slow
+        ; mov x0, x20
+        ; movz x1, dst as u32
+        ; movz x2, lhs as u32
+        ; movz x3, rhs as u32
+        ; movz x4, u32::from(negate)
+    );
+    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_LOOSE_EQ));
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, #1
+        ; b.eq =>threw
+        ; cmp x0, #2
+        ; b.eq =>bail
+        ; =>done
+    );
+    Ok(())
 }
 
 /// Emit an int32 bitwise/shift op over the full `ToInt32` fast path.

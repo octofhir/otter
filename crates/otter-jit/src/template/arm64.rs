@@ -175,7 +175,7 @@ pub(super) fn compile(
                 rhs,
                 negate,
             } => {
-                emit_loose_compare(&mut ops, dst, lhs, rhs, negate, bail)?;
+                emit_loose_compare(&mut ops, transitions, dst, lhs, rhs, negate, bail, threw)?;
             }
             TemplateOp::IntBitwise {
                 dst,

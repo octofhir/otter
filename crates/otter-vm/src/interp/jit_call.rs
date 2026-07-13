@@ -1261,6 +1261,41 @@ impl Interpreter {
         Ok(true)
     }
 
+    /// Complete one full loose-equality opcode in place for a compiled
+    /// caller whose inline paths (numeric, nullish) did not decide the
+    /// comparison. Runs the interpreter's own §7.2.13 IsLooselyEqual —
+    /// object-to-primitive coercion may re-enter arbitrary JS under the
+    /// caller's published activation — and writes the (optionally negated)
+    /// boolean into the destination register.
+    ///
+    /// # Safety-adjacent contract
+    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
+    /// compiled code guarantees the destination/operand registers are in
+    /// bounds for that window.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn jit_runtime_loose_equal_in_place(
+        &mut self,
+        context: &ExecutionContext,
+        dst_reg: u16,
+        lhs_reg: u16,
+        rhs_reg: u16,
+        negate: bool,
+        caller_regs: *mut Value,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
+        // SAFETY: compiler-emitted operand indices into the caller window.
+        let lhs = unsafe { *caller_regs.add(lhs_reg as usize) };
+        let rhs = unsafe { *caller_regs.add(rhs_reg as usize) };
+        let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
+        // SAFETY: `dst_reg` is a compiler-emitted index into the caller
+        // window; the window slab is pinned, so the pointer survived any
+        // nested coercion dispatch.
+        unsafe {
+            *caller_regs.add(dst_reg as usize) = Value::boolean(eq ^ negate);
+        }
+        Ok(())
+    }
+
     /// Prepare a direct compiled **plain** call (`callee(args…)`) from the
     /// callee value in a caller register. Returns `Ok(None)` when the callee
     /// is not an eligible installed bytecode function — the emitted site bails

@@ -88,10 +88,12 @@ pub(crate) extern "C" fn jit_load_prop_window_stub(
     // register window of the executing (framed or frameless) callee.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
     match unsafe {
         vm.jit_runtime_load_property_window(
             context,
+            stack,
             ctx.regs,
             function_id as u32,
             dst as u16,

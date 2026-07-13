@@ -938,6 +938,26 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = key.name();
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let value = self.load_property_value(context, stack, receiver, name)?;
+        let frame = &mut stack[top_idx];
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Full string-keyed `[[Get]]` over any receiver value: the complete
+    /// interpreter resolution cascade (ordinary objects, every exotic
+    /// receiver family, primitives, and the proxy-aware fallback), including
+    /// accessor invocation through the synchronous callable path. Shared by
+    /// the interpreter opcode and the JIT property transitions, so both
+    /// tiers resolve one property exactly one way.
+    pub(crate) fn load_property_value(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        receiver: Value,
+        name: &str,
+    ) -> Result<Value, VmError> {
         if receiver.is_nullish() {
             return Err(
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())
@@ -1425,10 +1445,7 @@ impl Interpreter {
                 }
             }
         };
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(value)
     }
 
     /// §10.1.9.2 — continue OrdinarySet for a callable whose virtual
@@ -3275,6 +3292,7 @@ impl Interpreter {
     pub unsafe fn jit_runtime_load_property_window(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut HoltStack,
         regs: *mut u64,
         function_id: u32,
         dst: u16,
@@ -3287,11 +3305,24 @@ impl Interpreter {
             .property_atom_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+        // Non-object receivers (primitives, proxies) and saturated sites
+        // complete through the full resolution cascade below; the IC layers
+        // only serve cache-representable ordinary-object loads.
+        let full_get = |vm: &mut Self, stack: &mut HoltStack| -> Result<Option<u64>, VmError> {
+            let value =
+                vm.load_property_value(context, stack, receiver, atomized_key.name())?;
+            // SAFETY: `dst` is a compiler-emitted index into the pinned
+            // caller window, which a getter's nested dispatch cannot move.
+            unsafe {
+                *regs.add(dst as usize) = value.to_bits();
+            }
+            Ok(Some(0))
+        };
         let Some(obj) = receiver.as_object() else {
-            return Ok(None);
+            return full_get(self, stack);
         };
         if site >= self.load_property_ics.len() || self.load_property_ics[site].is_megamorphic() {
-            return Ok(None);
+            return full_get(self, stack);
         }
         let mut hit_value: Option<Value> = None;
         for ic in self.load_property_ics[site].entries() {
@@ -3328,7 +3359,9 @@ impl Interpreter {
             }
             return Ok(Some(self.whisker_load_cell_fill(site, obj, atomized_key)));
         }
-        Ok(None)
+        // Not cache-representable (accessor, deep prototype, absent):
+        // complete the load in place through the full cascade.
+        full_get(self, stack)
     }
 
     /// Frameless `StoreProperty` — the [`Self::jit_runtime_load_property_window`]

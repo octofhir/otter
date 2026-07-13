@@ -963,6 +963,16 @@ impl<'rt> NativeCtx<'rt> {
         collections::set_add_with_roots(set, self.heap_mut(), value, &mut external_visit)
     }
 
+    /// Seal a host-owned Set snapshot against all JavaScript Set mutators.
+    pub fn make_set_readonly(&mut self, value: Value) -> Result<(), NativeError> {
+        let set = value.as_set().ok_or_else(|| NativeError::TypeError {
+            name: "make Set readonly",
+            reason: "value is not a Set".to_string(),
+        })?;
+        collections::set_make_readonly(set, self.heap_mut());
+        Ok(())
+    }
+
     /// Insert into a `WeakMap` through the native root contract.
     pub fn weak_map_set(
         &mut self,
@@ -1454,6 +1464,15 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<Scoped<'s>, NativeError> {
         let result = self.cx.interp.scoped_array(s, len);
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_array"))
+    }
+
+    /// Allocate a Set collection and park it in scope `s`.
+    pub fn scoped_collection_set<'s>(
+        &mut self,
+        s: &'s HandleScope,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_collection_set(s);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_collection_set"))
     }
 
     /// Allocate a Proxy over scoped target and handler handles.

@@ -5,6 +5,7 @@
 //! - [`default_cwd`] builds the runtime's default `process.cwd()` snapshot.
 //! - [`install_global`] materializes the JS-visible `process` object.
 //! - [`crate::process_events`] owns EventEmitter and warning behavior.
+//! - [`crate::process_flags`] owns the immutable NODE_OPTIONS allowlist.
 //!
 //! # Invariants
 //! - `process.env` is capability-filtered at install time and never bypasses
@@ -123,6 +124,8 @@ pub(crate) fn install_global(
 
         let env = crate::process_env::build(ctx, scope, capabilities, hooks)?;
         ctx.scoped_set(scope, process, "env", env)?;
+        let allowed_flags = crate::process_flags::build(ctx, scope)?;
+        ctx.scoped_set(scope, process, "allowedNodeEnvironmentFlags", allowed_flags)?;
 
         for (name, length, call) in [
             (
@@ -957,6 +960,36 @@ results.join(':')
         assert_eq!(
             result.completion_string(),
             "TypeError:TypeError:ERR_INVALID_OBJECT_DEFINE_PROPERTY:7:false:true"
+        );
+    }
+
+    #[test]
+    fn process_allowed_node_environment_flags_is_readonly() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const flags = process.allowedNodeEnvironmentFlags;
+const size = flags.size;
+flags.add('foo');
+Set.prototype.add.call(flags, 'bar');
+flags.delete('-r');
+Set.prototype.clear.call(flags);
+[
+  Object.isFrozen(flags),
+  flags.size === size,
+  flags.has('-r'),
+  flags.has('r'),
+  flags.has('--perf_basic_prof'),
+  flags.has('--stack-trace-limit=100'),
+  flags.has('--cheeseburgers')
+].join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "true:true:true:true:true:true:false"
         );
     }
 

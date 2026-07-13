@@ -308,6 +308,23 @@ pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 
     }
 }
 
+/// Materialize a regex literal (`Op::LoadRegExp`) into the frame's
+/// destination register. Allocating; a bad pattern reports status 1.
+pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
+    match vm.jit_runtime_load_regexp(context, stack, ctx.frame_index, dst as u16, idx as u32) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 pub(crate) extern "C" fn otter_jit_math_random() -> u64 {
     Value::number(otter_vm::math::random_number()).to_bits()
 }

@@ -155,6 +155,8 @@ pub(crate) enum TemplateOp {
     },
     /// `r<dst> = constants[constant]` (string constant).
     LoadString { dst: u16, constant: u32 },
+    /// Materialize a regex literal from the constant pool.
+    LoadRegExp { dst: u16, constant: u32 },
     /// `r<dst> = global[name]` or throw.
     LoadGlobal { dst: u16, name: u32 },
     /// `r<dst>` = builtin error constructor for `constant`.
@@ -443,6 +445,13 @@ impl TemplatePlan {
                 Op::LoadString => {
                     let operands = lowered.constant_operands()?;
                     TemplateOp::LoadString {
+                        dst: operands.dst,
+                        constant: operands.constant,
+                    }
+                }
+                Op::LoadRegExp => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::LoadRegExp {
                         dst: operands.dst,
                         constant: operands.constant,
                     }

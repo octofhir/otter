@@ -472,6 +472,7 @@ impl BaselinePlan {
                 }),
                 Op::MakeFunction
                 | Op::LoadString
+                | Op::LoadRegExp
                 | Op::LoadBigInt
                 | Op::LoadGlobalOrThrow
                 | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {

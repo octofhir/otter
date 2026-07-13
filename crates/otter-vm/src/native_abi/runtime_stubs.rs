@@ -828,6 +828,17 @@ pub const STUB_JIT_LOOSE_EQ: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
+/// Materializes a regex literal from the constant pool; allocates the
+/// RegExp body and may compile the pattern.
+pub const STUB_JIT_LOAD_REGEXP: RuntimeStubDescriptor = descriptor(
+    52,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::allocating(true, true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
 /// Leaf §7.1.2 ToBoolean probe over one raw operand word (the second
 /// argument is ignored): never throws, never allocates; total for every
 /// value including heap cells, so it never misses on a live isolate.
@@ -908,6 +919,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         49 => "jit_loose_eq",
         50 => "to_boolean_leaf",
         51 => "number_rem_leaf",
+        52 => "jit_load_regexp",
         _ => "unknown_runtime_stub",
     }
 }
@@ -965,6 +977,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_LOOSE_EQ,
     STUB_TO_BOOLEAN_LEAF,
     STUB_NUMBER_REM_LEAF,
+    STUB_JIT_LOAD_REGEXP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

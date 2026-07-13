@@ -95,6 +95,19 @@ pub(super) fn emit_load_string(
     emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_STRING), threw);
 }
 
+pub(super) fn emit_load_regexp(
+    ops: &mut Assembler,
+    table: &TransitionTable,
+    dst: u16,
+    constant: u32,
+    threw: DynamicLabel,
+) {
+    emit_ctx_arg(ops);
+    dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
+    emit_load_u64(ops, 2, u64::from(constant));
+    emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_REGEXP), threw);
+}
+
 pub(super) fn emit_load_global(
     ops: &mut Assembler,
     table: &TransitionTable,

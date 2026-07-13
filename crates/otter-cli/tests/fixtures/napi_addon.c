@@ -23,6 +23,8 @@ extern napi_status napi_get_cb_info(napi_env, napi_callback_info, size_t *, napi
 extern napi_status napi_get_value_double(napi_env, napi_value, double *);
 extern napi_status napi_call_function(napi_env, napi_value, napi_value, size_t,
                                       const napi_value *, napi_value *);
+extern napi_status napi_new_instance(napi_env, napi_value, size_t,
+                                     const napi_value *, napi_value *);
 extern napi_status napi_throw_error(napi_env, const char *, const char *);
 extern napi_status napi_get_undefined(napi_env, napi_value *);
 extern napi_status napi_typeof(napi_env, napi_value, int *);
@@ -74,6 +76,18 @@ static napi_value call_js(napi_env env, napi_callback_info info) {
   }
   napi_create_double(env, 41, &input);
   napi_call_function(env, receiver, args[0], 1, &input, &result);
+  return result;
+}
+
+static napi_value construct_js(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value args[2], result;
+  napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+  if (argc != 2) {
+    napi_throw_error(env, NULL, "constructJs expects a constructor and value");
+    return NULL;
+  }
+  napi_new_instance(env, args[0], 1, &args[1], &result);
   return result;
 }
 
@@ -140,6 +154,9 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_set_named_property(env, exports, "makeArray", value);
   napi_create_function(env, "callJs", NAPI_AUTO_LENGTH, call_js, NULL, &value);
   napi_set_named_property(env, exports, "callJs", value);
+  napi_create_function(env, "constructJs", NAPI_AUTO_LENGTH, construct_js, NULL,
+                       &value);
+  napi_set_named_property(env, exports, "constructJs", value);
   napi_create_function(env, "fail", NAPI_AUTO_LENGTH, fail, NULL, &value);
   napi_set_named_property(env, exports, "fail", value);
   napi_create_function(env, "asyncAnswer", NAPI_AUTO_LENGTH, async_answer, NULL,

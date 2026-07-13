@@ -74,6 +74,9 @@ if (addon.version !== '1.0.0') throw new Error('version');
 if (addon.add(20, 22) !== 42) throw new Error('add');
 if (addon.makeArray().join(':') !== 'otter:napi') throw new Error('array');
 if (addon.callJs((value) => value + 1) !== 42) throw new Error('callJs');
+function Box(value) { this.value = value; }
+const boxed = addon.constructJs(Box, 42);
+if (!(boxed instanceof Box) || boxed.value !== 42) throw new Error('constructJs');
 if (addon.missingArgIsUndefined() !== 1) throw new Error('missing argument');
 let message = '';
 try { addon.fail(); } catch (error) { message = error.message; }

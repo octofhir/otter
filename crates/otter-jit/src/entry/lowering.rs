@@ -517,9 +517,11 @@ impl BaselinePlan {
                         exception_register: region.exception_register,
                     })
                 }
-                Op::Throw => LoweredOperands::Source(SourceOperands {
-                    src: reg(operands, 0)?,
-                }),
+                Op::Throw | Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => {
+                    LoweredOperands::Source(SourceOperands {
+                        src: reg(operands, 0)?,
+                    })
+                }
                 Op::PopParkedFinally => LoweredOperands::Immediate(ImmediateOperands {
                     value: imm32(operands, 0)?,
                 }),
@@ -564,12 +566,16 @@ impl BaselinePlan {
                     src: reg(operands, 1)?,
                     hint: const_index(operands, 2)?,
                 }),
-                Op::ToNumeric | Op::Neg | Op::BitwiseNot | Op::ToBoolean | Op::LogicalNot => {
-                    LoweredOperands::Unary(UnaryOperands {
-                        dst: reg(operands, 0)?,
-                        src: reg(operands, 1)?,
-                    })
-                }
+                Op::ToNumeric
+                | Op::Neg
+                | Op::BitwiseNot
+                | Op::ToBoolean
+                | Op::LogicalNot
+                | Op::GetIterator
+                | Op::GetAsyncIterator => LoweredOperands::Unary(UnaryOperands {
+                    dst: reg(operands, 0)?,
+                    src: reg(operands, 1)?,
+                }),
                 Op::Increment => LoweredOperands::Increment(IncrementOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
@@ -670,6 +676,14 @@ impl BaselinePlan {
                     value: imm32(operands, 0)?,
                 }),
                 Op::DefineDataProperty | Op::DefineOwnProperty => {
+                    let (first, second, third) = reg3(operands)?;
+                    LoweredOperands::Triple(TripleOperands {
+                        first,
+                        second,
+                        third,
+                    })
+                }
+                Op::IteratorNext => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,

@@ -33,6 +33,7 @@ mod arith;
 mod calls;
 mod collections;
 mod exceptions;
+mod iterators;
 mod properties;
 mod transitions;
 mod values;
@@ -561,6 +562,82 @@ pub(super) fn compile(
                     0,
                     bail,
                     returned,
+                    threw,
+                );
+            }
+            TemplateOp::IteratorNext {
+                value_dst,
+                done_dst,
+                iterator,
+            } => {
+                iterators::emit_iterator_op(
+                    &mut ops,
+                    transitions,
+                    Op::IteratorNext as u8,
+                    u64::from(value_dst),
+                    u64::from(done_dst),
+                    u64::from(iterator),
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::IteratorClose { iterator } => {
+                iterators::emit_iterator_op(
+                    &mut ops,
+                    transitions,
+                    Op::IteratorClose as u8,
+                    u64::from(iterator),
+                    0,
+                    0,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::IteratorCloseStart { iterator } => {
+                iterators::emit_iterator_op(
+                    &mut ops,
+                    transitions,
+                    Op::IteratorCloseStart as u8,
+                    u64::from(iterator),
+                    0,
+                    0,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::IteratorCloseEnd { iterator } => {
+                iterators::emit_iterator_op(
+                    &mut ops,
+                    transitions,
+                    Op::IteratorCloseEnd as u8,
+                    u64::from(iterator),
+                    0,
+                    0,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::GetIterator { dst, src } => {
+                iterators::emit_iterator_op(
+                    &mut ops,
+                    transitions,
+                    Op::GetIterator as u8,
+                    u64::from(dst),
+                    u64::from(src),
+                    0,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::GetAsyncIterator { dst, src } => {
+                iterators::emit_iterator_op(
+                    &mut ops,
+                    transitions,
+                    Op::GetAsyncIterator as u8,
+                    u64::from(dst),
+                    u64::from(src),
+                    0,
+                    bail,
                     threw,
                 );
             }

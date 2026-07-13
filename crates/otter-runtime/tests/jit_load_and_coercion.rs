@@ -5,6 +5,9 @@
 //!   megamorphic sites, exceptions, and allocating getter reentry.
 //! - In-place `ToPrimitive`/`ToNumeric` completion through observable
 //!   `@@toPrimitive` and `valueOf` hooks.
+//! - Cold numeric-family completion for BigInt arithmetic/bitwise operations,
+//!   uncommon Number conversions, and update-expression coercion.
+//! - Generic method-resolution errors after observable proxy/accessor effects.
 //!
 //! # Invariants
 //! - Every matrix runs through loop OSR in the production template tier.
@@ -184,6 +187,109 @@ JSON.stringify([
 ]);
 "#;
 
+const NUMERIC_SOURCE: &str = r#"
+let expected = {
+  sub: BigInt(7), mul: BigInt(18), div: BigInt(4), rem: BigInt(1),
+  pow: BigInt(81), and: BigInt(0), or: BigInt(11), xor: BigInt(11),
+  shl: BigInt(36), shr: BigInt(2), not: BigInt(-10)
+};
+function bigNumeric(a, b, e) {
+  let score = 0;
+  for (let i = 0; i < 4; i++) {
+    if (a - b === e.sub) score++;
+    if (a * b === e.mul) score++;
+    if (a / b === e.div) score++;
+    if (a % b === e.rem) score++;
+    if (a ** b === e.pow) score++;
+    if ((a & b) === e.and) score++;
+    if ((a | b) === e.or) score++;
+    if ((a ^ b) === e.xor) score++;
+    if ((a << b) === e.shl) score++;
+    if ((a >> b) === e.shr) score++;
+    if (~a === e.not) score++;
+  }
+  return score;
+}
+
+let huge = 1e20;
+let expectedHuge = huge | 0;
+function uncommonNumbers(hugeValue, expectedValue) {
+  let score = 0;
+  for (let i = 0; i < 4; i++) {
+    if ((NaN & 7) === 0) score++;
+    if ((Infinity | 3) === 3) score++;
+    if ((hugeValue ^ 0) === expectedValue) score++;
+  }
+  return score;
+}
+
+let incrementCalls = 0;
+let incrementObject = {
+  valueOf() {
+    incrementCalls++;
+    let values = [];
+    for (let i = 0; i < 32; i++) values.push({i, text: "increment-" + i});
+    return 4;
+  }
+};
+function coerciveIncrement(object) {
+  let sum = 0;
+  for (let i = 0; i < 6; i++) {
+    let value = object;
+    sum += value++;
+  }
+  return sum;
+}
+
+let throwCalls = 0;
+let throwProgress = 0;
+let throwingIncrementObject = {
+  valueOf() {
+    throwCalls++;
+    if (throwCalls === 3) throw new Error("increment boom");
+    return 1;
+  }
+};
+function throwingIncrement(object) {
+  for (let i = 0; i < 6; i++) {
+    let value = object;
+    value++;
+    throwProgress++;
+  }
+}
+
+let throwName = "";
+let bigScore = bigNumeric(BigInt(9), BigInt(2), expected);
+let numberScore = uncommonNumbers(huge, expectedHuge);
+let incrementSum = coerciveIncrement(incrementObject);
+try { throwingIncrement(throwingIncrementObject); } catch (e) { throwName = e.message; }
+
+JSON.stringify([
+  bigScore, numberScore, incrementSum, incrementCalls,
+  throwCalls, throwProgress, throwName
+]);
+"#;
+
+const METHOD_ERROR_SOURCE: &str = r#"
+let getCalls = 0;
+let callCalls = 0;
+let receiver = new Proxy({}, {
+  get(target, key) {
+    getCalls++;
+    if (getCalls === 7) return 0;
+    return function () { callCalls++; return 1; };
+  }
+});
+function invokeUntilError(object) {
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += object.method();
+  return sum;
+}
+let errorName = "";
+try { invokeUntilError(receiver); } catch (error) { errorName = error.name; }
+JSON.stringify([getCalls, callCalls, errorName]);
+"#;
+
 fn run(source: &str, selection: JitSelection) -> (String, u64, u64, u64) {
     let mut runtime = Runtime::builder()
         .jit_selection(selection)
@@ -236,5 +342,31 @@ fn coercive_unary_ops_complete_in_place_with_gc_reentry() {
     assert!(
         reentrant_stubs > 0,
         "coercive operands must execute the reentrant unary transition"
+    );
+}
+
+#[test]
+fn numeric_family_misses_complete_in_place_without_replay() {
+    let (oracle, _, _, _) = run(NUMERIC_SOURCE, JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "[44,12,24,6,3,2,\"increment boom\"]");
+    let (compiled, osr, _, reentrant_stubs) = run(NUMERIC_SOURCE, JitSelection::Template);
+    assert_eq!(compiled, oracle);
+    assert!(osr > 0, "numeric matrix must enter through loop OSR");
+    assert!(
+        reentrant_stubs > 0,
+        "numeric misses must execute the shared reentrant transition"
+    );
+}
+
+#[test]
+fn method_resolution_error_does_not_replay_observable_get() {
+    let (oracle, _, _, _) = run(METHOD_ERROR_SOURCE, JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "[7,6,\"TypeError\"]");
+    let (compiled, osr, _, reentrant_stubs) = run(METHOD_ERROR_SOURCE, JitSelection::Template);
+    assert_eq!(compiled, oracle);
+    assert!(osr > 0, "method matrix must enter through loop OSR");
+    assert!(
+        reentrant_stubs > 0,
+        "proxy method resolution must execute the reentrant transition"
     );
 }

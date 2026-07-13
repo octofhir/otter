@@ -3,7 +3,7 @@
 //! # Contents
 //! - Native activation publication and release.
 //! - Direct-call preparation, completion, and bailout recovery.
-//! - Reentrant equality and unary-coercion completion.
+//! - Reentrant equality, numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
 //! # Invariants
@@ -176,8 +176,9 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
 
 /// Complete one full `CallMethodValue` in the VM after the direct-call
 /// prepare reported an ineligible resolution. `0` = destination written and
-/// the compiled caller continues, `1` = threw, `2` = an exotic receiver the
-/// interpreter's opcode branch must run (exact side exit).
+/// the compiled caller continues, `1` = threw (including a resolved missing or
+/// non-callable method), `2` = an exotic receiver whose bespoke opcode branch
+/// has not started and must run in the interpreter (exact side exit).
 pub(crate) extern "C" fn jit_call_method_generic_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -348,6 +349,41 @@ pub(crate) extern "C" fn jit_coerce_unary_stub(
         hint_index as u32,
         function_id as u32,
         ctx.regs.cast::<otter_vm::Value>(),
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Complete one numeric-family opcode in the VM. `0` means the destination
+/// was committed, `1` means the operation threw, and `2` is reserved for an
+/// isolate-less compiled-entry probe where no VM activation exists.
+pub(crate) extern "C" fn jit_numeric_op_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    lhs: u64,
+    rhs_or_delta: u64,
+    opcode: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 2;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_numeric_op(
+        context,
+        stack,
+        ctx.frame_index,
+        dst as u16,
+        lhs as u16,
+        rhs_or_delta,
+        opcode as u8,
     ) {
         Ok(()) => 0,
         Err(err) => {

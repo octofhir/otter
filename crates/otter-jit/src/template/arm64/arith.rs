@@ -22,6 +22,7 @@
 //! - [`super::values`] — the tagged encode/decode primitives used here.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use otter_bytecode::Op;
 
 use super::transitions::{TransitionTable, emit_add_delegate, emit_string_concat_alloc_call};
 use super::values::{
@@ -48,6 +49,39 @@ pub(super) struct CoercionSlowPath {
     function_id: u32,
 }
 
+/// One cold completion for a numeric-family fast-path miss. `rhs_or_delta`
+/// is a register index for binary operations and the signed immediate bits for
+/// `Increment`; unary operations ignore it.
+pub(super) struct NumericSlowPath {
+    entry: DynamicLabel,
+    resume: DynamicLabel,
+    dst: u16,
+    lhs: u16,
+    rhs_or_delta: u64,
+    opcode: Op,
+}
+
+fn numeric_slow_path(
+    ops: &mut Assembler,
+    slow_paths: &mut Vec<NumericSlowPath>,
+    dst: u16,
+    lhs: u16,
+    rhs_or_delta: u64,
+    opcode: Op,
+) -> (DynamicLabel, DynamicLabel) {
+    let entry = ops.new_dynamic_label();
+    let resume = ops.new_dynamic_label();
+    slow_paths.push(NumericSlowPath {
+        entry,
+        resume,
+        dst,
+        lhs,
+        rhs_or_delta,
+        opcode,
+    });
+    (entry, resume)
+}
+
 /// Function-id immediate low tag as a 32-bit `dynasm` operand.
 const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
 use crate::template::{ArithKind, BitwiseKind, CompareKind};
@@ -67,31 +101,41 @@ pub(super) fn emit_binary_arith(
     lhs: u16,
     rhs: u16,
     kind: ArithKind,
-    bail: DynamicLabel,
+    slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
+    let opcode = match kind {
+        ArithKind::Sub => Op::Sub,
+        ArithKind::Mul => Op::Mul,
+        ArithKind::Div => Op::Div,
+        ArithKind::Rem => Op::Rem,
+        ArithKind::Pow => Op::Pow,
+    };
+    let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, lhs, u64::from(rhs), opcode);
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
     match kind {
         ArithKind::Div => {
-            emit_num_to_double(ops, 9, 0, bail);
-            emit_num_to_double(ops, 10, 1, bail);
+            emit_num_to_double(ops, 9, 0, slow);
+            emit_num_to_double(ops, 10, 1, slow);
             dynasm!(ops ; .arch aarch64 ; fdiv d2, d0, d1);
             emit_box_double(ops, 2, 13);
-            return emit_store_reg(ops, 13, dst);
+            emit_store_reg(ops, 13, dst)?;
+            dynasm!(ops ; .arch aarch64 ; =>resume);
+            return Ok(());
         }
         ArithKind::Rem => {
             let store = ops.new_dynamic_label();
-            let slow = ops.new_dynamic_label();
+            let number_slow = ops.new_dynamic_label();
             let done = ops.new_dynamic_label();
-            emit_guard_int32(ops, 9, slow);
-            emit_guard_int32(ops, 10, slow);
+            emit_guard_int32(ops, 9, number_slow);
+            emit_guard_int32(ops, 10, number_slow);
             dynasm!(ops
                 ; .arch aarch64
-                ; cbz w10, =>slow          // rhs == 0 → NaN via the f64 probe
+                ; cbz w10, =>number_slow   // rhs == 0 → NaN via the f64 probe
                 ; sdiv w11, w9, w10        // truncating quotient
                 ; msub w13, w11, w10, w9   // remainder = lhs - quotient * rhs
                 ; cbnz w13, =>store        // nonzero remainder: sign correct
-                ; tbnz w9, #31, =>slow     // zero remainder, negative lhs → -0
+                ; tbnz w9, #31, =>number_slow // zero remainder, negative lhs → -0
                 ; =>store
             );
             emit_box_int32(ops, 13, 12);
@@ -102,7 +146,7 @@ pub(super) fn emit_binary_arith(
             dynasm!(ops
                 ; .arch aarch64
                 ; b =>done
-                ; =>slow
+                ; =>number_slow
                 ; ldr x0, [x20, THREAD_OFFSET]
                 ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
                 ; mov x1, x9
@@ -117,11 +161,15 @@ pub(super) fn emit_binary_arith(
                 ; .arch aarch64
                 ; blr x16
                 ; and x1, x1, #0xff
-                ; cbnz x1, =>bail
+                ; cbnz x1, =>slow
                 ; mov x13, x0
             );
             emit_store_reg(ops, 13, dst)?;
-            dynasm!(ops ; .arch aarch64 ; =>done);
+            dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
+            return Ok(());
+        }
+        ArithKind::Pow => {
+            dynasm!(ops ; .arch aarch64 ; b =>slow ; =>resume);
             return Ok(());
         }
         ArithKind::Sub | ArithKind::Mul => {}
@@ -151,8 +199,8 @@ pub(super) fn emit_binary_arith(
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-    emit_num_to_double(ops, 9, 0, bail);
-    emit_num_to_double(ops, 10, 1, bail);
+    emit_num_to_double(ops, 9, 0, slow);
+    emit_num_to_double(ops, 10, 1, slow);
     match kind {
         ArithKind::Sub => dynasm!(ops ; .arch aarch64 ; fsub d2, d0, d1),
         ArithKind::Mul => dynasm!(ops ; .arch aarch64 ; fmul d2, d0, d1),
@@ -160,7 +208,7 @@ pub(super) fn emit_binary_arith(
     }
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
-    dynasm!(ops ; .arch aarch64 ; =>done);
+    dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
     Ok(())
 }
 
@@ -227,7 +275,44 @@ pub(super) fn emit_compare(
     rhs: u16,
     kind: CompareKind,
     bail: DynamicLabel,
+    slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
+    let relational_slow = match kind {
+        CompareKind::Lt => Some(numeric_slow_path(
+            ops,
+            slow_paths,
+            dst,
+            lhs,
+            u64::from(rhs),
+            Op::LessThan,
+        )),
+        CompareKind::Le => Some(numeric_slow_path(
+            ops,
+            slow_paths,
+            dst,
+            lhs,
+            u64::from(rhs),
+            Op::LessEq,
+        )),
+        CompareKind::Gt => Some(numeric_slow_path(
+            ops,
+            slow_paths,
+            dst,
+            lhs,
+            u64::from(rhs),
+            Op::GreaterThan,
+        )),
+        CompareKind::Ge => Some(numeric_slow_path(
+            ops,
+            slow_paths,
+            dst,
+            lhs,
+            u64::from(rhs),
+            Op::GreaterEq,
+        )),
+        CompareKind::Eq | CompareKind::Ne => None,
+    };
+    let numeric_miss = relational_slow.map_or(bail, |(entry, _)| entry);
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
     let float_path = ops.new_dynamic_label();
@@ -321,13 +406,17 @@ pub(super) fn emit_compare(
             ; =>number_path
         );
     }
-    emit_num_to_double(ops, 9, 0, bail);
-    emit_num_to_double(ops, 10, 1, bail);
+    emit_num_to_double(ops, 9, 0, numeric_miss);
+    emit_num_to_double(ops, 10, 1, numeric_miss);
     dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
     emit_cset(ops, kind, FloatCondition);
     dynasm!(ops ; .arch aarch64 ; =>have_bool);
     emit_box_bool(ops, 13, 12);
-    emit_store_reg(ops, 13, dst)
+    emit_store_reg(ops, 13, dst)?;
+    if let Some((_, resume)) = relational_slow {
+        dynasm!(ops ; .arch aarch64 ; =>resume);
+    }
+    Ok(())
 }
 
 /// Marker: integer condition codes for [`emit_cset`].
@@ -461,12 +550,20 @@ pub(super) fn emit_int_bitwise(
     lhs: u16,
     rhs: u16,
     kind: BitwiseKind,
-    bail: DynamicLabel,
+    slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
+    let opcode = match kind {
+        BitwiseKind::Or => Op::BitwiseOr,
+        BitwiseKind::And => Op::BitwiseAnd,
+        BitwiseKind::Xor => Op::BitwiseXor,
+        BitwiseKind::Shl => Op::Shl,
+        BitwiseKind::Shr => Op::Shr,
+    };
+    let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, lhs, u64::from(rhs), opcode);
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
-    emit_to_int32_fast(ops, 9, 11, bail);
-    emit_to_int32_fast(ops, 10, 12, bail);
+    emit_to_int32_fast(ops, 9, 11, slow);
+    emit_to_int32_fast(ops, 10, 12, slow);
     match kind {
         BitwiseKind::Or => dynasm!(ops ; .arch aarch64 ; orr w13, w11, w12),
         BitwiseKind::And => dynasm!(ops ; .arch aarch64 ; and w13, w11, w12),
@@ -475,7 +572,9 @@ pub(super) fn emit_int_bitwise(
         BitwiseKind::Shr => dynasm!(ops ; .arch aarch64 ; asr w13, w11, w12),
     }
     emit_box_int32(ops, 13, 12);
-    emit_store_reg(ops, 13, dst)
+    emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>resume);
+    Ok(())
 }
 
 /// Emit unsigned right shift. The result boxes as a double because JS `>>>`
@@ -486,19 +585,22 @@ pub(super) fn emit_unsigned_shift_right(
     dst: u16,
     lhs: u16,
     rhs: u16,
-    bail: DynamicLabel,
+    slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
+    let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, lhs, u64::from(rhs), Op::Ushr);
     emit_load_reg(ops, 9, lhs)?;
     emit_load_reg(ops, 10, rhs)?;
-    emit_to_uint32_fast(ops, 9, 11, bail);
-    emit_to_uint32_fast(ops, 10, 12, bail);
+    emit_to_uint32_fast(ops, 9, 11, slow);
+    emit_to_uint32_fast(ops, 10, 12, slow);
     dynasm!(ops
         ; .arch aarch64
         ; lsr w13, w11, w12
         ; ucvtf d0, w13
     );
     emit_box_double(ops, 0, 13);
-    emit_store_reg(ops, 13, dst)
+    emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>resume);
+    Ok(())
 }
 
 /// Emit `dst = ToNumeric(src) + delta` (§13.4 UpdateExpression): int32 fast
@@ -509,8 +611,16 @@ pub(super) fn emit_increment(
     dst: u16,
     src: u16,
     delta: i32,
-    bail: DynamicLabel,
+    slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
+    let (slow, resume) = numeric_slow_path(
+        ops,
+        slow_paths,
+        dst,
+        src,
+        u64::from(delta as u32),
+        Op::Increment,
+    );
     emit_load_reg(ops, 9, src)?;
     emit_load_u64(ops, 12, u64::from(delta as u32));
     let float_path = ops.new_dynamic_label();
@@ -527,11 +637,11 @@ pub(super) fn emit_increment(
     emit_box_int32(ops, 13, 11);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-    emit_num_to_double(ops, 9, 0, bail);
+    emit_num_to_double(ops, 9, 0, slow);
     dynasm!(ops ; .arch aarch64 ; scvtf d1, w12 ; fadd d2, d0, d1);
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
-    dynasm!(ops ; .arch aarch64 ; =>done);
+    dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
     Ok(())
 }
 
@@ -542,8 +652,9 @@ pub(super) fn emit_negate(
     ops: &mut Assembler,
     dst: u16,
     src: u16,
-    bail: DynamicLabel,
+    slow_paths: &mut Vec<NumericSlowPath>,
 ) -> Result<(), Unsupported> {
+    let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, src, 0, Op::Neg);
     emit_load_reg(ops, 9, src)?;
     let maybe_double = ops.new_dynamic_label();
     let zero_case = ops.new_dynamic_label();
@@ -579,7 +690,7 @@ pub(super) fn emit_negate(
     dynasm!(ops
         ; .arch aarch64
         ; tst x9, x15
-        ; b.eq =>bail                 // cell / immediate → exact coercion
+        ; b.eq =>slow                 // cell / immediate → VM numeric completion
         ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
         ; sub x14, x9, x14
         ; fmov d0, x14
@@ -587,7 +698,25 @@ pub(super) fn emit_negate(
     );
     emit_box_double(ops, 1, 13);
     emit_store_reg(ops, 13, dst)?;
-    dynasm!(ops ; .arch aarch64 ; =>done);
+    dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
+    Ok(())
+}
+
+/// Emit unary bitwise-not over the Number fast path. BigInt and uncommon
+/// numeric representations complete in the shared cold numeric transition.
+pub(super) fn emit_bitwise_not(
+    ops: &mut Assembler,
+    dst: u16,
+    src: u16,
+    slow_paths: &mut Vec<NumericSlowPath>,
+) -> Result<(), Unsupported> {
+    let (slow, resume) = numeric_slow_path(ops, slow_paths, dst, src, 0, Op::BitwiseNot);
+    emit_load_reg(ops, 9, src)?;
+    emit_to_int32_fast(ops, 9, 11, slow);
+    dynasm!(ops ; .arch aarch64 ; mvn w13, w11);
+    emit_box_int32(ops, 13, 12);
+    emit_store_reg(ops, 13, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>resume);
     Ok(())
 }
 
@@ -666,6 +795,49 @@ pub(super) fn emit_to_primitive(
         function_id,
     });
     Ok(())
+}
+
+/// Emit every deferred numeric-family completion after the hot operation
+/// stream. The VM helper writes `dst` only after the full operation succeeds;
+/// a live runtime therefore returns handled-or-threw and never replays an
+/// observable conversion through interpreter resume.
+pub(super) fn emit_numeric_slow_paths(
+    ops: &mut Assembler,
+    table: &TransitionTable,
+    slow_paths: Vec<NumericSlowPath>,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+) {
+    let entry = table.entry(abi::STUB_JIT_NUMERIC_OP);
+    for path in slow_paths {
+        let NumericSlowPath {
+            entry: slow_entry,
+            resume,
+            dst,
+            lhs,
+            rhs_or_delta,
+            opcode,
+        } = path;
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>slow_entry
+            ; mov x0, x20
+            ; movz x1, dst as u32
+            ; movz x2, lhs as u32
+        );
+        emit_load_u64(ops, 3, rhs_or_delta);
+        emit_load_u64(ops, 4, u64::from(opcode as u8));
+        emit_load_u64(ops, 16, entry);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, #1
+            ; b.eq =>threw
+            ; cmp x0, #2
+            ; b.eq =>bail
+            ; b =>resume
+        );
+    }
 }
 
 /// Emit all deferred coercion continuations after the hot operation stream.

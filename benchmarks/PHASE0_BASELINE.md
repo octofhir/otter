@@ -603,3 +603,55 @@ Splay relative to the inline build, but the remaining Splay loss is retained as
 an observed performance regression, not relabelled as noise. The final Octane
 TypeScript sentinel reported `ReferenceError: TypeScript is not defined` for
 Node, Bun, and Otter and produced no score; it remains failed and non-scoreable.
+
+### Phase 2 production numeric-family and method-error completion
+
+The production template tier now completes the remaining numeric-family fast
+misses through one reentrant VM transition. `Sub`, `Mul`, `Div`, `Rem`, the four
+relational comparisons, all six binary bitwise/shift operations, `Increment`,
+and `Neg` retain their inline Number paths; BigInt, uncommon Number encodings,
+and observable update coercion complete through the same VM register helpers as
+interpreter dispatch. `Pow` and `BitwiseNot` are now template operations rather
+than unsupported side exits. Their cold completion blocks are outlined after
+the hot instruction stream. The runtime-stub table is version 3 with numeric
+stub 55.
+
+The generic `CallMethodValue` transition also owns missing/non-callable errors
+after method resolution. Once an accessor or Proxy `[[Get]]` has run, the stub
+returns threw instead of exact-bailing and replaying the observable lookup.
+Generator, iterator, and pending-bind families still exact-exit before their
+bespoke interpreter branches begin.
+
+The live-runtime bailout delta is sixteen numeric opcode miss families removed,
+two opcode-level unsupported cases removed (`Pow`, `BitwiseNot`), and two
+post-resolution method-error outcomes changed from bail to throw. The supported
+template opcode set is 65 of the 172 active bytecodes; argument-count variants
+and the other 107 opcodes remain unchanged.
+
+The first targeted build hung in BigInt remainder. This run is invalid and is
+not counted as passing: a local Number-remainder slow label shadowed the common
+numeric-transition label and looped on the leaf miss. Renaming the local label
+and routing its miss to the outlined transition fixed the loop before the
+validation gate.
+
+The final gate passed JIT 38/38, VM 716/716, runtime 153/153 unit tests (two
+pre-existing ignored) plus all integration tests, and relevant all-target,
+all-feature clippy with `-D warnings`. Exponentiation (44/44), bitwise
+(106/106), less-than (92/92), less-than-or-equal (47/47), greater-than (92/92),
+greater-than-or-equal (43/43), postfix increment (38/38), and prefix increment
+(33/33) targeted Test262 subsets had zero failures, skips, timeouts, OOMs, or
+crashes. The frozen full-corpus reference remains 99.02% (51,480/53,173,
+excluding skipped tests). Cross-chunk and template-corpus tests passed with GC
+verification at strides 1, 8, and 16; the property/coercion/numeric/method
+transition matrix passed at every stride 1 through 16. The release differential
+corpus passed 11/11 at every stride 1 through 16 with verification enabled.
+
+Three captured V8 v7 after scores were Richards `511/525/532`, DeltaBlue
+`270/279/280`, Crypto `463/549/546`, and Splay `1,246/1,214/1,410`. The after
+medians are `525/279/546/1,246`. Against the preceding documented medians for
+Richards `522`, DeltaBlue `276`, and Splay `1,155`, this is approximately
+`+0.6%`, `+1.1%`, and `+7.9%` (higher is better). There is no controlled
+same-checkpoint Crypto before score, so no speedup is claimed for Crypto. Every
+Otter run emitted the suite score marker. Bun failed each combined run with
+`ReferenceError: setupEngine is not defined`; those Bun observations are
+non-scoreable and do not affect the validated Otter scores.

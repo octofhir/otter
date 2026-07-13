@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! Narrow entry points for fixed-operand operations whose full ECMAScript
-//! semantics still belong to the VM: coercing arithmetic, captured-binding
-//! checks, constant materialization, descriptor writes, and loose equality.
+//! semantics still belong to the VM: the complete numeric family, coercing
+//! arithmetic, captured-binding checks, constant materialization, descriptor
+//! writes, and loose equality.
 //!
 //! # Invariants
 //! - Every operand is decoded by the compiler and passed explicitly. These
@@ -15,11 +16,160 @@
 //!
 //! # See also
 //! - `crate::property_dispatch` for typed property and element slow paths.
-//! - `otter-jit::baseline` for the machine-code stubs calling these operations.
+//! - `otter-jit::template` for the machine-code stubs calling these operations.
 
 use crate::{ExecutionContext, Interpreter, VmError, holt_stack::HoltStack, write_register};
+use otter_bytecode::Op;
 
 impl Interpreter {
+    /// Complete a numeric, bitwise, update, or relational opcode from decoded
+    /// operands. This is the single compiled slow transition for the numeric
+    /// family; it calls the same register helpers as interpreter dispatch and
+    /// restores the interpreter PC because the native frame owns canonical
+    /// compiled progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn jit_runtime_numeric_op(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        lhs: u16,
+        rhs_or_delta: u64,
+        opcode: u8,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        let saved_pc = stack[frame_index].pc;
+        let result = {
+            let frame = &mut stack[frame_index];
+            match opcode {
+                x if x == Op::Sub as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::sub,
+                    crate::arithmetic_dispatch::bigint_sub_op,
+                    None,
+                ),
+                x if x == Op::Mul as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::mul,
+                    crate::arithmetic_dispatch::bigint_mul_op,
+                    None,
+                ),
+                x if x == Op::Div as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::div,
+                    crate::bigint::ops::div,
+                    None,
+                ),
+                x if x == Op::Rem as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::rem,
+                    crate::bigint::ops::rem,
+                    None,
+                ),
+                x if x == Op::Pow as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::pow,
+                    crate::bigint::ops::pow,
+                    None,
+                ),
+                x if x == Op::BitwiseAnd as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::bitwise_and,
+                    crate::arithmetic_dispatch::bigint_and_op,
+                    None,
+                ),
+                x if x == Op::BitwiseOr as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::bitwise_or,
+                    crate::arithmetic_dispatch::bigint_or_op,
+                    None,
+                ),
+                x if x == Op::BitwiseXor as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::bitwise_xor,
+                    crate::arithmetic_dispatch::bigint_xor_op,
+                    None,
+                ),
+                x if x == Op::Shl as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::shl,
+                    crate::bigint::ops::shl,
+                    None,
+                ),
+                x if x == Op::Shr as u8 => self.run_numeric_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    crate::number::shr_arith,
+                    crate::bigint::ops::shr,
+                    None,
+                ),
+                x if x == Op::Ushr as u8 => {
+                    self.run_ushr_regs(frame, dst, lhs, rhs_or_delta as u16, None)
+                }
+                x if x == Op::LessThan as u8 => {
+                    self.run_compare_regs(frame, dst, lhs, rhs_or_delta as u16, Op::LessThan, None)
+                }
+                x if x == Op::LessEq as u8 => {
+                    self.run_compare_regs(frame, dst, lhs, rhs_or_delta as u16, Op::LessEq, None)
+                }
+                x if x == Op::GreaterThan as u8 => self.run_compare_regs(
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u16,
+                    Op::GreaterThan,
+                    None,
+                ),
+                x if x == Op::GreaterEq as u8 => {
+                    self.run_compare_regs(frame, dst, lhs, rhs_or_delta as u16, Op::GreaterEq, None)
+                }
+                x if x == Op::Neg as u8 => self.run_neg_regs(frame, dst, lhs),
+                x if x == Op::BitwiseNot as u8 => self.run_bitwise_not_regs(frame, dst, lhs),
+                x if x == Op::Increment as u8 => self.run_increment_regs(
+                    context,
+                    frame,
+                    dst,
+                    lhs,
+                    rhs_or_delta as u32 as i32,
+                    None,
+                ),
+                _ => Err(VmError::InvalidOperand),
+            }
+        };
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     /// Execute generic ECMAScript addition from decoded register operands.
     pub fn jit_runtime_add(
         &mut self,

@@ -518,7 +518,7 @@ impl BaselinePlan {
                     src: reg(operands, 1)?,
                     hint: const_index(operands, 2)?,
                 }),
-                Op::ToNumeric | Op::Neg | Op::ToBoolean | Op::LogicalNot => {
+                Op::ToNumeric | Op::Neg | Op::BitwiseNot | Op::ToBoolean | Op::LogicalNot => {
                     LoweredOperands::Unary(UnaryOperands {
                         dst: reg(operands, 0)?,
                         src: reg(operands, 1)?,
@@ -653,6 +653,7 @@ impl BaselinePlan {
                 | Op::Mul
                 | Op::Div
                 | Op::Rem
+                | Op::Pow
                 | Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan

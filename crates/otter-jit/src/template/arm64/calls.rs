@@ -148,9 +148,11 @@ pub(super) fn emit_construct(
 /// falls through to the direct-method prepare; an ineligible resolution
 /// (polymorphic, native, accessor, or cold method) then completes through
 /// the generic in-place method transition, so the compiled caller keeps
-/// running for every ordinary receiver. Only exotic receivers the
+/// running for every ordinary receiver, including missing/non-callable
+/// resolutions after an observable getter or proxy trap. Only receivers the
 /// interpreter dispatches through bespoke opcode branches (generators,
-/// iterators, callable receivers) take the exact side exit.
+/// iterators, pending bind continuations) take the exact side exit before
+/// resolution begins.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_method_call(
     ops: &mut Assembler,

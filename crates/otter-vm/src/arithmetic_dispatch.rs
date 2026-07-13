@@ -210,6 +210,43 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Execute one update-expression numeric step through the same semantic
+    /// path used by interpreter dispatch and compiled numeric slow paths.
+    /// Observable coercion completes before `dst` is committed.
+    pub(crate) fn run_increment_regs(
+        &mut self,
+        context: &crate::execution_context::ExecutionContext,
+        frame: &mut Frame,
+        dst: u16,
+        src: u16,
+        delta: i32,
+        feedback: Option<&InstructionFeedback>,
+    ) -> Result<(), VmError> {
+        let value = *read_register(frame, src)?;
+        if let Some(feedback) = feedback {
+            feedback.record_arith(value, Value::number_i32(delta));
+        }
+        let primitive =
+            self.evaluate_to_primitive(context, &value, abstract_ops::ToPrimitiveHint::Number)?;
+        let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        let next = match kind {
+            abstract_ops::NumericKind::Num(n) => {
+                Value::number(NumberValue::from_f64(n.as_f64() + f64::from(delta)))
+            }
+            abstract_ops::NumericKind::Big(b) => {
+                let delta_big = num_bigint::BigInt::from(delta);
+                let sum = bigint::ops::add(&b, &delta_big);
+                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                Value::big_int(handle)
+            }
+        };
+        write_register(frame, dst, next)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
     pub(crate) fn run_equal_regs(
         &mut self,
         frame: &mut Frame,

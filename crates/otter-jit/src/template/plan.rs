@@ -11,9 +11,9 @@
 //! - Built strictly on top of the shared typed lowering pass: operand decoding,
 //!   duplicate-PC detection, and branch-target verification happen exactly once
 //!   before any backend opens an assembler.
-//! - An opcode outside the supported subset rejects the whole compilation with
-//!   [`Unsupported::Opcode`]; a plan never describes a partially compilable
-//!   function.
+//! - Structured exception opcodes reject whole-function entry compilation;
+//!   other unsupported opcodes become canonical-PC pre-effect side exits and
+//!   make the body loop-OSR-only.
 //! - Branch targets are canonical instruction indices already proven to name
 //!   instruction boundaries; back edges are classified here so every backend
 //!   places its cooperative poll identically.
@@ -28,15 +28,16 @@ use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
 
 use crate::entry::{BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag};
 
-/// Numeric binary operators lowered to the shared int32/double template.
-/// `+` has its own operation ([`TemplateOp::AddGeneric`]) because its
-/// non-numeric semantics are additive, not a side exit.
+/// Numeric binary operators lowered to the shared int32/double template plus
+/// the common VM numeric completion. `+` has its own operation
+/// ([`TemplateOp::AddGeneric`]) because its non-numeric semantics are additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArithKind {
     Sub,
     Mul,
     Div,
     Rem,
+    Pow,
 }
 
 /// Comparison operators lowered to the shared int32/double template.
@@ -120,6 +121,9 @@ pub(crate) enum TemplateOp {
     /// `r<dst> = -ToNumeric(r<src>)` including the `-0` and `-i32::MIN`
     /// double promotions.
     Negate { dst: u16, src: u16 },
+    /// `r<dst> = ~ToNumeric(r<src>)`, with Number fast paths and BigInt
+    /// completion through the shared numeric transition.
+    BitwiseNot { dst: u16, src: u16 },
     /// `r<dst> = ToNumeric(r<src>)` — identity on numbers; coercive cases
     /// complete through the shared reentrant unary transition.
     ToNumeric { dst: u16, src: u16 },
@@ -409,7 +413,7 @@ impl TemplatePlan {
                         concat_safepoint,
                     }
                 }
-                Op::Sub | Op::Mul | Op::Div | Op::Rem => {
+                Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => {
                     let operands = lowered.binary_operands()?;
                     TemplateOp::BinaryArith {
                         dst: operands.dst,
@@ -419,7 +423,8 @@ impl TemplatePlan {
                             Op::Sub => ArithKind::Sub,
                             Op::Mul => ArithKind::Mul,
                             Op::Div => ArithKind::Div,
-                            _ => ArithKind::Rem,
+                            Op::Rem => ArithKind::Rem,
+                            _ => ArithKind::Pow,
                         },
                     }
                 }
@@ -717,6 +722,13 @@ impl TemplatePlan {
                         src: operands.src,
                     }
                 }
+                Op::BitwiseNot => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::BitwiseNot {
+                        dst: operands.dst,
+                        src: operands.src,
+                    }
+                }
                 Op::ToNumeric => {
                     let operands = lowered.unary_operands()?;
                     TemplateOp::ToNumeric {
@@ -1002,6 +1014,40 @@ mod tests {
                 .iter()
                 .any(|record| record.id == concat_safepoint)
         );
+    }
+
+    #[test]
+    fn plan_compiles_pow_and_bitwise_not_without_osr_fallback() {
+        let v = view(&[
+            (
+                Op::Pow,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::BitwiseNot,
+                vec![Operand::Register(3), Operand::Register(2)],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(3)]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("plan");
+        assert_eq!(
+            plan.instructions[0].op,
+            TemplateOp::BinaryArith {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+                kind: ArithKind::Pow,
+            }
+        );
+        assert_eq!(
+            plan.instructions[1].op,
+            TemplateOp::BitwiseNot { dst: 3, src: 2 }
+        );
+        assert!(!plan.osr_only);
     }
 
     #[test]

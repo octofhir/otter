@@ -137,7 +137,9 @@ asynchronous completion returns through the runtime microtask checkpoint. The
 CLI exports the `napi_*` symbols needed by dynamically loaded addons. This path
 has been exercised against a C ABI fixture, the current napi-rs Rollup native
 package, the current `@swc/core` native package, and the current Lightning CSS
-native package. The validation includes
+native package. Both symbol-based initializers and the constructor-based
+`napi_module_register` ABI used by `@parcel/watcher` are recognized. The
+validation includes
 synchronous and asynchronous Rollup parsing, hashing, a complete
 `rollup(...).generate(...)` run, and a native SWC TypeScript transform. Buffer
 views and addon-reported external memory use the VM's typed-array and heap

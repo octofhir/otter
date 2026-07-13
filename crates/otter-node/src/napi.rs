@@ -1,16 +1,17 @@
 //! Node-API host ABI for loading native `.node` addons.
 //!
-//! A native addon is a dynamic library whose `napi_register_module_v1` entry
-//! point calls the `napi_*` C symbols exported by the Otter executable. This
-//! module supplies that VM-neutral ABI directly; it does not embed Node or V8
-//! and does not route through `napi-rs` (which is an addon-side binding).
+//! A native addon is a dynamic library whose symbol-based initializer or
+//! constructor-based `napi_module_register` callback calls the `napi_*` C
+//! symbols exported by the Otter executable. This module supplies that
+//! VM-neutral ABI directly; it does not embed Node or V8 and does not route
+//! through `napi-rs` (which is an addon-side binding).
 //!
 //! # Contents
 //! - [`load_addon`] opens a capability-approved library and runs registration.
 //! - [`NapiEnv`] owns stable C handles backed by Otter persistent roots.
 //! - Exported `napi_*` functions implement the initial Node-API value,
 //!   property, callback, exception, external-memory, buffer, Promise,
-//!   async-work, and handle-scope surface.
+//!   async-work, property-descriptor, and handle-scope surface.
 //!
 //! # Invariants
 //! - Both `read` and `ffi` capabilities are checked before native code loads.
@@ -23,6 +24,8 @@
 //!   runtime microtask checkpoint; no VM context crosses a thread boundary.
 //! - Loaded code stays mapped while any JS callback created from it is alive.
 //!   Unsupported ABI symbols remain absent, so the platform loader fails fast.
+//! - Deprecated constructor registration is captured in a thread-local frame
+//!   only while the platform loader is mapping that addon.
 //!
 //! # See also
 //! - <https://nodejs.org/api/n-api.html>
@@ -36,6 +39,7 @@
 // addresses must remain stable when the owning Vec grows.
 #![allow(clippy::missing_safety_doc, clippy::vec_box)]
 
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
@@ -54,6 +58,7 @@ pub type napi_value = *mut c_void;
 pub type napi_callback_info = *mut NapiCallbackInfo;
 pub type napi_status = c_int;
 pub type napi_handle_scope = *mut c_void;
+pub type napi_escapable_handle_scope = *mut NapiEscapableHandleScope;
 pub type napi_ref = *mut NapiRef;
 pub type napi_deferred = *mut NapiDeferred;
 pub type napi_async_work = *mut NapiAsyncWork;
@@ -62,6 +67,7 @@ pub type napi_callback = Option<unsafe extern "C" fn(napi_env, napi_callback_inf
 pub type napi_async_execute_callback = Option<unsafe extern "C" fn(napi_env, *mut c_void)>;
 pub type napi_async_complete_callback =
     Option<unsafe extern "C" fn(napi_env, napi_status, *mut c_void)>;
+type napi_addon_register_func = Option<unsafe extern "C" fn(napi_env, napi_value) -> napi_value>;
 
 const NAPI_OK: napi_status = 0;
 const NAPI_INVALID_ARG: napi_status = 1;
@@ -72,6 +78,7 @@ const NAPI_NUMBER_EXPECTED: napi_status = 6;
 const NAPI_BOOLEAN_EXPECTED: napi_status = 7;
 const NAPI_GENERIC_FAILURE: napi_status = 9;
 const NAPI_PENDING_EXCEPTION: napi_status = 10;
+const NAPI_ESCAPE_CALLED_TWICE: napi_status = 12;
 const NAPI_CLOSING: napi_status = 16;
 
 const NAPI_UNDEFINED: c_int = 0;
@@ -84,6 +91,9 @@ const NAPI_FUNCTION: c_int = 7;
 const NAPI_EXTERNAL: c_int = 8;
 const NAPI_UINT8_ARRAY: u32 = 1;
 const NAPI_AUTO_LENGTH: usize = usize::MAX;
+const NAPI_WRITABLE: c_int = 1;
+const NAPI_ENUMERABLE: c_int = 1 << 1;
+const NAPI_CONFIGURABLE: c_int = 1 << 2;
 const NAPI_STATIC: c_int = 1 << 10;
 
 #[repr(C)]
@@ -96,6 +106,37 @@ pub struct napi_property_descriptor {
     value: napi_value,
     attributes: c_int,
     data: *mut c_void,
+}
+
+#[repr(C)]
+struct NapiModule {
+    nm_version: c_int,
+    nm_flags: u32,
+    nm_filename: *const c_char,
+    nm_register_func: napi_addon_register_func,
+    nm_modname: *const c_char,
+    nm_priv: *mut c_void,
+    reserved: [*mut c_void; 4],
+}
+
+#[repr(C)]
+pub struct NapiExtendedErrorInfo {
+    error_message: *const c_char,
+    engine_reserved: *mut c_void,
+    engine_error_code: u32,
+    error_code: napi_status,
+}
+
+pub struct NapiEscapableHandleScope {
+    base: usize,
+    escaped: Option<Box<NapiHandle>>,
+}
+
+thread_local! {
+    /// One registration slot per nested `Library::new` call on this thread.
+    static LEGACY_MODULE_REGISTRATIONS: RefCell<Vec<Option<usize>>> = const {
+        RefCell::new(Vec::new())
+    };
 }
 
 struct NapiHandle {
@@ -210,6 +251,7 @@ pub struct NapiEnv {
     handles: Vec<Box<NapiHandle>>,
     scopes: Vec<usize>,
     pending: Option<NativeError>,
+    last_error: NapiExtendedErrorInfo,
     library: Arc<Library>,
     state: Arc<NapiState>,
 }
@@ -221,6 +263,12 @@ impl NapiEnv {
             handles: Vec::new(),
             scopes: Vec::new(),
             pending: None,
+            last_error: NapiExtendedErrorInfo {
+                error_message: c"Otter Node-API call failed".as_ptr(),
+                engine_reserved: ptr::null_mut(),
+                engine_error_code: 0,
+                error_code: NAPI_GENERIC_FAILURE,
+            },
             library,
             state,
         }
@@ -255,6 +303,7 @@ impl NapiEnv {
 
     fn fail(&mut self, error: NativeError) -> napi_status {
         self.pending = Some(error);
+        self.last_error.error_code = NAPI_PENDING_EXCEPTION;
         NAPI_PENDING_EXCEPTION
     }
 
@@ -393,7 +442,15 @@ pub fn load_addon(
         ));
     }
     keep_napi_exports();
-    let library = Arc::new(unsafe { Library::new(path) }.map_err(|error| {
+    LEGACY_MODULE_REGISTRATIONS.with(|registrations| registrations.borrow_mut().push(None));
+    let loaded = unsafe { Library::new(path) };
+    let legacy_register = LEGACY_MODULE_REGISTRATIONS.with(|registrations| {
+        registrations
+            .borrow_mut()
+            .pop()
+            .expect("legacy Node-API registration frame")
+    });
+    let library = Arc::new(loaded.map_err(|error| {
         invalid(
             "require",
             format!("cannot load native addon '{}': {error}", path.display()),
@@ -406,11 +463,19 @@ pub fn load_addon(
             )
             .map(|symbol| *symbol)
     }
-    .map_err(|error| {
+    .ok()
+    .or_else(|| {
+        legacy_register.map(|address| unsafe {
+            std::mem::transmute::<usize, unsafe extern "C" fn(napi_env, napi_value) -> napi_value>(
+                address,
+            )
+        })
+    })
+    .ok_or_else(|| {
         invalid(
             "require",
             format!(
-                "'{}' is not a Node-API addon (missing napi_register_module_v1: {error})",
+                "'{}' is not a Node-API addon (no supported registration entry point)",
                 path.display()
             ),
         )
@@ -430,6 +495,23 @@ pub fn load_addon(
     unsafe { env.value(returned) }
         .or_else(|| unsafe { env.value(exports_handle) })
         .ok_or_else(|| invalid("require", "native addon returned an invalid handle"))
+}
+
+/// Capture the deprecated constructor-based registration callback while the
+/// platform loader is mapping an addon on the current thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_module_register(module: *mut c_void) {
+    if module.is_null() {
+        return;
+    }
+    let Some(register) = (unsafe { &*module.cast::<NapiModule>() }).nm_register_func else {
+        return;
+    };
+    LEGACY_MODULE_REGISTRATIONS.with(|registrations| {
+        if let Some(slot) = registrations.borrow_mut().last_mut() {
+            *slot = Some(register as usize);
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -992,6 +1074,192 @@ pub unsafe extern "C" fn napi_get_property(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_has_property(
+    env: napi_env,
+    object: napi_value,
+    key: napi_value,
+    result: *mut bool,
+) -> napi_status {
+    if result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let mut value = ptr::null_mut();
+    let status = unsafe { napi_get_property(env, object, key, &mut value) };
+    if status != NAPI_OK {
+        return status;
+    }
+    let env = unsafe { &mut *env };
+    unsafe { *result = env.value(value).is_some_and(|value| !value.is_undefined()) };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_define_properties(
+    env: napi_env,
+    object: napi_value,
+    property_count: usize,
+    properties: *const napi_property_descriptor,
+) -> napi_status {
+    if env.is_null() || object.is_null() || (property_count != 0 && properties.is_null()) {
+        return NAPI_INVALID_ARG;
+    }
+    for index in 0..property_count {
+        let descriptor = unsafe { &*properties.add(index) };
+        let name = if !descriptor.utf8name.is_null() {
+            descriptor.utf8name
+        } else if !descriptor.name.is_null() {
+            let env = unsafe { &mut *env };
+            let Some(name) = (unsafe { env.value(descriptor.name) }) else {
+                return NAPI_INVALID_ARG;
+            };
+            let Ok(name) = std::ffi::CString::new(name.display_string(unsafe { env.ctx() }.heap()))
+            else {
+                return NAPI_INVALID_ARG;
+            };
+            let status = unsafe { define_one_property(env, object, name.as_ptr(), descriptor) };
+            if status != NAPI_OK {
+                return status;
+            }
+            continue;
+        } else {
+            return NAPI_INVALID_ARG;
+        };
+        let status = unsafe { define_one_property(env, object, name, descriptor) };
+        if status != NAPI_OK {
+            return status;
+        }
+    }
+    NAPI_OK
+}
+
+unsafe fn define_one_property(
+    env: napi_env,
+    object: napi_value,
+    name: *const c_char,
+    descriptor: &napi_property_descriptor,
+) -> napi_status {
+    let name_text = unsafe { read_utf8(name, NAPI_AUTO_LENGTH) };
+    let mut property_value = descriptor.value;
+    if descriptor.method.is_some() {
+        let status = unsafe {
+            napi_create_function(
+                env,
+                name,
+                NAPI_AUTO_LENGTH,
+                descriptor.method,
+                descriptor.data,
+                &mut property_value,
+            )
+        };
+        if status != NAPI_OK {
+            return status;
+        }
+    }
+    if !property_value.is_null() {
+        let env = unsafe { &mut *env };
+        let (Some(object), Some(value)) = (unsafe { env.value(object) }, unsafe {
+            env.value(property_value)
+        }) else {
+            return NAPI_INVALID_ARG;
+        };
+        let flags = otter_vm::object::PropertyFlags::new(
+            descriptor.attributes & NAPI_WRITABLE != 0,
+            descriptor.attributes & NAPI_ENUMERABLE != 0,
+            descriptor.attributes & NAPI_CONFIGURABLE != 0,
+        );
+        let defined = unsafe { env.ctx() }.scope(|ctx, scope| {
+            let object = ctx.scoped_value(scope, object);
+            let value = ctx.scoped_value(scope, value);
+            ctx.scoped_define_data(scope, object, &name_text, value, flags)
+        });
+        return match defined {
+            Ok(()) => NAPI_OK,
+            Err(error) => env.fail(error),
+        };
+    }
+
+    let mut getter = ptr::null_mut();
+    if descriptor.getter.is_some() {
+        let status = unsafe {
+            napi_create_function(
+                env,
+                name,
+                NAPI_AUTO_LENGTH,
+                descriptor.getter,
+                descriptor.data,
+                &mut getter,
+            )
+        };
+        if status != NAPI_OK {
+            return status;
+        }
+    }
+    let mut setter = ptr::null_mut();
+    if descriptor.setter.is_some() {
+        let status = unsafe {
+            napi_create_function(
+                env,
+                name,
+                NAPI_AUTO_LENGTH,
+                descriptor.setter,
+                descriptor.data,
+                &mut setter,
+            )
+        };
+        if status != NAPI_OK {
+            return status;
+        }
+    }
+    if getter.is_null() && setter.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+
+    let env = unsafe { &mut *env };
+    let Some(object) = (unsafe { env.value(object) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let getter = unsafe { env.value(getter) };
+    let setter = unsafe { env.value(setter) };
+    let Some(object_constructor) = (unsafe { env.ctx() }).global_value("Object") else {
+        return NAPI_GENERIC_FAILURE;
+    };
+    let defined = unsafe { env.ctx() }.scope(|ctx, scope| {
+        let object = ctx.scoped_value(scope, object);
+        let object_constructor = ctx.scoped_value(scope, object_constructor);
+        let descriptor_object = ctx.scoped_object(scope)?;
+        let name = ctx.scoped_string(scope, &name_text)?;
+        if let Some(getter) = getter {
+            let getter = ctx.scoped_value(scope, getter);
+            ctx.scoped_set(scope, descriptor_object, "get", getter)?;
+        }
+        if let Some(setter) = setter {
+            let setter = ctx.scoped_value(scope, setter);
+            ctx.scoped_set(scope, descriptor_object, "set", setter)?;
+        }
+        let enumerable = ctx.scoped_boolean(scope, descriptor.attributes & NAPI_ENUMERABLE != 0);
+        let configurable =
+            ctx.scoped_boolean(scope, descriptor.attributes & NAPI_CONFIGURABLE != 0);
+        ctx.scoped_set(scope, descriptor_object, "enumerable", enumerable)?;
+        ctx.scoped_set(scope, descriptor_object, "configurable", configurable)?;
+        let define_property = ctx.scoped_get(scope, object_constructor, "defineProperty")?;
+        ctx.call(
+            ctx.escape(define_property),
+            ctx.escape(object_constructor),
+            &[
+                ctx.escape(object),
+                ctx.escape(name),
+                ctx.escape(descriptor_object),
+            ],
+        )?;
+        Ok::<(), NativeError>(())
+    });
+    match defined {
+        Ok(()) => NAPI_OK,
+        Err(error) => env.fail(error),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_set_element(
     env: napi_env,
     object: napi_value,
@@ -1290,6 +1558,43 @@ pub unsafe extern "C" fn napi_create_error(
     result: *mut napi_value,
 ) -> napi_status {
     unsafe { create_error(env, message, result, "Error") }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_create_type_error(
+    env: napi_env,
+    _code: napi_value,
+    message: napi_value,
+    result: *mut napi_value,
+) -> napi_status {
+    unsafe { create_error(env, message, result, "TypeError") }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_get_last_error_info(
+    env: napi_env,
+    result: *mut *const NapiExtendedErrorInfo,
+) -> napi_status {
+    if env.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    unsafe { *result = &(&*env).last_error };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_fatal_exception(env: napi_env, error: napi_value) -> napi_status {
+    unsafe { napi_throw(env, error) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_fatal_error(
+    _location: *const c_char,
+    _location_len: usize,
+    _message: *const c_char,
+    _message_len: usize,
+) -> ! {
+    std::process::abort()
 }
 
 #[unsafe(no_mangle)]
@@ -2308,6 +2613,75 @@ pub unsafe extern "C" fn napi_close_handle_scope(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_open_escapable_handle_scope(
+    env: napi_env,
+    result: *mut napi_escapable_handle_scope,
+) -> napi_status {
+    if env.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let base = env.handles.len();
+    env.scopes.push(base);
+    unsafe {
+        *result = Box::into_raw(Box::new(NapiEscapableHandleScope {
+            base,
+            escaped: None,
+        }))
+    };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_escape_handle(
+    env: napi_env,
+    scope: napi_escapable_handle_scope,
+    escapee: napi_value,
+    result: *mut napi_value,
+) -> napi_status {
+    if env.is_null() || scope.is_null() || escapee.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let scope = unsafe { &mut *scope };
+    if env.scopes.last() != Some(&scope.base) {
+        return NAPI_INVALID_ARG;
+    }
+    if scope.escaped.is_some() {
+        return NAPI_ESCAPE_CALLED_TWICE;
+    }
+    let Some(value) = (unsafe { env.value(escapee) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let root = unsafe { env.ctx() }.persistent_root_insert(value);
+    let handle = Box::new(NapiHandle { root });
+    unsafe { *result = (&*handle as *const NapiHandle).cast_mut().cast() };
+    scope.escaped = Some(handle);
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_close_escapable_handle_scope(
+    env: napi_env,
+    scope: napi_escapable_handle_scope,
+) -> napi_status {
+    if env.is_null() || scope.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let mut scope = unsafe { Box::from_raw(scope) };
+    if env.scopes.pop() != Some(scope.base) {
+        let _ = Box::into_raw(scope);
+        return NAPI_INVALID_ARG;
+    }
+    env.truncate_handles(scope.base);
+    if let Some(handle) = scope.escaped.take() {
+        env.handles.push(handle);
+    }
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_get_version(_env: napi_env, result: *mut u32) -> napi_status {
     if result.is_null() {
         return NAPI_INVALID_ARG;
@@ -2320,6 +2694,7 @@ pub unsafe extern "C" fn napi_get_version(_env: napi_env, result: *mut u32) -> n
 /// discard functions referenced only by a library loaded at runtime.
 pub fn keep_napi_exports() {
     let anchors: &[*const ()] = &[
+        napi_module_register as *const (),
         napi_get_undefined as *const (),
         napi_get_null as *const (),
         napi_get_global as *const (),
@@ -2349,6 +2724,8 @@ pub fn keep_napi_exports() {
         napi_has_named_property as *const (),
         napi_set_property as *const (),
         napi_get_property as *const (),
+        napi_has_property as *const (),
+        napi_define_properties as *const (),
         napi_set_element as *const (),
         napi_get_element as *const (),
         napi_get_cb_info as *const (),
@@ -2361,6 +2738,10 @@ pub fn keep_napi_exports() {
         napi_is_exception_pending as *const (),
         napi_get_and_clear_last_exception as *const (),
         napi_create_error as *const (),
+        napi_create_type_error as *const (),
+        napi_get_last_error_info as *const (),
+        napi_fatal_exception as *const (),
+        napi_fatal_error as *const (),
         napi_strict_equals as *const (),
         napi_is_error as *const (),
         napi_get_prototype as *const (),
@@ -2400,6 +2781,9 @@ pub fn keep_napi_exports() {
         napi_define_class as *const (),
         napi_open_handle_scope as *const (),
         napi_close_handle_scope as *const (),
+        napi_open_escapable_handle_scope as *const (),
+        napi_escape_handle as *const (),
+        napi_close_escapable_handle_scope as *const (),
         napi_get_version as *const (),
         keep_napi_exports as *const (),
     ];

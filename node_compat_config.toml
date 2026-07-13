@@ -28,6 +28,16 @@ args = [
 ]
 timeout_secs = 300
 
+[[integration_tests]]
+module = "napi"
+name = "constructor-registration"
+program = "cargo"
+args = [
+    "test", "-p", "otter-cli", "--test", "node_napi",
+    "node_api_addon_supports_constructor_registration", "--", "--exact",
+]
+timeout_secs = 300
+
 [modules.assert]
 patterns = ["test-assert-*.js", "test-assert.js"]
 skip = [

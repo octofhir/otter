@@ -8,9 +8,21 @@ typedef int napi_status;
 typedef void *napi_deferred;
 typedef void *napi_async_work;
 typedef void *napi_threadsafe_function;
+typedef void *napi_escapable_handle_scope;
 typedef napi_value (*napi_callback)(napi_env, napi_callback_info);
 typedef void (*napi_async_execute_callback)(napi_env, void *);
 typedef void (*napi_async_complete_callback)(napi_env, napi_status, void *);
+
+typedef struct napi_property_descriptor {
+  const char *utf8name;
+  napi_value name;
+  napi_callback method;
+  napi_callback getter;
+  napi_callback setter;
+  napi_value value;
+  int attributes;
+  void *data;
+} napi_property_descriptor;
 
 extern napi_status napi_create_double(napi_env, double, napi_value *);
 extern napi_status napi_create_string_utf8(napi_env, const char *, size_t, napi_value *);
@@ -52,6 +64,15 @@ extern napi_status napi_create_threadsafe_function(
 extern napi_status napi_call_threadsafe_function(napi_threadsafe_function, void *,
                                                  int);
 extern napi_status napi_release_threadsafe_function(napi_threadsafe_function, int);
+extern napi_status napi_define_properties(napi_env, napi_value, size_t,
+                                          const napi_property_descriptor *);
+extern napi_status napi_has_property(napi_env, napi_value, napi_value, _Bool *);
+extern napi_status napi_open_escapable_handle_scope(
+    napi_env, napi_escapable_handle_scope *);
+extern napi_status napi_escape_handle(napi_env, napi_escapable_handle_scope,
+                                      napi_value, napi_value *);
+extern napi_status napi_close_escapable_handle_scope(
+    napi_env, napi_escapable_handle_scope);
 extern napi_status napi_create_promise(napi_env, napi_deferred *, napi_value *);
 extern napi_status napi_resolve_deferred(napi_env, napi_deferred, napi_value);
 extern napi_status napi_create_async_work(napi_env, napi_value, napi_value,
@@ -288,6 +309,30 @@ static napi_value lifecycle_hooks(napi_env env, napi_callback_info info) {
   return result;
 }
 
+static napi_value inspect_descriptors(napi_env env, napi_callback_info info) {
+  (void)info;
+  napi_escapable_handle_scope scope;
+  napi_value answer, escaped, object, key, result;
+  _Bool has_answer = 0;
+
+  napi_open_escapable_handle_scope(env, &scope);
+  napi_create_double(env, 42, &answer);
+  napi_escape_handle(env, scope, answer, &escaped);
+  napi_close_escapable_handle_scope(env, scope);
+
+  napi_create_object(env, &object);
+  napi_property_descriptor descriptor = {"answer", NULL, NULL, NULL,
+                                         NULL, escaped,  7,    NULL};
+  napi_define_properties(env, object, 1, &descriptor);
+  napi_create_string_utf8(env, "answer", NAPI_AUTO_LENGTH, &key);
+  napi_has_property(env, object, key, &has_answer);
+  if (!has_answer) {
+    napi_create_double(env, -1, &result);
+    return result;
+  }
+  return escaped;
+}
+
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_value value;
   napi_add_env_cleanup_hook(env, cleanup_callback, &cleanup_ran);
@@ -329,5 +374,8 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_create_function(env, "lifecycleHooks", NAPI_AUTO_LENGTH,
                        lifecycle_hooks, NULL, &value);
   napi_set_named_property(env, exports, "lifecycleHooks", value);
+  napi_create_function(env, "inspectDescriptors", NAPI_AUTO_LENGTH,
+                       inspect_descriptors, NULL, &value);
+  napi_set_named_property(env, exports, "inspectDescriptors", value);
   return exports;
 }

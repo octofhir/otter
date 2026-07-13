@@ -34,8 +34,8 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
-    TaggedLocationKind, validate_stub_descriptor,
+    STUB_NUMBER_REM_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_TO_BOOLEAN_LEAF,
+    SafepointId, SafepointRecord, TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -393,6 +393,18 @@ pub const STRICT_EQ_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: strict_eq_leaf,
 };
 
+/// Callable ABI entry for the ToBoolean probe.
+pub const TO_BOOLEAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_TO_BOOLEAN_LEAF,
+    entry: to_boolean_leaf,
+};
+
+/// Callable ABI entry for the numeric-remainder probe.
+pub const NUMBER_REM_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_NUMBER_REM_LEAF,
+    entry: number_rem_leaf,
+};
+
 /// Callable ABI entry for `Map.prototype.has`.
 pub const COLLECTION_MAP_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_COLLECTION_MAP_HAS_LEAF,
@@ -461,6 +473,8 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
         id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
+        id if id == STUB_TO_BOOLEAN_LEAF.id => Some(TO_BOOLEAN_LEAF),
+        id if id == STUB_NUMBER_REM_LEAF.id => Some(NUMBER_REM_LEAF),
         _ => None,
     }
 }
@@ -763,6 +777,46 @@ impl Drop for LeafNoAllocGuard {
             );
         }
     }
+}
+
+/// §7.1.2 ToBoolean over one raw operand word (`rhs_bits` is ignored).
+/// Total for every value including heap cells; the only miss is a null heap
+/// pointer (probe harnesses without a live isolate).
+#[must_use]
+pub extern "C" fn to_boolean_leaf(
+    heap: *const otter_gc::GcHeap,
+    value_bits: u64,
+    _ignored: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let value = Value::from_abi_bits(value_bits);
+    let truthy = value.to_boolean(heap);
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(truthy)))
+}
+
+/// Full f64 remainder over two operand words already guarded to be numbers
+/// (the emitted int32 fast path handles the representable cases; this owns
+/// doubles, zero divisors, and the `-0` results int32 cannot express).
+/// A non-number operand misses so the interpreter owns coercion.
+#[must_use]
+pub extern "C" fn number_rem_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let lhs = Value::from_abi_bits(lhs_bits);
+    let rhs = Value::from_abi_bits(rhs_bits);
+    let (Some(a), Some(b)) = (lhs.as_number(), rhs.as_number()) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let rem = a.as_f64() % b.as_f64();
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::number(
+        crate::NumberValue::Double(rem),
+    )))
 }
 
 /// §7.2.15 IsStrictlyEqual over two raw operand words. Total for every value

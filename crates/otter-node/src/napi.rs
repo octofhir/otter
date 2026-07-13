@@ -903,6 +903,37 @@ pub unsafe extern "C" fn napi_call_function(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_new_instance(
+    env: napi_env,
+    constructor: napi_value,
+    argc: usize,
+    argv: *const napi_value,
+    result: *mut napi_value,
+) -> napi_status {
+    if env.is_null() || constructor.is_null() || result.is_null() || (argc != 0 && argv.is_null()) {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(constructor) = (unsafe { env.value(constructor) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let mut args = Vec::with_capacity(argc);
+    for index in 0..argc {
+        let Some(value) = (unsafe { env.value(*argv.add(index)) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        args.push(value);
+    }
+    match unsafe { env.ctx() }.construct(constructor, &args) {
+        Ok(value) => {
+            unsafe { *result = env.root(value) };
+            NAPI_OK
+        }
+        Err(error) => env.fail(error),
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_throw(env: napi_env, error: napi_value) -> napi_status {
     if env.is_null() || error.is_null() {
         return NAPI_INVALID_ARG;
@@ -1153,6 +1184,23 @@ pub unsafe extern "C" fn napi_get_reference_value(
         return NAPI_OK;
     };
     unsafe { *result = env.root(value) };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_reference_ref(
+    _env: napi_env,
+    reference: napi_ref,
+    result: *mut u32,
+) -> napi_status {
+    if reference.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let reference = unsafe { &mut *reference };
+    reference.count = reference.count.saturating_add(1);
+    if !result.is_null() {
+        unsafe { *result = reference.count };
+    }
     NAPI_OK
 }
 
@@ -1714,6 +1762,7 @@ pub fn keep_napi_exports() {
         napi_get_element as *const (),
         napi_get_cb_info as *const (),
         napi_call_function as *const (),
+        napi_new_instance as *const (),
         napi_throw as *const (),
         napi_throw_error as *const (),
         napi_throw_type_error as *const (),
@@ -1727,6 +1776,7 @@ pub fn keep_napi_exports() {
         napi_create_reference as *const (),
         napi_delete_reference as *const (),
         napi_get_reference_value as *const (),
+        napi_reference_ref as *const (),
         napi_reference_unref as *const (),
         napi_wrap as *const (),
         napi_unwrap as *const (),

@@ -61,7 +61,10 @@ const types = {
            t === '[object Boolean]' || t === '[object Symbol]' ||
            t === '[object BigInt]';
   },
-  isNativeError(v) { return v instanceof Error; },
+  isNativeError(v) {
+    return typeof Error.isError === 'function' ? Error.isError(v) :
+      objToString(v) === '[object Error]';
+  },
   isAnyArrayBuffer(v) {
     return tagged('ArrayBuffer')(v) || tagged('SharedArrayBuffer')(v);
   },
@@ -881,6 +884,83 @@ function utf8ToBytes(str) {
   return out;
 }
 
+// Parse Node's dotenv grammar without consulting process.env. Quoted values
+// may span lines, comments only start outside quotes, and only double-quoted
+// values expand the conventional `\n` and `\r` escapes.
+function parseEnv(content) {
+  if (typeof content !== 'string') {
+    throw argTypeError('content', 'argument must be of type string', content);
+  }
+  const result = {};
+  let index = 0;
+  while (index < content.length) {
+    while (index < content.length && /[ \t\r\n]/.test(content[index])) index++;
+    if (index >= content.length) break;
+    if (content[index] === '#') {
+      while (index < content.length && content[index] !== '\n') index++;
+      continue;
+    }
+    const lineStart = index;
+    if (content.slice(index, index + 6) === 'export' && /[ \t]/.test(content[index + 6] || '')) {
+      index += 6;
+      while (content[index] === ' ' || content[index] === '\t') index++;
+    }
+    const keyStart = index;
+    while (index < content.length && content[index] !== '=' &&
+           content[index] !== '\n' && content[index] !== '#') index++;
+    if (content[index] !== '=') {
+      index = lineStart;
+      while (index < content.length && content[index] !== '\n') index++;
+      continue;
+    }
+    const key = content.slice(keyStart, index).trim();
+    index++;
+    while (content[index] === ' ' || content[index] === '\t') index++;
+    let value = '';
+    const quote = content[index];
+    if (quote === '"' || quote === "'" || quote === '`') {
+      const valueStart = ++index;
+      const closing = content.indexOf(quote, valueStart);
+      if (closing === -1) {
+        let lineEnd = content.indexOf('\n', valueStart);
+        if (lineEnd === -1) lineEnd = content.length;
+        value = quote + content.slice(valueStart, lineEnd).trimEnd();
+        index = lineEnd;
+      } else {
+        value = content.slice(valueStart, closing);
+        index = closing + 1;
+        if (quote === '"') value = value.split('\\n').join('\n').split('\\r').join('\r');
+        while (index < content.length && content[index] !== '\n') index++;
+      }
+    } else {
+      const valueStart = index;
+      while (index < content.length && content[index] !== '\n' && content[index] !== '#') index++;
+      value = content.slice(valueStart, index).trim();
+      while (index < content.length && content[index] !== '\n') index++;
+    }
+    if (key) result[key] = value;
+  }
+  return result;
+}
+
+function toUSVString(value) {
+  const input = String(value);
+  let output = '';
+  for (let index = 0; index < input.length; index++) {
+    const first = input.charCodeAt(index);
+    if (first < 0xd800 || first > 0xdfff) {
+      output += input[index];
+    } else if (first <= 0xdbff && index + 1 < input.length) {
+      const second = input.charCodeAt(index + 1);
+      if (second >= 0xdc00 && second <= 0xdfff) output += input[index] + input[++index];
+      else output += '\ufffd';
+    } else {
+      output += '\ufffd';
+    }
+  }
+  return output;
+}
+
 class TextEncoder {
   get encoding() { return 'utf-8'; }
   encode(input = '') { return new Uint8Array(utf8ToBytes(input)); }
@@ -902,6 +982,7 @@ const exportsObj = {
   stripVTControlCharacters,
   styleText,
   TextEncoder,
+  parseEnv,
   isArray: Array.isArray,
   isError(e) { return e instanceof Error || objToString(e) === '[object Error]'; },
   isFunction(v) { return typeof v === 'function'; },
@@ -925,7 +1006,7 @@ const exportsObj = {
       base64: 'base64', base64url: 'base64url', hex: 'hex', ascii: 'ascii' };
     return map[e];
   },
-  toUSVString(s) { return String(s); },
+  toUSVString,
   getSystemErrorName(err) { return `Unknown system error ${err}`; },
   getCallSites(frameCountOrOptions, options) {
     // Node signature: getCallSites([frameCount][, options]). We support

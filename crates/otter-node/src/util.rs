@@ -3,8 +3,8 @@
 //! A practical subset of Node's `util`, implemented as a dependency-free JS
 //! shim ([`SHIM`]) run through [`otter_runtime::run_builtin_cjs_shim`]. `inspect`
 //! (the suite's single most-used helper) and `format` are the focus, alongside
-//! `types`, `promisify`, `inherits`, `isDeepStrictEqual`, `deprecate`, and the
-//! ANSI/style helpers. Replaces the earlier native stub.
+//! `types`, `promisify`, `inherits`, `isDeepStrictEqual`, `deprecate`, dotenv
+//! parsing, USV-string normalization, and the ANSI/style helpers.
 
 use otter_runtime::CapabilitySet;
 use otter_vm::{JsString, NativeCtx, NativeError, Value, native_function};

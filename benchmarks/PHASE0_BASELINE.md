@@ -746,3 +746,36 @@ variance is treated as host contention, not a code signal, and no before/after
 speedup or regression figure is claimed from it. Any real perf recovery is
 deferred to the Phase 9 measurement-driven levers once the coverage base and
 tier-2 prerequisites are in place.
+
+### Phase 2 production BindFunction completion
+
+The template tier now compiles `Op::BindFunction`. The synchronous
+`Interpreter::bind_function_full` is the reentrant sibling of the interpreter's
+frame-push `drive_bind_function`: accessor `name`/`length` getters on the bind
+target run through `run_callable_sync` instead of parking a
+`PendingBindFunction` continuation, so a compiled bind is never resumed after a
+partially observed getter. The single VM metadata reader
+(`callable_bind_metadata_get`) and the single bound-function allocator
+(`finish_bind_function`) are shared with the interpreter, so both tiers observe
+identical Proxy/accessor effects and bound-function shape. The intermediate
+`name` result is held on the traced iteration-anchor stack across the `length`
+getter and the bound allocation; all source operands are re-read from the live
+frame registers after every reentrant call. Every observable getter commits
+before the bound function is allocated; there is no post-effect side exit. A
+bind site with more than four bound arguments still lowers to an exact
+pre-effect side exit and serves loop OSR.
+
+The bind path is reentrant stub 58 (`Variadic`, `StatusWord`); `dst`, `callee`,
+`this`, and `argc` pack into one machine word and the bound-argument registers
+into a second. Template coverage is 78 of 172 active opcodes (up from 77); 94
+remain unsupported.
+
+The focused interpreter/template OSR matrix covers plain bound-argument capture
+and an accessor `name` getter whose call count is observable; the compiled
+counter and every bound result match the interpreter oracle at normal GC and
+under `OTTER_GC_STRESS`. Targeted Test262
+`built-ins/Function/prototype/bind` executed 97 tests with 0 failures,
+timeouts, or crashes (3 skips). The release differential corpus passed 11/11
+under GC stress strides 1 through 16 with verification enabled. The frozen full
+Test262 reference remains 99.02% (51,480/53,173 excluding skips). Performance
+remains subordinate to coverage for this batch.

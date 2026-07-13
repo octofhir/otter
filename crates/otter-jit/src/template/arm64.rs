@@ -33,6 +33,7 @@ mod arith;
 mod calls;
 mod collections;
 mod exceptions;
+mod functions;
 mod iterators;
 mod properties;
 mod transitions;
@@ -613,6 +614,26 @@ pub(super) fn compile(
                     u64::from(iterator),
                     0,
                     0,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::BindFunction {
+                dst,
+                callee,
+                bound_this,
+                argc,
+                packed_args,
+            } => {
+                let packed_meta = u64::from(dst)
+                    | (u64::from(callee) << 16)
+                    | (u64::from(bound_this) << 32)
+                    | (u64::from(argc) << 48);
+                functions::emit_bind_function(
+                    &mut ops,
+                    transitions,
+                    packed_meta,
+                    packed_args,
                     bail,
                     threw,
                 );

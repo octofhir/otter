@@ -253,6 +253,18 @@ pub(crate) enum TemplateOp {
         arg0: Option<u16>,
         arg1: Option<u16>,
     },
+    /// `r<dst> = r<callee>.bind(r<bound_this>, args…)` (`Op::BindFunction`)
+    /// through the shared reentrant bind transition. Accessor `name`/`length`
+    /// getters and bound-function allocation complete in the VM; a
+    /// non-callable target reports a thrown `TypeError`. Argument register
+    /// indices are packed one per 16-bit lane.
+    BindFunction {
+        dst: u16,
+        callee: u16,
+        bound_this: u16,
+        argc: u16,
+        packed_args: u64,
+    },
     /// Install one pre-resolved structured-exception handler.
     EnterTry {
         catch_pc: Option<u32>,
@@ -692,6 +704,25 @@ impl TemplatePlan {
                         byte_pc: lowered.byte_pc,
                         arg0: arguments.first().copied(),
                         arg1: arguments.get(1).copied(),
+                    }
+                }
+                Op::BindFunction => {
+                    let operands = lowered.bind_function_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        osr_only = true;
+                        instructions.push(TemplateInstr {
+                            pc,
+                            op: TemplateOp::UnsupportedBail,
+                        });
+                        continue;
+                    }
+                    TemplateOp::BindFunction {
+                        dst: operands.dst,
+                        callee: operands.callee,
+                        bound_this: operands.bound_this,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_method_arg_regs(arguments),
                     }
                 }
                 Op::EnterTry => {

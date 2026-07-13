@@ -112,6 +112,35 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
     }
 }
 
+/// Complete one `Op::BindFunction`. `packed_meta` is
+/// `dst | callee<<16 | this<<32 | argc<<48`; `packed_args` holds the bound-arg
+/// registers. `0` means the VM committed the bind and the template may fall
+/// through; `1` reports a parked throw; `2` remains an exact pre-effect side
+/// exit for an absent activation.
+pub(crate) extern "C" fn jit_bind_function_stub(
+    ctx: *mut JitCtx,
+    packed_meta: u64,
+    packed_args: u64,
+    _reserved0: u64,
+    _reserved1: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return STATUS_BAILED;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_bind_function(context, stack, ctx.frame_index, packed_meta, packed_args) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            STATUS_THREW
+        }
+    }
+}
+
 /// Publish one machine-constructed [`JitCtx`] before its compiled entry can
 /// reach an allocating/reentrant safepoint. Returns `0` on success and parks a
 /// stack-overflow error in the shared slot on failure.

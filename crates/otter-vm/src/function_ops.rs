@@ -528,6 +528,117 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Complete one `Op::BindFunction` synchronously for a compiled frame.
+    ///
+    /// This is the reentrant sibling of the interpreter's frame-push
+    /// [`Self::drive_bind_function`]: accessor `name`/`length` getters on the
+    /// bind target run through [`Self::run_callable_sync`] instead of parking a
+    /// [`PendingBindFunction`] continuation, so the JIT never resumes a
+    /// partially observed bind. The single VM metadata reader
+    /// ([`Self::callable_bind_metadata_get`]) and the single allocator
+    /// ([`Self::finish_bind_function`]) are shared with the interpreter, so both
+    /// tiers observe identical Proxy/accessor effects and bound-function shape.
+    /// Every observable getter commits before the bound function is allocated;
+    /// there is no post-effect side exit.
+    pub(crate) fn bind_function_full(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        top_idx: usize,
+        dst: u16,
+        callee_reg: u16,
+        this_reg: u16,
+        arg_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let target = *read_register(&stack[top_idx], callee_reg)?;
+        if !self.is_callable_runtime(&target) {
+            return Err(VmError::NotCallable);
+        }
+
+        // §20.2.3.2 — read `name`, then `length`. Each may be an accessor whose
+        // getter runs `this = target`; the frame source registers stay live
+        // roots, so re-read the target after every reentrant call.
+        let target_name = match self.callable_bind_metadata_get(context, &target, "name")? {
+            BindMetadataGet::Value(value) => value,
+            BindMetadataGet::Getter(getter) => {
+                let receiver = *read_register(&stack[top_idx], callee_reg)?;
+                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+            }
+        };
+
+        // Anchor the produced name across the length getter and the bound-
+        // function allocation so a moving collection cannot strand it.
+        let name_anchor = self.push_iteration_anchor(target_name) - 1;
+
+        let target = *read_register(&stack[top_idx], callee_reg)?;
+        let target_length = match self.callable_bind_metadata_get(context, &target, "length")? {
+            BindMetadataGet::Value(value) => value,
+            BindMetadataGet::Getter(getter) => {
+                let receiver = *read_register(&stack[top_idx], callee_reg)?;
+                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+            }
+        };
+
+        let target_name = self.iteration_anchor(name_anchor);
+        let target = *read_register(&stack[top_idx], callee_reg)?;
+        let bound_this = *read_register(&stack[top_idx], this_reg)?;
+        let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(arg_regs.len());
+        for &reg in arg_regs {
+            bound_args.push(*read_register(&stack[top_idx], reg)?);
+        }
+        let result = self.finish_bind_function(
+            stack,
+            dst,
+            target,
+            bound_this,
+            bound_args,
+            target_name,
+            target_length,
+        );
+        self.pop_iteration_anchors_to(name_anchor);
+        result
+    }
+
+    /// Complete one `Op::BindFunction` for a published compiled frame.
+    ///
+    /// `packed_meta` carries `dst | callee<<16 | this<<32 | argc<<48`; the low
+    /// `argc` 16-bit lanes of `packed_args` name the bound-argument registers.
+    /// The lowering guarantees `argc <= MAX_METHOD_ARGS`, so the four lanes are
+    /// sufficient.
+    pub fn jit_runtime_bind_function(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        packed_meta: u64,
+        packed_args: u64,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        if frame_index + 1 != stack.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        let saved_pc = stack[frame_index].pc;
+        let dst = packed_meta as u16;
+        let callee_reg = (packed_meta >> 16) as u16;
+        let this_reg = (packed_meta >> 32) as u16;
+        let argc = ((packed_meta >> 48) & 0xffff) as usize;
+        let mut arg_regs: SmallVec<[u16; 4]> = SmallVec::with_capacity(argc);
+        for i in 0..argc {
+            arg_regs.push(((packed_args >> (16 * i)) & 0xffff) as u16);
+        }
+        self.bind_function_full(
+            context,
+            stack,
+            frame_index,
+            dst,
+            callee_reg,
+            this_reg,
+            &arg_regs,
+        )?;
+        stack[frame_index].pc = saved_pc;
+        Ok(())
+    }
+
     pub(crate) fn run_vm_intrinsic_sync(
         &mut self,
         context: &ExecutionContext,

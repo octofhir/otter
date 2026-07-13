@@ -925,6 +925,18 @@ pub const STUB_JIT_ITERATOR_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes `Function.prototype.bind` — accessor `name`/`length` getters and
+/// bound-function allocation — through the VM's full bind semantics.
+pub const STUB_JIT_BIND_FUNCTION: RuntimeStubDescriptor = descriptor(
+    58,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -986,6 +998,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         55 => "jit_numeric_op",
         56 => "jit_exception_op",
         57 => "jit_iterator_op",
+        58 => "jit_bind_function",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1049,6 +1062,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_NUMERIC_OP,
     STUB_JIT_EXCEPTION_OP,
     STUB_JIT_ITERATOR_OP,
+    STUB_JIT_BIND_FUNCTION,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

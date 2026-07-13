@@ -1256,6 +1256,13 @@ pub enum NativeError {
         /// The thrown value. Foundation: rendered to a string.
         message: String,
     },
+    /// A host ABI requested a catchable ordinary JavaScript `Error` with an
+    /// already-finalized message (for example Node-API's `napi_throw_error`).
+    #[error("{message}")]
+    Error {
+        /// Human-readable error message.
+        message: String,
+    },
     /// A JS error carrying a Node-style `.code` (`ERR_*`). `kind` selects the
     /// error class; `code` becomes an own property on the thrown instance.
     /// Native modules use this for structured `error.code` (no string munging).

@@ -7,14 +7,20 @@
 //!
 //! # Contents
 //! - [`fs`] - permission-gated `node:fs` / `fs` helpers.
+//! - [`napi`] - stable Node-API ABI and `.node` dynamic-library loader.
 //! - [`HOSTED_MODULES`] - static Node hosted-module specs.
 //! - [`NodeApiBuilderExt`] - convenience helper for runtime builders.
 //!
 //! # Invariants
 //! - Node modules are opt-in and are not installed by `otter-runtime` itself.
 //! - Permission checks happen at the Rust boundary before host resources open.
+//! - Native addons require both read and FFI capabilities and expose VM values
+//!   through persistent-root-backed ABI handles.
 //! - Host state is owned Rust data; no VM values, handles, or contexts are
 //!   stored in futures or long-lived module state.
+//!
+//! # See also
+//! - [`otter_runtime::CommonJsAddonLoader`]
 
 pub mod assert;
 pub mod buffer;
@@ -27,6 +33,7 @@ pub mod globals;
 pub mod internal_errors_ext;
 pub mod internal_test_binding_ext;
 pub mod misc_modules;
+pub mod napi;
 pub mod node_test;
 pub mod os;
 pub mod path;
@@ -125,6 +132,16 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
         "vm",
         HostedModuleInstall::new(misc_modules::install_noop),
         misc_modules::vm_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "node:process",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::process_cjs_value,
+    ),
+    HostedModule::new_with_cjs_value(
+        "process",
+        HostedModuleInstall::new(misc_modules::install_noop),
+        misc_modules::process_cjs_value,
     ),
     HostedModule::new_with_cjs_value(
         "node:path",
@@ -423,6 +440,7 @@ pub trait NodeApiBuilderExt: Sized {
 impl NodeApiBuilderExt for RuntimeBuilder {
     fn with_node_apis(self) -> Self {
         self.with_nodejs_modules()
+            .commonjs_addon_loader(napi::load_addon)
             .global_installer(globals::node_globals_installer())
             .hosted_modules(HOSTED_MODULES.iter().copied())
     }
@@ -431,6 +449,7 @@ impl NodeApiBuilderExt for RuntimeBuilder {
 impl NodeApiBuilderExt for OtterBuilder {
     fn with_node_apis(self) -> Self {
         self.with_nodejs_modules()
+            .commonjs_addon_loader(napi::load_addon)
             .global_installer(globals::node_globals_installer())
             .hosted_modules(HOSTED_MODULES.iter().copied())
     }

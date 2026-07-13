@@ -902,6 +902,17 @@ pub const STUB_JIT_NUMERIC_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes structured exception-region state changes and abrupt unwinds.
+pub const STUB_JIT_EXCEPTION_OP: RuntimeStubDescriptor = descriptor(
+    56,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusPair,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -961,6 +972,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         53 => "jit_construct",
         54 => "jit_coerce_unary",
         55 => "jit_numeric_op",
+        56 => "jit_exception_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1022,6 +1034,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CONSTRUCT,
     STUB_JIT_COERCE_UNARY,
     STUB_JIT_NUMERIC_OP,
+    STUB_JIT_EXCEPTION_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

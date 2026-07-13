@@ -13,9 +13,12 @@
 //! # See also
 //! - `super::super::abi` — machine-visible entry context.
 
-use otter_vm::{Value, VmError};
+use otter_vm::{JitExceptionOutcome, Value, VmError};
 
-use super::super::{JitCtx, JitRet, STATUS_RETURNED, STATUS_THREW, unpack_method_arg_regs};
+use super::super::{
+    JitCtx, JitRet, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED, STATUS_THREW,
+    unpack_method_arg_regs,
+};
 
 pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     // SAFETY: every `JitCtx` is built with an initialized error slot that lives
@@ -23,6 +26,53 @@ pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     // the same pointer.
     unsafe {
         *ctx.error = Some(err);
+    }
+}
+
+/// Complete one structured-exception opcode. Unlike ordinary status-word
+/// transitions this returns the full compiled-entry pair: a committed handler
+/// mutation may continue, resume at a dynamic logical PC, return a value, or
+/// propagate a parked error.
+pub(crate) extern "C" fn jit_exception_op_stub(
+    ctx: *mut JitCtx,
+    opcode: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> JitRet {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
+    match vm.jit_runtime_exception_op(
+        context,
+        stack,
+        ctx.frame_index,
+        opcode as u8,
+        arg0,
+        arg1,
+        arg2,
+    ) {
+        Ok(JitExceptionOutcome::Continue) => JitRet {
+            value: 0,
+            status: STATUS_CONTINUE,
+        },
+        Ok(JitExceptionOutcome::Resume(pc)) => JitRet {
+            value: u64::from(pc),
+            status: STATUS_BAILED,
+        },
+        Ok(JitExceptionOutcome::Return(value)) => JitRet {
+            value: value.to_bits(),
+            status: STATUS_RETURNED,
+        },
+        Err(err) => {
+            park_jit_error(ctx, err);
+            JitRet {
+                value: 0,
+                status: STATUS_THREW,
+            }
+        }
     }
 }
 

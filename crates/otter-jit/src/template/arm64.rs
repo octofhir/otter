@@ -32,6 +32,7 @@
 mod arith;
 mod calls;
 mod collections;
+mod exceptions;
 mod properties;
 mod transitions;
 mod values;
@@ -39,6 +40,7 @@ mod values;
 use std::collections::BTreeMap;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
+use otter_bytecode::Op;
 use otter_vm::JitCompileSnapshot;
 
 use self::arith::{
@@ -85,6 +87,7 @@ pub(super) fn compile(
     let mut numeric_slow_paths = Vec::new();
     let mut ops = Assembler::new().expect("assembler alloc");
     let bail = ops.new_dynamic_label();
+    let returned = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
     let labels: BTreeMap<u32, DynamicLabel> = plan
         .instructions
@@ -479,19 +482,99 @@ pub(super) fn compile(
                     threw,
                 )?;
             }
+            TemplateOp::EnterTry {
+                catch_pc,
+                finally_pc,
+                exception_register,
+            } => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::EnterTry as u8,
+                    u64::from(catch_pc.unwrap_or(u32::MAX)),
+                    u64::from(finally_pc.unwrap_or(u32::MAX)),
+                    u64::from(exception_register),
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
+            TemplateOp::LeaveTry => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::LeaveTry as u8,
+                    0,
+                    0,
+                    0,
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
+            TemplateOp::Throw { src } => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::Throw as u8,
+                    u64::from(src),
+                    0,
+                    0,
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
+            TemplateOp::EndFinally => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::EndFinally as u8,
+                    0,
+                    0,
+                    0,
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
+            TemplateOp::PopParkedFinally { count } => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::PopParkedFinally as u8,
+                    u64::from(count),
+                    0,
+                    0,
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
+            TemplateOp::JumpViaFinally { target, floor } => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::JumpViaFinally as u8,
+                    u64::from(target),
+                    u64::from(floor),
+                    0,
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
             TemplateOp::Return { src } => {
                 let off = reg_offset(src)?;
                 dynasm!(ops
                     ; .arch aarch64
                     ; ldr x0, [x19, off]
-                    ; movz x1, STATUS_RETURNED as u32
+                    ; b =>returned
                 );
-                emit_epilogue(&mut ops);
             }
             TemplateOp::ReturnUndefined => {
                 emit_load_u64(&mut ops, 0, VALUE_UNDEFINED);
-                dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
-                emit_epilogue(&mut ops);
+                dynasm!(ops ; .arch aarch64 ; b =>returned);
             }
             TemplateOp::UnsupportedBail => {
                 dynasm!(ops ; .arch aarch64 ; b =>bail);
@@ -507,6 +590,14 @@ pub(super) fn compile(
         emit_numeric_slow_paths(&mut ops, transitions, numeric_slow_paths, bail, threw);
         emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, bail, threw);
     }
+
+    // Shared normal-return epilogue. `x0` already carries the boxed value.
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>returned
+        ; movz x1, STATUS_RETURNED as u32
+    );
+    emit_epilogue(&mut ops);
 
     // Shared exact-side-exit epilogue: status = bailed, value = 0. The frame
     // PC stamped at the exiting instruction names the uncommitted opcode.

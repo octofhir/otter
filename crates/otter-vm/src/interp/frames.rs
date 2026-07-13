@@ -409,43 +409,56 @@ impl Interpreter {
         completion: crate::cold_frame::AbruptKind,
         floor: u32,
     ) -> Result<Option<Value>, VmError> {
-        use crate::cold_frame::AbruptKind;
+        let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        match self.advance_abrupt_frame(&mut stack[top_idx], completion, floor)? {
+            crate::cold_frame::AbruptFrameOutcome::Resume => Ok(None),
+            crate::cold_frame::AbruptFrameOutcome::Return(value) => self.pop_frame(stack, value),
+        }
+    }
+
+    /// Advance one abrupt completion inside a live frame without changing the
+    /// HoltStack shape. Compiled code uses the same handler walk, then returns
+    /// a normal completion to the VM-owned frame-pop boundary when necessary.
+    pub(crate) fn advance_abrupt_frame(
+        &mut self,
+        frame: &mut Frame,
+        completion: crate::cold_frame::AbruptKind,
+        floor: u32,
+    ) -> Result<crate::cold_frame::AbruptFrameOutcome, VmError> {
+        use crate::cold_frame::{AbruptFrameOutcome, AbruptKind};
         loop {
-            let top_idx = stack.len() - 1;
             let handler_count = self
-                .frame_cold(&stack[top_idx])
+                .frame_cold(frame)
                 .map(|c| c.handlers.len() as u32)
                 .unwrap_or(0);
             if handler_count <= floor {
                 return match completion {
                     AbruptKind::Jump(pc) => {
-                        stack[top_idx].pc = pc;
-                        Ok(None)
+                        frame.pc = pc;
+                        Ok(AbruptFrameOutcome::Resume)
                     }
-                    AbruptKind::Return(v) => self.pop_frame(stack, v),
+                    AbruptKind::Return(v) => Ok(AbruptFrameOutcome::Return(v)),
                 };
             }
-            let handler = self
-                .frame_cold_mut(&mut stack[top_idx])
-                .and_then(|c| c.handlers.pop());
+            let handler = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
             // §14.15.3 — discard completions parked by `finally`
             // blocks this completion abandons (depth above the
             // remaining handler stack).
-            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+            if let Some(cold) = self.frame_cold_mut(frame) {
                 let len = cold.handlers.len() as u32;
                 cold.parked_finally.retain(|(_, depth)| *depth <= len);
             }
             match handler {
                 Some(h) if h.finally_pc.is_some() => {
                     let finally_pc = h.finally_pc.expect("finally_pc checked");
-                    let cold = self.frame_ensure_cold(&mut stack[top_idx]);
+                    let cold = self.frame_ensure_cold(frame);
                     let depth = cold.handlers.len() as u32;
                     cold.parked_finally.push((
                         crate::cold_frame::ParkedFinally::Abrupt(completion, floor),
                         depth,
                     ));
-                    stack[top_idx].pc = finally_pc;
-                    return Ok(None);
+                    frame.pc = finally_pc;
+                    return Ok(AbruptFrameOutcome::Resume);
                 }
                 // Catch-only handler crossed by the abrupt completion:
                 // pop it (cleanup) and keep walking.
@@ -453,10 +466,10 @@ impl Interpreter {
                 None => {
                     return match completion {
                         AbruptKind::Jump(pc) => {
-                            stack[top_idx].pc = pc;
-                            Ok(None)
+                            frame.pc = pc;
+                            Ok(AbruptFrameOutcome::Resume)
                         }
-                        AbruptKind::Return(v) => self.pop_frame(stack, v),
+                        AbruptKind::Return(v) => Ok(AbruptFrameOutcome::Return(v)),
                     };
                 }
             }

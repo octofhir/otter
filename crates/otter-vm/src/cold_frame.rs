@@ -52,6 +52,15 @@ pub enum AbruptKind {
     Jump(u32),
 }
 
+/// Frame-local result of advancing an [`AbruptKind`] without changing the
+/// owning HoltStack shape.
+pub(crate) enum AbruptFrameOutcome {
+    /// Execution resumes in the same frame at its updated PC.
+    Resume,
+    /// No finally remains; the frame boundary must return this value.
+    Return(Value),
+}
+
 /// A completion parked while its `finally` block runs (§14.15.3
 /// Try-statement evaluation: B's completion replaces F when B is
 /// abrupt). One entry per in-flight `finally`, innermost on top; the

@@ -11,9 +11,9 @@
 //! - Built strictly on top of the shared typed lowering pass: operand decoding,
 //!   duplicate-PC detection, and branch-target verification happen exactly once
 //!   before any backend opens an assembler.
-//! - Structured exception opcodes reject whole-function entry compilation;
-//!   other unsupported opcodes become canonical-PC pre-effect side exits and
-//!   make the body loop-OSR-only.
+//! - Structured exception opcodes carry pre-resolved canonical handlers into
+//!   the shared VM completion transition; other unsupported opcodes become
+//!   canonical-PC pre-effect side exits and make the body loop-OSR-only.
 //! - Branch targets are canonical instruction indices already proven to name
 //!   instruction boundaries; back edges are classified here so every backend
 //!   places its cooperative poll identically.
@@ -253,6 +253,23 @@ pub(crate) enum TemplateOp {
         arg0: Option<u16>,
         arg1: Option<u16>,
     },
+    /// Install one pre-resolved structured-exception handler.
+    EnterTry {
+        catch_pc: Option<u32>,
+        finally_pc: Option<u32>,
+        exception_register: u16,
+    },
+    /// Leave the innermost handler, parking normal-finally completion when
+    /// required.
+    LeaveTry,
+    /// Throw `r<src>` through the canonical VM unwind implementation.
+    Throw { src: u16 },
+    /// Resume the completion parked by the active finally body.
+    EndFinally,
+    /// Abandon `count` parked finally completions.
+    PopParkedFinally { count: u32 },
+    /// Run finally bodies down to `floor`, then jump to `target`.
+    JumpViaFinally { target: u32, floor: u32 },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -654,6 +671,31 @@ impl TemplatePlan {
                         arg1: arguments.get(1).copied(),
                     }
                 }
+                Op::EnterTry => {
+                    let operands = lowered.exception_region_operands()?;
+                    TemplateOp::EnterTry {
+                        catch_pc: operands.catch_pc,
+                        finally_pc: operands.finally_pc,
+                        exception_register: operands.exception_register,
+                    }
+                }
+                Op::LeaveTry => TemplateOp::LeaveTry,
+                Op::Throw => TemplateOp::Throw {
+                    src: lowered.source_operands()?.src,
+                },
+                Op::EndFinally => TemplateOp::EndFinally,
+                Op::PopParkedFinally => {
+                    let count = u32::try_from(lowered.immediate_operands()?.value)
+                        .map_err(|_| Unsupported::OperandShape("PopParkedFinally count"))?;
+                    TemplateOp::PopParkedFinally { count }
+                }
+                Op::JumpViaFinally => {
+                    let operands = lowered.jump_via_finally_operands()?;
+                    TemplateOp::JumpViaFinally {
+                        target: operands.target,
+                        floor: operands.floor,
+                    }
+                }
                 Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan
@@ -869,15 +911,49 @@ mod tests {
     }
 
     #[test]
-    fn plan_rejects_the_whole_function_on_an_unsupported_opcode() {
+    fn plan_maps_structured_exception_region_completion() {
         let v = view(&[
-            (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
+            (
+                Op::EnterTry,
+                vec![
+                    Operand::Imm32(1),
+                    Operand::Imm32(otter_vm::NO_HANDLER_OFFSET),
+                    Operand::Register(3),
+                ],
+            ),
+            (Op::LeaveTry, vec![]),
             (Op::Throw, vec![Operand::Register(1)]),
-            (Op::ReturnValue, vec![Operand::Register(1)]),
+            (Op::EndFinally, vec![]),
+            (Op::PopParkedFinally, vec![Operand::Imm32(1)]),
+            (
+                Op::JumpViaFinally,
+                vec![Operand::Imm32(0), Operand::Imm32(0)],
+            ),
+            (Op::ReturnUndefined, vec![]),
         ]);
+        let plan = TemplatePlan::build(&v).expect("exception plan");
+        assert!(!plan.osr_only);
         assert_eq!(
-            TemplatePlan::build(&v).err(),
-            Some(Unsupported::Opcode(Op::Throw))
+            plan.instructions[0].op,
+            TemplateOp::EnterTry {
+                catch_pc: Some(2),
+                finally_pc: None,
+                exception_register: 3,
+            }
+        );
+        assert_eq!(plan.instructions[1].op, TemplateOp::LeaveTry);
+        assert_eq!(plan.instructions[2].op, TemplateOp::Throw { src: 1 });
+        assert_eq!(plan.instructions[3].op, TemplateOp::EndFinally);
+        assert_eq!(
+            plan.instructions[4].op,
+            TemplateOp::PopParkedFinally { count: 1 }
+        );
+        assert_eq!(
+            plan.instructions[5].op,
+            TemplateOp::JumpViaFinally {
+                target: 6,
+                floor: 0,
+            }
         );
     }
 

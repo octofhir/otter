@@ -361,7 +361,8 @@ The passive native ABI now defines fixed-width C-layout `VmThread`,
 `CodeDependency` records plus VM/stub/build versions. Golden host tests assert
 sizes and offsets. Runtime stubs carry explicit effects; leaf descriptors reject
 allocation, GC, throw, reentry, and safepoints, while allocating/reentrant stubs
-require a safepoint. The current 17 descriptors form a dense checked inventory.
+require a safepoint. The current 56 descriptors form a dense checked inventory;
+the structured-exception transition is descriptor 56 and table version 4.
 
 Code lifetime is explicit: invalidate and unlink entry first, retain active
 code anchors until no frame can return, then retire/reclaim. Derived object,
@@ -558,7 +559,7 @@ numbers retain their inline paths; observable `@@toPrimitive`, `valueOf`, and
 transition blocks are emitted in the function's cold tail so they do not split
 hot fast-path blocks. Source, primitive intermediate, and result are held in the
 handle arena, and the destination frame register is committed only after
-successful completion. The runtime-stub table is version 2 with coercion stub
+successful completion. The runtime-stub table uses layout version 4 with coercion stub
 54. Its production outcomes are handled-or-threw; the bail result exists only
 for an isolate-less ABI probe. No raw heap mutation, manual value-root vector,
 or derived moving-GC pointer was added.
@@ -613,8 +614,8 @@ and `Neg` retain their inline Number paths; BigInt, uncommon Number encodings,
 and observable update coercion complete through the same VM register helpers as
 interpreter dispatch. `Pow` and `BitwiseNot` are now template operations rather
 than unsupported side exits. Their cold completion blocks are outlined after
-the hot instruction stream. The runtime-stub table is version 3 with numeric
-stub 55.
+the hot instruction stream. The runtime-stub table remains layout version 4 with numeric
+stub 55 and structured-exception stub 56.
 
 The generic `CallMethodValue` transition also owns missing/non-callable errors
 after method resolution. Once an accessor or Proxy `[[Get]]` has run, the stub
@@ -655,3 +656,41 @@ same-checkpoint Crypto before score, so no speedup is claimed for Crypto. Every
 Otter run emitted the suite score marker. Bun failed each combined run with
 `ReferenceError: setupEngine is not defined`; those Bun observations are
 non-scoreable and do not affect the validated Otter scores.
+
+### Phase 2 production structured-exception completion
+
+The template tier now compiles `EnterTry`, `LeaveTry`, `Throw`, `EndFinally`,
+`PopParkedFinally`, and `JumpViaFinally` for whole-function entry. Lowering
+consumes the CodeBlock's pre-resolved canonical exception regions. Handler
+mutation, throw routing, finally resumption, and abrupt completion walking use
+the VM's existing frame/cold-state helpers through reentrant stub 56 (runtime
+stub table version 4). A committed effect returns a dynamic same-frame
+continuation or a value; it never exact-side-exits and replays the opcode.
+Unhandled compiled throws retain the originating frame snapshot and thrown
+value across direct-call boundaries.
+
+The active template opcode support delta is six newly compiled exception
+opcodes: 65 -> 71 supported active bytecodes, and 107 -> 101 remaining
+unsupported opcodes. The previous whole-function rejection for the four core
+exception opcodes is removed; `PopParkedFinally` and `JumpViaFinally` no longer
+force an OSR-only body. Remaining unsupported families are iterator/generator
+ladders, async suspension, spread/eval/class-construction variants, and other
+cold bytecodes outside this existing plan.
+
+The targeted exception matrix passed interpreter/template parity, catch and
+finally effect counters, abrupt return and loop jumps, direct compiled-callee
+throw propagation, and whole-function entry with zero OSR attempts. JIT 38/38,
+VM 716/716, runtime 153/153 unit tests (two pre-existing ignored), relevant
+clippy `-D warnings`, cross-chunk/template corpus, and the full runtime
+integration suite passed. `OTTER_GC_STRESS=1` exception coverage also passed;
+the prior 11/11 difftest corpus remains passing at stress strides 1..16 with
+GC verification. The frozen Test262 reference remains 99.02% (51,480/53,173,
+excluding skipped tests); no full-corpus rerun was required for this compiled
+execution-only batch.
+
+Three scoreable V8 v7 runs after the batch produced medians Richards `536`,
+DeltaBlue `277`, Crypto `490`, and Splay `1,303`, versus the preceding
+documented medians `525`, `279`, `546`, and `1,246`. These are observed
+workload deltas of `+2.1%`, `-0.7%`, `-10.3%`, and `+4.6%` respectively (higher
+is better); the Crypto regression is retained as measured. Bun again failed
+with `ReferenceError: setupEngine is not defined` and is non-scoreable.

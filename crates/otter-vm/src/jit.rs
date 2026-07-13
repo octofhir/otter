@@ -38,6 +38,21 @@ use crate::{
     native_abi::{SafepointId, SafepointRecord},
 };
 
+/// Canonical handlers owned by one compiled `EnterTry` instruction.
+///
+/// This is an owned scalar view of the CodeBlock control-flow table. The JIT
+/// consumes these already-resolved logical PCs and never decodes relative
+/// exception targets independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitExceptionRegion {
+    /// Catch entry, absent for a `try/finally` region.
+    pub catch_pc: Option<u32>,
+    /// Finally entry, absent for a catch-only region.
+    pub finally_pc: Option<u32>,
+    /// Register receiving the thrown value on catch entry.
+    pub exception_register: u16,
+}
+
 /// Owned compile request for one bytecode function.
 #[derive(Debug, Clone)]
 pub struct JitCompileRequest {
@@ -670,6 +685,17 @@ impl JitInstructionMetadata {
     #[must_use]
     pub fn operand_view<'a>(&self, code_block: &'a CodeBlock) -> crate::OperandView<'a> {
         code_block.operand_view(self.resolve(code_block))
+    }
+
+    /// Pre-resolved exception handlers for this `EnterTry` instruction.
+    #[must_use]
+    pub fn exception_region(&self, code_block: &CodeBlock) -> Option<JitExceptionRegion> {
+        let region = code_block.exception_region(self.instruction_pc(code_block))?;
+        Some(JitExceptionRegion {
+            catch_pc: region.catch_pc,
+            finally_pc: region.finally_pc,
+            exception_register: region.exception_register,
+        })
     }
 }
 

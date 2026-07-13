@@ -256,6 +256,9 @@ pub(super) fn compile(
                     threw,
                 );
             }
+            TemplateOp::LoadRegExp { dst, constant } => {
+                transitions::emit_load_regexp(&mut ops, transitions, dst, constant, threw);
+            }
             TemplateOp::LoadGlobal { dst, name } => {
                 transitions::emit_load_global(
                     &mut ops,

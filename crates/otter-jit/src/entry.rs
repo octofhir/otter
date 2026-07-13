@@ -286,6 +286,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_LOOSE_EQ,
             jit_loose_eq_stub as *const () as usize,
         ),
+        binding(
+            abi::STUB_JIT_LOAD_REGEXP,
+            jit_load_regexp_stub as *const () as usize,
+        ),
     ]
 }
 

@@ -839,6 +839,28 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Typed JIT allocation operation for `LoadRegExp`: materialize a fresh
+    /// RegExp from the constant-pool `(pattern, flags)` through the isolate
+    /// compile cache and publish it to the frame's destination register.
+    /// The frame PC is saved and restored so a later guard bail re-runs the
+    /// compiled body from its entry.
+    ///
+    /// # Errors
+    /// Propagates an invalid-pattern `SyntaxError` and allocation failure.
+    pub fn jit_runtime_load_regexp(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst: u16,
+        idx: u32,
+    ) -> Result<(), VmError> {
+        let saved_pc = stack[frame_index].pc;
+        let result = self.run_load_regexp_reg(context, &mut stack[frame_index], dst, idx);
+        stack[frame_index].pc = saved_pc;
+        result
+    }
+
     pub(crate) fn run_array_push_regs(
         &mut self,
         stack: &mut HoltStack,

@@ -40,7 +40,7 @@ mod entry;
 mod template;
 
 pub use code::CompiledCode;
-pub use entry::Unsupported;
+pub use entry::{TransitionTable, Unsupported};
 pub use template::{TemplateCode, compile};
 
 /// Baseline JIT compiler implementation wired into `otter-vm` through the
@@ -49,14 +49,26 @@ pub use template::{TemplateCode, compile};
 /// Drives the [`template`] compiler — the one production tier. There is no
 /// environment or runtime toggle for compiler selection; hosts opt out of
 /// native execution by not installing the hook at all.
-#[derive(Debug, Default)]
-pub struct BaselineJitCompiler;
+#[derive(Default)]
+pub struct BaselineJitCompiler {
+    /// Hook-lifetime resolution of the transition inventory; every compile
+    /// bakes entry addresses through this table.
+    transitions: TransitionTable,
+}
+
+impl std::fmt::Debug for BaselineJitCompiler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaselineJitCompiler").finish()
+    }
+}
 
 impl BaselineJitCompiler {
     /// Construct the production baseline JIT compiler hook.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            transitions: TransitionTable::resolve(),
+        }
     }
 }
 
@@ -74,7 +86,7 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
-        match template::compile(&request.snapshot, request.code_object_id) {
+        match template::compile(&request.snapshot, request.code_object_id, &self.transitions) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),

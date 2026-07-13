@@ -13,6 +13,8 @@
 //! - [`runtime_ops`] — typed C ABI runtime transition entries.
 //! - [`code`] — [`enter_compiled`], the shared activation-to-entry invocation.
 //! - [`runtime_stub_bindings`] — the complete JIT-owned transition inventory.
+//! - [`TransitionTable`] — hook-lifetime descriptor-id-indexed resolution of
+//!   that inventory for O(1) compile-time address baking.
 //!
 //! # Invariants
 //! - Compiled functions are `extern "C" fn(*mut JitCtx) -> JitRet`. A normal
@@ -50,6 +52,80 @@ pub(crate) use value_abi::*;
 /// this tag before an inline shape-slot read, since every cell value word is a
 /// bare cage offset with no class tag of its own.
 pub(crate) const OBJECT_BODY_TYPE_TAG: u32 = 0x11;
+
+/// Hook-lifetime resolution of the JIT-owned transition inventory.
+///
+/// Built once when the compiler hook is constructed and reused by every
+/// compilation: entries are indexed by descriptor id and validated against
+/// the descriptor's signature family, so a compile bakes addresses through
+/// one O(1) lookup instead of re-resolving the binding inventory.
+pub struct TransitionTable {
+    /// `(entry_addr, signature)` indexed by `descriptor.id - 1`; VM-owned
+    /// slots (resolved through their own compile-time accessors) stay vacant.
+    entries: Box<[(u64, Option<otter_vm::native_abi::RuntimeStubSignature>)]>,
+}
+
+impl Default for TransitionTable {
+    fn default() -> Self {
+        Self::resolve()
+    }
+}
+
+impl TransitionTable {
+    /// Resolve and validate the complete JIT-owned binding inventory.
+    #[must_use]
+    pub fn resolve() -> Self {
+        let descriptors = otter_vm::native_abi::RUNTIME_STUB_DESCRIPTORS;
+        let mut entries = vec![(0u64, None); descriptors.len()].into_boxed_slice();
+        for binding in runtime_stub_bindings() {
+            let descriptor = descriptors[binding.id as usize - 1];
+            assert_eq!(descriptor.id, binding.id);
+            assert_eq!(descriptor.signature, binding.signature);
+            assert_ne!(binding.entry_addr, 0);
+            entries[binding.id as usize - 1] = (binding.entry_addr as u64, Some(binding.signature));
+        }
+        Self { entries }
+    }
+
+    /// Validated machine entry for `descriptor`.
+    ///
+    /// Panics on an unbound id or a signature-family mismatch: both are
+    /// compiler-construction bugs, not runtime conditions.
+    pub(crate) fn entry(&self, descriptor: otter_vm::native_abi::RuntimeStubDescriptor) -> u64 {
+        let (addr, signature) = self.entries[descriptor.id as usize - 1];
+        assert_eq!(
+            signature,
+            Some(descriptor.signature),
+            "runtime stub {} has no JIT binding for its signature family",
+            descriptor.id
+        );
+        addr
+    }
+
+    /// Validated machine entry for a status-reporting `Variadic` transition.
+    pub(crate) fn variadic_entry(
+        &self,
+        descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
+    ) -> u64 {
+        assert_eq!(
+            descriptor.signature,
+            otter_vm::native_abi::RuntimeStubSignature::Variadic
+        );
+        self.entry(descriptor)
+    }
+
+    /// Validated machine entry for a `NullaryValue` producer.
+    pub(crate) fn nullary_value_entry(
+        &self,
+        descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
+    ) -> u64 {
+        assert_eq!(
+            descriptor.signature,
+            otter_vm::native_abi::RuntimeStubSignature::NullaryValue
+        );
+        self.entry(descriptor)
+    }
+}
 
 /// JIT-owned runtime transitions installed into the isolate entry table at
 /// compiler-hook install. Each binding names its VM descriptor id and

@@ -39,7 +39,10 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use libloading::Library;
 use otter_runtime::CapabilitySet;
@@ -67,7 +70,9 @@ const NAPI_STRING_EXPECTED: napi_status = 3;
 const NAPI_FUNCTION_EXPECTED: napi_status = 5;
 const NAPI_NUMBER_EXPECTED: napi_status = 6;
 const NAPI_BOOLEAN_EXPECTED: napi_status = 7;
+const NAPI_GENERIC_FAILURE: napi_status = 9;
 const NAPI_PENDING_EXCEPTION: napi_status = 10;
+const NAPI_CLOSING: napi_status = 16;
 
 const NAPI_UNDEFINED: c_int = 0;
 const NAPI_NULL: c_int = 1;
@@ -114,10 +119,80 @@ pub struct NapiAsyncWork {
     queued: bool,
 }
 
-#[derive(Default)]
+struct NapiThreadsafeFunction {
+    library: Arc<Library>,
+    thread_count: AtomicUsize,
+    closing: AtomicBool,
+    finalize_data: usize,
+    finalize_callback: usize,
+    context: usize,
+}
+
 struct NapiState {
+    library: Arc<Library>,
     wraps: Mutex<Vec<NapiWrap>>,
     externals: Mutex<Vec<NapiExternal>>,
+    cleanup_hooks: Mutex<Vec<NapiCleanupHook>>,
+    finalizers: Mutex<Vec<NapiFinalizer>>,
+}
+
+impl NapiState {
+    fn new(library: Arc<Library>) -> Self {
+        Self {
+            library,
+            wraps: Mutex::new(Vec::new()),
+            externals: Mutex::new(Vec::new()),
+            cleanup_hooks: Mutex::new(Vec::new()),
+            finalizers: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Drop for NapiState {
+    fn drop(&mut self) {
+        let _keep_library_loaded = &self.library;
+        for hook in self
+            .cleanup_hooks
+            .get_mut()
+            .expect("napi cleanup hooks lock")
+            .drain(..)
+            .rev()
+        {
+            let callback: unsafe extern "C" fn(*mut c_void) =
+                unsafe { std::mem::transmute(hook.callback) };
+            unsafe { callback(hook.data as *mut c_void) };
+        }
+        for finalizer in self
+            .finalizers
+            .get_mut()
+            .expect("napi finalizers lock")
+            .drain(..)
+            .rev()
+        {
+            let callback: unsafe extern "C" fn(napi_env, *mut c_void, *mut c_void) =
+                unsafe { std::mem::transmute(finalizer.callback) };
+            unsafe {
+                callback(
+                    ptr::null_mut(),
+                    finalizer.data as *mut c_void,
+                    finalizer.hint as *mut c_void,
+                )
+            };
+        }
+    }
+}
+
+struct NapiCleanupHook {
+    callback: usize,
+    data: usize,
+}
+
+struct NapiFinalizer {
+    object_root: PersistentRootId,
+    callback: usize,
+    data: usize,
+    hint: usize,
+    remove_with_wrap: bool,
 }
 
 struct NapiWrap {
@@ -237,6 +312,17 @@ fn make_uint8_array(ctx: &mut NativeCtx<'_>, bytes: &[u8]) -> Result<Value, Nati
     })
 }
 
+fn make_uint8_array_len(ctx: &mut NativeCtx<'_>, length: usize) -> Result<Value, NativeError> {
+    let constructor = ctx
+        .global_value("Uint8Array")
+        .ok_or_else(|| invalid("napi_create_buffer", "Uint8Array is unavailable"))?;
+    ctx.scope(|ctx, scope| {
+        let constructor = ctx.scoped_value(scope, constructor);
+        let length = ctx.scoped_number(scope, length as f64);
+        ctx.construct(ctx.escape(constructor), &[ctx.escape(length)])
+    })
+}
+
 unsafe fn find_external(env: &mut NapiEnv, value: Value) -> Option<usize> {
     let externals: Vec<(PersistentRootId, usize)> = env
         .state
@@ -334,7 +420,7 @@ pub fn load_addon(
         let exports = ctx.scoped_object(scope)?;
         Ok::<Value, NativeError>(ctx.escape(exports))
     })?;
-    let state = Arc::new(NapiState::default());
+    let state = Arc::new(NapiState::new(library.clone()));
     let mut env = NapiEnv::new(ctx, library, state);
     let exports_handle = env.root(exports);
     let returned = unsafe { register(&mut env, exports_handle) };
@@ -615,8 +701,8 @@ pub unsafe extern "C" fn napi_coerce_to_object(
 pub unsafe extern "C" fn napi_create_external(
     env: napi_env,
     data: *mut c_void,
-    _finalize: *mut c_void,
-    _hint: *mut c_void,
+    finalize: *mut c_void,
+    hint: *mut c_void,
     result: *mut napi_value,
 ) -> napi_status {
     if env.is_null() || result.is_null() {
@@ -638,6 +724,19 @@ pub unsafe extern "C" fn napi_create_external(
                     value: root,
                     data: data as usize,
                 });
+            if !finalize.is_null() {
+                env.state
+                    .finalizers
+                    .lock()
+                    .expect("napi finalizers lock")
+                    .push(NapiFinalizer {
+                        object_root: root,
+                        callback: finalize as usize,
+                        data: data as usize,
+                        hint: hint as usize,
+                        remove_with_wrap: false,
+                    });
+            }
             unsafe { *result = env.root(value) };
             NAPI_OK
         }
@@ -1354,8 +1453,8 @@ pub unsafe extern "C" fn napi_wrap(
     env: napi_env,
     object: napi_value,
     data: *mut c_void,
-    _finalize: *mut c_void,
-    _hint: *mut c_void,
+    finalize: *mut c_void,
+    hint: *mut c_void,
     result: *mut napi_ref,
 ) -> napi_status {
     if env.is_null() || object.is_null() {
@@ -1377,6 +1476,19 @@ pub unsafe extern "C" fn napi_wrap(
             object: root,
             data: data as usize,
         });
+    if !finalize.is_null() {
+        env.state
+            .finalizers
+            .lock()
+            .expect("napi finalizers lock")
+            .push(NapiFinalizer {
+                object_root: root,
+                callback: finalize as usize,
+                data: data as usize,
+                hint: hint as usize,
+                remove_with_wrap: true,
+            });
+    }
     if !result.is_null() {
         return unsafe { napi_create_reference(env, object, 0, result) };
     }
@@ -1445,9 +1557,72 @@ pub unsafe extern "C" fn napi_remove_wrap(
         .lock()
         .expect("napi wraps lock")
         .retain(|wrap| wrap.object != root);
+    env.state
+        .finalizers
+        .lock()
+        .expect("napi finalizers lock")
+        .retain(|finalizer| !(finalizer.remove_with_wrap && finalizer.object_root == root));
     let _ = unsafe { env.ctx() }.persistent_root_remove(root);
     if !result.is_null() {
         unsafe { *result = data as *mut c_void };
+    }
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_add_env_cleanup_hook(
+    env: napi_env,
+    callback: *mut c_void,
+    data: *mut c_void,
+) -> napi_status {
+    if env.is_null() || callback.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    unsafe { &mut *env }
+        .state
+        .cleanup_hooks
+        .lock()
+        .expect("napi cleanup hooks lock")
+        .push(NapiCleanupHook {
+            callback: callback as usize,
+            data: data as usize,
+        });
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_add_finalizer(
+    env: napi_env,
+    object: napi_value,
+    data: *mut c_void,
+    callback: *mut c_void,
+    hint: *mut c_void,
+    result: *mut napi_ref,
+) -> napi_status {
+    if env.is_null() || object.is_null() || callback.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(object_value) = (unsafe { env.value(object) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if !object_value.is_object_type() && !object_value.is_callable() {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    let root = unsafe { env.ctx() }.persistent_root_insert(object_value);
+    env.state
+        .finalizers
+        .lock()
+        .expect("napi finalizers lock")
+        .push(NapiFinalizer {
+            object_root: root,
+            callback: callback as usize,
+            data: data as usize,
+            hint: hint as usize,
+            remove_with_wrap: false,
+        });
+    if !result.is_null() {
+        return unsafe { napi_create_reference(env, object, 0, result) };
     }
     NAPI_OK
 }
@@ -1543,6 +1718,33 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
         unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) }
     };
     match make_uint8_array(unsafe { env.ctx() }, bytes) {
+        Ok(value) => {
+            let pointer = unsafe { env.ctx() }
+                .typed_array_info(value)
+                .map(|(_, _, data, _, _)| data.cast())
+                .unwrap_or(ptr::null_mut());
+            if !result_data.is_null() {
+                unsafe { *result_data = pointer };
+            }
+            unsafe { *result = env.root(value) };
+            NAPI_OK
+        }
+        Err(error) => env.fail(error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_create_buffer(
+    env: napi_env,
+    length: usize,
+    result_data: *mut *mut c_void,
+    result: *mut napi_value,
+) -> napi_status {
+    if env.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    match make_uint8_array_len(unsafe { env.ctx() }, length) {
         Ok(value) => {
             let pointer = unsafe { env.ctx() }
                 .typed_array_info(value)
@@ -1661,6 +1863,124 @@ pub unsafe extern "C" fn napi_is_buffer(
             .is_some_and(|(kind, _, _, _, _)| kind == NAPI_UINT8_ARRAY)
     };
     NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_is_array(
+    env: napi_env,
+    value: napi_value,
+    result: *mut bool,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    match unsafe { env.ctx() }.is_array(value) {
+        Ok(is_array) => {
+            unsafe { *result = is_array };
+            NAPI_OK
+        }
+        Err(error) => env.fail(error),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_is_promise(
+    env: napi_env,
+    value: napi_value,
+    result: *mut bool,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    unsafe { *result = value.is_promise() };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_is_typedarray(
+    env: napi_env,
+    value: napi_value,
+    result: *mut bool,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    unsafe { *result = value.is_typed_array() };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_get_array_length(
+    env: napi_env,
+    value: napi_value,
+    result: *mut u32,
+) -> napi_status {
+    if env.is_null() || value.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(value) = (unsafe { env.value(value) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    let Some(length) = (unsafe { env.ctx() }).array_length(value) else {
+        return NAPI_INVALID_ARG;
+    };
+    unsafe { *result = length.min(u32::MAX as usize) as u32 };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_get_property_names(
+    env: napi_env,
+    object: napi_value,
+    result: *mut napi_value,
+) -> napi_status {
+    if env.is_null() || object.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let Some(object) = (unsafe { env.value(object) }) else {
+        return NAPI_INVALID_ARG;
+    };
+    if !object.is_object_type() && !object.is_callable() {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    let Some(object_constructor) = (unsafe { env.ctx() }).global_value("Object") else {
+        return env.fail(invalid(
+            "napi_get_property_names",
+            "Object constructor is unavailable",
+        ));
+    };
+    let names = unsafe { env.ctx() }.scope(|ctx, scope| {
+        let constructor = ctx.scoped_value(scope, object_constructor);
+        let object = ctx.scoped_value(scope, object);
+        let keys = ctx.get_value_property(ctx.escape(constructor), "keys")?;
+        let keys = ctx.scoped_value(scope, keys);
+        ctx.call(
+            ctx.escape(keys),
+            ctx.escape(constructor),
+            &[ctx.escape(object)],
+        )
+    });
+    match names {
+        Ok(names) => {
+            unsafe { *result = env.root(names) };
+            NAPI_OK
+        }
+        Err(error) => env.fail(error),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1798,22 +2118,86 @@ pub unsafe extern "C" fn napi_delete_async_work(
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn napi_create_threadsafe_function(
-    _env: napi_env,
+    env: napi_env,
     _function: napi_value,
     _resource: napi_value,
     _name: napi_value,
     _max_queue_size: usize,
-    _initial_thread_count: usize,
-    _finalize_data: *mut c_void,
-    _finalize_callback: *mut c_void,
-    _context: *mut c_void,
+    initial_thread_count: usize,
+    finalize_data: *mut c_void,
+    finalize_callback: *mut c_void,
+    context: *mut c_void,
     _call_js_callback: *mut c_void,
     result: *mut napi_threadsafe_function,
 ) -> napi_status {
-    if result.is_null() {
+    if env.is_null() || result.is_null() || initial_thread_count == 0 {
         return NAPI_INVALID_ARG;
     }
-    unsafe { *result = 1usize as napi_threadsafe_function };
+    let function = Box::new(NapiThreadsafeFunction {
+        library: unsafe { &*env }.library.clone(),
+        thread_count: AtomicUsize::new(initial_thread_count),
+        closing: AtomicBool::new(false),
+        finalize_data: finalize_data as usize,
+        finalize_callback: finalize_callback as usize,
+        context: context as usize,
+    });
+    unsafe { *result = Box::into_raw(function).cast() };
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_call_threadsafe_function(
+    function: napi_threadsafe_function,
+    _data: *mut c_void,
+    _mode: c_int,
+) -> napi_status {
+    if function.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let function = unsafe { &*function.cast::<NapiThreadsafeFunction>() };
+    if function.closing.load(Ordering::Acquire) {
+        return NAPI_CLOSING;
+    }
+    // Delivery requires an owned runtime message that wakes and re-enters the
+    // isolate. Returning an explicit failure keeps worker threads from ever
+    // dereferencing a retained mutator-turn context.
+    NAPI_GENERIC_FAILURE
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_release_threadsafe_function(
+    function: napi_threadsafe_function,
+    mode: c_int,
+) -> napi_status {
+    if function.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let function_ref = unsafe { &*function.cast::<NapiThreadsafeFunction>() };
+    if mode == 1 {
+        function_ref.closing.store(true, Ordering::Release);
+    }
+    let previous = function_ref.thread_count.fetch_sub(1, Ordering::AcqRel);
+    if previous == 0 {
+        function_ref.thread_count.store(0, Ordering::Release);
+        return NAPI_INVALID_ARG;
+    }
+    if previous != 1 {
+        return NAPI_OK;
+    }
+    function_ref.closing.store(true, Ordering::Release);
+    let function = unsafe { Box::from_raw(function.cast::<NapiThreadsafeFunction>()) };
+    let _keep_library_loaded = &function.library;
+    if function.finalize_callback != 0 {
+        let callback: unsafe extern "C" fn(napi_env, *mut c_void, *mut c_void) =
+            unsafe { std::mem::transmute(function.finalize_callback) };
+        unsafe {
+            callback(
+                ptr::null_mut(),
+                function.finalize_data as *mut c_void,
+                function.context as *mut c_void,
+            )
+        };
+    }
     NAPI_OK
 }
 
@@ -1988,20 +2372,30 @@ pub fn keep_napi_exports() {
         napi_wrap as *const (),
         napi_unwrap as *const (),
         napi_remove_wrap as *const (),
+        napi_add_env_cleanup_hook as *const (),
+        napi_add_finalizer as *const (),
         napi_create_promise as *const (),
         napi_resolve_deferred as *const (),
         napi_reject_deferred as *const (),
         napi_create_buffer_copy as *const (),
+        napi_create_buffer as *const (),
         napi_create_external_buffer as *const (),
         napi_get_typedarray_info as *const (),
         napi_get_buffer_info as *const (),
         napi_is_buffer as *const (),
+        napi_is_array as *const (),
+        napi_is_promise as *const (),
+        napi_is_typedarray as *const (),
+        napi_get_array_length as *const (),
+        napi_get_property_names as *const (),
         napi_adjust_external_memory as *const (),
         napi_create_async_work as *const (),
         napi_queue_async_work as *const (),
         napi_cancel_async_work as *const (),
         napi_delete_async_work as *const (),
         napi_create_threadsafe_function as *const (),
+        napi_call_threadsafe_function as *const (),
+        napi_release_threadsafe_function as *const (),
         napi_unref_threadsafe_function as *const (),
         napi_define_class as *const (),
         napi_open_handle_scope as *const (),

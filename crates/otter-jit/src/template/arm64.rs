@@ -460,6 +460,9 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
                 emit_epilogue(&mut ops);
             }
+            TemplateOp::UnsupportedBail => {
+                dynasm!(ops ; .arch aarch64 ; b =>bail);
+            }
         }
     }
 
@@ -487,12 +490,29 @@ pub(super) fn compile(
         store_ic_cells.len(),
         "StoreProperty IC count"
     );
+
+    // OSR trampolines: one per verified loop header. Each runs the standard
+    // prologue (establishing the shared entry ABI from the ctx argument) and
+    // branches to the header's body label, so the VM can enter mid-loop with
+    // the live frame registers.
+    let mut osr_entries: BTreeMap<u32, usize> = BTreeMap::new();
+    for &header_pc in view.code_block.loop_headers() {
+        let Some(&target) = labels.get(&header_pc) else {
+            continue;
+        };
+        let offset = ops.offset().0;
+        emit_prologue(&mut ops);
+        dynasm!(ops ; .arch aarch64 ; b =>target);
+        osr_entries.insert(header_pc, offset);
+    }
+
     let buf = ops.finalize().expect("finalize");
     let TemplatePlan {
         register_count,
         register_operands,
         index_operands,
         mut safepoint_records,
+        osr_only,
         ..
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
@@ -506,6 +526,8 @@ pub(super) fn compile(
         load_ic_cells,
         store_ic_cells,
         safepoint_records.into_boxed_slice(),
+        osr_entries,
+        osr_only,
     ))
 }
 

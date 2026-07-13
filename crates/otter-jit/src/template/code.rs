@@ -53,6 +53,11 @@ pub struct TemplateCode {
     store_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
     /// Code-object-owned allocating safepoints, sorted by id.
     safepoint_records: Box<[SafepointRecord]>,
+    /// Loop-header logical PC → assembler offset of its OSR-entry trampoline.
+    osr_entries: std::collections::BTreeMap<u32, usize>,
+    /// `true` when unsupported opcodes were lowered to exact side exits;
+    /// entry selection skips such code and only loop OSR uses it.
+    osr_only: bool,
 }
 
 impl TemplateCode {
@@ -67,6 +72,8 @@ impl TemplateCode {
         load_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
         store_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
         safepoint_records: Box<[SafepointRecord]>,
+        osr_entries: std::collections::BTreeMap<u32, usize>,
+        osr_only: bool,
     ) -> Self {
         const AARCH64_TEMPLATE_ABI: u64 = 0x4136_3454_504c_0001;
         let metadata = CodeObjectMetadata {
@@ -96,6 +103,8 @@ impl TemplateCode {
             load_ic_cells,
             store_ic_cells,
             safepoint_records,
+            osr_entries,
+            osr_only,
         }
     }
 
@@ -123,6 +132,10 @@ impl JitFunctionCode for TemplateCode {
         self.code.len()
     }
 
+    fn osr_only(&self) -> bool {
+        self.osr_only
+    }
+
     fn entry_addr(&self) -> Option<usize> {
         // SAFETY: the mapping is live for `self`; callers must keep the owning
         // code object installed while using this address (the direct-call
@@ -139,6 +152,31 @@ impl JitFunctionCode for TemplateCode {
             .binary_search_by_key(&safepoint_id, |record| record.id)
             .ok()
             .map(|index| &self.safepoint_records[index])
+    }
+
+    fn osr_entry(
+        &self,
+        activation: VmRuntimeActivation,
+        logical_pc: u32,
+    ) -> Option<JitExecOutcome> {
+        if !self.metadata.is_compatible_with_current_vm() {
+            return None;
+        }
+        let offset = *self.osr_entries.get(&logical_pc)?;
+        // SAFETY: `offset` is an assembler offset recorded for this buffer and
+        // points at a prologue trampoline emitted with the shared entry ABI.
+        let entry = unsafe { self.code.ptr_at(offset) };
+        // SAFETY: same reentry contract as `run_entry`.
+        Some(unsafe {
+            enter_compiled(
+                activation,
+                entry,
+                self.code_object_id,
+                self.function_id,
+                self.register_count,
+                !self.safepoint_records.is_empty(),
+            )
+        })
     }
 
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {

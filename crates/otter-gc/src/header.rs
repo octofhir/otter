@@ -128,7 +128,26 @@ pub struct GcHeader {
     size_bytes: u32,
 }
 
+/// Type tag reserved for free-space fillers in old-space pages. A filler
+/// header keeps the page's linear object walk intact over reclaimed
+/// ranges; it is never traced, never dropped, and never registered in the
+/// trace table.
+pub const FREE_TAG: u8 = u8::MAX;
+
 impl GcHeader {
+    /// Build a free-space filler header covering `size_bytes` (header
+    /// included). Old-generation, white, no flags: the sweeper treats it
+    /// as reclaimable space and the marker can never reach it.
+    #[inline]
+    pub const fn new_free(size_bytes: u32) -> Self {
+        Self {
+            type_tag: FREE_TAG,
+            flags: AtomicU8::new(0),
+            _reserved: 0,
+            size_bytes,
+        }
+    }
+
     /// Build a fresh old-generation header with the given type tag
     /// and total allocation size (header + payload).
     #[inline]

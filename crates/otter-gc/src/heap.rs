@@ -1744,21 +1744,65 @@ impl GcHeap {
         let mut reclaimed = 0usize;
         let mut per_tag_live_count = [0u64; TYPE_TAG_COUNT];
         let mut per_tag_live_bytes = [0usize; TYPE_TAG_COUNT];
+        // Free ranges recovered from partially-live old pages this sweep
+        // (page-absolute cage offset + byte length). Collected locally and
+        // published to the old-space free list after the walk borrows end.
+        let mut free_ranges: Vec<(u32, usize)> = Vec::new();
+        self.old_space.clear_free_list();
         unsafe {
-            // Drop in-place + free per dead old-space object;
-            // accumulate live counts in the same pass.
+            // Old-space sweep: drop dead objects in place, then cover every
+            // maximal dead run with a `FREE_TAG` filler so the page's linear
+            // header walk stays intact and the range becomes reusable
+            // through the free list. A run that ends at the bump cursor is
+            // returned to bump space instead. Live counts accumulate in the
+            // same pass.
             for page in self.old_space.pages() {
-                page.for_each_object(|h, _| {
+                // A fully-dead page is reaped whole below — recording its
+                // ranges would leave dangling free-list entries — but its
+                // corpses still need their one finalize/drop pass (backing
+                // stores, external-memory tokens) before the page memory
+                // returns to the cage.
+                if page.header().live_bytes == 0 {
+                    page.for_each_object(|h, _| {
+                        let tag_u8 = (*h).type_tag();
+                        if tag_u8 != crate::header::FREE_TAG && !(*h).is_swept() {
+                            if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
+                                finalize_fn(h);
+                            }
+                            if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
+                                drop_fn(h);
+                            }
+                            (*h).set_swept();
+                            reclaimed += (*h).size_bytes() as usize;
+                        }
+                    });
+                    continue;
+                }
+                let page_base_offset = page.cage_offset();
+                let base = page.base_ptr();
+                let mut live_allocated = 0usize;
+                let mut run_start: Option<usize> = None;
+                let mut run_bytes = 0usize;
+                let mut close_run = |run_start: &mut Option<usize>, run_bytes: &mut usize| {
+                    if let Some(start) = run_start.take() {
+                        let bytes = std::mem::take(run_bytes);
+                        // SAFETY: the run lies inside this page's payload
+                        // area; every byte of it belonged to swept objects.
+                        let header_ptr = base.add(start) as *mut GcHeader;
+                        std::ptr::write(header_ptr, GcHeader::new_free(bytes as u32));
+                        free_ranges.push((page_base_offset + start as u32, bytes));
+                    }
+                };
+                page.for_each_object(|h, offset| {
                     let tag = (*h).type_tag() as usize;
                     let size = (*h).size_bytes() as usize;
-                    if !(*h).is_marked() {
-                        // Old/large space is non-moving and reaps only
-                        // whole dead pages, so a dropped corpse stays in
-                        // the bump range and is re-walked by later
-                        // sweeps. Drop exactly once — a second
-                        // `drop_in_place` would double-free any buffer
-                        // the payload owns (e.g. a string `Vec<u16>`).
-                        if !(*h).is_swept() {
+                    let aligned = crate::page::align_up(size, crate::page::CELL_SIZE);
+                    let is_free_filler = tag == crate::header::FREE_TAG as usize;
+                    if is_free_filler || !(*h).is_marked() {
+                        // Drop exactly once — a second `drop_in_place`
+                        // would double-free any buffer the payload owns
+                        // (e.g. a string `Vec<u16>`). Fillers own nothing.
+                        if !is_free_filler && !(*h).is_swept() {
                             let tag_u8 = (*h).type_tag();
                             if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
                                 finalize_fn(h);
@@ -1769,11 +1813,27 @@ impl GcHeap {
                             (*h).set_swept();
                             reclaimed += size;
                         }
+                        if run_start.is_none() {
+                            run_start = Some(offset);
+                        }
+                        run_bytes += aligned;
                     } else {
                         per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
                         per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
+                        live_allocated += aligned;
+                        close_run(&mut run_start, &mut run_bytes);
                     }
                 });
+                let header = page.header_mut();
+                if let Some(start) = run_start {
+                    // The final dead run touches the bump cursor: hand it
+                    // straight back to bump allocation.
+                    debug_assert_eq!(start + run_bytes, header.bump_cursor);
+                    header.bump_cursor = start;
+                } else {
+                    close_run(&mut run_start, &mut run_bytes);
+                }
+                header.allocated_bytes = live_allocated;
             }
             for page in self.large_space.pages() {
                 page.for_each_object(|h, _| {
@@ -1839,9 +1899,13 @@ impl GcHeap {
                 false
             }
         });
-        // Reap pages whose live bytes is zero.
+        // Reap pages whose live bytes is zero, then publish the free
+        // ranges recovered from the surviving pages.
         let _ = self.old_space.reap_dead_pages();
         let _ = self.large_space.reap_dead_pages();
+        for (offset, bytes) in free_ranges {
+            self.old_space.push_free_range(offset, bytes);
+        }
 
         self.marking.finish_cycle();
         self.stats.last_full_reclaimed = reclaimed;

@@ -305,6 +305,18 @@ pub(crate) enum TemplateOp {
     /// Obtain an async iterator (including async-from-sync fallback) through
     /// the VM's full observable `@@asyncIterator` transition.
     GetAsyncIterator { dst: u16, src: u16 },
+    /// Complete one global-variable access (`LoadGlobalThis`,
+    /// `LoadGlobalOrUndefined`, `StoreGlobalBinding`, `StoreGlobalChecked`)
+    /// through the shared reentrant global environment-record transition.
+    /// Accessor globals fire their getters/setters in the VM. `arg0`/`arg1`/
+    /// `arg2` name the destination/value register, constant name index, and the
+    /// opcode-specific strictness flag or `exists` register.
+    GlobalOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -779,6 +791,42 @@ impl TemplatePlan {
                     TemplateOp::GetAsyncIterator {
                         dst: operands.dst,
                         src: operands.src,
+                    }
+                }
+                Op::LoadGlobalThis => {
+                    let dst = lowered.destination_operands()?.dst;
+                    TemplateOp::GlobalOp {
+                        opcode: Op::LoadGlobalThis as u8,
+                        arg0: u64::from(dst),
+                        arg1: 0,
+                        arg2: 0,
+                    }
+                }
+                Op::LoadGlobalOrUndefined => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::GlobalOp {
+                        opcode: Op::LoadGlobalOrUndefined as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.constant),
+                        arg2: 0,
+                    }
+                }
+                Op::StoreGlobalBinding => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::GlobalOp {
+                        opcode: Op::StoreGlobalBinding as u8,
+                        arg0: u64::from(operands.value),
+                        arg1: u64::from(operands.name),
+                        arg2: u64::from(operands.extra),
+                    }
+                }
+                Op::StoreGlobalChecked => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::GlobalOp {
+                        opcode: Op::StoreGlobalChecked as u8,
+                        arg0: u64::from(operands.value),
+                        arg1: u64::from(operands.name),
+                        arg2: u64::from(operands.extra),
                     }
                 }
                 Op::LessThan

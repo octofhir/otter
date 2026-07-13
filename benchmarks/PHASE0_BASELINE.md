@@ -779,3 +779,34 @@ timeouts, or crashes (3 skips). The release differential corpus passed 11/11
 under GC stress strides 1 through 16 with verification enabled. The frozen full
 Test262 reference remains 99.02% (51,480/53,173 excluding skips). Performance
 remains subordinate to coverage for this batch.
+
+### Phase 2 production global-access completion
+
+The template tier now compiles the hot global-variable access opcodes:
+`LoadGlobalThis`, `LoadGlobalOrUndefined`, `StoreGlobalBinding`, and
+`StoreGlobalChecked`. They share reentrant runtime stub 59 and dispatch to the
+same `run_*_reg` global environment-record helpers the interpreter uses, so an
+accessor-defined global fires identical getters/setters, the declarative-record
+lexical shadow and const/TDZ checks are identical, and both tiers observe the
+same global-record state. `LoadGlobalOrThrow` was already compiled; this batch
+adds the non-throwing read, the `globalThis` read, and both global stores.
+Accessor getter/setter reentry runs through `run_callable_sync`; a committed
+global effect is never replayed by an exact side exit. The one-time global
+*declaration* opcodes (`DeclareGlobalVar`/`Lex`, `DefineGlobalVar`/`Function`,
+`InitGlobalLex`, `ValidateGlobalDecl`, `GlobalBindingExists`) remain exact side
+exits — they run once at top level, never in a hot loop, so they stay a
+separate low-value follow-up rather than part of the hot-access family.
+
+Template coverage is 82 of 172 active opcodes (up from 78); 90 remain
+unsupported.
+
+The focused interpreter/template OSR matrix covers a plain global-var
+read/write in a hot loop plus an accessor global whose setter call count is
+observable; the compiled counter and every global value match the interpreter
+oracle at normal GC and under `OTTER_GC_STRESS`. Targeted Test262
+`language/expressions/assignment` executed 807/818 (9 pre-existing known
+failures, unchanged from the frozen baseline; 0 crashes) and
+`language/global-code` passed 195/195. The release differential corpus passed
+11/11 under GC stress strides 1 through 16 with verification enabled. The
+frozen full Test262 reference remains 99.02% (51,480/53,173 excluding skips).
+Performance remains subordinate to coverage for this batch.

@@ -34,6 +34,7 @@ mod calls;
 mod collections;
 mod exceptions;
 mod functions;
+mod globals;
 mod iterators;
 mod properties;
 mod transitions;
@@ -634,6 +635,23 @@ pub(super) fn compile(
                     transitions,
                     packed_meta,
                     packed_args,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::GlobalOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                globals::emit_global_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
                     bail,
                     threw,
                 );

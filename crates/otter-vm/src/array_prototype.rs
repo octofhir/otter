@@ -1943,29 +1943,39 @@ impl Interpreter {
     /// else `e` is appended as one element. The combined length must
     /// stay within `2**53 - 1` (TypeError otherwise). Returns the next
     /// write index.
+    /// `e` and `a` are iteration-anchor indices, not raw values: every step
+    /// below (the `@@isConcatSpreadable` read, length coercion, property
+    /// probes, element reads, and the reentrant defines on the output) can
+    /// allocate and scavenge, so the live handles are re-read from their
+    /// collector-rewritten anchor slots after each one.
     fn concat_append_to(
         &mut self,
         context: &ExecutionContext,
-        e: Value,
-        a: Value,
+        e_anchor: usize,
+        a_anchor: usize,
         mut n: u64,
     ) -> Result<u64, VmError> {
         const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
         const TOO_LONG: &str = "concatenated array length exceeds the maximum safe integer";
+        let e = self.iteration_anchor(e_anchor);
         if self.is_concat_spreadable(context, e)? {
+            let e = self.iteration_anchor(e_anchor);
             let len = length_of_array_like(self, context, &e)? as u64;
             if (n as f64) + (len as f64) > MAX_SAFE {
                 return Err(self.err_type(TOO_LONG.to_string().into()));
             }
             for k in 0..len {
                 let key = k.to_string();
+                let e = self.iteration_anchor(e_anchor);
                 if self.ordinary_has_property_value(
                     context,
                     e,
                     &crate::VmPropertyKey::String(&key),
                     0,
                 )? {
+                    let e = self.iteration_anchor(e_anchor);
                     let v = self.get_property_value_for_call(context, e, &key)?;
+                    let a = self.iteration_anchor(a_anchor);
                     self.create_data_property_or_throw(context, a, &n.to_string(), v)?;
                 }
                 n += 1;
@@ -1974,6 +1984,8 @@ impl Interpreter {
             if n as f64 >= MAX_SAFE {
                 return Err(self.err_type(TOO_LONG.to_string().into()));
             }
+            let e = self.iteration_anchor(e_anchor);
+            let a = self.iteration_anchor(a_anchor);
             self.create_data_property_or_throw(context, a, &n.to_string(), e)?;
             n += 1;
         }
@@ -1998,19 +2010,33 @@ impl Interpreter {
         // element is read; elements are then appended via
         // CreateDataProperty so a custom species object / proxy
         // observes each define.
-        let a = self.array_species_create(context, o, 0, roots)?;
-        let mut n: u64 = self.concat_append_to(context, o, a, 0)?;
+        // Anchor the receiver, every argument, and (below) the species
+        // result: each append step is reentrant and allocating, so a moving
+        // scavenge relocates any of them; the anchors are collector-rewritten
+        // slots the loop re-reads.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
         for &item in args {
-            n = self.concat_append_to(context, item, a, n)?;
+            self.push_iteration_anchor(item);
         }
-        // §23.1.3.1 step 4 — Set(A, "length", n).
-        self.array_set_property_throwing(
-            context,
-            a,
-            "length",
-            Value::number(NumberValue::from_f64(n as f64)),
-        )?;
-        Ok(a)
+        let a = self.array_species_create(context, o, 0, roots)?;
+        let a_anchor = self.push_iteration_anchor(a) - 1;
+        let result = (|| {
+            let mut n: u64 = self.concat_append_to(context, o_anchor, a_anchor, 0)?;
+            for index in 0..args.len() {
+                n = self.concat_append_to(context, o_anchor + 1 + index, a_anchor, n)?;
+            }
+            // §23.1.3.1 step 4 — Set(A, "length", n).
+            let a = self.iteration_anchor(a_anchor);
+            self.array_set_property_throwing(
+                context,
+                a,
+                "length",
+                Value::number(NumberValue::from_f64(n as f64)),
+            )?;
+            Ok(self.iteration_anchor(a_anchor))
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     /// §23.1.3.30.1 SortCompare(x, y, comparefn). `undefined` sorts to

@@ -1,8 +1,6 @@
 //! Descriptor-resolved runtime transitions for the template backend.
 //!
 //! # Contents
-//! - [`TransitionTable`] — per-compile resolution of classified stub
-//!   descriptors to validated machine entries.
 //! - Reentrant transition emitters completing whole opcodes in the VM.
 //! - The allocating call-packet emitter publishing a concrete safepoint.
 //!
@@ -21,10 +19,11 @@
 //!   descriptor inventory.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
-use otter_vm::native_abi::{self as abi, RuntimeStubDescriptor, RuntimeStubSignature};
+use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::values::{emit_load_reg, emit_load_u64, emit_store_reg};
+pub(super) use crate::entry::TransitionTable;
 use crate::entry::{
     ALLOC_CTX_CODE_OBJECT_ID_OFFSET, ALLOC_CTX_FRAME_OFFSET, ALLOC_CTX_RESERVED0_OFFSET,
     ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
@@ -32,53 +31,6 @@ use crate::entry::{
     NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, THREAD_OFFSET, Unsupported,
     VALUE_UNDEFINED,
 };
-
-/// Per-compile resolution of the JIT-owned transition inventory.
-///
-/// Entries are resolved by descriptor id at compile time and baked into the
-/// emitted code; the table itself never outlives one compilation.
-pub(super) struct TransitionTable {
-    bindings: Vec<otter_vm::JitRuntimeStubBinding>,
-}
-
-impl TransitionTable {
-    pub(super) fn resolve() -> Self {
-        Self {
-            bindings: crate::entry::runtime_stub_bindings(),
-        }
-    }
-
-    /// Validated machine entry for `descriptor`.
-    ///
-    /// Panics on an unknown id or a signature-family mismatch: both are
-    /// compiler-construction bugs, not runtime conditions.
-    pub(super) fn entry(&self, descriptor: RuntimeStubDescriptor) -> u64 {
-        let binding = self
-            .bindings
-            .iter()
-            .find(|binding| binding.id == descriptor.id)
-            .unwrap_or_else(|| panic!("runtime stub {} has no JIT binding", descriptor.id));
-        assert_eq!(
-            binding.signature, descriptor.signature,
-            "runtime stub {} bound with a different signature family",
-            descriptor.id
-        );
-        assert_ne!(binding.entry_addr, 0);
-        binding.entry_addr as u64
-    }
-
-    /// Validated machine entry for a status-reporting `Variadic` transition.
-    fn variadic_entry(&self, descriptor: RuntimeStubDescriptor) -> u64 {
-        assert_eq!(descriptor.signature, RuntimeStubSignature::Variadic);
-        self.entry(descriptor)
-    }
-
-    /// Validated machine entry for a `NullaryValue` producer.
-    fn nullary_value_entry(&self, descriptor: RuntimeStubDescriptor) -> u64 {
-        assert_eq!(descriptor.signature, RuntimeStubSignature::NullaryValue);
-        self.entry(descriptor)
-    }
-}
 
 /// `blr` to a resolved transition entry and branch to `threw` on a nonzero
 /// status in `x0`. Argument registers must already be set.

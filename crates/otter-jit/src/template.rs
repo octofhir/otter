@@ -41,16 +41,19 @@ mod plan;
 pub use code::TemplateCode;
 pub(crate) use plan::{ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan};
 
-use crate::entry::Unsupported;
+use crate::entry::{TransitionTable, Unsupported};
 
 /// Compile a function view to template machine code under the
-/// isolate-assigned unique code-object identity, or report why not.
+/// isolate-assigned unique code-object identity, or report why not. The
+/// caller provides the hook-lifetime [`TransitionTable`] so per-compile work
+/// stays plan-and-emit only.
 #[cfg(target_arch = "aarch64")]
 pub fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    transitions: &TransitionTable,
 ) -> Result<TemplateCode, Unsupported> {
-    arm64::compile(view, code_object_id)
+    arm64::compile(view, code_object_id, transitions)
 }
 
 /// Non-arm64 stub: the template backend is arm64-only for now.
@@ -58,8 +61,9 @@ pub fn compile(
 pub fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    transitions: &TransitionTable,
 ) -> Result<TemplateCode, Unsupported> {
-    let _ = (view, code_object_id);
+    let _ = (view, code_object_id, transitions);
     Err(Unsupported::OperandShape("template compiler is arm64-only"))
 }
 
@@ -180,7 +184,7 @@ mod tests {
     }
 
     fn compile(view: &JitCompileSnapshot) -> Result<TemplateCode, super::Unsupported> {
-        super::compile(view, 1)
+        super::compile(view, 1, &crate::entry::TransitionTable::resolve())
     }
 
     fn run(view: &JitCompileSnapshot, regs: &mut [u64]) -> Exit {

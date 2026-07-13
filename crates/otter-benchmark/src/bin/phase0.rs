@@ -31,7 +31,7 @@ use otter_benchmark::{
     JitMode, MemoryMetrics, RuntimeMode, ValidationStatus,
 };
 use otter_compiler::compile_script_source;
-use otter_jit::{BaselineJitCompiler, compile};
+use otter_jit::{BaselineJitCompiler, TransitionTable, compile};
 use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_runtime::{
@@ -438,8 +438,9 @@ fn run_call(
 /// Compile the snapshot once through the production template compiler.
 fn compile_once(
     view: &otter_vm::JitCompileSnapshot,
+    transitions: &TransitionTable,
 ) -> Result<Box<dyn otter_vm::JitFunctionCode>, String> {
-    compile(view, 1)
+    compile(view, 1, transitions)
         .map(|code| Box::new(code) as Box<dyn otter_vm::JitFunctionCode>)
         .map_err(|error| format!("{error:?}"))
 }
@@ -560,8 +561,9 @@ fn run_jit_compile(
             );
         }
     }
+    let transitions = TransitionTable::resolve();
     for _ in 0..warmup {
-        if let Err(error) = compile_once(&view) {
+        if let Err(error) = compile_once(&view, &transitions) {
             return result(
                 benchmark,
                 RuntimeMode::Vm,
@@ -577,7 +579,7 @@ fn run_jit_compile(
     let mut code_bytes = None;
     for _ in 0..samples {
         let started = Instant::now();
-        let code = match compile_once(&view) {
+        let code = match compile_once(&view, &transitions) {
             Ok(code) => code,
             Err(error) => {
                 return result(

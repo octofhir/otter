@@ -46,7 +46,6 @@ use self::arith::{
     emit_add_generic, emit_binary_arith, emit_compare, emit_increment, emit_int_bitwise,
     emit_loose_compare, emit_negate, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
-use self::transitions::TransitionTable;
 use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
@@ -68,9 +67,9 @@ const VALUE_UNDEFINED_IMM: u32 = VALUE_UNDEFINED as u32;
 pub(super) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    transitions: &crate::entry::TransitionTable,
 ) -> Result<TemplateCode, Unsupported> {
     let plan = TemplatePlan::build(view)?;
-    let transitions = TransitionTable::resolve();
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let code_block_id = view.code_block.id;
     // Self-patching property IC cells: allocated address-stable before any
@@ -209,7 +208,7 @@ pub(super) fn compile(
             } => {
                 emit_add_generic(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     dst,
                     lhs,
                     rhs,
@@ -230,7 +229,7 @@ pub(super) fn compile(
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::MakeFunction { dst, constant } => {
-                transitions::emit_make_function(&mut ops, &transitions, dst, constant, threw);
+                transitions::emit_make_function(&mut ops, transitions, dst, constant, threw);
             }
             TemplateOp::MakeClosure {
                 dst,
@@ -239,7 +238,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_make_closure(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     code_block_id,
                     dst,
                     function,
@@ -250,7 +249,7 @@ pub(super) fn compile(
             TemplateOp::LoadString { dst, constant } => {
                 transitions::emit_load_string(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     code_block_id,
                     dst,
                     constant,
@@ -260,7 +259,7 @@ pub(super) fn compile(
             TemplateOp::LoadGlobal { dst, name } => {
                 transitions::emit_load_global(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     dst,
                     name,
                     code_block_id,
@@ -268,15 +267,15 @@ pub(super) fn compile(
                 );
             }
             TemplateOp::LoadBuiltinError { dst, constant } => {
-                transitions::emit_load_builtin_error(&mut ops, &transitions, dst, constant, threw);
+                transitions::emit_load_builtin_error(&mut ops, transitions, dst, constant, threw);
             }
             TemplateOp::NewObject { dst } => {
-                transitions::emit_new_object(&mut ops, &transitions, dst, threw);
+                transitions::emit_new_object(&mut ops, transitions, dst, threw);
             }
             TemplateOp::NewArray { dst, elements } => {
                 transitions::emit_new_array(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     dst,
                     plan.register_tail(elements),
                     threw,
@@ -289,7 +288,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_math_call(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     dst,
                     method,
                     plan.register_tail(arguments),
@@ -297,12 +296,12 @@ pub(super) fn compile(
                 )?;
             }
             TemplateOp::FreshUpvalue { index } => {
-                transitions::emit_fresh_upvalue(&mut ops, &transitions, index, threw);
+                transitions::emit_fresh_upvalue(&mut ops, transitions, index, threw);
             }
             TemplateOp::DefineDataProperty { object, key, value } => {
                 transitions::emit_define_data_property(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     object,
                     key,
                     value,
@@ -316,7 +315,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_define_own_property(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     target,
                     key,
                     descriptor,
@@ -328,7 +327,7 @@ pub(super) fn compile(
                 receiver,
                 index,
             } => {
-                transitions::emit_load_element(&mut ops, &transitions, dst, receiver, index, threw);
+                transitions::emit_load_element(&mut ops, transitions, dst, receiver, index, threw);
             }
             TemplateOp::StoreElement {
                 receiver,
@@ -338,7 +337,7 @@ pub(super) fn compile(
             } => {
                 transitions::emit_store_element(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     receiver,
                     index,
                     value,
@@ -347,13 +346,13 @@ pub(super) fn compile(
                 );
             }
             TemplateOp::LoadUpvalue { dst, index } => {
-                transitions::emit_load_upvalue(&mut ops, &transitions, dst, index, threw);
+                transitions::emit_load_upvalue(&mut ops, transitions, dst, index, threw);
             }
             TemplateOp::StoreUpvalue { src, index } => {
-                transitions::emit_store_upvalue(&mut ops, &transitions, src, index, false, threw);
+                transitions::emit_store_upvalue(&mut ops, transitions, src, index, false, threw);
             }
             TemplateOp::StoreUpvalueChecked { src, index } => {
-                transitions::emit_store_upvalue(&mut ops, &transitions, src, index, true, threw);
+                transitions::emit_store_upvalue(&mut ops, transitions, src, index, true, threw);
             }
             TemplateOp::LoadProperty {
                 dst,
@@ -367,7 +366,7 @@ pub(super) fn compile(
                 let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_load_property(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     view,
                     dst,
                     object,
@@ -390,7 +389,7 @@ pub(super) fn compile(
                 let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_store_property(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     view,
                     object,
                     name,
@@ -409,7 +408,7 @@ pub(super) fn compile(
             } => {
                 calls::emit_call(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     dst,
                     callee,
                     argc,
@@ -431,7 +430,7 @@ pub(super) fn compile(
             } => {
                 calls::emit_method_call(
                     &mut ops,
-                    &transitions,
+                    transitions,
                     view,
                     dst,
                     receiver,

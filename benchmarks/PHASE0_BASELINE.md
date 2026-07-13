@@ -400,14 +400,14 @@ atomically fall back to parse/compile and never weaken permission checks.
 `56bc0e56`.** Phase 0 is complete: correctness, differential GC stress,
 startup/call/JIT/module/package timing, managed heap/RSS, whole-runtime native
 code residency, macro compatibility, and same-commit tier evidence are all
-recorded. This decision authorizes the schema/CodeBlock migration sequence; it
-does not approve a default-tier switch or claim performance for any failed
-workload.
+recorded. The subsequent status sections record the completed schema/CodeBlock
+migration and default-tier switch. Failed or unvalidated workloads still receive
+no performance score.
 
 Entry constraints for every Phase 2 vertical slice:
 
-- Keep the old optimizer feature- and environment-gated; its same-commit
-  composite regressed 8.1% and it is not the reference tier.
+- Keep one production template JIT. The legacy baseline emitter and experimental
+  optimizer have been deleted; neither may return as a compatibility stack.
 - Preserve the machine-readable schema-v1 fixtures and semantic markers. Failed
   or unvalidated macro workloads remain non-scoreable.
 - Treat the observed V8 `SIGSEGV` and Octane TypeScript JIT abort as stability
@@ -420,7 +420,7 @@ Entry constraints for every Phase 2 vertical slice:
 - Keep new telemetry default-off and out of dispatch/allocation hot paths unless
   a separately measured overhead gate permits it.
 
-The Phase 2 implementation order is:
+The completed Phase 2 implementation order was:
 
 1. Replace the conservative opcode audit fields with one declarative schema that
    generates exact formats, register reads/writes, successors, effects, verifier,
@@ -439,8 +439,10 @@ The Phase 2 implementation order is:
 6. Switch execution atomically after correctness, metadata-size, and >=1.5x
    dispatch gates; then delete the self-describing frozen execution form,
    byte-to-instruction map, and compatibility adapter.
-7. Only then delete/rebuild baseline machine code over the stable CodeBlock,
-   frame, stub, status, safepoint, and dependency contracts.
+7. Rebuild the production template machine code over the stable CodeBlock,
+   frame, stub, status, safepoint, and dependency contracts, then delete the
+   parallel emitters. This is complete; current work removes measured bailouts
+   from that single production tier.
 
 ### Phase 2 slice 1 status
 
@@ -503,3 +505,101 @@ scored `338/365/349/359/357` (sorted median `357`): approximately `+1.1%`
 versus the preceding `353` checkpoint and `+6.6%` versus the pre-migration
 median `335`. Higher is better; wall times were `2.77/2.04/2.02/2.02/2.10 s`,
 with the first run carrying the expected cold-process/link-cache noise.
+
+### Phase 2 production StoreProperty miss completion
+
+The production template tier now completes every named `StoreProperty` miss in
+place through the VM's shared value-level `[[Set]]` implementation. The inline
+own-data and ordinary shape-transition paths are unchanged. Inherited setters,
+throwing setters, inherited non-writable data, Proxy and exotic receivers,
+primitive receivers, megamorphic sites, and reentrant allocation no longer use
+the store stub's exact side exit. The stub status is now handled-or-threw only,
+so no observable setter or proxy effect can be replayed by interpreter resume.
+The published frame window remains the moving-GC root across the transition;
+new typed-array expando materialisation uses the handle arena and re-reads both
+the typed array and bag after allocation.
+
+The 2026-07-13 proportional gate passed the JIT/VM/runtime suites, relevant
+`clippy -D warnings`, the targeted assignment/accessor/Proxy Test262 subsets,
+and all 11 `otter-difftest` corpus cases under `OTTER_GC_STRESS=1..16` with
+`OTTER_GC_VERIFY=1`. Cross-chunk and in-process template-corpus tests also
+passed at strides 1, 8, and 16. The frozen full Test262 baseline remains
+99.02% (51,480/53,173, excluding skipped tests).
+
+An exploratory TypedArray named-expando readback assertion returned
+`undefined` (serialized as `null`) under `OTTER_GC_STRESS=1` in the interpreter
+oracle, before the tiered half of that assertion ran. The new handle-scoped
+materialisation avoids a stale-body write, but that separate pre-existing
+TypedArray readback gap is not counted as passing or parity coverage here; the
+committed exotic-store matrix uses RegExp `lastIndex` and passes all stress
+strides.
+
+Three-run validated V8 v7 medians before/after were Richards `523 -> 531`,
+DeltaBlue `277 -> 282`, and Splay `1,173 -> 1,231`. The changes are small
+relative to run-to-run variance and are treated as performance-neutral. The
+Octane TypeScript sentinel no longer reproduces the historical
+`jit_store_prop_stub` abort, but Node, Bun, and Otter all reported `Parse
+errors.` and no score marker in this checkout. That run remains failed and
+non-scoreable; it does not clear the broader Octane compatibility sentinel.
+
+### Phase 2 production property-load and coercion completion
+
+The production template tier now also completes named `LoadProperty` misses and
+coercive `ToPrimitive`/`ToNumeric` operations in place. Property loads retain
+their monomorphic own-data fast path; inherited and throwing getters, Proxy
+traps, primitive receivers, megamorphic sites, and allocating reentry use the
+VM's single full `[[Get]]` implementation. The load transition is total on a
+live isolate and returns handled-or-threw, so a getter or proxy effect cannot be
+replayed by an exact side exit.
+
+Lowering preserves the bytecode `ToPrimitive` hint. Immediate primitives and
+numbers retain their inline paths; observable `@@toPrimitive`, `valueOf`, and
+`toString` work enters the shared reentrant VM coercion transition. Per-site
+transition blocks are emitted in the function's cold tail so they do not split
+hot fast-path blocks. Source, primitive intermediate, and result are held in the
+handle arena, and the destination frame register is committed only after
+successful completion. The runtime-stub table is version 2 with coercion stub
+54. Its production outcomes are handled-or-threw; the bail result exists only
+for an isolate-less ABI probe. No raw heap mutation, manual value-root vector,
+or derived moving-GC pointer was added.
+
+The last executed Proxy subset failure was an escaped function from
+`$262.createRealm()` whose VM-raised error incorrectly used the caller realm's
+`TypeError`. Linked bytecode functions now carry a stable scalar realm id, and
+error materialisation selects the top frame's realm through the existing traced
+realm swap. No realm-local GC handle is copied into function metadata.
+
+The first exact regression run under `OTTER_GC_STRESS=3` exposed a separate
+use-after-move during extra-realm `ErrorClassRegistry` finalisation. That run
+crashed and is not counted as passing. Realm bootstrap now publishes a
+provisional `RealmState` into the interpreter's ordinary traced root graph
+before later allocation, re-reads objects after safepoints, and defines each
+JS-visible Error global through a handle scope. After the fix, the exact
+cross-realm Proxy case passed interpreter-only and template execution at every
+stress stride 1 through 16 with `OTTER_GC_VERIFY=1`.
+
+The final targeted Test262 results were assignment `807/816` executed (9 known
+failures, 2 skipped), accessors `435/435` executed (13 skipped),
+`Symbol.toPrimitive` `3/3` executed (1 skipped), and Proxy `275/275` executed
+(36 skipped, zero failures/timeouts/OOM/crashes). Proxy improved by one passing
+test. The frozen full-corpus reference remains 99.02% (51,480/53,173, excluding
+skipped tests); it was not regenerated from a proportional subset.
+
+The JIT (37 tests), VM (716 tests), and runtime (153 tests, 2 pre-existing
+ignored) suites passed, as did relevant all-feature/all-target clippy with
+`-D warnings`. Cross-chunk and template-corpus tests passed at stress strides
+1, 8, and 16. The release differential corpus passed 11/11 across
+`OTTER_GC_STRESS=1..16` with verification enabled.
+
+The first validated build, with coercion slow blocks inline, produced three-run
+V8 v7 medians Richards `519`, DeltaBlue `274`, and Splay `1,130`; three more
+clean Splay scores were `1,169/1,132/1,178`. Moving those transitions to cold
+tails improved the final medians to Richards `522`, DeltaBlue `276`, and Splay
+`1,155`. Final raw scores were `526/520/522`, `276/272/278`, and
+`1,198/1,155/1,137`; every run reported the suite success marker and is
+scoreable. Against the pre-slice medians `531/282/1,231`, the final deltas are
+-1.7%, -2.1%, and -6.2% (higher is better). Cold outlining recovered 2.2% on
+Splay relative to the inline build, but the remaining Splay loss is retained as
+an observed performance regression, not relabelled as noise. The final Octane
+TypeScript sentinel reported `ReferenceError: TypeScript is not defined` for
+Node, Bun, and Otter and produced no score; it remains failed and non-scoreable.

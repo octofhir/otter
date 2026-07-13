@@ -26,9 +26,7 @@
 use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
 
-use crate::entry::{
-    BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag,
-};
+use crate::entry::{BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag};
 
 /// Numeric binary operators lowered to the shared int32/double template.
 /// `+` has its own operation ([`TemplateOp::AddGeneric`]) because its
@@ -122,13 +120,13 @@ pub(crate) enum TemplateOp {
     /// `r<dst> = -ToNumeric(r<src>)` including the `-0` and `-i32::MIN`
     /// double promotions.
     Negate { dst: u16, src: u16 },
-    /// `r<dst> = ToNumeric(r<src>)` — identity on numbers, side exit
-    /// otherwise.
+    /// `r<dst> = ToNumeric(r<src>)` — identity on numbers; coercive cases
+    /// complete through the shared reentrant unary transition.
     ToNumeric { dst: u16, src: u16 },
-    /// `r<dst> = ToPrimitive(r<src>)` — identity on primitives, side exit on
-    /// heap cells and function references so observable coercion hooks run in
-    /// the interpreter.
-    ToPrimitive { dst: u16, src: u16 },
+    /// `r<dst> = ToPrimitive(r<src>, hint)` — identity on primitives;
+    /// observable coercion hooks complete through the reentrant unary
+    /// transition using the compiler-emitted hint token.
+    ToPrimitive { dst: u16, src: u16, hint: u32 },
     /// `r<dst> = r<lhs> + r<rhs>` with the full `+` semantics: inline numeric
     /// paths, an allocating string-concat runtime call rooted through the
     /// published frame at `concat_safepoint`, and the interpreter-completing
@@ -197,8 +195,9 @@ pub(crate) enum TemplateOp {
     StoreUpvalue { src: u16, index: i32 },
     /// `upvalue[index] = r<src>` with the TDZ read guard.
     StoreUpvalueChecked { src: u16, index: i32 },
-    /// `r<dst> = r<object>.name` through the inline WhiskerIC probe and the
-    /// window transition.
+    /// `r<dst> = r<object>.name` through the inline WhiskerIC probe. A miss
+    /// completes the VM's full `[[Get]]` semantics in the window transition;
+    /// it never exact-side-exits after invoking a getter or proxy trap.
     LoadProperty {
         dst: u16,
         object: u16,
@@ -206,8 +205,9 @@ pub(crate) enum TemplateOp {
         site: u64,
         array_length: bool,
     },
-    /// `r<object>.name = r<value>` through the inline WhiskerIC probe and the
-    /// window transition.
+    /// `r<object>.name = r<value>` through the inline WhiskerIC probe. A miss
+    /// completes the VM's full `[[Set]]` semantics in the window transition;
+    /// it never side-exits after invoking user code or committing a store.
     StoreProperty {
         object: u16,
         name: u32,
@@ -725,10 +725,11 @@ impl TemplatePlan {
                     }
                 }
                 Op::ToPrimitive => {
-                    let operands = lowered.unary_operands()?;
+                    let operands = lowered.to_primitive_operands()?;
                     TemplateOp::ToPrimitive {
                         dst: operands.dst,
                         src: operands.src,
+                        hint: operands.hint,
                     }
                 }
                 Op::Return | Op::ReturnValue => TemplateOp::Return {

@@ -3,6 +3,7 @@
 //! # Contents
 //! - Native activation publication and release.
 //! - Direct-call preparation, completion, and bailout recovery.
+//! - Reentrant equality and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
 //! # Invariants
@@ -311,6 +312,41 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
         lhs as u16,
         rhs as u16,
         negate != 0,
+        ctx.regs.cast::<otter_vm::Value>(),
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Complete one `ToPrimitive`/`ToNumeric` opcode in the VM. `0` means the
+/// destination was written, `1` means a coercion hook threw, and `2` is
+/// reserved for an isolate-less probe context with no published activation.
+pub(crate) extern "C" fn jit_coerce_unary_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    src: u64,
+    numeric: u64,
+    hint_index: u64,
+    function_id: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 2;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_coerce_unary_in_place(
+        context,
+        dst as u16,
+        src as u16,
+        numeric != 0,
+        hint_index as u32,
+        function_id as u32,
         ctx.regs.cast::<otter_vm::Value>(),
     ) {
         Ok(()) => 0,

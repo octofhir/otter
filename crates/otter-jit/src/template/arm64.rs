@@ -43,8 +43,9 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::JitCompileSnapshot;
 
 use self::arith::{
-    emit_add_generic, emit_binary_arith, emit_compare, emit_increment, emit_int_bitwise,
-    emit_loose_compare, emit_negate, emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
+    emit_add_generic, emit_binary_arith, emit_coercion_slow_paths, emit_compare, emit_increment,
+    emit_int_bitwise, emit_loose_compare, emit_negate, emit_to_numeric, emit_to_primitive,
+    emit_unsigned_shift_right,
 };
 use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
@@ -76,13 +77,12 @@ pub(super) fn compile(
     // pointer is baked, consumed strictly in emission order, owned by the
     // finalized code object.
     let mut load_ic_cells =
-        vec![crate::entry::WhiskerIcCell::default(); plan.load_property_count]
-            .into_boxed_slice();
+        vec![crate::entry::WhiskerIcCell::default(); plan.load_property_count].into_boxed_slice();
     let mut store_ic_cells =
-        vec![crate::entry::WhiskerIcCell::default(); plan.store_property_count]
-            .into_boxed_slice();
+        vec![crate::entry::WhiskerIcCell::default(); plan.store_property_count].into_boxed_slice();
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
+    let mut coercion_slow_paths = Vec::new();
     let mut ops = Assembler::new().expect("assembler alloc");
     let bail = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
@@ -195,10 +195,23 @@ pub(super) fn compile(
                 emit_negate(&mut ops, dst, src, bail)?;
             }
             TemplateOp::ToNumeric { dst, src } => {
-                emit_to_numeric(&mut ops, dst, src, bail)?;
+                emit_to_numeric(
+                    &mut ops,
+                    dst,
+                    src,
+                    view.code_block.id,
+                    &mut coercion_slow_paths,
+                )?;
             }
-            TemplateOp::ToPrimitive { dst, src } => {
-                emit_to_primitive(&mut ops, dst, src, bail)?;
+            TemplateOp::ToPrimitive { dst, src, hint } => {
+                emit_to_primitive(
+                    &mut ops,
+                    dst,
+                    src,
+                    hint,
+                    view.code_block.id,
+                    &mut coercion_slow_paths,
+                )?;
             }
             TemplateOp::AddGeneric {
                 dst,
@@ -377,7 +390,6 @@ pub(super) fn compile(
                     site,
                     array_length,
                     cell_addr,
-                    bail,
                     threw,
                 )?;
             }
@@ -399,7 +411,6 @@ pub(super) fn compile(
                     value,
                     site,
                     cell_addr,
-                    bail,
                     threw,
                 )?;
             }
@@ -483,6 +494,14 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch aarch64 ; b =>bail);
             }
         }
+    }
+
+    // Preserve the old end-of-stream exact exit while keeping every coercion
+    // transition out of line. Each cold continuation returns to the label
+    // immediately after its source operation's inline fast path.
+    if !coercion_slow_paths.is_empty() {
+        dynasm!(ops ; .arch aarch64 ; b =>bail);
+        emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, bail, threw);
     }
 
     // Shared exact-side-exit epilogue: status = bailed, value = 0. The frame

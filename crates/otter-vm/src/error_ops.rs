@@ -12,6 +12,9 @@
 //! - Error kind names are compiler-emitted string constants.
 //! - Allocated instances come from the interpreter's `ErrorClassRegistry` so
 //!   prototype identity matches `instanceof`.
+//! - VM-raised errors use the top bytecode frame's `[[Realm]]`; linked
+//!   function metadata carries only scalar realm ids, and the existing traced
+//!   realm swap owns all moving-GC state.
 //!
 //! # See also
 //! - [`crate::error_classes`]
@@ -198,6 +201,19 @@ impl Interpreter {
         stack: &HoltStack,
         err: &VmError,
     ) -> Option<Value> {
+        let error_realm_id = stack
+            .last()
+            .and_then(|frame| self.function_realm_ids.get(&frame.function_id))
+            .copied()
+            .unwrap_or(self.active_realm_id);
+        if error_realm_id != self.active_realm_id {
+            return self
+                .with_host_realm_id(error_realm_id, |interp| {
+                    Ok(interp.vm_error_to_throwable_with_stack_roots(context, stack, err))
+                })
+                .ok()
+                .flatten();
+        }
         use crate::run_control::ErrorDetail;
         let is_oom = matches!(err, VmError::OutOfMemory { .. });
         // Node-style `.code` to stamp on the instance after it is built.

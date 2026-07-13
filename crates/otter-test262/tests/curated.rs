@@ -123,6 +123,42 @@ assert.sameValue(typeof globalThis.realmOnly, "undefined");
 }
 
 #[test]
+fn escaped_bytecode_function_raises_in_its_origin_realm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let corpus = synth_corpus(&tmp);
+    let path = write_test(
+        &corpus,
+        "realm/escaped-function-error.js",
+        r#"/*---
+description: escaped bytecode functions retain their origin error realm
+flags: [onlyStrict]
+features: [cross-realm, Proxy]
+---*/
+const other = $262.createRealm();
+const callRevoked = other.evalScript(`
+  (function() {
+    var proxyObj = Proxy.revocable(function() {}, {});
+    var proxy = proxyObj.proxy;
+    var revoke = proxyObj.revoke;
+    revoke();
+    return proxy();
+  })
+`);
+let caught = null;
+try {
+  callRevoked();
+} catch (error) {
+  caught = error;
+}
+assert.sameValue(caught instanceof other.global.TypeError, true);
+assert.sameValue(caught instanceof TypeError, false);
+"#,
+    );
+    let outcome = drive(&corpus, &path);
+    assert!(matches!(outcome, Outcome::Pass), "got {outcome:?}");
+}
+
+#[test]
 fn create_realm_preserves_iterator_realm_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let corpus = synth_corpus(&tmp);

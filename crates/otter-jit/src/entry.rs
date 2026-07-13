@@ -294,6 +294,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_CONSTRUCT,
             jit_construct_stub as *const () as usize,
         ),
+        binding(
+            abi::STUB_JIT_COERCE_UNARY,
+            jit_coerce_unary_stub as *const () as usize,
+        ),
     ]
 }
 
@@ -484,6 +488,26 @@ mod tests {
                 .map(|operands| operands.src),
             Ok(3)
         );
+    }
+
+    #[test]
+    fn lowering_plan_preserves_to_primitive_hint() {
+        let v = view(&[
+            (
+                Op::ToPrimitive,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(7),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ]);
+        let plan = BaselinePlan::build(&v).expect("plan");
+        let operands = plan.instructions[0]
+            .to_primitive_operands()
+            .expect("ToPrimitive operands");
+        assert_eq!((operands.dst, operands.src, operands.hint), (1, 0, 7));
     }
 
     #[test]

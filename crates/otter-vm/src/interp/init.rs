@@ -3,11 +3,14 @@
 //! # Contents
 //! - `new` / `with_string_heap_cap` bootstrap the heap, realm surfaces,
 //!   shape runtime, caches, and JIT state.
+//! - Host-realm construction publishes a provisional traced `RealmState`
+//!   before any later allocation and finalizes JS-visible error globals through
+//!   the handle arena.
 //! - Introspection accessors expose property-IC and JIT counters.
 //!
 //! # Invariants
-//! - Every partially built GC graph is owned by an RAII root scope until its
-//!   fields move into the completed interpreter.
+//! - Every partially built GC graph is owned either by an RAII bootstrap root
+//!   scope or by the interpreter's ordinary traced realm graph.
 //! - Root providers are dropped before their stack slots move into the
 //!   interpreter, and no GC allocation occurs during that move.
 //! - A half-built interpreter is never observable outside this module.
@@ -241,6 +244,9 @@ impl Interpreter {
             error_classes,
             global_this,
             extra_realms: Vec::new(),
+            active_realm_id: 0,
+            next_realm_id: 1,
+            function_realm_ids: rustc_hash::FxHashMap::default(),
             active_realm_is_extra: false,
             eval_hook: None,
             pending_generator_throw: None,
@@ -399,20 +405,48 @@ impl Interpreter {
         );
     }
 
-    fn build_realm_state(&mut self) -> Result<RealmState, VmError> {
+    fn build_realm_state(&mut self, id: u32) -> Result<usize, VmError> {
         let error_classes = ErrorClassRegistry::new(&mut self.gc_heap).map_err(crate::oom_to_vm)?;
+        let state_index = self.extra_realms.len();
+        self.extra_realms.push(RealmState {
+            id,
+            // Temporary duplicate of the active global. Moving-GC can now
+            // trace `error_classes` through the normal Interpreter root walk
+            // while the real realm global is built below; no raw root slots or
+            // contributor-facing heap API are needed.
+            global_this: self.global_this,
+            error_classes,
+            realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
+            array_iterator_prototype: None,
+            map_iterator_prototype: None,
+            set_iterator_prototype: None,
+            string_iterator_prototype: None,
+            regexp_string_iterator_prototype: None,
+            iterator_helper_prototype: None,
+            wrap_for_valid_iterator_prototype: None,
+        });
+        let result = self.initialize_realm_state(state_index);
+        if result.is_err() {
+            self.extra_realms.remove(state_index);
+        }
+        result.map(|()| state_index)
+    }
+
+    fn initialize_realm_state(&mut self, state_index: usize) -> Result<(), VmError> {
         let global_this = bootstrap::build_global_this(&mut self.gc_heap, &self.well_known_symbols)
             .map_err(|err| {
                 self.err_type((format!("createRealm bootstrap failed: {err}")).into())
             })?;
+        self.extra_realms[state_index].global_this = global_this;
         crate::intrinsics::symbol::install_symbol_well_knowns_post_bootstrap(
             &mut self.gc_heap,
-            global_this,
+            self.extra_realms[state_index].global_this,
             &self.well_known_symbols,
         )
         .map_err(|err| {
             self.err_type((format!("createRealm Symbol bootstrap failed: {err}")).into())
         })?;
+        let global_this = self.extra_realms[state_index].global_this;
         let function_prototype = resolve_ctor_prototype(&mut self.gc_heap, global_this, "Function");
         if let Some(function_prototype) = function_prototype {
             let has_instance = self
@@ -428,31 +462,26 @@ impl Interpreter {
             .map_err(|err| {
                 self.err_type((format!("createRealm Function bootstrap failed: {err}")).into())
             })?;
+            // The installer above allocates. Re-read both objects from the
+            // rooted realm graph instead of using pre-safepoint raw handles.
+            let global_this = self.extra_realms[state_index].global_this;
+            let function_prototype =
+                resolve_ctor_prototype(&mut self.gc_heap, global_this, "Function")
+                    .ok_or(VmError::InvalidOperand)?;
             if let Some(object_prototype) =
                 resolve_ctor_prototype(&mut self.gc_heap, global_this, "Object")
             {
-                error_classes.finalize_after_bootstrap(
-                    &mut self.gc_heap,
+                self.finalize_extra_realm_error_classes(
+                    state_index,
                     function_prototype,
                     object_prototype,
-                    global_this,
-                );
+                )?;
             }
         }
         let mut realm_intrinsics = realm_intrinsics::RealmIntrinsics::default();
+        let global_this = self.extra_realms[state_index].global_this;
         realm_intrinsics.populate(&mut self.gc_heap, global_this);
-        let mut state = RealmState {
-            global_this,
-            error_classes,
-            realm_intrinsics,
-            array_iterator_prototype: None,
-            map_iterator_prototype: None,
-            set_iterator_prototype: None,
-            string_iterator_prototype: None,
-            regexp_string_iterator_prototype: None,
-            iterator_helper_prototype: None,
-            wrap_for_valid_iterator_prototype: None,
-        };
+        self.extra_realms[state_index].realm_intrinsics = realm_intrinsics;
         if let Some(iter_proto) = object::get(global_this, &self.gc_heap, "Iterator")
             .and_then(|ctor| {
                 if let Some(obj) = ctor.as_object() {
@@ -483,6 +512,7 @@ impl Interpreter {
                 .map_err(|err| {
                     self.err_type((format!("createRealm Iterator bootstrap failed: {err}")).into())
                 })?;
+            let state = &mut self.extra_realms[state_index];
             state.array_iterator_prototype = Some(protos.array);
             state.map_iterator_prototype = Some(protos.map);
             state.set_iterator_prototype = Some(protos.set);
@@ -491,9 +521,82 @@ impl Interpreter {
             state.iterator_helper_prototype = Some(protos.helper);
             state.wrap_for_valid_iterator_prototype = Some(protos.wrap_for_valid_iterator);
         }
+        let global_this = self.extra_realms[state_index].global_this;
         self.tag_array_realm_natives(global_this);
         self.tag_iterator_realm_natives(global_this);
-        Ok(state)
+        Ok(())
+    }
+
+    /// Finish a host realm's native error hierarchy through the interpreter's
+    /// high-level handle arena. The realm registry itself already lives in
+    /// `extra_realms` and is traced by the normal runtime root walk; every
+    /// JS-visible global write resolves its object/value handles after the
+    /// preceding allocation.
+    fn finalize_extra_realm_error_classes(
+        &mut self,
+        state_index: usize,
+        function_prototype: JsObject,
+        object_prototype: JsObject,
+    ) -> Result<(), VmError> {
+        let registry = &self.extra_realms[state_index].error_classes;
+        let error_constructor = registry.constructor(ErrorKind::Error);
+        let error_prototype = registry.prototype(ErrorKind::Error);
+        object::set_prototype(
+            error_constructor,
+            &mut self.gc_heap,
+            Some(function_prototype),
+        );
+        object::set_prototype(error_prototype, &mut self.gc_heap, Some(object_prototype));
+        for kind in [
+            ErrorKind::TypeError,
+            ErrorKind::RangeError,
+            ErrorKind::SyntaxError,
+            ErrorKind::ReferenceError,
+            ErrorKind::URIError,
+            ErrorKind::EvalError,
+            ErrorKind::AggregateError,
+        ] {
+            let constructor = self.extra_realms[state_index]
+                .error_classes
+                .constructor(kind);
+            let error_constructor = self.extra_realms[state_index]
+                .error_classes
+                .constructor(ErrorKind::Error);
+            object::set_prototype(constructor, &mut self.gc_heap, Some(error_constructor));
+        }
+        for (name, kind) in [
+            ("Error", ErrorKind::Error),
+            ("TypeError", ErrorKind::TypeError),
+            ("RangeError", ErrorKind::RangeError),
+            ("SyntaxError", ErrorKind::SyntaxError),
+            ("ReferenceError", ErrorKind::ReferenceError),
+            ("URIError", ErrorKind::URIError),
+            ("EvalError", ErrorKind::EvalError),
+            ("AggregateError", ErrorKind::AggregateError),
+        ] {
+            self.with_handle_scope(|interp, scope| {
+                let global = interp.scoped_value(
+                    scope,
+                    Value::object(interp.extra_realms[state_index].global_this),
+                );
+                let constructor = interp.scoped_value(
+                    scope,
+                    Value::object(
+                        interp.extra_realms[state_index]
+                            .error_classes
+                            .constructor(kind),
+                    ),
+                );
+                interp.scoped_define_data(
+                    scope,
+                    global,
+                    name,
+                    constructor,
+                    object::PropertyFlags::new(true, false, true),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn tag_native_value_realm(&mut self, value: Value, global: JsObject) {
@@ -685,10 +788,13 @@ impl Interpreter {
 
     /// Create an additional realm global object inside this interpreter.
     pub fn create_host_realm_global(&mut self) -> Result<JsObject, VmError> {
-        let state = self.build_realm_state()?;
-        let global = state.global_this;
-        self.extra_realms.push(state);
-        Ok(global)
+        let id = self.next_realm_id;
+        self.next_realm_id = self
+            .next_realm_id
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        let state_index = self.build_realm_state(id)?;
+        Ok(self.extra_realms[state_index].global_this)
     }
 
     /// Run `body` with the realm identified by `global` as the active realm.
@@ -709,6 +815,8 @@ impl Interpreter {
         };
         let mut realm = self.extra_realms.remove(index);
         self.swap_active_realm_state(&mut realm);
+        let previous_realm_id = self.active_realm_id;
+        self.active_realm_id = realm.id;
         let was_extra = self.active_realm_is_extra;
         self.active_realm_is_extra = true;
         let realm_roots_guard = self
@@ -717,9 +825,30 @@ impl Interpreter {
         let result = body(self);
         drop(realm_roots_guard);
         self.swap_active_realm_state(&mut realm);
+        self.active_realm_id = previous_realm_id;
         self.active_realm_is_extra = was_extra;
         self.extra_realms.insert(index, realm);
         result
+    }
+
+    /// Run `body` with a stable realm identity active. Bytecode function
+    /// metadata uses scalar ids, while this boundary reuses the existing
+    /// traced [`RealmState`] swap instead of retaining raw GC handles.
+    pub(crate) fn with_host_realm_id<R>(
+        &mut self,
+        realm_id: u32,
+        body: impl FnOnce(&mut Self) -> Result<R, VmError>,
+    ) -> Result<R, VmError> {
+        if realm_id == self.active_realm_id {
+            return body(self);
+        }
+        let global = self
+            .extra_realms
+            .iter()
+            .find(|realm| realm.id == realm_id)
+            .map(|realm| realm.global_this)
+            .ok_or_else(|| self.err_type(("unknown host realm id".to_string()).into()))?;
+        self.with_host_realm_global(global, body)
     }
 
     /// Execute a host script in the realm identified by `global`.

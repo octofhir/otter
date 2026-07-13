@@ -20,7 +20,7 @@
 /// Native VM ABI layout version.
 pub const VM_LAYOUT_VERSION: u32 = 1;
 /// Runtime-stub table version.
-pub const RUNTIME_STUB_TABLE_VERSION: u32 = 1;
+pub const RUNTIME_STUB_TABLE_VERSION: u32 = 2;
 /// Code-object metadata layout version.
 pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 1;
 /// Reproducible build identity for transient native code.

@@ -531,20 +531,23 @@ function partialMatchBody(actual, expected, seen) {
     if (!Array.isArray(actual)) return false;
     // Each expected element must match a DISTINCT actual element (a
     // consumed subset), not merely some element — so duplicates in
-    // expected need duplicates in actual.
-    const adj = expected.map((e) => actual.map((a) => childMatch(a, e)));
-    if (!subsetMatchExists(expected.length, actual.length, (ei, aj) => adj[ei][aj])) {
+    // expected need duplicates in actual. Enumerate present index properties,
+    // not `length`: Node's fixtures intentionally use 150-million-slot sparse
+    // arrays with only a handful of values, and holes are not elements.
+    const expectedValues = enumerableArrayElements(expected);
+    const actualValues = enumerableArrayElements(actual);
+    const adj = expectedValues.map((e) => actualValues.map((a) => childMatch(a, e)));
+    if (!subsetMatchExists(expectedValues.length, actualValues.length, (ei, aj) => adj[ei][aj])) {
       return false;
     }
   } else if (ArrayBuffer.isView(expected) && !(expected instanceof DataView)) {
     if (!ArrayBuffer.isView(actual) || actual instanceof DataView) return false;
     if (Object.getPrototypeOf(actual) !== Object.getPrototypeOf(expected)) return false;
-    const expectedValues = Array.from(expected);
-    const actualValues = Array.from(actual);
-    const adj = expectedValues.map((e) => actualValues.map((a) => Object.is(a, e)));
-    if (!subsetMatchExists(expectedValues.length, actualValues.length, (ei, aj) => adj[ei][aj])) {
-      return false;
-    }
+    // Exact views with no differing expandos are fully settled by util's
+    // native byte comparison. Return before enumerating 100k integer-indexed
+    // keys merely to discard every one of them below.
+    if (expected.length === actual.length && isDeepStrictEqual(actual, expected)) return true;
+    if (!typedArraySubset(actual, expected)) return false;
   } else if (expected instanceof Set) {
     // A Set/Map expected value is a containment check: every expected
     // member must match a DISTINCT actual member (so duplicates in the
@@ -578,6 +581,53 @@ function partialMatchBody(actual, expected, seen) {
   for (const k of partialEnumerableKeys(expected, indexKeysMatchedByContainer)) {
     if (!Reflect.has(actual, k)) return false;
     if (!partialMatch(actual[k], expected[k], seen)) return false;
+  }
+  return true;
+}
+
+function enumerableArrayElements(array) {
+  const values = [];
+  for (const key of Object.keys(array)) {
+    if (/^(0|[1-9]\d*)$/.test(key)) values.push(array[key]);
+  }
+  return values;
+}
+
+// Typed-array elements are primitives, so the general bipartite adjacency
+// matrix is unnecessary and catastrophically expensive for Node's 100k-entry
+// assert fixtures. Preserve the consumed-multiset semantics in linear space,
+// with an ordered fast path for the overwhelmingly common equal-view case.
+function typedArraySubset(actual, expected) {
+  if (expected.length > actual.length) return false;
+
+  const counts = new Map();
+  let positiveZero = 0;
+  let negativeZero = 0;
+  for (let i = 0; i < actual.length; i++) {
+    const value = actual[i];
+    if (value === 0) {
+      if (Object.is(value, -0)) negativeZero++;
+      else positiveZero++;
+    } else {
+      counts.set(value, (counts.get(value) || 0) + 1);
+    }
+  }
+  for (let i = 0; i < expected.length; i++) {
+    const value = expected[i];
+    if (value === 0) {
+      if (Object.is(value, -0)) {
+        if (negativeZero === 0) return false;
+        negativeZero--;
+      } else {
+        if (positiveZero === 0) return false;
+        positiveZero--;
+      }
+      continue;
+    }
+    const count = counts.get(value) || 0;
+    if (count === 0) return false;
+    if (count === 1) counts.delete(value);
+    else counts.set(value, count - 1);
   }
   return true;
 }

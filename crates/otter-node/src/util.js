@@ -4,9 +4,9 @@
 // promisify, inherits, isDeepStrictEqual, deprecate, styleText.
 // Run dependency-free through run_builtin_cjs_shim.
 
-// Native call-site capture (Rust): returns a JSON array of call-site
-// records. `getCallSites` skips its own frame and parses the result.
-const __captureCallSites = require('__otter_callsites');
+// Rust installs two non-enumerable native helpers on `exportsObj` after this
+// shim runs. Keeping them on the exported object gives the moving collector a
+// normal traced property slot instead of relying on an embedded raw capture.
 
 const objToString = (v) => Object.prototype.toString.call(v);
 
@@ -537,7 +537,9 @@ function deepEqual(a, b, strict, memo, skipProto) {
     if (!isTypedArray(b)) return false;
     if (objToString(a) !== objToString(b)) return false;
     if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+    const typedArrayComparison = exportsObj.__otterTypedArraysEqual(a, b);
+    if (typedArrayComparison === 0) return false;
+    if (typedArrayComparison === 1) return true;
     return compareKeys(a, b, strict, memo, skipProto, true);
   }
 
@@ -1032,7 +1034,7 @@ const exportsObj = {
     } else if (frameCountOrOptions && typeof frameCountOrOptions === 'object') {
       options = frameCountOrOptions;
     }
-    return JSON.parse(__captureCallSites(1, frameCount));
+    return JSON.parse(exportsObj.__otterCaptureCallSites(1, frameCount));
   },
   _extend(target, source) {
     if (source === null || typeof source !== 'object') return target;

@@ -91,10 +91,13 @@ pub fn run_builtin_cjs_shim(
     // bare locals dangling. The module-root stack relocates its slots in place,
     // so after every subsequent allocation we re-fetch the live handles from the
     // slots instead of trusting the stale `module` / `exports` locals.
-    let exports = ctx.alloc_object().map_err(|e| e.to_string())?;
-    let module = ctx.alloc_object().map_err(|e| e.to_string())?;
-    let exports_val = Value::object(exports);
-    let module_val = Value::object(module);
+    let (exports_val, module_val) = ctx
+        .scope(|ctx, scope| {
+            let exports = ctx.scoped_object_bare(scope)?;
+            let module = ctx.scoped_object_bare(scope)?;
+            Ok::<_, NativeError>((ctx.escape(exports), ctx.escape(module)))
+        })
+        .map_err(|err| err.to_string())?;
 
     let root_base = ctx.interp_mut().module_root_depth();
     let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
@@ -110,16 +113,20 @@ pub fn run_builtin_cjs_shim(
     object::set(&mut module, ctx.heap_mut(), "exports", exports_val);
 
     let id_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
+    let id_idx = ctx.interp_mut().push_module_root(id_val) - 1;
     let mut module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
+    let id_val = ctx.interp_mut().module_root(id_idx);
     object::set(&mut module, ctx.heap_mut(), "id", id_val);
     object::set(&mut module, ctx.heap_mut(), "loaded", Value::boolean(false));
 
     let name_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
+    let name_idx = ctx.interp_mut().push_module_root(name_val) - 1;
     let require_val = make_shim_require(ctx, deps)?;
+    let require_idx = ctx.interp_mut().push_module_root(require_val) - 1;
 
     // Re-fetch the relocated handles after the require/string allocations.
     let module_val = ctx.interp_mut().module_root(module_idx);
@@ -130,6 +137,10 @@ pub fn run_builtin_cjs_shim(
     let wrapper = interp
         .create_commonjs_wrapper(name, source)
         .map_err(|e| e.to_string())?;
+    let wrapper_idx = interp.push_module_root(wrapper) - 1;
+    let wrapper = interp.module_root(wrapper_idx);
+    let require_val = interp.module_root(require_idx);
+    let name_val = interp.module_root(name_idx);
     let call_args: SmallVec<[Value; 8]> =
         smallvec![exports_val, require_val, module_val, name_val, name_val,];
 
@@ -153,32 +164,41 @@ pub fn run_builtin_cjs_shim(
 /// The deps are stored on a plain JS object (which roots their values) captured
 /// by the closure; `require(spec)` returns `deps[spec]` or throws.
 fn make_shim_require(ctx: &mut NativeCtx<'_>, deps: &[(&str, Value)]) -> Result<Value, String> {
-    let mut table = ctx.alloc_object().map_err(|e| e.to_string())?;
-    for (spec, value) in deps {
-        object::set(&mut table, ctx.heap_mut(), spec, *value);
-    }
-    let captures: SmallVec<[Value; 4]> = smallvec![Value::object(table)];
-    let closure = move |ctx: &mut NativeCtx<'_>,
-                        args: &[Value],
-                        captures: &[Value]|
-          -> Result<Value, NativeError> {
-        let table = captures
-            .first()
-            .and_then(|value| value.as_object())
-            .ok_or_else(|| runtime_type_error("require", "missing shim dependency table"))?;
-        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
-        match object::get(table, ctx.heap(), &spec) {
-            Some(value) => Ok(value),
-            None => Err(runtime_type_error(
-                "require",
-                format!("Cannot find module '{spec}'"),
-            )),
+    ctx.scope(|ctx, scope| {
+        let deps: Vec<_> = deps
+            .iter()
+            .map(|(spec, value)| (*spec, ctx.scoped_value(scope, *value)))
+            .collect();
+        let table = ctx
+            .scoped_object_bare(scope)
+            .map_err(|err| err.to_string())?;
+        for (spec, value) in deps {
+            ctx.scoped_set(scope, table, spec, value)
+                .map_err(|err| err.to_string())?;
         }
-    };
-    // `NativeCtx::native_value` traces runtime state and captures itself; no
-    // caller-managed root slices are needed here.
-    ctx.native_value("require", captures, closure)
-        .map_err(|e| e.to_string())
+        let captures: SmallVec<[Value; 4]> = smallvec![ctx.escape(table)];
+        let closure = move |ctx: &mut NativeCtx<'_>,
+                            args: &[Value],
+                            captures: &[Value]|
+              -> Result<Value, NativeError> {
+            let table = captures
+                .first()
+                .and_then(|value| value.as_object())
+                .ok_or_else(|| runtime_type_error("require", "missing shim dependency table"))?;
+            let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+            match object::get(table, ctx.heap(), &spec) {
+                Some(value) => Ok(value),
+                None => Err(runtime_type_error(
+                    "require",
+                    format!("Cannot find module '{spec}'"),
+                )),
+            }
+        };
+        // `NativeCtx::native_value` traces runtime state and captures itself;
+        // the scoped dependency table remains current until capture completes.
+        ctx.native_value("require", captures, closure)
+            .map_err(|err| err.to_string())
+    })
 }
 
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier

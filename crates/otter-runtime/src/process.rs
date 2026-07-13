@@ -27,10 +27,7 @@ use otter_vm::{
 };
 use sysinfo::{ProcessesToUpdate, System};
 
-use crate::{
-    CapabilityRequest, CapabilitySet, DiagnosticCode, OtterError, RuntimeCapability,
-    default_check_capability,
-};
+use crate::{CapabilitySet, DiagnosticCode, OtterError, RuntimeHooks};
 
 pub(crate) fn default_argv() -> Vec<String> {
     vec![runtime_process_snapshot().exec_path]
@@ -45,6 +42,7 @@ pub(crate) fn install_global(
     process_argv: &[String],
     process_cwd: &Path,
     capabilities: &CapabilitySet,
+    hooks: &RuntimeHooks,
 ) -> Result<(), OtterError> {
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
@@ -123,17 +121,7 @@ pub(crate) fn install_global(
         let undefined = ctx.scoped_undefined(scope);
         ctx.scoped_set(scope, process, "exitCode", undefined)?;
 
-        let env = ctx.scoped_object_bare(scope)?;
-        for (name, value) in std::env::vars() {
-            if default_check_capability(
-                capabilities,
-                RuntimeCapability::Env,
-                &CapabilityRequest::EnvVar(&name),
-            ) {
-                let value = ctx.scoped_string(scope, &value)?;
-                ctx.scoped_set(scope, env, &name, value)?;
-            }
-        }
+        let env = crate::process_env::build(ctx, scope, capabilities, hooks)?;
         ctx.scoped_set(scope, process, "env", env)?;
 
         for (name, length, call) in [
@@ -890,6 +878,86 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.completion_string(), "string:undefined");
+    }
+
+    #[test]
+    fn process_env_capability_hook_cannot_bypass_secret_filter() {
+        if std::env::var_os("PATH").is_none() {
+            return;
+        }
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::sandbox())
+            .capability_hook(
+                |_capabilities: &CapabilitySet,
+                 capability: crate::RuntimeCapability,
+                 _request: &crate::CapabilityRequest<'_>| {
+                    capability == crate::RuntimeCapability::Env
+                },
+            )
+            .build()
+            .unwrap();
+        let result = otter
+            .blocking_run_script(
+                "typeof process.env.PATH + ':' + typeof process.env.OPENAI_API_KEY",
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), "string:undefined");
+    }
+
+    #[test]
+    fn process_env_coerces_values_and_deletes_properties() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+process.env.TEXT = 'value';
+process.env.NUMBER = 42;
+process.env.BOOLEAN = false;
+process.env.MISSING = undefined;
+delete process.env.TEXT;
+[
+  process.env.TEXT,
+  process.env.NUMBER,
+  process.env.BOOLEAN,
+  process.env.MISSING,
+  Object.getPrototypeOf(process.env) === Object.prototype
+].join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(result.completion_string(), ":42:false:undefined:true");
+    }
+
+    #[test]
+    fn process_env_rejects_symbols_and_restricted_descriptors() {
+        let otter = Otter::new();
+        let result = otter
+            .blocking_run_script(
+                r#"
+const symbol = Symbol('env');
+const results = [];
+try { process.env[symbol] = 1; } catch (error) { results.push(error.name); }
+try { process.env.VALUE = symbol; } catch (error) { results.push(error.name); }
+try {
+  Object.defineProperty(process.env, 'BAD', { value: 'bad' });
+} catch (error) {
+  results.push(error.code);
+}
+Object.defineProperty(process.env, 'GOOD', {
+  value: 7,
+  configurable: true,
+  writable: true,
+  enumerable: true
+});
+results.push(process.env.GOOD, symbol in process.env, delete process.env[symbol]);
+results.join(':')
+"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "TypeError:TypeError:ERR_INVALID_OBJECT_DEFINE_PROPERTY:7:false:true"
+        );
     }
 
     #[test]

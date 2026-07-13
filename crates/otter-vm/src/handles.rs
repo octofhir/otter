@@ -417,6 +417,37 @@ impl Interpreter {
         Ok(handle)
     }
 
+    /// Allocate a Proxy over scoped target and handler handles, keeping both
+    /// live and relocatable across old-space allocation.
+    pub(crate) fn scoped_proxy<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        target: Scoped<'_>,
+        handler: Scoped<'_>,
+    ) -> Result<Scoped<'s>, VmError> {
+        let target = self.handle_arena.get(target.index());
+        let handler = self.handle_arena.get(handler.index());
+        if !target.is_object_type() || !handler.is_object_type() {
+            return Err(VmError::TypeMismatch);
+        }
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let proxy = crate::proxy::alloc_proxy_with_roots(
+            &mut self.gc_heap,
+            target,
+            handler,
+            &mut external_visit,
+        )?;
+        Ok(self.scoped_value(
+            scope,
+            Value::proxy(crate::proxy::JsProxy::from_handle(proxy)),
+        ))
+    }
+
     /// Park an `f64` number in the current scope. Numbers are NaN-boxed
     /// immediates, so this never allocates; it exists so number construction
     /// reads the same as every other scoped creation.

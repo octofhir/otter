@@ -14,6 +14,8 @@
 //! - `EOL` is non-writable but configurable, matching Node (assignment throws in
 //!   strict mode; `Object.defineProperty` can still redefine it).
 //! - `arch`/`platform`/`endianness` reflect the host the binary was built for.
+//! - Environment-dependent queries use JavaScript `Get` on the filtered
+//!   `process.env` proxy; they never read the host environment directly.
 //! - No VM values are retained across the FFI calls; results are copied out.
 
 use otter_runtime::CapabilitySet;
@@ -29,13 +31,11 @@ use crate::string_value;
 /// already applied at install time. Reading `std::env` directly would bypass
 /// both, so `os` never does.
 fn env_var(ctx: &mut NativeCtx<'_>, key: &str) -> Option<String> {
-    let global = *ctx.interp_mut().global_this();
-    let heap = ctx.heap();
-    let process = object::get(global, heap, "process")?.as_object()?;
-    let env = object::get(process, heap, "env")?.as_object()?;
-    let value = object::get(env, heap, key)?;
+    let process = ctx.global_value("process")?;
+    let env = ctx.get_value_property(process, "env").ok()?;
+    let value = ctx.get_value_property(env, key).ok()?;
     if value.is_string() {
-        Some(value.display_string(heap))
+        Some(value.display_string(ctx.heap()))
     } else {
         None
     }

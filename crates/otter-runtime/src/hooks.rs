@@ -349,6 +349,27 @@ pub fn default_check_capability(
     }
 }
 
+/// Apply the active runtime hook while preserving non-overridable security
+/// filters. Capability hooks may replace the configured allow policy, but they
+/// cannot expose environment names covered by the built-in secret denylist.
+#[must_use]
+pub(crate) fn check_capability_with_hooks(
+    hooks: &RuntimeHooks,
+    capabilities: &CapabilitySet,
+    capability: RuntimeCapability,
+    request: &CapabilityRequest<'_>,
+) -> bool {
+    if let (RuntimeCapability::Env, CapabilityRequest::EnvVar(name)) = (capability, request)
+        && crate::env_name_is_builtin_denied(name)
+    {
+        return false;
+    }
+    hooks.capability_hook().map_or_else(
+        || default_check_capability(capabilities, capability, request),
+        |hook| hook.check_capability(capabilities, capability, request),
+    )
+}
+
 /// Compile source through the default script compiler.
 ///
 /// Hook implementations can call this helper to preserve the runtime's

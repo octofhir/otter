@@ -7,6 +7,8 @@
 //!
 //! # Invariants
 //! - The `run` (subprocess) capability is checked before any process starts.
+//! - Explicit child environments are enumerated through JavaScript internal
+//!   methods, so filtered `process.env` proxies cannot leak hidden host values.
 //! - No VM state is retained across the spawn.
 
 use std::process::{Command, Stdio};
@@ -102,22 +104,33 @@ fn opt_string(ctx: &mut NativeCtx<'_>, opts: Option<Value>, key: &str) -> Option
     }
 }
 
-fn opt_env(ctx: &mut NativeCtx<'_>, opts: Option<Value>) -> Option<Vec<(String, String)>> {
-    let opts_obj = opts?.as_object()?;
-    let env = object::get(opts_obj, ctx.heap(), "env")?.as_object()?;
-    let keys: Vec<String> = object::with_properties(env, ctx.heap(), |p| {
-        p.enumerable_keys().map(str::to_string).collect()
-    });
-    let mut out = Vec::with_capacity(keys.len());
-    for key in keys {
-        if let Some(value) = object::get(env, ctx.heap(), &key)
-            && !value.is_undefined()
-            && !value.is_null()
-        {
-            out.push((key, value.display_string(ctx.heap())));
-        }
+fn opt_env(
+    ctx: &mut NativeCtx<'_>,
+    opts: Option<Value>,
+) -> Result<Option<Vec<(String, String)>>, NativeError> {
+    let Some(opts_obj) = opts.and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(env) = object::get(opts_obj, ctx.heap(), "env") else {
+        return Ok(None);
+    };
+    if !env.is_object_type() {
+        return Ok(None);
     }
-    Some(out)
+    ctx.scope(|ctx, scope| {
+        let env = ctx.scoped_value(scope, env);
+        let keys = ctx.enumerable_own_string_keys(ctx.escape(env))?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = ctx.get_value_property(ctx.escape(env), &key)?;
+            let value = ctx.scoped_value(scope, value);
+            let value = ctx.escape(value);
+            if !value.is_undefined() && !value.is_null() {
+                out.push((key, value.display_string(ctx.heap())));
+            }
+        }
+        Ok(Some(out))
+    })
 }
 
 fn current_exec_path(ctx: &mut NativeCtx<'_>) -> Option<String> {
@@ -166,7 +179,7 @@ fn spawn_sync_raw(
     let opts = args.get(2).copied();
     let cwd = opt_string(ctx, opts, "cwd");
     let input = opt_string(ctx, opts, "input");
-    let env = opt_env(ctx, opts);
+    let env = opt_env(ctx, opts)?;
     if should_propagate_allow_all(ctx, &command, caps) {
         argv.insert(0, "--allow-all".to_string());
     }

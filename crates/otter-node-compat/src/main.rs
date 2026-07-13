@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
+use otter_node_compat::Outcome;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -50,14 +51,42 @@ fn main() -> Result<()> {
         "node-compat: {}/{} passed ({:.1}%)",
         report.summary.passed, report.summary.total, report.summary.pass_rate
     );
-    if !report.summary.failures.is_empty() {
+    let failures: Vec<_> = report
+        .results
+        .iter()
+        .filter(|result| result.outcome == Outcome::Fail)
+        .collect();
+    if !failures.is_empty() {
         println!("failures:");
-        for failure in report.summary.failures.iter().take(20) {
+        for failure in failures.iter().take(20) {
             println!(
                 "  {}: {}",
                 failure.path,
-                failure.error.lines().next().unwrap_or("")
+                failure
+                    .error
+                    .as_deref()
+                    .and_then(|error| error.lines().next())
+                    .unwrap_or("")
             );
+        }
+    }
+    for outcome in [Outcome::Timeout, Outcome::Crashed] {
+        let results: Vec<_> = report
+            .results
+            .iter()
+            .filter(|result| result.outcome == outcome)
+            .collect();
+        if results.is_empty() {
+            continue;
+        }
+        let label = if outcome == Outcome::Timeout {
+            "timeouts"
+        } else {
+            "crashes"
+        };
+        println!("{label}:");
+        for result in results {
+            println!("  {} ({} ms)", result.path, result.duration_ms);
         }
     }
     Ok(())

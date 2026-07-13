@@ -779,6 +779,27 @@ impl<'rt> NativeCtx<'rt> {
             .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "get property"))
     }
 
+    /// Return enumerable own string keys through the target's JavaScript
+    /// internal methods, including Proxy `ownKeys` and descriptor traps.
+    pub fn enumerable_own_string_keys(
+        &mut self,
+        target: Value,
+    ) -> Result<Vec<String>, NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "enumerate properties",
+                reason: "missing execution context".to_string(),
+            })?;
+        self.cx
+            .interp
+            .enumerable_own_string_keys_for_value(&context, target, 0)
+            .map_err(|err| {
+                native_function::vm_to_native_error(self.cx.interp, err, "enumerate properties")
+            })
+    }
+
     /// Perform JavaScript `Set(receiver, key, value, true)` through the active
     /// execution context, including callable and exotic receivers.
     pub fn set_value_property(
@@ -940,6 +961,16 @@ impl<'rt> NativeCtx<'rt> {
             );
         };
         collections::set_add_with_roots(set, self.heap_mut(), value, &mut external_visit)
+    }
+
+    /// Seal a host-owned Set snapshot against all JavaScript Set mutators.
+    pub fn make_set_readonly(&mut self, value: Value) -> Result<(), NativeError> {
+        let set = value.as_set().ok_or_else(|| NativeError::TypeError {
+            name: "make Set readonly",
+            reason: "value is not a Set".to_string(),
+        })?;
+        collections::set_make_readonly(set, self.heap_mut());
+        Ok(())
     }
 
     /// Insert into a `WeakMap` through the native root contract.
@@ -1435,6 +1466,26 @@ impl<'rt> NativeCtx<'rt> {
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_array"))
     }
 
+    /// Allocate a Set collection and park it in scope `s`.
+    pub fn scoped_collection_set<'s>(
+        &mut self,
+        s: &'s HandleScope,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_collection_set(s);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_collection_set"))
+    }
+
+    /// Allocate a Proxy over scoped target and handler handles.
+    pub fn scoped_proxy<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        target: Scoped<'_>,
+        handler: Scoped<'_>,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_proxy(s, target, handler);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_proxy"))
+    }
+
     /// Park an `f64` number in scope `s`. Numbers are NaN-boxed immediates, so
     /// this never allocates and never fails; parking keeps number construction
     /// reading like every other scoped creation.
@@ -1447,6 +1498,17 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub fn scoped_boolean<'s>(&mut self, s: &'s HandleScope, b: bool) -> Scoped<'s> {
         self.cx.interp.scoped_boolean(s, b)
+    }
+
+    /// Allocate a `BigInt` from a signed 128-bit host counter and park it in
+    /// scope `s` before any later allocation can relocate it.
+    pub fn scoped_bigint_i128<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        n: i128,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_bigint_i128(s, n);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_bigint_i128"))
     }
 
     /// Park the `undefined` immediate in scope `s`.
@@ -1510,6 +1572,29 @@ impl<'rt> NativeCtx<'rt> {
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_define_data"))
     }
 
+    /// Make `obj` callable through the native function held by `call`.
+    pub fn scoped_set_call_native(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        call: Scoped<'_>,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_set_call_native(s, obj, call);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set_call_native"))
+    }
+
+    /// Set `obj`'s prototype from a scoped object handle, or install a null
+    /// prototype with `None`.
+    pub fn scoped_set_prototype(
+        &mut self,
+        s: &HandleScope,
+        obj: Scoped<'_>,
+        prototype: Option<Scoped<'_>>,
+    ) -> Result<(), NativeError> {
+        let result = self.cx.interp.scoped_set_prototype(s, obj, prototype);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set_prototype"))
+    }
+
     /// Allocate an ordinary object whose prototype is the object held by the
     /// `proto` handle (e.g. a class's `.prototype`), and park it in scope `s`.
     /// Use this to build a native instance that must carry a specific prototype
@@ -1567,6 +1652,12 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<Scoped<'s>, NativeError> {
         let result = self.cx.interp.scoped_get_index(s, arr, index);
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_get_index"))
+    }
+
+    /// Read the current logical length of the array handle `arr`.
+    pub fn scoped_array_length(&self, arr: Scoped<'_>) -> Result<usize, NativeError> {
+        let result = self.cx.interp.scoped_array_length(arr);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_array_length"))
     }
 
     /// Allocate a host-data object through the native root contract and park it

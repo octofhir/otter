@@ -4870,7 +4870,25 @@ impl Interpreter {
                 | M::IsExtensible
                 | M::PreventExtensions
         ) && target.as_typed_array(&self.gc_heap).is_some();
-        if !target.is_proxy() && !namespace_integrity && !typed_array_integrity {
+        // Map, Set, and Generator objects keep ordinary own properties on a
+        // lazy expando bag. Integrity operations must freeze/test that bag;
+        // Set's internal [[SetData]] intentionally remains mutable unless a
+        // host API explicitly marks its snapshot read-only.
+        let collection_integrity =
+            matches!(
+                method,
+                M::Freeze
+                    | M::Seal
+                    | M::IsFrozen
+                    | M::IsSealed
+                    | M::IsExtensible
+                    | M::PreventExtensions
+            ) && (target.is_map() || target.is_set() || target.is_generator());
+        if !target.is_proxy()
+            && !namespace_integrity
+            && !typed_array_integrity
+            && !collection_integrity
+        {
             return Ok(None);
         }
         match method {

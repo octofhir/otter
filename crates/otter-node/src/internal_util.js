@@ -47,19 +47,31 @@ function emitExperimentalWarning(feature) {
   }
 }
 
-// §deprecate — mirrors util.deprecate (one warning per wrapped function).
-function deprecate(fn, msg, code) {
+// §deprecate — mirrors util.deprecate metadata and code-level warning dedupe.
+const emittedDeprecationCodes = new Set();
+function deprecate(fn, msg, code, options) {
+  if (typeof fn !== 'function') throw argTypeError('fn', 'argument must be of type function', fn);
   let warned = false;
   function deprecated(...args) {
-    if (!warned) {
+    if (!warned && (code === undefined || !emittedDeprecationCodes.has(code))) {
       warned = true;
+      if (code !== undefined) emittedDeprecationCodes.add(code);
       if (typeof process !== 'undefined' && typeof process.emitWarning === 'function') {
         process.emitWarning(msg, 'DeprecationWarning', code);
       }
     }
     return fn.apply(this, args);
   }
+  Object.defineProperty(deprecated, 'length', { value: fn.length, configurable: true });
+  if (!options || options.modifyPrototype !== false) {
+    Object.setPrototypeOf(deprecated, fn);
+    deprecated.prototype = fn.prototype;
+  }
   return deprecated;
+}
+
+function pendingDeprecate(fn, msg, code) {
+  return deprecate(fn, msg, code);
 }
 
 const kEmptyObject = Object.freeze(Object.create(null));
@@ -68,5 +80,6 @@ module.exports = {
   sleep,
   emitExperimentalWarning,
   deprecate,
+  pendingDeprecate,
   kEmptyObject,
 };

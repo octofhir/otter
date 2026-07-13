@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - CommonJS WHATWG constructor and file-URL helper interoperability.
+//! - Legacy `Url`, query parsing, formatting, and RFC-style resolution.
 //! - Node formatting options, including non-boolean truthy/falsy values.
 //! - Named ESM file-URL helpers used by Vite-style loaders.
 //!
@@ -45,6 +46,17 @@ fn node_url_commonjs_file_helpers_round_trip() {
         r#"
 const url = require('node:url');
 const { URL, pathToFileURL, fileURLToPath, urlToHttpOptions } = url;
+if (url.Url === URL) throw new Error('legacy Url must be distinct from WHATWG URL');
+const legacy = url.parse('/a/b?x=1&x=2#frag', true);
+if (!(legacy instanceof url.Url)) throw new Error('legacy parse brand failed');
+if (Object.getPrototypeOf(legacy.query) !== null) throw new Error('query prototype failed');
+if (legacy.query.x.length !== 2 || legacy.query.x[1] !== '2') {
+  throw new Error('legacy query parsing failed');
+}
+if (url.format(legacy) !== '/a/b?x=1&x=2#frag') throw new Error('legacy format failed');
+if (url.resolve('http://example.test/a/b', '../c') !== 'http://example.test/c') {
+  throw new Error('legacy resolve failed');
+}
 const href = pathToFileURL('/tmp/otter url.js').href;
 if (href !== 'file:///tmp/otter%20url.js') throw new Error(href);
 if (fileURLToPath(new URL(href)) !== '/tmp/otter url.js') throw new Error('round trip failed');

@@ -18,6 +18,8 @@
 //! # Invariants
 //! - `JsMap::set` / `JsSet::add` preserve insertion order; updating
 //!   an existing key does not change its position.
+//! - A host-frozen [`JsSet`] keeps its insertion snapshot immutable even when
+//!   its mutators are invoked through `%Set.prototype%` directly.
 //! - Two `JsMap` handles cloned from the same heap object share
 //!   storage — both observe subsequent mutations.
 //! - `JsWeakMap` / `JsWeakSet` reject values that cannot be held weakly with
@@ -606,6 +608,10 @@ pub struct SetBody {
     /// layout as [`MapBody::jit_guard_flags`].
     #[pelt(skip)]
     jit_guard_flags: u32,
+    /// Host-owned immutable snapshots (for example Node's allowed environment
+    /// flags) ignore all Set mutators, including prototype-borrowed calls.
+    #[pelt(skip)]
+    readonly: bool,
     /// Insertion-ordered `[[SetData]]` list. Deleted entries become
     /// tombstones so active iterators and `forEach` observe later
     /// additions before exhaustion.
@@ -779,6 +785,9 @@ pub fn set_add(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    if set_is_readonly(set, heap) {
+        return Ok(());
+    }
     let barrier_value = value;
     let k = MapKey::from_value(&value, heap);
     let exists = heap.read_payload(set, |body| set_find_entry(body, &k, heap).is_some());
@@ -807,6 +816,9 @@ pub(crate) fn set_add_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    if set_is_readonly(*set, heap) {
+        return Ok(());
+    }
     let barrier_value = value;
     let k = MapKey::from_value(&value, heap);
     let exists = heap.read_payload(*set, |body| set_find_entry(body, &k, heap).is_some());
@@ -831,6 +843,9 @@ pub(crate) fn set_add_with_roots(
 
 /// `Set.prototype.delete` — Spec §24.2.3.4.
 pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> bool {
+    if set_is_readonly(set, heap) {
+        return false;
+    }
     let k = MapKey::from_value(value, heap);
     let idx = heap.read_payload(set, |body| set_find_entry(body, &k, heap));
     match idx {
@@ -847,12 +862,32 @@ pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> boo
 
 /// `Set.prototype.clear` — Spec §24.2.3.3.
 pub fn set_clear(set: JsSet, heap: &mut otter_gc::GcHeap) {
+    if set_is_readonly(set, heap) {
+        return;
+    }
     heap.with_payload(set, |body| {
         for entry in &mut body.entries {
             entry.clear();
         }
         body.index.clear();
     });
+}
+
+/// Whether host code has sealed this Set's internal entry snapshot.
+#[must_use]
+pub fn set_is_readonly(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(set, |body| body.readonly)
+}
+
+/// Seal a host-owned Set snapshot and freeze its ordinary expando properties.
+/// ECMAScript `Object.freeze(new Set())` does not call this: normal Sets remain
+/// free to mutate their internal `[[SetData]]` after ordinary property freeze.
+pub fn set_make_readonly(set: JsSet, heap: &mut otter_gc::GcHeap) {
+    let expando = heap.read_payload(set, |body| body.expando);
+    heap.with_payload(set, |body| body.readonly = true);
+    if let Some(expando) = expando {
+        crate::object::freeze(expando, heap);
+    }
 }
 
 /// Snapshot value list in insertion order.
@@ -1651,6 +1686,19 @@ mod tests {
         set_add(s, &mut heap, n(1)).unwrap();
         set_add(s, &mut heap, n(2)).unwrap();
         assert_eq!(set_len(s, &heap), 2);
+    }
+
+    #[test]
+    fn readonly_set_ignores_every_mutator() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let s = alloc_set(&mut heap).unwrap();
+        set_add(s, &mut heap, n(1)).unwrap();
+        set_make_readonly(s, &mut heap);
+        set_add(s, &mut heap, n(2)).unwrap();
+        assert!(!set_delete(s, &mut heap, &n(1)));
+        set_clear(s, &mut heap);
+        assert!(set_is_readonly(s, &heap));
+        assert_eq!(set_values(s, &heap), vec![n(1)]);
     }
 
     #[test]

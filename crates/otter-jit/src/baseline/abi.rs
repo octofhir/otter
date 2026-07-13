@@ -138,17 +138,13 @@ pub(crate) const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, code_object_id) as u32;
 pub(crate) const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
 /// Byte offsets of the isolate-published cells on [`VmThread`] read by
-/// emitted code: interrupt poll byte, back-edge fuel counter, leaf-stub heap
-/// pointer, and the synchronous-reentry depth/limit pair.
+/// emitted code: interrupt poll byte, back-edge fuel counter, and the
+/// leaf-stub heap pointer.
 pub(crate) const VM_THREAD_INTERRUPT_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, interrupt_cell) as u32;
 pub(crate) const VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, backedge_fuel_cell) as u32;
 pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, gc_heap) as u32;
-pub(crate) const VM_THREAD_SYNC_REENTRY_DEPTH_CELL_OFFSET: u32 =
-    std::mem::offset_of!(VmThread, sync_reentry_depth_cell) as u32;
-pub(crate) const VM_THREAD_SYNC_REENTRY_LIMIT_OFFSET: u32 =
-    std::mem::offset_of!(VmThread, sync_reentry_limit) as u32;
 /// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
 pub(crate) const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
 /// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
@@ -175,11 +171,6 @@ pub(crate) const ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, spill_slot_count) as u32;
 pub(crate) const ALLOC_CTX_STACK_SIZE: u32 =
     ((std::mem::size_of::<RuntimeStubAllocContext>() + 15) & !15) as u32;
-/// Size of one `UpvalueCell` (a 4-byte compressed `Gc<UpvalueCellBody>`).
-pub(crate) const UPVALUE_CELL_SIZE: u32 = 4;
-/// Byte offset of the single `Value` inside an `UpvalueCellBody` from its
-/// decompressed pointer (just past the 8-byte `GcHeader`).
-pub(crate) const UPVALUE_VALUE_OFFSET: u32 = 8;
 pub(crate) const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
 pub(crate) const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
 pub(crate) const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;

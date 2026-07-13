@@ -1320,9 +1320,6 @@ pub enum JitSelection {
     /// Interpreter plus the production compiler (the template tier).
     #[default]
     Baseline,
-    /// Interpreter plus the previous-generation emitter, kept selectable for
-    /// differential comparison until its deletion.
-    Legacy,
     /// Interpreter plus the template compiler (explicit selection; same as
     /// the default).
     Template,
@@ -2060,13 +2057,6 @@ impl Runtime {
                             JitSelection::Baseline | JitSelection::Template => {
                                 interp.set_jit_compiler(Some(std::sync::Arc::new(
                                     otter_jit::BaselineJitCompiler::new(),
-                                )));
-                            }
-                            JitSelection::Legacy => {
-                                interp.set_jit_compiler(Some(std::sync::Arc::new(
-                                    otter_jit::BaselineJitCompiler::with_kind(
-                                        otter_jit::BaselineCompilerKind::Legacy,
-                                    ),
                                 )));
                             }
                             JitSelection::InterpreterOnly => {}

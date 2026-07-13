@@ -12,14 +12,11 @@
 //! - Register offsets fit the baseline backend's unsigned scaled addressing.
 //!
 //! # See also
-//! - [`super::arm64`], the first machine-code consumer of these rules.
+//! - `crate::template::plan`, the machine-code consumer of these rules.
 
 use otter_bytecode::{Op, Operand};
 use otter_vm::{JitCompileSnapshot, NO_FRAME_STATE, SafepointId, SafepointRecord};
 use std::collections::{BTreeMap, BTreeSet};
-
-/// Largest argument count the `Call` emitter inlines.
-pub(crate) const MAX_INLINE_ARGS: usize = 4;
 
 /// Largest argument count a `CallMethodValue` site passes inline.
 ///
@@ -414,28 +411,6 @@ impl LoweredInstr {
         }
     }
 
-    pub(crate) fn written_register(self) -> Option<u16> {
-        match self.operands {
-            LoweredOperands::Destination(operands) => Some(operands.dst),
-            LoweredOperands::Constant(operands) => Some(operands.dst),
-            LoweredOperands::LoadInt32(operands) => Some(operands.dst),
-            LoweredOperands::Local(operands) if self.op == Op::LoadLocal => Some(operands.value),
-            LoweredOperands::Unary(operands) => Some(operands.dst),
-            LoweredOperands::Binary(operands) => Some(operands.dst),
-            LoweredOperands::ElementLoad(operands) => Some(operands.dst),
-            LoweredOperands::Increment(operands) => Some(operands.dst),
-            LoweredOperands::PropertyLoad(operands) => Some(operands.dst),
-            LoweredOperands::NewArray(operands) => Some(operands.dst),
-            LoweredOperands::MathCall(operands) => Some(operands.dst),
-            LoweredOperands::MakeClosure(operands) => Some(operands.dst),
-            LoweredOperands::Call(operands) => Some(operands.dst),
-            LoweredOperands::MethodCall(operands) => Some(operands.dst),
-            LoweredOperands::Upvalue(operands) if self.op == Op::LoadUpvalue => {
-                Some(operands.value)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Backend-neutral facts established before machine-code emission starts.
@@ -447,12 +422,10 @@ pub(crate) struct BaselinePlan {
     pub(crate) instructions: Vec<LoweredInstr>,
     register_operands: Box<[u16]>,
     index_operands: Box<[u32]>,
-    pub(crate) enable_float_residency: bool,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) add_alloc_safepoints: BTreeMap<u32, SafepointId>,
-    pub(crate) method_alloc_safepoints: BTreeMap<u32, SafepointId>,
 }
 
 impl BaselinePlan {
@@ -460,7 +433,6 @@ impl BaselinePlan {
         let code_block = view.code_block.as_ref();
         let mut instructions = Vec::with_capacity(view.instructions.len());
         let mut boundaries = BTreeSet::new();
-        let mut enable_float_residency = false;
         let mut load_property_count = 0;
         let mut store_property_count = 0;
         let mut register_operands = Vec::new();
@@ -476,7 +448,6 @@ impl BaselinePlan {
                 Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally => {
                     return Err(Unsupported::Opcode(op));
                 }
-                Op::Div => enable_float_residency = true,
                 Op::LoadProperty => load_property_count += 1,
                 Op::StoreProperty => store_property_count += 1,
                 Op::CallMethodValue => {
@@ -717,37 +688,16 @@ impl BaselinePlan {
             .map_or(1, |id| id.saturating_add(1))
             .max(1);
         let mut add_alloc_safepoints = BTreeMap::new();
-        let mut method_alloc_safepoints = BTreeMap::new();
         for lowered in &instructions {
-            match lowered.op {
-                Op::CallMethodValue => {
-                    let safepoint = view
-                        .collection_alloc_methods
-                        .get(&lowered.byte_pc)
-                        .map(|alloc| alloc.safepoint_id)
-                        .unwrap_or_else(|| {
-                            let id = next_safepoint;
-                            next_safepoint = next_safepoint.saturating_add(1);
-                            safepoint_records.push(SafepointRecord::frame_slot_window(
-                                id,
-                                NO_FRAME_STATE,
-                                view.code_block.register_count,
-                            ));
-                            id
-                        });
-                    method_alloc_safepoints.insert(lowered.byte_pc, safepoint);
-                }
-                Op::Add => {
-                    let safepoint = next_safepoint;
-                    next_safepoint = next_safepoint.saturating_add(1);
-                    add_alloc_safepoints.insert(lowered.byte_pc, safepoint);
-                    safepoint_records.push(SafepointRecord::frame_slot_window(
-                        safepoint,
-                        NO_FRAME_STATE,
-                        view.code_block.register_count,
-                    ));
-                }
-                _ => {}
+            if lowered.op == Op::Add {
+                let safepoint = next_safepoint;
+                next_safepoint = next_safepoint.saturating_add(1);
+                add_alloc_safepoints.insert(lowered.byte_pc, safepoint);
+                safepoint_records.push(SafepointRecord::frame_slot_window(
+                    safepoint,
+                    NO_FRAME_STATE,
+                    view.code_block.register_count,
+                ));
             }
         }
 
@@ -755,12 +705,10 @@ impl BaselinePlan {
             instructions,
             register_operands: register_operands.into_boxed_slice(),
             index_operands: index_operands.into_boxed_slice(),
-            enable_float_residency,
             load_property_count,
             store_property_count,
             safepoint_records,
             add_alloc_safepoints,
-            method_alloc_safepoints,
         })
     }
 
@@ -772,12 +720,6 @@ impl BaselinePlan {
         slice_range(&self.index_operands, range)
     }
 
-    pub(crate) fn take_operand_buffers(&mut self) -> (Box<[u16]>, Box<[u32]>) {
-        (
-            std::mem::take(&mut self.register_operands),
-            std::mem::take(&mut self.index_operands),
-        )
-    }
 }
 
 fn slice_range<T>(storage: &[T], range: OperandRange) -> Result<&[T], Unsupported> {
@@ -827,60 +769,6 @@ pub(crate) fn branch_target(
 
 pub(crate) trait WordOperands: Copy {
     fn get(self, index: usize) -> Option<Operand>;
-}
-
-/// Borrowed typed call operands exposed through the legacy word accessor while
-/// call emitters are migrated to field-based inputs.
-#[derive(Clone, Copy)]
-pub(crate) enum CallOperandView<'a> {
-    Plain {
-        call: CallOperands,
-        arguments: &'a [u16],
-    },
-    Method {
-        call: MethodCallOperands,
-        arguments: &'a [u16],
-    },
-}
-
-impl WordOperands for CallOperandView<'_> {
-    fn get(self, index: usize) -> Option<Operand> {
-        match self {
-            Self::Plain { call, arguments } => match index {
-                0 => Some(Operand::Register(call.dst)),
-                1 => Some(Operand::Register(call.callee)),
-                2 => Some(Operand::ConstIndex(u32::try_from(arguments.len()).ok()?)),
-                tail => arguments
-                    .get(tail.checked_sub(3)?)
-                    .copied()
-                    .map(Operand::Register),
-            },
-            Self::Method { call, arguments } => match index {
-                0 => Some(Operand::Register(call.dst)),
-                1 => Some(Operand::Register(call.receiver)),
-                2 => Some(Operand::ConstIndex(call.name)),
-                3 => Some(Operand::ConstIndex(u32::try_from(arguments.len()).ok()?)),
-                tail => arguments
-                    .get(tail.checked_sub(4)?)
-                    .copied()
-                    .map(Operand::Register),
-            },
-        }
-    }
-}
-
-/// Schema-checked accessor used only while nested inline-callee bodies are
-/// lowered independently from the owning function plan.
-#[derive(Clone, Copy)]
-pub(crate) struct InstructionOperandView<'a> {
-    pub(crate) code_block: &'a otter_vm::CodeBlock,
-    pub(crate) instruction: &'a otter_vm::JitInstructionMetadata,
-}
-
-impl WordOperands for InstructionOperandView<'_> {
-    fn get(self, index: usize) -> Option<Operand> {
-        self.instruction.operand(self.code_block, index)
-    }
 }
 
 fn append_register_tail(

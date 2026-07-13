@@ -7,13 +7,13 @@
 //! # Invariants
 //! - Operands are decoded during compilation. No entry accepts a byte PC or
 //!   looks up a `CodeBlockInstruction` at runtime.
-//! - Raw metadata pointers target immutable boxed slices retained by the active
-//!   `BaselineCode` for the executable mapping's full lifetime.
+//! - Raw metadata pointers target immutable boxed slices retained by the
+//!   active code object for the executable mapping's full lifetime.
 //! - JS values remain in the published frame window across every allocating or
 //!   throwing operation, preserving precise moving-GC roots.
 //!
 //! # See also
-//! - [`super::BaselineCode`] for metadata ownership.
+//! - `crate::template::code` for metadata ownership.
 //! - `otter_vm::jit_runtime_ops` for the safe typed VM operations.
 
 use otter_vm::VmError;

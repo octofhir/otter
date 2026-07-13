@@ -80,10 +80,14 @@ pub(super) fn emit_call(
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
 ///
-/// The collection-method IC transition completes hot collection methods in
-/// place (`0`), throws (`1`), or misses (`2`); a miss falls through to the
-/// direct-method prepare, whose ineligible resolutions take the exact side
-/// exit to normal dispatch.
+/// Layered dispatch: the collection-method IC transition completes hot
+/// collection methods in place (`0`), throws (`1`), or misses (`2`); a miss
+/// falls through to the direct-method prepare; an ineligible resolution
+/// (polymorphic, native, accessor, or cold method) then completes through
+/// the generic in-place method transition, so the compiled caller keeps
+/// running for every ordinary receiver. Only exotic receivers the
+/// interpreter dispatches through bespoke opcode branches (generators,
+/// iterators, callable receivers) take the exact side exit.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
@@ -141,6 +145,7 @@ pub(super) fn emit_method_call(
         ; cbz x0, =>done
     );
 
+    let generic = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, x20
@@ -161,10 +166,34 @@ pub(super) fn emit_method_call(
         ; cmp x0, #1
         ; b.eq =>threw
         ; cmp x0, #2
-        ; b.eq =>bail
+        ; b.eq =>generic
     );
     emit_direct_call_tail(ops, table, dst, threw, done);
-    dynasm!(ops ; .arch aarch64 ; =>done);
+
+    // Ineligible direct resolution: complete the whole opcode through the
+    // generic in-place method transition; only its exotic-receiver report
+    // (`2`) side-exits to normal dispatch.
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>generic
+        ; mov x0, x20
+        ; movz x1, dst as u32
+        ; movz x2, receiver as u32
+    );
+    emit_load_u64(ops, 3, u64::from(name));
+    emit_load_u64(ops, 4, site);
+    dynasm!(ops ; .arch aarch64 ; movz x5, argc as u32);
+    emit_load_u64(ops, 6, packed_args);
+    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_METHOD_GENERIC));
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, #1
+        ; b.eq =>threw
+        ; cmp x0, #2
+        ; b.eq =>bail
+        ; =>done
+    );
     Ok(())
 }
 

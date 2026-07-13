@@ -1086,6 +1086,132 @@ impl Interpreter {
         }
     }
 
+    /// Complete one full `CallMethodValue` in place for a compiled caller
+    /// whose direct-call prepare reported an ineligible resolution
+    /// (polymorphic, native, accessor, or cold method).
+    ///
+    /// Covers exactly the receiver families whose interpreter semantics are
+    /// "resolve the method value, then call it": ordinary property-bearing
+    /// receivers (objects, arrays, collections, proxies) and primitives.
+    /// Families the interpreter dispatches through bespoke opcode branches —
+    /// generators, iterators, callable receivers, pending `bind`
+    /// continuations — and every resolution failure report `Ok(false)`, so
+    /// the exact side exit keeps the interpreter the only owner of their
+    /// semantics and error messages. On `Ok(true)` the destination register
+    /// holds the call result and the compiled caller continues at the next
+    /// instruction.
+    ///
+    /// The callee runs through [`Self::run_callable_sync_already_rooted`]
+    /// under the caller's published activation: it may allocate, re-enter
+    /// arbitrary JS, and invalidate the caller's body (the entry anchor keeps
+    /// the mapping alive). Register windows live in the pinned register-stack
+    /// slab, so `caller_regs` stays valid across the nested dispatch;
+    /// receiver and argument handles are re-read from the traced window after
+    /// every allocating step.
+    ///
+    /// # Safety-adjacent contract
+    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
+    /// compiled code guarantees the destination/receiver/argument registers
+    /// are in bounds for that window.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn jit_runtime_call_method_in_place(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        dst_reg: u16,
+        recv_reg: u16,
+        name_idx: u32,
+        site: usize,
+        arg_regs: &[u16],
+        caller_regs: *mut Value,
+    ) -> Result<bool, VmError> {
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
+        self.jit_runtime_stats.runtime_method_stubs = self
+            .jit_runtime_stats
+            .runtime_method_stubs
+            .saturating_add(1);
+        // A parked partial `Function.prototype.bind` continuation on this
+        // frame re-enters through the interpreter's opcode branch only.
+        if self
+            .frame_cold(&stack[frame_index])
+            .is_some_and(|cold| cold.pending_bind_function.is_some())
+        {
+            return Ok(false);
+        }
+        // SAFETY: `recv_reg` is a compiler-emitted index into the caller window.
+        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
+        if recv.is_nullish()
+            || recv.is_generator()
+            || recv.is_iterator()
+            || recv.as_function().is_some()
+            || recv.as_closure(&self.gc_heap).is_some()
+            || recv.as_native_function().is_some()
+            || recv.as_bound_function().is_some()
+            || recv.as_class_constructor().is_some()
+        {
+            return Ok(false);
+        }
+        let caller_fid = stack[frame_index].function_id;
+        // Resolve through the same layers the interpreter uses: the per-site
+        // method IC for ordinary objects, then the full receiver-family walk
+        // (prototype chain, primitive intrinsic prototypes, proxy [[Get]]).
+        let mut method = None;
+        if let Some(obj) = recv.as_object()
+            && let Some(key) = context.property_atom_for_function(caller_fid, name_idx)
+        {
+            method = self.resolve_method_ic(obj, key, site);
+        }
+        if method.is_none() {
+            let Some(name) = context.string_constant_str_for_function(caller_fid, name_idx) else {
+                return Ok(false);
+            };
+            method = self.get_method_value_for_call(context, stack, recv, name)?;
+        }
+        let Some(method) = method else {
+            return Ok(false);
+        };
+        if !self.is_callable_runtime(&method) {
+            return Ok(false);
+        }
+        // Method-inline feedback, mirroring the interpreter's
+        // `Op::CallMethodValue` arm: capture the receiver/prototype layout
+        // while the pre-call handle is valid, record it only for a bytecode
+        // target after the call completes.
+        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
+        let method_fid = method
+            .as_closure(&self.gc_heap)
+            .map(|closure| closure.function_id())
+            .or_else(|| method.as_function());
+        let method_site = match method_fid {
+            Some(_) if !self.method_site_feedback_saturated(site) => {
+                self.method_site_for_receiver(context, caller_fid, name_idx, recv)
+            }
+            _ => None,
+        };
+        // Re-read receiver and arguments from the traced window after the
+        // allocating resolution steps; the copies below stay live only until
+        // the callable path moves them into the callee frame.
+        let recv = unsafe { *caller_regs.add(recv_reg as usize) };
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &arg in arg_regs {
+            // SAFETY: compiler-emitted argument indices into the caller window.
+            args.push(unsafe { *caller_regs.add(arg as usize) });
+        }
+        let result = self.run_callable_sync_already_rooted(context, &method, recv, args)?;
+        if let (Some(method_fid), Some(method_site)) = (method_fid, method_site) {
+            self.note_method_target(site, method_fid, method_site);
+        }
+        // SAFETY: `dst_reg` is a compiler-emitted index into the caller
+        // window; the window slab is pinned, so the pointer survived the
+        // nested dispatch.
+        unsafe {
+            *caller_regs.add(dst_reg as usize) = result;
+        }
+        Ok(true)
+    }
+
     /// Prepare a direct compiled **plain** call (`callee(args…)`) from the
     /// callee value in a caller register. Returns `Ok(None)` when the callee
     /// is not an eligible installed bytecode function — the emitted site bails

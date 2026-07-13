@@ -199,6 +199,7 @@ node-compat-fetch:
 # Run the default Node.js compatibility baseline. With no arguments this covers
 # the implemented foundation modules; explicit arguments still select exactly
 # the requested modules/flags (for example `just node-compat process --limit 25`).
+# The runner rebuilds and tests target/release/otter by default.
 node-compat *args:
     if [ -z "{{args}}" ]; then cargo run -p otter-node-compat -- napi querystring url util path os buffer assert events process; else cargo run -p otter-node-compat -- {{args}}; fi
 

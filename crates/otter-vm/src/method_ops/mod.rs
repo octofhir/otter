@@ -1773,7 +1773,7 @@ impl Interpreter {
     /// routine centralizes the ordinary property/getter path so the call
     /// opcode can be collapsed behind one `GetMethod + Call` boundary in
     /// smaller, reviewable steps.
-    fn get_method_value_for_call(
+    pub(crate) fn get_method_value_for_call(
         &mut self,
         context: &ExecutionContext,
         stack: &mut HoltStack,

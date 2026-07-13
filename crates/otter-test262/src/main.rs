@@ -187,9 +187,12 @@ struct RunArgs {
 /// Execution-tier selection forwarded to every per-test runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JitTierArg {
-    /// Interpreter plus the production baseline compiler.
+    /// Interpreter plus the production compiler (the template tier).
     Baseline,
-    /// Interpreter plus the template compiler (differential coverage).
+    /// Interpreter plus the previous-generation emitter (differential
+    /// comparison until its deletion).
+    Legacy,
+    /// Interpreter plus the template compiler (explicit; same as baseline).
     Template,
     /// Interpreter only.
     Interpreter,
@@ -199,6 +202,7 @@ impl JitTierArg {
     fn selection(self) -> otter_runtime::JitSelection {
         match self {
             Self::Baseline => otter_runtime::JitSelection::Baseline,
+            Self::Legacy => otter_runtime::JitSelection::Legacy,
             Self::Template => otter_runtime::JitSelection::Template,
             Self::Interpreter => otter_runtime::JitSelection::InterpreterOnly,
         }
@@ -207,6 +211,7 @@ impl JitTierArg {
     fn as_arg(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
+            Self::Legacy => "legacy",
             Self::Template => "template",
             Self::Interpreter => "interpreter",
         }

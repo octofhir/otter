@@ -34,8 +34,8 @@ use crate::native_abi::{
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
     STUB_COLLECTION_MAP_HAS_LEAF, STUB_COLLECTION_MAP_SET_ALLOC, STUB_COLLECTION_SET_ADD_ALLOC,
     STUB_COLLECTION_SET_DELETE_ALLOC, STUB_COLLECTION_SET_HAS_ALLOC, STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord, TaggedLocationKind,
-    validate_stub_descriptor,
+    STUB_STRICT_EQ_LEAF, STUB_STRING_CONCAT_ALLOC, SafepointId, SafepointRecord,
+    TaggedLocationKind, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -387,6 +387,12 @@ pub const COLLECTION_MAP_GET_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: collection_map_get_leaf,
 };
 
+/// Callable ABI entry for the strict-equality probe.
+pub const STRICT_EQ_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: STUB_STRICT_EQ_LEAF,
+    entry: strict_eq_leaf,
+};
+
 /// Callable ABI entry for `Map.prototype.has`.
 pub const COLLECTION_MAP_HAS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_COLLECTION_MAP_HAS_LEAF,
@@ -454,6 +460,7 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_COLLECTION_MAP_GET_LEAF.id => Some(COLLECTION_MAP_GET_LEAF),
         id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => Some(COLLECTION_MAP_HAS_LEAF),
         id if id == STUB_COLLECTION_SET_HAS_LEAF.id => Some(COLLECTION_SET_HAS_LEAF),
+        id if id == STUB_STRICT_EQ_LEAF.id => Some(STRICT_EQ_LEAF),
         _ => None,
     }
 }
@@ -756,6 +763,26 @@ impl Drop for LeafNoAllocGuard {
             );
         }
     }
+}
+
+/// §7.2.15 IsStrictlyEqual over two raw operand words. Total for every value
+/// pair — numbers, strings (code-unit content), BigInts, and identity for
+/// the remaining heap shapes — so the only miss is a null heap pointer
+/// (probe harnesses without a live isolate).
+#[must_use]
+pub extern "C" fn strict_eq_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> RuntimeStubResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return RuntimeStubResultPair::from_result(RuntimeStubResult::miss());
+    };
+    let lhs = Value::from_abi_bits(lhs_bits);
+    let rhs = Value::from_abi_bits(rhs_bits);
+    let eq = crate::abstract_ops::is_strictly_equal(&lhs, &rhs, heap);
+    RuntimeStubResultPair::from_result(RuntimeStubResult::ok_value(Value::boolean(eq)))
 }
 
 /// Leaf `Map.prototype.get` probe.

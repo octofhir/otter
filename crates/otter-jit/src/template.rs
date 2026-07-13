@@ -633,9 +633,15 @@ mod tests {
         expect(Op::Equal, t, f, f);
         expect(Op::Equal, VALUE_NULL, VALUE_UNDEFINED, f);
         expect(Op::Equal, box_i32(1), VALUE_TRUE, f);
-        // Heap cells side-exit; the interpreter owns content equality.
+        // Identical heap-cell bits are the same cell — strict equality
+        // decides inline without a probe.
+        expect(Op::Equal, 0x1234, 0x1234, t);
+        expect(Op::NotEqual, 0x1234, 0x1234, f);
+        // Distinct cells ask the leaf content-equality probe; without a live
+        // isolate heap (this harness) the probe misses and the site takes
+        // the exact side exit.
         assert!(matches!(
-            run_binary(Op::Equal, 0x1234, 0x1234),
+            run_binary(Op::Equal, 0x1234, 0x5678),
             Exit::Bailed(_)
         ));
     }

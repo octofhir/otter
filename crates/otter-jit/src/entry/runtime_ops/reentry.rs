@@ -188,9 +188,12 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
+    let Some(activation) = ctx.checked_activation() else {
+        return 2;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     match vm.jit_runtime_call_method_in_place(
@@ -226,8 +229,11 @@ pub(crate) extern "C" fn jit_call_generic_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
+    let Some(activation) = ctx.checked_activation() else {
+        return 2;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
     let all = unpack_method_arg_regs(packed_args);
     let argc = (argc as usize).min(all.len());
     match vm.jit_runtime_call_in_place(
@@ -239,6 +245,39 @@ pub(crate) extern "C" fn jit_call_generic_stub(
     ) {
         Ok(true) => 0,
         Ok(false) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
+/// Complete one full loose-equality opcode in the VM. `0` = destination
+/// written, `1` = threw (coercion raised), `2` = no live activation
+/// (isolate-less probe harness; exact side exit).
+pub(crate) extern "C" fn jit_loose_eq_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    lhs: u64,
+    rhs: u64,
+    negate: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 2;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_loose_equal_in_place(
+        context,
+        dst as u16,
+        lhs as u16,
+        rhs as u16,
+        negate != 0,
+        ctx.regs.cast::<otter_vm::Value>(),
+    ) {
+        Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
             1

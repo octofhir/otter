@@ -707,6 +707,28 @@ impl Interpreter {
             .map_err(VmError::from)
     }
 
+    /// Read array element `index` and park the result in the current scope.
+    /// Missing elements and indices beyond `length` read as `undefined`.
+    pub(crate) fn scoped_get_index<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        arr: Scoped<'_>,
+        index: usize,
+    ) -> Result<Scoped<'s>, VmError> {
+        let array = self
+            .handle_arena
+            .get(arr.index())
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
+        let value = crate::array::with_elements(array, &self.gc_heap, |elements| {
+            elements
+                .get(index)
+                .copied()
+                .unwrap_or_else(Value::undefined)
+        });
+        Ok(self.scoped_value(scope, value))
+    }
+
     /// Read the current raw `Value` behind a scope handle for immediate
     /// hand-off across the scope boundary (returning to the VM, or storing into
     /// an already-rooted object). Valid until the next allocation.

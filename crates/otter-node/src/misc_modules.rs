@@ -1,4 +1,14 @@
-//! Small `node:` module shims grouped together: `perf_hooks`, `v8`, `module`.
+//! Small `node:` module shims grouped together: `perf_hooks`, `v8`, `module`,
+//! and aliases such as `node:process` that expose an existing runtime global.
+//!
+//! # Contents
+//! - CommonJS shims for small Node namespaces.
+//! - Global aliases whose identity must match the corresponding global.
+//!
+//! # Invariants
+//! - Aliases return the already-rooted global value; they do not clone state.
+//! - Capability-bearing behavior remains in the Rust implementation that owns
+//!   the underlying global/module.
 
 use otter_runtime::CapabilitySet;
 use otter_vm::{NativeCtx, Value};
@@ -68,6 +78,12 @@ pub fn v8_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Val
 /// `node:module` — builtin-module metadata + a minimal Module class.
 pub fn module_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
     otter_runtime::run_builtin_cjs_shim(ctx, "node:module", MODULE_SHIM, &[])
+}
+
+/// `node:process` / `process` — the exact `globalThis.process` object.
+pub fn process_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
+    ctx.global_value("process")
+        .ok_or_else(|| "process global is not installed".to_string())
 }
 
 /// `internal/util` — the `--expose-internals` subset (sleep,

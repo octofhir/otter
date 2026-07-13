@@ -122,5 +122,40 @@ The pure `path`, `url`, `util`, and TTY-shape helpers require no capability.
 Resource modules still enforce deny-by-default capabilities at their native
 Rust boundary (`fs` for paths and `child_process` for subprocesses).
 
+## Node-API Addons
+
+With `NodeApiBuilderExt` enabled, CommonJS resolution also supports native
+`.node` packages. Resolution walks ancestor `node_modules` directories, reads
+`package.json#main`, and probes the usual `.js`, `.cjs`, `.json`, and `.node`
+entries. A native addon requires both filesystem read permission and an FFI
+allowlist match for the resolved library; either capability remains denied by
+default.
+
+Otter implements the stable Node-API C ABI directly over its own VM. Addon
+values are persistent-root handles rather than raw moving-GC values, and
+asynchronous completion returns through the runtime microtask checkpoint. The
+CLI exports the `napi_*` symbols needed by dynamically loaded addons. This path
+has been exercised against a C ABI fixture and the current napi-rs Rollup
+native package, including synchronous parsing, async parsing, hashing, and a
+complete `rollup(...).generate(...)` run.
+
+Node and napi-rs themselves are not embedded. An addon must use Node-API; a
+binary linked directly against V8 or private Node internals is a different ABI
+and cannot be made portable by a module-loader shim.
+
+## TypeScript Declarations
+
+Otter does not maintain a handwritten copy of Node's declarations.
+`otter-types` references `node` and depends on `@types/node` with an unpinned
+range so normal package installation selects the current release. Otter-only
+globals remain in Otter's declarations.
+
+Running JavaScript or TypeScript with `otter run` does not require
+`node_modules/@types/node`: declarations are static-tooling input, not runtime
+modules. Editor and type-check workflows should install or acquire the official
+package. A future no-`node_modules` type-check path should resolve the same
+official package through the package-manager cache instead of vendoring or
+forking its `.d.ts` files.
+
 `otter:kv` and `otter:sql` have module-graph tests that import the module
 specifier and execute the exported native functions.

@@ -11,17 +11,24 @@
 //! - [`CjsConfig`] - capability snapshot + hosted-module list shared by all
 //!   `require` closures in a run.
 //! - [`cjs_instantiate_file`] - compile + execute one CommonJS file.
-//! - `cjs_load` - resolve a specifier (builtin or relative file) and load it.
+//! - `cjs_load` - resolve builtins, files, `node_modules` packages, and native
+//!   addons, then cache and load their exports.
 //!
 //! # Invariants
 //! - The require cache is a plain JS object (`require.cache`), so cached
 //!   `module.exports` values stay rooted by GC. A module is inserted into the
 //!   cache *before* its body runs so circular `require` returns the partial
 //!   exports (Node behaviour).
-//! - Filesystem capabilities are checked before any module file is read.
+//! - Filesystem capabilities are checked before any module or package manifest
+//!   is read; native addons additionally pass through the configured loader's
+//!   FFI capability check.
 //! - Re-entry uses [`otter_vm::Interpreter::run_callable_sync`] and the
 //!   code-space-linked wrapper from `create_commonjs_wrapper`; the unsafe
 //!   `Interpreter::run` (which swaps `code_space`) is never called nested.
+//!
+//! # See also
+//! - [`crate::CommonJsAddonLoader`]
+//! - [`crate::RuntimeBuilder::commonjs_addon_loader`]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,17 +38,18 @@ use smallvec::{SmallVec, smallvec};
 use otter_vm::{NativeCtx, Value, object};
 
 use crate::{
-    CapabilitySet, HostedModule, RuntimeNativeError as NativeError, RuntimeTaskSpawner,
-    runtime_string_value, runtime_type_error,
+    CapabilitySet, CommonJsAddonLoader, HostedModule, RuntimeNativeError as NativeError,
+    RuntimeTaskSpawner, runtime_string_value, runtime_type_error,
 };
 
-/// Shared configuration for a CommonJS run: capability snapshot and the hosted
-/// (builtin) module list used to satisfy `require('node:fs')` and friends.
+/// Shared configuration for a CommonJS run: capability snapshot, hosted
+/// modules, task spawner, and optional native-addon loader.
 #[derive(Clone)]
 pub(crate) struct CjsConfig {
     pub(crate) capabilities: CapabilitySet,
     pub(crate) hosted: Vec<HostedModule>,
     pub(crate) runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    pub(crate) addon_loader: Option<CommonJsAddonLoader>,
 }
 
 fn oom(err: impl std::fmt::Display) -> NativeError {
@@ -197,25 +205,55 @@ fn canonical_builtin_cache_key(cfg: &CjsConfig, spec: &str) -> String {
     }
 }
 
-/// Resolve a relative/absolute file specifier to a concrete file path, probing
-/// the standard CommonJS extension + `index` candidates.
-fn resolve_file(dir: &Path, spec: &str) -> Option<PathBuf> {
-    let base = if Path::new(spec).is_absolute() {
-        PathBuf::from(spec)
-    } else {
-        dir.join(spec)
-    };
+/// Resolve a file/directory candidate using Node's CommonJS extension and
+/// package-main probes.
+fn resolve_path(base: &Path, capabilities: &CapabilitySet) -> Option<PathBuf> {
     let candidates = [
-        base.clone(),
+        base.to_path_buf(),
         base.with_extension("js"),
         base.with_extension("cjs"),
         base.with_extension("json"),
-        base.join("index.js"),
-        base.join("index.cjs"),
+        base.with_extension("node"),
     ];
     for candidate in candidates {
         if candidate.is_file() {
             return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+        }
+    }
+    if base.is_dir() {
+        let package_json = base.join("package.json");
+        if capabilities.read.matches_path(&package_json)
+            && let Ok(source) = std::fs::read_to_string(&package_json)
+            && let Ok(package) = serde_json::from_str::<serde_json::Value>(&source)
+            && let Some(main) = package.get("main").and_then(|value| value.as_str())
+            && let Some(resolved) = resolve_path(&base.join(main), capabilities)
+        {
+            return Some(resolved);
+        }
+        for index in ["index.js", "index.cjs", "index.json", "index.node"] {
+            let candidate = base.join(index);
+            if candidate.is_file() {
+                return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve relative, absolute, and bare package specifiers. Bare packages walk
+/// ancestor `node_modules` directories, including scoped package names and
+/// subpaths (`@scope/pkg/subpath`).
+fn resolve_file(dir: &Path, spec: &str, capabilities: &CapabilitySet) -> Option<PathBuf> {
+    if Path::new(spec).is_absolute() {
+        return resolve_path(Path::new(spec), capabilities);
+    }
+    if spec.starts_with('.') {
+        return resolve_path(&dir.join(spec), capabilities);
+    }
+    for ancestor in dir.ancestors() {
+        let candidate = ancestor.join("node_modules").join(spec);
+        if let Some(resolved) = resolve_path(&candidate, capabilities) {
+            return Some(resolved);
         }
     }
     None
@@ -301,7 +339,7 @@ pub(crate) fn cjs_load(
     }
 
     // 2. File module.
-    let resolved = resolve_file(dir, spec)
+    let resolved = resolve_file(dir, spec, &cfg.capabilities)
         .ok_or_else(|| runtime_type_error("require", format!("Cannot find module '{spec}'")))?;
     let id = resolved.to_string_lossy().to_string();
     if let Some(cached) = object::get(cache, ctx.heap(), &id) {
@@ -312,6 +350,23 @@ pub(crate) fn cjs_load(
             "require",
             format!("permission denied for '{id}'"),
         ));
+    }
+    if resolved.extension().is_some_and(|ext| ext == "node") {
+        let loader = cfg.addon_loader.ok_or_else(|| {
+            runtime_type_error(
+                "require",
+                format!("native addons are not enabled for '{id}'"),
+            )
+        })?;
+        return ctx.scope(|ctx, scope| {
+            // Park the cache before entering addon code: registration can run
+            // arbitrary allocating N-API calls and relocate this young object.
+            let cache = ctx.scoped_value(scope, Value::object(cache));
+            let value = loader(ctx, &resolved, &cfg.capabilities)?;
+            let value = ctx.scoped_value(scope, value);
+            ctx.scoped_set(scope, cache, &id, value)?;
+            Ok(ctx.escape(value))
+        });
     }
     let source = std::fs::read_to_string(&resolved)
         .map_err(|err| runtime_type_error("require", format!("io error for '{id}': {err}")))?;

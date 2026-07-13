@@ -8,6 +8,26 @@
 
 timeout_secs = 10
 
+[[integration_tests]]
+module = "napi"
+name = "stable-c-abi"
+program = "cargo"
+args = [
+    "test", "-p", "otter-cli", "--test", "node_napi",
+    "node_api_addon_executes_stable_c_abi", "--", "--exact",
+]
+timeout_secs = 300
+
+[[integration_tests]]
+module = "napi"
+name = "capabilities"
+program = "cargo"
+args = [
+    "test", "-p", "otter-cli", "--test", "node_napi",
+    "node_api_addon_requires_read_and_ffi_capabilities", "--", "--exact",
+]
+timeout_secs = 300
+
 [modules.assert]
 patterns = ["test-assert-*.js", "test-assert.js"]
 skip = [
@@ -28,6 +48,10 @@ patterns = ["test-util-*.js", "test-util.js"]
 skip = [
     "test-util-callbackify.js",                    # needs full promise/callback interop
 ]
+
+[modules.querystring]
+patterns = ["test-querystring-*.js", "test-querystring.js"]
+skip = []
 
 [modules.buffer]
 patterns = ["test-buffer-*.js", "test-buffer.js"]
@@ -54,6 +78,7 @@ skip = [
 
 [modules.url]
 patterns = ["test-url-*.js"]
+timeout_secs = 60
 skip = [
     "test-url-parse-invalid-input.js",             # legacy parse warnings + child_process
 ]

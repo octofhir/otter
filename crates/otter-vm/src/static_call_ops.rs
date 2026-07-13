@@ -1694,15 +1694,25 @@ fn assign_set_string(
             .map_err(|_| VmError::TypeMismatch)?;
         return Ok(());
     }
-    // For other exotic value kinds, surface failure rather than
-    // silently dropping the assign step.
-    Err(interp.err_type(
-        (format!(
-            "Object.assign: cannot set '{key}' on {}",
-            crate::value_kind_name(target_value)
+    let property_key = VmPropertyKey::String(key);
+    if interp.ordinary_set_data_value(
+        context,
+        *target_value,
+        &property_key,
+        value,
+        *target_value,
+        0,
+    )? {
+        Ok(())
+    } else {
+        Err(interp.err_type(
+            (format!(
+                "Object.assign: cannot set '{key}' on {}",
+                crate::value_kind_name(target_value)
+            ))
+            .into(),
         ))
-        .into(),
-    ))
+    }
 }
 
 fn assign_set_symbol(
@@ -1720,13 +1730,25 @@ fn assign_set_symbol(
         crate::array::set_symbol_property(arr, &mut interp.gc_heap, sym, value);
         return Ok(());
     }
-    Err(interp.err_type(
-        (format!(
-            "Object.assign: cannot set symbol on {}",
-            crate::value_kind_name(target_value)
+    let property_key = VmPropertyKey::Symbol(sym);
+    if interp.ordinary_set_data_value(
+        context,
+        *target_value,
+        &property_key,
+        value,
+        *target_value,
+        0,
+    )? {
+        Ok(())
+    } else {
+        Err(interp.err_type(
+            (format!(
+                "Object.assign: cannot set symbol on {}",
+                crate::value_kind_name(target_value)
+            ))
+            .into(),
         ))
-        .into(),
-    ))
+    }
 }
 
 /// §7.3.2 `Get(target, name)` for indexed-string entry probing in

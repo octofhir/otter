@@ -70,11 +70,10 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, shape: u32, value_byte: u32)
 }
 
 /// Frameless `LoadProperty` miss handler for a self-recursive callee running on
-/// the flat register window (no `HoltStack` frame). Resolves the own-data IC
-/// directly against `ctx.regs`; returns `0` on an inline-eligible hit (value
-/// written, cell self-patched), `2` when the load needs the full `[[Get]]`
-/// ladder (caller bails to the interpreter), `1` on throw. `function_id` is
-/// baked by the emitter (the window has no frame to read it from).
+/// the flat register window. Resolves the own-data IC directly against
+/// `ctx.regs` and completes every remaining `[[Get]]` case through the VM.
+/// Returns `0` when handled and `1` on throw; it never requests an exact side
+/// exit. `function_id` is baked by the emitter.
 pub(crate) extern "C" fn jit_load_prop_window_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -102,7 +101,7 @@ pub(crate) extern "C" fn jit_load_prop_window_stub(
             site as usize,
         )
     } {
-        Ok(Some(fill)) => {
+        Ok(fill) => {
             if cell != 0 && fill != 0 {
                 let cell = cell as *mut WhiskerIcCell;
                 // SAFETY: stable per-site cell address baked into this code.
@@ -112,7 +111,6 @@ pub(crate) extern "C" fn jit_load_prop_window_stub(
             }
             0
         }
-        Ok(None) => 2,
         Err(err) => {
             park_jit_error(ctx, err);
             1
@@ -121,10 +119,10 @@ pub(crate) extern "C" fn jit_load_prop_window_stub(
 }
 
 /// Frameless `StoreProperty` miss handler — the [`jit_load_prop_window_stub`]
-/// counterpart. Resolves an existing-own-data store (with barrier) against
-/// `ctx.regs` and runs ordinary data-property transitions from decoded values.
-/// Returns `0` when handled (self-patching the cell when eligible), `2` for
-/// accessor/exotic/non-object semantics, and `1` on throw.
+/// counterpart. Resolves existing-own-data stores and shape transitions against
+/// `ctx.regs`, then completes all remaining `[[Set]]` semantics through the
+/// VM's shared value-level funnel. Returns `0` when handled (self-patching the
+/// cell when eligible) and `1` on throw; it never requests an exact side exit.
 pub(crate) extern "C" fn jit_store_prop_window_stub(
     ctx: *mut JitCtx,
     obj: u64,
@@ -137,10 +135,12 @@ pub(crate) extern "C" fn jit_store_prop_window_stub(
     // SAFETY: as `jit_load_prop_window_stub`.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
     match unsafe {
         vm.jit_runtime_store_property_window(
             context,
+            stack,
             ctx.regs,
             function_id as u32,
             obj as u16,
@@ -149,7 +149,7 @@ pub(crate) extern "C" fn jit_store_prop_window_stub(
             site as usize,
         )
     } {
-        Ok(Some(fill)) => {
+        Ok(fill) => {
             if cell != 0 && fill != 0 {
                 let cell = cell as *mut WhiskerIcCell;
                 // SAFETY: stable per-site cell address baked into this code.
@@ -159,7 +159,6 @@ pub(crate) extern "C" fn jit_store_prop_window_stub(
             }
             0
         }
-        Ok(None) => 2,
         Err(err) => {
             park_jit_error(ctx, err);
             1

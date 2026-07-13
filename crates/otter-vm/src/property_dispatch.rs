@@ -7,7 +7,8 @@
 //! # Contents
 //! - Legacy `instanceof` prototype-chain fallback.
 //! - Synchronous `in` / `HasProperty` checks through the shared object resolver.
-//! - Synchronous property and element load/store tails.
+//! - Synchronous property and element load/store tails, including the shared
+//!   named-value `[[Set]]` entry used by JIT miss transitions.
 //!
 //! # Invariants
 //! - Stack-modifying proxy and `@@hasInstance` cases are handled before these
@@ -1446,6 +1447,59 @@ impl Interpreter {
             }
         };
         Ok(value)
+    }
+
+    /// Full string-keyed `[[Set]]` over any receiver value.
+    ///
+    /// Object-like receivers enter the single value-level internal-method
+    /// funnel in [`Self::ordinary_set_data_value`]. Primitive bases enter at
+    /// their wrapper prototype, matching interpreter dispatch without creating
+    /// a temporary wrapper; inherited setters remain observable and the
+    /// receiver phase rejects as required. Reentrant setters execute
+    /// synchronously through the runtime callable boundary while the caller's
+    /// published register window remains a moving-GC root.
+    pub(crate) fn store_property_value(
+        &mut self,
+        context: &ExecutionContext,
+        _stack: &mut HoltStack,
+        receiver: Value,
+        name: &str,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), VmError> {
+        if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
+            return Err(self.err_type(
+                (format!(
+                    "Cannot set property '{name}' on {}",
+                    value_kind_name(&receiver)
+                ))
+                .into(),
+            ));
+        }
+        let key = VmPropertyKey::String(name);
+        let wrapper_name = if receiver.is_boolean() {
+            Some("Boolean")
+        } else if receiver.is_number() {
+            Some("Number")
+        } else if receiver.is_string() {
+            Some("String")
+        } else if receiver.is_symbol() {
+            Some("Symbol")
+        } else if receiver.is_big_int() {
+            Some("BigInt")
+        } else {
+            None
+        };
+        let accepted = if let Some(wrapper_name) = wrapper_name {
+            let parent = self.primitive_wrapper_prototype(wrapper_name)?;
+            self.ordinary_set_data_value(context, Value::object(parent), &key, value, receiver, 0)?
+        } else {
+            self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)?
+        };
+        if !accepted {
+            self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))?;
+        }
+        Ok(())
     }
 
     /// §10.1.9.2 — continue OrdinarySet for a callable whose virtual
@@ -3277,13 +3331,10 @@ impl Interpreter {
     /// against the register window `regs`, with no `HoltStack` frame. Used by a
     /// self-recursive callee that runs frameless on the flat JIT register stack.
     ///
-    /// Returns `Ok(Some(fill))` when handled — the value is written into
-    /// `regs[dst]` and `fill` is the WhiskerIC cell-fill (`0` = no inline) — or
-    /// `Ok(None)` when the load needs the full `[[Get]]` ladder (non-object,
-    /// accessor, prototype hop, or non-cacheable), in which case the caller
-    /// bails to the interpreter and resumes there. The own-data IC warms from
-    /// the framed top-level execution before any frameless child runs, so the
-    /// steady state is the inline hit (this stub is the cold miss).
+    /// Writes the result into `regs[dst]` and returns the WhiskerIC cell-fill
+    /// (`0` = no inline). Non-object, accessor, prototype, proxy, exotic, and
+    /// megamorphic misses complete through the full `[[Get]]` ladder; this
+    /// transition never requests an exact side exit.
     ///
     /// # Safety
     /// `regs` must point at a live, GC-traced register window with at least
@@ -3299,7 +3350,7 @@ impl Interpreter {
         obj_reg: u16,
         name_idx: u32,
         site: usize,
-    ) -> Result<Option<u64>, VmError> {
+    ) -> Result<u64, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
@@ -3308,19 +3359,18 @@ impl Interpreter {
         // Non-object receivers (primitives, proxies) and saturated sites
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
-        let full_get = |vm: &mut Self, stack: &mut HoltStack| -> Result<Option<u64>, VmError> {
+        let full_get = |vm: &mut Self, stack: &mut HoltStack| -> Result<u64, VmError> {
             // Re-read the receiver from the traced window: the IC probes
             // above may have allocated (cache-stub install) and moved the
             // handle read at entry.
             let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
-            let value =
-                vm.load_property_value(context, stack, receiver, atomized_key.name())?;
+            let value = vm.load_property_value(context, stack, receiver, atomized_key.name())?;
             // SAFETY: `dst` is a compiler-emitted index into the pinned
             // caller window, which a getter's nested dispatch cannot move.
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            Ok(Some(0))
+            Ok(0)
         };
         let Some(obj) = receiver.as_object() else {
             return full_get(self, stack);
@@ -3340,7 +3390,7 @@ impl Interpreter {
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            return Ok(Some(self.whisker_load_cell_fill(site, obj, atomized_key)));
+            return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
         }
         if self.load_property_ics[site].entry_count() > 0 {
             self.load_property_ics[site]
@@ -3361,7 +3411,7 @@ impl Interpreter {
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
-            return Ok(Some(self.whisker_load_cell_fill(site, obj, atomized_key)));
+            return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
         }
         // Not cache-representable (accessor, deep prototype, absent):
         // complete the load in place through the full cascade.
@@ -3369,36 +3419,45 @@ impl Interpreter {
     }
 
     /// Frameless `StoreProperty` — the [`Self::jit_runtime_load_property_window`]
-    /// counterpart. Resolves an existing-own-data monomorphic store (including
-    /// the generational write barrier, which the IC's `store` applies) directly
-    /// against the register window. An ordinary-object miss continues through
-    /// the same [`Self::set_property`] data-write primitive as interpreter
-    /// dispatch, with already-decoded values, so shape transitions do not
-    /// deoptimize. Accessor/exotic/non-object outcomes return `Ok(None)`.
+    /// counterpart. Resolves existing-own-data stores and ordinary shape
+    /// transitions through the current IC/data path. Every non-cacheable miss
+    /// completes through [`Self::store_property_value`], including accessors,
+    /// exotics, proxies, primitive bases, megamorphic sites, and exceptions.
     ///
     /// # Safety
     /// As [`Self::jit_runtime_load_property_window`].
     pub unsafe fn jit_runtime_store_property_window(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut HoltStack,
         regs: *mut u64,
         function_id: u32,
         obj_reg: u16,
         name_idx: u32,
         src: u16,
         site: usize,
-    ) -> Result<Option<u64>, VmError> {
+    ) -> Result<u64, VmError> {
         self.record_jit_runtime_property_stub();
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
         let value = Value::from_bits(unsafe { *regs.add(src as usize) });
+        let full_set = |vm: &mut Self, stack: &mut HoltStack| -> Result<u64, VmError> {
+            // Re-read both values from the published, traced window. IC setup
+            // and property-key materialisation may allocate and move either
+            // operand before the semantic slow path begins.
+            let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+            let value = Value::from_bits(unsafe { *regs.add(src as usize) });
+            let strict = context.function_is_strict(function_id);
+            vm.store_property_value(context, stack, receiver, atomized_key.name(), value, strict)?;
+            Ok(0)
+        };
         let Some(obj) = receiver.as_object() else {
-            return Ok(None);
+            return full_set(self, stack);
         };
         if !object::supports_fast_property_ic(obj, &self.gc_heap) {
-            return Ok(None);
+            return full_set(self, stack);
         }
         // A store IC may describe the receiver's shaped own-data layout, but it
         // is not authority to bypass an inherited accessor/non-writable/exotic
@@ -3406,7 +3465,7 @@ impl Interpreter {
         // before consulting any cached store entry.
         let set_outcome = object::resolve_set(obj, &self.gc_heap, atomized_key.name());
         if !matches!(set_outcome, object::SetOutcome::AssignData) {
-            return Ok(None);
+            return full_set(self, stack);
         }
         if site < self.store_property_ics.len() {
             let entries_len = self.store_property_ics[site].entry_count();
@@ -3417,10 +3476,10 @@ impl Interpreter {
                     .is_some()
                 {
                     self.property_ic_stats.record_hit(PropertyIcKind::Store);
-                    return Ok(Some(self.whisker_store_cell_fill(
+                    return Ok(self.whisker_store_cell_fill(
                         site,
                         object::shape(obj, &self.gc_heap).offset(),
-                    )));
+                    ));
                 }
             }
             if entries_len > 0 {
@@ -3446,15 +3505,14 @@ impl Interpreter {
                     PropertyIcKind::Store,
                     ic,
                 );
-                return Ok(Some(self.whisker_store_cell_fill(
-                    site,
-                    object::shape(obj, &self.gc_heap).offset(),
-                )));
+                return Ok(
+                    self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
+                );
             }
         }
 
         self.set_property(obj, atomized_key.name(), value)?;
-        Ok(Some(0))
+        Ok(0)
     }
 
     /// Packed WhiskerIC inline-load cell fill for `site`, or `0` for "no inline".
@@ -5883,14 +5941,33 @@ impl Interpreter {
     }
 }
 
-/// Lazy-allocate (and cache) the TypedArray expando JsObject used
-/// to back non-canonical-numeric own properties such as
-/// `typedArr.constructor = X`.
-fn typed_array_ensure_expando(
+/// Lazy-allocate and cache the TypedArray expando through the VM handle arena.
+///
+/// The typed-array body is re-read from its scoped handle after allocating the
+/// bag, so a nursery move can never make `set_expando` target a stale body.
+/// The returned bag is current at scope exit and callers hand it immediately to
+/// descriptor/store code; any later allocating operation owns its own roots.
+pub(crate) fn typed_array_ensure_expando(
     interp: &mut Interpreter,
     t: &crate::binary::typed_array::JsTypedArray,
 ) -> Result<JsObject, VmError> {
-    typed_array_ensure_expando_pub(&mut interp.gc_heap, t)
+    if let Some(existing) = t.expando(&interp.gc_heap) {
+        return Ok(existing);
+    }
+    interp.with_handle_scope(|interp, scope| {
+        let typed_array = interp.scoped_value(scope, Value::typed_array(*t));
+        let bag = interp.scoped_object_bare(scope)?;
+        let current_t = interp
+            .escape_scoped(typed_array)
+            .as_typed_array(&interp.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        let current_bag = interp
+            .escape_scoped(bag)
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        current_t.set_expando(&mut interp.gc_heap, current_bag);
+        Ok(current_bag)
+    })
 }
 
 /// Public-crate variant of `typed_array_ensure_expando` so static

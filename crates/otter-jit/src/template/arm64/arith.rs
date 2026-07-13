@@ -14,6 +14,9 @@
 //!   content equality through the leaf strict-equality probe and the
 //!   reentrant loose-equality transition; no equality opcode side-exits on
 //!   a live isolate.
+//! - Coercive `ToPrimitive`/`ToNumeric` cases publish their operands in the
+//!   frame window and complete through cold VM-transition tails; user hooks
+//!   are never replayed and cold transition code does not split hot blocks.
 //!
 //! # See also
 //! - [`super::values`] — the tagged encode/decode primitives used here.
@@ -22,15 +25,28 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 
 use super::transitions::{TransitionTable, emit_add_delegate, emit_string_concat_alloc_call};
 use super::values::{
-    emit_box_bool, emit_box_double, emit_box_int32, emit_guard_int32, emit_guard_number,
-    emit_load_reg, emit_load_u64, emit_num_to_double, emit_store_reg, emit_to_int32_fast,
-    emit_to_uint32_fast,
+    emit_box_bool, emit_box_double, emit_box_int32, emit_guard_int32, emit_load_reg, emit_load_u64,
+    emit_num_to_double, emit_store_reg, emit_to_int32_fast, emit_to_uint32_fast,
 };
 use crate::entry::{
     DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_NULL,
     VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
 };
 use otter_vm::native_abi as abi;
+
+/// One cold coercion continuation emitted after the function's hot operation
+/// stream. The source instruction has already published its canonical PC;
+/// success branches to `resume`, while throws and isolate-less probe misses use
+/// the function's shared status epilogues.
+pub(super) struct CoercionSlowPath {
+    entry: DynamicLabel,
+    resume: DynamicLabel,
+    dst: u16,
+    src: u16,
+    mode: u32,
+    hint: u32,
+    function_id: u32,
+}
 
 /// Function-id immediate low tag as a 32-bit `dynasm` operand.
 const FUNCTION_ID_TAG_IMM: u32 = FUNCTION_ID_TAG as u32;
@@ -576,29 +592,54 @@ pub(super) fn emit_negate(
 }
 
 /// Emit `dst = ToNumeric(src)`: identity on a number (int32 or double);
-/// every other value side-exits for exact coercion.
+/// every coercive case completes through the shared reentrant VM transition.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_to_numeric(
     ops: &mut Assembler,
     dst: u16,
     src: u16,
-    bail: DynamicLabel,
+    function_id: u32,
+    slow_paths: &mut Vec<CoercionSlowPath>,
 ) -> Result<(), Unsupported> {
+    let slow = ops.new_dynamic_label();
+    let resume = ops.new_dynamic_label();
     emit_load_reg(ops, 9, src)?;
-    emit_guard_number(ops, 9, bail);
-    emit_store_reg(ops, 9, dst)
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; tst x9, x15
+        ; b.eq =>slow
+    );
+    emit_store_reg(ops, 9, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>resume);
+    slow_paths.push(CoercionSlowPath {
+        entry: slow,
+        resume,
+        dst,
+        src,
+        mode: 1,
+        hint: 0,
+        function_id,
+    });
+    Ok(())
 }
 
 /// Emit `dst = ToPrimitive(src)` for already-primitive values. Heap cells
-/// (objects, callables, strings) and bytecode-function references side-exit
-/// so observable `@@toPrimitive` / `valueOf` / `toString` hooks still run;
-/// numbers and the `null` / boolean / `undefined` immediates pass through.
+/// and bytecode-function references complete observable `@@toPrimitive` /
+/// `valueOf` / `toString` hooks through the shared VM transition; immediate
+/// primitives pass through inline.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_to_primitive(
     ops: &mut Assembler,
     dst: u16,
     src: u16,
-    bail: DynamicLabel,
+    hint: u32,
+    function_id: u32,
+    slow_paths: &mut Vec<CoercionSlowPath>,
 ) -> Result<(), Unsupported> {
     let keep = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let resume = ops.new_dynamic_label();
     emit_load_reg(ops, 9, src)?;
     dynasm!(ops
         ; .arch aarch64
@@ -607,11 +648,66 @@ pub(super) fn emit_to_primitive(
         ; b.ne =>keep
         ; orr x15, x15, #0x2          // NOT_CELL_MASK (OTHER_TAG)
         ; tst x9, x15
-        ; b.eq =>bail                 // heap cell (object/string/callable)
+        ; b.eq =>slow                 // heap cell (object/string/callable)
         ; and x14, x9, #0xffff
         ; cmp x14, FUNCTION_ID_TAG_IMM
-        ; b.eq =>bail                 // closure-less function reference
+        ; b.eq =>slow                 // closure-less function reference
         ; =>keep
     );
-    emit_store_reg(ops, 9, dst)
+    emit_store_reg(ops, 9, dst)?;
+    dynasm!(ops ; .arch aarch64 ; =>resume);
+    slow_paths.push(CoercionSlowPath {
+        entry: slow,
+        resume,
+        dst,
+        src,
+        mode: 0,
+        hint,
+        function_id,
+    });
+    Ok(())
+}
+
+/// Emit all deferred coercion continuations after the hot operation stream.
+/// The stub commits `dst` only after the VM coercion succeeds, so branching
+/// back to `resume` cannot expose a partially completed operation.
+pub(super) fn emit_coercion_slow_paths(
+    ops: &mut Assembler,
+    table: &TransitionTable,
+    slow_paths: Vec<CoercionSlowPath>,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+) {
+    let entry = table.entry(abi::STUB_JIT_COERCE_UNARY);
+    for path in slow_paths {
+        let CoercionSlowPath {
+            entry: slow_entry,
+            resume,
+            dst,
+            src,
+            mode,
+            hint,
+            function_id,
+        } = path;
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>slow_entry
+            ; mov x0, x20
+            ; movz x1, dst as u32
+            ; movz x2, src as u32
+            ; movz x3, mode
+        );
+        emit_load_u64(ops, 4, u64::from(hint));
+        emit_load_u64(ops, 5, u64::from(function_id));
+        emit_load_u64(ops, 16, entry);
+        dynasm!(ops
+            ; .arch aarch64
+            ; blr x16
+            ; cmp x0, #1
+            ; b.eq =>threw
+            ; cmp x0, #2
+            ; b.eq =>bail
+            ; b =>resume
+        );
+    }
 }

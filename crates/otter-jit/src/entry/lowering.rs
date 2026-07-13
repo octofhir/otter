@@ -82,6 +82,14 @@ pub(crate) struct UnaryOperands {
     pub(crate) src: u16,
 }
 
+/// Typed `ToPrimitive` operands including the compiler-emitted hint token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToPrimitiveOperands {
+    pub(crate) dst: u16,
+    pub(crate) src: u16,
+    pub(crate) hint: u32,
+}
+
 /// Typed three-register operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BinaryOperands {
@@ -223,6 +231,7 @@ enum LoweredOperands {
     LoadInt32(LoadInt32Operands),
     Local(LocalOperands),
     Unary(UnaryOperands),
+    ToPrimitive(ToPrimitiveOperands),
     Binary(BinaryOperands),
     ElementLoad(ElementLoadOperands),
     ElementStore(ElementStoreOperands),
@@ -290,6 +299,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Unary(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered unary operands")),
+        }
+    }
+
+    pub(crate) fn to_primitive_operands(self) -> Result<ToPrimitiveOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ToPrimitive(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered ToPrimitive operands")),
         }
     }
 
@@ -410,7 +426,6 @@ impl LoweredInstr {
             )),
         }
     }
-
 }
 
 /// Backend-neutral facts established before machine-code emission starts.
@@ -498,7 +513,12 @@ impl BaselinePlan {
                     value: reg(operands, 0)?,
                     local: local_index(operands, 1)?,
                 }),
-                Op::ToPrimitive | Op::ToNumeric | Op::Neg | Op::ToBoolean | Op::LogicalNot => {
+                Op::ToPrimitive => LoweredOperands::ToPrimitive(ToPrimitiveOperands {
+                    dst: reg(operands, 0)?,
+                    src: reg(operands, 1)?,
+                    hint: const_index(operands, 2)?,
+                }),
+                Op::ToNumeric | Op::Neg | Op::ToBoolean | Op::LogicalNot => {
                     LoweredOperands::Unary(UnaryOperands {
                         dst: reg(operands, 0)?,
                         src: reg(operands, 1)?,
@@ -720,7 +740,6 @@ impl BaselinePlan {
     pub(crate) fn index_tail(&self, range: OperandRange) -> Result<&[u32], Unsupported> {
         slice_range(&self.index_operands, range)
     }
-
 }
 
 fn slice_range<T>(storage: &[T], range: OperandRange) -> Result<&[T], Unsupported> {

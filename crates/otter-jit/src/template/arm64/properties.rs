@@ -3,8 +3,8 @@
 //! # Contents
 //! - Inline guarded own-data loads/stores through self-patching WhiskerIC
 //!   cells, with the Array exotic `length` fast path.
-//! - Window-transition misses that resolve the full semantics and self-patch
-//!   the site's cell.
+//! - Window-transition misses that resolve full load/`[[Set]]` semantics and
+//!   self-patch cacheable sites.
 //!
 //! # Invariants
 //! - Inline sequences neither allocate nor call, so they carry no safepoint;
@@ -16,10 +16,12 @@
 //! - Pointer-valued stores run the generational write barrier; primitive
 //!   stores skip it. Wide values the compressed slot cannot hold take the
 //!   window transition.
+//! - Store misses publish the frame window before entering the VM, so setters,
+//!   proxies, exceptions, reentry, and moving GC complete without replay.
 //!
 //! # See also
 //! - [`super::values`] — slot compression/decompression primitives.
-//! - `crates/otter-jit/src/baseline/runtime_ops/vm_ops.rs` — the window
+//! - `crates/otter-jit/src/entry/runtime_ops/vm_ops.rs` — the window
 //!   transitions and the authoritative cell layout.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
@@ -44,7 +46,6 @@ pub(super) fn emit_load_property(
     site: u64,
     array_length: bool,
     cell_addr: usize,
-    bail: DynamicLabel,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
@@ -148,9 +149,8 @@ pub(super) fn emit_load_property(
         );
     }
 
-    // Miss / no cage base: the window transition resolves own-data IC state
-    // and self-patches the cell; full `[[Get]]` semantics take the exact side
-    // exit to normal dispatch.
+    // Miss / no cage base: the window transition resolves own-data IC state,
+    // self-patches cacheable sites, and completes full `[[Get]]` semantics.
     dynasm!(ops
         ; .arch aarch64
         ; =>miss
@@ -168,8 +168,6 @@ pub(super) fn emit_load_property(
         ; blr x16
         ; cmp x0, #1
         ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>bail
         ; =>done
     );
     Ok(())
@@ -186,7 +184,6 @@ pub(super) fn emit_store_property(
     value: u16,
     site: u64,
     cell_addr: usize,
-    bail: DynamicLabel,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
@@ -273,8 +270,8 @@ pub(super) fn emit_store_property(
     }
 
     // Miss / no cage base: the window transition resolves the store and
-    // self-patches the cell; accessor/exotic semantics take the exact side
-    // exit.
+    // self-patches the cell. Accessor/exotic/proxy/primitive semantics complete
+    // in place through the VM's single value-level `[[Set]]` funnel.
     dynasm!(ops
         ; .arch aarch64
         ; =>miss
@@ -292,8 +289,6 @@ pub(super) fn emit_store_property(
         ; blr x16
         ; cmp x0, #1
         ; b.eq =>threw
-        ; cmp x0, #2
-        ; b.eq =>bail
         ; =>done
     );
     Ok(())

@@ -249,6 +249,9 @@ pub use value::{Value, ValueKind};
 /// through Test262 cross-realm checks.
 #[derive(Clone)]
 pub(crate) struct RealmState {
+    /// Stable scalar identity. Function-to-realm metadata stores this id rather
+    /// than a GC handle, so the metadata needs no separate root protocol.
+    pub(crate) id: u32,
     pub(crate) global_this: JsObject,
     pub(crate) error_classes: ErrorClassRegistry,
     pub(crate) realm_intrinsics: realm_intrinsics::RealmIntrinsics,
@@ -1047,6 +1050,15 @@ pub struct Interpreter {
     /// `$262.createRealm`. The first/default realm lives in the
     /// top-level interpreter fields for hot-path compatibility.
     extra_realms: Vec<RealmState>,
+    /// Stable identity of the currently swapped-in realm. Realm zero is the
+    /// default interpreter realm.
+    active_realm_id: u32,
+    /// Monotonic allocator for additional realm identities.
+    next_realm_id: u32,
+    /// ECMAScript function `[[Realm]]` metadata for linked bytecode chunks.
+    /// Both key and value are scalars; all moving-GC state remains owned and
+    /// traced by [`RealmState`].
+    function_realm_ids: rustc_hash::FxHashMap<u32, u32>,
     /// `true` while an extra realm (not the first/default realm) is the
     /// active one. Array allocation stamps a per-instance prototype
     /// override only in that window: a default-realm array resolves its

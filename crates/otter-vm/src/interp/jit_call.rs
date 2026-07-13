@@ -4,13 +4,16 @@
 //! Tier-up dispatch (`maybe_dispatch_jit`, backedge/OSR accounting),
 //! compiled-frame entry (`run_compiled_frame`, `jit_runtime_call`),
 //! direct-call and direct-method-call preparation/finish/abort, the
-//! per-fid direct-method inline cache, and raw frame-pointer accessors
-//! the emitted code reads (`jit_frame_regs_ptr` and friends).
+//! per-fid direct-method inline cache, in-place coercive unary operations, and
+//! raw frame-pointer accessors the emitted code reads (`jit_frame_regs_ptr`
+//! and friends).
 //!
 //! # Invariants
 //! Every publish of a callee frame is paired with a finish/abort helper
 //! that releases pinned code and the sync-reentry guard; bail paths must
 //! leave the frame stack exactly as the interpreter expects to resume.
+//! Reentrant unary coercion owns moving values through the handle arena and
+//! commits its destination only after the abstract operation succeeds.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -1357,6 +1360,72 @@ impl Interpreter {
             *caller_regs.add(dst_reg as usize) = Value::boolean(eq ^ negate);
         }
         Ok(())
+    }
+
+    /// Complete a coercive `ToPrimitive` or `ToNumeric` opcode in place for a
+    /// compiled caller. `numeric` selects §7.1.3; otherwise `hint_index`
+    /// identifies the compiler-emitted `default`/`number`/`string` token.
+    ///
+    /// The source, intermediate primitive, and result live in the high-level
+    /// handle arena across user `@@toPrimitive`/`valueOf`/`toString` reentry.
+    /// The published caller window remains authoritative and receives the
+    /// result only after the complete abstract operation succeeds.
+    ///
+    /// # Safety-adjacent contract
+    /// `caller_regs` is the caller's live traced register window and both
+    /// register indices are compiler-validated for that window.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn jit_runtime_coerce_unary_in_place(
+        &mut self,
+        context: &ExecutionContext,
+        dst_reg: u16,
+        src_reg: u16,
+        numeric: bool,
+        hint_index: u32,
+        function_id: u32,
+        caller_regs: *mut Value,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
+        self.with_handle_scope(|interp, scope| {
+            // SAFETY: `src_reg` is a compiler-emitted index into the published
+            // caller window.
+            let input = interp.scoped_value(scope, unsafe { *caller_regs.add(src_reg as usize) });
+            let hint = if numeric {
+                abstract_ops::ToPrimitiveHint::Number
+            } else {
+                let token = context
+                    .string_constant_str_for_function(function_id, hint_index)
+                    .ok_or(VmError::InvalidOperand)?;
+                abstract_ops::ToPrimitiveHint::from_token(token).ok_or(VmError::InvalidOperand)?
+            };
+            let current = interp.escape_scoped(input);
+            let primitive = if abstract_ops::is_primitive(&current) {
+                current
+            } else {
+                interp.evaluate_to_primitive(context, &current, hint)?
+            };
+            let primitive = interp.scoped_value(scope, primitive);
+            let primitive_value = interp.escape_scoped(primitive);
+            let result = if !numeric || primitive_value.is_number() || primitive_value.is_big_int()
+            {
+                primitive_value
+            } else if primitive_value.is_symbol() {
+                return Err(interp
+                    .err_type(("Cannot convert a Symbol value to a number".to_string()).into()));
+            } else {
+                Value::number(crate::number::NumberValue::from_f64(
+                    crate::number::parse::to_number_value(&primitive_value, &interp.gc_heap),
+                ))
+            };
+            let result = interp.scoped_value(scope, result);
+            // SAFETY: `dst_reg` is a compiler-emitted index into the pinned
+            // caller window; resolve the handle after every possible GC.
+            unsafe {
+                *caller_regs.add(dst_reg as usize) = interp.escape_scoped(result);
+            }
+            Ok(())
+        })
     }
 
     /// Prepare a direct compiled **plain** call (`callee(args…)`) from the

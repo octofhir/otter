@@ -1,8 +1,9 @@
 //! Typed C ABI entries for baseline JIT runtime slow paths.
 //!
 //! # Contents
-//! Fixed-operand coercion and descriptor operations plus compile-owned variadic
-//! metadata adapters for arrays, closures, and `Math` calls.
+//! Fixed-operand coercion and descriptor operations, reentrant
+//! `ToPrimitive`/`ToNumeric` completion, plus compile-owned variadic metadata
+//! adapters for arrays, closures, and `Math` calls.
 //!
 //! # Invariants
 //! - Operands are decoded during compilation. No entry accepts a byte PC or

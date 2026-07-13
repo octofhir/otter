@@ -8,6 +8,8 @@
 //! # Invariants
 //! Drains that run outside `run`'s rooted scope must push the
 //! interpreter's extra roots before touching the heap.
+//! Linked bytecode chunks retain the scalar identity of their creation realm;
+//! no moving-GC handle is stored in function metadata.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -75,7 +77,17 @@ impl Interpreter {
     /// after they escape to frames executing other chunks (the
     /// `eval` / `new Function` / dynamic-import escape paths).
     pub fn link_module(&mut self, module: otter_bytecode::BytecodeModule) -> ExecutionContext {
-        code_space::CodeSpace::link(&self.code_space, module)
+        let function_count = u32::try_from(module.functions.len())
+            .expect("linked module function table exceeds u32 range");
+        let context = code_space::CodeSpace::link(&self.code_space, module);
+        if self.active_realm_id != 0 {
+            let base = context.function_base();
+            for function_id in base..base + function_count {
+                self.function_realm_ids
+                    .insert(function_id, self.active_realm_id);
+            }
+        }
+        context
     }
 
     /// Execute `<main>` of `module` and return its completion value.

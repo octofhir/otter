@@ -2,9 +2,9 @@
 //! `[[Get]]` / `[[Set]]` / etc. and a user-defined handler.
 //!
 //! A proxy carries a `(target, handler)` pair. Each property
-//! operation consults the corresponding handler trap; when the trap
-//! is missing or the proxy is revoked, the operation falls through
-//! to the target object.
+//! operation consults the corresponding handler trap; a missing trap
+//! delegates to the target, while a revoked proxy raises `TypeError` in the
+//! active execution realm.
 //!
 //! # Contents
 //! - [`JsProxy`] — cheap-to-clone handle.

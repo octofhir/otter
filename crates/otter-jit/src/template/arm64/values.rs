@@ -92,17 +92,6 @@ pub(super) fn emit_guard_int32(ops: &mut Assembler, r: u8, bail: DynamicLabel) {
     );
 }
 
-/// Guard that `X(r)` is a Number (int32 or boxed double): branch to `bail`
-/// when no number-tag bit is set. Clobbers x15.
-pub(super) fn emit_guard_number(ops: &mut Assembler, r: u8, bail: DynamicLabel) {
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x15, NUMBER_TAG_HI16, lsl #48
-        ; tst X(r), x15
-        ; b.eq =>bail
-    );
-}
-
 /// Decode the `Number` in x-register `src_x` into f64 register `dst_d`.
 ///
 /// `int32` payloads sign-convert (`scvtf`); a boxed double has the encode

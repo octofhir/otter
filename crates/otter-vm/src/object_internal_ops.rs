@@ -8,12 +8,16 @@
 //! # Contents
 //! - Proxy trap invocation.
 //! - VM property-key conversion and own-property lookup helpers.
+//! - The value-level `[[Set]]` funnel shared by interpreter and JIT property
+//!   stores, including ordinary and exotic receiver phases.
 //! - String exotic property reads/descriptors.
 //! - Proxy invariant validation helpers.
 //! - Realm constructor prototype lookup.
 //!
 //! # Invariants
 //! - Proxy traps are invoked through the normal callable path.
+//! - `ordinary_set_data_value` is total for object-like values: specialised
+//!   exotics run first and the generic internal-method fallback owns the rest.
 //! - String exotic keys only synthesize `length` and index descriptors.
 //! - Constructor prototype lookup preserves existing global-object semantics.
 //!
@@ -5541,6 +5545,13 @@ impl Interpreter {
         Ok(true)
     }
 
+    /// Execute the value-level `[[Set]](key, value, receiver)` operation.
+    ///
+    /// Specialised exotic objects run their own internal methods above the
+    /// generic tail. Every remaining object-like value resolves its own
+    /// descriptor, prototype, and receiver phase through the shared internal
+    /// method helpers, so interpreter opcodes and JIT slow transitions do not
+    /// carry parallel property semantics.
     pub(crate) fn ordinary_set_data_value(
         &mut self,
         context: &ExecutionContext,
@@ -5575,10 +5586,7 @@ impl Interpreter {
         if let Some(t) = target.as_typed_array(&self.gc_heap) {
             match key {
                 VmPropertyKey::Symbol(sym) => {
-                    let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
-                        &mut self.gc_heap,
-                        &t,
-                    )?;
+                    let bag = crate::property_dispatch::typed_array_ensure_expando(self, &t)?;
                     return Ok(object::set_symbol(bag, &mut self.gc_heap, *sym, value));
                 }
                 _ => {
@@ -5614,10 +5622,7 @@ impl Interpreter {
                         // [[Set]]).
                         return self.ordinary_set_on_receiver(context, key, value, &receiver);
                     }
-                    let mut bag = crate::property_dispatch::typed_array_ensure_expando_pub(
-                        &mut self.gc_heap,
-                        &t,
-                    )?;
+                    let mut bag = crate::property_dispatch::typed_array_ensure_expando(self, &t)?;
                     // OrdinarySet on the expando: an own non-writable
                     // data property rejects, an own accessor invokes
                     // its setter (receiver = the typed array), and a
@@ -6260,6 +6265,72 @@ impl Interpreter {
                     self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1)
                 }
             };
+        }
+        // Generic OrdinarySet for the remaining object-like receiver families
+        // (class/bound constructors, Promise/ArrayBuffer/DataView and future
+        // hosted objects). Their value-level descriptor/prototype/define
+        // internal methods are authoritative; duplicating one branch per
+        // representation here would let interpreter and JIT semantics drift.
+        if crate::reflect::is_type_object_value(&target) {
+            return self.with_handle_scope(|interp, scope| {
+                let target = interp.scoped_value(scope, target);
+                let value = interp.scoped_value(scope, value);
+                let receiver = interp.scoped_value(scope, receiver);
+                // The handle arena owns every moving value here. The legacy
+                // descriptor helper receives no manually threaded roots.
+                let own = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    interp.escape_scoped(target),
+                    key,
+                    hops + 1,
+                    &[],
+                    &[],
+                )?;
+                if let Some(desc) = own {
+                    return match desc.kind {
+                        object::DescriptorKind::Accessor { setter, .. } => {
+                            let Some(setter) = setter else {
+                                return Ok(false);
+                            };
+                            interp.run_callable_sync(
+                                context,
+                                &setter,
+                                interp.escape_scoped(receiver),
+                                smallvec::smallvec![interp.escape_scoped(value)],
+                            )?;
+                            Ok(true)
+                        }
+                        object::DescriptorKind::Data { .. } => {
+                            if !desc.writable() {
+                                return Ok(false);
+                            }
+                            interp.ordinary_set_on_receiver(
+                                context,
+                                key,
+                                interp.escape_scoped(value),
+                                &interp.escape_scoped(receiver),
+                            )
+                        }
+                    };
+                }
+                let parent = interp.get_prototype_for_op(&interp.escape_scoped(target))?;
+                if parent.is_null() || parent.is_undefined() {
+                    return interp.ordinary_set_on_receiver(
+                        context,
+                        key,
+                        interp.escape_scoped(value),
+                        &interp.escape_scoped(receiver),
+                    );
+                }
+                interp.ordinary_set_data_value(
+                    context,
+                    parent,
+                    key,
+                    interp.escape_scoped(value),
+                    interp.escape_scoped(receiver),
+                    hops + 1,
+                )
+            });
         }
         Ok(false)
     }

@@ -3309,8 +3309,7 @@ impl Interpreter {
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
         let full_get = |vm: &mut Self, stack: &mut HoltStack| -> Result<Option<u64>, VmError> {
-            let value =
-                vm.load_property_value(context, stack, receiver, atomized_key.name())?;
+            let value = vm.load_property_value(context, stack, receiver, atomized_key.name())?;
             // SAFETY: `dst` is a compiler-emitted index into the pinned
             // caller window, which a getter's nested dispatch cannot move.
             unsafe {
@@ -5976,14 +5975,13 @@ pub(crate) fn generator_ensure_expando_pub(
 /// As [`map_ensure_expando_pub`] for a Set.
 pub(crate) fn set_ensure_expando_pub(
     heap: &mut otter_gc::GcHeap,
-    s: crate::collections::JsSet,
+    mut s: crate::collections::JsSet,
 ) -> Result<JsObject, VmError> {
     if let Some(existing) = crate::collections::set_expando(s, heap) {
         return Ok(existing);
     }
-    let recv = Value::set(s);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        recv.trace_value_slots(visitor);
+        visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     crate::collections::set_set_expando(s, heap, bag);

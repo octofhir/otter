@@ -69,6 +69,7 @@ mod package_graph_resolver;
 mod process;
 mod process_env;
 mod process_events;
+mod process_flags;
 pub mod promise_registry;
 mod runtime_activity;
 pub mod structured_clone;

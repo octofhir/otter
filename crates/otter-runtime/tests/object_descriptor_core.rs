@@ -562,6 +562,16 @@ fn reflect_own_keys_appends_symbols_after_ordered_strings() {
 }
 
 #[test]
+fn object_freeze_set_freezes_properties_not_entries() {
+    let completion = run(r#"
+        const set = Object.freeze(new Set([1]));
+        set.add(2);
+        Object.isFrozen(set) + ":" + [...set].join(",");
+        "#);
+    assert_eq!(completion, "true:1,2");
+}
+
+#[test]
 fn proxy_set_fallback_rejects_non_extensible_target() {
     let mut rt = Runtime::builder().build().expect("runtime");
     let err = rt

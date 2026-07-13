@@ -342,7 +342,6 @@ impl OldSpace {
         self.free_list.push(offset, size);
     }
 
-
     /// Atomically reserve empty standby pages before a copying collection.
     ///
     /// Pages are first acquired into a temporary vector. If the cage cannot

@@ -270,6 +270,29 @@ pub(crate) enum TemplateOp {
     PopParkedFinally { count: u32 },
     /// Run finally bodies down to `floor`, then jump to `target`.
     JumpViaFinally { target: u32, floor: u32 },
+    /// Advance an iterator through the VM's complete iterator transition.
+    /// User `next`, generator resume, iterator helpers, and result-record
+    /// accessors all complete in place through one reentrant runtime stub.
+    IteratorNext {
+        value_dst: u16,
+        done_dst: u16,
+        iterator: u16,
+    },
+    /// Complete `IteratorClose` through the VM's full `return`/generator/
+    /// helper semantics.
+    IteratorClose { iterator: u16 },
+    /// Register an iterator for abrupt close in the current frame.
+    IteratorCloseStart { iterator: u16 },
+    /// Remove an iterator from the current frame's abrupt-close registry.
+    IteratorCloseEnd { iterator: u16 },
+    /// Obtain an iterator through the VM's full observable `@@iterator`
+    /// transition: built-in iterables, user `[Symbol.iterator]()` methods
+    /// (called synchronously through the shared reentrant path), and
+    /// GetIteratorDirect `next` caching all complete in place.
+    GetIterator { dst: u16, src: u16 },
+    /// Obtain an async iterator (including async-from-sync fallback) through
+    /// the VM's full observable `@@asyncIterator` transition.
+    GetAsyncIterator { dst: u16, src: u16 },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -696,6 +719,37 @@ impl TemplatePlan {
                         floor: operands.floor,
                     }
                 }
+                Op::IteratorNext => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::IteratorNext {
+                        value_dst: operands.first,
+                        done_dst: operands.second,
+                        iterator: operands.third,
+                    }
+                }
+                Op::IteratorClose => TemplateOp::IteratorClose {
+                    iterator: lowered.source_operands()?.src,
+                },
+                Op::IteratorCloseStart => TemplateOp::IteratorCloseStart {
+                    iterator: lowered.source_operands()?.src,
+                },
+                Op::IteratorCloseEnd => TemplateOp::IteratorCloseEnd {
+                    iterator: lowered.source_operands()?.src,
+                },
+                Op::GetIterator => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::GetIterator {
+                        dst: operands.dst,
+                        src: operands.src,
+                    }
+                }
+                Op::GetAsyncIterator => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::GetAsyncIterator {
+                        dst: operands.dst,
+                        src: operands.src,
+                    }
+                }
                 Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan
@@ -954,6 +1008,62 @@ mod tests {
                 target: 6,
                 floor: 0,
             }
+        );
+    }
+
+    #[test]
+    fn plan_maps_iterator_lifecycle_completion() {
+        let v = view(&[
+            (Op::IteratorCloseStart, vec![Operand::Register(1)]),
+            (
+                Op::IteratorNext,
+                vec![
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::Register(1),
+                ],
+            ),
+            (Op::IteratorClose, vec![Operand::Register(1)]),
+            (Op::IteratorCloseEnd, vec![Operand::Register(1)]),
+            (
+                Op::GetAsyncIterator,
+                vec![Operand::Register(4), Operand::Register(1)],
+            ),
+            (
+                Op::GetIterator,
+                vec![Operand::Register(5), Operand::Register(1)],
+            ),
+            (Op::ReturnUndefined, vec![]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("iterator plan");
+        assert!(!plan.osr_only);
+        assert_eq!(
+            plan.instructions[0].op,
+            TemplateOp::IteratorCloseStart { iterator: 1 }
+        );
+        assert_eq!(
+            plan.instructions[1].op,
+            TemplateOp::IteratorNext {
+                value_dst: 2,
+                done_dst: 3,
+                iterator: 1,
+            }
+        );
+        assert_eq!(
+            plan.instructions[2].op,
+            TemplateOp::IteratorClose { iterator: 1 }
+        );
+        assert_eq!(
+            plan.instructions[3].op,
+            TemplateOp::IteratorCloseEnd { iterator: 1 }
+        );
+        assert_eq!(
+            plan.instructions[4].op,
+            TemplateOp::GetAsyncIterator { dst: 4, src: 1 }
+        );
+        assert_eq!(
+            plan.instructions[5].op,
+            TemplateOp::GetIterator { dst: 5, src: 1 }
         );
     }
 

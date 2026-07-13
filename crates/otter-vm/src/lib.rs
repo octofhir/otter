@@ -103,6 +103,7 @@ pub mod iterator_state;
 pub mod jit;
 mod jit_exception_ops;
 pub mod jit_feedback;
+mod jit_iterator_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
 pub mod js_surface;

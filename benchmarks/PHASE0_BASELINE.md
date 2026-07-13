@@ -694,3 +694,55 @@ documented medians `525`, `279`, `546`, and `1,246`. These are observed
 workload deltas of `+2.1%`, `-0.7%`, `-10.3%`, and `+4.6%` respectively (higher
 is better); the Crypto regression is retained as measured. Bun again failed
 with `ReferenceError: setupEngine is not defined` and is non-scoreable.
+
+### Phase 2 production iterator-lifecycle completion
+
+The template tier now compiles `GetAsyncIterator`, `IteratorNext`,
+`IteratorClose`, `IteratorCloseStart`, and `IteratorCloseEnd`. They share
+reentrant runtime stub 57 and call the VM's existing complete iterator helpers
+rather than copying iterator semantics into JIT code. The transition covers
+observable `@@asyncIterator` lookup and async-from-sync fallback, builtin and
+user iterators, generators, iterator helpers, result-record accessors, and
+`return()` close semantics. An already-active abrupt-close registration is
+removed only for the span of a reentrant `next` call and restored only after a
+non-done result; a throwing `next` therefore cannot accidentally close or
+replay the iterator opcode.
+
+`GetIterator` now completes in machine code as well, through the same reentrant
+stub 57. The synchronous `Interpreter::get_iterator_full` helper is the
+reentrant sibling of the interpreter's frame-push `drive_get_iterator`: built-in
+iterables reuse the shared `run_get_iterator_regs` fast path, while user
+`[Symbol.iterator]()` methods, accessor `@@iterator` getters, and TypedArray
+prototype iterators run through `run_callable_sync` instead of parking the
+opcode on a continuation. The GetIteratorDirect `next` read (once) is factored
+into `wrap_iterator_method_result`, now shared by the interpreter resume path
+and the compiled transition so both tiers observe identical effects. Every
+observable acquisition effect is committed before the destination register is
+written; the compiled body no longer side-exits at iterator acquisition. A
+whole-function body whose only former blocker was `GetIterator` is now
+tier-eligible for entry rather than loop-OSR-only.
+
+The supported active template set is 77 of 172 bytecodes (up from 71); 95
+remain unsupported. The abrupt-close registration disarm/re-arm rule for a
+reentrant `next` is unchanged: a throwing `next` cannot accidentally close or
+replay the iterator opcode.
+
+The focused interpreter/template OSR matrix covers dense arrays and a user
+iterator whose `next` and `return` are observable. It passed at normal GC and
+with `OTTER_GC_STRESS=1 OTTER_GC_VERIFY=1`. Targeted Test262
+`language/statements/for-of` executed 742 tests with 0 failures, timeouts, or
+crashes (10 skips). The release differential corpus passed 11/11 under every
+GC stress stride 1 through 16 with verification enabled. The frozen full
+Test262 reference remains 99.02% (51,480/53,173 excluding skips).
+
+Performance is explicitly subordinate to opcode coverage for this batch: the
+goal is a complete template-tier base for the future optimizing tier, not a
+short-term score. The iterator family does not touch the Richards/DeltaBlue hot
+path; a serial post-batch V8 v7 run of Richards, DeltaBlue, and Splay emitted
+suite score markers with zero crash, panic, or missing-marker failure. Earlier
+lifecycle-only samples showed a large Richards/Splay swing on an M1-under-load
+host with more than 2x run-to-run variance (Splay 571–1,324 in one set); that
+variance is treated as host contention, not a code signal, and no before/after
+speedup or regression figure is claimed from it. Any real perf recovery is
+deferred to the Phase 9 measurement-driven levers once the coverage base and
+tier-2 prerequisites are in place.

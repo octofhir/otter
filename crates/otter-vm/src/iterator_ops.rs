@@ -213,6 +213,177 @@ impl Interpreter {
         self.run_get_iterator_regs(stack, top_idx, dst, src)
     }
 
+    /// §7.4.2 GetIteratorDirect — wrap the object returned by a user
+    /// `[@@iterator]()` into an iterator `Value`, reading `next` exactly
+    /// once and caching it in the record. Shared by the interpreter's
+    /// frame-push resume path and the synchronous [`Self::get_iterator_full`]
+    /// reentrant transition, so both tiers observe identical accessor and
+    /// prototype effects.
+    pub(crate) fn wrap_iterator_method_result(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        produced: Value,
+    ) -> Result<Value, VmError> {
+        // §7.4.3 step 2 — `[@@iterator]()` must return an Object.
+        if let Some(iter) = produced.as_iterator() {
+            return Ok(Value::iterator(iter));
+        }
+        let iter_state = if let Some(handle) = produced.as_generator() {
+            IteratorState::Generator { handle }
+        } else if produced.is_object()
+            || produced.is_proxy()
+            || produced.is_array()
+            || produced.is_map()
+            || produced.is_set()
+        {
+            // `next` is read ONCE here; later `IteratorNext` ticks must not
+            // re-read it (observable via an accessor-defined `next`).
+            let next_method = match self.ordinary_get_value(
+                context,
+                produced,
+                produced,
+                &VmPropertyKey::String("next"),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, produced, SmallVec::new())?
+                }
+            };
+            IteratorState::User {
+                iterator: produced,
+                next_method: Some(next_method),
+            }
+        } else {
+            return Err(VmError::TypeMismatch);
+        };
+        let iter = self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
+        Ok(Value::iterator(iter))
+    }
+
+    /// Complete one `Op::GetIterator` synchronously for a compiled frame.
+    ///
+    /// This is the reentrant sibling of the interpreter's frame-push
+    /// [`Self::drive_get_iterator`]: user `[Symbol.iterator]()` methods run
+    /// through [`Self::run_callable_sync`] instead of suspending the opcode on
+    /// a parked continuation, so the JIT never resumes a partially observed
+    /// GetIterator. Built-in iterables fall through to the shared
+    /// [`Self::run_get_iterator_regs`] fast path. Every observable accessor,
+    /// `@@iterator` call, and GetIteratorDirect `next` read is committed before
+    /// the destination register is written; there is no post-effect side exit.
+    pub(crate) fn get_iterator_full(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        top_idx: usize,
+        dst: u16,
+        src: u16,
+    ) -> Result<(), VmError> {
+        let value = *read_register(&stack[top_idx], src)?;
+        let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
+
+        // Arrays with an own or prototype `@@iterator` run the user method;
+        // the plain built-in Array iterator falls through to the fast path.
+        if let Some(arr) = value.as_array() {
+            let own_method = array::get_symbol_property(arr, &self.gc_heap, iter_sym);
+            let proto = self.constructor_prototype_value("Array")?;
+            let proto_has = if own_method.is_none() {
+                self.ordinary_has_property_value(
+                    context,
+                    proto,
+                    &VmPropertyKey::Symbol(iter_sym),
+                    0,
+                )?
+            } else {
+                false
+            };
+            if own_method.is_some() || proto_has {
+                let callee = if let Some(method) = own_method {
+                    method
+                } else {
+                    match self.ordinary_get_value(
+                        context,
+                        proto,
+                        value,
+                        &VmPropertyKey::Symbol(iter_sym),
+                        0,
+                    )? {
+                        VmGetOutcome::Value(v) => v,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                        }
+                    }
+                };
+                if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
+                    return Err(VmError::TypeMismatch);
+                }
+                let receiver = *read_register(&stack[top_idx], src)?;
+                let produced =
+                    self.run_callable_sync(context, &callee, receiver, SmallVec::new())?;
+                let wrapped = self.wrap_iterator_method_result(context, stack, produced)?;
+                write_register(&mut stack[top_idx], dst, wrapped)?;
+                return Ok(());
+            }
+            return Err(VmError::TypeMismatch);
+        }
+
+        // §23.2.3.32 %TypedArray%.prototype[@@iterator] returns a live array
+        // iterator; a TypedArray is not an ordinary object, so always route it
+        // through its prototype's `@@iterator`.
+        if value.as_typed_array(&self.gc_heap).is_some() {
+            let callee = match self.ordinary_get_value(
+                context,
+                value,
+                value,
+                &VmPropertyKey::Symbol(iter_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                }
+            };
+            if !is_callable(&callee) {
+                return Err(VmError::TypeMismatch);
+            }
+            let receiver = *read_register(&stack[top_idx], src)?;
+            let produced = self.run_callable_sync(context, &callee, receiver, SmallVec::new())?;
+            let wrapped = self.wrap_iterator_method_result(context, stack, produced)?;
+            write_register(&mut stack[top_idx], dst, wrapped)?;
+            return Ok(());
+        }
+
+        // Non-object, non-proxy sources are the built-in fast path (arrays and
+        // strings handled there); everything callable-iterable goes through
+        // the ordinary `[[Get]]` ladder so an accessor `@@iterator` fires.
+        if value.as_object().is_none() && value.as_proxy().is_none() {
+            return self.run_get_iterator_regs(stack, top_idx, dst, src);
+        }
+
+        let callee = match self.ordinary_get_value(
+            context,
+            value,
+            value,
+            &VmPropertyKey::Symbol(iter_sym),
+            0,
+        )? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, value, SmallVec::new())?
+            }
+        };
+        if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
+            // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
+            return Err(VmError::TypeMismatch);
+        }
+        let receiver = *read_register(&stack[top_idx], src)?;
+        let produced = self.run_callable_sync(context, &callee, receiver, SmallVec::new())?;
+        let wrapped = self.wrap_iterator_method_result(context, stack, produced)?;
+        write_register(&mut stack[top_idx], dst, wrapped)?;
+        Ok(())
+    }
+
     pub(crate) fn run_iterator_next_regs(
         &mut self,
         frame: &mut Frame,
@@ -1614,66 +1785,17 @@ impl Interpreter {
         if let Some(_state) = resume {
             let produced = *read_register(&stack[top_idx], dst)?;
             // §7.4.3 step 2 — `[@@iterator]()` must return an
-            // Object. Anything else is a TypeError.
-            let produced_value = if let Some(iter) = produced.as_iterator() {
-                Value::iterator(iter)
-            } else {
-                let iter_state = if let Some(handle) = produced.as_generator() {
-                    IteratorState::Generator { handle }
-                } else if produced.is_object()
-                    || produced.is_proxy()
-                    || produced.is_array()
-                    || produced.is_map()
-                    || produced.is_set()
-                {
-                    // §7.4.2 GetIteratorDirect — `next` is read ONCE
-                    // here and cached in the iterator record; later
-                    // `IteratorNext` ticks must not re-read it
-                    // (observable via accessor-defined `next`).
-                    let next_method = match self.ordinary_get_value(
-                        context,
-                        produced,
-                        produced,
-                        &VmPropertyKey::String("next"),
-                        0,
-                    ) {
-                        Ok(VmGetOutcome::Value(v)) => v,
-                        Ok(VmGetOutcome::InvokeGetter { getter }) => {
-                            match self.run_callable_sync(
-                                context,
-                                &getter,
-                                produced,
-                                SmallVec::new(),
-                            ) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                                        cold.pending_get_iterator = None;
-                                    }
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                                cold.pending_get_iterator = None;
-                            }
-                            return Err(e);
-                        }
-                    };
-                    IteratorState::User {
-                        iterator: produced,
-                        next_method: Some(next_method),
-                    }
-                } else {
+            // Object; GetIteratorDirect then reads `next` once. Both
+            // are owned by the shared wrap helper. A failure here must
+            // still clear the parked continuation before propagating.
+            let produced_value = match self.wrap_iterator_method_result(context, stack, produced) {
+                Ok(value) => value,
+                Err(e) => {
                     if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                         cold.pending_get_iterator = None;
                     }
-                    return Err(VmError::TypeMismatch);
-                };
-                let iter =
-                    self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
-                Value::iterator(iter)
+                    return Err(e);
+                }
             };
             write_register(&mut stack[top_idx], dst, produced_value)?;
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {

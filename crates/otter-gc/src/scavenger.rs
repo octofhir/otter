@@ -252,9 +252,7 @@ pub unsafe fn scavenge(
     // 5) Run minor-GC ephemeron processing. This may evacuate values for
     // keys that were already kept alive by ordinary reachability.
     // SAFETY: registry slots are valid non-root slots supplied by the heap.
-    unsafe {
-        process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots)
-    };
+    unsafe { process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots) };
 
     // 6) Rewrite non-root weak registry entries after all strong and
     // ephemeron reachability has been evacuated, but before from-space is

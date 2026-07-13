@@ -11,8 +11,9 @@
 //!   caller's published frame survives untouched.
 //! - The callee frame lives exactly as long as its machine-stack
 //!   reservation; the caller's frame is republished before any exit path.
-//! - Ineligible call resolutions take an exact side exit; compiled code
-//!   never re-enters one interpreter opcode through a bespoke bridge.
+//! - Ineligible call resolutions complete through the descriptor-classified
+//!   generic in-place transitions; only receivers whose opcode semantics the
+//!   interpreter dispatches through bespoke branches take an exact side exit.
 //!
 //! # See also
 //! - [`super::transitions`] — descriptor-resolved entries used here.
@@ -44,8 +45,10 @@ use crate::entry::{
 ///
 /// The prepare transition resolves the callee against installed code and
 /// stages the callee window/identity in the entry context (`0`), throws
-/// (`1`), or reports an ineligible callee (`2`) which takes the exact side
-/// exit so normal dispatch runs the call.
+/// (`1`), or reports an ineligible callee (`2`), which then completes
+/// through the generic in-place call transition — the compiled caller keeps
+/// running for every callable. Only a non-callable value takes the exact
+/// side exit so the interpreter owns the thrown error.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_call(
     ops: &mut Assembler,
@@ -58,6 +61,7 @@ pub(super) fn emit_call(
     threw: DynamicLabel,
 ) {
     let done = ops.new_dynamic_label();
+    let generic = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; mov x0, x20
@@ -72,10 +76,32 @@ pub(super) fn emit_call(
         ; cmp x0, #1
         ; b.eq =>threw
         ; cmp x0, #2
-        ; b.eq =>bail
+        ; b.eq =>generic
     );
     emit_direct_call_tail(ops, table, dst, threw, done);
-    dynasm!(ops ; .arch aarch64 ; =>done);
+
+    // Ineligible callee: complete the whole opcode through the generic
+    // in-place call transition; only its non-callable report (`2`)
+    // side-exits to normal dispatch.
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>generic
+        ; mov x0, x20
+        ; movz x1, dst as u32
+        ; movz x2, callee as u32
+        ; movz x3, argc as u32
+    );
+    emit_load_u64(ops, 4, packed_args);
+    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CALL_GENERIC));
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, #1
+        ; b.eq =>threw
+        ; cmp x0, #2
+        ; b.eq =>bail
+        ; =>done
+    );
 }
 
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).

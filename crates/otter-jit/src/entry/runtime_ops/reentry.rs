@@ -213,6 +213,39 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
     }
 }
 
+/// Complete one full plain `Call` in the VM after the direct-call prepare
+/// reported an ineligible callee. `0` = destination written and the compiled
+/// caller continues, `1` = threw, `2` = non-callable (exact side exit; the
+/// interpreter owns the thrown error).
+pub(crate) extern "C" fn jit_call_generic_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    callee: u64,
+    argc: u64,
+    packed_args: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
+    let all = unpack_method_arg_regs(packed_args);
+    let argc = (argc as usize).min(all.len());
+    match vm.jit_runtime_call_in_place(
+        context,
+        dst as u16,
+        callee as u16,
+        &all[..argc],
+        ctx.regs.cast::<otter_vm::Value>(),
+    ) {
+        Ok(true) => 0,
+        Ok(false) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 pub(crate) extern "C" fn jit_finish_direct_call_returned_stub(
     ctx: *mut JitCtx,
     dst: u64,

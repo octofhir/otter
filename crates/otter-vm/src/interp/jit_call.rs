@@ -1212,6 +1212,55 @@ impl Interpreter {
         Ok(true)
     }
 
+    /// Complete one full plain `Call` in place for a compiled caller whose
+    /// direct-call prepare reported an ineligible callee (native, bound, or
+    /// a bytecode function outside the direct-call plan).
+    ///
+    /// The interpreter's `Op::Call` has no exotic receiver branches — its
+    /// semantics are exactly "call the callee value with `undefined` as
+    /// `this`" — so any callable completes here through
+    /// [`Self::run_callable_sync_already_rooted`] under the caller's
+    /// published activation. A non-callable value reports `Ok(false)` and
+    /// side-exits, keeping the interpreter the owner of the thrown error.
+    /// On `Ok(true)` the destination register holds the call result.
+    ///
+    /// # Safety-adjacent contract
+    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
+    /// compiled code guarantees the destination/callee/argument registers
+    /// are in bounds for that window.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn jit_runtime_call_in_place(
+        &mut self,
+        context: &ExecutionContext,
+        dst_reg: u16,
+        callee_reg: u16,
+        arg_regs: &[u16],
+        caller_regs: *mut Value,
+    ) -> Result<bool, VmError> {
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
+        self.jit_runtime_stats.runtime_calls =
+            self.jit_runtime_stats.runtime_calls.saturating_add(1);
+        // SAFETY: `callee_reg` is a compiler-emitted index into the caller window.
+        let callee = unsafe { *caller_regs.add(callee_reg as usize) };
+        if !self.is_callable_runtime(&callee) {
+            return Ok(false);
+        }
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &arg in arg_regs {
+            // SAFETY: compiler-emitted argument indices into the caller window.
+            args.push(unsafe { *caller_regs.add(arg as usize) });
+        }
+        let result =
+            self.run_callable_sync_already_rooted(context, &callee, Value::undefined(), args)?;
+        // SAFETY: `dst_reg` is a compiler-emitted index into the caller
+        // window; the window slab is pinned, so the pointer survived the
+        // nested dispatch.
+        unsafe {
+            *caller_regs.add(dst_reg as usize) = result;
+        }
+        Ok(true)
+    }
+
     /// Prepare a direct compiled **plain** call (`callee(args…)`) from the
     /// callee value in a caller register. Returns `Ok(None)` when the callee
     /// is not an eligible installed bytecode function — the emitted site bails

@@ -56,7 +56,7 @@ pub(crate) struct WhiskerIcCell {
 ///
 /// # Safety
 /// `cell` must be a valid, stable [`WhiskerIcCell`] pointer (a site's cell from
-/// the owning `BaselineCode` backing slice).
+/// the owning code object's backing slice).
 unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, shape: u32, value_byte: u32) {
     unsafe {
         let ways = &mut (*cell).ways;

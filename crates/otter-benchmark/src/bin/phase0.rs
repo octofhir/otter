@@ -31,7 +31,7 @@ use otter_benchmark::{
     JitMode, MemoryMetrics, RuntimeMode, ValidationStatus,
 };
 use otter_compiler::compile_script_source;
-use otter_jit::{BaselineCompilerKind, BaselineJitCompiler, compile, compile_template};
+use otter_jit::{BaselineJitCompiler, compile};
 use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_runtime::{
@@ -151,9 +151,6 @@ enum Command {
         samples: u32,
         #[arg(long, default_value_t = 10)]
         warmup: u32,
-        /// Compiler implementation to measure.
-        #[arg(long, value_enum, default_value_t = CompilerArg::Legacy)]
-        compiler: CompilerArg,
     },
     /// Measure managed allocations, heap bytes, and cumulative GC pause time.
     Memory {
@@ -438,36 +435,13 @@ fn run_call(
     )
 }
 
-/// Compiler implementation measured by `jit-compile`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum CompilerArg {
-    /// The production baseline emitter.
-    Legacy,
-    /// The template compiler.
-    Template,
-}
-
-impl CompilerArg {
-    fn kind(self) -> BaselineCompilerKind {
-        match self {
-            Self::Legacy => BaselineCompilerKind::Legacy,
-            Self::Template => BaselineCompilerKind::Template,
-        }
-    }
-
-    fn compile_once(
-        self,
-        view: &otter_vm::JitCompileSnapshot,
-    ) -> Result<Box<dyn otter_vm::JitFunctionCode>, String> {
-        match self {
-            Self::Legacy => compile(view, 1)
-                .map(|code| Box::new(code) as Box<dyn otter_vm::JitFunctionCode>)
-                .map_err(|error| format!("{error:?}")),
-            Self::Template => compile_template(view, 1)
-                .map(|code| Box::new(code) as Box<dyn otter_vm::JitFunctionCode>)
-                .map_err(|error| format!("{error:?}")),
-        }
-    }
+/// Compile the snapshot once through the production template compiler.
+fn compile_once(
+    view: &otter_vm::JitCompileSnapshot,
+) -> Result<Box<dyn otter_vm::JitFunctionCode>, String> {
+    compile(view, 1)
+        .map(|code| Box::new(code) as Box<dyn otter_vm::JitFunctionCode>)
+        .map_err(|error| format!("{error:?}"))
 }
 
 fn run_jit_compile(
@@ -476,7 +450,6 @@ fn run_jit_compile(
     expected: f64,
     samples: u32,
     warmup: u32,
-    compiler: CompilerArg,
 ) -> BenchmarkResult {
     let benchmark = format!("jit-compile-{function_name}");
     if samples == 0 {
@@ -559,9 +532,7 @@ fn run_jit_compile(
         }
     };
     let mut validation_interpreter = Interpreter::new();
-    validation_interpreter.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::with_kind(
-        compiler.kind(),
-    ))));
+    validation_interpreter.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
     match validation_interpreter.run(&context) {
         Ok(value) if value.as_f64() == Some(expected) => {}
         Ok(value) => {
@@ -590,7 +561,7 @@ fn run_jit_compile(
         }
     }
     for _ in 0..warmup {
-        if let Err(error) = compiler.compile_once(&view) {
+        if let Err(error) = compile_once(&view) {
             return result(
                 benchmark,
                 RuntimeMode::Vm,
@@ -606,7 +577,7 @@ fn run_jit_compile(
     let mut code_bytes = None;
     for _ in 0..samples {
         let started = Instant::now();
-        let code = match compiler.compile_once(&view) {
+        let code = match compile_once(&view) {
             Ok(code) => code,
             Err(error) => {
                 return result(
@@ -1164,8 +1135,7 @@ fn main() {
             expected,
             samples,
             warmup,
-            compiler,
-        } => run_jit_compile(source, function, expected, samples, warmup, compiler),
+        } => run_jit_compile(source, function, expected, samples, warmup),
         Command::Memory {
             iterations,
             samples,

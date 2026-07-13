@@ -1,15 +1,15 @@
 //! Template compiler built on backend-neutral [`TemplatePlan`] operations.
 //!
-//! A second native compiler beside the established baseline emitter, sharing
-//! its frozen entry contract (`JitCtx`/`JitRet`, `otter_vm::native_abi`). It
-//! compiles constants, register moves, branches, tagged truthiness, the full
-//! tagged numeric/comparison/bitwise set, `+` with allocating string concat,
+//! The production native compiler over the frozen entry contract
+//! (`JitCtx`/`JitRet`, `otter_vm::native_abi`). It compiles constants,
+//! register moves, branches, tagged truthiness, the full tagged
+//! numeric/comparison/bitwise set, `+` with allocating string concat,
 //! descriptor-resolved runtime transitions, ordinary and method calls with
 //! callee-owned frames, named-property IC probes, and guarded Map/Set builtin
-//! fast paths. Every opcode outside the subset rejects the whole function
-//! with [`Unsupported`] — a template compile never produces partially
-//! executable code. Deliberately absent (later, measured slices): inlining,
-//! OSR entries, and FP residency.
+//! fast paths. Opcodes outside the subset lower to exact side exits
+//! (loop-OSR-only code) or reject the whole function with [`Unsupported`] —
+//! a template compile never produces partially executable code. Deliberately
+//! absent (later, measured slices): inlining and FP residency.
 //!
 //! # Contents
 //! - [`plan`] — machine-independent operation stream over typed lowering.
@@ -18,19 +18,18 @@
 //! - [`compile`] — the whole-function compile entry point.
 //!
 //! # Invariants
-//! - Selection is an explicit code-level wiring point
-//!   ([`crate::BaselineCompilerKind`]); there is no environment or runtime
-//!   toggle, and the default hook construction never routes here.
 //! - Compiled code publishes the canonical instruction-index PC before every
 //!   opcode and exits only through exact side exits, returns, or the throw
-//!   status — identical boundary semantics to the baseline emitter.
+//!   status; the interpreter resumes exactly there and never replays earlier
+//!   effects.
 //! - The VM is reached only through `otter_vm::native_abi` records and the
 //!   shared runtime-stub inventory; no template-private frame or status shape
 //!   exists.
 //!
 //! # See also
 //! - `JIT_REFACTOR_PLAN.md` — replacement-compiler direction and gates.
-//! - [`crate::baseline`] — the full-subset emitter this compiler will replace.
+//! - [`crate::baseline`] — the shared entry ABI, typed lowering, and runtime
+//!   transitions this compiler consumes.
 
 use otter_vm::JitCompileSnapshot;
 
@@ -369,13 +368,11 @@ mod tests {
         assert!(!code.frameless_entry_safe());
     }
 
-    /// Differential fixtures compiled by BOTH compilers and executed through
-    /// the identical entry ABI. The template result must match the expected
-    /// interpreter semantics; whenever the baseline compiler also completes
-    /// (it bails on non-boolean branch conditions the template handles), the
-    /// two compiled results must agree bit-for-bit.
+    /// Executable fixtures spanning constants, branches, moves, and returns,
+    /// executed through the shared entry ABI; each result must match the
+    /// expected interpreter semantics.
     #[test]
-    fn both_compilers_agree_on_shared_fixtures() {
+    fn shared_fixtures_match_interpreter_semantics() {
         let fixtures: Vec<(&str, JitCompileSnapshot, [u64; 8], Exit)> = vec![
             (
                 "int constant return",
@@ -435,29 +432,70 @@ mod tests {
                 1 << 30,
             );
             assert_eq!(template_exit, expected, "template fixture `{name}`");
-
-            let baseline_code =
-                crate::baseline::compile(&v, 2).expect("baseline compiles the shared fixture");
-            let mut baseline_regs = regs_in;
-            // SAFETY: the code object outlives the call.
-            let baseline_exit = exec_entry(
-                unsafe { baseline_entry_for_test(&baseline_code) },
-                &mut baseline_regs,
-                0,
-                1 << 30,
-            );
-            if let Exit::Returned(_) = baseline_exit {
-                assert_eq!(baseline_exit, template_exit, "A/B fixture `{name}`");
-                assert_eq!(baseline_regs, template_regs, "A/B registers `{name}`");
-            }
         }
     }
 
-    // SAFETY-wrapper: reach the baseline entry through its VM entry address so
-    // both compilers execute through the same test harness.
-    unsafe fn baseline_entry_for_test(code: &crate::BaselineCode) -> *const u8 {
-        code.entry_addr()
-            .expect("baseline code publishes an entry address") as *const u8
+    #[test]
+    fn method_call_uses_full_packed_argument_abi() {
+        let four_args = view(&[
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(4),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::Register(4),
+                    Operand::Register(5),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(
+            compile(&four_args).is_ok(),
+            "the compiler must accept every argument representable by the shared packed ABI"
+        );
+
+        let five_args = view(&[
+            (
+                Op::CallMethodValue,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(5),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::Register(4),
+                    Operand::Register(5),
+                    Operand::Register(6),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(compile(&five_args).is_err());
+    }
+
+    #[test]
+    fn store_element_is_part_of_the_compiled_subset() {
+        let store = view(&[
+            (
+                Op::StoreElement,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+        assert!(
+            compile(&store).is_ok(),
+            "element stores must stay compiled through the typed runtime transition"
+        );
     }
 
     #[test]

@@ -1,3 +1,21 @@
+//! Config-driven Node.js compatibility runner.
+//!
+//! # Contents
+//! - TOML selection of official JavaScript tests by module and filename glob.
+//! - Configured integration commands for compatibility surfaces that need
+//!   build fixtures, such as native Node-API addons.
+//! - Watchdog execution and generated JSON/Markdown conformance reports.
+//!
+//! # Invariants
+//! - Only tests selected by `node_compat_config.toml` enter the report.
+//! - Every child runs in its own process group and is terminated by the
+//!   external watchdog on timeout.
+//! - Configured commands use owned strings and never cross VM/GC boundaries.
+//!
+//! # See also
+//! - `node_compat_config.toml`
+//! - `NODE_CONFORMANCE.md`
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -14,6 +32,8 @@ pub struct NodeCompatConfig {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     pub modules: BTreeMap<String, NodeCompatModuleConfig>,
+    #[serde(default)]
+    pub integration_tests: Vec<NodeCompatIntegrationTest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +41,17 @@ pub struct NodeCompatModuleConfig {
     pub patterns: Vec<String>,
     #[serde(default)]
     pub skip: Vec<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeCompatIntegrationTest {
+    pub module: String,
+    pub name: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +139,14 @@ pub enum Outcome {
 struct PlannedTest {
     module: String,
     display_path: String,
-    file_path: PathBuf,
+    kind: PlannedTestKind,
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+enum PlannedTestKind {
+    NodeJs(PathBuf),
+    Command { program: String, args: Vec<String> },
 }
 
 const NODE_TEST_ROOT: &str = "tests/node-compat/node/test/parallel";
@@ -208,43 +246,59 @@ fn collect_tests(
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("js"))
         .collect();
 
-    // Full-suite coverage: discover every `test-*.js`, derive its module from
-    // the `test-<module>-` filename prefix. The config no longer scopes which
-    // tests run (that hid most of the suite) — it only supplies skip-lists.
-    // A module argument filters to that prefix; no argument runs everything.
     let selected: HashMap<&str, ()> = options
         .selected_modules
         .iter()
         .map(|m| (m.as_str(), ()))
         .collect();
-    let skipped: HashMap<&str, ()> = config
-        .modules
-        .values()
-        .flat_map(|m| m.skip.iter())
-        .map(|item| (item.as_str(), ()))
-        .collect();
-
     let mut planned = Vec::new();
-    for path in &available {
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !file_name.starts_with("test-") || skipped.contains_key(file_name) {
-            continue;
-        }
-        let module = module_from_filename(file_name);
+    for (module, module_config) in &config.modules {
         if !selected.is_empty() && !selected.contains_key(module.as_str()) {
             continue;
         }
+        for path in &available {
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if module_config.skip.iter().any(|skip| skip == file_name)
+                || !module_config
+                    .patterns
+                    .iter()
+                    .any(|pattern| wildcard_matches(pattern, file_name))
+            {
+                continue;
+            }
+            if let Some(filter) = &options.substring_filter
+                && !file_name.contains(filter)
+            {
+                continue;
+            }
+            planned.push(PlannedTest {
+                display_path: format!("{module}/{file_name}"),
+                module: module.clone(),
+                kind: PlannedTestKind::NodeJs(path.clone()),
+                timeout_secs: module_config.timeout_secs,
+            });
+        }
+    }
+
+    for integration in &config.integration_tests {
+        if !selected.is_empty() && !selected.contains_key(integration.module.as_str()) {
+            continue;
+        }
         if let Some(filter) = &options.substring_filter
-            && !file_name.contains(filter)
+            && !integration.name.contains(filter)
         {
             continue;
         }
         planned.push(PlannedTest {
-            display_path: format!("{module}/{file_name}"),
-            module,
-            file_path: path.clone(),
+            display_path: format!("{}/{}", integration.module, integration.name),
+            module: integration.module.clone(),
+            kind: PlannedTestKind::Command {
+                program: integration.program.clone(),
+                args: integration.args.clone(),
+            },
+            timeout_secs: integration.timeout_secs,
         });
     }
 
@@ -255,12 +309,36 @@ fn collect_tests(
     Ok(planned)
 }
 
-/// Derive the module name from a `test-<module>-...js` filename: the run of
-/// characters after `test-` up to the next `-` or `.`. `test-fs-read.js` -> `fs`,
-/// `test-http2-foo.js` -> `http2`, `test-path.js` -> `path`.
-fn module_from_filename(file_name: &str) -> String {
-    let rest = file_name.strip_prefix("test-").unwrap_or(file_name);
-    rest.split(['-', '.']).next().unwrap_or("misc").to_string()
+/// Match the config's filename globs without parsing or transforming JS.
+/// Node test names are ASCII; `*` and `?` use the conventional glob meaning.
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let (mut pattern_index, mut text_index) = (0, 0);
+    let (mut star, mut star_text_index) = (None, 0);
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
+        {
+            pattern_index += 1;
+            text_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_text_index = text_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            star_text_index += 1;
+            text_index = star_text_index;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 fn run_one_test(
@@ -270,7 +348,8 @@ fn run_one_test(
     test: &PlannedTest,
 ) -> Result<TestResult> {
     let started = Instant::now();
-    let watchdog_timeout = Duration::from_secs(emergency_watchdog_timeout_secs(timeout_secs));
+    let test_timeout_secs = test.timeout_secs.unwrap_or(timeout_secs);
+    let watchdog_timeout = Duration::from_secs(emergency_watchdog_timeout_secs(test_timeout_secs));
     let stdout_path = temp_output_path("stdout");
     let stderr_path = temp_output_path("stderr");
     let stdout_file = File::create(&stdout_path).with_context(|| {
@@ -285,17 +364,31 @@ fn run_one_test(
             test.display_path
         )
     })?;
-    // The active `otter` CLI has no `--timeout` flag; per-test time limits are
-    // enforced by the external watchdog below (process-group SIGKILL).
-    let mut command = Command::new(otter_bin);
+    let mut command = match &test.kind {
+        PlannedTestKind::NodeJs(file_path) => {
+            let mut command = Command::new(otter_bin);
+            command
+                .arg(format!("--timeout={test_timeout_secs}"))
+                .arg("--allow-all")
+                .arg(file_path)
+                // The harness's `common` re-execs the test with V8-specific
+                // `// Flags:`. Otter is a different engine, so disable that
+                // flag-reexec path.
+                .env("NODE_SKIP_FLAG_CHECK", "1")
+                // Color-control variables are test inputs in util/TTY.
+                .env_remove("NO_COLOR")
+                .env_remove("NODE_DISABLE_COLORS")
+                .env_remove("FORCE_COLOR");
+            command
+        }
+        PlannedTestKind::Command { program, args } => {
+            let mut command = Command::new(program);
+            command.args(args);
+            command
+        }
+    };
     command
-        .arg("--allow-all")
-        .arg(&test.file_path)
         .current_dir(workspace_root)
-        // The harness's `common` re-execs the test with V8-specific `// Flags:`
-        // when it detects them; otter is a different engine and rejects those
-        // flags, so disable the flag-reexec path.
-        .env("NODE_SKIP_FLAG_CHECK", "1")
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
     configure_watchdog_process_group(&mut command);
@@ -544,7 +637,15 @@ fn write_conformance_markdown(workspace_root: &Path, report: &RunReport) -> Resu
 mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-    use super::{Outcome, RunOptions, run};
+    use super::{Outcome, RunOptions, run, wildcard_matches};
+
+    #[test]
+    fn config_filename_globs_match_expected_node_tests() {
+        assert!(wildcard_matches("test-util-*.js", "test-util-format.js"));
+        assert!(wildcard_matches("test-path.js", "test-path.js"));
+        assert!(!wildcard_matches("test-path.js", "test-path-extra.js"));
+        assert!(wildcard_matches("test-?-x.js", "test-a-x.js"));
+    }
 
     fn temp_test_root(name: &str) -> std::path::PathBuf {
         let mut dir = std::env::temp_dir();

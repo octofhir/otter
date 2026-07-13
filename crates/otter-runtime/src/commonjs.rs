@@ -11,17 +11,24 @@
 //! - [`CjsConfig`] - capability snapshot + hosted-module list shared by all
 //!   `require` closures in a run.
 //! - [`cjs_instantiate_file`] - compile + execute one CommonJS file.
-//! - `cjs_load` - resolve a specifier (builtin or relative file) and load it.
+//! - `cjs_load` - resolve builtins, files, `node_modules` packages, and native
+//!   addons, then cache and load their exports.
 //!
 //! # Invariants
 //! - The require cache is a plain JS object (`require.cache`), so cached
 //!   `module.exports` values stay rooted by GC. A module is inserted into the
 //!   cache *before* its body runs so circular `require` returns the partial
 //!   exports (Node behaviour).
-//! - Filesystem capabilities are checked before any module file is read.
+//! - Filesystem capabilities are checked before any module or package manifest
+//!   is read; native addons additionally pass through the configured loader's
+//!   FFI capability check.
 //! - Re-entry uses [`otter_vm::Interpreter::run_callable_sync`] and the
 //!   code-space-linked wrapper from `create_commonjs_wrapper`; the unsafe
 //!   `Interpreter::run` (which swaps `code_space`) is never called nested.
+//!
+//! # See also
+//! - [`crate::CommonJsAddonLoader`]
+//! - [`crate::RuntimeBuilder::commonjs_addon_loader`]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,17 +38,18 @@ use smallvec::{SmallVec, smallvec};
 use otter_vm::{NativeCtx, Value, object};
 
 use crate::{
-    CapabilitySet, HostedModule, RuntimeNativeError as NativeError, RuntimeTaskSpawner,
-    runtime_string_value, runtime_type_error,
+    CapabilitySet, CommonJsAddonLoader, HostedModule, RuntimeNativeError as NativeError,
+    RuntimeTaskSpawner, runtime_string_value, runtime_type_error,
 };
 
-/// Shared configuration for a CommonJS run: capability snapshot and the hosted
-/// (builtin) module list used to satisfy `require('node:fs')` and friends.
+/// Shared configuration for a CommonJS run: capability snapshot, hosted
+/// modules, task spawner, and optional native-addon loader.
 #[derive(Clone)]
 pub(crate) struct CjsConfig {
     pub(crate) capabilities: CapabilitySet,
     pub(crate) hosted: Vec<HostedModule>,
     pub(crate) runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    pub(crate) addon_loader: Option<CommonJsAddonLoader>,
 }
 
 fn oom(err: impl std::fmt::Display) -> NativeError {
@@ -197,25 +205,55 @@ fn canonical_builtin_cache_key(cfg: &CjsConfig, spec: &str) -> String {
     }
 }
 
-/// Resolve a relative/absolute file specifier to a concrete file path, probing
-/// the standard CommonJS extension + `index` candidates.
-fn resolve_file(dir: &Path, spec: &str) -> Option<PathBuf> {
-    let base = if Path::new(spec).is_absolute() {
-        PathBuf::from(spec)
-    } else {
-        dir.join(spec)
-    };
+/// Resolve a file/directory candidate using Node's CommonJS extension and
+/// package-main probes.
+fn resolve_path(base: &Path, capabilities: &CapabilitySet) -> Option<PathBuf> {
     let candidates = [
-        base.clone(),
+        base.to_path_buf(),
         base.with_extension("js"),
         base.with_extension("cjs"),
         base.with_extension("json"),
-        base.join("index.js"),
-        base.join("index.cjs"),
+        base.with_extension("node"),
     ];
     for candidate in candidates {
         if candidate.is_file() {
             return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+        }
+    }
+    if base.is_dir() {
+        let package_json = base.join("package.json");
+        if capabilities.read.matches_path(&package_json)
+            && let Ok(source) = std::fs::read_to_string(&package_json)
+            && let Ok(package) = serde_json::from_str::<serde_json::Value>(&source)
+            && let Some(main) = package.get("main").and_then(|value| value.as_str())
+            && let Some(resolved) = resolve_path(&base.join(main), capabilities)
+        {
+            return Some(resolved);
+        }
+        for index in ["index.js", "index.cjs", "index.json", "index.node"] {
+            let candidate = base.join(index);
+            if candidate.is_file() {
+                return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+            }
+        }
+    }
+    None
+}
+
+/// Resolve relative, absolute, and bare package specifiers. Bare packages walk
+/// ancestor `node_modules` directories, including scoped package names and
+/// subpaths (`@scope/pkg/subpath`).
+fn resolve_file(dir: &Path, spec: &str, capabilities: &CapabilitySet) -> Option<PathBuf> {
+    if Path::new(spec).is_absolute() {
+        return resolve_path(Path::new(spec), capabilities);
+    }
+    if spec.starts_with('.') {
+        return resolve_path(&dir.join(spec), capabilities);
+    }
+    for ancestor in dir.ancestors() {
+        let candidate = ancestor.join("node_modules").join(spec);
+        if let Some(resolved) = resolve_path(&candidate, capabilities) {
+            return Some(resolved);
         }
     }
     None
@@ -301,7 +339,7 @@ pub(crate) fn cjs_load(
     }
 
     // 2. File module.
-    let resolved = resolve_file(dir, spec)
+    let resolved = resolve_file(dir, spec, &cfg.capabilities)
         .ok_or_else(|| runtime_type_error("require", format!("Cannot find module '{spec}'")))?;
     let id = resolved.to_string_lossy().to_string();
     if let Some(cached) = object::get(cache, ctx.heap(), &id) {
@@ -312,6 +350,28 @@ pub(crate) fn cjs_load(
             "require",
             format!("permission denied for '{id}'"),
         ));
+    }
+    if resolved.extension().is_some_and(|ext| ext == "node") {
+        let loader = cfg.addon_loader.ok_or_else(|| {
+            runtime_type_error(
+                "require",
+                format!("native addons are not enabled for '{id}'"),
+            )
+        })?;
+        return ctx.scope(|ctx, scope| {
+            // Park the cache before entering addon code: registration can run
+            // arbitrary allocating N-API calls and relocate this young object.
+            let cache = ctx.scoped_value(scope, Value::object(cache));
+            let value = loader(
+                ctx,
+                &resolved,
+                &cfg.capabilities,
+                cfg.runtime_task_spawner.clone(),
+            )?;
+            let value = ctx.scoped_value(scope, value);
+            ctx.scoped_set(scope, cache, &id, value)?;
+            Ok(ctx.escape(value))
+        });
     }
     let source = std::fs::read_to_string(&resolved)
         .map_err(|err| runtime_type_error("require", format!("io error for '{id}': {err}")))?;
@@ -331,28 +391,28 @@ pub(crate) fn cjs_instantiate_file(
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
 
-    // Build `module` + `exports`, then IMMEDIATELY root them (and the cache) on
-    // the GC-traced module-root stack — before any further allocation
-    // (`runtime_string_value`, `make_require`'s closure, `object::set`). A
-    // collection landing in an unrooted window (e.g. under
-    // `OTTER_GC_STRESS=full`) would otherwise reclaim these young objects and
-    // reuse their offsets, leaving the bare locals dangling. The module-root
-    // stack relocates its slots in place, so after every subsequent allocation
-    // we re-fetch the live handle from the slot instead of trusting the stale
-    // `module` local.
+    // Build `module` + `exports` through handle scopes, then IMMEDIATELY root
+    // each escaped value on the GC-traced module-root stack before the next
+    // allocation. A collection landing between the two object allocations
+    // would otherwise reclaim `exports` before it reached the module-root
+    // stack. The stack relocates its slots in place, so after every subsequent
+    // allocation we re-fetch the live handle instead of trusting a stale local.
     // Root the caller's `cache` handle BEFORE allocating `exports` / `module`:
     // those allocations can scavenge and relocate `cache` (a young object), and
     // a bare local pushed afterwards would already be a stale, moved-from handle.
     let root_base = ctx.interp_mut().module_root_depth();
     let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
 
-    let exports = ctx.alloc_object().map_err(oom)?;
-    let module = ctx.alloc_object().map_err(oom)?;
-    let exports_val = Value::object(exports);
-    let module_val = Value::object(module);
-
-    let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
+    let exports_val = ctx.scope(|ctx, scope| {
+        let exports = ctx.scoped_object(scope)?;
+        Ok::<Value, NativeError>(ctx.escape(exports))
+    })?;
     let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
+    let module_val = ctx.scope(|ctx, scope| {
+        let module = ctx.scoped_object(scope)?;
+        Ok::<Value, NativeError>(ctx.escape(module))
+    })?;
+    let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
 
     // From here on, re-fetch the relocated handles after each allocation.
     let mut module = ctx

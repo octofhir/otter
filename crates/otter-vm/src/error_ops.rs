@@ -530,6 +530,7 @@ pub(crate) fn native_to_vm_error(interp: &mut crate::Interpreter, err: NativeErr
 
     match err {
         NativeError::Thrown { name: _, message } => interp.err_uncaught(message.into()),
+        NativeError::Error { message } => native_spec_error(interp, ErrorKind::Error, message),
         NativeError::Coded {
             kind,
             code,

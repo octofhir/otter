@@ -324,6 +324,21 @@ impl HostedModuleInstall {
 pub type HostedModuleValueInstall =
     for<'rt> fn(&mut otter_vm::NativeCtx<'rt>, &CapabilitySet) -> Result<otter_vm::Value, String>;
 
+/// Load one CommonJS native addon (`.node`) after module resolution and the
+/// filesystem capability check have completed.
+///
+/// The Node compatibility product installs this hook; the core runtime keeps
+/// native code loading opt-in and has no dependency on a particular addon ABI.
+/// Implementations must enforce the separate `ffi` capability before opening
+/// the library. The optional task spawner is the owned, sendable route for
+/// addon worker callbacks to re-enter a handle-backed isolate.
+pub type CommonJsAddonLoader = for<'rt> fn(
+    &mut otter_vm::NativeCtx<'rt>,
+    &Path,
+    &CapabilitySet,
+    Option<RuntimeTaskSpawner>,
+) -> Result<otter_vm::Value, otter_vm::NativeError>;
+
 /// One runtime-hosted module.
 #[derive(Debug, Clone, Copy)]
 pub struct HostedModule {
@@ -1294,6 +1309,7 @@ pub(crate) struct RuntimeConfig {
     /// / `__dirname`) for script-shaped sources. Off by default; opt in via
     /// [`RuntimeBuilder::with_nodejs_modules`].
     commonjs_enabled: bool,
+    commonjs_addon_loader: Option<CommonJsAddonLoader>,
     global_classes: Vec<GlobalClass>,
     extensions: Vec<&'static Extension>,
     global_installers: Vec<RuntimeGlobalInstaller>,
@@ -1517,6 +1533,7 @@ impl Default for RuntimeConfig {
             loader: None,
             hosted_modules: Vec::new(),
             commonjs_enabled: false,
+            commonjs_addon_loader: None,
             global_classes: Vec::new(),
             extensions: Vec::new(),
             global_installers: Vec::new(),
@@ -1643,6 +1660,16 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn with_nodejs_modules(mut self) -> Self {
         self.config.commonjs_enabled = true;
+        self
+    }
+
+    /// Register the native-addon loader used for CommonJS `.node` files.
+    ///
+    /// This does not grant filesystem or FFI access. The runtime checks `read`
+    /// during module resolution and the loader must independently check `ffi`.
+    #[must_use]
+    pub fn commonjs_addon_loader(mut self, loader: CommonJsAddonLoader) -> Self {
+        self.config.commonjs_addon_loader = Some(loader);
         self
     }
 
@@ -3909,6 +3936,7 @@ impl Runtime {
             capabilities: self.config.capabilities.clone(),
             hosted: self.config.hosted_modules.clone(),
             runtime_task_spawner: self.runtime_task_spawner.clone(),
+            addon_loader: self.config.commonjs_addon_loader,
         });
         // Entry execution context, linked into the interpreter code space so the
         // wrapper closures resolve from any frame.
@@ -4237,6 +4265,14 @@ impl OtterBuilder {
     #[must_use]
     pub fn with_nodejs_modules(mut self) -> Self {
         self.runtime = self.runtime.with_nodejs_modules();
+        self
+    }
+
+    /// Register the CommonJS native-addon loader. See
+    /// [`RuntimeBuilder::commonjs_addon_loader`].
+    #[must_use]
+    pub fn commonjs_addon_loader(mut self, loader: CommonJsAddonLoader) -> Self {
+        self.runtime = self.runtime.commonjs_addon_loader(loader);
         self
     }
 

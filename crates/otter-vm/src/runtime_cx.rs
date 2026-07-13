@@ -306,6 +306,40 @@ impl<'rt> NativeCtx<'rt> {
             .reserve_external_with_roots(bytes, &mut external_visit)
     }
 
+    /// Adjust the cumulative amount of memory retained outside GC cells.
+    ///
+    /// This is the high-level host-ABI counterpart to [`Self::reserve_external`]
+    /// for APIs such as Node-API whose contract reports signed deltas rather
+    /// than transferring ownership of one RAII token. Positive adjustments are
+    /// booked against the heap cap and can trigger collection; negative
+    /// adjustments release the same reservation. A host is expected not to
+    /// release more than it previously reserved.
+    pub fn adjust_external_memory(
+        &mut self,
+        change_in_bytes: i64,
+    ) -> Result<i64, otter_gc::OutOfMemory> {
+        let current = self
+            .cx
+            .interp
+            .external_memory_adjustment
+            .as_ref()
+            .map_or(0, otter_gc::ExternalMemory::bytes);
+        let adjusted = (i128::from(current) + i128::from(change_in_bytes))
+            .clamp(0, i128::from(i64::MAX)) as u64;
+
+        if let Some(reservation) = self.cx.interp.external_memory_adjustment.as_mut() {
+            reservation.resize(adjusted)?;
+            if adjusted == 0 {
+                self.cx.interp.external_memory_adjustment = None;
+            }
+        } else if adjusted != 0 {
+            let reservation = self.reserve_external(adjusted)?;
+            self.cx.interp.external_memory_adjustment = Some(reservation);
+        }
+
+        Ok(adjusted as i64)
+    }
+
     /// Allocate an ordinary object through the native root contract.
     pub fn alloc_object(&mut self) -> Result<object::JsObject, otter_gc::OutOfMemory> {
         self.alloc_object_with_roots(&[], &[])
@@ -603,11 +637,185 @@ impl<'rt> NativeCtx<'rt> {
             .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "construct"))
     }
 
+    /// Invoke a callable synchronously with an explicit receiver.
+    ///
+    /// This is the high-level re-entry path for host ABIs whose contract
+    /// requires an immediate callback result (notably Node-API's
+    /// `napi_call_function`). Callers must keep any values they retain across
+    /// this call in scoped or persistent roots.
+    pub fn call(
+        &mut self,
+        target: Value,
+        this_value: Value,
+        args: &[Value],
+    ) -> Result<Value, NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "call",
+                reason: "missing execution context".to_string(),
+            })?;
+        let argv: smallvec::SmallVec<[Value; 8]> = args.iter().copied().collect();
+        self.cx
+            .interp
+            .run_callable_sync(&context, &target, this_value, argv)
+            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "call"))
+    }
+
+    /// Create a pending Promise together with its resolving functions.
+    ///
+    /// The three returned values are current at the return boundary; callers
+    /// retaining them across any later allocation must immediately place them
+    /// in scoped or persistent roots.
+    pub fn promise_capability(&mut self) -> Result<(Value, Value, Value), NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "Promise",
+                reason: "missing execution context".to_string(),
+            })?;
+        let builder = crate::promise_dispatch::PromiseBuilder::with_context(context);
+        builder
+            .construct_native_rooted(self, &[], &[])
+            .map(|(promise, resolve, reject)| (Value::promise(promise), resolve, reject))
+            .map_err(|error| NativeError::OutOfMemory {
+                name: "Promise",
+                requested_bytes: error.requested_bytes(),
+                heap_limit_bytes: error.heap_limit_bytes(),
+            })
+    }
+
+    /// Return the Node-API typed-array metadata and a pointer to its first byte.
+    ///
+    /// The pointer remains valid while the backing ArrayBuffer is alive and is
+    /// not resized or detached. This mirrors the lifetime contract of
+    /// `napi_get_typedarray_info`; callers must keep `value` rooted.
+    pub fn typed_array_info(
+        &mut self,
+        value: Value,
+    ) -> Option<(u32, usize, *mut u8, Value, usize)> {
+        let typed = value.as_typed_array(self.heap())?;
+        let kind = typed.kind().as_u32();
+        let length = typed.length(self.heap());
+        let byte_offset = typed.byte_offset(self.heap());
+        let buffer = typed.buffer(self.heap());
+        let data = buffer.with_bytes_mut(self.heap_mut(), |bytes| {
+            if byte_offset > bytes.len() {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: `byte_offset <= len`; `add(len)` is a valid one-past
+                // pointer for a zero-length view.
+                unsafe { bytes.as_mut_ptr().add(byte_offset) }
+            }
+        });
+        Some((kind, length, data, Value::array_buffer(buffer), byte_offset))
+    }
+
+    /// Apply ECMAScript `IsArray`, including recursive Proxy handling.
+    pub fn is_array(&mut self, value: Value) -> Result<bool, NativeError> {
+        crate::abstract_ops::is_array(self.heap(), &value)
+            .map_err(|error| native_function::vm_to_native_error(self.cx.interp, error, "IsArray"))
+    }
+
+    /// Return the logical length of an Array exotic value.
+    #[must_use]
+    pub fn array_length(&self, value: Value) -> Option<usize> {
+        value
+            .as_array()
+            .map(|array| crate::array::len(array, self.heap()))
+    }
+
+    /// Test whether `value` is an instance of `constructor` using the VM's
+    /// ordinary `instanceof` semantics and the active execution context.
+    ///
+    /// Native platform adapters use this for branded arguments such as URL
+    /// objects instead of accepting arbitrary duck-typed host objects.
+    pub fn is_instance_of(
+        &mut self,
+        value: Value,
+        constructor: Value,
+    ) -> Result<bool, NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "instanceof",
+                reason: "missing execution context".to_string(),
+            })?;
+        self.cx
+            .interp
+            .ordinary_has_instance(&context, &constructor, &value)
+            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "instanceof"))
+    }
+
+    /// ECMAScript `===` comparison for two rooted/current values.
+    #[must_use]
+    pub fn strict_equals(&self, left: Value, right: Value) -> bool {
+        crate::abstract_ops::is_strictly_equal(&left, &right, self.heap())
+    }
+
     /// Resolve a `globalThis.<name>` value (e.g. a constructor) for native use.
     #[must_use]
     pub fn global_value(&self, name: &str) -> Option<Value> {
         let global = *self.cx.interp.global_this();
         object::get(global, self.heap(), name)
+    }
+
+    /// Perform ordinary/exotic JavaScript `Get(receiver, key)` through the
+    /// active execution context.
+    pub fn get_value_property(&mut self, receiver: Value, key: &str) -> Result<Value, NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "get property",
+                reason: "missing execution context".to_string(),
+            })?;
+        self.cx
+            .interp
+            .get_property(&context, receiver, key)
+            .map_err(|err| native_function::vm_to_native_error(self.cx.interp, err, "get property"))
+    }
+
+    /// Perform JavaScript `Set(receiver, key, value, true)` through the active
+    /// execution context, including callable and exotic receivers.
+    pub fn set_value_property(
+        &mut self,
+        receiver: Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), NativeError> {
+        let context = self
+            .context
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "set property",
+                reason: "missing execution context".to_string(),
+            })?;
+        let ok = self
+            .cx
+            .interp
+            .ordinary_set_data_value(
+                &context,
+                receiver,
+                &crate::VmPropertyKey::String(key),
+                value,
+                receiver,
+                0,
+            )
+            .map_err(|err| {
+                native_function::vm_to_native_error(self.cx.interp, err, "set property")
+            })?;
+        if ok {
+            Ok(())
+        } else {
+            Err(NativeError::TypeError {
+                name: "set property",
+                reason: format!("Cannot assign to property '{key}'"),
+            })
+        }
     }
 
     /// Allocate a `WeakMap` body through the native root contract.
@@ -1348,6 +1556,17 @@ impl<'rt> NativeCtx<'rt> {
     ) -> Result<(), NativeError> {
         let result = self.cx.interp.scoped_set_index(s, arr, index, value);
         result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_set_index"))
+    }
+
+    /// Read `index` from an array handle and park the result in scope `s`.
+    pub fn scoped_get_index<'s>(
+        &mut self,
+        s: &'s HandleScope,
+        arr: Scoped<'_>,
+        index: usize,
+    ) -> Result<Scoped<'s>, NativeError> {
+        let result = self.cx.interp.scoped_get_index(s, arr, index);
+        result.map_err(|err| self.scoped_error(err, "NativeCtx::scoped_get_index"))
     }
 
     /// Allocate a host-data object through the native root contract and park it

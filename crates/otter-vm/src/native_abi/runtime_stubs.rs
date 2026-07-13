@@ -793,6 +793,18 @@ pub const STUB_JIT_CALL_METHOD_GENERIC: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
+/// Completes one full plain `Call` in the VM for callee resolutions the
+/// direct-call prepare cannot stage (native, bound, or ineligible bytecode
+/// callables); the callee may be arbitrary JS.
+pub const STUB_JIT_CALL_GENERIC: RuntimeStubDescriptor = descriptor(
+    47,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
 
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
@@ -844,6 +856,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         44 => "jit_inline_closure_upvalues",
         45 => "jit_math_random",
         46 => "jit_call_method_generic",
+        47 => "jit_call_generic",
         _ => "unknown_runtime_stub",
     }
 }
@@ -896,6 +909,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_INLINE_CLOSURE_UPVALUES,
     STUB_JIT_MATH_RANDOM,
     STUB_JIT_CALL_METHOD_GENERIC,
+    STUB_JIT_CALL_GENERIC,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

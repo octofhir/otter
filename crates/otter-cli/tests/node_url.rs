@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - CommonJS WHATWG constructor and file-URL helper interoperability.
+//! - Node formatting options, including non-boolean truthy/falsy values.
 //! - Named ESM file-URL helpers used by Vite-style loaders.
 //!
 //! # Invariants
@@ -42,13 +43,30 @@ fn node_url_commonjs_file_helpers_round_trip() {
     run_fixture(
         "commonjs.js",
         r#"
-const { URL, pathToFileURL, fileURLToPath, urlToHttpOptions } = require('node:url');
+const url = require('node:url');
+const { URL, pathToFileURL, fileURLToPath, urlToHttpOptions } = url;
 const href = pathToFileURL('/tmp/otter url.js').href;
 if (href !== 'file:///tmp/otter%20url.js') throw new Error(href);
 if (fileURLToPath(new URL(href)) !== '/tmp/otter url.js') throw new Error('round trip failed');
 const options = urlToHttpOptions(new URL('http://user:pass@example.com:8080/a?q=1'));
 if (options.auth !== 'user:pass') throw new Error('auth failed');
 if (options.path !== '/a?q=1') throw new Error('options failed');
+const formatted = new URL('http://user:pass@example.com/a?q=1#hash');
+if (url.format(formatted, { auth: 0 }) !== 'http://example.com/a?q=1#hash') {
+  throw new Error('falsy auth option failed');
+}
+if (url.format(formatted, { search: '', fragment: 0 }) !== 'http://user:pass@example.com/a') {
+  throw new Error('falsy search/fragment options failed');
+}
+if (url.format({
+  protocol: 'http', host: 'a.com', pathname: 'a/b', search: 'q=1', hash: 'h'
+}) !== 'http://a.com/a/b?q=1#h') {
+  throw new Error('legacy object formatting failed');
+}
+if (url.format({ protocol: 'coap:', auth: 'u:p', hostname: '::1', port: '61616' }) !==
+    'coap:u:p@[::1]:61616') {
+  throw new Error('legacy IPv6 formatting failed');
+}
 "#,
     );
 }

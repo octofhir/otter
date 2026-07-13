@@ -24,7 +24,7 @@ use super::values::{
     emit_load_reg, emit_load_u64, emit_num_to_double, emit_store_reg, emit_to_int32_fast,
     emit_to_uint32_fast,
 };
-use crate::baseline::{
+use crate::entry::{
     DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, Unsupported, VALUE_NULL, VALUE_UNDEFINED,
 };
 

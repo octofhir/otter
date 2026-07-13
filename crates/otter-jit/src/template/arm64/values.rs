@@ -18,7 +18,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
 
-use crate::baseline::{
+use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, FUNCTION_ID_TAG, NUMBER_TAG_HI16, Unsupported,
     VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED, reg_offset,
 };

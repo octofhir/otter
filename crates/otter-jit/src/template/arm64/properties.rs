@@ -30,7 +30,7 @@ use super::transitions::TransitionTable;
 use super::values::{
     emit_box_int32, emit_compress_slot_or_bail, emit_decompress_slot, emit_load_u64, emit_slab_base,
 };
-use crate::baseline::{IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
+use crate::entry::{IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
 
 /// Emit `dst = obj.name` with the inline WhiskerIC probe.
 #[allow(clippy::too_many_arguments)]

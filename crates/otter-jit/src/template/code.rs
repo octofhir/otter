@@ -14,11 +14,11 @@
 //!   for the baseline emitter's code objects.
 //!
 //! # See also
-//! - [`crate::baseline`] — owner of the shared entry context and epilogue
+//! - [`crate::entry`] — owner of the shared entry context and epilogue
 //!   status contract.
 
 use crate::CompiledCode;
-use crate::baseline::enter_compiled;
+use crate::entry::enter_compiled;
 use otter_vm::native_abi::{
     BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION,
 };
@@ -47,10 +47,10 @@ pub struct TemplateCode {
     /// Stable backing store for the self-patching `LoadProperty` IC cells;
     /// emitted code holds raw addresses into this slice.
     #[allow(dead_code)]
-    load_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
+    load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
     /// Stable backing store for the self-patching `StoreProperty` IC cells.
     #[allow(dead_code)]
-    store_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
+    store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
     /// Code-object-owned allocating safepoints, sorted by id.
     safepoint_records: Box<[SafepointRecord]>,
     /// Loop-header logical PC → assembler offset of its OSR-entry trampoline.
@@ -69,8 +69,8 @@ impl TemplateCode {
         register_count: u16,
         register_operands: Box<[u16]>,
         index_operands: Box<[u32]>,
-        load_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
-        store_ic_cells: Box<[crate::baseline::WhiskerIcCell]>,
+        load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+        store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
         safepoint_records: Box<[SafepointRecord]>,
         osr_entries: std::collections::BTreeMap<u32, usize>,
         osr_only: bool,

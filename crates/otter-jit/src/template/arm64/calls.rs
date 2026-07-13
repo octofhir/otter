@@ -27,7 +27,7 @@ use super::collections::{
 };
 use super::transitions::TransitionTable;
 use super::values::emit_load_u64;
-use crate::baseline::{
+use crate::entry::{
     CTX_PLUS_FRAME_STACK_SIZE, DIRECT_CODE_OBJECT_ID_OFFSET, DIRECT_ENTRY_OFFSET,
     DIRECT_FRAME_IDS_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_FRAME_META_OFFSET,
     DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET,
@@ -100,7 +100,7 @@ pub(super) fn emit_method_call(
     arg1: Option<u16>,
     bail: DynamicLabel,
     threw: DynamicLabel,
-) -> Result<(), crate::baseline::Unsupported> {
+) -> Result<(), crate::entry::Unsupported> {
     let done = ops.new_dynamic_label();
     let method_site = MethodSite {
         dst,

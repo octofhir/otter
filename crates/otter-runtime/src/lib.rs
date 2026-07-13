@@ -1317,11 +1317,14 @@ pub(crate) struct RuntimeConfig {
 /// compiler; there is no environment toggle for tier selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JitSelection {
-    /// Interpreter plus the production baseline compiler.
+    /// Interpreter plus the production compiler (the template tier).
     #[default]
     Baseline,
-    /// Interpreter plus the template compiler. Functions outside its subset
-    /// report `Unsupported` and stay on the interpreter.
+    /// Interpreter plus the previous-generation emitter, kept selectable for
+    /// differential comparison until its deletion.
+    Legacy,
+    /// Interpreter plus the template compiler (explicit selection; same as
+    /// the default).
     Template,
     /// Interpreter only — the semantic oracle for differential runs.
     InterpreterOnly,
@@ -2054,15 +2057,15 @@ impl Runtime {
                     }
                     if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
                         match config.jit_selection {
-                            JitSelection::Baseline => {
+                            JitSelection::Baseline | JitSelection::Template => {
                                 interp.set_jit_compiler(Some(std::sync::Arc::new(
                                     otter_jit::BaselineJitCompiler::new(),
                                 )));
                             }
-                            JitSelection::Template => {
+                            JitSelection::Legacy => {
                                 interp.set_jit_compiler(Some(std::sync::Arc::new(
                                     otter_jit::BaselineJitCompiler::with_kind(
-                                        otter_jit::BaselineCompilerKind::Template,
+                                        otter_jit::BaselineCompilerKind::Legacy,
                                     ),
                                 )));
                             }

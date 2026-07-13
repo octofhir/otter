@@ -50,12 +50,13 @@ pub use template::{TemplateCode, compile as compile_template};
 /// environment or runtime toggle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BaselineCompilerKind {
-    /// The full-subset production baseline emitter.
-    #[default]
+    /// The previous-generation baseline emitter, kept selectable for
+    /// differential comparison until its deletion.
     Legacy,
-    /// The [`template`]-plan compiler: constants, register moves, branches,
-    /// tagged truthiness, and returns; every other shape reports
-    /// `Unsupported` and execution stays on the interpreter.
+    /// The [`template`]-plan compiler — the production tier. Opcodes outside
+    /// its subset lower to exact side exits (loop-OSR-only code) or reject
+    /// the compile; execution then stays on the interpreter.
+    #[default]
     Template,
 }
 
@@ -75,7 +76,7 @@ impl BaselineJitCompiler {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            kind: BaselineCompilerKind::Legacy,
+            kind: BaselineCompilerKind::Template,
         }
     }
 

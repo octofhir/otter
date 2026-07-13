@@ -168,6 +168,7 @@ impl Interpreter {
             json_root_stack: Vec::new(),
             handle_arena: crate::handles::HandleArena::new(),
             json_stringify_capacity_hint: 0,
+            external_memory_adjustment: None,
             array_index_accessor_protector: false,
             interrupt: InterruptFlag::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,

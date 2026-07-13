@@ -28,6 +28,12 @@ extern napi_status napi_new_instance(napi_env, napi_value, size_t,
 extern napi_status napi_throw_error(napi_env, const char *, const char *);
 extern napi_status napi_get_undefined(napi_env, napi_value *);
 extern napi_status napi_typeof(napi_env, napi_value, int *);
+extern napi_status napi_coerce_to_object(napi_env, napi_value, napi_value *);
+extern napi_status napi_create_external(napi_env, void *, void *, void *, napi_value *);
+extern napi_status napi_get_value_external(napi_env, napi_value, void **);
+extern napi_status napi_get_buffer_info(napi_env, napi_value, void **, size_t *);
+extern napi_status napi_is_buffer(napi_env, napi_value, _Bool *);
+extern napi_status napi_adjust_external_memory(napi_env, long long, long long *);
 extern napi_status napi_create_promise(napi_env, napi_deferred *, napi_value *);
 extern napi_status napi_resolve_deferred(napi_env, napi_deferred, napi_value);
 extern napi_status napi_create_async_work(napi_env, napi_value, napi_value,
@@ -143,6 +149,54 @@ static napi_value missing_arg_is_undefined(napi_env env,
   return result;
 }
 
+static napi_value external_round_trip(napi_env env, napi_callback_info info) {
+  (void)info;
+  static int payload = 42;
+  napi_value external, result;
+  void *data = NULL;
+  int type = -1;
+  napi_create_external(env, &payload, NULL, NULL, &external);
+  napi_typeof(env, external, &type);
+  napi_get_value_external(env, external, &data);
+  napi_create_double(env, type == 8 && data == &payload ? *(int *)data : -1,
+                     &result);
+  return result;
+}
+
+static napi_value inspect_buffer(napi_env env, napi_callback_info info) {
+  size_t argc = 1, length = 0;
+  napi_value arg, result;
+  void *data = NULL;
+  _Bool is_buffer = 0;
+  napi_get_cb_info(env, info, &argc, &arg, NULL, NULL);
+  napi_is_buffer(env, arg, &is_buffer);
+  napi_get_buffer_info(env, arg, &data, &length);
+  unsigned char first = length == 0 ? 0 : *(unsigned char *)data;
+  napi_create_double(env, is_buffer ? (double)(length + first) : -1, &result);
+  return result;
+}
+
+static napi_value coerce_object(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value arg, object, result;
+  int type = -1;
+  napi_get_cb_info(env, info, &argc, &arg, NULL, NULL);
+  napi_coerce_to_object(env, arg, &object);
+  napi_typeof(env, object, &type);
+  napi_create_double(env, type, &result);
+  return result;
+}
+
+static napi_value account_external(napi_env env, napi_callback_info info) {
+  (void)info;
+  long long increased = 0, released = 0;
+  napi_value result;
+  napi_adjust_external_memory(env, 4096, &increased);
+  napi_adjust_external_memory(env, -4096, &released);
+  napi_create_double(env, (double)(increased - released), &result);
+  return result;
+}
+
 napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_value value;
   napi_create_string_utf8(env, "1.0.0", NAPI_AUTO_LENGTH, &value);
@@ -165,5 +219,17 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
   napi_create_function(env, "missingArgIsUndefined", NAPI_AUTO_LENGTH,
                        missing_arg_is_undefined, NULL, &value);
   napi_set_named_property(env, exports, "missingArgIsUndefined", value);
+  napi_create_function(env, "externalRoundTrip", NAPI_AUTO_LENGTH,
+                       external_round_trip, NULL, &value);
+  napi_set_named_property(env, exports, "externalRoundTrip", value);
+  napi_create_function(env, "inspectBuffer", NAPI_AUTO_LENGTH, inspect_buffer,
+                       NULL, &value);
+  napi_set_named_property(env, exports, "inspectBuffer", value);
+  napi_create_function(env, "coerceObject", NAPI_AUTO_LENGTH, coerce_object,
+                       NULL, &value);
+  napi_set_named_property(env, exports, "coerceObject", value);
+  napi_create_function(env, "accountExternal", NAPI_AUTO_LENGTH,
+                       account_external, NULL, &value);
+  napi_set_named_property(env, exports, "accountExternal", value);
   return exports;
 }

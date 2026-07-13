@@ -3,8 +3,8 @@
 //! # Contents
 //! - A real C shared library loaded through bare-package `node_modules`
 //!   resolution and `package.json#main`.
-//! - Value, property, callback, JS re-entry, array, exception, Promise, and
-//!   asynchronous-work ABI calls.
+//! - Value, property, callback, JS re-entry, array, exception, external,
+//!   buffer, external-memory accounting, Promise, and asynchronous-work calls.
 //! - Independent deny-by-default checks for `read` and `ffi`.
 //!
 //! # Invariants
@@ -78,6 +78,10 @@ function Box(value) { this.value = value; }
 const boxed = addon.constructJs(Box, 42);
 if (!(boxed instanceof Box) || boxed.value !== 42) throw new Error('constructJs');
 if (addon.missingArgIsUndefined() !== 1) throw new Error('missing argument');
+if (addon.externalRoundTrip() !== 42) throw new Error('external');
+if (addon.inspectBuffer(new Uint8Array([7, 8, 9])) !== 10) throw new Error('buffer');
+if (addon.coerceObject(42) !== 6) throw new Error('coerce object');
+if (addon.accountExternal() !== 4096) throw new Error('external memory');
 let message = '';
 try { addon.fail(); } catch (error) { message = error.message; }
 if (message !== 'native boom') throw new Error('throw: ' + message);

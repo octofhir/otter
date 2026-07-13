@@ -119,6 +119,9 @@ pub(crate) struct JitRet {
 pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
 pub(crate) const STATUS_THREW: u64 = 2;
+/// Internal runtime-transition result: the committed opcode completed and the
+/// current machine-code fallthrough remains authoritative.
+pub(crate) const STATUS_CONTINUE: u64 = 3;
 
 /// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
 #[allow(dead_code)]

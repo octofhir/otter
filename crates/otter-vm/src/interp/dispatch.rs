@@ -2290,12 +2290,7 @@ impl Interpreter {
                         .exec_imm32(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?
                         .max(0) as usize;
-                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                        for _ in 0..count {
-                            cold.parked_finally.pop();
-                        }
-                    }
-                    stack[top_idx].advance_pc()?;
+                    self.run_pop_parked_finally(&mut stack[top_idx], count)?;
                     continue;
                 }
                 Op::JumpViaFinally => {

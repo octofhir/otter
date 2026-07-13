@@ -119,6 +119,7 @@ impl std::fmt::Debug for TemplateCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TemplateCode")
             .field("code_len", &self.code.len())
+            .field("osr_only", &self.osr_only)
             .finish()
     }
 }

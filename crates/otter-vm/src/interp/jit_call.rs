@@ -82,7 +82,9 @@ impl Interpreter {
                 if matches!(err, VmError::Uncaught)
                     && let Some(thrown) = self.pending_uncaught_throw.take()
                 {
-                    self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    if self.pending_uncaught_frames.is_none() {
+                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    }
                     let unwind = self.unwind_throw(context, stack, thrown);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
@@ -105,7 +107,9 @@ impl Interpreter {
                         } else {
                             None
                         };
-                    self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    if self.pending_uncaught_frames.is_none() {
+                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                    }
                     let unwind = self.unwind_throw_with_uncaught(context, stack, thrown, uncaught);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;

@@ -101,6 +101,7 @@ pub mod intrinsics;
 mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
+mod jit_exception_ops;
 pub mod jit_feedback;
 pub mod jit_registry;
 mod jit_runtime_ops;
@@ -167,6 +168,7 @@ pub use frame_state::{
     AsyncFrameState, Frame, PendingBindFunction, PendingBindStage, PendingGetIterator,
     PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,
 };
+pub use jit_exception_ops::JitExceptionOutcome;
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,

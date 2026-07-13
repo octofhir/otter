@@ -222,6 +222,21 @@ pub(crate) struct ConditionalBranchOperands {
     pub(crate) condition: u16,
 }
 
+/// Pre-resolved handlers installed by `EnterTry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExceptionRegionOperands {
+    pub(crate) catch_pc: Option<u32>,
+    pub(crate) finally_pc: Option<u32>,
+    pub(crate) exception_register: u16,
+}
+
+/// Abrupt jump target plus the handler-stack floor it may unwind through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct JumpViaFinallyOperands {
+    pub(crate) target: u32,
+    pub(crate) floor: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoweredOperands {
     Raw,
@@ -248,6 +263,8 @@ enum LoweredOperands {
     Triple(TripleOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
+    ExceptionRegion(ExceptionRegionOperands),
+    JumpViaFinally(JumpViaFinallyOperands),
 }
 
 /// One backend-neutral instruction in canonical emission order.
@@ -426,6 +443,22 @@ impl LoweredInstr {
             )),
         }
     }
+
+    pub(crate) fn exception_region_operands(self) -> Result<ExceptionRegionOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ExceptionRegion(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape(
+                "lowered exception-region operands",
+            )),
+        }
+    }
+
+    pub(crate) fn jump_via_finally_operands(self) -> Result<JumpViaFinallyOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::JumpViaFinally(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered JumpViaFinally operands")),
+        }
+    }
 }
 
 /// Backend-neutral facts established before machine-code emission starts.
@@ -460,9 +493,6 @@ impl BaselinePlan {
             }
 
             match op {
-                Op::EnterTry | Op::LeaveTry | Op::Throw | Op::EndFinally => {
-                    return Err(Unsupported::Opcode(op));
-                }
                 Op::LoadProperty => load_property_count += 1,
                 Op::StoreProperty => store_property_count += 1,
                 Op::CallMethodValue => {
@@ -477,6 +507,22 @@ impl BaselinePlan {
 
             let operands = instr.operand_view(code_block);
             let operands = match op {
+                Op::EnterTry => {
+                    let region = instr
+                        .exception_region(code_block)
+                        .ok_or(Unsupported::OperandShape("EnterTry exception region"))?;
+                    LoweredOperands::ExceptionRegion(ExceptionRegionOperands {
+                        catch_pc: region.catch_pc,
+                        finally_pc: region.finally_pc,
+                        exception_register: region.exception_register,
+                    })
+                }
+                Op::Throw => LoweredOperands::Source(SourceOperands {
+                    src: reg(operands, 0)?,
+                }),
+                Op::PopParkedFinally => LoweredOperands::Immediate(ImmediateOperands {
+                    value: imm32(operands, 0)?,
+                }),
                 Op::MakeFunction | Op::MakeClosure if instr.make_self => {
                     LoweredOperands::Destination(DestinationOperands {
                         dst: reg(operands, 0)?,
@@ -682,7 +728,10 @@ impl BaselinePlan {
         }
 
         for (instr, lowered) in view.instructions.iter().zip(&mut instructions) {
-            if matches!(lowered.op, Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue) {
+            if matches!(
+                lowered.op,
+                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpViaFinally
+            ) {
                 let rel = imm32(instr.operand_view(code_block), 0)?;
                 let target = branch_target(code_block, instr, rel);
                 let target_pc = u32::try_from(target)
@@ -691,6 +740,16 @@ impl BaselinePlan {
                     .ok_or(Unsupported::BranchTarget(target))?;
                 lowered.operands = match lowered.op {
                     Op::Jump => LoweredOperands::Branch(BranchOperands { target: target_pc }),
+                    Op::JumpViaFinally => {
+                        let floor = u32::try_from(imm32(instr.operand_view(code_block), 1)?)
+                            .map_err(|_| {
+                                Unsupported::OperandShape("JumpViaFinally handler floor")
+                            })?;
+                        LoweredOperands::JumpViaFinally(JumpViaFinallyOperands {
+                            target: target_pc,
+                            floor,
+                        })
+                    }
                     Op::JumpIfFalse | Op::JumpIfTrue => {
                         LoweredOperands::ConditionalBranch(ConditionalBranchOperands {
                             target: target_pc,

@@ -7,8 +7,9 @@
 //! descriptor-resolved runtime transitions, ordinary and method calls with
 //! callee-owned frames, named-property IC probes, and guarded Map/Set builtin
 //! fast paths. Opcodes that are safe to retry before any observable effect
-//! lower to canonical-PC exact side exits (loop-OSR-only code); structured
-//! exception opcodes reject the whole function with [`Unsupported`].
+//! lower to canonical-PC exact side exits (loop-OSR-only code). Structured
+//! exception regions complete through the VM's canonical handler/unwind
+//! implementation and return committed same-frame continuations.
 //!
 //! # Contents
 //! - [`plan`] — machine-independent operation stream over typed lowering.
@@ -337,15 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_opcodes_reject_the_whole_function() {
+    fn structured_exception_opcodes_compile_for_entry() {
         let v = view(&[
             (Op::Throw, vec![Operand::Register(2)]),
             (Op::ReturnValue, vec![Operand::Register(2)]),
         ]);
-        assert_eq!(
-            compile(&v).err(),
-            Some(super::Unsupported::Opcode(Op::Throw))
-        );
+        let code = compile(&v).expect("Throw compiles through the exception transition");
+        assert!(!code.osr_only());
     }
 
     #[test]

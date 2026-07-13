@@ -210,11 +210,36 @@ impl Interpreter {
         region: crate::executable::code_block_cfg::CodeBlockExceptionRegion,
     ) -> Result<(), VmError> {
         debug_assert_eq!(region.enter_pc, frame.pc);
-        self.frame_ensure_cold(frame).handlers.push(TryHandler {
-            catch_pc: region.catch_pc,
-            finally_pc: region.finally_pc,
-            exc_register: region.exception_register,
-        });
+        self.run_enter_try_handler(
+            frame,
+            TryHandler {
+                catch_pc: region.catch_pc,
+                finally_pc: region.finally_pc,
+                exc_register: region.exception_register,
+            },
+        )
+    }
+
+    pub(crate) fn run_enter_try_handler(
+        &mut self,
+        frame: &mut Frame,
+        handler: TryHandler,
+    ) -> Result<(), VmError> {
+        self.frame_ensure_cold(frame).handlers.push(handler);
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    pub(crate) fn run_pop_parked_finally(
+        &mut self,
+        frame: &mut Frame,
+        count: usize,
+    ) -> Result<(), VmError> {
+        if let Some(cold) = self.frame_cold_mut(frame) {
+            for _ in 0..count {
+                cold.parked_finally.pop();
+            }
+        }
         frame.advance_pc()?;
         Ok(())
     }

@@ -136,11 +136,15 @@ values are persistent-root handles rather than raw moving-GC values, and
 asynchronous completion returns through the runtime microtask checkpoint. The
 CLI exports the `napi_*` symbols needed by dynamically loaded addons. This path
 has been exercised against a C ABI fixture, the current napi-rs Rollup native
-package, and the current `@swc/core` native package. The validation includes
+package, the current `@swc/core` native package, and the current Lightning CSS
+native package. The validation includes
 synchronous and asynchronous Rollup parsing, hashing, a complete
 `rollup(...).generate(...)` run, and a native SWC TypeScript transform. Buffer
 views and addon-reported external memory use the VM's typed-array and heap
-accounting APIs rather than detached shadow storage.
+accounting APIs rather than detached shadow storage. Lightning CSS synchronous
+CSS transformation is covered; cross-thread `napi_threadsafe_function` delivery
+still requires an owned runtime-message bridge and currently fails explicitly
+instead of retaining a mutator-turn `NativeCtx` across threads.
 
 Node and napi-rs themselves are not embedded. An addon must use Node-API; a
 binary linked directly against V8 or private Node internals is a different ABI

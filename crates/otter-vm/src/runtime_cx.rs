@@ -713,6 +713,20 @@ impl<'rt> NativeCtx<'rt> {
         Some((kind, length, data, Value::array_buffer(buffer), byte_offset))
     }
 
+    /// Apply ECMAScript `IsArray`, including recursive Proxy handling.
+    pub fn is_array(&mut self, value: Value) -> Result<bool, NativeError> {
+        crate::abstract_ops::is_array(self.heap(), &value)
+            .map_err(|error| native_function::vm_to_native_error(self.cx.interp, error, "IsArray"))
+    }
+
+    /// Return the logical length of an Array exotic value.
+    #[must_use]
+    pub fn array_length(&self, value: Value) -> Option<usize> {
+        value
+            .as_array()
+            .map(|array| crate::array::len(array, self.heap()))
+    }
+
     /// Test whether `value` is an instance of `constructor` using the VM's
     /// ordinary `instanceof` semantics and the active execution context.
     ///

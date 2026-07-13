@@ -82,6 +82,8 @@ if (addon.externalRoundTrip() !== 42) throw new Error('external');
 if (addon.inspectBuffer(new Uint8Array([7, 8, 9])) !== 10) throw new Error('buffer');
 if (addon.coerceObject(42) !== 6) throw new Error('coerce object');
 if (addon.accountExternal() !== 4096) throw new Error('external memory');
+if (addon.inspectCollections() !== 42) throw new Error('collection predicates');
+if (addon.lifecycleHooks() !== 42) throw new Error('lifecycle hooks');
 let message = '';
 try { addon.fail(); } catch (error) { message = error.message; }
 if (message !== 'native boom') throw new Error('throw: ' + message);

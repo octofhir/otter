@@ -1175,6 +1175,10 @@ impl Interpreter {
         if !self.is_callable_runtime(&method) {
             return Ok(false);
         }
+        // The resolved method is the one live handle no traced storage
+        // holds; anchor it so the feedback capture below (which may
+        // allocate) and a moving scavenge cannot strand it.
+        let method_anchor = self.push_iteration_anchor(method) - 1;
         // Method-inline feedback, mirroring the interpreter's
         // `Op::CallMethodValue` arm: capture the receiver/prototype layout
         // while the pre-call handle is valid, record it only for a bytecode
@@ -1190,16 +1194,19 @@ impl Interpreter {
             }
             _ => None,
         };
-        // Re-read receiver and arguments from the traced window after the
-        // allocating resolution steps; the copies below stay live only until
-        // the callable path moves them into the callee frame.
+        // Re-read every handle after the allocating capture step: the
+        // receiver and arguments from the traced window, the method from
+        // its anchor slot (a moving scavenge rewrites both in place).
+        let method = self.iteration_anchor(method_anchor);
         let recv = unsafe { *caller_regs.add(recv_reg as usize) };
         let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
         for &arg in arg_regs {
             // SAFETY: compiler-emitted argument indices into the caller window.
             args.push(unsafe { *caller_regs.add(arg as usize) });
         }
-        let result = self.run_callable_sync_already_rooted(context, &method, recv, args)?;
+        let result = self.run_callable_sync_already_rooted(context, &method, recv, args);
+        self.pop_iteration_anchors_to(method_anchor);
+        let result = result?;
         if let (Some(method_fid), Some(method_site)) = (method_fid, method_site) {
             self.note_method_target(site, method_fid, method_site);
         }

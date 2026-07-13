@@ -3309,6 +3309,10 @@ impl Interpreter {
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
         let full_get = |vm: &mut Self, stack: &mut HoltStack| -> Result<Option<u64>, VmError> {
+            // Re-read the receiver from the traced window: the IC probes
+            // above may have allocated (cache-stub install) and moved the
+            // handle read at entry.
+            let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
             let value =
                 vm.load_property_value(context, stack, receiver, atomized_key.name())?;
             // SAFETY: `dst` is a compiler-emitted index into the pinned

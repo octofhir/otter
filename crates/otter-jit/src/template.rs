@@ -568,15 +568,21 @@ mod tests {
         expect_binary_int(Op::Rem, box_i32(7), box_i32(3), 1);
         expect_binary_int(Op::Rem, box_i32(-7), box_i32(3), -1);
         expect_binary_int(Op::Rem, box_i32(6), box_i32(3), 0);
-        // Cases int32 cannot represent side-exit: NaN divisor, -0 remainder.
-        assert!(matches!(
-            run_binary(Op::Rem, box_i32(7), box_i32(0)),
-            Exit::Bailed(_)
-        ));
-        assert!(matches!(
-            run_binary(Op::Rem, box_i32(-6), box_i32(3)),
-            Exit::Bailed(_)
-        ));
+        // Cases int32 cannot represent complete through the leaf f64
+        // remainder probe: NaN for a zero divisor, `-0` for a zero
+        // remainder of a negative dividend, and double operands.
+        match run_binary(Op::Rem, box_i32(7), box_i32(0)) {
+            Exit::Returned(bits) => assert!(unbox_f64(bits).is_nan()),
+            Exit::Bailed(pc) => panic!("zero-divisor remainder bailed at {pc}"),
+        }
+        match run_binary(Op::Rem, box_i32(-6), box_i32(3)) {
+            Exit::Returned(bits) => {
+                assert_eq!(unbox_f64(bits), 0.0);
+                assert!(unbox_f64(bits).is_sign_negative(), "-0 must stay signed");
+            }
+            Exit::Bailed(pc) => panic!("-0 remainder bailed at {pc}"),
+        }
+        expect_binary_f64(Op::Rem, box_f64(7.5), box_i32(2), 1.5);
         // Non-number operands side-exit for exact coercion.
         assert!(matches!(
             run_binary(Op::Sub, box_i32(1), VALUE_UNDEFINED),

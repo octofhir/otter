@@ -64,20 +64,49 @@ pub(super) fn emit_binary_arith(
             return emit_store_reg(ops, 13, dst);
         }
         ArithKind::Rem => {
-            emit_guard_int32(ops, 9, bail);
-            emit_guard_int32(ops, 10, bail);
             let store = ops.new_dynamic_label();
+            let slow = ops.new_dynamic_label();
+            let done = ops.new_dynamic_label();
+            emit_guard_int32(ops, 9, slow);
+            emit_guard_int32(ops, 10, slow);
             dynasm!(ops
                 ; .arch aarch64
-                ; cbz w10, =>bail          // rhs == 0 → interpreter yields NaN
+                ; cbz w10, =>slow          // rhs == 0 → NaN via the f64 probe
                 ; sdiv w11, w9, w10        // truncating quotient
                 ; msub w13, w11, w10, w9   // remainder = lhs - quotient * rhs
                 ; cbnz w13, =>store        // nonzero remainder: sign correct
-                ; tbnz w9, #31, =>bail     // zero remainder, negative lhs → -0
+                ; tbnz w9, #31, =>slow     // zero remainder, negative lhs → -0
                 ; =>store
             );
             emit_box_int32(ops, 13, 12);
-            return emit_store_reg(ops, 13, dst);
+            emit_store_reg(ops, 13, dst)?;
+            // Doubles and the results int32 cannot represent complete
+            // through the leaf f64-remainder probe; a non-number operand
+            // misses so the interpreter owns coercion.
+            dynasm!(ops
+                ; .arch aarch64
+                ; b =>done
+                ; =>slow
+                ; ldr x0, [x20, THREAD_OFFSET]
+                ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                ; mov x1, x9
+                ; mov x2, x10
+            );
+            emit_load_u64(
+                ops,
+                16,
+                otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr() as u64,
+            );
+            dynasm!(ops
+                ; .arch aarch64
+                ; blr x16
+                ; and x1, x1, #0xff
+                ; cbnz x1, =>bail
+                ; mov x13, x0
+            );
+            emit_store_reg(ops, 13, dst)?;
+            dynasm!(ops ; .arch aarch64 ; =>done);
+            return Ok(());
         }
         ArithKind::Sub | ArithKind::Mul => {}
     }

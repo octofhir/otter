@@ -53,8 +53,8 @@ use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
     NUMBER_TAG_HI16, SELF_CLOSURE_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
     THIS_VALUE_OFFSET, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
-    VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
-    reg_offset,
+    VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_INTERRUPT_CELL_OFFSET, reg_offset,
 };
 use otter_vm::native_abi as abi;
 
@@ -591,7 +591,29 @@ fn emit_truthiness_bool(ops: &mut Assembler, bail: DynamicLabel) {
         ; b.eq =>falsy
         ; cmp x9, VALUE_UNDEFINED_IMM
         ; b.eq =>falsy
-        ; b =>bail                              // cell / hole / other encoding
+    );
+    // Heap cells and remaining immediates (function ids, holes) resolve
+    // through the total leaf ToBoolean probe; its only miss is a null heap
+    // (isolate-less probe harness), which side-exits.
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        ; mov x1, x9
+        ; movz x2, #0
+    );
+    emit_load_u64(
+        ops,
+        16,
+        otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; and x1, x1, #0xff
+        ; cbnz x1, =>bail
+        ; mov x9, x0                            // boolean Value from the probe
+        ; b =>done
         ; =>int_case
         ; cbz w9, =>falsy
         ; b =>truthy

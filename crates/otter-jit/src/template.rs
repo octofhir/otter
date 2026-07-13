@@ -28,7 +28,7 @@
 //!
 //! # See also
 //! - `JIT_REFACTOR_PLAN.md` — replacement-compiler direction and gates.
-//! - [`crate::baseline`] — the shared entry ABI, typed lowering, and runtime
+//! - [`crate::entry`] — the shared entry ABI, typed lowering, and runtime
 //!   transitions this compiler consumes.
 
 use otter_vm::JitCompileSnapshot;
@@ -41,7 +41,7 @@ mod plan;
 pub use code::TemplateCode;
 pub(crate) use plan::{ArithKind, BitwiseKind, CompareKind, TemplateOp, TemplatePlan};
 
-use crate::baseline::Unsupported;
+use crate::entry::Unsupported;
 
 /// Compile a function view to template machine code under the
 /// isolate-assigned unique code-object identity, or report why not.
@@ -65,14 +65,13 @@ pub fn compile(
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
-    //! Execution tests for the template subset, plus differential fixtures
-    //! compiled by both the template and the baseline compiler. They drive
-    //! compiled code through a `JitCtx` whose `vm`/`stack`/`context` are null —
-    //! valid because this subset never re-enters the VM — and a `regs` pointer
-    //! at a local register array.
+    //! Execution tests for the template subset. They drive compiled code
+    //! through a `JitCtx` whose `vm`/`stack`/`context` are null — valid
+    //! because this subset never re-enters the VM — and a `regs` pointer at a
+    //! local register array.
 
     use super::TemplateCode;
-    use crate::baseline::{
+    use crate::entry::{
         JitCtx, JitEntry, JitRet, STATUS_RETURNED, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
         VALUE_UNDEFINED, value_tag,
     };

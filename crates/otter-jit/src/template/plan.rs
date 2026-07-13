@@ -26,7 +26,7 @@
 use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
 
-use crate::baseline::{
+use crate::entry::{
     BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag,
 };
 

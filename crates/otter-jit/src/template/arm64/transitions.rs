@@ -25,7 +25,7 @@ use otter_vm::native_abi::{self as abi, RuntimeStubDescriptor, RuntimeStubSignat
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::values::{emit_load_reg, emit_load_u64, emit_store_reg};
-use crate::baseline::{
+use crate::entry::{
     ALLOC_CTX_CODE_OBJECT_ID_OFFSET, ALLOC_CTX_FRAME_OFFSET, ALLOC_CTX_RESERVED0_OFFSET,
     ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
     ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
@@ -44,7 +44,7 @@ pub(super) struct TransitionTable {
 impl TransitionTable {
     pub(super) fn resolve() -> Self {
         Self {
-            bindings: crate::baseline::runtime_stub_bindings(),
+            bindings: crate::entry::runtime_stub_bindings(),
         }
     }
 

@@ -35,12 +35,12 @@
 //! - `otter-gc` — the moving collector, `FrameRoots`, and the W^X/rooting
 //!   contract this tier must honor.
 
-mod baseline;
 mod code;
+mod entry;
 mod template;
 
-pub use baseline::Unsupported;
 pub use code::CompiledCode;
+pub use entry::Unsupported;
 pub use template::{TemplateCode, compile};
 
 /// Baseline JIT compiler implementation wired into `otter-vm` through the
@@ -62,7 +62,7 @@ impl BaselineJitCompiler {
 
 impl otter_vm::JitCompilerHook for BaselineJitCompiler {
     fn runtime_stub_bindings(&self) -> Vec<otter_vm::JitRuntimeStubBinding> {
-        baseline::runtime_stub_bindings()
+        entry::runtime_stub_bindings()
     }
 
     // The baseline tier serves OSR requests too: it builds a loop-header

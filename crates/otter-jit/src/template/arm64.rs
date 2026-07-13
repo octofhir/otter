@@ -50,7 +50,7 @@ use self::transitions::TransitionTable;
 use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
-use crate::baseline::{
+use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
     NUMBER_TAG_HI16, SELF_CLOSURE_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
     THIS_VALUE_OFFSET, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
@@ -77,10 +77,10 @@ pub(super) fn compile(
     // pointer is baked, consumed strictly in emission order, owned by the
     // finalized code object.
     let mut load_ic_cells =
-        vec![crate::baseline::WhiskerIcCell::default(); plan.load_property_count]
+        vec![crate::entry::WhiskerIcCell::default(); plan.load_property_count]
             .into_boxed_slice();
     let mut store_ic_cells =
-        vec![crate::baseline::WhiskerIcCell::default(); plan.store_property_count]
+        vec![crate::entry::WhiskerIcCell::default(); plan.store_property_count]
             .into_boxed_slice();
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
@@ -364,7 +364,7 @@ pub(super) fn compile(
             } => {
                 let cell = &mut load_ic_cells[next_load_ic];
                 next_load_ic += 1;
-                let cell_addr = cell as *mut crate::baseline::WhiskerIcCell as usize;
+                let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_load_property(
                     &mut ops,
                     &transitions,
@@ -387,7 +387,7 @@ pub(super) fn compile(
             } => {
                 let cell = &mut store_ic_cells[next_store_ic];
                 next_store_ic += 1;
-                let cell_addr = cell as *mut crate::baseline::WhiskerIcCell as usize;
+                let cell_addr = cell as *mut crate::entry::WhiskerIcCell as usize;
                 properties::emit_store_property(
                     &mut ops,
                     &transitions,

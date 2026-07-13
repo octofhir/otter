@@ -6,10 +6,9 @@
 //! numeric/comparison/bitwise set, `+` with allocating string concat,
 //! descriptor-resolved runtime transitions, ordinary and method calls with
 //! callee-owned frames, named-property IC probes, and guarded Map/Set builtin
-//! fast paths. Opcodes outside the subset lower to exact side exits
-//! (loop-OSR-only code) or reject the whole function with [`Unsupported`] —
-//! a template compile never produces partially executable code. Deliberately
-//! absent (later, measured slices): inlining and FP residency.
+//! fast paths. Opcodes that are safe to retry before any observable effect
+//! lower to canonical-PC exact side exits (loop-OSR-only code); structured
+//! exception opcodes reject the whole function with [`Unsupported`].
 //!
 //! # Contents
 //! - [`plan`] — machine-independent operation stream over typed lowering.
@@ -19,9 +18,9 @@
 //!
 //! # Invariants
 //! - Compiled code publishes the canonical instruction-index PC before every
-//!   opcode and exits only through exact side exits, returns, or the throw
-//!   status; the interpreter resumes exactly there and never replays earlier
-//!   effects.
+//!   opcode and exits only through pre-effect exact side exits, returns, or the
+//!   throw status; the interpreter resumes exactly there and never replays a
+//!   committed effect.
 //! - The VM is reached only through `otter_vm::native_abi` records and the
 //!   shared runtime-stub inventory; no template-private frame or status shape
 //!   exists.

@@ -12,9 +12,8 @@
 //! - Every instruction stamps its canonical resume PC into the published
 //!   native frame before any observable work; exact side exits, returns, and
 //!   the throw status are the only exits.
-//! - Tagged truthiness decides numbers, booleans, `null`, and `undefined`
-//!   inline; heap cells and every other encoding take an exact side exit so
-//!   the interpreter re-executes the uncommitted instruction.
+//! - Tagged truthiness decides immediate primitives inline and delegates heap
+//!   cells to the total leaf helper without allocating or re-entering JS.
 //! - Boxed-double falsiness is decided by exact bit patterns (`+0.0`, `-0.0`,
 //!   the canonical NaN); the VM's NaN-purification invariant makes this
 //!   complete.
@@ -43,9 +42,9 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::JitCompileSnapshot;
 
 use self::arith::{
-    emit_add_generic, emit_binary_arith, emit_coercion_slow_paths, emit_compare, emit_increment,
-    emit_int_bitwise, emit_loose_compare, emit_negate, emit_to_numeric, emit_to_primitive,
-    emit_unsigned_shift_right,
+    emit_add_generic, emit_binary_arith, emit_bitwise_not, emit_coercion_slow_paths, emit_compare,
+    emit_increment, emit_int_bitwise, emit_loose_compare, emit_negate, emit_numeric_slow_paths,
+    emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
 use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
@@ -83,6 +82,7 @@ pub(super) fn compile(
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let mut coercion_slow_paths = Vec::new();
+    let mut numeric_slow_paths = Vec::new();
     let mut ops = Assembler::new().expect("assembler alloc");
     let bail = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
@@ -159,7 +159,7 @@ pub(super) fn compile(
                 rhs,
                 kind,
             } => {
-                emit_binary_arith(&mut ops, dst, lhs, rhs, kind, bail)?;
+                emit_binary_arith(&mut ops, dst, lhs, rhs, kind, &mut numeric_slow_paths)?;
             }
             TemplateOp::Compare {
                 dst,
@@ -167,7 +167,7 @@ pub(super) fn compile(
                 rhs,
                 kind,
             } => {
-                emit_compare(&mut ops, dst, lhs, rhs, kind, bail)?;
+                emit_compare(&mut ops, dst, lhs, rhs, kind, bail, &mut numeric_slow_paths)?;
             }
             TemplateOp::LooseCompare {
                 dst,
@@ -183,16 +183,19 @@ pub(super) fn compile(
                 rhs,
                 kind,
             } => {
-                emit_int_bitwise(&mut ops, dst, lhs, rhs, kind, bail)?;
+                emit_int_bitwise(&mut ops, dst, lhs, rhs, kind, &mut numeric_slow_paths)?;
             }
             TemplateOp::UnsignedShiftRight { dst, lhs, rhs } => {
-                emit_unsigned_shift_right(&mut ops, dst, lhs, rhs, bail)?;
+                emit_unsigned_shift_right(&mut ops, dst, lhs, rhs, &mut numeric_slow_paths)?;
             }
             TemplateOp::Increment { dst, src, delta } => {
-                emit_increment(&mut ops, dst, src, delta, bail)?;
+                emit_increment(&mut ops, dst, src, delta, &mut numeric_slow_paths)?;
             }
             TemplateOp::Negate { dst, src } => {
-                emit_negate(&mut ops, dst, src, bail)?;
+                emit_negate(&mut ops, dst, src, &mut numeric_slow_paths)?;
+            }
+            TemplateOp::BitwiseNot { dst, src } => {
+                emit_bitwise_not(&mut ops, dst, src, &mut numeric_slow_paths)?;
             }
             TemplateOp::ToNumeric { dst, src } => {
                 emit_to_numeric(
@@ -499,8 +502,9 @@ pub(super) fn compile(
     // Preserve the old end-of-stream exact exit while keeping every coercion
     // transition out of line. Each cold continuation returns to the label
     // immediately after its source operation's inline fast path.
-    if !coercion_slow_paths.is_empty() {
+    if !coercion_slow_paths.is_empty() || !numeric_slow_paths.is_empty() {
         dynasm!(ops ; .arch aarch64 ; b =>bail);
+        emit_numeric_slow_paths(&mut ops, transitions, numeric_slow_paths, bail, threw);
         emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, bail, threw);
     }
 

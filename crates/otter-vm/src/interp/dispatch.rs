@@ -2043,36 +2043,8 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let delta = context.exec_imm32(instr, 2).unwrap_or(1);
-                    let value = *read_register(&stack[top_idx], src)?;
-                    // Record operand-type feedback for the optimizing tier: the
-                    // updated operand against the int32 step. A counting loop's
-                    // `i++` thus reads as int32-only and lowers to a guarded
-                    // `Int32Add`.
-                    if let Some(feedback) = feedback {
-                        feedback.record_arith(value, Value::number_i32(delta));
-                    }
-                    let primitive = self.evaluate_to_primitive(
-                        context,
-                        &value,
-                        abstract_ops::ToPrimitiveHint::Number,
-                    )?;
-                    let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
-                        .ok_or(VmError::TypeMismatch)?;
-                    let next = match kind {
-                        abstract_ops::NumericKind::Num(n) => Value::number(
-                            crate::number::NumberValue::from_f64(n.as_f64() + f64::from(delta)),
-                        ),
-                        abstract_ops::NumericKind::Big(b) => {
-                            let delta_big = num_bigint::BigInt::from(delta);
-                            let sum = bigint::ops::add(&b, &delta_big);
-                            let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
-                                .map_err(|_| VmError::TypeMismatch)?;
-                            Value::big_int(handle)
-                        }
-                    };
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, next)?;
-                    frame.advance_pc()?;
+                    self.run_increment_regs(context, frame, dst, src, delta, feedback)?;
                     continue;
                 }
                 Op::ValidateGlobalDecl => {

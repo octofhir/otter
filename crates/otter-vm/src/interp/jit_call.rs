@@ -1100,12 +1100,12 @@ impl Interpreter {
     /// class-constructor / native property walks, and the synchronous
     /// callable path dispatches resolved VM intrinsics (`call`, `apply`,
     /// `bind`) itself. Families the interpreter dispatches through bespoke
-    /// opcode branches — generators, iterators, pending `bind`
-    /// continuations — and every resolution failure report `Ok(false)`, so
-    /// the exact side exit keeps the interpreter the only owner of their
-    /// semantics and error messages. On `Ok(true)` the destination register
-    /// holds the call result and the compiled caller continues at the next
-    /// instruction.
+    /// opcode branches — generators, iterators, and pending `bind`
+    /// continuations — report `Ok(false)` before resolution starts. Once
+    /// resolution has invoked an accessor or proxy trap, missing and
+    /// non-callable results throw here so an exact side exit cannot replay the
+    /// observable `[[Get]]`. On `Ok(true)` the destination register holds the
+    /// call result and the compiled caller continues at the next instruction.
     ///
     /// The callee runs through [`Self::run_callable_sync_already_rooted`]
     /// under the caller's published activation: it may allocate, re-enter
@@ -1155,6 +1155,9 @@ impl Interpreter {
         // Resolve through the same layers the interpreter uses: the per-site
         // method IC for ordinary objects, then the full receiver-family walk
         // (prototype chain, primitive intrinsic prototypes, proxy [[Get]]).
+        let Some(name) = context.string_constant_str_for_function(caller_fid, name_idx) else {
+            return Ok(false);
+        };
         let mut method = None;
         if let Some(obj) = recv.as_object()
             && let Some(key) = context.property_atom_for_function(caller_fid, name_idx)
@@ -1162,16 +1165,13 @@ impl Interpreter {
             method = self.resolve_method_ic(obj, key, site);
         }
         if method.is_none() {
-            let Some(name) = context.string_constant_str_for_function(caller_fid, name_idx) else {
-                return Ok(false);
-            };
             method = self.get_method_value_for_call(context, stack, recv, name)?;
         }
         let Some(method) = method else {
-            return Ok(false);
+            return Err(self.err_unknown_intrinsic(name.to_string().into()));
         };
         if !self.is_callable_runtime(&method) {
-            return Ok(false);
+            return Err(VmError::NotCallable);
         }
         // The resolved method is the one live handle no traced storage
         // holds; anchor it so the feedback capture below (which may

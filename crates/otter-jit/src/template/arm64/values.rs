@@ -10,7 +10,7 @@
 //! - Boxed doubles are purified before encoding, so no emitted value aliases
 //!   the cell space.
 //! - Coercions the fast path cannot represent exactly branch to the caller's
-//!   side-exit label before any observable effect.
+//!   supplied pre-effect continuation, normally an outlined VM transition.
 //!
 //! # See also
 //! - `otter_vm::value::tag` — the frozen boxed-value contract these bake.

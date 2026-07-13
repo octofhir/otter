@@ -783,7 +783,8 @@ pub const STUB_JIT_MATH_RANDOM: RuntimeStubDescriptor = descriptor(
 );
 /// Completes one full `CallMethodValue` in the VM for site resolutions the
 /// direct-call prepare cannot stage (polymorphic, native, accessor, or cold
-/// methods); the resolved callee may be arbitrary JS.
+/// methods); the resolved callee may be arbitrary JS, and post-resolution
+/// missing/non-callable results throw without replaying observable `[[Get]]`.
 pub const STUB_JIT_CALL_METHOD_GENERIC: RuntimeStubDescriptor = descriptor(
     46,
     RuntimeStubClass::Reentrant,
@@ -888,6 +889,19 @@ pub const STUB_JIT_COERCE_UNARY: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes one numeric, bitwise, update, or relational opcode in the VM.
+/// The shared family is conservatively reentrant because `Increment` may run
+/// user conversion hooks and BigInt results may allocate.
+pub const STUB_JIT_NUMERIC_OP: RuntimeStubDescriptor = descriptor(
+    55,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -946,6 +960,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         52 => "jit_load_regexp",
         53 => "jit_construct",
         54 => "jit_coerce_unary",
+        55 => "jit_numeric_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1006,6 +1021,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_LOAD_REGEXP,
     STUB_JIT_CONSTRUCT,
     STUB_JIT_COERCE_UNARY,
+    STUB_JIT_NUMERIC_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

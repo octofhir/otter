@@ -252,6 +252,42 @@ pub(crate) extern "C" fn jit_call_generic_stub(
     }
 }
 
+/// Complete one full `Op::New` construct in the VM. `0` = destination
+/// written and the compiled caller continues, `1` = threw, `2` = a
+/// non-constructor callee or no live activation (exact side exit; the
+/// interpreter owns the thrown error).
+pub(crate) extern "C" fn jit_construct_stub(
+    ctx: *mut JitCtx,
+    dst: u64,
+    callee: u64,
+    argc: u64,
+    packed_args: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return 2;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    let all = unpack_method_arg_regs(packed_args);
+    let argc = (argc as usize).min(all.len());
+    match vm.jit_runtime_construct_in_place(
+        context,
+        dst as u16,
+        callee as u16,
+        &all[..argc],
+        ctx.regs.cast::<otter_vm::Value>(),
+    ) {
+        Ok(true) => 0,
+        Ok(false) => 2,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
+}
+
 /// Complete one full loose-equality opcode in the VM. `0` = destination
 /// written, `1` = threw (coercion raised), `2` = no live activation
 /// (isolate-less probe harness; exact side exit).

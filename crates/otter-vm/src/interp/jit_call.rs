@@ -1263,6 +1263,67 @@ impl Interpreter {
         Ok(true)
     }
 
+    /// Complete one full `Op::New` construct in place for a compiled caller
+    /// whose New site fell outside the compiled subset. Reads the callee and
+    /// argument registers from the caller's live window and runs the
+    /// interpreter's own `Construct(callee, args, callee)` synchronously under
+    /// the caller's published activation, writing the constructed value into
+    /// `dst`.
+    ///
+    /// A non-constructor callee reports `Ok(false)` and side-exits, keeping the
+    /// interpreter the sole owner of the thrown `TypeError`. On `Ok(true)` the
+    /// destination register holds the constructed object and the compiled
+    /// caller continues at the next instruction.
+    ///
+    /// The constructor body runs through
+    /// [`Self::run_construct_sync_already_rooted`] (the caller already holds an
+    /// `ExtraRoots` registration): it may allocate, re-enter arbitrary JS, and
+    /// invalidate the caller's body — the entry anchor keeps the mapping alive.
+    /// Register windows live in the pinned register-stack slab, so `caller_regs`
+    /// stays valid across the nested dispatch; the callee and argument handles
+    /// are read from the traced window and handed straight to the synchronous
+    /// construct, which roots them at every allocation.
+    ///
+    /// # Safety-adjacent contract
+    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
+    /// compiled code guarantees the destination/callee/argument registers are
+    /// in bounds for that window.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn jit_runtime_construct_in_place(
+        &mut self,
+        context: &ExecutionContext,
+        dst_reg: u16,
+        callee_reg: u16,
+        arg_regs: &[u16],
+        caller_regs: *mut Value,
+    ) -> Result<bool, VmError> {
+        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
+        self.jit_runtime_stats.runtime_constructs =
+            self.jit_runtime_stats.runtime_constructs.saturating_add(1);
+        // SAFETY: `callee_reg` is a compiler-emitted index into the caller window.
+        let callee = unsafe { *caller_regs.add(callee_reg as usize) };
+        // The interpreter's `Op::New` throws `NotCallable` for a non-constructor
+        // callee; leave that error to the exact side exit.
+        if !crate::interp::helpers::is_constructor_runtime(&callee, context, &self.gc_heap) {
+            return Ok(false);
+        }
+        let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &arg in arg_regs {
+            // SAFETY: compiler-emitted argument indices into the caller window.
+            args.push(unsafe { *caller_regs.add(arg as usize) });
+        }
+        // A plain `new callee(args…)` uses the callee itself as `new.target`,
+        // matching `do_construct`'s `effective_new_target`.
+        let result = self.run_construct_sync_already_rooted(context, &callee, callee, args)?;
+        // SAFETY: `dst_reg` is a compiler-emitted index into the caller
+        // window; the window slab is pinned, so the pointer survived the
+        // nested dispatch.
+        unsafe {
+            *caller_regs.add(dst_reg as usize) = result;
+        }
+        Ok(true)
+    }
+
     /// Complete one full loose-equality opcode in place for a compiled
     /// caller whose inline paths (numeric, nullish) did not decide the
     /// comparison. Runs the interpreter's own §7.2.13 IsLooselyEqual —

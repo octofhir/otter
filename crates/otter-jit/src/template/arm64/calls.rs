@@ -104,6 +104,43 @@ pub(super) fn emit_call(
     );
 }
 
+/// Emit `dst = new callee(args…)` (`Op::New`).
+///
+/// The construct opcode has no direct-call fast path: it completes through
+/// the single generic in-place construct transition, which runs the
+/// interpreter's own `Construct` synchronously and writes `dst`. Status `0`
+/// continues the compiled caller, `1` throws, and `2` (a non-constructor
+/// callee) takes the exact side exit so the interpreter owns the `TypeError`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_construct(
+    ops: &mut Assembler,
+    table: &TransitionTable,
+    dst: u16,
+    callee: u16,
+    argc: u16,
+    packed_args: u64,
+    bail: DynamicLabel,
+    threw: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x0, x20
+        ; movz x1, dst as u32
+        ; movz x2, callee as u32
+        ; movz x3, argc as u32
+    );
+    emit_load_u64(ops, 4, packed_args);
+    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_CONSTRUCT));
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, #1
+        ; b.eq =>threw
+        ; cmp x0, #2
+        ; b.eq =>bail
+    );
+}
+
 /// Emit `dst = recv.name(args…)` (`Op::CallMethodValue`).
 ///
 /// Layered dispatch: the collection-method IC transition completes hot

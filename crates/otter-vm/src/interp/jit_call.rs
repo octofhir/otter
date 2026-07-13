@@ -1093,8 +1093,11 @@ impl Interpreter {
     /// Covers exactly the receiver families whose interpreter semantics are
     /// "resolve the method value, then call it": ordinary property-bearing
     /// receivers (objects, arrays, collections, proxies) and primitives.
-    /// Families the interpreter dispatches through bespoke opcode branches —
-    /// generators, iterators, callable receivers, pending `bind`
+    /// Covers callable receivers too: the resolver owns function /
+    /// class-constructor / native property walks, and the synchronous
+    /// callable path dispatches resolved VM intrinsics (`call`, `apply`,
+    /// `bind`) itself. Families the interpreter dispatches through bespoke
+    /// opcode branches — generators, iterators, pending `bind`
     /// continuations — and every resolution failure report `Ok(false)`, so
     /// the exact side exit keeps the interpreter the only owner of their
     /// semantics and error messages. On `Ok(true)` the destination register
@@ -1142,15 +1145,7 @@ impl Interpreter {
         }
         // SAFETY: `recv_reg` is a compiler-emitted index into the caller window.
         let recv = unsafe { *caller_regs.add(recv_reg as usize) };
-        if recv.is_nullish()
-            || recv.is_generator()
-            || recv.is_iterator()
-            || recv.as_function().is_some()
-            || recv.as_closure(&self.gc_heap).is_some()
-            || recv.as_native_function().is_some()
-            || recv.as_bound_function().is_some()
-            || recv.as_class_constructor().is_some()
-        {
+        if recv.is_nullish() || recv.is_generator() || recv.is_iterator() {
             return Ok(false);
         }
         let caller_fid = stack[frame_index].function_id;

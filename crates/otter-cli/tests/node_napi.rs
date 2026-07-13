@@ -3,6 +3,7 @@
 //! # Contents
 //! - A real C shared library loaded through bare-package `node_modules`
 //!   resolution and `package.json#main`.
+//! - Both symbol-based and constructor-based Node-API registration.
 //! - Value, property, callback, JS re-entry, array, exception, external,
 //!   buffer, external-memory accounting, Promise, and asynchronous-work calls.
 //! - Independent deny-by-default checks for `read` and `ffi`.
@@ -17,11 +18,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const ADDON_SOURCE: &str = include_str!("fixtures/napi_addon.c");
+const LEGACY_ADDON_SOURCE: &str = include_str!("fixtures/napi_legacy_addon.c");
 
 fn build_addon(root: &Path) -> PathBuf {
+    build_addon_source(root, ADDON_SOURCE)
+}
+
+fn build_addon_source(root: &Path, source_text: &str) -> PathBuf {
     let source = root.join("addon.c");
     let output = root.join("addon.node");
-    std::fs::write(&source, ADDON_SOURCE).expect("write addon source");
+    std::fs::write(&source, source_text).expect("write addon source");
     let mut cc = Command::new("cc");
     #[cfg(target_os = "macos")]
     cc.args(["-dynamiclib", "-undefined", "dynamic_lookup"]);
@@ -36,6 +42,43 @@ fn build_addon(root: &Path) -> PathBuf {
         .expect("run C compiler");
     assert!(status.success(), "C compiler failed with {status}");
     output
+}
+
+#[test]
+fn node_api_addon_supports_constructor_registration() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let addon = build_addon_source(tmp.path(), LEGACY_ADDON_SOURCE);
+    std::fs::write(
+        tmp.path().join("main.js"),
+        "const addon = require('./addon.node');\n\
+         if (addon.registration !== 'constructor') throw new Error('registration');\n\
+         console.log('napi-constructor-ok');",
+    )
+    .expect("write main");
+
+    let root = std::fs::canonicalize(tmp.path())
+        .expect("canonical root")
+        .to_string_lossy()
+        .into_owned();
+    let addon = std::fs::canonicalize(addon)
+        .expect("canonical addon")
+        .to_string_lossy()
+        .into_owned();
+    let output = run(
+        tmp.path(),
+        &[
+            format!("--allow-read={root}"),
+            format!("--allow-ffi={addon}"),
+            "run".into(),
+            "main.js".into(),
+        ],
+    );
+    assert!(output.status.success(), "{}", diagnostic(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("napi-constructor-ok"),
+        "{}",
+        diagnostic(&output)
+    );
 }
 
 fn run(root: &Path, args: &[String]) -> Output {
@@ -84,6 +127,7 @@ if (addon.coerceObject(42) !== 6) throw new Error('coerce object');
 if (addon.accountExternal() !== 4096) throw new Error('external memory');
 if (addon.inspectCollections() !== 42) throw new Error('collection predicates');
 if (addon.lifecycleHooks() !== 42) throw new Error('lifecycle hooks');
+if (addon.inspectDescriptors() !== 42) throw new Error('descriptors');
 let message = '';
 try { addon.fail(); } catch (error) { message = error.message; }
 if (message !== 'native boom') throw new Error('throw: ' + message);

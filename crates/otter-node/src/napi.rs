@@ -11,18 +11,24 @@
 //! - [`NapiEnv`] owns stable C handles backed by Otter persistent roots.
 //! - Exported `napi_*` functions implement the initial Node-API value,
 //!   property, callback, exception, external-memory, buffer, Promise,
-//!   async-work, property-descriptor, and handle-scope surface.
+//!   async-work, thread-safe-function, property-descriptor, and handle-scope
+//!   surface.
 //!
 //! # Invariants
 //! - Both `read` and `ffi` capabilities are checked before native code loads.
 //! - A `napi_value` never stores a raw moving-heap offset. It points to a stable
 //!   Rust box containing a persistent-root id; every access rereads the root.
+//! - `napi_env` has addon lifetime, while its mutator context is installed only
+//!   for the current isolate turn. Addons may retain the environment pointer,
+//!   but worker threads may only use APIs documented as thread-safe.
 //! - VM allocations and mutations use `NativeCtx::scope` / `scoped_*` APIs.
-//! - The raw context pointer is confined to the synchronous C ABI turn. Addons
-//!   may not retain `napi_env` beyond that turn or use it from another thread.
-//! - Async execute/completion callbacks receive a fresh environment at the
-//!   runtime microtask checkpoint; no VM context crosses a thread boundary.
-//! - Loaded code stays mapped while any JS callback created from it is alive.
+//! - The raw context pointer is confined to the synchronous C ABI turn.
+//! - Async execute/completion callbacks receive the stable addon environment
+//!   at the runtime checkpoint; no VM context crosses a thread boundary.
+//! - Thread-safe function calls cross the owned runtime inbox and reacquire
+//!   persistent-rooted callbacks on the isolate thread.
+//! - Loaded code stays mapped while any JS callback or async task created from
+//!   it is alive.
 //!   Unsupported ABI symbols remain absent, so the platform loader fails fast.
 //! - Deprecated constructor registration is captured in a thread-local frame
 //!   only while the platform loader is mapping that addon.
@@ -44,14 +50,16 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use libloading::Library;
-use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, NativeError, PersistentRootId, Value};
-use smallvec::SmallVec;
+use otter_runtime::{
+    CapabilitySet, RuntimeExecutionContext, RuntimeKeepAlive, RuntimeLiveness, RuntimeTask,
+    RuntimeTaskSpawner,
+};
+use otter_vm::{NativeCall, NativeCtx, NativeError, PersistentRootId, Value};
 
 pub type napi_env = *mut NapiEnv;
 pub type napi_value = *mut c_void;
@@ -79,6 +87,7 @@ const NAPI_BOOLEAN_EXPECTED: napi_status = 7;
 const NAPI_GENERIC_FAILURE: napi_status = 9;
 const NAPI_PENDING_EXCEPTION: napi_status = 10;
 const NAPI_ESCAPE_CALLED_TWICE: napi_status = 12;
+const NAPI_QUEUE_FULL: napi_status = 15;
 const NAPI_CLOSING: napi_status = 16;
 
 const NAPI_UNDEFINED: c_int = 0;
@@ -161,16 +170,120 @@ pub struct NapiAsyncWork {
 }
 
 struct NapiThreadsafeFunction {
-    library: Arc<Library>,
+    inner: Arc<NapiThreadsafeFunctionInner>,
+}
+
+struct NapiThreadsafeFunctionInner {
+    state: Arc<NapiState>,
+    task_spawner: RuntimeTaskSpawner,
+    execution_context: RuntimeExecutionContext,
+    function_root: Option<PersistentRootId>,
+    call_js_callback: usize,
     thread_count: AtomicUsize,
+    queued: AtomicUsize,
+    max_queue_size: usize,
     closing: AtomicBool,
     finalize_data: usize,
     finalize_callback: usize,
     context: usize,
+    keep_alive: RuntimeKeepAlive,
+}
+
+struct NapiThreadsafeFunctionCallTask {
+    function: Arc<NapiThreadsafeFunctionInner>,
+    data: usize,
+}
+
+impl RuntimeTask for NapiThreadsafeFunctionCallTask {
+    fn run(
+        self: Box<Self>,
+        runtime: &mut otter_runtime::Runtime,
+    ) -> Result<(), otter_runtime::OtterError> {
+        self.function.queued.fetch_sub(1, Ordering::AcqRel);
+        let function = self.function.clone();
+        let execution_context = function.execution_context.clone();
+        let data = self.data;
+        runtime
+            .run_native_event(&execution_context, move |ctx| {
+                let callback_value = function
+                    .function_root
+                    .and_then(|root| ctx.persistent_root_get(root));
+                if function.call_js_callback == 0 {
+                    if let Some(callback) = callback_value {
+                        ctx.call(callback, Value::undefined(), &[])?;
+                    }
+                    return Ok(Value::undefined());
+                }
+                let callback: unsafe extern "C" fn(napi_env, napi_value, *mut c_void, *mut c_void) =
+                    unsafe { std::mem::transmute(function.call_js_callback) };
+                with_stable_env(ctx, &function.state, |env| {
+                    let callback_value = callback_value
+                        .map(|value| env.root(value))
+                        .unwrap_or(ptr::null_mut());
+                    unsafe {
+                        callback(
+                            env,
+                            callback_value,
+                            function.context as *mut c_void,
+                            data as *mut c_void,
+                        )
+                    };
+                    if let Some(error) = env.pending.take() {
+                        return Err(error);
+                    }
+                    Ok(Value::undefined())
+                })
+            })
+            .map(|_| ())
+    }
+}
+
+struct NapiThreadsafeFunctionFinalizeTask {
+    function: Arc<NapiThreadsafeFunctionInner>,
+}
+
+impl RuntimeTask for NapiThreadsafeFunctionFinalizeTask {
+    fn run(
+        self: Box<Self>,
+        runtime: &mut otter_runtime::Runtime,
+    ) -> Result<(), otter_runtime::OtterError> {
+        let function = self.function.clone();
+        let execution_context = function.execution_context.clone();
+        let result = runtime
+            .run_native_event(&execution_context, move |ctx| {
+                if let Some(root) = function.function_root {
+                    let _ = ctx.persistent_root_remove(root);
+                }
+                if function.finalize_callback != 0 {
+                    let callback: unsafe extern "C" fn(napi_env, *mut c_void, *mut c_void) =
+                        unsafe { std::mem::transmute(function.finalize_callback) };
+                    with_stable_env(ctx, &function.state, |env| {
+                        unsafe {
+                            callback(
+                                env,
+                                function.finalize_data as *mut c_void,
+                                function.context as *mut c_void,
+                            )
+                        };
+                        if let Some(error) = env.pending.take() {
+                            return Err(error);
+                        }
+                        Ok::<(), NativeError>(())
+                    })?;
+                }
+                Ok(Value::undefined())
+            })
+            .map(|_| ());
+        self.function.keep_alive.close();
+        result
+    }
 }
 
 struct NapiState {
     library: Arc<Library>,
+    env_ptr: AtomicUsize,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    execution_context: Option<RuntimeExecutionContext>,
     wraps: Mutex<Vec<NapiWrap>>,
     externals: Mutex<Vec<NapiExternal>>,
     cleanup_hooks: Mutex<Vec<NapiCleanupHook>>,
@@ -178,9 +291,16 @@ struct NapiState {
 }
 
 impl NapiState {
-    fn new(library: Arc<Library>) -> Self {
+    fn new(
+        library: Arc<Library>,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+        execution_context: Option<RuntimeExecutionContext>,
+    ) -> Self {
         Self {
             library,
+            env_ptr: AtomicUsize::new(0),
+            runtime_task_spawner,
+            execution_context,
             wraps: Mutex::new(Vec::new()),
             externals: Mutex::new(Vec::new()),
             cleanup_hooks: Mutex::new(Vec::new()),
@@ -220,6 +340,10 @@ impl Drop for NapiState {
                 )
             };
         }
+        let env = self.env_ptr.swap(0, Ordering::AcqRel);
+        if env != 0 {
+            drop(unsafe { Box::from_raw(env as *mut NapiEnv) });
+        }
     }
 }
 
@@ -252,12 +376,11 @@ pub struct NapiEnv {
     scopes: Vec<usize>,
     pending: Option<NativeError>,
     last_error: NapiExtendedErrorInfo,
-    library: Arc<Library>,
-    state: Arc<NapiState>,
+    state: Weak<NapiState>,
 }
 
 impl NapiEnv {
-    fn new(ctx: &mut NativeCtx<'_>, library: Arc<Library>, state: Arc<NapiState>) -> Self {
+    fn new(ctx: &mut NativeCtx<'_>, state: Weak<NapiState>) -> Self {
         Self {
             ctx: (ctx as *mut NativeCtx<'_>).cast(),
             handles: Vec::new(),
@@ -269,7 +392,6 @@ impl NapiEnv {
                 engine_error_code: 0,
                 error_code: NAPI_GENERIC_FAILURE,
             },
-            library,
             state,
         }
     }
@@ -280,7 +402,14 @@ impl NapiEnv {
     /// `self.ctx` is live only while the synchronous registration/callback
     /// frame that constructed this environment remains on the Rust stack.
     unsafe fn ctx(&mut self) -> &mut NativeCtx<'static> {
+        assert!(!self.ctx.is_null(), "napi_env used outside an isolate turn");
         unsafe { &mut *self.ctx.cast::<NativeCtx<'static>>() }
+    }
+
+    fn state(&self) -> Arc<NapiState> {
+        self.state
+            .upgrade()
+            .expect("Node-API state outlives its stable environment")
     }
 
     fn root(&mut self, value: Value) -> napi_value {
@@ -315,10 +444,28 @@ impl NapiEnv {
     }
 }
 
-impl Drop for NapiEnv {
-    fn drop(&mut self) {
-        self.truncate_handles(0);
-    }
+fn install_stable_env(ctx: &mut NativeCtx<'_>, state: &Arc<NapiState>) {
+    let env = Box::new(NapiEnv::new(ctx, Arc::downgrade(state)));
+    let previous = state
+        .env_ptr
+        .swap(Box::into_raw(env) as usize, Ordering::AcqRel);
+    assert_eq!(previous, 0, "stable napi_env installed once");
+}
+
+fn with_stable_env<R>(
+    ctx: &mut NativeCtx<'_>,
+    state: &Arc<NapiState>,
+    run: impl FnOnce(&mut NapiEnv) -> R,
+) -> R {
+    let env_ptr = state.env_ptr.load(Ordering::Acquire) as *mut NapiEnv;
+    assert!(!env_ptr.is_null(), "stable napi_env is installed");
+    let env = unsafe { &mut *env_ptr };
+    let previous_ctx = std::mem::replace(&mut env.ctx, (ctx as *mut NativeCtx<'_>).cast());
+    let handle_base = env.handles.len();
+    let result = run(env);
+    env.truncate_handles(handle_base);
+    env.ctx = previous_ctx;
+    result
 }
 
 pub struct NapiCallbackInfo {
@@ -373,8 +520,8 @@ fn make_uint8_array_len(ctx: &mut NativeCtx<'_>, length: usize) -> Result<Value,
 }
 
 unsafe fn find_external(env: &mut NapiEnv, value: Value) -> Option<usize> {
-    let externals: Vec<(PersistentRootId, usize)> = env
-        .state
+    let state = env.state();
+    let externals: Vec<(PersistentRootId, usize)> = state
         .externals
         .lock()
         .expect("napi externals lock")
@@ -409,24 +556,26 @@ fn invoke_addon_callback(
     callback_addr: usize,
     data_addr: usize,
     args: &[Value],
-    library: Arc<Library>,
     state: Arc<NapiState>,
 ) -> Result<Value, NativeError> {
     let callback: unsafe extern "C" fn(napi_env, napi_callback_info) -> napi_value =
         unsafe { std::mem::transmute(callback_addr) };
-    let mut env = NapiEnv::new(ctx, library, state);
-    let this_arg = env.root(*ctx.this_value());
-    let argv = args.iter().copied().map(|value| env.root(value)).collect();
-    let mut info = NapiCallbackInfo {
-        this_arg,
-        args: argv,
-        data: data_addr as *mut c_void,
-    };
-    let returned = unsafe { callback(&mut env, &mut info) };
-    if let Some(error) = env.pending.take() {
-        return Err(error);
-    }
-    unsafe { env.value(returned) }.ok_or_else(|| invalid("napi callback", "invalid return handle"))
+    let this_value = *ctx.this_value();
+    with_stable_env(ctx, &state, |env| {
+        let this_arg = env.root(this_value);
+        let argv = args.iter().copied().map(|value| env.root(value)).collect();
+        let mut info = NapiCallbackInfo {
+            this_arg,
+            args: argv,
+            data: data_addr as *mut c_void,
+        };
+        let returned = unsafe { callback(env, &mut info) };
+        if let Some(error) = env.pending.take() {
+            return Err(error);
+        }
+        unsafe { env.value(returned) }
+            .ok_or_else(|| invalid("napi callback", "invalid return handle"))
+    })
 }
 
 /// Load and initialize a Node-API addon selected by CommonJS resolution.
@@ -434,6 +583,7 @@ pub fn load_addon(
     ctx: &mut NativeCtx<'_>,
     path: &Path,
     capabilities: &CapabilitySet,
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
 ) -> Result<Value, NativeError> {
     if !capabilities.ffi.matches_path(path) {
         return Err(invalid(
@@ -485,16 +635,22 @@ pub fn load_addon(
         let exports = ctx.scoped_object(scope)?;
         Ok::<Value, NativeError>(ctx.escape(exports))
     })?;
-    let state = Arc::new(NapiState::new(library.clone()));
-    let mut env = NapiEnv::new(ctx, library, state);
-    let exports_handle = env.root(exports);
-    let returned = unsafe { register(&mut env, exports_handle) };
-    if let Some(error) = env.pending.take() {
-        return Err(error);
-    }
-    unsafe { env.value(returned) }
-        .or_else(|| unsafe { env.value(exports_handle) })
-        .ok_or_else(|| invalid("require", "native addon returned an invalid handle"))
+    let state = Arc::new(NapiState::new(
+        library.clone(),
+        runtime_task_spawner,
+        ctx.execution_context().cloned(),
+    ));
+    install_stable_env(ctx, &state);
+    with_stable_env(ctx, &state, |env| {
+        let exports_handle = env.root(exports);
+        let returned = unsafe { register(env, exports_handle) };
+        if let Some(error) = env.pending.take() {
+            return Err(error);
+        }
+        unsafe { env.value(returned) }
+            .or_else(|| unsafe { env.value(exports_handle) })
+            .ok_or_else(|| invalid("require", "native addon returned an invalid handle"))
+    })
 }
 
 /// Capture the deprecated constructor-based registration callback while the
@@ -667,28 +823,14 @@ pub unsafe extern "C" fn napi_create_function(
     let callback = callback.expect("checked");
     let callback_addr = callback as usize;
     let data_addr = data as usize;
-    let library = env.library.clone();
-    let state = env.state.clone();
-    let created = unsafe { env.ctx() }
-        .native_value(
-            "napiCallback",
-            SmallVec::new(),
-            move |ctx, args, _captures| {
-                invoke_addon_callback(
-                    ctx,
-                    callback_addr,
-                    data_addr,
-                    args,
-                    library.clone(),
-                    state.clone(),
-                )
-            },
-        )
-        .map_err(|error| NativeError::OutOfMemory {
-            name: "napi_create_function",
-            requested_bytes: error.requested_bytes(),
-            heap_limit_bytes: error.heap_limit_bytes(),
-        });
+    let state = env.state();
+    let call = NativeCall::Dynamic(Arc::new(move |ctx, args, _captures| {
+        invoke_addon_callback(ctx, callback_addr, data_addr, args, state.clone())
+    }));
+    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
+        let value = ctx.scoped_native_call(scope, "napiCallback", 0, call)?;
+        Ok::<Value, NativeError>(ctx.escape(value))
+    });
     match created {
         Ok(value) => {
             unsafe { *result = env.root(value) };
@@ -798,7 +940,8 @@ pub unsafe extern "C" fn napi_create_external(
     match created {
         Ok(value) => {
             let root = unsafe { env.ctx() }.persistent_root_insert(value);
-            env.state
+            let state = env.state();
+            state
                 .externals
                 .lock()
                 .expect("napi externals lock")
@@ -807,7 +950,7 @@ pub unsafe extern "C" fn napi_create_external(
                     data: data as usize,
                 });
             if !finalize.is_null() {
-                env.state
+                state
                     .finalizers
                     .lock()
                     .expect("napi finalizers lock")
@@ -1773,16 +1916,13 @@ pub unsafe extern "C" fn napi_wrap(
         return NAPI_OBJECT_EXPECTED;
     }
     let root = unsafe { env.ctx() }.persistent_root_insert(value);
-    env.state
-        .wraps
-        .lock()
-        .expect("napi wraps lock")
-        .push(NapiWrap {
-            object: root,
-            data: data as usize,
-        });
+    let state = env.state();
+    state.wraps.lock().expect("napi wraps lock").push(NapiWrap {
+        object: root,
+        data: data as usize,
+    });
     if !finalize.is_null() {
-        env.state
+        state
             .finalizers
             .lock()
             .expect("napi finalizers lock")
@@ -1801,8 +1941,8 @@ pub unsafe extern "C" fn napi_wrap(
 }
 
 unsafe fn find_wrap(env: &mut NapiEnv, object: Value) -> Option<(usize, PersistentRootId)> {
-    let wraps: Vec<(usize, PersistentRootId)> = env
-        .state
+    let state = env.state();
+    let wraps: Vec<(usize, PersistentRootId)> = state
         .wraps
         .lock()
         .expect("napi wraps lock")
@@ -1857,12 +1997,13 @@ pub unsafe extern "C" fn napi_remove_wrap(
         }
         return NAPI_OK;
     };
-    env.state
+    let state = env.state();
+    state
         .wraps
         .lock()
         .expect("napi wraps lock")
         .retain(|wrap| wrap.object != root);
-    env.state
+    state
         .finalizers
         .lock()
         .expect("napi finalizers lock")
@@ -1884,7 +2025,7 @@ pub unsafe extern "C" fn napi_add_env_cleanup_hook(
         return NAPI_INVALID_ARG;
     }
     unsafe { &mut *env }
-        .state
+        .state()
         .cleanup_hooks
         .lock()
         .expect("napi cleanup hooks lock")
@@ -1915,7 +2056,7 @@ pub unsafe extern "C" fn napi_add_finalizer(
         return NAPI_OBJECT_EXPECTED;
     }
     let root = unsafe { env.ctx() }.persistent_root_insert(object_value);
-    env.state
+    env.state()
         .finalizers
         .lock()
         .expect("napi finalizers lock")
@@ -2359,36 +2500,30 @@ pub unsafe extern "C" fn napi_queue_async_work(
     let execute = work.execute;
     let complete = work.complete;
     let data = work.data;
-    let library = env.library.clone();
-    let state = env.state.clone();
-    let task = match unsafe { env.ctx() }.native_value(
-        "napiAsyncWork",
-        SmallVec::new(),
-        move |ctx, _args, _captures| {
-            let mut callback_env = NapiEnv::new(ctx, library.clone(), state.clone());
+    let state = env.state();
+    let call = NativeCall::Dynamic(Arc::new(move |ctx, _args, _captures| {
+        with_stable_env(ctx, &state, |callback_env| {
             if let Some(execute) = execute {
-                unsafe { execute(&mut callback_env, data as *mut c_void) };
+                unsafe { execute(callback_env, data as *mut c_void) };
             }
             if let Some(error) = callback_env.pending.take() {
                 return Err(error);
             }
             if let Some(complete) = complete {
-                unsafe { complete(&mut callback_env, NAPI_OK, data as *mut c_void) };
+                unsafe { complete(callback_env, NAPI_OK, data as *mut c_void) };
             }
             if let Some(error) = callback_env.pending.take() {
                 return Err(error);
             }
             Ok(Value::undefined())
-        },
-    ) {
+        })
+    }));
+    let task = match unsafe { env.ctx() }.scope(|ctx, scope| {
+        let task = ctx.scoped_native_call(scope, "napiAsyncWork", 0, call)?;
+        Ok::<Value, NativeError>(ctx.escape(task))
+    }) {
         Ok(task) => task,
-        Err(error) => {
-            return env.fail(NativeError::OutOfMemory {
-                name: "napi_queue_async_work",
-                requested_bytes: error.requested_bytes(),
-                heap_limit_bytes: error.heap_limit_bytes(),
-            });
-        }
+        Err(error) => return env.fail(error),
     };
     match unsafe { env.ctx() }.queue_microtask(task, []) {
         Ok(()) => NAPI_OK,
@@ -2424,27 +2559,59 @@ pub unsafe extern "C" fn napi_delete_async_work(
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn napi_create_threadsafe_function(
     env: napi_env,
-    _function: napi_value,
+    function: napi_value,
     _resource: napi_value,
     _name: napi_value,
-    _max_queue_size: usize,
+    max_queue_size: usize,
     initial_thread_count: usize,
     finalize_data: *mut c_void,
     finalize_callback: *mut c_void,
     context: *mut c_void,
-    _call_js_callback: *mut c_void,
+    call_js_callback: *mut c_void,
     result: *mut napi_threadsafe_function,
 ) -> napi_status {
     if env.is_null() || result.is_null() || initial_thread_count == 0 {
         return NAPI_INVALID_ARG;
     }
+    let env = unsafe { &mut *env };
+    if function.is_null() && call_js_callback.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let state = env.state();
+    let (Some(task_spawner), Some(execution_context)) = (
+        state.runtime_task_spawner.clone(),
+        state.execution_context.clone(),
+    ) else {
+        return NAPI_GENERIC_FAILURE;
+    };
+    let function_root = if function.is_null() {
+        None
+    } else {
+        let Some(function) = (unsafe { env.value(function) }) else {
+            return NAPI_INVALID_ARG;
+        };
+        if !function.is_callable() {
+            return NAPI_FUNCTION_EXPECTED;
+        }
+        Some(unsafe { env.ctx() }.persistent_root_insert(function))
+    };
+    let keep_alive = task_spawner.retain_keep_alive(RuntimeLiveness::Ref);
     let function = Box::new(NapiThreadsafeFunction {
-        library: unsafe { &*env }.library.clone(),
-        thread_count: AtomicUsize::new(initial_thread_count),
-        closing: AtomicBool::new(false),
-        finalize_data: finalize_data as usize,
-        finalize_callback: finalize_callback as usize,
-        context: context as usize,
+        inner: Arc::new(NapiThreadsafeFunctionInner {
+            state,
+            task_spawner,
+            execution_context,
+            function_root,
+            call_js_callback: call_js_callback as usize,
+            thread_count: AtomicUsize::new(initial_thread_count),
+            queued: AtomicUsize::new(0),
+            max_queue_size,
+            closing: AtomicBool::new(false),
+            finalize_data: finalize_data as usize,
+            finalize_callback: finalize_callback as usize,
+            context: context as usize,
+            keep_alive,
+        }),
     });
     unsafe { *result = Box::into_raw(function).cast() };
     NAPI_OK
@@ -2453,20 +2620,74 @@ pub unsafe extern "C" fn napi_create_threadsafe_function(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_call_threadsafe_function(
     function: napi_threadsafe_function,
-    _data: *mut c_void,
+    data: *mut c_void,
     _mode: c_int,
 ) -> napi_status {
     if function.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let function = unsafe { &*function.cast::<NapiThreadsafeFunction>() };
+    let function = unsafe { &*function.cast::<NapiThreadsafeFunction>() }
+        .inner
+        .clone();
     if function.closing.load(Ordering::Acquire) {
         return NAPI_CLOSING;
     }
-    // Delivery requires an owned runtime message that wakes and re-enters the
-    // isolate. Returning an explicit failure keeps worker threads from ever
-    // dereferencing a retained mutator-turn context.
-    NAPI_GENERIC_FAILURE
+    if function.max_queue_size != 0 {
+        let reserved =
+            function
+                .queued
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    (queued < function.max_queue_size).then_some(queued + 1)
+                });
+        if reserved.is_err() {
+            return NAPI_QUEUE_FULL;
+        }
+    } else {
+        function.queued.fetch_add(1, Ordering::AcqRel);
+    }
+    let task = NapiThreadsafeFunctionCallTask {
+        function: function.clone(),
+        data: data as usize,
+    };
+    match function.task_spawner.enqueue(task, RuntimeLiveness::Unref) {
+        Ok(()) => NAPI_OK,
+        Err(_) => {
+            function.queued.fetch_sub(1, Ordering::AcqRel);
+            if function.closing.load(Ordering::Acquire) {
+                NAPI_CLOSING
+            } else {
+                NAPI_GENERIC_FAILURE
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_acquire_threadsafe_function(
+    function: napi_threadsafe_function,
+) -> napi_status {
+    if function.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let function = &unsafe { &*function.cast::<NapiThreadsafeFunction>() }.inner;
+    if function.closing.load(Ordering::Acquire) {
+        return NAPI_CLOSING;
+    }
+    function.thread_count.fetch_add(1, Ordering::AcqRel);
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_get_threadsafe_function_context(
+    function: napi_threadsafe_function,
+    result: *mut *mut c_void,
+) -> napi_status {
+    if function.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let function = &unsafe { &*function.cast::<NapiThreadsafeFunction>() }.inner;
+    unsafe { *result = function.context as *mut c_void };
+    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
@@ -2477,7 +2698,7 @@ pub unsafe extern "C" fn napi_release_threadsafe_function(
     if function.is_null() {
         return NAPI_INVALID_ARG;
     }
-    let function_ref = unsafe { &*function.cast::<NapiThreadsafeFunction>() };
+    let function_ref = &unsafe { &*function.cast::<NapiThreadsafeFunction>() }.inner;
     if mode == 1 {
         function_ref.closing.store(true, Ordering::Release);
     }
@@ -2491,26 +2712,49 @@ pub unsafe extern "C" fn napi_release_threadsafe_function(
     }
     function_ref.closing.store(true, Ordering::Release);
     let function = unsafe { Box::from_raw(function.cast::<NapiThreadsafeFunction>()) };
-    let _keep_library_loaded = &function.library;
-    if function.finalize_callback != 0 {
-        let callback: unsafe extern "C" fn(napi_env, *mut c_void, *mut c_void) =
-            unsafe { std::mem::transmute(function.finalize_callback) };
-        unsafe {
-            callback(
-                ptr::null_mut(),
-                function.finalize_data as *mut c_void,
-                function.context as *mut c_void,
-            )
-        };
+    let task = NapiThreadsafeFunctionFinalizeTask {
+        function: function.inner.clone(),
+    };
+    match function
+        .inner
+        .task_spawner
+        .enqueue(task, RuntimeLiveness::Unref)
+    {
+        Ok(()) => NAPI_OK,
+        Err(_) => {
+            function.inner.keep_alive.close();
+            NAPI_GENERIC_FAILURE
+        }
     }
-    NAPI_OK
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn napi_unref_threadsafe_function(
     _env: napi_env,
-    _function: napi_threadsafe_function,
+    function: napi_threadsafe_function,
 ) -> napi_status {
+    if function.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    unsafe { &*function.cast::<NapiThreadsafeFunction>() }
+        .inner
+        .keep_alive
+        .unref();
+    NAPI_OK
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_ref_threadsafe_function(
+    _env: napi_env,
+    function: napi_threadsafe_function,
+) -> napi_status {
+    if function.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    unsafe { &*function.cast::<NapiThreadsafeFunction>() }
+        .inner
+        .keep_alive
+        .ref_();
     NAPI_OK
 }
 
@@ -2776,8 +3020,11 @@ pub fn keep_napi_exports() {
         napi_delete_async_work as *const (),
         napi_create_threadsafe_function as *const (),
         napi_call_threadsafe_function as *const (),
+        napi_acquire_threadsafe_function as *const (),
+        napi_get_threadsafe_function_context as *const (),
         napi_release_threadsafe_function as *const (),
         napi_unref_threadsafe_function as *const (),
+        napi_ref_threadsafe_function as *const (),
         napi_define_class as *const (),
         napi_open_handle_scope as *const (),
         napi_close_handle_scope as *const (),

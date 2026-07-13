@@ -362,7 +362,12 @@ pub(crate) fn cjs_load(
             // Park the cache before entering addon code: registration can run
             // arbitrary allocating N-API calls and relocate this young object.
             let cache = ctx.scoped_value(scope, Value::object(cache));
-            let value = loader(ctx, &resolved, &cfg.capabilities)?;
+            let value = loader(
+                ctx,
+                &resolved,
+                &cfg.capabilities,
+                cfg.runtime_task_spawner.clone(),
+            )?;
             let value = ctx.scoped_value(scope, value);
             ctx.scoped_set(scope, cache, &id, value)?;
             Ok(ctx.escape(value))
@@ -386,28 +391,28 @@ pub(crate) fn cjs_instantiate_file(
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
 
-    // Build `module` + `exports`, then IMMEDIATELY root them (and the cache) on
-    // the GC-traced module-root stack — before any further allocation
-    // (`runtime_string_value`, `make_require`'s closure, `object::set`). A
-    // collection landing in an unrooted window (e.g. under
-    // `OTTER_GC_STRESS=full`) would otherwise reclaim these young objects and
-    // reuse their offsets, leaving the bare locals dangling. The module-root
-    // stack relocates its slots in place, so after every subsequent allocation
-    // we re-fetch the live handle from the slot instead of trusting the stale
-    // `module` local.
+    // Build `module` + `exports` through handle scopes, then IMMEDIATELY root
+    // each escaped value on the GC-traced module-root stack before the next
+    // allocation. A collection landing between the two object allocations
+    // would otherwise reclaim `exports` before it reached the module-root
+    // stack. The stack relocates its slots in place, so after every subsequent
+    // allocation we re-fetch the live handle instead of trusting a stale local.
     // Root the caller's `cache` handle BEFORE allocating `exports` / `module`:
     // those allocations can scavenge and relocate `cache` (a young object), and
     // a bare local pushed afterwards would already be a stale, moved-from handle.
     let root_base = ctx.interp_mut().module_root_depth();
     let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
 
-    let exports = ctx.alloc_object().map_err(oom)?;
-    let module = ctx.alloc_object().map_err(oom)?;
-    let exports_val = Value::object(exports);
-    let module_val = Value::object(module);
-
-    let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
+    let exports_val = ctx.scope(|ctx, scope| {
+        let exports = ctx.scoped_object(scope)?;
+        Ok::<Value, NativeError>(ctx.escape(exports))
+    })?;
     let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
+    let module_val = ctx.scope(|ctx, scope| {
+        let module = ctx.scoped_object(scope)?;
+        Ok::<Value, NativeError>(ctx.escape(module))
+    })?;
+    let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
 
     // From here on, re-fetch the relocated handles after each allocation.
     let mut module = ctx

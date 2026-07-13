@@ -34,6 +34,7 @@ fn build_addon_source(root: &Path, source_text: &str) -> PathBuf {
     #[cfg(not(target_os = "macos"))]
     cc.args(["-shared", "-fPIC"]);
     let status = cc
+        .arg("-pthread")
         .arg("-O2")
         .arg("-o")
         .arg(&output)
@@ -128,6 +129,10 @@ if (addon.accountExternal() !== 4096) throw new Error('external memory');
 if (addon.inspectCollections() !== 42) throw new Error('collection predicates');
 if (addon.lifecycleHooks() !== 42) throw new Error('lifecycle hooks');
 if (addon.inspectDescriptors() !== 42) throw new Error('descriptors');
+addon.threadsafeAnswer(value => {
+  if (value !== 42) throw new Error('threadsafe: ' + value);
+  console.log('napi-tsfn-ok');
+});
 let message = '';
 try { addon.fail(); } catch (error) { message = error.message; }
 if (message !== 'native boom') throw new Error('throw: ' + message);
@@ -157,6 +162,11 @@ addon.asyncAnswer().then(value => {
     assert!(output.status.success(), "{}", diagnostic(&output));
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("napi-async-ok"),
+        "{}",
+        diagnostic(&output)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("napi-tsfn-ok"),
         "{}",
         diagnostic(&output)
     );

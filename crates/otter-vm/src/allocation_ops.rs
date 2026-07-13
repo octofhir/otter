@@ -13,6 +13,8 @@
 //! # Invariants
 //! - Inputs are decoded from executable operands.
 //! - Helpers advance the current frame PC exactly once on success.
+//! - Object-with-prototype allocation parks both object and prototype in a
+//!   handle scope before either raw handle is used after a possible scavenge.
 //!
 //! # See also
 //! - [`crate::array`]
@@ -241,31 +243,41 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let proto_value = Value::object(proto);
-        let roots = self.collect_runtime_roots();
-        let shape_root = self.shape_root();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            proto_value.trace_value_slots(visitor);
-            for value in value_roots {
-                value.trace_value_slots(visitor);
-            }
-            for slice in slice_roots {
-                for value in *slice {
+        self.with_handle_scope(|interp, scope| {
+            let proto_handle = interp.scoped_value(scope, Value::object(proto));
+            let roots = interp.collect_runtime_roots();
+            let shape_root = interp.shape_root();
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                for value in value_roots {
                     value.trace_value_slots(visitor);
                 }
-            }
-        };
-        let object = crate::object::alloc_object_with_shape_roots(
-            &mut self.gc_heap,
-            shape_root,
-            &mut external_visit,
-        )
-        .map_err(VmError::from)?;
-        crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
-        Ok(object)
+                for slice in slice_roots {
+                    for value in *slice {
+                        value.trace_value_slots(visitor);
+                    }
+                }
+            };
+            let object = crate::object::alloc_object_with_shape_roots(
+                &mut interp.gc_heap,
+                shape_root,
+                &mut external_visit,
+            )
+            .map_err(VmError::from)?;
+            let object_handle = interp.scoped_value(scope, Value::object(object));
+            let live_proto = interp
+                .escape_scoped(proto_handle)
+                .as_object()
+                .expect("object prototype handle must remain an object");
+            let live_object = interp
+                .escape_scoped(object_handle)
+                .as_object()
+                .expect("fresh object handle must remain an object");
+            crate::object::set_prototype(live_object, &mut interp.gc_heap, Some(live_proto));
+            Ok(live_object)
+        })
     }
 
     pub(crate) fn alloc_runtime_rooted_array_from_values<I>(
@@ -568,31 +580,41 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let proto_value = Value::object(proto);
-        let roots = self.collect_allocation_roots(stack);
-        let shape_root = self.shape_root();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            proto_value.trace_value_slots(visitor);
-            for value in value_roots {
-                value.trace_value_slots(visitor);
-            }
-            for slice in slice_roots {
-                for value in *slice {
+        self.with_handle_scope(|interp, scope| {
+            let proto_handle = interp.scoped_value(scope, Value::object(proto));
+            let roots = interp.collect_allocation_roots(stack);
+            let shape_root = interp.shape_root();
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+                for value in value_roots {
                     value.trace_value_slots(visitor);
                 }
-            }
-        };
-        let object = crate::object::alloc_object_with_shape_roots(
-            &mut self.gc_heap,
-            shape_root,
-            &mut external_visit,
-        )
-        .map_err(VmError::from)?;
-        crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
-        Ok(object)
+                for slice in slice_roots {
+                    for value in *slice {
+                        value.trace_value_slots(visitor);
+                    }
+                }
+            };
+            let object = crate::object::alloc_object_with_shape_roots(
+                &mut interp.gc_heap,
+                shape_root,
+                &mut external_visit,
+            )
+            .map_err(VmError::from)?;
+            let object_handle = interp.scoped_value(scope, Value::object(object));
+            let live_proto = interp
+                .escape_scoped(proto_handle)
+                .as_object()
+                .expect("object prototype handle must remain an object");
+            let live_object = interp
+                .escape_scoped(object_handle)
+                .as_object()
+                .expect("fresh object handle must remain an object");
+            crate::object::set_prototype(live_object, &mut interp.gc_heap, Some(live_proto));
+            Ok(live_object)
+        })
     }
 
     pub(crate) fn alloc_stack_rooted_array(

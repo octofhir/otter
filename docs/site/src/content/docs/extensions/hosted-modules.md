@@ -102,5 +102,71 @@ The current active slices are:
 - `otter:sql`: `openSql` / `sql`, backed by SQLite.
 - `otter:ffi`: `dlopen`, permission-checked library loading metadata.
 
+Node compatibility is opt-in through `otter_node::NodeApiBuilderExt`:
+
+```rust,ignore
+let mut runtime = otter_runtime::Runtime::builder()
+    .with_node_apis()
+    .build()?;
+```
+
+The Node crate registers both `node:` and bare CommonJS aliases. Current
+ecosystem-facing modules include `fs`, `path`, `url`, `util`, `util/types`,
+`tty`, `events`, `buffer`, `os`, `querystring`, timers, streams, crypto, and
+zlib. `node:url` supports WHATWG constructors plus file-URL conversion in
+CommonJS; `pathToFileURL` and `fileURLToPath` are also named ESM exports.
+`node:tty` deliberately exposes deterministic non-TTY streams and does not
+open or inspect host descriptors.
+
+The pure `path`, `url`, `util`, and TTY-shape helpers require no capability.
+Resource modules still enforce deny-by-default capabilities at their native
+Rust boundary (`fs` for paths and `child_process` for subprocesses).
+
+## Node-API Addons
+
+With `NodeApiBuilderExt` enabled, CommonJS resolution also supports native
+`.node` packages. Resolution walks ancestor `node_modules` directories, reads
+`package.json#main`, and probes the usual `.js`, `.cjs`, `.json`, and `.node`
+entries. A native addon requires both filesystem read permission and an FFI
+allowlist match for the resolved library; either capability remains denied by
+default.
+
+Otter implements the stable Node-API C ABI directly over its own VM. Addon
+values are persistent-root handles rather than raw moving-GC values, and
+asynchronous completion returns through the runtime microtask checkpoint. The
+CLI exports the `napi_*` symbols needed by dynamically loaded addons. This path
+has been exercised against a C ABI fixture, the current napi-rs Rollup native
+package, the current `@swc/core` native package, and the current Lightning CSS
+native package. Both symbol-based initializers and the constructor-based
+`napi_module_register` ABI used by `@parcel/watcher` are recognized. The
+validation includes
+synchronous and asynchronous Rollup parsing, hashing, a complete
+`rollup(...).generate(...)` run, and a native SWC TypeScript transform. Buffer
+views and addon-reported external memory use the VM's typed-array and heap
+accounting APIs rather than detached shadow storage. Lightning CSS synchronous
+CSS transformation is covered. `napi_env` remains stable for addon lifetime,
+and cross-thread `napi_threadsafe_function` delivery uses the runtime's owned
+task inbox: workers carry only owned data and persistent-root ids, then
+reacquire JS callbacks on the isolate thread. This path is exercised by a real
+pthread C fixture and `@parcel/watcher` snapshot, event, and unsubscribe flows.
+
+Node and napi-rs themselves are not embedded. An addon must use Node-API; a
+binary linked directly against V8 or private Node internals is a different ABI
+and cannot be made portable by a module-loader shim.
+
+## TypeScript Declarations
+
+Otter does not maintain a handwritten copy of Node's declarations.
+`otter-types` references `node` and depends on `@types/node` with an unpinned
+range so normal package installation selects the current release. Otter-only
+globals remain in Otter's declarations.
+
+Running JavaScript or TypeScript with `otter run` does not require
+`node_modules/@types/node`: declarations are static-tooling input, not runtime
+modules. Editor and type-check workflows should install or acquire the official
+package. A future no-`node_modules` type-check path should resolve the same
+official package through the package-manager cache instead of vendoring or
+forking its `.d.ts` files.
+
 `otter:kv` and `otter:sql` have module-graph tests that import the module
 specifier and execute the exported native functions.

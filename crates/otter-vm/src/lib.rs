@@ -718,6 +718,10 @@ pub struct Interpreter {
     /// pre-size the next call's scratch buffer. Repeated stringify of
     /// similarly-shaped data then never re-grows the buffer from empty.
     json_stringify_capacity_hint: usize,
+    /// Cumulative host-reported memory retained outside GC cells. The RAII
+    /// token is declared before `gc_heap` so Rust drops it first, while its
+    /// owning heap is still live.
+    external_memory_adjustment: Option<otter_gc::ExternalMemory>,
     /// Protector for the array element store fast path: flips to
     /// `true` once any accessor descriptor lands on an array-index
     /// key anywhere (e.g. `Array.prototype[1] = {set}`); array index

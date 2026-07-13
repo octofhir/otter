@@ -1,4 +1,14 @@
-//! Small `node:` module shims grouped together: `perf_hooks`, `v8`, `module`.
+//! Small `node:` module shims grouped together: `perf_hooks`, `v8`, `module`,
+//! and aliases such as `node:process` that expose an existing runtime global.
+//!
+//! # Contents
+//! - CommonJS shims for small Node namespaces.
+//! - Global aliases whose identity must match the corresponding global.
+//!
+//! # Invariants
+//! - Aliases return the already-rooted global value; they do not clone state.
+//! - Capability-bearing behavior remains in the Rust implementation that owns
+//!   the underlying global/module.
 
 use otter_runtime::CapabilitySet;
 use otter_vm::{NativeCtx, Value};
@@ -9,6 +19,7 @@ const MODULE_SHIM: &str = include_str!("module_builtin.js");
 const CLUSTER_SHIM: &str = include_str!("cluster.js");
 const INTERNAL_UTIL_SHIM: &str = include_str!("internal_util.js");
 const VM_SHIM: &str = include_str!("vm.js");
+const INTERNAL_URL_SHIM: &str = "'use strict'; module.exports = { isURL(value) { return typeof URL !== 'undefined' && value instanceof URL; } };";
 
 /// `internal/event_target` (exposed under `--expose-internals`) — re-exports the
 /// `Event` / `EventTarget` / `CustomEvent` globals (installed by the Web API
@@ -69,6 +80,12 @@ pub fn module_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Resul
     otter_runtime::run_builtin_cjs_shim(ctx, "node:module", MODULE_SHIM, &[])
 }
 
+/// `node:process` / `process` — the exact `globalThis.process` object.
+pub fn process_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
+    ctx.global_value("process")
+        .ok_or_else(|| "process global is not installed".to_string())
+}
+
 /// `internal/util` — the `--expose-internals` subset (sleep,
 /// emitExperimentalWarning, deprecate, kEmptyObject).
 pub fn internal_util_cjs_value(
@@ -81,6 +98,14 @@ pub fn internal_util_cjs_value(
 /// `node:vm` — best-effort in-realm sandbox (with-scoped Proxy).
 pub fn vm_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
     otter_runtime::run_builtin_cjs_shim(ctx, "node:vm", VM_SHIM, &[])
+}
+
+/// `internal/url` brand predicate used by Node's own URL tests.
+pub fn internal_url_cjs_value(
+    ctx: &mut NativeCtx<'_>,
+    _caps: &CapabilitySet,
+) -> Result<Value, String> {
+    otter_runtime::run_builtin_cjs_shim(ctx, "internal/url", INTERNAL_URL_SHIM, &[])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

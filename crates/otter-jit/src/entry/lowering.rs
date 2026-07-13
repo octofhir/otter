@@ -186,6 +186,15 @@ pub(crate) struct CallOperands {
     pub(crate) arguments: OperandRange,
 }
 
+/// Typed `Function.prototype.bind` prefix plus plan-owned bound-argument range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BindFunctionOperands {
+    pub(crate) dst: u16,
+    pub(crate) callee: u16,
+    pub(crate) bound_this: u16,
+    pub(crate) arguments: OperandRange,
+}
+
 /// Typed method-call prefix plus plan-owned argument-register range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MethodCallOperands {
@@ -259,6 +268,7 @@ enum LoweredOperands {
     MakeClosure(MakeClosureOperands),
     Call(CallOperands),
     MethodCall(MethodCallOperands),
+    BindFunction(BindFunctionOperands),
     Immediate(ImmediateOperands),
     Triple(TripleOperands),
     Branch(BranchOperands),
@@ -409,6 +419,13 @@ impl LoweredInstr {
             _ => Err(Unsupported::OperandShape(
                 "lowered CallMethodValue operands",
             )),
+        }
+    }
+
+    pub(crate) fn bind_function_operands(self) -> Result<BindFunctionOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::BindFunction(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered BindFunction operands")),
         }
     }
 
@@ -622,6 +639,23 @@ impl BaselinePlan {
                         dst: reg(operands, 0)?,
                         receiver: reg(operands, 1)?,
                         name: const_index(operands, 2)?,
+                        arguments,
+                    })
+                }
+                Op::BindFunction => {
+                    let count = const_index(operands, 3)? as usize;
+                    let arguments = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        4,
+                        count,
+                        "BindFunction register tail",
+                    )?;
+                    LoweredOperands::BindFunction(BindFunctionOperands {
+                        dst: reg(operands, 0)?,
+                        callee: reg(operands, 1)?,
+                        bound_this: reg(operands, 2)?,
                         arguments,
                     })
                 }

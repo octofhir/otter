@@ -186,6 +186,15 @@ pub(crate) struct CallOperands {
     pub(crate) arguments: OperandRange,
 }
 
+/// Typed global-store operands. `extra` carries the strictness flag for
+/// `StoreGlobalBinding` and the `exists` register for `StoreGlobalChecked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalStoreOperands {
+    pub(crate) value: u16,
+    pub(crate) name: u32,
+    pub(crate) extra: u32,
+}
+
 /// Typed `Function.prototype.bind` prefix plus plan-owned bound-argument range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BindFunctionOperands {
@@ -269,6 +278,7 @@ enum LoweredOperands {
     Call(CallOperands),
     MethodCall(MethodCallOperands),
     BindFunction(BindFunctionOperands),
+    GlobalStore(GlobalStoreOperands),
     Immediate(ImmediateOperands),
     Triple(TripleOperands),
     Branch(BranchOperands),
@@ -429,6 +439,13 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn global_store_operands(self) -> Result<GlobalStoreOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::GlobalStore(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered global-store operands")),
+        }
+    }
+
     pub(crate) fn immediate_operands(self) -> Result<ImmediateOperands, Unsupported> {
         match self.operands {
             LoweredOperands::Immediate(operands) => Ok(operands),
@@ -547,14 +564,27 @@ impl BaselinePlan {
                         dst: reg(operands, 0)?,
                     })
                 }
-                Op::NewObject | Op::LoadThis => LoweredOperands::Destination(DestinationOperands {
-                    dst: reg(operands, 0)?,
+                Op::NewObject | Op::LoadThis | Op::LoadGlobalThis => {
+                    LoweredOperands::Destination(DestinationOperands {
+                        dst: reg(operands, 0)?,
+                    })
+                }
+                Op::StoreGlobalBinding => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 0)?,
+                    name: const_index(operands, 1)?,
+                    extra: imm32(operands, 2)? as u32,
+                }),
+                Op::StoreGlobalChecked => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 0)?,
+                    name: const_index(operands, 1)?,
+                    extra: u32::from(reg(operands, 2)?),
                 }),
                 Op::MakeFunction
                 | Op::LoadString
                 | Op::LoadRegExp
                 | Op::LoadBigInt
                 | Op::LoadGlobalOrThrow
+                | Op::LoadGlobalOrUndefined
                 | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,

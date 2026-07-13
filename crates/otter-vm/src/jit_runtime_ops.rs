@@ -101,9 +101,16 @@ impl Interpreter {
         dst: u16,
         kind_index: u32,
     ) -> Result<(), VmError> {
+        // `kind_index` is a constant-pool index of the COMPILED function's
+        // chunk; in a multi-script runtime the ambient context may belong to
+        // a different chunk, so resolve the owner before decoding.
+        let function_id = stack[frame_index].function_id;
+        let resolved = context
+            .for_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
         let saved_pc = stack[frame_index].pc;
         let result =
-            self.run_load_builtin_error_reg(context, &mut stack[frame_index], dst, kind_index);
+            self.run_load_builtin_error_reg(&resolved, &mut stack[frame_index], dst, kind_index);
         stack[frame_index].pc = saved_pc;
         result
     }

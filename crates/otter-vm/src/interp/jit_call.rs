@@ -216,7 +216,10 @@ impl Interpreter {
             self.jit_osr_disabled.insert((fid, osr_pc));
             return Ok(None);
         };
-        let activation = jit::VmRuntimeActivation::new(self, stack, context, top_idx);
+        // See `run_compiled_frame`: the activation must name the chunk owning
+        // the OSR-entered frame, not the caller tick's chunk.
+        let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
+        let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         match code.osr_entry(activation, osr_pc) {
             // No trampoline for this header — it's not an OSR target. Disable
             // just this header and re-arm so another header can still tier up.
@@ -497,11 +500,23 @@ impl Interpreter {
         top_idx: usize,
         code: &std::sync::Arc<dyn jit::JitFunctionCode>,
     ) -> jit::JitExecOutcome {
+        // The activation context must be the chunk owning the entered frame:
+        // the caller's dispatch tick may be running a sibling script's chunk,
+        // and reentrant transitions resolve constants/atoms through the
+        // activation. Entering with the caller's chunk would decode the
+        // callee's constant-pool indices against foreign tables.
+        let fid = stack
+            .get(top_idx)
+            .map_or(u32::MAX, |frame| frame.function_id);
+        let resolved = match context.for_function(fid) {
+            Some(resolved) => resolved,
+            None => return jit::JitExecOutcome::Threw(VmError::InvalidOperand),
+        };
         // SAFETY: the raw pointers are formed from this method's own live
-        // borrows (`self`, `stack`, `context`) and are valid for the duration
+        // borrows (`self`, `stack`, `resolved`) and are valid for the duration
         // of `run_entry`; the JIT does not retain them, and we do not touch
         // those borrows again until `run_entry` returns.
-        let activation = jit::VmRuntimeActivation::new(self, stack, context, top_idx);
+        let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         code.run_entry(activation)
     }
 

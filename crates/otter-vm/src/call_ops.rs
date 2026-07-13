@@ -2733,6 +2733,32 @@ impl Interpreter {
         result
     }
 
+    /// Synchronous `Construct` re-entry for callers that already hold a live
+    /// [`otter_gc::ExtraRoots`] registration for this interpreter on the heap's
+    /// LIFO stack — the JIT construct bridge ([`Interpreter::jit_runtime_construct_in_place`]).
+    ///
+    /// Mirrors [`Self::run_callable_sync_already_rooted`]: compiled code only
+    /// runs under an enclosing `dispatch_loop` (loop-OSR / function-entry
+    /// tier-up) or under [`Self::run_construct_sync`] itself, both of which
+    /// push `ExtraRoots::new(self as &Interpreter)` before entering compiled
+    /// code. That registration traces the frame-independent runtime-global
+    /// roots, so a second push for the nested construct is a pure duplicate the
+    /// heap's `same_source` walk already skips. The stack-overflow guard
+    /// (`enter_sync_reentry`) is retained because each level still consumes
+    /// native stack.
+    pub(crate) fn run_construct_sync_already_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        target: &Value,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        self.enter_sync_reentry()?;
+        let result = self.run_construct_sync_inner(context, target, new_target, args);
+        self.leave_sync_reentry();
+        result
+    }
+
     fn run_construct_sync_inner(
         &mut self,
         context: &ExecutionContext,
@@ -2870,6 +2896,13 @@ impl Interpreter {
         {
             proto = Some(self.constructor_prototype_value("Date")?);
         }
+        // The receiver allocation roots `proto` through the ad-hoc
+        // external-visit path, which — unlike the frame-stack root walk the
+        // interpreter's `do_construct` uses — does not reliably relocate this
+        // detached local across a moving scavenge. Park it on the traced
+        // iteration-anchor stack and read the relocated handle back before it
+        // becomes the receiver's `[[Prototype]]`.
+        let proto_anchor = proto.map(|value| self.push_iteration_anchor(value) - 1);
         let receiver = {
             let mut value_roots: SmallVec<[&Value; 4]> =
                 smallvec::smallvec![&current, &effective_new_target];
@@ -2881,6 +2914,10 @@ impl Interpreter {
                 &[effective_args.as_slice()],
             )?
         };
+        if let Some(index) = proto_anchor {
+            proto = Some(self.iteration_anchor(index));
+            self.pop_iteration_anchors_to(index);
+        }
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         }

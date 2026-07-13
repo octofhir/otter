@@ -385,6 +385,8 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 pub struct JitRuntimeStats {
     /// Compiled `Op::Call` bridge invocations.
     pub runtime_calls: u64,
+    /// Compiled `Op::New` in-place construct bridge invocations.
+    pub runtime_constructs: u64,
     /// Bridge calls that stayed on the compiled-to-compiled fast path.
     pub direct_calls: u64,
     /// Bridge calls that fell back to the generic Rust callable path.

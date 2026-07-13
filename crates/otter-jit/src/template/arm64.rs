@@ -420,6 +420,23 @@ pub(super) fn compile(
                     threw,
                 );
             }
+            TemplateOp::Construct {
+                dst,
+                callee,
+                argc,
+                packed_args,
+            } => {
+                calls::emit_construct(
+                    &mut ops,
+                    transitions,
+                    dst,
+                    callee,
+                    argc,
+                    packed_args,
+                    bail,
+                    threw,
+                );
+            }
             TemplateOp::MethodCall {
                 dst,
                 receiver,

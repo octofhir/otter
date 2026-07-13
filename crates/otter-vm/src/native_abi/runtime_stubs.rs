@@ -864,6 +864,18 @@ pub const STUB_NUMBER_REM_LEAF: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusPair,
 );
 
+/// Completes one full `Op::New` construct in the VM for a New site outside
+/// the compiled subset; the constructor body may run arbitrary JS.
+pub const STUB_JIT_CONSTRUCT: RuntimeStubDescriptor = descriptor(
+    53,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -920,6 +932,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         50 => "to_boolean_leaf",
         51 => "number_rem_leaf",
         52 => "jit_load_regexp",
+        53 => "jit_construct",
         _ => "unknown_runtime_stub",
     }
 }
@@ -978,6 +991,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_TO_BOOLEAN_LEAF,
     STUB_NUMBER_REM_LEAF,
     STUB_JIT_LOAD_REGEXP,
+    STUB_JIT_CONSTRUCT,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

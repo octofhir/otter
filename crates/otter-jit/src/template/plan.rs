@@ -241,6 +241,11 @@ pub(crate) enum TemplateOp {
     Return { src: u16 },
     /// Return `undefined` as the completion value.
     ReturnUndefined,
+    /// Exact side exit at an opcode outside the compiled subset: the stamped
+    /// PC names the uncommitted instruction and the interpreter resumes
+    /// there. Code containing one is only sound to enter at a loop header
+    /// via OSR (function entry would exit immediately).
+    UnsupportedBail,
 }
 
 /// Range into a plan-owned homogeneous operand side buffer.
@@ -270,6 +275,9 @@ pub(crate) struct TemplatePlan {
     pub(crate) safepoint_records: Vec<SafepointRecord>,
     pub(crate) load_property_count: usize,
     pub(crate) store_property_count: usize,
+    /// `true` when at least one opcode outside the subset was lowered to an
+    /// exact side exit; such code serves loop OSR only.
+    pub(crate) osr_only: bool,
 }
 
 impl TemplatePlan {
@@ -288,6 +296,7 @@ impl TemplatePlan {
         let mut instructions = Vec::with_capacity(lowering.instructions.len());
         let mut register_operands: Vec<u16> = Vec::new();
         let mut index_operands: Vec<u32> = Vec::new();
+        let mut osr_only = false;
         for (meta, lowered) in view.instructions.iter().zip(&lowering.instructions) {
             let pc = lowered.instruction_pc;
             let op = match lowered.op {
@@ -568,7 +577,12 @@ impl TemplatePlan {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
                     if arguments.len() > MAX_METHOD_ARGS {
-                        return Err(Unsupported::ArgCount(arguments.len()));
+                        osr_only = true;
+                        instructions.push(TemplateInstr {
+                            pc,
+                            op: TemplateOp::UnsupportedBail,
+                        });
+                        continue;
                     }
                     TemplateOp::Call {
                         dst: operands.dst,
@@ -684,7 +698,14 @@ impl TemplatePlan {
                     src: lowered.source_operands()?.src,
                 },
                 Op::ReturnUndefined => TemplateOp::ReturnUndefined,
-                op => return Err(Unsupported::Opcode(op)),
+                // Opcode outside the subset: lower to an exact side exit at
+                // this PC instead of failing the whole compile, so a hot,
+                // fully-supported loop still tiers up via OSR. The entry path
+                // skips such code (`osr_only`).
+                _ => {
+                    osr_only = true;
+                    TemplateOp::UnsupportedBail
+                }
             };
             instructions.push(TemplateInstr { pc, op });
         }
@@ -696,6 +717,7 @@ impl TemplatePlan {
             load_property_count: lowering.load_property_count,
             store_property_count: lowering.store_property_count,
             safepoint_records: lowering.safepoint_records,
+            osr_only,
         })
     }
 }

@@ -619,7 +619,9 @@ impl BaselinePlan {
                 | Op::ToBoolean
                 | Op::LogicalNot
                 | Op::GetIterator
-                | Op::GetAsyncIterator => LoweredOperands::Unary(UnaryOperands {
+                | Op::GetAsyncIterator
+                | Op::GetPrototype
+                | Op::SetPrototype => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
@@ -747,7 +749,7 @@ impl BaselinePlan {
                         third,
                     })
                 }
-                Op::IteratorNext => {
+                Op::IteratorNext | Op::Instanceof | Op::HasProperty => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,

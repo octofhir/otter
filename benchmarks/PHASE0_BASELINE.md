@@ -810,3 +810,35 @@ failures, unchanged from the frozen baseline; 0 crashes) and
 11/11 under GC stress strides 1 through 16 with verification enabled. The
 frozen full Test262 reference remains 99.02% (51,480/53,173 excluding skips).
 Performance remains subordinate to coverage for this batch.
+
+### Phase 2 production object property-protocol completion
+
+The template tier now compiles the object property-protocol query family:
+`Instanceof`, `HasProperty` (`in`), `GetPrototype`, and `SetPrototype`. They
+share reentrant runtime stub 60. Rather than re-implement any protocol
+semantics in JIT code, the transition rebuilds the register operands and calls
+the interpreter's own Proxy-aware `drive_*_proxy` driver (which fires
+`@@hasInstance`, `has`, `getPrototypeOf`, and `setPrototypeOf` traps through
+`run_callable_sync`) and otherwise the same `run_*_regs` fast path. A committed
+protocol effect is never replayed by an exact side exit.
+
+Completing `HasProperty` from a compiled frame exposed that
+`drive_has_property_proxy` hard-required a per-site has-property IC keyed by the
+interpreter's pc; a compiled frame has no such site. The IC is a pure fast-path
+optimization, so an absent site now skips the IC and falls through to the
+`ordinary_has_property_value` spec funnel instead of raising `InvalidOperand`.
+Interpreter behavior is unchanged (its pcs always resolve a site).
+
+Template coverage is 86 of 172 active opcodes (up from 82); 86 remain
+unsupported.
+
+The focused interpreter/template OSR matrix covers `instanceof`, `in`, and
+`getPrototypeOf` over ordinary objects plus a Proxy whose `has`/`getPrototypeOf`
+trap call counts are observable; the compiled counters and every result match
+the interpreter oracle at normal GC and under `OTTER_GC_STRESS`. Targeted
+Test262 `language/expressions/instanceof` (43/43),
+`language/expressions/in` (79/79), and `built-ins/Proxy` (275/275, 36 skips)
+passed with 0 failures/crashes. The release differential corpus passed 11/11
+under GC stress strides 1 through 16 with verification enabled. The frozen full
+Test262 reference remains 99.02% (51,480/53,173 excluding skips). Performance
+remains subordinate to coverage for this batch.

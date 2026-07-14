@@ -318,6 +318,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_GLOBAL_OP,
             jit_global_op_stub as *const () as usize,
         ),
+        binding(
+            abi::STUB_JIT_OBJECT_PROTOCOL_OP,
+            jit_object_protocol_op_stub as *const () as usize,
+        ),
     ]
 }
 

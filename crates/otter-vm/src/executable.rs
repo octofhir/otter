@@ -219,6 +219,10 @@ impl CodeBlock {
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
+                    arith_feedback: crate::jit_feedback::ArithFeedback::from_bits(
+                        self.feedback_at(index)
+                            .map_or(0, crate::jit_feedback::InstructionFeedback::arith_bits),
+                    ),
                 })
                 .collect(),
             // Baked by `Interpreter::bake_inline_callees` (it holds the live

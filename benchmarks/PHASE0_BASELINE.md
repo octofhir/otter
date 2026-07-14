@@ -1015,3 +1015,19 @@ strides 1 through 16, and targeted Test262 `language/statements/class` was
 4,351/4,369 — the four failures reproduce identically under interpreter-only
 execution (tier-independent pre-existing baseline). The frozen full Test262
 reference remains 99.02%.
+
+### Phase 2 production variadic-construction completion
+
+`ArrayConstruct`, `ArrayFrom`, `ArrayOf`, and `QueueMicrotask` now compile
+through reentrant runtime stub 69. The transition reconstructs its operand list
+(prefix register + count + argument registers) from the packed argument tail and
+calls the same `run_array_static_operands`/`run_queue_microtask_operands` helper
+the interpreter dispatches; no variadic semantics are duplicated in JIT code. A
+site with more than four arguments lowers to an exact pre-effect side exit and
+serves loop OSR. Template coverage is 129 of 172 active opcodes (up from 125); 43
+remain unsupported. Interpreter/template parity holds for an
+`Array.of`/`Array.from`/`new Array`/`queueMicrotask` loop; the release
+differential corpus passed 11/11 under GC stress strides 1 through 16, and
+targeted Test262 `built-ins/Array/of` (15/16) and `built-ins/Array/from`
+(142/143) passed with 0 failures/crashes. The frozen full Test262 reference
+remains 99.02%.

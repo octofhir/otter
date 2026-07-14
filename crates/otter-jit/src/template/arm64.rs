@@ -48,6 +48,7 @@ mod super_access;
 mod transitions;
 mod value_load;
 mod values;
+mod variadic;
 
 use std::collections::BTreeMap;
 
@@ -808,6 +809,23 @@ pub(super) fn compile(
                     arg0,
                     arg1,
                     arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::VariadicOp {
+                opcode,
+                prefix,
+                argc,
+                packed_args,
+            } => {
+                variadic::emit_variadic_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    prefix,
+                    argc,
+                    packed_args,
                     bail,
                     threw,
                 );

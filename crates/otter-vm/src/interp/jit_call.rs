@@ -305,7 +305,7 @@ impl Interpreter {
         if !matches!(function.op(instr), Op::Add | Op::Sub | Op::Mul) {
             return false;
         }
-        let Some(feedback) = function.feedback_at(instr.instruction_pc as usize) else {
+        let Some(feedback) = function.feedback_recorder_at(instr.instruction_pc as usize) else {
             return false;
         };
         if !feedback.widen_arith_to_float() {

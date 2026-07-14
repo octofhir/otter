@@ -158,7 +158,7 @@ impl Interpreter {
             // Feedback is dense in the owning CodeBlock. Interpreter-only
             // execution keeps the cell untouched and pays no atomic update.
             let feedback = if jit_installed {
-                function.feedback_at(idx)
+                function.feedback_recorder_at(idx)
             } else {
                 None
             };
@@ -234,7 +234,12 @@ impl Interpreter {
                         // before the tier-up hook may consume the freshly pushed
                         // frame.
                         let callee_fid = stack[stack.len() - 1].function_id;
-                        if feedback.is_some_and(|cell| cell.record_call_target(callee_fid)) {
+                        let transition = self.record_ordinary_call_feedback(
+                            function,
+                            instr.instruction_pc,
+                            callee_fid,
+                        );
+                        if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
                         }
                         if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {

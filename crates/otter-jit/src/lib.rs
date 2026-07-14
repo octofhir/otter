@@ -1,15 +1,17 @@
-//! Baseline JIT for the Otter VM.
+//! Native JIT tiers for the Otter VM.
 //!
-//! A Sparkplug-style template macro-assembler that lowers Otter register
-//! bytecode to native machine code with **no IR, no register allocation, and no
-//! deopt**. It deletes the interpreter dispatch envelope for hot functions while
-//! reusing the interpreter's own frame array and explicit safepoint records for
-//! moving-GC rooting. Backend chosen by the
-//! `JIT_DESIGN.md` §3.2 prototype gate (dynasm-rs template assembler).
+//! The production compiler is a Sparkplug-style template macro-assembler that
+//! lowers Otter register bytecode directly to native machine code with no
+//! register allocation or deopt. Backend-independent optimizing analyses are
+//! inert until a separate compiler consumes them. Native execution reuses the
+//! interpreter's frame array and explicit safepoint records for moving-GC
+//! rooting. Backend chosen by the `JIT_DESIGN.md` §3.2 prototype gate
+//! (dynasm-rs template assembler).
 //!
 //! # Contents
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
+//! - [`ir`] — backend-independent analysis structures for optimizing compilers.
 //!
 //! # Invariants
 //! - **`unsafe` is contained here.** This crate lifts the workspace
@@ -37,6 +39,7 @@
 
 mod code;
 mod entry;
+pub mod ir;
 mod template;
 
 pub use code::CompiledCode;

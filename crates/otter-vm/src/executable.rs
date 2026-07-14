@@ -353,6 +353,12 @@ impl CodeBlock {
         self.control_flow.block_starts()
     }
 
+    /// Borrow the immutable logical control-flow tables for this function.
+    #[must_use]
+    pub fn control_flow(&self) -> crate::CodeBlockControlFlowView<'_> {
+        crate::CodeBlockControlFlowView::new(&self.control_flow)
+    }
+
     /// Sorted logical PCs targeted by backwards normal-flow edges.
     #[must_use]
     pub fn loop_headers(&self) -> &[u32] {

@@ -4,13 +4,14 @@
 //! - [`CodeBlockControlFlow`] — immutable basic-block, loop-header, and
 //!   exception-region tables built from verified schema wordcode.
 //! - [`CodeBlockExceptionRegion`] — resolved handler PCs for one `EnterTry`.
+//! - [`CodeBlockControlFlowView`] — borrowed read-only access for JIT consumers.
 //!
 //! # Invariants
 //! - Every PC is a canonical instruction index, never a serialized byte PC.
 //! - Targets are resolved once after wordcode verification; dispatch and JIT
 //!   lowering do not reinterpret relative branch or handler operands.
 //! - Tables are sorted and duplicate-free. Exception regions are keyed by the
-//!   `EnterTry` instruction PC.
+//!   `EnterTry` instruction PC and end at the matching `LeaveTry` PC.
 //!
 //! # See also
 //! - [`crate::CodeBlock`]
@@ -25,15 +26,65 @@ use otter_bytecode::{
 
 /// Resolved static handlers installed by one `EnterTry` instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CodeBlockExceptionRegion {
+pub struct CodeBlockExceptionRegion {
     /// PC of the `EnterTry` instruction owning this region.
-    pub(crate) enter_pc: u32,
+    pub enter_pc: u32,
+    /// Exclusive end of the protected body: the matching `LeaveTry` PC.
+    pub end_pc: u32,
     /// Catch entry PC, absent for `try/finally` without a catch.
-    pub(crate) catch_pc: Option<u32>,
+    pub catch_pc: Option<u32>,
     /// Finally entry PC, absent when the region has no finally clause.
-    pub(crate) finally_pc: Option<u32>,
+    pub finally_pc: Option<u32>,
     /// Register receiving the thrown value at the catch entry.
-    pub(crate) exception_register: u16,
+    pub exception_register: u16,
+}
+
+/// Borrowed access to one CodeBlock's immutable logical control-flow tables.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeBlockControlFlowView<'a> {
+    control_flow: &'a CodeBlockControlFlow,
+}
+
+impl<'a> CodeBlockControlFlowView<'a> {
+    pub(crate) const fn new(control_flow: &'a CodeBlockControlFlow) -> Self {
+        Self { control_flow }
+    }
+
+    /// Sorted logical PCs beginning basic blocks in this function.
+    #[must_use]
+    pub fn block_starts(self) -> &'a [u32] {
+        self.control_flow.block_starts()
+    }
+
+    /// Sorted logical PCs targeted by backwards normal-flow edges.
+    #[must_use]
+    pub fn loop_headers(self) -> &'a [u32] {
+        self.control_flow.loop_headers()
+    }
+
+    /// Last logical backedge PC for `header_pc`.
+    #[must_use]
+    pub fn loop_latch(self, header_pc: u32) -> Option<u32> {
+        self.control_flow.loop_latch(header_pc)
+    }
+
+    /// Exception regions in ascending `EnterTry` PC order.
+    #[must_use]
+    pub fn exception_regions(self) -> &'a [CodeBlockExceptionRegion] {
+        self.control_flow.exception_regions()
+    }
+
+    /// Region installed by the `EnterTry` at `enter_pc`.
+    #[must_use]
+    pub fn exception_region(self, enter_pc: u32) -> Option<CodeBlockExceptionRegion> {
+        self.control_flow.exception_region(enter_pc)
+    }
+
+    /// Innermost region whose protected body contains `pc`.
+    #[must_use]
+    pub fn enclosing_exception_region(self, pc: u32) -> Option<CodeBlockExceptionRegion> {
+        self.control_flow.enclosing_exception_region(pc)
+    }
 }
 
 /// Immutable logical-PC tables shared by interpreter and JIT consumers.
@@ -51,6 +102,7 @@ impl CodeBlockControlFlow {
         let mut block_starts = BTreeSet::new();
         let mut loop_latches = BTreeMap::<u32, u32>::new();
         let mut exception_regions = Vec::new();
+        let mut open_exception_regions = Vec::new();
         let instruction_count = code.len() as u32;
 
         if instruction_count != 0 {
@@ -106,10 +158,16 @@ impl CodeBlockControlFlow {
                 }
                 exception_regions.push(CodeBlockExceptionRegion {
                     enter_pc: pc,
+                    end_pc: instruction_count,
                     catch_pc,
                     finally_pc,
                     exception_register,
                 });
+                open_exception_regions.push(exception_regions.len() - 1);
+            } else if instruction.op == Op::LeaveTry
+                && let Some(region_index) = open_exception_regions.pop()
+            {
+                exception_regions[region_index].end_pc = pc;
             }
         }
 
@@ -142,6 +200,18 @@ impl CodeBlockControlFlow {
             .binary_search_by_key(&enter_pc, |region| region.enter_pc)
             .ok()
             .map(|index| self.exception_regions[index])
+    }
+
+    fn exception_regions(&self) -> &[CodeBlockExceptionRegion] {
+        &self.exception_regions
+    }
+
+    fn enclosing_exception_region(&self, pc: u32) -> Option<CodeBlockExceptionRegion> {
+        self.exception_regions
+            .iter()
+            .rev()
+            .copied()
+            .find(|region| region.enter_pc < pc && pc < region.end_pc)
     }
 }
 
@@ -217,6 +287,7 @@ mod tests {
             cfg.exception_region(0),
             Some(CodeBlockExceptionRegion {
                 enter_pc: 0,
+                end_pc: 1,
                 catch_pc: Some(2),
                 finally_pc: None,
                 exception_register: 3,
@@ -224,5 +295,43 @@ mod tests {
         );
         assert_eq!(cfg.exception_region(1), None);
         assert_eq!(cfg.block_starts(), &[0, 1, 2]);
+        assert_eq!(cfg.enclosing_exception_region(0), None);
+        assert_eq!(cfg.enclosing_exception_region(1), None);
+    }
+
+    #[test]
+    fn matches_nested_exception_region_ranges() {
+        let mut builder = FunctionCodeBuilder::new();
+        builder.push(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Imm32(6),
+                Operand::Register(0),
+            ],
+        );
+        builder.push(
+            Op::EnterTry,
+            &[
+                Operand::Imm32(3),
+                Operand::Imm32(NO_HANDLER_OFFSET),
+                Operand::Register(0),
+            ],
+        );
+        builder.push(Op::Nop, &[]);
+        builder.push(Op::LeaveTry, &[]);
+        builder.push(Op::Jump, &[Operand::Imm32(1)]);
+        builder.push(Op::Nop, &[]);
+        builder.push(Op::LeaveTry, &[]);
+        builder.push(Op::Nop, &[]);
+        builder.push(Op::EndFinally, &[]);
+        builder.push(Op::ReturnUndefined, &[]);
+        let cfg = CodeBlockControlFlow::from_verified_wordcode(&builder.finish());
+
+        assert_eq!(cfg.exception_regions[0].end_pc, 6);
+        assert_eq!(cfg.exception_regions[1].end_pc, 3);
+        assert_eq!(cfg.enclosing_exception_region(2).unwrap().enter_pc, 1);
+        assert_eq!(cfg.enclosing_exception_region(5).unwrap().enter_pc, 0);
+        assert_eq!(cfg.enclosing_exception_region(6), None);
     }
 }

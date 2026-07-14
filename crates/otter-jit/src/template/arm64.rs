@@ -32,6 +32,7 @@
 mod arith;
 mod calls;
 mod collections;
+mod delete;
 mod exceptions;
 mod functions;
 mod globals;
@@ -664,6 +665,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 protocol::emit_object_protocol_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::DeleteOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                delete::emit_delete_op(
                     &mut ops,
                     transitions,
                     opcode,

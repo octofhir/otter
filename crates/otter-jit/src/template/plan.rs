@@ -328,6 +328,17 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one `delete` (`DeleteProperty`, `DeleteElement`,
+    /// `DeleteDynamic`) through the shared reentrant delete transition. Proxy
+    /// `deleteProperty` traps fire in the VM. `arg0`/`arg1`/`arg2` name the
+    /// destination register, object register or name index, and name index or
+    /// key register per opcode.
+    DeleteOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -855,6 +866,33 @@ impl TemplatePlan {
                         opcode: lowered.op as u8,
                         arg0: u64::from(operands.dst),
                         arg1: u64::from(operands.src),
+                        arg2: 0,
+                    }
+                }
+                Op::DeleteProperty => {
+                    let operands = lowered.property_load_operands()?;
+                    TemplateOp::DeleteOp {
+                        opcode: Op::DeleteProperty as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.object),
+                        arg2: u64::from(operands.name),
+                    }
+                }
+                Op::DeleteElement => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::DeleteOp {
+                        opcode: Op::DeleteElement as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
+                    }
+                }
+                Op::DeleteDynamic => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::DeleteOp {
+                        opcode: Op::DeleteDynamic as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.constant),
                         arg2: 0,
                     }
                 }

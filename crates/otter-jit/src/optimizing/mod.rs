@@ -1,6 +1,6 @@
-//! Feedback-guided optimizing tier for reducible int32 arithmetic functions.
+//! Feedback-guided optimizing tier for reducible numeric arithmetic functions.
 //!
-//! This module compiles multi-block int32 arithmetic leaves, including
+//! This module compiles multi-block int32 and float64 arithmetic leaves, including
 //! reducible loops entered only at function entry. It runs
 //! the complete CFG, dominance, SSA, liveness, register-allocation,
 //! representation, frame-state, and deopt-lowering pipeline before the arm64
@@ -25,7 +25,8 @@
 //!   status.
 //! - Phi moves execute before a back-edge poll. Interrupt or exhausted fuel
 //!   deopts at the target header so the interpreter owns cancellation/refill.
-//! - Tagged int32 values are `(0xfffe << 48) | payload_u32`.
+//! - Tagged int32 values are `(0xfffe << 48) | payload_u32`; boxed doubles use
+//!   the VM's frozen NaN-box encoding and canonical NaN representation.
 //! - Deopt writeback is generated from the same [`DeoptTable`] published with
 //!   the code object; every interpreter register is materialized before return.
 //!
@@ -53,7 +54,7 @@ pub const OPTIMIZED_STATUS_DEOPT: u64 = crate::entry::STATUS_DEOPT;
 
 /// Two-word return of an [`OptimizedLeafEntry`].
 ///
-/// On [`OPTIMIZED_STATUS_RETURNED`], `value` is a boxed int32. On
+/// On [`OPTIMIZED_STATUS_RETURNED`], `value` is a boxed numeric value. On
 /// [`OPTIMIZED_STATUS_DEOPT`], `value` is the exact interpreter byte PC whose
 /// speculation failed.
 #[repr(C)]
@@ -86,9 +87,9 @@ pub struct OptimizedMetadata {
     pub param_count: u16,
     /// Number of writable interpreter registers reconstructed on deopt.
     pub register_count: u16,
-    /// Number of allocatable machine registers used by linear scan.
+    /// Total number of allocatable GPR and FP registers used by linear scan.
     pub machine_register_count: u8,
-    /// Spill slots forced by linear scan before deopt-location legalization.
+    /// GPR and FP spill slots forced by linear scan before deopt legalization.
     pub linear_scan_spill_slot_count: u32,
     /// Number of eight-byte stack spill slots reserved by the emitter.
     pub spill_slot_count: u32,
@@ -209,7 +210,7 @@ impl JitFunctionCode for OptimizedCode {
     }
 }
 
-/// Compile the minimal int32 optimizing subset after running every existing IR
+/// Compile the minimal numeric optimizing subset after running every existing IR
 /// analysis, or return [`Unsupported`] without producing executable code.
 #[cfg(target_arch = "aarch64")]
 pub fn compile_optimized(

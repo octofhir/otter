@@ -1,24 +1,26 @@
-//! Arm64 emission for the reducible multi-block int32 optimizing subset.
+//! Arm64 emission for the reducible multi-block numeric optimizing subset.
 //!
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
-//! - Reducible loop checks, tagged comparisons, and per-edge phi copies.
+//! - Reducible loop checks, numeric comparisons, and per-edge phi copies.
 //! - Cooperative back-edge polling with loop-header deoptimization.
-//! - Parameter tag guards, unboxed arithmetic, spills, boxing, and deopt exits.
+//! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
+//!   and deopt exits.
 //!
 //! # Invariants
-//! - Linear-scan registers `0..4` map to `x19..x22`; `x8..x12` are reserved
-//!   caller-saved scratch registers. Spill slot `n` is `[sp, #n*8]` after the
-//!   aligned spill frame is reserved.
-//! - Every used tagged parameter is checked for the `0xfffe` int32 tag before
-//!   its low 32 bits enter an allocated location.
+//! - GPR linear-scan registers `0..4` map to `x19..x22`; FP registers `0..8`
+//!   map to the AAPCS64 callee-saved `d8..d15`. `x8..x15` and `d16..d17` are
+//!   caller-saved scratch registers. GPR spill slots precede FP spill slots in
+//!   one aligned stack frame.
+//! - Every used tagged numeric parameter is checked with the VM's frozen
+//!   number-tag mask before its payload enters an unboxed operation.
 //! - `Add`/`Sub` use the arm64 signed-overflow flag and `Mul` compares its
 //!   signed 64-bit product with the sign-extended low word. Overflow deopts at
 //!   the arithmetic instruction's exact byte PC; it never silently wraps.
 //! - Every CFG edge targets a block label in reverse postorder. Sequentialized
 //!   phi moves execute only on their owning edge before its final jump.
-//! - FP allocations remain unsupported until float64 emission lands; every
-//!   emitter location boundary rejects them without changing the GPR path.
+//! - Float64 arithmetic never deopts for overflow or division by zero. NaNs
+//!   remain unordered in comparisons and are canonicalized whenever boxed.
 //! - Every backwards bytecode edge targets a dominating loop header. Its phi moves
 //!   execute before the interrupt/fuel poll so a poll exit reconstructs the
 //!   loop-header frame, and no optimized loop can bypass cooperative polling.
@@ -46,8 +48,9 @@ use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
     CompiledCode,
     entry::{
-        STATUS_DEOPT, STATUS_RETURNED, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16, STATUS_DEOPT, STATUS_RETURNED,
+        Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -67,14 +70,15 @@ const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
     fp: 8,
 };
 const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [19, 20, 21, 22];
+const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
+const FP_SCRATCH: u8 = 16;
+const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
 const MAX_SPILL_FRAME_BYTES: u32 = 4080;
 const MAX_PARAMETER_OFFSET: u32 = 32_760;
 
 #[derive(Debug, Clone, Copy)]
 struct GuardedParam {
-    value: ValueId,
-    index: u32,
     use_pc: u32,
     deopt_byte_pc: u32,
 }
@@ -83,6 +87,13 @@ struct GuardedParam {
 struct Eligibility {
     guarded_params: Vec<GuardedParam>,
     back_edges: BTreeMap<(BlockId, BlockId), u32>,
+}
+
+struct EmissionPlan<'a> {
+    reprs: &'a ReprMap,
+    allocation: &'a Allocation,
+    eligibility: &'a Eligibility,
+    deopt_table: &'a DeoptTable,
 }
 
 pub(super) fn compile(
@@ -118,7 +129,7 @@ pub(super) fn compile(
     frame_states
         .verify(&ssa, &cfg, &dom)
         .map_err(|_| Unsupported::OperandShape("optimizing frame-state verification"))?;
-    let linear_scan_spill_slot_count = allocation.spill_slot_counts.gpr;
+    let linear_scan_spill_slot_count = total_spill_slots(&allocation)?;
     let mut allocation = legalize_deopt_locations(&allocation, &frame_states)?;
     allocation
         .rebuild_edge_moves(&ssa, &cfg, &reprs)
@@ -132,9 +143,12 @@ pub(super) fn compile(
         &cfg,
         dom.reverse_postorder(),
         &ssa,
-        &allocation,
-        &eligibility,
-        deopt.table(),
+        EmissionPlan {
+            reprs: &reprs,
+            allocation: &allocation,
+            eligibility: &eligibility,
+            deopt_table: deopt.table(),
+        },
     )?;
     Ok(OptimizedCode::new(
         code,
@@ -144,9 +158,15 @@ pub(super) fn compile(
             function_id: view.code_block.id,
             param_count: view.code_block.param_count,
             register_count: view.code_block.register_count,
-            machine_register_count: allocation.register_budget.gpr,
+            machine_register_count: allocation
+                .register_budget
+                .gpr
+                .checked_add(allocation.register_budget.fp)
+                .ok_or(Unsupported::OperandShape(
+                    "optimizing machine register count overflow",
+                ))?,
             linear_scan_spill_slot_count,
-            spill_slot_count: allocation.spill_slot_counts.gpr,
+            spill_slot_count: total_spill_slots(&allocation)?,
         },
     ))
 }
@@ -230,19 +250,7 @@ fn check_eligibility(
             }
         }
     }
-    for value in &ssa.values {
-        if matches!(value.def, ValueDef::Phi { .. })
-            && reprs.representation(value.id) == Representation::Float64
-        {
-            return Err(Unsupported::OperandShape(
-                "optimizing subset rejects float64 phis",
-            ));
-        }
-    }
-
-    let spill_bytes = allocation
-        .spill_slot_counts
-        .gpr
+    let spill_bytes = total_spill_slots(allocation)?
         .checked_mul(STACK_SLOT_BYTES)
         .and_then(|bytes| bytes.checked_add(15))
         .map(|bytes| bytes & !15)
@@ -259,24 +267,41 @@ fn check_eligibility(
         for instruction in &ssa.blocks[block.0 as usize].instrs {
             match instruction.op {
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
-                Op::LoadNumber => {
-                    check_constant_result(instruction, reprs)?;
-                    exact_load_number(view, instruction.pc)?;
-                }
+                Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
                 Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
                 Op::Add | Op::Sub | Op::Mul => {
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("arithmetic result"))?;
-                    if reprs.representation(result) != Representation::Int32
+                    let result_repr = reprs.representation(result);
+                    if !matches!(result_repr, Representation::Int32 | Representation::Float64)
                         || instruction.inputs.len() != 2
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
-                    check_int32_inputs(
+                    check_numeric_inputs(
                         instruction,
                         ssa,
                         reprs,
+                        result_repr,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
+                Op::Div => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("division result"))?;
+                    if reprs.representation(result) != Representation::Float64
+                        || instruction.inputs.len() != 2
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_numeric_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        Representation::Float64,
                         &mut guarded_uses,
                         &mut allowed_conversions,
                     )?;
@@ -295,10 +320,18 @@ fn check_eligibility(
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
-                    check_int32_inputs(
+                    let input_repr = if view.feedback_at(instruction.pc).is_int32_only() {
+                        Representation::Int32
+                    } else if view.feedback_at(instruction.pc).is_numeric_only() {
+                        Representation::Float64
+                    } else {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    };
+                    check_numeric_inputs(
                         instruction,
                         ssa,
                         reprs,
+                        input_repr,
                         &mut guarded_uses,
                         &mut allowed_conversions,
                     )?;
@@ -324,9 +357,12 @@ fn check_eligibility(
                         return Err(Unsupported::OperandShape("optimizing return shape"));
                     }
                     let returned = instruction.inputs[0];
-                    if reprs.representation(returned) != Representation::Int32 {
-                        return Err(Unsupported::Opcode(instruction.op));
-                    }
+                    let returned_repr = reprs.representation(returned);
+                    let expected_conversion = match returned_repr {
+                        Representation::Int32 => ConversionKind::BoxInt32,
+                        Representation::Float64 => ConversionKind::BoxFloat64,
+                        Representation::Tagged => return Err(Unsupported::Opcode(instruction.op)),
+                    };
                     let conversion = reprs.conversions().iter().find(|conversion| {
                         conversion.at_pc == instruction.pc && conversion.operand_index == 0
                     });
@@ -334,11 +370,11 @@ fn check_eligibility(
                         conversion,
                         Some(conversion)
                             if conversion.value == returned
-                                && conversion.kind == ConversionKind::BoxInt32
+                                && conversion.kind == expected_conversion
                                 && !conversion.may_deopt
                     ) {
                         return Err(Unsupported::OperandShape(
-                            "optimizing return requires int32 boxing",
+                            "optimizing return requires numeric boxing",
                         ));
                     }
                     allowed_conversions.insert((instruction.pc, 0));
@@ -357,7 +393,7 @@ fn check_eligibility(
     }
 
     let mut guarded_params = Vec::with_capacity(guarded_uses.len());
-    for ((use_pc, value), index) in guarded_uses {
+    for ((use_pc, _value), index) in guarded_uses {
         let offset = index
             .checked_mul(STACK_SLOT_BYTES)
             .ok_or(Unsupported::OperandShape("optimizing parameter offset"))?;
@@ -367,50 +403,62 @@ fn check_eligibility(
             ));
         }
         guarded_params.push(GuardedParam {
-            value,
-            index,
             use_pc,
             deopt_byte_pc: byte_pc(view, use_pc)?,
         });
     }
-    guarded_params.sort_by_key(|param| (param.use_pc, param.index, param.value));
+    guarded_params.sort_by_key(|param| param.use_pc);
+    guarded_params.dedup_by_key(|param| param.use_pc);
     Ok(Eligibility {
         guarded_params,
         back_edges,
     })
 }
 
-fn check_int32_inputs(
+fn check_numeric_inputs(
     instruction: &SsaInstr,
     ssa: &SsaFunction,
     reprs: &ReprMap,
+    required: Representation,
     guarded_uses: &mut BTreeMap<(u32, ValueId), u32>,
     allowed_conversions: &mut BTreeSet<(u32, usize)>,
 ) -> Result<(), Unsupported> {
     for (operand_index, &input) in instruction.inputs.iter().enumerate() {
-        match reprs.representation(input) {
-            Representation::Int32 => {}
-            Representation::Tagged => {
-                let ValueDef::Param { index, .. } = ssa.values[input.0 as usize].def else {
-                    return Err(Unsupported::Opcode(instruction.op));
-                };
-                let conversion = reprs.conversions().iter().find(|conversion| {
-                    conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
-                });
-                if !matches!(
-                    conversion,
-                    Some(conversion)
-                        if conversion.value == input
-                            && conversion.kind == ConversionKind::CheckedTaggedToInt32
-                            && conversion.may_deopt
-                ) {
-                    return Err(Unsupported::Opcode(instruction.op));
-                }
-                guarded_uses.insert((instruction.pc, input), index);
-                allowed_conversions.insert((instruction.pc, operand_index));
-            }
-            Representation::Float64 => return Err(Unsupported::Opcode(instruction.op)),
+        let actual = reprs.representation(input);
+        if actual == required {
+            continue;
         }
+        let expected_kind = match (actual, required) {
+            (Representation::Int32, Representation::Float64) => ConversionKind::Int32ToFloat64,
+            (Representation::Tagged, Representation::Int32) => ConversionKind::CheckedTaggedToInt32,
+            (Representation::Tagged, Representation::Float64) => {
+                ConversionKind::CheckedTaggedToFloat64
+            }
+            _ => return Err(Unsupported::Opcode(instruction.op)),
+        };
+        let conversion = reprs.conversions().iter().find(|conversion| {
+            conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+        });
+        let may_deopt = matches!(
+            expected_kind,
+            ConversionKind::CheckedTaggedToInt32 | ConversionKind::CheckedTaggedToFloat64
+        );
+        if !matches!(
+            conversion,
+            Some(conversion)
+                if conversion.value == input
+                    && conversion.kind == expected_kind
+                    && conversion.may_deopt == may_deopt
+        ) {
+            return Err(Unsupported::Opcode(instruction.op));
+        }
+        if may_deopt {
+            let ValueDef::Param { index, .. } = ssa.values[input.0 as usize].def else {
+                return Err(Unsupported::Opcode(instruction.op));
+            };
+            guarded_uses.insert((instruction.pc, input), index);
+        }
+        allowed_conversions.insert((instruction.pc, operand_index));
     }
     Ok(())
 }
@@ -442,6 +490,26 @@ fn check_constant_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), 
     Ok(())
 }
 
+fn check_number_constant_result(
+    view: &JitCompileSnapshot,
+    instruction: &SsaInstr,
+    reprs: &ReprMap,
+) -> Result<(), Unsupported> {
+    let result = instruction.result.ok_or(Unsupported::OperandShape(
+        "optimizing number constant result",
+    ))?;
+    let number = load_number(view, instruction.pc)?;
+    let expected = if is_exact_i32(number) {
+        Representation::Int32
+    } else {
+        Representation::Float64
+    };
+    if !instruction.inputs.is_empty() || reprs.representation(result) != expected {
+        return Err(Unsupported::Opcode(instruction.op));
+    }
+    Ok(())
+}
+
 fn check_boolean_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), Unsupported> {
     let result = instruction
         .result
@@ -452,21 +520,19 @@ fn check_boolean_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), U
     Ok(())
 }
 
-fn exact_load_number(view: &JitCompileSnapshot, pc: u32) -> Result<i32, Unsupported> {
-    let number = view
-        .instructions
+fn load_number(view: &JitCompileSnapshot, pc: u32) -> Result<f64, Unsupported> {
+    view.instructions
         .get(pc as usize)
         .and_then(|instruction| instruction.load_number)
-        .ok_or(Unsupported::OperandShape("optimizing LoadNumber metadata"))?;
-    if !number.is_finite()
-        || (number == 0.0 && number.is_sign_negative())
-        || number < f64::from(i32::MIN)
-        || number > f64::from(i32::MAX)
-        || number != f64::from(number as i32)
-    {
-        return Err(Unsupported::Opcode(Op::LoadNumber));
-    }
-    Ok(number as i32)
+        .ok_or(Unsupported::OperandShape("optimizing LoadNumber metadata"))
+}
+
+fn is_exact_i32(number: f64) -> bool {
+    number.is_finite()
+        && !(number == 0.0 && number.is_sign_negative())
+        && number >= f64::from(i32::MIN)
+        && number <= f64::from(i32::MAX)
+        && number == f64::from(number as i32)
 }
 
 fn byte_pc(view: &JitCompileSnapshot, pc: u32) -> Result<u32, Unsupported> {
@@ -481,11 +547,15 @@ fn emit(
     cfg: &ControlFlowGraph,
     rpo: &[BlockId],
     ssa: &SsaFunction,
-    allocation: &Allocation,
-    eligibility: &Eligibility,
-    deopt_table: &DeoptTable,
+    plan: EmissionPlan<'_>,
 ) -> Result<CompiledCode, Unsupported> {
-    let spill_frame_bytes = aligned_spill_bytes(allocation.spill_slot_counts.gpr)?;
+    let EmissionPlan {
+        reprs,
+        allocation,
+        eligibility,
+        deopt_table,
+    } = plan;
+    let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
     let mut deopt_exits = Vec::<(DynamicLabel, u32)>::new();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
@@ -514,22 +584,15 @@ fn emit(
         let label = block_labels[block_id.0 as usize];
         dynasm!(ops ; .arch aarch64 ; =>label);
         for instruction in &ssa.blocks[block_id.0 as usize].instrs {
-            for param in eligibility
+            let guard_deopt = eligibility
                 .guarded_params
                 .iter()
-                .filter(|param| param.use_pc == instruction.pc)
-            {
-                let deopt = ops.new_dynamic_label();
-                emit_load_tagged_location(&mut ops, allocation.location(param.value), 9)?;
-                dynasm!(ops
-                    ; .arch aarch64
-                    ; lsr x10, x9, #48
-                    ; movz x11, #0xfffe
-                    ; cmp x10, x11
-                    ; b.ne =>deopt
-                );
-                deopt_exits.push((deopt, param.deopt_byte_pc));
-            }
+                .find(|param| param.use_pc == instruction.pc)
+                .map(|param| {
+                    let label = ops.new_dynamic_label();
+                    deopt_exits.push((label, param.deopt_byte_pc));
+                    label
+                });
             match instruction.op {
                 Op::LoadInt32 => {
                     let value = load_int32(view, instruction.pc)?;
@@ -542,14 +605,25 @@ fn emit(
                     )?;
                 }
                 Op::LoadNumber => {
-                    let value = exact_load_number(view, instruction.pc)?;
-                    emit_load_i32(&mut ops, 9, value);
-                    emit_store_location(
-                        &mut ops,
-                        allocation
-                            .location(instruction.result.expect("eligibility checked result")),
-                        9,
-                    )?;
+                    let result = instruction.result.expect("eligibility checked result");
+                    let value = load_number(view, instruction.pc)?;
+                    match reprs.representation(result) {
+                        Representation::Int32 => {
+                            emit_load_i32(&mut ops, 9, value as i32);
+                            emit_store_location(&mut ops, allocation.location(result), 9)?;
+                        }
+                        Representation::Float64 => {
+                            emit_load_u64(&mut ops, 9, value.to_bits());
+                            dynasm!(ops ; .arch aarch64 ; fmov D(FP_SCRATCH), x9);
+                            emit_store_fp_location(
+                                &mut ops,
+                                allocation,
+                                allocation.location(result),
+                                FP_SCRATCH,
+                            )?;
+                        }
+                        Representation::Tagged => unreachable!("eligibility checked number"),
+                    }
                 }
                 Op::LoadTrue | Op::LoadFalse => {
                     let value = if instruction.op == Op::LoadTrue {
@@ -565,37 +639,99 @@ fn emit(
                         9,
                     )?;
                 }
-                Op::Add | Op::Sub | Op::Mul => {
-                    emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
-                    emit_load_location(&mut ops, allocation.location(instruction.inputs[1]), 10)?;
-                    let deopt = ops.new_dynamic_label();
-                    match instruction.op {
-                        Op::Add => dynasm!(ops
-                            ; .arch aarch64
-                            ; adds w11, w9, w10
-                            ; b.vs =>deopt
-                        ),
-                        Op::Sub => dynasm!(ops
-                            ; .arch aarch64
-                            ; subs w11, w9, w10
-                            ; b.vs =>deopt
-                        ),
-                        Op::Mul => dynasm!(ops
-                            ; .arch aarch64
-                            ; smull x11, w9, w10
-                            ; sxtw x12, w11
-                            ; cmp x11, x12
-                            ; b.ne =>deopt
-                        ),
-                        _ => unreachable!(),
+                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                    let result = instruction.result.expect("eligibility checked result");
+                    match reprs.representation(result) {
+                        Representation::Int32 => {
+                            emit_load_int_operand(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                0,
+                                9,
+                                guard_deopt,
+                            )?;
+                            emit_load_int_operand(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                1,
+                                10,
+                                guard_deopt,
+                            )?;
+                            let deopt = ops.new_dynamic_label();
+                            match instruction.op {
+                                Op::Add => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; adds w11, w9, w10
+                                    ; b.vs =>deopt
+                                ),
+                                Op::Sub => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; subs w11, w9, w10
+                                    ; b.vs =>deopt
+                                ),
+                                Op::Mul => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; smull x11, w9, w10
+                                    ; sxtw x12, w11
+                                    ; cmp x11, x12
+                                    ; b.ne =>deopt
+                                ),
+                                _ => unreachable!("int32 division is ineligible"),
+                            }
+                            emit_store_location(&mut ops, allocation.location(result), 11)?;
+                            deopt_exits.push((deopt, byte_pc(view, instruction.pc)?));
+                        }
+                        Representation::Float64 => {
+                            emit_load_float_operand(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                0,
+                                FP_SCRATCH,
+                                guard_deopt,
+                            )?;
+                            emit_load_float_operand(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                1,
+                                FP_SCRATCH_2,
+                                guard_deopt,
+                            )?;
+                            match instruction.op {
+                                Op::Add => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; fadd D(FP_SCRATCH), D(FP_SCRATCH), D(FP_SCRATCH_2)
+                                ),
+                                Op::Sub => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; fsub D(FP_SCRATCH), D(FP_SCRATCH), D(FP_SCRATCH_2)
+                                ),
+                                Op::Mul => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; fmul D(FP_SCRATCH), D(FP_SCRATCH), D(FP_SCRATCH_2)
+                                ),
+                                Op::Div => dynasm!(ops
+                                    ; .arch aarch64
+                                    ; fdiv D(FP_SCRATCH), D(FP_SCRATCH), D(FP_SCRATCH_2)
+                                ),
+                                _ => unreachable!(),
+                            }
+                            emit_store_fp_location(
+                                &mut ops,
+                                allocation,
+                                allocation.location(result),
+                                FP_SCRATCH,
+                            )?;
+                        }
+                        Representation::Tagged => unreachable!("eligibility checked arithmetic"),
                     }
-                    emit_store_location(
-                        &mut ops,
-                        allocation
-                            .location(instruction.result.expect("eligibility checked result")),
-                        11,
-                    )?;
-                    deopt_exits.push((deopt, byte_pc(view, instruction.pc)?));
                 }
                 Op::LessThan
                 | Op::LessEq
@@ -603,9 +739,47 @@ fn emit(
                 | Op::GreaterEq
                 | Op::Equal
                 | Op::NotEqual => {
-                    emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
-                    emit_load_location(&mut ops, allocation.location(instruction.inputs[1]), 10)?;
-                    emit_comparison(&mut ops, instruction.op);
+                    if view.feedback_at(instruction.pc).is_int32_only() {
+                        emit_load_int_operand(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            0,
+                            9,
+                            guard_deopt,
+                        )?;
+                        emit_load_int_operand(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            1,
+                            10,
+                            guard_deopt,
+                        )?;
+                        emit_int_comparison(&mut ops, instruction.op);
+                    } else {
+                        emit_load_float_operand(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            0,
+                            FP_SCRATCH,
+                            guard_deopt,
+                        )?;
+                        emit_load_float_operand(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            1,
+                            FP_SCRATCH_2,
+                            guard_deopt,
+                        )?;
+                        emit_float_comparison(&mut ops, instruction.op);
+                    }
                     emit_store_tagged_location(
                         &mut ops,
                         allocation
@@ -664,11 +838,26 @@ fn emit(
                     )?;
                 }
                 Op::Return | Op::ReturnValue => {
-                    emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
+                    let returned = instruction.inputs[0];
+                    match reprs.representation(returned) {
+                        Representation::Int32 => {
+                            emit_load_location(&mut ops, allocation.location(returned), 9)?;
+                            emit_box_int32(&mut ops, 9, 10);
+                        }
+                        Representation::Float64 => {
+                            emit_load_fp_location(
+                                &mut ops,
+                                allocation,
+                                allocation.location(returned),
+                                FP_SCRATCH,
+                            )?;
+                            emit_box_double(&mut ops, FP_SCRATCH, 9);
+                        }
+                        Representation::Tagged => unreachable!("eligibility checked return"),
+                    }
                     dynasm!(ops
                         ; .arch aarch64
-                        ; movz x10, #0xfffe, lsl #48
-                        ; orr x0, x10, x9
+                        ; mov x0, x9
                         ; movz x1, STATUS_RETURNED as u32
                     );
                     emit_epilogue(&mut ops, spill_frame_bytes);
@@ -698,7 +887,7 @@ fn emit(
             .ok_or(Unsupported::OperandShape(
                 "optimizing deopt exit missing frame state",
             ))?;
-        emit_deopt_writeback(&mut ops, frame_state)?;
+        emit_deopt_writeback(&mut ops, allocation, frame_state)?;
         emit_load_u32(&mut ops, 0, deopt_byte_pc);
         dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_DEOPT as u32);
         emit_epilogue(&mut ops, spill_frame_bytes);
@@ -721,7 +910,11 @@ fn emit_cfg_edge(
     predecessor: BlockId,
     target: BlockId,
 ) -> Result<(), Unsupported> {
-    emit_edge_moves(ops, edge_moves(allocation, predecessor, target)?)?;
+    emit_edge_moves(
+        ops,
+        allocation,
+        edge_moves(allocation, predecessor, target)?,
+    )?;
     if let Some(&header_byte_pc) = eligibility.back_edges.get(&(predecessor, target)) {
         let deopt = ops.new_dynamic_label();
         emit_backedge_poll(ops, deopt);
@@ -757,11 +950,33 @@ fn emit_backedge_poll(ops: &mut Assembler, deopt: DynamicLabel) {
     );
 }
 
-fn emit_comparison(ops: &mut Assembler, op: Op) {
+fn emit_int_comparison(ops: &mut Assembler, op: Op) {
     dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
     match op {
         Op::LessThan => dynasm!(ops ; .arch aarch64 ; cset w11, lt),
         Op::LessEq => dynasm!(ops ; .arch aarch64 ; cset w11, le),
+        Op::GreaterThan => dynasm!(ops ; .arch aarch64 ; cset w11, gt),
+        Op::GreaterEq => dynasm!(ops ; .arch aarch64 ; cset w11, ge),
+        Op::Equal => dynasm!(ops ; .arch aarch64 ; cset w11, eq),
+        Op::NotEqual => dynasm!(ops ; .arch aarch64 ; cset w11, ne),
+        _ => unreachable!("eligibility checked comparison"),
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz w12, VALUE_FALSE_LOW
+        ; add w11, w11, w12
+    );
+}
+
+/// Materialize a tagged boolean for an IEEE-754 comparison. AArch64's
+/// unordered `fcmp` flags make `mi`/`ls` the relational conditions that stay
+/// false for NaN; `eq` is likewise false, while `ne` is true as JavaScript
+/// requires for numeric inequality.
+fn emit_float_comparison(ops: &mut Assembler, op: Op) {
+    dynasm!(ops ; .arch aarch64 ; fcmp D(FP_SCRATCH), D(FP_SCRATCH_2));
+    match op {
+        Op::LessThan => dynasm!(ops ; .arch aarch64 ; cset w11, mi),
+        Op::LessEq => dynasm!(ops ; .arch aarch64 ; cset w11, ls),
         Op::GreaterThan => dynasm!(ops ; .arch aarch64 ; cset w11, gt),
         Op::GreaterEq => dynasm!(ops ; .arch aarch64 ; cset w11, ge),
         Op::Equal => dynasm!(ops ; .arch aarch64 ; cset w11, eq),
@@ -789,27 +1004,35 @@ fn edge_moves(
         ))
 }
 
-fn emit_edge_moves(ops: &mut Assembler, edge: &EdgeMoves) -> Result<(), Unsupported> {
+fn emit_edge_moves(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    edge: &EdgeMoves,
+) -> Result<(), Unsupported> {
     for &movement in &edge.moves {
-        emit_move(ops, movement)?;
+        emit_move(ops, allocation, movement)?;
     }
     Ok(())
 }
 
-fn emit_move(ops: &mut Assembler, movement: Move) -> Result<(), Unsupported> {
+fn emit_move(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    movement: Move,
+) -> Result<(), Unsupported> {
     match (movement.src, movement.dst) {
         (Location::Register(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
-            let src = move_register(src)?;
-            let dst = move_register(dst)?;
+            let src = gpr_move_register(src)?;
+            let dst = gpr_move_register(dst)?;
             dynasm!(ops ; .arch aarch64 ; mov X(dst), X(src));
         }
         (Location::Register(RegClass::Gpr, src), Location::Spill(RegClass::Gpr, dst)) => {
-            let src = move_register(src)?;
+            let src = gpr_move_register(src)?;
             let offset = spill_offset(dst)?;
             dynasm!(ops ; .arch aarch64 ; str X(src), [sp, offset]);
         }
         (Location::Spill(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
-            let dst = move_register(dst)?;
+            let dst = gpr_move_register(dst)?;
             let offset = spill_offset(src)?;
             dynasm!(ops ; .arch aarch64 ; ldr X(dst), [sp, offset]);
         }
@@ -822,12 +1045,36 @@ fn emit_move(ops: &mut Assembler, movement: Move) -> Result<(), Unsupported> {
                 ; str x9, [sp, dst_offset]
             );
         }
-        _ => return Err(Unsupported::OperandShape("optimizing FP phi move")),
+        (Location::Register(RegClass::Fp, src), Location::Register(RegClass::Fp, dst)) => {
+            let src = fp_move_register(src)?;
+            let dst = fp_move_register(dst)?;
+            dynasm!(ops ; .arch aarch64 ; fmov D(dst), D(src));
+        }
+        (Location::Register(RegClass::Fp, src), Location::Spill(RegClass::Fp, dst)) => {
+            let src = fp_move_register(src)?;
+            let offset = fp_spill_offset(allocation, dst)?;
+            dynasm!(ops ; .arch aarch64 ; str D(src), [sp, offset]);
+        }
+        (Location::Spill(RegClass::Fp, src), Location::Register(RegClass::Fp, dst)) => {
+            let dst = fp_move_register(dst)?;
+            let offset = fp_spill_offset(allocation, src)?;
+            dynasm!(ops ; .arch aarch64 ; ldr D(dst), [sp, offset]);
+        }
+        (Location::Spill(RegClass::Fp, src), Location::Spill(RegClass::Fp, dst)) => {
+            let src_offset = fp_spill_offset(allocation, src)?;
+            let dst_offset = fp_spill_offset(allocation, dst)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr D(FP_SCRATCH), [sp, src_offset]
+                ; str D(FP_SCRATCH), [sp, dst_offset]
+            );
+        }
+        _ => return Err(Unsupported::OperandShape("optimizing cross-class phi move")),
     }
     Ok(())
 }
 
-fn move_register(register: u8) -> Result<u8, Unsupported> {
+fn gpr_move_register(register: u8) -> Result<u8, Unsupported> {
     if register == ALLOCATABLE_REGISTER_COUNT {
         Ok(12)
     } else {
@@ -836,6 +1083,19 @@ fn move_register(register: u8) -> Result<u8, Unsupported> {
             .copied()
             .ok_or(Unsupported::OperandShape(
                 "optimizing phi move register mapping",
+            ))
+    }
+}
+
+fn fp_move_register(register: u8) -> Result<u8, Unsupported> {
+    if register == REGISTER_BUDGET.fp {
+        Ok(FP_SCRATCH)
+    } else {
+        FP_REGISTERS
+            .get(register as usize)
+            .copied()
+            .ok_or(Unsupported::OperandShape(
+                "optimizing FP phi move register mapping",
             ))
     }
 }
@@ -850,22 +1110,38 @@ fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
     }
 }
 
-fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result<(), Unsupported> {
+fn emit_deopt_writeback(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    frame_state: &FrameState,
+) -> Result<(), Unsupported> {
     for (register, slot) in frame_state.slots.iter().enumerate() {
-        if slot.repr == DeoptRepr::Float64 {
-            return Err(Unsupported::OperandShape("optimizing FP deopt writeback"));
-        }
         match slot.location {
-            DeoptLocation::Register(register) => {
-                let physical = VALUE_REGISTERS.get(register as usize).copied().ok_or(
-                    Unsupported::OperandShape("optimizing deopt register mapping"),
-                )?;
-                match slot.repr {
-                    DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; mov w9, W(physical)),
-                    DeoptRepr::Tagged => dynasm!(ops ; .arch aarch64 ; mov x9, X(physical)),
-                    DeoptRepr::Float64 => unreachable!("rejected above"),
+            DeoptLocation::Register(machine_register) => match slot.repr {
+                DeoptRepr::Int32 | DeoptRepr::Tagged => {
+                    let physical = VALUE_REGISTERS
+                        .get(machine_register as usize)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape("optimizing deopt GPR mapping"))?;
+                    if slot.repr == DeoptRepr::Int32 {
+                        dynasm!(ops ; .arch aarch64 ; mov w9, W(physical));
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; mov x9, X(physical));
+                    }
                 }
-            }
+                DeoptRepr::Float64 => {
+                    let fp_index = machine_register
+                        .checked_sub(u16::from(allocation.register_budget.gpr))
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing deopt FP register class",
+                        ))?;
+                    let physical = FP_REGISTERS
+                        .get(fp_index as usize)
+                        .copied()
+                        .ok_or(Unsupported::OperandShape("optimizing deopt FP mapping"))?;
+                    dynasm!(ops ; .arch aarch64 ; fmov D(FP_SCRATCH), D(physical));
+                }
+            },
             DeoptLocation::StackSlot(offset) => {
                 let offset = u32::try_from(offset).map_err(|_| {
                     Unsupported::OperandShape("optimizing negative deopt spill offset")
@@ -873,8 +1149,15 @@ fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result
                 match slot.repr {
                     DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; ldr w9, [sp, offset]),
                     DeoptRepr::Tagged => dynasm!(ops ; .arch aarch64 ; ldr x9, [sp, offset]),
-                    DeoptRepr::Float64 => unreachable!("rejected above"),
+                    DeoptRepr::Float64 => {
+                        dynasm!(ops ; .arch aarch64 ; ldr D(FP_SCRATCH), [sp, offset]);
+                    }
                 }
+            }
+            DeoptLocation::Constant(_) if slot.repr == DeoptRepr::Float64 => {
+                return Err(Unsupported::OperandShape(
+                    "optimizing float64 deopt constant",
+                ));
             }
             DeoptLocation::Constant(_) => {
                 emit_load_u32(ops, 9, otter_vm::Value::undefined().to_bits() as u32);
@@ -884,10 +1167,10 @@ fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result
             DeoptRepr::Tagged => {}
             DeoptRepr::Int32 => dynasm!(ops
                 ; .arch aarch64
-                ; movz x10, #0xfffe, lsl #48
+                ; movz x10, NUMBER_TAG_HI16, lsl #48
                 ; orr x9, x10, x9
             ),
-            DeoptRepr::Float64 => unreachable!("rejected above"),
+            DeoptRepr::Float64 => emit_box_double(ops, FP_SCRATCH, 9),
         }
         emit_store_frame_register(ops, register as u32, 9)?;
     }
@@ -924,6 +1207,16 @@ fn load_int32(view: &JitCompileSnapshot, pc: u32) -> Result<i32, Unsupported> {
     }
 }
 
+fn total_spill_slots(allocation: &Allocation) -> Result<u32, Unsupported> {
+    allocation
+        .spill_slot_counts
+        .gpr
+        .checked_add(allocation.spill_slot_counts.fp)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing total spill slot overflow",
+        ))
+}
+
 fn aligned_spill_bytes(spill_slot_count: u32) -> Result<u32, Unsupported> {
     let bytes = spill_slot_count
         .checked_mul(STACK_SLOT_BYTES)
@@ -941,6 +1234,181 @@ fn aligned_spill_bytes(spill_slot_count: u32) -> Result<u32, Unsupported> {
 fn spill_offset(slot: u32) -> Result<u32, Unsupported> {
     slot.checked_mul(STACK_SLOT_BYTES)
         .ok_or(Unsupported::OperandShape("optimizing spill offset"))
+}
+
+fn fp_spill_offset(allocation: &Allocation, slot: u32) -> Result<u32, Unsupported> {
+    let unified = allocation
+        .spill_slot_counts
+        .gpr
+        .checked_add(slot)
+        .ok_or(Unsupported::OperandShape("optimizing FP spill offset"))?;
+    spill_offset(unified)
+}
+
+fn conversion_kind_at(
+    reprs: &ReprMap,
+    instruction: &SsaInstr,
+    operand_index: usize,
+) -> Option<ConversionKind> {
+    reprs
+        .conversions()
+        .iter()
+        .find(|conversion| {
+            conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+        })
+        .map(|conversion| conversion.kind)
+}
+
+fn emit_load_int_operand(
+    ops: &mut Assembler,
+    reprs: &ReprMap,
+    allocation: &Allocation,
+    instruction: &SsaInstr,
+    operand_index: usize,
+    scratch: u8,
+    deopt: Option<DynamicLabel>,
+) -> Result<(), Unsupported> {
+    let input = instruction.inputs[operand_index];
+    match reprs.representation(input) {
+        Representation::Int32 => emit_load_location(ops, allocation.location(input), scratch),
+        Representation::Tagged
+            if conversion_kind_at(reprs, instruction, operand_index)
+                == Some(ConversionKind::CheckedTaggedToInt32) =>
+        {
+            let deopt = deopt.ok_or(Unsupported::OperandShape(
+                "optimizing int32 guard missing deopt exit",
+            ))?;
+            emit_load_tagged_location(ops, allocation.location(input), scratch)?;
+            emit_guard_int32(ops, scratch, deopt);
+            Ok(())
+        }
+        Representation::Float64 | Representation::Tagged => Err(Unsupported::OperandShape(
+            "optimizing int32 operand conversion",
+        )),
+    }
+}
+
+fn emit_load_float_operand(
+    ops: &mut Assembler,
+    reprs: &ReprMap,
+    allocation: &Allocation,
+    instruction: &SsaInstr,
+    operand_index: usize,
+    scratch: u8,
+    deopt: Option<DynamicLabel>,
+) -> Result<(), Unsupported> {
+    let input = instruction.inputs[operand_index];
+    match reprs.representation(input) {
+        Representation::Float64 => {
+            emit_load_fp_location(ops, allocation, allocation.location(input), scratch)
+        }
+        Representation::Int32
+            if conversion_kind_at(reprs, instruction, operand_index)
+                == Some(ConversionKind::Int32ToFloat64) =>
+        {
+            emit_load_location(ops, allocation.location(input), 9)?;
+            dynasm!(ops ; .arch aarch64 ; scvtf D(scratch), w9);
+            Ok(())
+        }
+        Representation::Tagged
+            if conversion_kind_at(reprs, instruction, operand_index)
+                == Some(ConversionKind::CheckedTaggedToFloat64) =>
+        {
+            let deopt = deopt.ok_or(Unsupported::OperandShape(
+                "optimizing float64 guard missing deopt exit",
+            ))?;
+            emit_load_tagged_location(ops, allocation.location(input), 9)?;
+            emit_num_to_double(ops, 9, scratch, deopt);
+            Ok(())
+        }
+        Representation::Int32 | Representation::Tagged => Err(Unsupported::OperandShape(
+            "optimizing float64 operand conversion",
+        )),
+    }
+}
+
+/// Exact frozen number-tag test used by the template tier.
+fn emit_guard_int32(ops: &mut Assembler, register: u8, deopt: DynamicLabel) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; and x14, X(register), x15
+        ; cmp x14, x15
+        ; b.ne =>deopt
+    );
+}
+
+/// Decode an engine-tagged number exactly as the template tier does: all
+/// number-tag bits select int32, some select a double, and none is non-number.
+fn emit_num_to_double(ops: &mut Assembler, source: u8, destination: u8, deopt: DynamicLabel) {
+    let non_int = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; and x14, X(source), x15
+        ; cmp x14, x15
+        ; b.ne =>non_int
+        ; scvtf D(destination), W(source)
+        ; b =>done
+        ; =>non_int
+        ; tst X(source), x15
+        ; b.eq =>deopt
+        ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
+        ; sub x14, X(source), x14
+        ; fmov D(destination), x14
+        ; =>done
+    );
+}
+
+fn emit_load_fp_location(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(RegClass::Fp, register) => {
+            let physical = FP_REGISTERS
+                .get(register as usize)
+                .copied()
+                .ok_or(Unsupported::OperandShape("optimizing FP register mapping"))?;
+            dynasm!(ops ; .arch aarch64 ; fmov D(scratch), D(physical));
+        }
+        Location::Spill(RegClass::Fp, slot) => {
+            let offset = fp_spill_offset(allocation, slot)?;
+            dynasm!(ops ; .arch aarch64 ; ldr D(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
+            return Err(Unsupported::OperandShape("optimizing non-FP location"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_fp_location(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(RegClass::Fp, register) => {
+            let physical = FP_REGISTERS
+                .get(register as usize)
+                .copied()
+                .ok_or(Unsupported::OperandShape("optimizing FP register mapping"))?;
+            dynasm!(ops ; .arch aarch64 ; fmov D(physical), D(scratch));
+        }
+        Location::Spill(RegClass::Fp, slot) => {
+            let offset = fp_spill_offset(allocation, slot)?;
+            dynasm!(ops ; .arch aarch64 ; str D(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
+            return Err(Unsupported::OperandShape("optimizing non-FP location"));
+        }
+    }
+    Ok(())
 }
 
 fn emit_load_location(
@@ -1039,6 +1507,30 @@ fn emit_store_tagged_location(
     Ok(())
 }
 
+fn emit_box_int32(ops: &mut Assembler, value: u8, scratch: u8) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz X(scratch), NUMBER_TAG_HI16, lsl #48
+        ; orr X(value), X(value), X(scratch)
+    );
+}
+
+/// Canonicalize NaN and add the VM's frozen JSC-style encode offset, matching
+/// `template::arm64::values::emit_box_double` instruction for instruction.
+fn emit_box_double(ops: &mut Assembler, source: u8, destination: u8) {
+    let ready = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; fmov X(destination), D(source)
+        ; fcmp D(source), D(source)
+        ; b.vc =>ready
+        ; movz X(destination), CANONICAL_NAN_HI16, lsl #48
+        ; =>ready
+        ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
+        ; add X(destination), X(destination), x14
+    );
+}
+
 fn emit_load_i32(ops: &mut Assembler, register: u8, value: i32) {
     emit_load_u32(ops, register, value as u32);
 }
@@ -1053,11 +1545,37 @@ fn emit_load_u32(ops: &mut Assembler, register: u8, value: u32) {
     );
 }
 
+fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
+    dynasm!(ops ; .arch aarch64 ; movz X(register), (value & 0xffff) as u32);
+    if (value >> 16) & 0xffff != 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; movk X(register), ((value >> 16) & 0xffff) as u32, lsl #16
+        );
+    }
+    if (value >> 32) & 0xffff != 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; movk X(register), ((value >> 32) & 0xffff) as u32, lsl #32
+        );
+    }
+    if (value >> 48) & 0xffff != 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; movk X(register), ((value >> 48) & 0xffff) as u32, lsl #48
+        );
+    }
+}
+
 fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {
     dynasm!(ops
         ; .arch aarch64
         ; stp x19, x20, [sp, #-32]!
         ; stp x21, x22, [sp, #16]
+        ; stp d8, d9, [sp, #-64]!
+        ; stp d10, d11, [sp, #16]
+        ; stp d12, d13, [sp, #32]
+        ; stp d14, d15, [sp, #48]
     );
     if spill_frame_bytes != 0 {
         dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill_frame_bytes);
@@ -1070,6 +1588,10 @@ fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
     }
     dynasm!(ops
         ; .arch aarch64
+        ; ldp d14, d15, [sp, #48]
+        ; ldp d12, d13, [sp, #32]
+        ; ldp d10, d11, [sp, #16]
+        ; ldp d8, d9, [sp], #64
         ; ldp x21, x22, [sp, #16]
         ; ldp x19, x20, [sp], #32
         ; ret
@@ -1088,7 +1610,7 @@ mod tests {
 
     use otter_vm::{
         jit::JitTestInstruction,
-        jit_feedback::{ARITH_INT32, ArithFeedback},
+        jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
     };
 
     use super::*;
@@ -1104,6 +1626,10 @@ mod tests {
 
     fn unbox_i32(value: u64) -> i32 {
         value as u32 as i32
+    }
+
+    fn box_f64(value: f64) -> u64 {
+        otter_vm::Value::number_f64(value).to_bits()
     }
 
     fn view(
@@ -1138,6 +1664,23 @@ mod tests {
             ) {
                 view.seed_arith_feedback_for_test(pc as u32, ArithFeedback::from_bits(ARITH_INT32));
             }
+        }
+        view
+    }
+
+    fn float_view(
+        param_count: u16,
+        register_count: u16,
+        instructions: Vec<(Op, Vec<Operand>)>,
+        float_feedback_pcs: &[u32],
+        numbers: &[(u32, f64)],
+    ) -> JitCompileSnapshot {
+        let mut view = view(param_count, register_count, instructions);
+        for &pc in float_feedback_pcs {
+            view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(ARITH_FLOAT64));
+        }
+        for &(pc, number) in numbers {
+            view.instructions[pc as usize].load_number = Some(number);
         }
         view
     }
@@ -1275,6 +1818,313 @@ mod tests {
         let result = execute(&code, &[box_i32(6), box_i32(4), box_i32(3)]);
         assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
         assert_eq!(unbox_i32(result.value), 23);
+    }
+
+    #[test]
+    fn executes_float_add_mul_chain() {
+        let view = float_view(
+            3,
+            5,
+            vec![
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Mul,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+            ],
+            &[0, 1],
+            &[],
+        );
+        let code = compile(&view, 101).expect("float add/mul chain is eligible");
+        let result = execute(&code, &[box_f64(1.5), box_f64(2.0), box_f64(4.0)]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.value, box_f64(14.0));
+    }
+
+    #[test]
+    fn executes_float_division_with_int32_widening() {
+        let view = float_view(
+            0,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(7)]),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(2)]),
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[2],
+            &[],
+        );
+        let code = compile(&view, 102).expect("float division is eligible");
+        let result = execute(&code, &[]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.value, box_f64(3.5));
+    }
+
+    #[test]
+    fn executes_mixed_tagged_int_and_double_division() {
+        let view = float_view(
+            2,
+            3,
+            vec![
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[0],
+            &[],
+        );
+        let code = compile(&view, 103).expect("mixed division is eligible");
+        let result = execute(&code, &[box_i32(7), box_f64(2.0)]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.value, box_f64(3.5));
+        assert_eq!(
+            execute(&code, &[box_f64(1.0), box_f64(0.0)]).value,
+            box_f64(f64::INFINITY)
+        );
+        assert_eq!(
+            execute(&code, &[box_f64(-1.0), box_f64(f64::INFINITY)]).value,
+            box_f64(-0.0)
+        );
+        assert_eq!(
+            execute(&code, &[box_f64(0.0), box_f64(0.0)]).value,
+            box_f64(f64::NAN)
+        );
+    }
+
+    #[test]
+    fn executes_float_compare_branch() {
+        let view = float_view(
+            2,
+            4,
+            vec![
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(3), Operand::ConstIndex(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(3), Operand::ConstIndex(1)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+            &[0],
+            &[(2, 11.5), (4, 22.5)],
+        );
+        let code = compile(&view, 104).expect("float comparison branch is eligible");
+        assert_eq!(
+            execute(&code, &[box_f64(1.5), box_f64(2.5)]).value,
+            box_f64(11.5)
+        );
+        assert_eq!(
+            execute(&code, &[box_f64(3.5), box_f64(2.5)]).value,
+            box_f64(22.5)
+        );
+    }
+
+    #[test]
+    fn executes_float_accumulation_loop_with_fp_phi_moves() {
+        let view = float_view(
+            1,
+            7,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(2), Operand::ConstIndex(0)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(4), Operand::ConstIndex(1)],
+                ),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(6), Operand::ConstIndex(2)],
+                ),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(5),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(4), Operand::Register(5)],
+                ),
+                (
+                    Op::Mul,
+                    vec![
+                        Operand::Register(6),
+                        Operand::Register(1),
+                        Operand::Register(4),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(6),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-6)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[7, 8],
+            &[(1, -0.0), (3, 1.5), (4, -0.0)],
+        );
+        let code = compile(&view, 105).expect("float accumulation loop is eligible");
+        let result = execute(&code, &[box_i32(5)]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.value, box_f64(15.0));
+    }
+
+    #[test]
+    fn float_nan_relational_and_equality_compares_are_false() {
+        let view = float_view(
+            0,
+            4,
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(1), Operand::ConstIndex(1)],
+                ),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfTrue,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (
+                    Op::Equal,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(3), Operand::ConstIndex(2)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(3), Operand::ConstIndex(3)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+            &[2, 4],
+            &[(0, f64::NAN), (1, 1.0), (6, 11.5), (8, 22.5)],
+        );
+        let code = compile(&view, 106).expect("NaN comparison is eligible");
+        let result = execute(&code, &[]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.value, box_f64(22.5));
+    }
+
+    #[test]
+    fn non_number_float_guard_deopts_and_boxes_prior_fp_value() {
+        let view = float_view(
+            2,
+            4,
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(2), Operand::ConstIndex(0)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+            &[1, 2],
+            &[(0, 1.5)],
+        );
+        let code = compile(&view, 107).expect("float deopt fixture is eligible");
+        let undefined = otter_vm::Value::undefined().to_bits();
+        let (result, frame) = execute_with_frame(&code, &[box_f64(2.0), undefined]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
+        assert_eq!(result.value, u64::from(2 * STRIDE + 3));
+        assert_eq!(frame[0], box_f64(2.0));
+        assert_eq!(frame[1], undefined);
+        assert_eq!(frame[2], box_f64(3.5));
     }
 
     #[test]
@@ -1565,6 +2415,47 @@ mod tests {
         let result = execute(&code, &[box_i32(10), box_i32(20), box_i32(30), box_i32(40)]);
         assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
         assert_eq!(unbox_i32(result.value), 110);
+    }
+
+    #[test]
+    fn executes_forced_fp_spills() {
+        let mut instructions = Vec::new();
+        let mut numbers = Vec::new();
+        for register in 0_u16..9 {
+            instructions.push((
+                Op::LoadNumber,
+                vec![
+                    Operand::Register(register),
+                    Operand::ConstIndex(register as u32),
+                ],
+            ));
+            numbers.push((u32::from(register), f64::from(register) + 0.5));
+        }
+        let mut float_pcs = Vec::new();
+        let mut accumulator = 0_u16;
+        for right in 1_u16..9 {
+            let destination = 8 + right;
+            let pc = instructions.len() as u32;
+            float_pcs.push(pc);
+            instructions.push((
+                Op::Add,
+                vec![
+                    Operand::Register(destination),
+                    Operand::Register(accumulator),
+                    Operand::Register(right),
+                ],
+            ));
+            accumulator = destination;
+        }
+        instructions.push((Op::ReturnValue, vec![Operand::Register(accumulator)]));
+
+        let view = float_view(0, 17, instructions, &float_pcs, &numbers);
+        let code = compile(&view, 108).expect("FP spill expression is eligible");
+        assert!(code.metadata().linear_scan_spill_slot_count > 0);
+        assert!(code.metadata().spill_slot_count > 0);
+        let result = execute(&code, &[]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.value, box_f64(40.5));
     }
 
     #[test]

@@ -121,7 +121,7 @@ impl Interpreter {
         let callee = *read_register(&stack[top_idx], fn_reg)?;
         let key_value = *read_register(&stack[top_idx], key_reg)?;
         let prefix = context
-            .property_atom(prefix_idx)
+            .property_atom_for_function(stack[top_idx].function_id, prefix_idx)
             .map(|atom| atom.name().to_string())
             .unwrap_or_default();
         let mut name = if let Some(sym) = key_value.as_symbol(&self.gc_heap) {

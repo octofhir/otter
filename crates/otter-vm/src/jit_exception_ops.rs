@@ -4,6 +4,7 @@
 //! - Frame-local try-handler installation and removal.
 //! - Throw/finally resumption through the interpreter's canonical unwind code.
 //! - Callee-throw delivery back into a live compiled caller.
+//! - Catchable VM-error materialization for reentrant compiled helpers.
 //! - Abrupt jump/return completion without popping a live compiled frame.
 //! - TDZ `ReferenceError` materialization through the same throwable builder as
 //!   interpreter dispatch.
@@ -43,6 +44,33 @@ pub enum JitExceptionOutcome {
 }
 
 impl Interpreter {
+    /// Materialize a catchable VM error and deliver it through the current
+    /// compiled frame's structured-exception state.
+    ///
+    /// Returns `Ok(None)` for structural/host errors that the interpreter
+    /// would not expose as JavaScript exceptions. A handled JavaScript error
+    /// returns the catch/finally continuation PC; an unhandled one preserves
+    /// the thrown value in `pending_uncaught_throw` and returns
+    /// [`VmError::Uncaught`].
+    pub fn jit_materialize_error_from_compiled(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        err: VmError,
+    ) -> Result<Option<u32>, VmError> {
+        let Some(value) = self.vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
+        else {
+            return Ok(None);
+        };
+        match self.jit_throw_from_compiled(context, stack, frame_index, value)? {
+            JitExceptionOutcome::Resume(pc) => Ok(Some(pc)),
+            JitExceptionOutcome::Continue | JitExceptionOutcome::Return(_) => {
+                Err(VmError::InvalidOperand)
+            }
+        }
+    }
+
     /// Deliver a propagated compiled-callee throw into `frame_index` when that
     /// caller still owns an active structured-exception handler.
     ///

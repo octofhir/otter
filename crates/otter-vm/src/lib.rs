@@ -102,6 +102,7 @@ mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
 mod jit_class_ops;
+mod jit_class_value_ops;
 mod jit_construct_ops;
 mod jit_control_ops;
 mod jit_delete_ops;
@@ -1477,14 +1478,15 @@ impl Interpreter {
     /// §13.2.8.4 GetTemplateObject steps 7-15 — build the frozen
     /// template-strings array with its frozen, non-enumerable `.raw`
     /// companion.
-    fn build_template_object(
+    pub(crate) fn build_template_object(
         &mut self,
         context: &ExecutionContext,
         stack: &HoltStack,
+        function_id: u32,
         site_idx: u32,
     ) -> Result<Value, VmError> {
         let site = context
-            .template_site(site_idx)
+            .template_site_for_function(function_id, site_idx)
             .ok_or_else(|| VmError::InvalidOperand)?
             .clone();
         let mut cooked: Vec<Value> = Vec::with_capacity(site.cooked.len());

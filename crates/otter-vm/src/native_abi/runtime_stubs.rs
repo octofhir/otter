@@ -1114,6 +1114,19 @@ pub const STUB_JIT_SPREAD_CALL_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes class creation, dynamic source evaluation, private-name/template
+/// materialization, eval identity, and full `ToNumber` coercion through shared
+/// VM helpers.
+pub const STUB_JIT_CLASS_VALUE_OP: RuntimeStubDescriptor = descriptor(
+    73,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1190,6 +1203,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         70 => "jit_static_call_op",
         71 => "jit_control_op",
         72 => "jit_spread_call_op",
+        73 => "jit_class_value_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1268,6 +1282,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_STATIC_CALL_OP,
     STUB_JIT_CONTROL_OP,
     STUB_JIT_SPREAD_CALL_OP,
+    STUB_JIT_CLASS_VALUE_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

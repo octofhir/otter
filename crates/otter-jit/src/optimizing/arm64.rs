@@ -17,6 +17,8 @@
 //!   the arithmetic instruction's exact byte PC; it never silently wraps.
 //! - Every CFG edge targets a block label in reverse postorder. Sequentialized
 //!   phi moves execute only on their owning edge before its final jump.
+//! - FP allocations remain unsupported until float64 emission lands; every
+//!   emitter location boundary rejects them without changing the GPR path.
 //! - Every backwards bytecode edge targets a dominating loop header. Its phi moves
 //!   execute before the interrupt/fuel poll so a poll exit reconstructs the
 //!   loop-header frame, and no optimized loop can bypass cooperative polling.
@@ -53,13 +55,17 @@ use crate::{
         dom::DominatorTree,
         frame_state::FrameStateTable,
         liveness::Liveness,
-        regalloc::{Allocation, EdgeMoves, Location, Move},
+        regalloc::{Allocation, EdgeMoves, Location, Move, RegClass, RegisterBudget},
         repr::{ConversionKind, ReprMap, Representation},
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
 };
 
 const ALLOCATABLE_REGISTER_COUNT: u8 = 4;
+const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
+    gpr: ALLOCATABLE_REGISTER_COUNT,
+    fp: 8,
+};
 const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [19, 20, 21, 22];
 const STACK_SLOT_BYTES: u32 = 8;
 const MAX_SPILL_FRAME_BYTES: u32 = 4080;
@@ -98,24 +104,24 @@ pub(super) fn compile(
     liveness
         .verify(&ssa, &cfg, &dom)
         .map_err(|_| Unsupported::OperandShape("optimizing liveness verification"))?;
-    let allocation = Allocation::compute(&ssa, &cfg, &liveness, ALLOCATABLE_REGISTER_COUNT)
-        .map_err(|_| Unsupported::OperandShape("optimizing register allocation"))?;
-    allocation
-        .verify(&ssa, &cfg, &liveness)
-        .map_err(|_| Unsupported::OperandShape("optimizing allocation verification"))?;
     let reprs = ReprMap::compute(view, &ssa);
     reprs
         .verify(view, &ssa)
         .map_err(|_| Unsupported::OperandShape("optimizing representation verification"))?;
+    let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
+        .map_err(|_| Unsupported::OperandShape("optimizing register allocation"))?;
+    allocation
+        .verify(&ssa, &cfg, &liveness, &reprs)
+        .map_err(|_| Unsupported::OperandShape("optimizing allocation verification"))?;
     let frame_states = FrameStateTable::build(&ssa, &cfg)
         .map_err(|_| Unsupported::OperandShape("optimizing frame-state construction"))?;
     frame_states
         .verify(&ssa, &cfg, &dom)
         .map_err(|_| Unsupported::OperandShape("optimizing frame-state verification"))?;
-    let linear_scan_spill_slot_count = allocation.spill_slot_count;
+    let linear_scan_spill_slot_count = allocation.spill_slot_counts.gpr;
     let mut allocation = legalize_deopt_locations(&allocation, &frame_states)?;
     allocation
-        .rebuild_edge_moves(&ssa, &cfg)
+        .rebuild_edge_moves(&ssa, &cfg, &reprs)
         .map_err(|_| Unsupported::OperandShape("optimizing legalized phi moves"))?;
     let deopt = DeoptLowering::build(view, &ssa, &frame_states, &allocation, &reprs)
         .map_err(|_| Unsupported::OperandShape("optimizing deopt lowering"))?;
@@ -138,9 +144,9 @@ pub(super) fn compile(
             function_id: view.code_block.id,
             param_count: view.code_block.param_count,
             register_count: view.code_block.register_count,
-            machine_register_count: allocation.register_count,
+            machine_register_count: allocation.register_budget.gpr,
             linear_scan_spill_slot_count,
-            spill_slot_count: allocation.spill_slot_count,
+            spill_slot_count: allocation.spill_slot_counts.gpr,
         },
     ))
 }
@@ -156,23 +162,27 @@ fn legalize_deopt_locations(
     frame_states: &FrameStateTable,
 ) -> Result<Allocation, Unsupported> {
     let mut legalized = allocation.clone();
-    let mut next_spill = legalized.spill_slot_count;
     for state in frame_states.states() {
         let mut owners = BTreeMap::<Location, ValueId>::new();
         for value in state.registers.iter().flatten().copied() {
             let location = legalized.location(value);
             if owners.get(&location).is_some_and(|owner| *owner != value) {
-                legalized.locations[value.0 as usize] = Location::Spill(next_spill);
-                next_spill = next_spill
+                let class = location.class();
+                let next_spill = match class {
+                    RegClass::Gpr => &mut legalized.spill_slot_counts.gpr,
+                    RegClass::Fp => &mut legalized.spill_slot_counts.fp,
+                };
+                let slot = *next_spill;
+                *next_spill = next_spill
                     .checked_add(1)
                     .ok_or(Unsupported::OperandShape("optimizing deopt spill overflow"))?;
+                legalized.locations[value.0 as usize] = Location::Spill(class, slot);
                 owners.insert(legalized.location(value), value);
             } else {
                 owners.insert(location, value);
             }
         }
     }
-    legalized.spill_slot_count = next_spill;
     Ok(legalized)
 }
 
@@ -231,7 +241,8 @@ fn check_eligibility(
     }
 
     let spill_bytes = allocation
-        .spill_slot_count
+        .spill_slot_counts
+        .gpr
         .checked_mul(STACK_SLOT_BYTES)
         .and_then(|bytes| bytes.checked_add(15))
         .map(|bytes| bytes & !15)
@@ -474,7 +485,7 @@ fn emit(
     eligibility: &Eligibility,
     deopt_table: &DeoptTable,
 ) -> Result<CompiledCode, Unsupported> {
-    let spill_frame_bytes = aligned_spill_bytes(allocation.spill_slot_count)?;
+    let spill_frame_bytes = aligned_spill_bytes(allocation.spill_slot_counts.gpr)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
     let mut deopt_exits = Vec::<(DynamicLabel, u32)>::new();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
@@ -787,22 +798,22 @@ fn emit_edge_moves(ops: &mut Assembler, edge: &EdgeMoves) -> Result<(), Unsuppor
 
 fn emit_move(ops: &mut Assembler, movement: Move) -> Result<(), Unsupported> {
     match (movement.src, movement.dst) {
-        (Location::Register(src), Location::Register(dst)) => {
+        (Location::Register(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
             let src = move_register(src)?;
             let dst = move_register(dst)?;
             dynasm!(ops ; .arch aarch64 ; mov X(dst), X(src));
         }
-        (Location::Register(src), Location::Spill(dst)) => {
+        (Location::Register(RegClass::Gpr, src), Location::Spill(RegClass::Gpr, dst)) => {
             let src = move_register(src)?;
             let offset = spill_offset(dst)?;
             dynasm!(ops ; .arch aarch64 ; str X(src), [sp, offset]);
         }
-        (Location::Spill(src), Location::Register(dst)) => {
+        (Location::Spill(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
             let dst = move_register(dst)?;
             let offset = spill_offset(src)?;
             dynasm!(ops ; .arch aarch64 ; ldr X(dst), [sp, offset]);
         }
-        (Location::Spill(src), Location::Spill(dst)) => {
+        (Location::Spill(RegClass::Gpr, src), Location::Spill(RegClass::Gpr, dst)) => {
             let src_offset = spill_offset(src)?;
             let dst_offset = spill_offset(dst)?;
             dynasm!(ops
@@ -811,6 +822,7 @@ fn emit_move(ops: &mut Assembler, movement: Move) -> Result<(), Unsupported> {
                 ; str x9, [sp, dst_offset]
             );
         }
+        _ => return Err(Unsupported::OperandShape("optimizing FP phi move")),
     }
     Ok(())
 }
@@ -840,6 +852,9 @@ fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
 
 fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result<(), Unsupported> {
     for (register, slot) in frame_state.slots.iter().enumerate() {
+        if slot.repr == DeoptRepr::Float64 {
+            return Err(Unsupported::OperandShape("optimizing FP deopt writeback"));
+        }
         match slot.location {
             DeoptLocation::Register(register) => {
                 let physical = VALUE_REGISTERS.get(register as usize).copied().ok_or(
@@ -847,9 +862,8 @@ fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result
                 )?;
                 match slot.repr {
                     DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; mov w9, W(physical)),
-                    DeoptRepr::Tagged | DeoptRepr::Float64 => {
-                        dynasm!(ops ; .arch aarch64 ; mov x9, X(physical));
-                    }
+                    DeoptRepr::Tagged => dynasm!(ops ; .arch aarch64 ; mov x9, X(physical)),
+                    DeoptRepr::Float64 => unreachable!("rejected above"),
                 }
             }
             DeoptLocation::StackSlot(offset) => {
@@ -858,9 +872,8 @@ fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result
                 })?;
                 match slot.repr {
                     DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; ldr w9, [sp, offset]),
-                    DeoptRepr::Tagged | DeoptRepr::Float64 => {
-                        dynasm!(ops ; .arch aarch64 ; ldr x9, [sp, offset]);
-                    }
+                    DeoptRepr::Tagged => dynasm!(ops ; .arch aarch64 ; ldr x9, [sp, offset]),
+                    DeoptRepr::Float64 => unreachable!("rejected above"),
                 }
             }
             DeoptLocation::Constant(_) => {
@@ -874,27 +887,11 @@ fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result
                 ; movz x10, #0xfffe, lsl #48
                 ; orr x9, x10, x9
             ),
-            DeoptRepr::Float64 => emit_box_float64(ops),
+            DeoptRepr::Float64 => unreachable!("rejected above"),
         }
         emit_store_frame_register(ops, register as u32, 9)?;
     }
     Ok(())
-}
-
-fn emit_box_float64(ops: &mut Assembler) {
-    let not_nan = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; ubfx x10, x9, #52, #11
-        ; cmp x10, #0x7ff
-        ; b.ne =>not_nan
-        ; lsl x10, x9, #12
-        ; cbz x10, =>not_nan
-        ; movz x9, #0x7ff8, lsl #48
-        ; =>not_nan
-        ; movz x10, #2, lsl #48
-        ; add x9, x9, x10
-    );
 }
 
 fn emit_store_frame_register(
@@ -952,16 +949,19 @@ fn emit_load_location(
     scratch: u8,
 ) -> Result<(), Unsupported> {
     match location {
-        Location::Register(register) => {
+        Location::Register(RegClass::Gpr, register) => {
             let physical = VALUE_REGISTERS
                 .get(register as usize)
                 .copied()
                 .ok_or(Unsupported::OperandShape("optimizing register mapping"))?;
             dynasm!(ops ; .arch aarch64 ; mov W(scratch), W(physical));
         }
-        Location::Spill(slot) => {
+        Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
             dynasm!(ops ; .arch aarch64 ; ldr W(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            return Err(Unsupported::OperandShape("optimizing FP location"));
         }
     }
     Ok(())
@@ -973,16 +973,19 @@ fn emit_store_location(
     scratch: u8,
 ) -> Result<(), Unsupported> {
     match location {
-        Location::Register(register) => {
+        Location::Register(RegClass::Gpr, register) => {
             let physical = VALUE_REGISTERS
                 .get(register as usize)
                 .copied()
                 .ok_or(Unsupported::OperandShape("optimizing register mapping"))?;
             dynasm!(ops ; .arch aarch64 ; mov W(physical), W(scratch));
         }
-        Location::Spill(slot) => {
+        Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
             dynasm!(ops ; .arch aarch64 ; str W(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            return Err(Unsupported::OperandShape("optimizing FP location"));
         }
     }
     Ok(())
@@ -994,16 +997,19 @@ fn emit_load_tagged_location(
     scratch: u8,
 ) -> Result<(), Unsupported> {
     match location {
-        Location::Register(register) => {
+        Location::Register(RegClass::Gpr, register) => {
             let physical = VALUE_REGISTERS
                 .get(register as usize)
                 .copied()
                 .ok_or(Unsupported::OperandShape("optimizing register mapping"))?;
             dynasm!(ops ; .arch aarch64 ; mov X(scratch), X(physical));
         }
-        Location::Spill(slot) => {
+        Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
             dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            return Err(Unsupported::OperandShape("optimizing FP location"));
         }
     }
     Ok(())
@@ -1015,16 +1021,19 @@ fn emit_store_tagged_location(
     scratch: u8,
 ) -> Result<(), Unsupported> {
     match location {
-        Location::Register(register) => {
+        Location::Register(RegClass::Gpr, register) => {
             let physical = VALUE_REGISTERS
                 .get(register as usize)
                 .copied()
                 .ok_or(Unsupported::OperandShape("optimizing register mapping"))?;
             dynasm!(ops ; .arch aarch64 ; mov X(physical), X(scratch));
         }
-        Location::Spill(slot) => {
+        Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
             dynasm!(ops ; .arch aarch64 ; str X(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            return Err(Unsupported::OperandShape("optimizing FP location"));
         }
     }
     Ok(())
@@ -1361,7 +1370,8 @@ mod tests {
                 .expect("diamond must contain a join phi")
                 .id;
         let liveness = Liveness::compute(&ssa, &cfg);
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, ALLOCATABLE_REGISTER_COUNT)
+        let reprs = ReprMap::compute(&view, &ssa);
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
             .expect("diamond allocation");
         let incoming: Vec<_> = allocation
             .edge_moves
@@ -1685,7 +1695,8 @@ mod tests {
         let ssa = SsaFunction::build(&view, &cfg).expect("summation SSA");
         assert!(ssa.blocks[header.0 as usize].phis.len() >= 2);
         let liveness = Liveness::compute(&ssa, &cfg);
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, ALLOCATABLE_REGISTER_COUNT)
+        let reprs = ReprMap::compute(&view, &ssa);
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
             .expect("summation allocation");
         assert!(
             allocation

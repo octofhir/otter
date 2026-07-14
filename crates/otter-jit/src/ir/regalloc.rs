@@ -3,7 +3,8 @@
 //! # Contents
 //! - [`LiveInterval`] — one conservative closed interval per SSA value.
 //! - [`Allocation`] — deterministic register/spill assignments and phi moves.
-//! - [`Allocation::compute`] — Poletto-Sarkar linear scan with spill-furthest-end.
+//! - [`RegClass`] and [`RegisterBudget`] — representation-driven register files.
+//! - [`Allocation::compute`] — per-class Poletto-Sarkar linear scan.
 //! - [`Allocation::verify`] — pure structural, interference, and phi-move checks.
 //! - [`RegallocError`] — precise construction and verification failures.
 //!
@@ -13,9 +14,10 @@
 //! - Phi inputs are live through the final point of their normal predecessor.
 //! - Definitions at one block head overlap through its final head point because
 //!   phi destinations are simultaneous even when individual phis are dead.
-//! - Overlapping closed intervals never share a register or spill slot.
-//! - Phi edge moves preserve parallel-copy semantics; register
-//!   `register_count` is a move-only scratch and is never assigned to a value.
+//! - Overlapping closed intervals never share a register within their class.
+//! - GPR and FP values have independent register files and spill namespaces.
+//! - Phi edge moves preserve parallel-copy semantics; each class reserves its
+//!   register-budget count as a move-only scratch never assigned to a value.
 //! - Allocation reads immutable SSA, CFG, and liveness data and has no runtime
 //!   effect.
 //!
@@ -29,16 +31,92 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     cfg::{BlockId, ControlFlowGraph},
     liveness::Liveness,
+    repr::{ReprMap, Representation},
     ssa::{SsaFunction, ValueDef, ValueId},
 };
+
+/// Backend-independent machine register class selected from a value representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegClass {
+    /// General-purpose registers for `Int32` and tagged values.
+    Gpr,
+    /// Floating-point registers for unboxed `Float64` values.
+    Fp,
+}
+
+impl RegClass {
+    const ALL: [Self; 2] = [Self::Gpr, Self::Fp];
+
+    /// Select the register class required by a machine representation.
+    #[must_use]
+    pub const fn from_representation(representation: Representation) -> Self {
+        match representation {
+            Representation::Int32 | Representation::Tagged => Self::Gpr,
+            Representation::Float64 => Self::Fp,
+        }
+    }
+}
+
+/// Number of value registers available independently in each register class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterBudget {
+    /// Assignable general-purpose registers.
+    pub gpr: u8,
+    /// Assignable floating-point registers.
+    pub fp: u8,
+}
+
+impl RegisterBudget {
+    const fn count(self, class: RegClass) -> u8 {
+        match class {
+            RegClass::Gpr => self.gpr,
+            RegClass::Fp => self.fp,
+        }
+    }
+}
+
+/// Number of fresh spill homes allocated independently in each register class.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpillSlotCounts {
+    /// General-purpose spill homes.
+    pub gpr: u32,
+    /// Floating-point spill homes.
+    pub fp: u32,
+}
+
+impl SpillSlotCounts {
+    const fn count(self, class: RegClass) -> u32 {
+        match class {
+            RegClass::Gpr => self.gpr,
+            RegClass::Fp => self.fp,
+        }
+    }
+
+    fn set(&mut self, class: RegClass, count: u32) {
+        match class {
+            RegClass::Gpr => self.gpr = count,
+            RegClass::Fp => self.fp = count,
+        }
+    }
+}
 
 /// Storage assigned to one SSA value, or used by an edge move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Location {
-    /// Backend register index.
-    Register(u8),
-    /// Backend-independent spill-slot index.
-    Spill(u32),
+    /// Backend register class and class-local index.
+    Register(RegClass, u8),
+    /// Backend-independent class and class-local spill-slot index.
+    Spill(RegClass, u32),
+}
+
+impl Location {
+    /// Return the register class owning this location.
+    #[must_use]
+    pub const fn class(self) -> RegClass {
+        match self {
+            Self::Register(class, _) | Self::Spill(class, _) => class,
+        }
+    }
 }
 
 /// Conservative closed live interval for one SSA value.
@@ -81,10 +159,10 @@ pub struct Allocation {
     pub intervals: Box<[LiveInterval]>,
     /// Normal-edge moves in `(predecessor, block)` order.
     pub edge_moves: Box<[EdgeMoves]>,
-    /// Number of registers available to values.
-    pub register_count: u8,
-    /// Number of distinct spill slots assigned to values.
-    pub spill_slot_count: u32,
+    /// Independent register budgets for GPR and FP values.
+    pub register_budget: RegisterBudget,
+    /// Number of distinct class-local spill slots assigned to values.
+    pub spill_slot_counts: SpillSlotCounts,
 }
 
 /// Failure to construct or verify a register allocation.
@@ -180,10 +258,21 @@ pub enum RegallocError {
         /// Stored end position.
         actual: u32,
     },
+    /// A value was assigned a location belonging to another register class.
+    LocationClassMismatch {
+        /// Value with the invalid assignment.
+        value: ValueId,
+        /// Representation-derived register class.
+        expected: RegClass,
+        /// Class stored in the value's location.
+        actual: RegClass,
+    },
     /// A value was assigned the reserved move-only scratch register.
     ScratchAssignedToValue {
         /// Value assigned the scratch.
         value: ValueId,
+        /// Register class owning the scratch.
+        class: RegClass,
         /// Reserved scratch register index.
         register: u8,
     },
@@ -191,6 +280,8 @@ pub enum RegallocError {
     RegisterOutOfRange {
         /// Value with the invalid assignment.
         value: ValueId,
+        /// Register class containing the invalid index.
+        class: RegClass,
         /// Invalid register index.
         register: u8,
         /// Number of assignable registers.
@@ -202,6 +293,8 @@ pub enum RegallocError {
         first: ValueId,
         /// Second conflicting value.
         second: ValueId,
+        /// Register class containing the conflict.
+        class: RegClass,
         /// Shared register.
         register: u8,
     },
@@ -209,6 +302,8 @@ pub enum RegallocError {
     SpillSlotOutOfRange {
         /// Value with the invalid spill assignment.
         value: ValueId,
+        /// Spill namespace containing the invalid slot.
+        class: RegClass,
         /// Invalid spill slot.
         slot: u32,
         /// Stored spill-slot count.
@@ -220,15 +315,41 @@ pub enum RegallocError {
         first: ValueId,
         /// Second value assigned the slot.
         second: ValueId,
+        /// Spill namespace containing the alias.
+        class: RegClass,
         /// Shared spill slot.
         slot: u32,
     },
     /// Spill slots are not a dense zero-based set.
     SpillSlotCountMismatch {
+        /// Spill namespace whose dense count is invalid.
+        class: RegClass,
         /// Dense count implied by value locations.
         expected: u32,
         /// Stored spill-slot count.
         actual: u32,
+    },
+    /// A phi input belongs to a different register class than its result.
+    PhiClassMismatch {
+        /// Phi whose parallel copy crosses register classes.
+        phi: ValueId,
+        /// Input value on the affected predecessor edge.
+        input: ValueId,
+        /// Register class required by the phi result.
+        expected: RegClass,
+        /// Register class required by the input.
+        actual: RegClass,
+    },
+    /// A stored edge move crosses register classes.
+    MoveClassMismatch {
+        /// Edge containing the invalid move.
+        predecessor: BlockId,
+        /// Successor block containing the phis.
+        block: BlockId,
+        /// Source location's class.
+        source: RegClass,
+        /// Destination location's class.
+        destination: RegClass,
     },
     /// Stored locations differ from a deterministic faithful linear-scan replay.
     LinearScanLocationMismatch {
@@ -334,18 +455,19 @@ impl Allocation {
         ssa: &SsaFunction,
         cfg: &ControlFlowGraph,
         liveness: &Liveness,
-        register_count: u8,
+        reprs: &ReprMap,
+        register_budget: RegisterBudget,
     ) -> Result<Self, RegallocError> {
         let linear = linearize(ssa, cfg)?;
         let intervals = build_intervals(ssa, cfg, liveness, &linear)?;
-        let (locations, spill_slot_count) = linear_scan(&intervals, register_count)?;
-        let edge_moves = build_edge_moves(ssa, cfg, &locations, register_count)?;
+        let (locations, spill_slot_counts) = linear_scan(&intervals, reprs, register_budget)?;
+        let edge_moves = build_edge_moves(ssa, cfg, reprs, &locations, register_budget)?;
         Ok(Self {
             locations: locations.into_boxed_slice(),
             intervals: intervals.into_boxed_slice(),
             edge_moves: edge_moves.into_boxed_slice(),
-            register_count,
-            spill_slot_count,
+            register_budget,
+            spill_slot_counts,
         })
     }
 
@@ -364,9 +486,10 @@ impl Allocation {
         &mut self,
         ssa: &SsaFunction,
         cfg: &ControlFlowGraph,
+        reprs: &ReprMap,
     ) -> Result<(), RegallocError> {
-        self.edge_moves =
-            build_edge_moves(ssa, cfg, &self.locations, self.register_count)?.into_boxed_slice();
+        self.edge_moves = build_edge_moves(ssa, cfg, reprs, &self.locations, self.register_budget)?
+            .into_boxed_slice();
         Ok(())
     }
 
@@ -376,6 +499,7 @@ impl Allocation {
         ssa: &SsaFunction,
         cfg: &ControlFlowGraph,
         liveness: &Liveness,
+        reprs: &ReprMap,
     ) -> Result<(), RegallocError> {
         let value_count = ssa.values.len();
         if self.locations.len() != value_count {
@@ -393,12 +517,12 @@ impl Allocation {
 
         let linear = linearize(ssa, cfg)?;
         verify_intervals(&self.intervals, ssa, cfg, liveness, &linear)?;
-        self.verify_locations()?;
+        self.verify_locations(reprs)?;
         self.verify_interference()?;
         self.verify_spills()?;
 
         let (expected_locations, expected_spills) =
-            linear_scan(&self.intervals, self.register_count)?;
+            linear_scan(&self.intervals, reprs, self.register_budget)?;
         for (index, (&expected, &actual)) in expected_locations
             .iter()
             .zip(self.locations.iter())
@@ -412,28 +536,48 @@ impl Allocation {
                 });
             }
         }
-        if expected_spills != self.spill_slot_count {
-            return Err(RegallocError::SpillSlotCountMismatch {
-                expected: expected_spills,
-                actual: self.spill_slot_count,
-            });
+        for class in RegClass::ALL {
+            let expected = expected_spills.count(class);
+            let actual = self.spill_slot_counts.count(class);
+            if expected != actual {
+                return Err(RegallocError::SpillSlotCountMismatch {
+                    class,
+                    expected,
+                    actual,
+                });
+            }
         }
 
-        self.verify_edge_moves(ssa, cfg)
+        self.verify_edge_moves(ssa, cfg, reprs)
     }
 
-    fn verify_locations(&self) -> Result<(), RegallocError> {
+    fn verify_locations(&self, reprs: &ReprMap) -> Result<(), RegallocError> {
         for (index, &location) in self.locations.iter().enumerate() {
-            if let Location::Register(register) = location {
-                let value = ValueId(index as u32);
-                if register == self.register_count {
-                    return Err(RegallocError::ScratchAssignedToValue { value, register });
+            let value = ValueId(index as u32);
+            let expected = RegClass::from_representation(reprs.representation(value));
+            let actual = location.class();
+            if actual != expected {
+                return Err(RegallocError::LocationClassMismatch {
+                    value,
+                    expected,
+                    actual,
+                });
+            }
+            if let Location::Register(class, register) = location {
+                let register_count = self.register_budget.count(class);
+                if register == register_count {
+                    return Err(RegallocError::ScratchAssignedToValue {
+                        value,
+                        class,
+                        register,
+                    });
                 }
-                if register > self.register_count {
+                if register > register_count {
                     return Err(RegallocError::RegisterOutOfRange {
                         value,
+                        class,
                         register,
-                        register_count: self.register_count,
+                        register_count,
                     });
                 }
             }
@@ -447,13 +591,17 @@ impl Allocation {
                 let first = self.intervals[first_index];
                 let second = self.intervals[second_index];
                 if intervals_overlap(first, second)
-                    && let (Location::Register(first_register), Location::Register(second_register)) =
-                        (self.locations[first_index], self.locations[second_index])
+                    && let (
+                        Location::Register(first_class, first_register),
+                        Location::Register(second_class, second_register),
+                    ) = (self.locations[first_index], self.locations[second_index])
+                    && first_class == second_class
                     && first_register == second_register
                 {
                     return Err(RegallocError::RegisterInterference {
                         first: first.value,
                         second: second.value,
+                        class: first_class,
                         register: first_register,
                     });
                 }
@@ -463,34 +611,43 @@ impl Allocation {
     }
 
     fn verify_spills(&self) -> Result<(), RegallocError> {
-        let mut owners = BTreeMap::new();
-        for (index, &location) in self.locations.iter().enumerate() {
-            let Location::Spill(slot) = location else {
-                continue;
-            };
-            let value = ValueId(index as u32);
-            if slot >= self.spill_slot_count {
-                return Err(RegallocError::SpillSlotOutOfRange {
-                    value,
-                    slot,
-                    spill_slot_count: self.spill_slot_count,
+        for class in RegClass::ALL {
+            let spill_slot_count = self.spill_slot_counts.count(class);
+            let mut owners = BTreeMap::new();
+            for (index, &location) in self.locations.iter().enumerate() {
+                let Location::Spill(location_class, slot) = location else {
+                    continue;
+                };
+                if location_class != class {
+                    continue;
+                }
+                let value = ValueId(index as u32);
+                if slot >= spill_slot_count {
+                    return Err(RegallocError::SpillSlotOutOfRange {
+                        value,
+                        class,
+                        slot,
+                        spill_slot_count,
+                    });
+                }
+                if let Some(first) = owners.insert(slot, value) {
+                    return Err(RegallocError::SpillSlotAliasing {
+                        first,
+                        second: value,
+                        class,
+                        slot,
+                    });
+                }
+            }
+            let expected =
+                u32::try_from(owners.len()).map_err(|_| RegallocError::SpillSlotOverflow)?;
+            if expected != spill_slot_count || owners.keys().copied().ne(0..spill_slot_count) {
+                return Err(RegallocError::SpillSlotCountMismatch {
+                    class,
+                    expected,
+                    actual: spill_slot_count,
                 });
             }
-            if let Some(first) = owners.insert(slot, value) {
-                return Err(RegallocError::SpillSlotAliasing {
-                    first,
-                    second: value,
-                    slot,
-                });
-            }
-        }
-        let expected = u32::try_from(owners.len()).map_err(|_| RegallocError::SpillSlotOverflow)?;
-        if expected != self.spill_slot_count || owners.keys().copied().ne(0..self.spill_slot_count)
-        {
-            return Err(RegallocError::SpillSlotCountMismatch {
-                expected,
-                actual: self.spill_slot_count,
-            });
         }
         Ok(())
     }
@@ -499,6 +656,7 @@ impl Allocation {
         &self,
         ssa: &SsaFunction,
         cfg: &ControlFlowGraph,
+        reprs: &ReprMap,
     ) -> Result<(), RegallocError> {
         let expected_edges = normal_edges(cfg);
         let edge_count = expected_edges.len().max(self.edge_moves.len());
@@ -518,9 +676,23 @@ impl Allocation {
         }
 
         for edge in &self.edge_moves {
-            let parallel =
-                parallel_phi_moves(ssa, cfg, &self.locations, edge.predecessor, edge.block)?;
+            let parallel = parallel_phi_moves(
+                ssa,
+                cfg,
+                reprs,
+                &self.locations,
+                edge.predecessor,
+                edge.block,
+            )?;
             for movement in &edge.moves {
+                if movement.src.class() != movement.dst.class() {
+                    return Err(RegallocError::MoveClassMismatch {
+                        predecessor: edge.predecessor,
+                        block: edge.block,
+                        source: movement.src.class(),
+                        destination: movement.dst.class(),
+                    });
+                }
                 for location in [movement.src, movement.dst] {
                     if !self.valid_move_location(location) {
                         return Err(RegallocError::InvalidMoveLocation {
@@ -546,9 +718,14 @@ impl Allocation {
                 };
                 contents.insert(movement.dst, value);
             }
-            for (phi, movement) in
-                phi_move_requirements(ssa, cfg, &self.locations, edge.predecessor, edge.block)?
-            {
+            for (phi, movement) in phi_move_requirements(
+                ssa,
+                cfg,
+                reprs,
+                &self.locations,
+                edge.predecessor,
+                edge.block,
+            )? {
                 let actual = contents.get(&movement.dst).copied();
                 if actual != Some(movement.src) {
                     return Err(RegallocError::PhiMoveIncomplete {
@@ -561,9 +738,9 @@ impl Allocation {
                 }
             }
 
-            let expected = sequentialize_parallel_moves(
+            let expected = sequentialize_class_moves(
                 parallel,
-                Location::Register(self.register_count),
+                self.register_budget,
                 edge.predecessor,
                 edge.block,
             )?;
@@ -581,8 +758,8 @@ impl Allocation {
 
     fn valid_move_location(&self, location: Location) -> bool {
         match location {
-            Location::Register(register) => register <= self.register_count,
-            Location::Spill(slot) => slot < self.spill_slot_count,
+            Location::Register(class, register) => register <= self.register_budget.count(class),
+            Location::Spill(class, slot) => slot < self.spill_slot_counts.count(class),
         }
     }
 }
@@ -873,11 +1050,42 @@ fn value_index(value: ValueId, value_count: usize) -> Result<usize, RegallocErro
 
 fn linear_scan(
     intervals: &[LiveInterval],
+    reprs: &ReprMap,
+    register_budget: RegisterBudget,
+) -> Result<(Vec<Location>, SpillSlotCounts), RegallocError> {
+    let mut locations = vec![None; intervals.len()];
+    let mut spill_slot_counts = SpillSlotCounts::default();
+    for class in RegClass::ALL {
+        let class_intervals = intervals
+            .iter()
+            .copied()
+            .filter(|interval| {
+                RegClass::from_representation(reprs.representation(interval.value)) == class
+            })
+            .collect::<Vec<_>>();
+        let spill_count = linear_scan_class(
+            &class_intervals,
+            class,
+            register_budget.count(class),
+            &mut locations,
+        )?;
+        spill_slot_counts.set(class, spill_count);
+    }
+    let locations = locations
+        .into_iter()
+        .map(|location| location.expect("every representation belongs to one register class"))
+        .collect();
+    Ok((locations, spill_slot_counts))
+}
+
+fn linear_scan_class(
+    intervals: &[LiveInterval],
+    class: RegClass,
     register_count: u8,
-) -> Result<(Vec<Location>, u32), RegallocError> {
+    locations: &mut [Option<Location>],
+) -> Result<u32, RegallocError> {
     let mut order = intervals.to_vec();
     order.sort_by_key(|interval| (interval.start, interval.value));
-    let mut locations = vec![Location::Spill(u32::MAX); intervals.len()];
     let mut active: Vec<LiveInterval> = Vec::new();
     let mut free: BTreeSet<u8> = (0..register_count).collect();
     let mut next_spill = 0_u32;
@@ -886,9 +1094,12 @@ fn linear_scan(
         let mut retained = Vec::with_capacity(active.len());
         for old in active.drain(..) {
             if old.end < interval.start {
-                let Location::Register(register) = locations[old.value.0 as usize] else {
+                let Some(Location::Register(location_class, register)) =
+                    locations[old.value.0 as usize]
+                else {
                     unreachable!("active intervals always occupy registers");
                 };
+                debug_assert_eq!(location_class, class);
                 free.insert(register);
             } else {
                 retained.push(old);
@@ -897,7 +1108,7 @@ fn linear_scan(
         active = retained;
 
         if register_count == 0 {
-            locations[interval.value.0 as usize] = Location::Spill(next_spill);
+            locations[interval.value.0 as usize] = Some(Location::Spill(class, next_spill));
             next_spill = next_spill
                 .checked_add(1)
                 .ok_or(RegallocError::SpillSlotOverflow)?;
@@ -909,18 +1120,23 @@ fn linear_scan(
             let spill = active[spill_index];
             if spill.end > interval.end {
                 let register = match locations[spill.value.0 as usize] {
-                    Location::Register(register) => register,
-                    Location::Spill(_) => unreachable!("active intervals always occupy registers"),
+                    Some(Location::Register(location_class, register)) => {
+                        debug_assert_eq!(location_class, class);
+                        register
+                    }
+                    Some(Location::Spill(_, _)) | None => {
+                        unreachable!("active intervals always occupy registers")
+                    }
                 };
-                locations[spill.value.0 as usize] = Location::Spill(next_spill);
+                locations[spill.value.0 as usize] = Some(Location::Spill(class, next_spill));
                 next_spill = next_spill
                     .checked_add(1)
                     .ok_or(RegallocError::SpillSlotOverflow)?;
                 active.pop();
-                locations[interval.value.0 as usize] = Location::Register(register);
+                locations[interval.value.0 as usize] = Some(Location::Register(class, register));
                 insert_active(&mut active, interval);
             } else {
-                locations[interval.value.0 as usize] = Location::Spill(next_spill);
+                locations[interval.value.0 as usize] = Some(Location::Spill(class, next_spill));
                 next_spill = next_spill
                     .checked_add(1)
                     .ok_or(RegallocError::SpillSlotOverflow)?;
@@ -929,11 +1145,11 @@ fn linear_scan(
             let register = free
                 .pop_first()
                 .expect("a non-full active set has a free register");
-            locations[interval.value.0 as usize] = Location::Register(register);
+            locations[interval.value.0 as usize] = Some(Location::Register(class, register));
             insert_active(&mut active, interval);
         }
     }
-    Ok((locations, next_spill))
+    Ok(next_spill)
 }
 
 fn insert_active(active: &mut Vec<LiveInterval>, interval: LiveInterval) {
@@ -951,19 +1167,15 @@ fn intervals_overlap(first: LiveInterval, second: LiveInterval) -> bool {
 fn build_edge_moves(
     ssa: &SsaFunction,
     cfg: &ControlFlowGraph,
+    reprs: &ReprMap,
     locations: &[Location],
-    register_count: u8,
+    register_budget: RegisterBudget,
 ) -> Result<Vec<EdgeMoves>, RegallocError> {
     normal_edges(cfg)
         .into_iter()
         .map(|(predecessor, block)| {
-            let parallel = parallel_phi_moves(ssa, cfg, locations, predecessor, block)?;
-            let moves = sequentialize_parallel_moves(
-                parallel,
-                Location::Register(register_count),
-                predecessor,
-                block,
-            )?;
+            let parallel = parallel_phi_moves(ssa, cfg, reprs, locations, predecessor, block)?;
+            let moves = sequentialize_class_moves(parallel, register_budget, predecessor, block)?;
             Ok(EdgeMoves {
                 predecessor,
                 block,
@@ -987,12 +1199,13 @@ fn normal_edges(cfg: &ControlFlowGraph) -> Vec<(BlockId, BlockId)> {
 fn parallel_phi_moves(
     ssa: &SsaFunction,
     cfg: &ControlFlowGraph,
+    reprs: &ReprMap,
     locations: &[Location],
     predecessor: BlockId,
     block: BlockId,
 ) -> Result<Vec<Move>, RegallocError> {
     Ok(
-        phi_move_requirements(ssa, cfg, locations, predecessor, block)?
+        phi_move_requirements(ssa, cfg, reprs, locations, predecessor, block)?
             .into_iter()
             .map(|(_, movement)| movement)
             .filter(|movement| movement.src != movement.dst)
@@ -1003,6 +1216,7 @@ fn parallel_phi_moves(
 fn phi_move_requirements(
     ssa: &SsaFunction,
     cfg: &ControlFlowGraph,
+    reprs: &ReprMap,
     locations: &[Location],
     predecessor: BlockId,
     block: BlockId,
@@ -1027,6 +1241,25 @@ fn phi_move_requirements(
         }
         let input = inputs[predecessor_index];
         let input_index = value_index(input, ssa.values.len())?;
+        let phi_class = RegClass::from_representation(reprs.representation(phi));
+        let input_class = RegClass::from_representation(reprs.representation(input));
+        if input_class != phi_class {
+            return Err(RegallocError::PhiClassMismatch {
+                phi,
+                input,
+                expected: phi_class,
+                actual: input_class,
+            });
+        }
+        for (value, location) in [(input, locations[input_index]), (phi, locations[phi_index])] {
+            if location.class() != phi_class {
+                return Err(RegallocError::LocationClassMismatch {
+                    value,
+                    expected: phi_class,
+                    actual: location.class(),
+                });
+            }
+        }
         requirements.push((
             phi,
             Move {
@@ -1036,6 +1269,40 @@ fn phi_move_requirements(
         ));
     }
     Ok(requirements)
+}
+
+fn sequentialize_class_moves(
+    parallel: Vec<Move>,
+    register_budget: RegisterBudget,
+    predecessor: BlockId,
+    block: BlockId,
+) -> Result<Vec<Move>, RegallocError> {
+    for movement in &parallel {
+        if movement.src.class() != movement.dst.class() {
+            return Err(RegallocError::MoveClassMismatch {
+                predecessor,
+                block,
+                source: movement.src.class(),
+                destination: movement.dst.class(),
+            });
+        }
+    }
+
+    let mut result = Vec::new();
+    for class in RegClass::ALL {
+        let class_moves = parallel
+            .iter()
+            .copied()
+            .filter(|movement| movement.src.class() == class)
+            .collect();
+        result.extend(sequentialize_parallel_moves(
+            class_moves,
+            Location::Register(class, register_budget.count(class)),
+            predecessor,
+            block,
+        )?);
+    }
+    Ok(result)
 }
 
 fn sequentialize_parallel_moves(
@@ -1103,7 +1370,11 @@ fn normal_predecessors(cfg: &ControlFlowGraph, block: BlockId) -> Vec<BlockId> {
 #[cfg(test)]
 mod tests {
     use otter_bytecode::{Op, Operand};
-    use otter_vm::{JitCompileSnapshot, jit::JitTestInstruction};
+    use otter_vm::{
+        JitCompileSnapshot,
+        jit::JitTestInstruction,
+        jit_feedback::{ARITH_FLOAT64, ArithFeedback},
+    };
 
     use super::*;
     use crate::ir::dom::DominatorTree;
@@ -1127,8 +1398,20 @@ mod tests {
         param_count: u16,
         register_count: u16,
         instructions: Vec<(Op, Vec<Operand>)>,
-    ) -> (ControlFlowGraph, SsaFunction, Liveness) {
-        let snapshot = snapshot(param_count, register_count, instructions);
+    ) -> (ControlFlowGraph, SsaFunction, Liveness, ReprMap) {
+        analyses_with_feedback(param_count, register_count, instructions, &[])
+    }
+
+    fn analyses_with_feedback(
+        param_count: u16,
+        register_count: u16,
+        instructions: Vec<(Op, Vec<Operand>)>,
+        feedback: &[(u32, u8)],
+    ) -> (ControlFlowGraph, SsaFunction, Liveness, ReprMap) {
+        let mut snapshot = snapshot(param_count, register_count, instructions);
+        for &(pc, bits) in feedback {
+            snapshot.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(bits));
+        }
         let cfg = ControlFlowGraph::build(&snapshot).expect("CFG builds");
         cfg.verify().expect("CFG verifies");
         let ssa = SsaFunction::build(&snapshot, &cfg).expect("SSA builds");
@@ -1138,7 +1421,15 @@ mod tests {
         liveness
             .verify(&ssa, &cfg, &dom)
             .expect("liveness verifies");
-        (cfg, ssa, liveness)
+        let reprs = ReprMap::compute(&snapshot, &ssa);
+        reprs
+            .verify(&snapshot, &ssa)
+            .expect("representations verify");
+        (cfg, ssa, liveness, reprs)
+    }
+
+    const fn budget(gpr: u8, fp: u8) -> RegisterBudget {
+        RegisterBudget { gpr, fp }
     }
 
     fn block_at(cfg: &ControlFlowGraph, pc: u32) -> BlockId {
@@ -1186,7 +1477,7 @@ mod tests {
 
     #[test]
     fn straight_line_reuses_register_after_a_value_dies() {
-        let (cfg, ssa, liveness) = analyses(
+        let (cfg, ssa, liveness, reprs) = analyses(
             0,
             2,
             vec![
@@ -1201,9 +1492,12 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
         );
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, 4).expect("allocate");
-        allocation.verify(&ssa, &cfg, &liveness).expect("verify");
-        assert_eq!(allocation.spill_slot_count, 0);
+        let allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(4, 4)).expect("allocate");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify");
+        assert_eq!(allocation.spill_slot_counts, SpillSlotCounts::default());
 
         let dead = op_value_at(&ssa, 0);
         let later = op_value_at(&ssa, 1);
@@ -1214,13 +1508,14 @@ mod tests {
         );
         assert_eq!(
             allocation,
-            Allocation::compute(&ssa, &cfg, &liveness, 4).expect("deterministic replay")
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(4, 4))
+                .expect("deterministic replay")
         );
     }
 
     #[test]
     fn diamond_phi_has_complete_moves_from_both_arms() {
-        let (cfg, ssa, liveness) = analyses(
+        let (cfg, ssa, liveness, reprs) = analyses(
             1,
             3,
             vec![
@@ -1248,8 +1543,11 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(2)]),
             ],
         );
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, 4).expect("allocate");
-        allocation.verify(&ssa, &cfg, &liveness).expect("verify");
+        let allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(4, 4)).expect("allocate");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify");
 
         let left = block_at(&cfg, 1);
         let right = block_at(&cfg, 3);
@@ -1258,7 +1556,7 @@ mod tests {
         assert!(phi.0 < ssa.values.len() as u32);
         for predecessor in [left, right] {
             let requirements =
-                phi_move_requirements(&ssa, &cfg, &allocation.locations, predecessor, join)
+                phi_move_requirements(&ssa, &cfg, &reprs, &allocation.locations, predecessor, join)
                     .expect("phi requirements");
             assert_eq!(requirements.len(), 1);
             let required = requirements[0].1;
@@ -1273,7 +1571,7 @@ mod tests {
 
     #[test]
     fn loop_phi_interval_spans_backedge_and_has_a_latch_move() {
-        let (cfg, ssa, liveness) = analyses(
+        let (cfg, ssa, liveness, reprs) = analyses(
             1,
             3,
             vec![
@@ -1296,8 +1594,11 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
         );
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, 4).expect("allocate");
-        allocation.verify(&ssa, &cfg, &liveness).expect("verify");
+        let allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(4, 4)).expect("allocate");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify");
 
         let header = block_at(&cfg, 2);
         let latch = block_at(&cfg, 3);
@@ -1307,8 +1608,9 @@ mod tests {
             allocation.intervals[carried.0 as usize].end
                 >= allocation.intervals[phi.0 as usize].start
         );
-        let requirements = phi_move_requirements(&ssa, &cfg, &allocation.locations, latch, header)
-            .expect("backedge phi requirement");
+        let requirements =
+            phi_move_requirements(&ssa, &cfg, &reprs, &allocation.locations, latch, header)
+                .expect("backedge phi requirement");
         assert_eq!(requirements.len(), 1);
         let edge = edge_moves(&allocation, latch, header);
         if requirements[0].1.src == requirements[0].1.dst {
@@ -1320,7 +1622,7 @@ mod tests {
 
     #[test]
     fn forced_spill_with_two_registers_remains_interference_free() {
-        let (cfg, ssa, liveness) = analyses(
+        let (cfg, ssa, liveness, reprs) = analyses(
             3,
             4,
             vec![
@@ -1343,14 +1645,17 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(3)]),
             ],
         );
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, 2).expect("allocate");
-        allocation.verify(&ssa, &cfg, &liveness).expect("verify");
-        assert!(allocation.spill_slot_count > 0);
+        let allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(2, 2)).expect("allocate");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify");
+        assert!(allocation.spill_slot_counts.gpr > 0);
         assert!(
             allocation
                 .locations
                 .iter()
-                .any(|location| matches!(location, Location::Spill(_)))
+                .any(|location| matches!(location, Location::Spill(RegClass::Gpr, _)))
         );
 
         let synthetic = [
@@ -1370,15 +1675,17 @@ mod tests {
                 end: 3,
             },
         ];
-        let (locations, spill_count) = linear_scan(&synthetic, 2).expect("linear scan");
-        assert_eq!(locations[0], Location::Spill(0));
-        assert_eq!(locations[2], Location::Register(0));
+        let mut locations = vec![None; synthetic.len()];
+        let spill_count =
+            linear_scan_class(&synthetic, RegClass::Gpr, 2, &mut locations).expect("linear scan");
+        assert_eq!(locations[0], Some(Location::Spill(RegClass::Gpr, 0)));
+        assert_eq!(locations[2], Some(Location::Register(RegClass::Gpr, 0)));
         assert_eq!(spill_count, 1, "the furthest active interval is spilled");
     }
 
     #[test]
     fn parallel_phi_swap_breaks_cycle_with_scratch() {
-        let (cfg, ssa, liveness) = analyses(
+        let (cfg, ssa, liveness, reprs) = analyses(
             1,
             3,
             vec![
@@ -1414,8 +1721,11 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(0)]),
             ],
         );
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, 2).expect("allocate");
-        allocation.verify(&ssa, &cfg, &liveness).expect("verify");
+        let allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(2, 2)).expect("allocate");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify");
 
         let left = block_at(&cfg, 1);
         let join = block_at(&cfg, 6);
@@ -1425,20 +1735,205 @@ mod tests {
         let edge = edge_moves(&allocation, left, join);
         assert_eq!(edge.moves.len(), 3, "two-copy cycle needs save plus copies");
         assert!(edge.moves.iter().any(|movement| {
-            movement.src == Location::Register(allocation.register_count)
-                || movement.dst == Location::Register(allocation.register_count)
+            movement.src == Location::Register(RegClass::Gpr, allocation.register_budget.gpr)
+                || movement.dst == Location::Register(RegClass::Gpr, allocation.register_budget.gpr)
         }));
-        assert!(
-            allocation
-                .locations
-                .iter()
-                .all(|&location| { location != Location::Register(allocation.register_count) })
+        assert!(allocation.locations.iter().all(|&location| {
+            location != Location::Register(RegClass::Gpr, allocation.register_budget.gpr)
+        }));
+    }
+
+    #[test]
+    fn float64_value_uses_fp_register_class() {
+        let (cfg, ssa, liveness, reprs) = analyses(
+            0,
+            1,
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        let value = op_value_at(&ssa, 0);
+        assert_eq!(reprs.representation(value), Representation::Float64);
+
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(1, 1))
+            .expect("allocate Float64");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify Float64 allocation");
+
+        assert_eq!(
+            allocation.location(value),
+            Location::Register(RegClass::Fp, 0)
+        );
+        assert_eq!(allocation.spill_slot_counts, SpillSlotCounts::default());
+    }
+
+    #[test]
+    fn mixed_values_use_same_index_without_cross_class_interference() {
+        let (cfg, ssa, liveness, reprs) = analyses_with_feedback(
+            0,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(2)]),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(1), Operand::ConstIndex(0)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[(2, ARITH_FLOAT64)],
+        );
+        let int_value = op_value_at(&ssa, 0);
+        let float_value = op_value_at(&ssa, 1);
+        assert_eq!(reprs.representation(int_value), Representation::Int32);
+        assert_eq!(reprs.representation(float_value), Representation::Float64);
+
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(1, 2))
+            .expect("allocate mixed classes");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify mixed allocation");
+
+        assert!(intervals_overlap(
+            allocation.intervals[int_value.0 as usize],
+            allocation.intervals[float_value.0 as usize]
+        ));
+        assert_eq!(
+            allocation.location(int_value),
+            Location::Register(RegClass::Gpr, 0)
+        );
+        assert_eq!(
+            allocation.location(float_value),
+            Location::Register(RegClass::Fp, 0)
         );
     }
 
     #[test]
+    fn forced_fp_spill_uses_fp_spill_namespace() {
+        let (cfg, ssa, liveness, reprs) = analyses_with_feedback(
+            0,
+            3,
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(1), Operand::ConstIndex(1)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[(2, ARITH_FLOAT64)],
+        );
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(3, 1))
+            .expect("allocate with one FP register");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify forced FP spill");
+
+        assert_eq!(allocation.spill_slot_counts.gpr, 0);
+        assert!(allocation.spill_slot_counts.fp > 0);
+        assert!(
+            allocation
+                .locations
+                .iter()
+                .any(|location| matches!(location, Location::Spill(RegClass::Fp, _)))
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_location_from_wrong_class() {
+        let (cfg, ssa, liveness, reprs) = analyses(
+            0,
+            1,
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        let value = op_value_at(&ssa, 0);
+        let mut allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(1, 1))
+            .expect("allocate Float64");
+        allocation.locations[value.0 as usize] = Location::Register(RegClass::Gpr, 0);
+
+        assert_eq!(
+            allocation.verify(&ssa, &cfg, &liveness, &reprs),
+            Err(RegallocError::LocationClassMismatch {
+                value,
+                expected: RegClass::Fp,
+                actual: RegClass::Gpr,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_float64_phi_with_gpr_input() {
+        let (cfg, ssa, liveness, reprs) = analyses_with_feedback(
+            1,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(8)]),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(2)]),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(0)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(7)]),
+                (Op::Jump, vec![Operand::Imm32(1)]),
+                (
+                    Op::Div,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+            &[(5, ARITH_FLOAT64)],
+        );
+        let join = block_at(&cfg, 6);
+        let phi = phi_for(&ssa, join, 1);
+        assert_eq!(reprs.representation(phi), Representation::Float64);
+
+        assert!(matches!(
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(3, 3)),
+            Err(RegallocError::PhiClassMismatch {
+                phi: actual_phi,
+                expected: RegClass::Fp,
+                actual: RegClass::Gpr,
+                ..
+            }) if actual_phi == phi
+        ));
+    }
+
+    #[test]
     fn verifier_rejects_overlapping_values_in_one_register() {
-        let (cfg, ssa, liveness) = analyses(
+        let (cfg, ssa, liveness, reprs) = analyses(
             3,
             4,
             vec![
@@ -1461,13 +1956,20 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(3)]),
             ],
         );
-        let mut allocation = Allocation::compute(&ssa, &cfg, &liveness, 8).expect("allocate");
+        let mut allocation =
+            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(8, 8)).expect("allocate");
         let mut pair = None;
         for first in 0..allocation.intervals.len() {
             for second in (first + 1)..allocation.intervals.len() {
                 if intervals_overlap(allocation.intervals[first], allocation.intervals[second])
-                    && matches!(allocation.locations[first], Location::Register(_))
-                    && matches!(allocation.locations[second], Location::Register(_))
+                    && matches!(
+                        allocation.locations[first],
+                        Location::Register(RegClass::Gpr, _)
+                    )
+                    && matches!(
+                        allocation.locations[second],
+                        Location::Register(RegClass::Gpr, _)
+                    )
                 {
                     pair = Some((first, second));
                     break;
@@ -1481,7 +1983,7 @@ mod tests {
         allocation.locations[second] = allocation.locations[first];
 
         assert!(matches!(
-            allocation.verify(&ssa, &cfg, &liveness),
+            allocation.verify(&ssa, &cfg, &liveness, &reprs),
             Err(RegallocError::RegisterInterference {
                 first: actual_first,
                 second: actual_second,

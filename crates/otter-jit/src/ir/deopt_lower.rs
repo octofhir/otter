@@ -10,7 +10,8 @@
 //! - Every abstract canonical-PC state maps to exactly one concrete byte-PC state.
 //! - Concrete slots are register-count wide and remain in interpreter-register order.
 //! - Register allocation locations and selected representations are recomputed per slot.
-//! - Spill indices map deterministically to aligned stack-byte offsets.
+//! - GPR deopt register IDs and spill offsets retain their existing numbering;
+//!   FP registers and spills follow their GPR namespace to prevent collisions.
 //! - A missing abstract value maps to a register-specific undefined constant with a
 //!   tagged representation, keeping multiple dead registers location-distinct.
 //!
@@ -32,7 +33,7 @@ use otter_vm::{
 
 use super::{
     frame_state::FrameStateTable,
-    regalloc::{Allocation, Location},
+    regalloc::{Allocation, Location, RegClass},
     repr::{ReprError, ReprMap, Representation},
     ssa::{SsaFunction, ValueId},
 };
@@ -56,6 +57,15 @@ pub enum DeoptLoweringError {
         expected: usize,
         /// Number of stored allocation locations.
         actual: usize,
+    },
+    /// A value allocation belongs to a different class than its representation.
+    AllocationClassMismatch {
+        /// Value with the invalid allocation.
+        value: ValueId,
+        /// Representation-derived register class.
+        expected: RegClass,
+        /// Class stored in the allocation.
+        actual: RegClass,
     },
     /// Abstract frame-state coverage differs from the snapshot instruction count.
     AbstractStateCountMismatch {
@@ -109,6 +119,8 @@ pub enum DeoptLoweringError {
     MachineRegisterOutOfRange {
         /// Value with the invalid allocation.
         value: ValueId,
+        /// Register class containing the invalid index.
+        class: RegClass,
         /// Invalid backend register index.
         register: u8,
         /// Number of registers available to values.
@@ -118,6 +130,8 @@ pub enum DeoptLoweringError {
     SpillSlotOutOfRange {
         /// Value with the invalid allocation.
         value: ValueId,
+        /// Spill namespace containing the invalid slot.
+        class: RegClass,
         /// Invalid spill-slot index.
         slot: u32,
         /// Number of allocated spill slots.
@@ -405,29 +419,61 @@ fn lower_slot(
             value_count: ssa.values.len(),
         });
     }
-    let location = match allocation.location(value) {
-        Location::Register(allocated) => {
-            if allocated >= allocation.register_count {
+    let representation = reprs.representation(value);
+    let expected_class = RegClass::from_representation(representation);
+    let allocated_location = allocation.location(value);
+    if allocated_location.class() != expected_class {
+        return Err(DeoptLoweringError::AllocationClassMismatch {
+            value,
+            expected: expected_class,
+            actual: allocated_location.class(),
+        });
+    }
+    let location = match allocated_location {
+        Location::Register(class, allocated) => {
+            let register_count = match class {
+                RegClass::Gpr => allocation.register_budget.gpr,
+                RegClass::Fp => allocation.register_budget.fp,
+            };
+            if allocated >= register_count {
                 return Err(DeoptLoweringError::MachineRegisterOutOfRange {
                     value,
+                    class,
                     register: allocated,
-                    register_count: allocation.register_count,
+                    register_count,
                 });
             }
-            DeoptLocation::Register(u16::from(allocated))
+            let unified = match class {
+                RegClass::Gpr => u16::from(allocated),
+                RegClass::Fp => u16::from(allocation.register_budget.gpr) + u16::from(allocated),
+            };
+            DeoptLocation::Register(unified)
         }
-        Location::Spill(slot) => {
-            if slot >= allocation.spill_slot_count {
+        Location::Spill(class, slot) => {
+            let spill_slot_count = match class {
+                RegClass::Gpr => allocation.spill_slot_counts.gpr,
+                RegClass::Fp => allocation.spill_slot_counts.fp,
+            };
+            if slot >= spill_slot_count {
                 return Err(DeoptLoweringError::SpillSlotOutOfRange {
                     value,
+                    class,
                     slot,
-                    spill_slot_count: allocation.spill_slot_count,
+                    spill_slot_count,
                 });
             }
-            DeoptLocation::StackSlot(spill_offset(slot)?)
+            let unified = match class {
+                RegClass::Gpr => slot,
+                RegClass::Fp => allocation
+                    .spill_slot_counts
+                    .gpr
+                    .checked_add(slot)
+                    .ok_or(DeoptLoweringError::SpillSlotOffsetOverflow { slot })?,
+            };
+            DeoptLocation::StackSlot(spill_offset(unified)?)
         }
     };
-    let repr = match reprs.representation(value) {
+    let repr = match representation {
         Representation::Int32 => DeoptRepr::Int32,
         Representation::Float64 => DeoptRepr::Float64,
         Representation::Tagged => DeoptRepr::Tagged,
@@ -462,14 +508,20 @@ fn verify_limits(
     ssa: &SsaFunction,
     allocation: &Allocation,
 ) -> Result<DeoptVerifyLimits, DeoptLoweringError> {
-    let max_stack_slot_offset = if allocation.spill_slot_count == 0 {
+    let spill_slot_count = allocation
+        .spill_slot_counts
+        .gpr
+        .checked_add(allocation.spill_slot_counts.fp)
+        .ok_or(DeoptLoweringError::SpillSlotOffsetOverflow { slot: u32::MAX })?;
+    let max_stack_slot_offset = if spill_slot_count == 0 {
         0
     } else {
-        spill_offset(allocation.spill_slot_count - 1)?
+        spill_offset(spill_slot_count - 1)?
     };
     Ok(DeoptVerifyLimits {
         max_frame_slots: usize::from(ssa.register_count),
-        machine_register_count: u16::from(allocation.register_count),
+        machine_register_count: u16::from(allocation.register_budget.gpr)
+            + u16::from(allocation.register_budget.fp),
         min_stack_slot_offset: 0,
         max_stack_slot_offset,
         constant_count: u32::from(ssa.register_count),
@@ -482,11 +534,14 @@ mod tests {
     use otter_vm::{
         deopt::{DeoptVerifyError, DeoptVerifyLimits},
         jit::JitTestInstruction,
-        jit_feedback::{ARITH_INT32, ArithFeedback},
+        jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
     };
 
     use super::*;
-    use crate::ir::{cfg::ControlFlowGraph, dom::DominatorTree, liveness::Liveness, ssa::ValueDef};
+    use crate::ir::{
+        cfg::ControlFlowGraph, dom::DominatorTree, liveness::Liveness, regalloc::RegisterBudget,
+        ssa::ValueDef,
+    };
 
     struct Pipeline {
         view: JitCompileSnapshot,
@@ -499,7 +554,7 @@ mod tests {
     fn pipeline(
         param_count: u16,
         register_count: u16,
-        machine_register_count: u8,
+        register_budget: RegisterBudget,
         instructions: Vec<(Op, Vec<Operand>)>,
         feedback: &[(u32, u8)],
     ) -> Pipeline {
@@ -524,17 +579,17 @@ mod tests {
         liveness
             .verify(&ssa, &cfg, &dom)
             .expect("liveness verifies");
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, machine_register_count)
+        let reprs = ReprMap::compute(&view, &ssa);
+        reprs.verify(&view, &ssa).expect("representations verify");
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, register_budget)
             .expect("allocation computes");
         allocation
-            .verify(&ssa, &cfg, &liveness)
+            .verify(&ssa, &cfg, &liveness, &reprs)
             .expect("allocation verifies");
         let frame_states = FrameStateTable::build(&ssa, &cfg).expect("frame states build");
         frame_states
             .verify(&ssa, &cfg, &dom)
             .expect("frame states verify");
-        let reprs = ReprMap::compute(&view, &ssa);
-        reprs.verify(&view, &ssa).expect("representations verify");
         Pipeline {
             view,
             ssa,
@@ -542,6 +597,10 @@ mod tests {
             allocation,
             reprs,
         }
+    }
+
+    const fn budget(gpr: u8, fp: u8) -> RegisterBudget {
+        RegisterBudget { gpr, fp }
     }
 
     fn lower(pipeline: &Pipeline) -> DeoptLowering {
@@ -581,7 +640,7 @@ mod tests {
         let pipeline = pipeline(
             0,
             1,
-            8,
+            budget(8, 8),
             vec![
                 (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(9)]),
                 (Op::Nop, vec![]),
@@ -619,11 +678,49 @@ mod tests {
     }
 
     #[test]
+    fn float64_fp_register_uses_disjoint_deopt_register_id() {
+        let pipeline = pipeline(
+            0,
+            1,
+            budget(3, 1),
+            vec![
+                (
+                    Op::LoadNumber,
+                    vec![Operand::Register(0), Operand::ConstIndex(0)],
+                ),
+                (Op::Nop, vec![]),
+                (Op::ReturnUndefined, vec![]),
+            ],
+            &[(0, ARITH_FLOAT64)],
+        );
+        let value = op_value_at(&pipeline.ssa, 0);
+        assert_eq!(
+            pipeline.allocation.location(value),
+            Location::Register(RegClass::Fp, 0)
+        );
+
+        let lowering = lower(&pipeline);
+        let slot = concrete_at(&lowering, &pipeline, 1).slots[0];
+        assert_eq!(slot.repr, DeoptRepr::Float64);
+        assert_eq!(slot.location, DeoptLocation::Register(3));
+        assert_eq!(
+            lowering.verify(
+                &pipeline.view,
+                &pipeline.ssa,
+                &pipeline.frame_states,
+                &pipeline.allocation,
+                &pipeline.reprs,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn spilled_value_maps_to_stack_slot() {
         let pipeline = pipeline(
             2,
             3,
-            1,
+            budget(1, 1),
             vec![
                 (
                     Op::Add,
@@ -644,8 +741,8 @@ mod tests {
             .iter()
             .enumerate()
             .find_map(|(value, location)| match location {
-                Location::Spill(slot) => Some((ValueId(value as u32), *slot)),
-                Location::Register(_) => None,
+                Location::Spill(RegClass::Gpr, slot) => Some((ValueId(value as u32), *slot)),
+                Location::Register(_, _) | Location::Spill(RegClass::Fp, _) => None,
             })
             .expect("one-register allocation spills");
         let (pc, register) = pipeline
@@ -683,7 +780,7 @@ mod tests {
         let pipeline = pipeline(
             0,
             1,
-            4,
+            budget(4, 4),
             vec![
                 (Op::LoadUndefined, vec![Operand::Register(0)]),
                 (Op::Nop, vec![]),
@@ -713,7 +810,7 @@ mod tests {
         let pipeline = pipeline(
             0,
             1,
-            4,
+            budget(4, 4),
             vec![
                 (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
                 (Op::Nop, vec![]),
@@ -755,7 +852,7 @@ mod tests {
         let pipeline = pipeline(
             0,
             1,
-            4,
+            budget(4, 4),
             vec![
                 (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
                 (Op::Nop, vec![]),
@@ -814,7 +911,7 @@ mod tests {
         let pipeline = pipeline(
             0,
             1,
-            4,
+            budget(4, 4),
             vec![
                 (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
                 (Op::Nop, vec![]),

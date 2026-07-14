@@ -230,6 +230,7 @@ impl Interpreter {
             property_ic_stats: property_ic::PropertyIcStats::default(),
             jit_hook: None,
             jit_call_counts: rustc_hash::FxHashMap::default(),
+            optimizing_tier_policy: tier_policy::TierPolicy::default(),
             jit_call_site_feedback: call_feedback::CallSiteFeedbackTable::new(),
             jit_method_site_feedback: Vec::new(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),

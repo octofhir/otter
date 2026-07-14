@@ -998,3 +998,20 @@ Interpreter/template parity holds for a `new Map`/`new Set`/`new WeakRef`/
 under GC stress strides 1 through 16, and targeted Test262 `built-ins/WeakRef`
 (28/29) and `built-ins/FinalizationRegistry` (46/47) passed with 0
 failures/crashes. The frozen full Test262 reference remains 99.02%.
+
+### Phase 2 production class-construction completion
+
+`BindThisValue`, `ClassCheck`, and `SetFunctionName` now compile through
+reentrant runtime stub 68. Their interpreter-dispatch bodies were extracted into
+single-implementation register helpers (`run_bind_this_value_reg`,
+`run_class_check_reg`, `run_set_function_name_reg`) that both the interpreter and
+the compiled transition call, so derived-constructor `super()` binding, class
+heritage `IsConstructor` validation, static-`prototype` rejection, and anonymous
+function naming are identical across tiers. No class semantics are duplicated in
+JIT code. Template coverage is 125 of 172 active opcodes (up from 122); 47
+remain unsupported. Interpreter/template parity holds for a derived-constructor
+instantiation loop; the release differential corpus passed 11/11 under GC stress
+strides 1 through 16, and targeted Test262 `language/statements/class` was
+4,351/4,369 — the four failures reproduce identically under interpreter-only
+execution (tier-independent pre-existing baseline). The frozen full Test262
+reference remains 99.02%.

@@ -1050,6 +1050,18 @@ pub const STUB_JIT_STRUCTURAL_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes class-construction opcodes (`BindThisValue`, `ClassCheck`,
+/// `SetFunctionName`) through the VM's class helpers.
+pub const STUB_JIT_CLASS_OP: RuntimeStubDescriptor = descriptor(
+    68,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1121,6 +1133,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         65 => "jit_value_load_op",
         66 => "jit_construct_op",
         67 => "jit_structural_op",
+        68 => "jit_class_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1194,6 +1207,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_VALUE_LOAD_OP,
     STUB_JIT_CONSTRUCT_OP,
     STUB_JIT_STRUCTURAL_OP,
+    STUB_JIT_CLASS_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -1,91 +1,62 @@
 //! Feedback-guided optimizing tier for reducible numeric arithmetic functions.
 //!
-//! This module compiles multi-block int32 and float64 arithmetic leaves, including
-//! reducible loops entered only at function entry. It runs
+//! This module compiles multi-block int32 and float64 arithmetic functions,
+//! including reducible loops entered only at function entry. It runs
 //! the complete CFG, dominance, SSA, liveness, register-allocation,
 //! representation, frame-state, and deopt-lowering pipeline before the arm64
 //! backend checks the deliberately narrow eligibility contract. CFG edges
 //! carry sequentialized phi moves, while every back-edge polls the VM thread's
 //! interrupt and fuel cells before returning to its dominating header.
-//! Installed code reconstructs the interpreter register file in place before
-//! every deopt.
+//! Installed code enters through the shared reentrant `JitCtx` ABI and
+//! reconstructs the interpreter register window in place before every bail.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
-//! - [`OptimizedLeafEntry`] and [`OptimizedLeafRet`] — production leaf ABI.
 //!
 //! # Invariants
-//! - Entries are leaves: they never allocate, call, safepoint, or re-enter the VM.
+//! - Current entries emit no allocating/reentrant operation or safepoint, but
+//!   use the same runtime-capable `JitCtx` and published frame as the template
+//!   tier so later operations can cross that boundary safely.
 //! - Every backwards bytecode edge targets a header that dominates its predecessor;
 //!   irreducible loops and exception edges are rejected.
-//! - ABI arguments `x0`, `x1`, and `x2` point to tagged `u64` parameters, the
-//!   interpreter register file, and a dynamically valid [`VmThread`]. A
-//!   two-word return uses `x0` for a boxed result or deopt byte PC and `x1` for
-//!   status.
+//! - The sole ABI argument is a dynamically valid `JitCtx`; parameters and
+//!   deopt writeback both use its rooted interpreter register window.
+//! - A two-word `JitRet` uses `x0` for a boxed returned value and `x1` for
+//!   `RETURNED`, `BAILED`, or `THREW` status.
 //! - Phi moves execute before a back-edge poll. Interrupt or exhausted fuel
-//!   deopts at the target header so the interpreter owns cancellation/refill.
+//!   bails at the target header so the interpreter owns cancellation/refill.
 //! - Tagged int32 values are `(0xfffe << 48) | payload_u32`; boxed doubles use
 //!   the VM's frozen NaN-box encoding and canonical NaN representation.
-//! - Deopt writeback is generated from the same [`DeoptTable`] published with
-//!   the code object; every interpreter register is materialized before return.
+//! - Bail writeback is generated from the same [`DeoptTable`] published with
+//!   the code object; every interpreter register and the exact logical resume
+//!   PC are published before return.
 //!
 //! # See also
 //! - [`crate::ir`] — the reusable optimizing analyses consumed here.
 //! - [`crate::template`] — the runtime-wired baseline compiler.
 
 use otter_vm::{
-    JitCompileSnapshot, JitExecOutcome, JitFunctionCode, JitOptimizedExecOutcome, Value,
+    JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
     deopt::DeoptTable,
-    native_abi::{
-        BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION, VmThread,
-    },
+    native_abi::{BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION},
 };
 
-use crate::{CompiledCode, Unsupported};
+use crate::{CompiledCode, Unsupported, entry::enter_compiled};
 
 #[cfg(target_arch = "aarch64")]
 mod arm64;
 
-/// Successful standalone optimizing-leaf status.
-pub const OPTIMIZED_STATUS_RETURNED: u64 = crate::entry::STATUS_RETURNED;
-/// Speculation-failure standalone optimizing-leaf status.
-pub const OPTIMIZED_STATUS_DEOPT: u64 = crate::entry::STATUS_DEOPT;
-
-/// Two-word return of an [`OptimizedLeafEntry`].
-///
-/// On [`OPTIMIZED_STATUS_RETURNED`], `value` is a boxed numeric value. On
-/// [`OPTIMIZED_STATUS_DEOPT`], `value` is the exact interpreter byte PC whose
-/// speculation failed.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OptimizedLeafRet {
-    /// Boxed return value or exact deopt byte PC, selected by [`Self::status`].
-    pub value: u64,
-    /// [`OPTIMIZED_STATUS_RETURNED`] or [`OPTIMIZED_STATUS_DEOPT`].
-    pub status: u64,
-}
-
-/// Optimizing-leaf calling convention.
-///
-/// The first pointer names a contiguous tagged-`u64` parameter array, the
-/// second names the writable interpreter register file, and the third names
-/// the VM thread record whose interrupt and back-edge-fuel cells remain valid
-/// for the call's dynamic extent. On arm64 they arrive in `x0`/`x1`/`x2`;
-/// [`OptimizedLeafRet`] returns in `x0`/`x1` per AAPCS64.
-pub type OptimizedLeafEntry =
-    extern "C" fn(*const u64, *mut u64, *mut VmThread) -> OptimizedLeafRet;
-
-/// Deterministic metadata for one optimized leaf compilation.
+/// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizedMetadata {
     /// Isolate-assigned identity supplied to [`compile_optimized`].
     pub code_object_id: u64,
     /// Source bytecode function identity.
     pub function_id: u32,
-    /// Number of tagged parameters consumed by the leaf ABI.
+    /// Number of tagged parameters read from the entry register window.
     pub param_count: u16,
-    /// Number of writable interpreter registers reconstructed on deopt.
+    /// Number of writable interpreter registers reconstructed on bail.
     pub register_count: u16,
     /// Total number of allocatable GPR and FP registers used by linear scan.
     pub machine_register_count: u8,
@@ -95,7 +66,7 @@ pub struct OptimizedMetadata {
     pub spill_slot_count: u32,
 }
 
-/// Finalized optimizing-leaf code and its exact-PC deoptimization metadata.
+/// Finalized optimizing code and its exact-PC deoptimization metadata.
 pub struct OptimizedCode {
     code: CompiledCode,
     deopt_table: DeoptTable,
@@ -109,7 +80,7 @@ impl OptimizedCode {
         deopt_table: DeoptTable,
         metadata: OptimizedMetadata,
     ) -> Self {
-        const AARCH64_OPTIMIZED_LEAF_ABI: u64 = 0x4136_344f_5054_0003;
+        const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0004;
         let code_metadata = CodeObjectMetadata {
             id: metadata.code_object_id,
             code_block_id: metadata.function_id,
@@ -123,7 +94,7 @@ impl OptimizedCode {
             layout: LayoutVersionRecord::CURRENT,
             build: BuildVersionRecord {
                 vm_build: VM_BUILD_VERSION,
-                target_abi: AARCH64_OPTIMIZED_LEAF_ABI,
+                target_abi: AARCH64_OPTIMIZED_JIT_CTX_ABI,
             },
         };
         Self {
@@ -176,37 +147,24 @@ impl JitFunctionCode for OptimizedCode {
         JitExecOutcome::Threw(otter_vm::VmError::InvalidOperand)
     }
 
-    fn run_optimized_entry(
-        &self,
-        params: &[u64],
-        frame_registers: &mut [Value],
-        thread: *mut VmThread,
-    ) -> Option<JitOptimizedExecOutcome> {
-        if params.len() < usize::from(self.metadata.param_count)
-            || frame_registers.len() < usize::from(self.metadata.register_count)
-            || thread.is_null()
-        {
+    fn run_optimized_entry(&self, activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
+        if !self.code_metadata.is_compatible_with_current_vm() {
             return None;
         }
-        // SAFETY: the compiler emitted `OptimizedLeafEntry`, this object owns
-        // the executable mapping through the call, and both slices satisfy the
-        // lengths recorded in immutable compilation metadata. The VM-owned
-        // thread record and its poll cells remain live until this call returns.
-        let entry: OptimizedLeafEntry = unsafe { std::mem::transmute(self.code.entry_ptr()) };
-        let result = entry(
-            params.as_ptr(),
-            frame_registers.as_mut_ptr().cast::<u64>(),
-            thread,
-        );
-        match result.status {
-            OPTIMIZED_STATUS_RETURNED => Some(JitOptimizedExecOutcome::Returned(Value::from_bits(
-                result.value,
-            ))),
-            OPTIMIZED_STATUS_DEOPT if self.deopt_table.lookup(result.value as u32).is_some() => {
-                Some(JitOptimizedExecOutcome::Deopt(result.value as u32))
-            }
-            _ => None,
-        }
+        // SAFETY: this object owns the live executable mapping, whose entry was
+        // emitted with the shared `JitCtx` ABI. `activation` carries the VM's
+        // frozen-borrow contract for the dynamic call.
+        let entry = unsafe { self.code.entry_ptr() };
+        Some(unsafe {
+            enter_compiled(
+                activation,
+                entry,
+                self.metadata.code_object_id,
+                self.metadata.function_id,
+                self.metadata.register_count,
+                false,
+            )
+        })
     }
 }
 

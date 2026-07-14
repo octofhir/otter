@@ -24,10 +24,10 @@
 //! - Baseline code uses the interpreter frame register array as its precise root
 //!   provider. Values may be cached in machine registers only between
 //!   safepoints; allocation and call slow paths must reload from frame slots.
-//! - Optimized leaves allocate and call nowhere; before deopt they reconstruct
-//!   every interpreter register in the same rooted frame array. Their VM thread
-//!   pointer is valid only for the dynamic entry call and exposes cooperative
-//!   interrupt/fuel cells, not a retained runtime capability.
+//! - Optimized entries use the same runtime activation and published native
+//!   frame as baseline entries. Before bailing they reconstruct every
+//!   interpreter register in the rooted frame window and publish the exact
+//!   logical resume PC.
 //!
 //! # See also
 //! - [`crate::execution_context`] for snapshot creation from frozen bytecode.
@@ -884,16 +884,6 @@ pub enum JitExecOutcome {
     Threw(crate::run_control::VmError),
 }
 
-/// Outcome of entering a leaf from the feedback-guided optimizing tier.
-#[derive(Debug)]
-pub enum JitOptimizedExecOutcome {
-    /// The optimized leaf completed and returned one boxed value.
-    Returned(crate::Value),
-    /// Speculation failed after the generated exit reconstructed the complete
-    /// interpreter register file; carries the exact interpreter byte PC.
-    Deopt(u32),
-}
-
 /// Type-erased compiled-code handle owned by the JIT implementation.
 ///
 /// The JIT implementation owns executable memory and the unsafe ABI calls. The
@@ -969,19 +959,12 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// stack throughout, so allocation/calls in the body are GC-safe.
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome;
 
-    /// Execute this object through the optimizing-leaf ABI.
+    /// Execute this object through the optimizing entry ABI.
     ///
     /// The default identifies baseline/template objects. Optimized code owns
-    /// the unsafe machine entry and returns `Some` only after validating the
-    /// supplied parameter and frame-register windows. `thread` names a
-    /// call-scoped machine-visible record whose poll-cell pointers stay valid
-    /// until this method returns.
-    fn run_optimized_entry(
-        &self,
-        _params: &[u64],
-        _frame_registers: &mut [crate::Value],
-        _thread: *mut crate::native_abi::VmThread,
-    ) -> Option<JitOptimizedExecOutcome> {
+    /// the unsafe machine entry and uses the activation to publish the same
+    /// runtime-capable context and native frame as [`Self::run_entry`].
+    fn run_optimized_entry(&self, _activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
         None
     }
 

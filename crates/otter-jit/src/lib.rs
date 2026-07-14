@@ -12,6 +12,7 @@
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
 //! - [`ir`] — backend-independent analysis structures for optimizing compilers.
+//! - [`optimizing`] — the unwired single-block int32 optimizing compiler.
 //!
 //! # Invariants
 //! - **`unsafe` is contained here.** This crate lifts the workspace
@@ -40,10 +41,12 @@
 mod code;
 mod entry;
 pub mod ir;
+pub mod optimizing;
 mod template;
 
 pub use code::CompiledCode;
 pub use entry::{TransitionTable, Unsupported};
+pub use optimizing::{OptimizedCode, compile_optimized};
 pub use template::{TemplateCode, compile};
 
 /// Baseline JIT compiler implementation wired into `otter-vm` through the

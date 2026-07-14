@@ -249,6 +249,14 @@ pub(crate) struct ConditionalBranchOperands {
     pub(crate) condition: u16,
 }
 
+/// Dynamic-eval-aware captured binding read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShadowedUpvalueOperands {
+    pub(crate) dst: u16,
+    pub(crate) name: u32,
+    pub(crate) index: i32,
+}
+
 /// Pre-resolved handlers installed by `EnterTry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExceptionRegionOperands {
@@ -293,6 +301,7 @@ enum LoweredOperands {
     Triple(TripleOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
+    ShadowedUpvalue(ShadowedUpvalueOperands),
     ExceptionRegion(ExceptionRegionOperands),
     JumpViaFinally(JumpViaFinallyOperands),
 }
@@ -491,6 +500,15 @@ impl LoweredInstr {
             LoweredOperands::ConditionalBranch(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape(
                 "lowered conditional branch operands",
+            )),
+        }
+    }
+
+    pub(crate) fn shadowed_upvalue_operands(self) -> Result<ShadowedUpvalueOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ShadowedUpvalue(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape(
+                "lowered LoadShadowedUpvalue operands",
             )),
         }
     }
@@ -896,6 +914,13 @@ impl BaselinePlan {
                         index: imm32(operands, 1)?,
                     })
                 }
+                Op::LoadShadowedUpvalue => {
+                    LoweredOperands::ShadowedUpvalue(ShadowedUpvalueOperands {
+                        dst: reg(operands, 0)?,
+                        name: const_index(operands, 1)?,
+                        index: imm32(operands, 2)?,
+                    })
+                }
                 Op::Add
                 | Op::Sub
                 | Op::Mul
@@ -932,7 +957,11 @@ impl BaselinePlan {
         for (instr, lowered) in view.instructions.iter().zip(&mut instructions) {
             if matches!(
                 lowered.op,
-                Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpViaFinally
+                Op::Jump
+                    | Op::JumpIfFalse
+                    | Op::JumpIfTrue
+                    | Op::JumpIfNullish
+                    | Op::JumpViaFinally
             ) {
                 let rel = imm32(instr.operand_view(code_block), 0)?;
                 let target = branch_target(code_block, instr, rel);
@@ -952,7 +981,7 @@ impl BaselinePlan {
                             floor,
                         })
                     }
-                    Op::JumpIfFalse | Op::JumpIfTrue => {
+                    Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNullish => {
                         LoweredOperands::ConditionalBranch(ConditionalBranchOperands {
                             target: target_pc,
                             condition: reg(instr.operand_view(code_block), 1)?,

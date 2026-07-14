@@ -1087,6 +1087,18 @@ pub const STUB_JIT_STATIC_CALL_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes dynamic control-family reads (`LoadShadowedUpvalue`) through the
+/// VM's shared dynamic-environment/upvalue helper.
+pub const STUB_JIT_CONTROL_OP: RuntimeStubDescriptor = descriptor(
+    71,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1161,6 +1173,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         68 => "jit_class_op",
         69 => "jit_variadic_op",
         70 => "jit_static_call_op",
+        71 => "jit_control_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1237,6 +1250,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CLASS_OP,
     STUB_JIT_VARIADIC_OP,
     STUB_JIT_STATIC_CALL_OP,
+    STUB_JIT_CONTROL_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

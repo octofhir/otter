@@ -1509,26 +1509,7 @@ impl Interpreter {
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let uv_idx = context.exec_imm32(instr, 2).unwrap_or(0) as usize;
                     let frame = &mut stack[top_idx];
-                    if let Some(name) = context.string_constant_str(name_idx)
-                        && let Some(cell) = self
-                            .frame_cold(frame)
-                            .and_then(|cold| cold.eval_vars.as_ref())
-                            .and_then(|map| map.get(name))
-                            .copied()
-                    {
-                        let value = crate::read_upvalue(&self.gc_heap, cell);
-                        write_register(frame, dst, value)?;
-                        frame.advance_pc()?;
-                        continue;
-                    }
-                    let cell = frame
-                        .upvalues
-                        .get(uv_idx)
-                        .copied()
-                        .ok_or_else(|| VmError::InvalidOperand)?;
-                    let value = crate::read_upvalue(&self.gc_heap, cell);
-                    write_register(frame, dst, value)?;
-                    frame.advance_pc()?;
+                    self.run_load_shadowed_upvalue_reg(context, frame, dst, name_idx, uv_idx)?;
                     continue;
                 }
                 Op::LoadDynamic => {

@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`cfg`] — typed bytecode basic blocks and complete control-flow edges.
 //! - [`dom`] — dominator tree and dominance-frontier analyses.
+//! - [`liveness`] — backward SSA-value liveness over normal control edges.
 //! - [`ssa`] — Cytron SSA construction over bytecode virtual registers.
 //!
 //! # Invariants
@@ -15,4 +16,5 @@
 
 pub mod cfg;
 pub mod dom;
+pub mod liveness;
 pub mod ssa;

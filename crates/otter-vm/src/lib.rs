@@ -105,6 +105,7 @@ mod jit_exception_ops;
 pub mod jit_feedback;
 mod jit_global_ops;
 mod jit_iterator_ops;
+mod jit_object_protocol_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
 pub mod js_surface;

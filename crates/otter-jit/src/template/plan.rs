@@ -317,6 +317,17 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one object property-protocol query (`Instanceof`,
+    /// `HasProperty`, `GetPrototype`, `SetPrototype`) through the shared
+    /// reentrant transition. Proxy `has`/`getPrototypeOf`/`setPrototypeOf` and
+    /// `@@hasInstance` traps fire in the VM. `arg0`/`arg1`/`arg2` name the
+    /// operand registers per opcode.
+    ObjectProtocolOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -827,6 +838,24 @@ impl TemplatePlan {
                         arg0: u64::from(operands.value),
                         arg1: u64::from(operands.name),
                         arg2: u64::from(operands.extra),
+                    }
+                }
+                Op::Instanceof | Op::HasProperty => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::ObjectProtocolOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
+                    }
+                }
+                Op::GetPrototype | Op::SetPrototype => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ObjectProtocolOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.src),
+                        arg2: 0,
                     }
                 }
                 Op::LessThan

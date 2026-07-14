@@ -37,6 +37,7 @@ mod functions;
 mod globals;
 mod iterators;
 mod properties;
+mod protocol;
 mod transitions;
 mod values;
 
@@ -646,6 +647,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 globals::emit_global_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ObjectProtocolOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                protocol::emit_object_protocol_op(
                     &mut ops,
                     transitions,
                     opcode,

@@ -5647,10 +5647,15 @@ impl Interpreter {
             )?;
             return Ok(true);
         }
-        if let (Some(obj), Some(key_string)) = (rhs.as_object(), lhs.as_string(&self.gc_heap)) {
-            let site = context
-                .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
-                .ok_or(VmError::InvalidOperand)?;
+        // The has-property IC is a pure fast-path optimization keyed by the
+        // interpreter's per-site pc. A compiled frame completing `in` through
+        // this driver has no such site, so an absent site simply skips the IC
+        // and falls through to the spec funnel below.
+        if let (Some(obj), Some(key_string), Some(site)) = (
+            rhs.as_object(),
+            lhs.as_string(&self.gc_heap),
+            context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc),
+        ) {
             let mut site_disabled = self.has_property_ics[site].is_megamorphic();
             let entries_len = self.has_property_ics[site].entry_count();
             let mut probe_hit = false;

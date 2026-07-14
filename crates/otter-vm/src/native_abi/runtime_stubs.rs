@@ -949,6 +949,19 @@ pub const STUB_JIT_GLOBAL_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes object property-protocol queries (`instanceof`, `in`,
+/// `[[GetPrototypeOf]]`, `[[SetPrototypeOf]]`) — including Proxy traps —
+/// through the VM's Proxy-aware drivers and fast paths.
+pub const STUB_JIT_OBJECT_PROTOCOL_OP: RuntimeStubDescriptor = descriptor(
+    60,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1012,6 +1025,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         57 => "jit_iterator_op",
         58 => "jit_bind_function",
         59 => "jit_global_op",
+        60 => "jit_object_protocol_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1077,6 +1091,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_ITERATOR_OP,
     STUB_JIT_BIND_FUNCTION,
     STUB_JIT_GLOBAL_OP,
+    STUB_JIT_OBJECT_PROTOCOL_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

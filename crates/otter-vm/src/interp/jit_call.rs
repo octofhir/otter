@@ -456,7 +456,6 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        self.optimizing_tier_policy.record_hotness(fid, 1);
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
@@ -560,7 +559,6 @@ impl Interpreter {
                 .jit_code_registry
                 .is_compatible_for_entry(code.as_ref())
         {
-            self.optimizing_tier_policy.record_hotness(fid, 1);
             return Some(code.clone());
         }
         let code = self.jit_code.get(&fid)?.clone()?;
@@ -572,7 +570,6 @@ impl Interpreter {
             return None;
         }
         self.jit_code_cache = Some((fid, code.clone()));
-        self.optimizing_tier_policy.record_hotness(fid, 1);
         Some(code)
     }
 

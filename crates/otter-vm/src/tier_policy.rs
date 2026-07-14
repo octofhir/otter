@@ -2,19 +2,26 @@
 //!
 //! # Contents
 //! - [`OptimizingDecision`] classifies one function's current promotion state.
-//! - [`Interpreter::optimizing_tier_decision`] samples the function's feedback
-//!   epoch and returns the current classification.
-//! - [`TierPolicy`] owns saturating per-function hotness and feedback history.
+//! - [`Interpreter::optimizing_tier_decision`] derives the function's hotness
+//!   from the existing baseline call counter, samples its feedback epoch, and
+//!   returns the current classification.
+//! - [`TierPolicy`] owns per-function feedback-stability history only.
 //!
 //! # Invariants
 //! - The policy is deterministic and isolate-local; it reads no environment or
 //!   process-global state.
-//! - Promotion requires both sustained post-baseline hotness and an unchanged
-//!   feedback epoch across [`STABLE_SAMPLES`] consecutive checks.
+//! - It adds ZERO work to the interpreter hot path: hotness is read lazily from
+//!   the baseline call counter when a decision is queried, never accumulated
+//!   per call or per back-edge. Only [`Interpreter::optimizing_tier_decision`]
+//!   touches the policy table, and no execution path calls it yet.
+//! - Promotion requires both sustained hotness and an unchanged feedback epoch
+//!   across [`STABLE_SAMPLES`] consecutive checks.
 //! - A decision never compiles or installs code and is not consulted by the
 //!   baseline function-entry or loop-OSR paths.
 //! - All thresholds are provisional Phase 11 values to be tuned against real
-//!   workloads when the optimizing compiler lands in Phase 12.
+//!   workloads when the optimizing compiler lands in Phase 12; the hotness
+//!   source itself (baseline call count) is provisional and will be replaced by
+//!   dedicated post-baseline accounting when Phase 12 consumes this decision.
 //!
 //! # See also
 //! - [`crate::executable::CodeBlock::feedback_epoch`]
@@ -24,11 +31,9 @@ use rustc_hash::FxHashMap;
 
 use crate::Interpreter;
 
-/// Provisional optimizing-tier hotness threshold.
-///
-/// This is four times the default baseline loop-OSR threshold (and eighty
-/// times the baseline call threshold), so a candidate must remain hot well
-/// after baseline tier-up. Phase 12 will tune it against production workloads.
+/// Provisional optimizing-tier hotness threshold, compared against the baseline
+/// call counter so a candidate must stay hot well after baseline tier-up.
+/// Phase 12 will tune it against production workloads.
 pub const OPTIMIZING_HOTNESS_THRESHOLD: u32 = 4_000;
 
 /// Provisional number of consecutive unchanged feedback-epoch checks required
@@ -52,17 +57,12 @@ pub enum OptimizingDecision {
 
 #[derive(Debug, Default)]
 struct FunctionTierState {
-    hotness: u32,
     last_feedback_epoch: Option<u32>,
     stable_streak: u8,
     observed_feedback_change: bool,
 }
 
 impl FunctionTierState {
-    fn record_hotness(&mut self, amount: u32) {
-        self.hotness = self.hotness.saturating_add(amount);
-    }
-
     fn observe_feedback(&mut self, epoch: u32) {
         match self.last_feedback_epoch {
             None => {
@@ -81,9 +81,7 @@ impl FunctionTierState {
     }
 
     fn decision(&self) -> OptimizingDecision {
-        if self.hotness < OPTIMIZING_HOTNESS_THRESHOLD {
-            OptimizingDecision::Cold
-        } else if self.stable_streak >= STABLE_SAMPLES {
+        if self.stable_streak >= STABLE_SAMPLES {
             OptimizingDecision::Promote
         } else if self.observed_feedback_change {
             OptimizingDecision::FeedbackUnstable
@@ -95,37 +93,30 @@ impl FunctionTierState {
 
 /// Isolate-local promotion telemetry. No current execution path consumes its
 /// decisions; Phase 12 may consult it before requesting optimizing compilation.
+/// The table is touched only when a decision is queried — never on the hot path.
 #[derive(Debug, Default)]
 pub(crate) struct TierPolicy {
     functions: FxHashMap<u32, FunctionTierState>,
 }
 
 impl TierPolicy {
-    /// Add call or back-edge hotness without changing baseline counters.
-    pub(crate) fn record_hotness(&mut self, function_id: u32, amount: u32) {
-        self.functions
-            .entry(function_id)
-            .or_default()
-            .record_hotness(amount);
-    }
-
-    /// Sample `feedback_epoch`, then classify from the tracked state. The
-    /// classifier itself is pure; sampling mutates only this additive policy
-    /// table and cannot affect baseline tier-up.
+    /// Classify one function from its lazily-supplied baseline hotness and its
+    /// current feedback epoch. A cold function creates no state; a hot one
+    /// accumulates only feedback-stability history. This is the sole mutator of
+    /// the policy table and runs only from a decision query, never per call.
     fn sample_and_decide(
         &mut self,
         function_id: u32,
+        hotness: u32,
         feedback_epoch: Option<u32>,
     ) -> OptimizingDecision {
-        let Some(state) = self.functions.get_mut(&function_id) else {
-            return OptimizingDecision::Cold;
-        };
-        if state.hotness < OPTIMIZING_HOTNESS_THRESHOLD {
+        if hotness < OPTIMIZING_HOTNESS_THRESHOLD {
             return OptimizingDecision::Cold;
         }
         let Some(epoch) = feedback_epoch else {
             return OptimizingDecision::Cold;
         };
+        let state = self.functions.entry(function_id).or_default();
         state.observe_feedback(epoch);
         state.decision()
     }
@@ -141,9 +132,18 @@ impl Interpreter {
     /// installs, or executes JIT code, and no baseline path calls it.
     #[must_use]
     pub fn optimizing_tier_decision(&mut self, function_id: u32) -> OptimizingDecision {
+        // Hotness is read lazily from the existing baseline call counter, so the
+        // hot path pays nothing for this policy. (Provisional source — Phase 12
+        // replaces it with dedicated post-baseline accounting when it consumes
+        // the decision.)
+        let hotness = self
+            .jit_call_counts
+            .get(&function_id)
+            .copied()
+            .unwrap_or(0);
         let feedback_epoch = self.code_space.feedback_epoch(function_id);
         self.optimizing_tier_policy
-            .sample_and_decide(function_id, feedback_epoch)
+            .sample_and_decide(function_id, hotness, feedback_epoch)
     }
 }
 
@@ -151,20 +151,15 @@ impl Interpreter {
 mod tests {
     use super::*;
 
-    fn hot_policy(function_id: u32) -> TierPolicy {
-        let mut policy = TierPolicy::default();
-        policy.record_hotness(function_id, OPTIMIZING_HOTNESS_THRESHOLD);
-        policy
-    }
+    const HOT: u32 = OPTIMIZING_HOTNESS_THRESHOLD;
 
     #[test]
     fn cold_below_optimizing_threshold() {
         let mut policy = TierPolicy::default();
-        policy.record_hotness(7, OPTIMIZING_HOTNESS_THRESHOLD - 1);
 
         for _ in 0..=STABLE_SAMPLES {
             assert_eq!(
-                policy.sample_and_decide(7, Some(0)),
+                policy.sample_and_decide(7, OPTIMIZING_HOTNESS_THRESHOLD - 1, Some(0)),
                 OptimizingDecision::Cold
             );
         }
@@ -172,74 +167,74 @@ mod tests {
 
     #[test]
     fn hot_function_warms_while_building_initial_stability_history() {
-        let mut policy = hot_policy(11);
+        let mut policy = TierPolicy::default();
 
         assert_eq!(
-            policy.sample_and_decide(11, Some(3)),
+            policy.sample_and_decide(11, HOT, Some(3)),
             OptimizingDecision::Warming
         );
         assert_eq!(
-            policy.sample_and_decide(11, Some(3)),
+            policy.sample_and_decide(11, HOT, Some(3)),
             OptimizingDecision::Warming
         );
     }
 
     #[test]
     fn feedback_change_stays_unstable_for_the_full_sample_window() {
-        let mut policy = hot_policy(13);
+        let mut policy = TierPolicy::default();
         assert_eq!(
-            policy.sample_and_decide(13, Some(1)),
+            policy.sample_and_decide(13, HOT, Some(1)),
             OptimizingDecision::Warming
         );
         assert_eq!(
-            policy.sample_and_decide(13, Some(2)),
+            policy.sample_and_decide(13, HOT, Some(2)),
             OptimizingDecision::FeedbackUnstable
         );
 
         for _ in 1..STABLE_SAMPLES {
             assert_eq!(
-                policy.sample_and_decide(13, Some(2)),
+                policy.sample_and_decide(13, HOT, Some(2)),
                 OptimizingDecision::FeedbackUnstable
             );
         }
         assert_eq!(
-            policy.sample_and_decide(13, Some(2)),
+            policy.sample_and_decide(13, HOT, Some(2)),
             OptimizingDecision::Promote
         );
     }
 
     #[test]
     fn hot_stable_feedback_promotes_at_exact_sample_boundary() {
-        let mut policy = hot_policy(17);
+        let mut policy = TierPolicy::default();
         assert_eq!(
-            policy.sample_and_decide(17, Some(9)),
+            policy.sample_and_decide(17, HOT, Some(9)),
             OptimizingDecision::Warming
         );
         for _ in 1..STABLE_SAMPLES {
             assert_eq!(
-                policy.sample_and_decide(17, Some(9)),
+                policy.sample_and_decide(17, HOT, Some(9)),
                 OptimizingDecision::Warming
             );
         }
         assert_eq!(
-            policy.sample_and_decide(17, Some(9)),
+            policy.sample_and_decide(17, HOT, Some(9)),
             OptimizingDecision::Promote
         );
     }
 
     #[test]
     fn identical_histories_are_deterministic() {
-        let mut first = hot_policy(19);
-        let mut second = hot_policy(19);
+        let mut first = TierPolicy::default();
+        let mut second = TierPolicy::default();
         let epochs = [4, 5, 5, 5, 5];
 
         let first_decisions: Vec<_> = epochs
             .into_iter()
-            .map(|epoch| first.sample_and_decide(19, Some(epoch)))
+            .map(|epoch| first.sample_and_decide(19, HOT, Some(epoch)))
             .collect();
         let second_decisions: Vec<_> = epochs
             .into_iter()
-            .map(|epoch| second.sample_and_decide(19, Some(epoch)))
+            .map(|epoch| second.sample_and_decide(19, HOT, Some(epoch)))
             .collect();
 
         assert_eq!(first_decisions, second_decisions);

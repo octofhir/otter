@@ -36,6 +36,7 @@ use otter_bytecode::{Op, Operand};
 
 use crate::{
     CodeBlock, CodeBlockInstruction,
+    jit_feedback::ArithFeedback,
     native_abi::{SafepointId, SafepointRecord},
 };
 
@@ -537,6 +538,8 @@ pub struct JitInstructionMetadata {
     /// `ConstF64` node without reaching back into the constant pool. `None` for
     /// every other opcode.
     pub load_number: Option<f64>,
+    /// Arithmetic representation observations frozen for this canonical PC.
+    pub(crate) arith_feedback: ArithFeedback,
 }
 
 impl JitInstructionMetadata {
@@ -548,6 +551,7 @@ impl JitInstructionMetadata {
             load_array_length: false,
             method_hint: JitMethodHint::None,
             load_number: None,
+            arith_feedback: ArithFeedback::default(),
         }
     }
 }
@@ -634,6 +638,28 @@ impl JitCompileSnapshot {
             primitive_method_guards: rustc_hash::FxHashMap::default(),
             safepoints: rustc_hash::FxHashMap::default(),
         }
+    }
+
+    /// Arithmetic feedback frozen for one canonical instruction PC.
+    #[must_use]
+    pub fn feedback_at(&self, instruction_pc: u32) -> ArithFeedback {
+        self.instructions
+            .get(instruction_pc as usize)
+            .map_or_else(ArithFeedback::default, |instruction| {
+                instruction.arith_feedback
+            })
+    }
+
+    /// Seed arithmetic feedback in a backend test snapshot.
+    ///
+    /// This only changes the immutable test overlay; production snapshots are
+    /// populated from their owning `CodeBlock` feedback cells.
+    #[doc(hidden)]
+    pub fn seed_arith_feedback_for_test(&mut self, instruction_pc: u32, feedback: ArithFeedback) {
+        self.instructions
+            .get_mut(instruction_pc as usize)
+            .expect("test feedback PC belongs to the snapshot")
+            .arith_feedback = feedback;
     }
 }
 

@@ -6,6 +6,7 @@
 //! - [`frame_state`] — abstract exact-PC interpreter-frame reconstruction.
 //! - [`liveness`] — backward SSA-value liveness over normal control edges.
 //! - [`regalloc`] — backend-independent linear-scan SSA register allocation.
+//! - [`repr`] — feedback-guided SSA representation selection and conversions.
 //! - [`safepoint`] — precise SSA root sets live across GC safepoints.
 //! - [`ssa`] — Cytron SSA construction over bytecode virtual registers.
 //!
@@ -22,5 +23,6 @@ pub mod dom;
 pub mod frame_state;
 pub mod liveness;
 pub mod regalloc;
+pub mod repr;
 pub mod safepoint;
 pub mod ssa;

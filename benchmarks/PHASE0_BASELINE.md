@@ -866,3 +866,33 @@ with 0 failures/crashes. The release differential corpus passed 11/11 under GC
 stress strides 1 through 16 with verification enabled. The frozen full Test262
 reference remains 99.02% (51,480/53,173 excluding skips). Performance remains
 subordinate to coverage for this batch.
+
+### Phase 2 production scalar value-query and coercion completion
+
+The template tier now compiles a wide scalar batch: `ToObject`,
+`ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
+`ArrayLength`, and `LoadLength`, sharing reentrant runtime stub 62. Five
+opcodes had their interpreter-dispatch bodies extracted into single-
+implementation register helpers (`run_to_object_reg`, `run_to_property_key_reg`,
+`run_is_array_reg`, `run_array_length_reg`, `run_load_length_reg`) that both the
+interpreter and the compiled transition call; `TypeOf`, `LoadNewTarget`, and
+`SameValue` already had such helpers. No scalar semantics are duplicated in JIT
+code. `ToPropertyKey` coercion (`@@toPrimitive`/`valueOf`/`toString`) reenters
+JS through the shared path; a committed coercion is never replayed by an exact
+side exit. `ToNumber` is deliberately excluded from this batch: its interpreter
+path is an incomplete foundation that does not re-coerce a `@@toPrimitive`
+result, so it will be matched exactly in a separate change rather than diverged.
+
+Template coverage is 97 of 172 active opcodes (up from 89); 75 remain
+unsupported.
+
+The focused interpreter/template OSR matrix covers `typeof`, string length,
+`Array.isArray`, `Object.is`, and a computed class-field key; the compiled
+results match the interpreter oracle at normal GC and under `OTTER_GC_STRESS`.
+Targeted Test262 `language/expressions/typeof` (17/17),
+`language/statements/class/elements` (1,532/1,534, 2 skips — covers
+`ToPropertyKey`), `built-ins/Object/is` (153/153), and `built-ins/Array/isArray`
+(29/29) passed with 0 failures/crashes. The release differential corpus passed
+11/11 under GC stress strides 1 through 16 with verification enabled. The frozen
+full Test262 reference remains 99.02% (51,480/53,173 excluding skips).
+Performance remains subordinate to coverage for this batch.

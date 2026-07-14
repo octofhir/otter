@@ -1232,13 +1232,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    let s = read_register(frame, src)?
-                        .as_string(&self.gc_heap)
-                        .ok_or(VmError::TypeMismatch)?;
-                    let len = NumberValue::from_i32(s.len() as i32);
-                    write_register(frame, dst, Value::number(len))?;
-                    frame.advance_pc()?;
+                    self.run_load_length_reg(&mut stack[top_idx], dst, src)?;
                     continue;
                 }
                 Op::LogicalNot => {
@@ -1950,14 +1944,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let value = *read_register(&stack[top_idx], src)?;
-                    if value.is_nullish() {
-                        return Err(VmError::TypeMismatch);
-                    }
-                    let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, value, &[])?;
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, boxed)?;
-                    frame.advance_pc()?;
+                    self.run_to_object_reg(stack, top_idx, dst, src)?;
                     continue;
                 }
                 // §7.1.19 ToPropertyKey with full user coercion —
@@ -1970,23 +1957,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let value = *read_register(&stack[top_idx], src)?;
-                    let primitive = self.evaluate_to_primitive(
-                        context,
-                        &value,
-                        abstract_ops::ToPrimitiveHint::String,
-                    )?;
-                    let key = if primitive.as_symbol(&self.gc_heap).is_some()
-                        || primitive.as_string(&self.gc_heap).is_some()
-                    {
-                        primitive
-                    } else {
-                        let text = primitive.display_string(&self.gc_heap);
-                        Value::string(JsString::from_str(&text, &mut self.gc_heap)?)
-                    };
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, key)?;
-                    frame.advance_pc()?;
+                    self.run_to_property_key_reg(context, stack, top_idx, dst, src)?;
                     continue;
                 }
                 // §7.3.31 PrivateElementFind own-only — private
@@ -2665,13 +2636,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    let arr = read_register(frame, src)?
-                        .as_array()
-                        .ok_or(VmError::TypeMismatch)?;
-                    let n = NumberValue::from_f64(crate::array::len(arr, &self.gc_heap) as f64);
-                    write_register(frame, dst, Value::number(n))?;
-                    frame.advance_pc()?;
+                    self.run_array_length_reg(&mut stack[top_idx], dst, src)?;
                     continue;
                 }
                 Op::IsArray => {
@@ -2681,17 +2646,7 @@ impl Interpreter {
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let value = *read_register(&stack[top_idx], src)?;
-                    let mut result = abstract_ops::is_array(&self.gc_heap, &value)?;
-                    if !result
-                        && let Some(obj) = value.as_object()
-                        && self.realm_intrinsics.array_prototype == Some(obj)
-                    {
-                        result = true;
-                    }
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::boolean(result))?;
-                    frame.advance_pc()?;
+                    self.run_is_array_reg(&mut stack[top_idx], dst, src)?;
                     continue;
                 }
                 Op::IsEvalIntrinsic => {

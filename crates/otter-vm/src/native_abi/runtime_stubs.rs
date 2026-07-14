@@ -1026,6 +1026,18 @@ pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes allocating construction opcodes (`CollectRest`, `NewError`,
+/// `NewBuiltinError`, `ArrayPush`) through the VM's construction helpers.
+pub const STUB_JIT_CONSTRUCT_OP: RuntimeStubDescriptor = descriptor(
+    66,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1095,6 +1107,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         63 => "jit_super_op",
         64 => "jit_private_op",
         65 => "jit_value_load_op",
+        66 => "jit_construct_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1166,6 +1179,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_SUPER_OP,
     STUB_JIT_PRIVATE_OP,
     STUB_JIT_VALUE_LOAD_OP,
+    STUB_JIT_CONSTRUCT_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

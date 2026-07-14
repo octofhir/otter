@@ -564,11 +564,13 @@ impl BaselinePlan {
                         dst: reg(operands, 0)?,
                     })
                 }
-                Op::NewObject | Op::LoadThis | Op::LoadGlobalThis | Op::LoadNewTarget => {
-                    LoweredOperands::Destination(DestinationOperands {
-                        dst: reg(operands, 0)?,
-                    })
-                }
+                Op::NewObject
+                | Op::LoadThis
+                | Op::LoadGlobalThis
+                | Op::LoadNewTarget
+                | Op::CollectRest => LoweredOperands::Destination(DestinationOperands {
+                    dst: reg(operands, 0)?,
+                }),
                 Op::StoreGlobalBinding => LoweredOperands::GlobalStore(GlobalStoreOperands {
                     value: reg(operands, 0)?,
                     name: const_index(operands, 1)?,
@@ -635,7 +637,9 @@ impl BaselinePlan {
                 | Op::IsArray
                 | Op::ArrayLength
                 | Op::LoadLength
-                | Op::PrivateBrandCheck => LoweredOperands::Unary(UnaryOperands {
+                | Op::PrivateBrandCheck
+                | Op::NewError
+                | Op::ArrayPush => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
@@ -787,11 +791,13 @@ impl BaselinePlan {
                         name: const_index(operands, 2)?,
                     })
                 }
-                Op::SetSuperProperty => LoweredOperands::GlobalStore(GlobalStoreOperands {
-                    value: reg(operands, 0)?,
-                    name: const_index(operands, 1)?,
-                    extra: u32::from(reg(operands, 2)?),
-                }),
+                Op::SetSuperProperty | Op::NewBuiltinError => {
+                    LoweredOperands::GlobalStore(GlobalStoreOperands {
+                        value: reg(operands, 0)?,
+                        name: const_index(operands, 1)?,
+                        extra: u32::from(reg(operands, 2)?),
+                    })
+                }
                 Op::StoreProperty => LoweredOperands::PropertyStore(PropertyStoreOperands {
                     object: reg(operands, 0)?,
                     name: const_index(operands, 1)?,

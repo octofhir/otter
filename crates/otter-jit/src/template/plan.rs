@@ -381,6 +381,16 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one allocating-construction opcode (`CollectRest`, `NewError`,
+    /// `NewBuiltinError`, `ArrayPush`) through the shared reentrant construction
+    /// transition. `arg0`/`arg1`/`arg2` name the destination plus source/value
+    /// registers or a constant kind index.
+    ConstructOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -965,6 +975,33 @@ impl TemplatePlan {
                         arg0: u64::from(operands.first),
                         arg1: u64::from(operands.second),
                         arg2: u64::from(operands.third),
+                    }
+                }
+                Op::CollectRest => {
+                    let dst = lowered.destination_operands()?.dst;
+                    TemplateOp::ConstructOp {
+                        opcode: Op::CollectRest as u8,
+                        arg0: u64::from(dst),
+                        arg1: 0,
+                        arg2: 0,
+                    }
+                }
+                Op::NewError | Op::ArrayPush => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ConstructOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.src),
+                        arg2: 0,
+                    }
+                }
+                Op::NewBuiltinError => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::ConstructOp {
+                        opcode: Op::NewBuiltinError as u8,
+                        arg0: u64::from(operands.value),
+                        arg1: u64::from(operands.name),
+                        arg2: u64::from(operands.extra),
                     }
                 }
                 Op::Nop => TemplateOp::NoOp,

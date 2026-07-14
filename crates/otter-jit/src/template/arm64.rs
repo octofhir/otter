@@ -44,6 +44,7 @@ mod private_access;
 mod properties;
 mod protocol;
 mod scalar;
+mod spread_call;
 mod static_call;
 mod structural;
 mod super_access;
@@ -899,6 +900,16 @@ pub(super) fn compile(
                     arg2,
                     bail,
                     threw,
+                );
+            }
+            TemplateOp::SpreadCallOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                spread_call::emit_spread_call_op(
+                    &mut ops, transitions, opcode, arg0, arg1, arg2, bail, threw,
                 );
             }
             TemplateOp::NoOp => {}

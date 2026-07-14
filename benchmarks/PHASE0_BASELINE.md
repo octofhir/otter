@@ -956,3 +956,16 @@ unsupported. Interpreter/template parity holds for a `Math.*`/`Symbol.*`/BigInt-
 literal/string-index loop; the release differential corpus passed 11/11 under GC
 stress strides 1 through 16, and targeted Test262 `built-ins/BigInt` passed
 76/77. The frozen full Test262 reference remains 99.02%.
+
+### Phase 2 production allocating-construction completion
+
+`CollectRest`, `NewError`, `NewBuiltinError`, and `ArrayPush` now compile
+through reentrant runtime stub 66; each reuses the interpreter's
+`run_collect_rest_reg`/`run_new_error_regs`/`run_new_builtin_error_regs`/
+`run_array_push_regs` helper, and the published frame roots the array/error
+allocation. No construction semantics are duplicated in JIT code. Template
+coverage is 117 of 172 active opcodes (up from 113); 55 remain unsupported.
+Interpreter/template parity holds for a rest-parameter/array-spread/`new Error`
+loop; the release differential corpus passed 11/11 under GC stress strides 1
+through 16, and targeted Test262 `built-ins/Error` passed 88/93. The frozen
+full Test262 reference remains 99.02%.

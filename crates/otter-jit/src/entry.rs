@@ -342,6 +342,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_VALUE_LOAD_OP,
             jit_value_load_op_stub as *const () as usize,
         ),
+        binding(
+            abi::STUB_JIT_CONSTRUCT_OP,
+            jit_construct_op_stub as *const () as usize,
+        ),
     ]
 }
 

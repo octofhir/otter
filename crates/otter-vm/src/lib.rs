@@ -101,6 +101,7 @@ pub mod intrinsics;
 mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
+mod jit_construct_ops;
 mod jit_delete_ops;
 mod jit_exception_ops;
 pub mod jit_feedback;

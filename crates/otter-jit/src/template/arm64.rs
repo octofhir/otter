@@ -32,6 +32,7 @@
 mod arith;
 mod calls;
 mod collections;
+mod construct;
 mod delete;
 mod exceptions;
 mod functions;
@@ -754,6 +755,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 value_load::emit_value_load_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ConstructOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                construct::emit_construct_op(
                     &mut ops,
                     transitions,
                     opcode,

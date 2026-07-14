@@ -1001,6 +1001,19 @@ pub const STUB_JIT_SUPER_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes private-member access (`PrivateGet`, `PrivateSet`,
+/// `PrivateBrandCheck`) — including private accessor getters/setters — through
+/// the VM's private-element helpers.
+pub const STUB_JIT_PRIVATE_OP: RuntimeStubDescriptor = descriptor(
+    64,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1068,6 +1081,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         61 => "jit_delete_op",
         62 => "jit_scalar_op",
         63 => "jit_super_op",
+        64 => "jit_private_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1137,6 +1151,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_DELETE_OP,
     STUB_JIT_SCALAR_OP,
     STUB_JIT_SUPER_OP,
+    STUB_JIT_PRIVATE_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

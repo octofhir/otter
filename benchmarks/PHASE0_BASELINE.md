@@ -924,3 +924,21 @@ OSR matrix covers `super.prop` accessor get/set, `super.method()`, and computed
 counters; the release differential corpus passed 11/11 under GC stress strides
 1 through 16, and targeted Test262 `language/expressions/super` passed 93/94
 (1 skip). The frozen full Test262 reference remains 99.02%.
+
+### Phase 2 production private-member completion
+
+`PrivateGet`, `PrivateSet`, and `PrivateBrandCheck` now compile through
+reentrant runtime stub 64. Their interpreter-dispatch bodies were extracted into
+single-implementation register helpers (`run_private_get_reg`,
+`run_private_set_reg`, `run_private_brand_check_reg`) that both the interpreter
+and the compiled transition call, so private accessor getters/setters,
+brand-check TypeErrors, and non-writable private-method rejections are identical
+across tiers and no private-element semantics are duplicated in JIT code. A
+committed private effect is never replayed by an exact side exit. Template
+coverage is 107 of 172 active opcodes (up from 104); 65 remain unsupported. The
+interpreter/template OSR matrix covers private data get/set, private accessor
+get/set, a private method call, and a `#field in obj` brand check with
+observable getter/setter counters; the release differential corpus passed 11/11
+under GC stress strides 1 through 16, and targeted Test262
+`language/statements/class/elements/private` passed 187/187. The frozen full
+Test262 reference remains 99.02%.

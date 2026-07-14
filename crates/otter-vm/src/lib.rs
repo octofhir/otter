@@ -114,6 +114,7 @@ mod jit_private_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
 mod jit_scalar_ops;
+mod jit_spread_call_ops;
 mod jit_static_call_ops;
 mod jit_structural_ops;
 mod jit_super_ops;
@@ -190,7 +191,9 @@ pub use run_control::{
 };
 
 use crate::holt_stack::HoltCallReservation;
-use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
+#[cfg(test)]
+use otter_bytecode::ArgumentsObjectKind;
+use otter_bytecode::{BytecodeModule, Op};
 use smallvec::SmallVec;
 
 use arithmetic_dispatch::{

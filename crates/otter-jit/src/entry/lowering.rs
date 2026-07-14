@@ -186,6 +186,15 @@ pub(crate) struct CallOperands {
     pub(crate) arguments: OperandRange,
 }
 
+/// Typed explicit-receiver call prefix plus plan-owned argument registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallWithThisOperands {
+    pub(crate) dst: u16,
+    pub(crate) callee: u16,
+    pub(crate) this_value: u16,
+    pub(crate) arguments: OperandRange,
+}
+
 /// Typed global-store operands. `extra` carries the strictness flag for
 /// `StoreGlobalBinding` and the `exists` register for `StoreGlobalChecked`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +243,15 @@ pub(crate) struct TripleOperands {
     pub(crate) first: u16,
     pub(crate) second: u16,
     pub(crate) third: u16,
+}
+
+/// Typed generic four-register operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuadOperands {
+    pub(crate) first: u16,
+    pub(crate) second: u16,
+    pub(crate) third: u16,
+    pub(crate) fourth: u16,
 }
 
 /// Canonical control-flow target resolved to a verified logical PC.
@@ -293,12 +311,14 @@ enum LoweredOperands {
     MathCall(MathCallOperands),
     MakeClosure(MakeClosureOperands),
     Call(CallOperands),
+    CallWithThis(CallWithThisOperands),
     MethodCall(MethodCallOperands),
     StaticCall(StaticCallOperands),
     BindFunction(BindFunctionOperands),
     GlobalStore(GlobalStoreOperands),
     Immediate(ImmediateOperands),
     Triple(TripleOperands),
+    Quad(QuadOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
     ShadowedUpvalue(ShadowedUpvalueOperands),
@@ -442,6 +462,13 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn call_with_this_operands(self) -> Result<CallWithThisOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::CallWithThis(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered CallWithThis operands")),
+        }
+    }
+
     pub(crate) fn method_call_operands(self) -> Result<MethodCallOperands, Unsupported> {
         match self.operands {
             LoweredOperands::MethodCall(operands) => Ok(operands),
@@ -483,6 +510,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Triple(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered triple operands")),
+        }
+    }
+
+    pub(crate) fn quad_operands(self) -> Result<QuadOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Quad(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered quad operands")),
         }
     }
 
@@ -605,7 +639,8 @@ impl BaselinePlan {
                 | Op::LoadThis
                 | Op::LoadGlobalThis
                 | Op::LoadNewTarget
-                | Op::CollectRest => LoweredOperands::Destination(DestinationOperands {
+                | Op::CollectRest
+                | Op::CollectArguments => LoweredOperands::Destination(DestinationOperands {
                     dst: reg(operands, 0)?,
                 }),
                 Op::StoreGlobalBinding => LoweredOperands::GlobalStore(GlobalStoreOperands {
@@ -714,6 +749,23 @@ impl BaselinePlan {
                     LoweredOperands::Call(CallOperands {
                         dst: reg(operands, 0)?,
                         callee: reg(operands, 1)?,
+                        arguments,
+                    })
+                }
+                Op::CallWithThis => {
+                    let count = const_index(operands, 3)? as usize;
+                    let arguments = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        4,
+                        count,
+                        "CallWithThis register tail",
+                    )?;
+                    LoweredOperands::CallWithThis(CallWithThisOperands {
+                        dst: reg(operands, 0)?,
+                        callee: reg(operands, 1)?,
+                        this_value: reg(operands, 2)?,
                         arguments,
                     })
                 }
@@ -843,7 +895,9 @@ impl BaselinePlan {
                 | Op::SetSuperElement
                 | Op::PrivateGet
                 | Op::PrivateSet
-                | Op::GetStringIndex => {
+                | Op::GetStringIndex
+                | Op::NewSpread
+                | Op::SuperConstructSpread => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,
@@ -851,6 +905,12 @@ impl BaselinePlan {
                         third,
                     })
                 }
+                Op::CallSpread => LoweredOperands::Quad(QuadOperands {
+                    first: reg(operands, 0)?,
+                    second: reg(operands, 1)?,
+                    third: reg(operands, 2)?,
+                    fourth: reg(operands, 3)?,
+                }),
                 Op::LoadProperty | Op::DeleteProperty | Op::LoadSuperProperty => {
                     LoweredOperands::PropertyLoad(PropertyLoadOperands {
                         dst: reg(operands, 0)?,

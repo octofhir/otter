@@ -442,6 +442,17 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete spread calls/constructions, explicit-receiver calls, and
+    /// `CollectArguments` through the shared synchronous VM transition.
+    /// `TailCall` is intentionally excluded — its interpreter completion
+    /// discards the caller frame for true tail-call stack reuse, which the
+    /// compiled call helper cannot reproduce, so it stays an exact side exit.
+    SpreadCallOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -823,6 +834,54 @@ impl TemplatePlan {
                         packed_args: pack_method_arg_regs(arguments),
                     }
                 }
+                Op::CallWithThis => {
+                    let operands = lowered.call_with_this_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        osr_only = true;
+                        instructions.push(TemplateInstr {
+                            pc,
+                            op: TemplateOp::UnsupportedBail,
+                        });
+                        continue;
+                    }
+                    TemplateOp::SpreadCallOp {
+                        opcode: Op::CallWithThis as u8,
+                        arg0: u64::from(operands.dst)
+                            | (u64::from(operands.callee) << 16)
+                            | (u64::from(operands.this_value) << 32)
+                            | ((arguments.len() as u64) << 48),
+                        arg1: pack_method_arg_regs(arguments),
+                        arg2: 0,
+                    }
+                }
+                Op::CallSpread => {
+                    let operands = lowered.quad_operands()?;
+                    TemplateOp::SpreadCallOp {
+                        opcode: Op::CallSpread as u8,
+                        arg0: u64::from(operands.first)
+                            | (u64::from(operands.second) << 16)
+                            | (u64::from(operands.third) << 32)
+                            | (u64::from(operands.fourth) << 48),
+                        arg1: 0,
+                        arg2: 0,
+                    }
+                }
+                Op::NewSpread | Op::SuperConstructSpread => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::SpreadCallOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
+                    }
+                }
+                Op::CollectArguments => TemplateOp::SpreadCallOp {
+                    opcode: Op::CollectArguments as u8,
+                    arg0: u64::from(lowered.destination_operands()?.dst),
+                    arg1: 0,
+                    arg2: 0,
+                },
                 Op::New => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;

@@ -28,7 +28,7 @@ use otter_bytecode::Op;
 
 use crate::{
     Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint,
-    jit_feedback::InstructionFeedback, number, oom_to_vm, read_register, write_register,
+    jit_feedback::InstructionFeedbackRecorder, number, oom_to_vm, read_register, write_register,
 };
 
 /// Signature of every BigInt binary op routed through this module.
@@ -52,7 +52,7 @@ impl Interpreter {
         rhs: u16,
         op: fn(NumberValue, NumberValue) -> NumberValue,
         bigint_op: BigIntBinop,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
@@ -67,7 +67,7 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         rhs: u16,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
@@ -132,7 +132,7 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         op: Op,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
@@ -147,7 +147,7 @@ impl Interpreter {
         dst: u16,
         lhs: u16,
         rhs: u16,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
@@ -220,7 +220,7 @@ impl Interpreter {
         dst: u16,
         src: u16,
         delta: i32,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let value = *read_register(frame, src)?;
         if let Some(feedback) = feedback {
@@ -254,7 +254,7 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         negate: bool,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         // Record operand-type feedback like the relational path: a `===` / `!==`
@@ -279,7 +279,7 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
         negate: bool,
-        feedback: Option<&InstructionFeedback>,
+        feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         if let Some(feedback) = feedback {

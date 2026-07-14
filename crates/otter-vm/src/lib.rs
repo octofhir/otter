@@ -43,6 +43,7 @@ pub mod atomics_wait;
 pub mod bigint;
 pub mod binary;
 pub mod boolean;
+mod call_feedback;
 mod call_ops;
 pub mod closure;
 mod code_space;
@@ -924,6 +925,10 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// Bounded ordinary-call target distributions for the future optimizing
+    /// tier, keyed by `(caller function id, canonical instruction index)`.
+    /// Populated additively; no current decision reads this table.
+    jit_call_site_feedback: call_feedback::CallSiteFeedbackTable,
     /// Dense method-call feedback driving baseline method inlining, keyed by
     /// the same executable IC site id as `method_call_ics`. Only mutated when a
     /// JIT hook is installed.

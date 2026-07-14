@@ -28,6 +28,8 @@
 //!   try-handler slots by the serialized verifier.
 //! - Named property IC sites receive dense VM-local ids during build; the
 //!   bytecode JSON dump stays unchanged.
+//! - Feedback epochs are CodeBlock-owned monotonic counters; instruction cells
+//!   remain fixed at eight bytes and never carry per-cell epochs.
 //!
 //! # See also
 //! - [`crate::execution_context`]
@@ -41,7 +43,10 @@ use otter_bytecode::{
     FunctionCodeBuilder, Op, Operand, SpanEntry, WordInstruction,
     encoding::{FunctionLayout, layout_wordcode_function, translate_spans_to_byte_pcs},
 };
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU32, Ordering},
+};
 
 use code_block_cfg::{CodeBlockControlFlow, CodeBlockExceptionRegion};
 
@@ -290,6 +295,7 @@ impl CodeBlock {
             wordcode,
             control_flow,
             feedback,
+            feedback_epoch: AtomicU32::new(0),
             byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
         })
@@ -315,6 +321,36 @@ impl CodeBlock {
         index: usize,
     ) -> Option<&crate::jit_feedback::InstructionFeedback> {
         self.feedback.get(index)
+    }
+
+    /// CodeBlock-wide version of material feedback transitions.
+    ///
+    /// This telemetry is intentionally not consumed by the current baseline
+    /// tier; it is exposed for a future optimizing tier to compare snapshots.
+    #[must_use]
+    pub fn feedback_epoch(&self) -> u32 {
+        self.feedback_epoch.load(Ordering::Acquire)
+    }
+
+    /// Pair one dense feedback cell with this CodeBlock's transition epoch.
+    #[must_use]
+    pub(crate) fn feedback_recorder_at(
+        &self,
+        index: usize,
+    ) -> Option<crate::jit_feedback::InstructionFeedbackRecorder<'_>> {
+        self.feedback
+            .get(index)
+            .map(|cell| crate::jit_feedback::InstructionFeedbackRecorder::new(self, cell))
+    }
+
+    /// Advance the feedback epoch without permitting wraparound.
+    #[inline]
+    pub(crate) fn bump_feedback_epoch(&self) {
+        let _ = self
+            .feedback_epoch
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |epoch| {
+                epoch.checked_add(1)
+            });
     }
 
     /// Cold serialized byte PC for one logical instruction index.
@@ -576,7 +612,7 @@ impl<'a> From<&'a Vec<Operand>> for OperandView<'a> {
 /// Construction verifies the compiler DTO directly in logical instruction-index
 /// coordinates, then builds schema-typed words. Cold byte-PC layout is computed
 /// without materialising or decoding the self-describing serialized stream.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CodeBlock {
     /// Global VM function id (chunk base + local table index).
     pub id: u32,
@@ -641,11 +677,50 @@ pub struct CodeBlock {
     control_flow: CodeBlockControlFlow,
     /// Advisory feedback parallel to `code`, shared without hash lookup.
     feedback: Box<[crate::jit_feedback::InstructionFeedback]>,
+    /// Monotonic version of material transitions in `feedback` and its bounded
+    /// ordinary-call distribution. Future optimizing tiers may snapshot it;
+    /// current compilation and tier-up decisions never read it.
+    feedback_epoch: AtomicU32,
     /// Cold serialized byte PCs parallel to `code`.
     byte_pcs: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
     /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
+}
+
+impl Clone for CodeBlock {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            param_count: self.param_count,
+            register_count: self.register_count,
+            own_upvalue_count: self.own_upvalue_count,
+            is_strict: self.is_strict,
+            is_arrow: self.is_arrow,
+            is_method: self.is_method,
+            has_rest: self.has_rest,
+            is_async: self.is_async,
+            is_generator: self.is_generator,
+            is_async_generator: self.is_async_generator,
+            is_derived_constructor: self.is_derived_constructor,
+            makes_function: self.makes_function,
+            needs_arguments: self.needs_arguments,
+            uses_arguments_callee: self.uses_arguments_callee,
+            arguments_object_kind: self.arguments_object_kind,
+            mapped_argument_bindings: self.mapped_argument_bindings.clone(),
+            is_module: self.is_module,
+            module_url: self.module_url.clone(),
+            direct_eval_bindings: self.direct_eval_bindings.clone(),
+            contains_direct_eval: self.contains_direct_eval,
+            code: self.code.clone(),
+            wordcode: self.wordcode.clone(),
+            control_flow: self.control_flow.clone(),
+            feedback: self.feedback.clone(),
+            feedback_epoch: AtomicU32::new(self.feedback_epoch()),
+            byte_pcs: self.byte_pcs.clone(),
+            byte_spans: self.byte_spans.clone(),
+        }
+    }
 }
 
 impl CodeBlock {
@@ -758,6 +833,7 @@ impl CodeBlock {
             wordcode,
             control_flow,
             feedback,
+            feedback_epoch: AtomicU32::new(0),
             byte_pcs: instr_to_byte_pc,
             byte_spans,
         }

@@ -9,6 +9,8 @@
 //! # Contents
 //! - [`ArithFeedback`] — decoded arithmetic representation bits.
 //! - [`InstructionFeedback`] — one dense atomic cell per CodeBlock instruction.
+//! - [`InstructionFeedbackRecorder`] — a CodeBlock-bound recording view that
+//!   advances the owning feedback epoch on material transitions.
 //!
 //! # Invariants
 //! - **Monotonic.** Bits are only ever set, never cleared. A site that has ever
@@ -21,6 +23,8 @@
 //!   only less fast.
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
+//! - The owning CodeBlock's feedback epoch advances once per material state
+//!   transition, never for an already-recorded observation.
 //! - The isolate's VM thread is the sole writer. Arithmetic/element bits use
 //!   relaxed atomics because they are advisory and monotonic; call state uses a
 //!   release/acquire publication edge because its function id is a separate
@@ -32,7 +36,7 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use crate::jit::JitElementLoadKind;
-use crate::{CallTargetFeedback, Value};
+use crate::{CallTargetFeedback, CodeBlock, Value};
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -64,6 +68,38 @@ const CALL_MONO: u8 = 1;
 const CALL_POLY: u8 = 2;
 const CALL_SHIFT: u8 = 2;
 const CALL_MASK: u8 = 0b0000_1100;
+const BRANCH_TAKEN_SEEN: u8 = 1 << 4;
+const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 5;
+
+/// Material transition made while recording an ordinary bytecode call target.
+///
+/// The existing baseline invalidation policy only reacts to
+/// [`Self::BecameMonomorphic`]. Keeping that decision distinct from the broader
+/// state-change signal lets the feedback epoch also observe mono-to-poly without
+/// changing baseline recompilation behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallTargetTransition {
+    /// The observation was already represented by the dense cell.
+    Unchanged,
+    /// The previously unseen site recorded its first bytecode callee.
+    BecameMonomorphic,
+    /// A monomorphic site observed a different bytecode callee.
+    BecamePolymorphic,
+}
+
+impl CallTargetTransition {
+    /// Whether the dense call-target state changed.
+    #[must_use]
+    pub(crate) const fn state_changed(self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+
+    /// Preserve the baseline's existing first-target invalidation decision.
+    #[must_use]
+    pub(crate) const fn evict_for_reopt(self) -> bool {
+        matches!(self, Self::BecameMonomorphic)
+    }
+}
 
 /// OR-accumulated representation feedback for one numeric-specialized bytecode
 /// site.
@@ -156,7 +192,9 @@ impl Clone for InstructionFeedback {
 
 impl InstructionFeedback {
     /// Record one conditional-branch outcome in this instruction's dense cell.
-    pub fn record_branch(&self, taken: bool) {
+    /// Returns `true` only for the first observation of each direction; compact
+    /// hit counters continue saturating independently on every observation.
+    pub fn record_branch(&self, taken: bool) -> bool {
         let saturating_increment = |value: u8| Some(value.saturating_add(1));
         let _ = self.branch_total.fetch_update(
             Ordering::Relaxed,
@@ -170,6 +208,12 @@ impl InstructionFeedback {
                 saturating_increment,
             );
         }
+        let seen = if taken {
+            BRANCH_TAKEN_SEEN
+        } else {
+            BRANCH_NOT_TAKEN_SEEN
+        };
+        self.states.fetch_or(seen, Ordering::Relaxed) & seen == 0
     }
 
     /// `(taken, total)` conditional-branch observations.
@@ -182,10 +226,11 @@ impl InstructionFeedback {
     }
 
     /// Fold one observed arithmetic operand pair into this instruction cell.
+    /// Returns `true` when the representation bitset gained at least one bit.
     #[inline]
-    pub fn record_arith(&self, lhs: Value, rhs: Value) {
+    pub fn record_arith(&self, lhs: Value, rhs: Value) -> bool {
         let bits = ArithFeedback::classify(lhs) | ArithFeedback::classify(rhs);
-        self.arith.fetch_or(bits, Ordering::Relaxed);
+        self.arith.fetch_or(bits, Ordering::Relaxed) & bits != bits
     }
 
     /// Mark an arithmetic site for float widening after its first overflow bail.
@@ -208,17 +253,26 @@ impl InstructionFeedback {
     /// Record the receiver family observed at one `LoadElement` instruction.
     /// `None` preserves an unseen cell for an ordinary non-typed receiver;
     /// mixed or unsupported typed-array kinds become permanently generic.
-    pub fn record_element_load(&self, observed: Option<JitElementLoadKind>) {
+    /// Returns `true` when the bounded element kind changes.
+    pub fn record_element_load(&self, observed: Option<JitElementLoadKind>) -> bool {
         let Some(observed) = observed else {
-            let current = self.states.load(Ordering::Relaxed) & ELEMENT_MASK;
-            if current != ELEMENT_UNSEEN {
-                self.states
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |states| {
-                        Some((states & !ELEMENT_MASK) | ELEMENT_GENERIC)
-                    })
-                    .ok();
+            let mut states = self.states.load(Ordering::Relaxed);
+            loop {
+                let current = states & ELEMENT_MASK;
+                if matches!(current, ELEMENT_UNSEEN | ELEMENT_GENERIC) {
+                    return false;
+                }
+                let next = (states & !ELEMENT_MASK) | ELEMENT_GENERIC;
+                match self.states.compare_exchange_weak(
+                    states,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => states = actual,
+                }
             }
-            return;
         };
         let observed = match observed {
             JitElementLoadKind::Any => ELEMENT_GENERIC,
@@ -234,7 +288,7 @@ impl InstructionFeedback {
                 _ => ELEMENT_GENERIC,
             };
             if next_element == current {
-                return;
+                return false;
             }
             let next = (states & !ELEMENT_MASK) | next_element;
             match self.states.compare_exchange_weak(
@@ -243,7 +297,7 @@ impl InstructionFeedback {
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => return true,
                 Err(actual) => states = actual,
             }
         }
@@ -260,8 +314,7 @@ impl InstructionFeedback {
     }
 
     /// Record one bytecode callee at an ordinary `Call` instruction.
-    /// Returns `true` only when the previously unseen cell becomes monomorphic.
-    pub(crate) fn record_call_target(&self, callee_fid: u32) -> bool {
+    pub(crate) fn record_call_target(&self, callee_fid: u32) -> CallTargetTransition {
         match (self.states.load(Ordering::Acquire) & CALL_MASK) >> CALL_SHIFT {
             CALL_UNSEEN => {
                 self.call_target.store(callee_fid, Ordering::Relaxed);
@@ -270,7 +323,7 @@ impl InstructionFeedback {
                         Some((states & !CALL_MASK) | (CALL_MONO << CALL_SHIFT))
                     })
                     .ok();
-                true
+                CallTargetTransition::BecameMonomorphic
             }
             CALL_MONO if self.call_target.load(Ordering::Relaxed) != callee_fid => {
                 self.states
@@ -278,9 +331,9 @@ impl InstructionFeedback {
                         Some((states & !CALL_MASK) | (CALL_POLY << CALL_SHIFT))
                     })
                     .ok();
-                false
+                CallTargetTransition::BecamePolymorphic
             }
-            _ => false,
+            _ => CallTargetTransition::Unchanged,
         }
     }
 
@@ -294,6 +347,58 @@ impl InstructionFeedback {
             )),
             _ => Some(CallTargetFeedback::Poly),
         }
+    }
+}
+
+/// One instruction cell paired with its owning CodeBlock epoch.
+///
+/// Recording through this view preserves the compact eight-byte cell while
+/// making the rare transition path advance the single function-wide epoch.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InstructionFeedbackRecorder<'a> {
+    code_block: &'a CodeBlock,
+    cell: &'a InstructionFeedback,
+}
+
+impl<'a> InstructionFeedbackRecorder<'a> {
+    pub(crate) const fn new(code_block: &'a CodeBlock, cell: &'a InstructionFeedback) -> Self {
+        Self { code_block, cell }
+    }
+
+    #[inline]
+    fn note_transition(self, changed: bool) -> bool {
+        if changed {
+            self.code_block.bump_feedback_epoch();
+        }
+        changed
+    }
+
+    /// Record arithmetic representations and advance the epoch on new bits.
+    #[inline]
+    pub(crate) fn record_arith(self, lhs: Value, rhs: Value) -> bool {
+        self.note_transition(self.cell.record_arith(lhs, rhs))
+    }
+
+    /// Record an element kind and advance the epoch on widening.
+    pub(crate) fn record_element_load(self, observed: Option<JitElementLoadKind>) -> bool {
+        self.note_transition(self.cell.record_element_load(observed))
+    }
+
+    /// Record a branch sample and advance the epoch on a newly seen direction.
+    pub(crate) fn record_branch(self, taken: bool) -> bool {
+        self.note_transition(self.cell.record_branch(taken))
+    }
+
+    /// Record a dense ordinary-call state transition and advance the epoch.
+    pub(crate) fn record_call_target(self, callee_fid: u32) -> CallTargetTransition {
+        let transition = self.cell.record_call_target(callee_fid);
+        self.note_transition(transition.state_changed());
+        transition
+    }
+
+    /// Mark arithmetic widening and advance the epoch only on its first bail.
+    pub(crate) fn widen_arith_to_float(self) -> bool {
+        self.note_transition(self.cell.widen_arith_to_float())
     }
 }
 
@@ -374,9 +479,9 @@ mod tests {
     #[test]
     fn branch_feedback_counts_taken_and_total_compactly() {
         let cell = InstructionFeedback::default();
-        cell.record_branch(true);
-        cell.record_branch(false);
-        cell.record_branch(true);
+        assert!(cell.record_branch(true));
+        assert!(cell.record_branch(false));
+        assert!(!cell.record_branch(true));
         assert_eq!(cell.branch_counts(), (2, 3));
         assert_eq!(cell.clone().branch_counts(), (2, 3));
     }
@@ -384,19 +489,90 @@ mod tests {
     #[test]
     fn call_target_tracks_mono_then_poly_without_truncating_ids() {
         let max_id = InstructionFeedback::default();
-        assert!(max_id.record_call_target(u32::MAX));
+        assert_eq!(
+            max_id.record_call_target(u32::MAX),
+            CallTargetTransition::BecameMonomorphic
+        );
         assert_eq!(
             max_id.call_target(),
             Some(CallTargetFeedback::Mono(u32::MAX))
         );
 
         let cell = InstructionFeedback::default();
-        assert!(cell.record_call_target(7));
-        assert!(!cell.record_call_target(7));
+        assert_eq!(
+            cell.record_call_target(7),
+            CallTargetTransition::BecameMonomorphic
+        );
+        assert_eq!(cell.record_call_target(7), CallTargetTransition::Unchanged);
         assert_eq!(cell.call_target(), Some(CallTargetFeedback::Mono(7)));
-        assert!(!cell.record_call_target(9));
+        assert_eq!(
+            cell.record_call_target(9),
+            CallTargetTransition::BecamePolymorphic
+        );
         assert_eq!(cell.call_target(), Some(CallTargetFeedback::Poly));
-        assert!(!cell.record_call_target(7));
+        assert_eq!(cell.record_call_target(7), CallTargetTransition::Unchanged);
         assert_eq!(cell.call_target(), Some(CallTargetFeedback::Poly));
+    }
+
+    #[test]
+    fn code_block_epoch_advances_once_per_material_transition() {
+        let code_block = CodeBlock::jit_test_stub(
+            1,
+            0,
+            0,
+            &[crate::jit::JitTestInstruction::new(
+                otter_bytecode::Op::Nop,
+                0,
+                0,
+                Vec::new(),
+            )],
+        );
+        let feedback = code_block.feedback_recorder_at(0).unwrap();
+        assert_eq!(code_block.feedback_epoch(), 0);
+
+        assert!(feedback.record_arith(Value::number_i32(1), Value::number_i32(2)));
+        assert_eq!(code_block.feedback_epoch(), 1);
+        assert!(!feedback.record_arith(Value::number_i32(3), Value::number_i32(4)));
+        assert_eq!(code_block.feedback_epoch(), 1);
+        assert!(feedback.record_arith(Value::number_f64(1.5), Value::number_i32(4)));
+        assert_eq!(code_block.feedback_epoch(), 2);
+
+        assert!(feedback.record_element_load(Some(JitElementLoadKind::Float64)));
+        assert_eq!(code_block.feedback_epoch(), 3);
+        assert!(!feedback.record_element_load(Some(JitElementLoadKind::Float64)));
+        assert_eq!(code_block.feedback_epoch(), 3);
+        assert!(feedback.record_element_load(Some(JitElementLoadKind::Int32)));
+        assert_eq!(code_block.feedback_epoch(), 4);
+        assert!(!feedback.record_element_load(None));
+        assert_eq!(code_block.feedback_epoch(), 4);
+
+        assert!(feedback.record_branch(true));
+        assert_eq!(code_block.feedback_epoch(), 5);
+        assert!(!feedback.record_branch(true));
+        assert_eq!(code_block.feedback_epoch(), 5);
+        assert!(feedback.record_branch(false));
+        assert_eq!(code_block.feedback_epoch(), 6);
+
+        assert_eq!(
+            feedback.record_call_target(7),
+            CallTargetTransition::BecameMonomorphic
+        );
+        assert_eq!(code_block.feedback_epoch(), 7);
+        assert_eq!(
+            feedback.record_call_target(7),
+            CallTargetTransition::Unchanged
+        );
+        assert_eq!(code_block.feedback_epoch(), 7);
+        assert_eq!(
+            feedback.record_call_target(8),
+            CallTargetTransition::BecamePolymorphic
+        );
+        assert_eq!(code_block.feedback_epoch(), 8);
+
+        assert!(feedback.widen_arith_to_float());
+        assert_eq!(code_block.feedback_epoch(), 9);
+        assert!(!feedback.widen_arith_to_float());
+        assert_eq!(code_block.feedback_epoch(), 9);
+        assert_eq!(std::mem::size_of::<InstructionFeedback>(), 8);
     }
 }

@@ -110,6 +110,7 @@ mod jit_exception_ops;
 pub mod jit_feedback;
 mod jit_global_ops;
 mod jit_iterator_ops;
+mod jit_module_ops;
 mod jit_object_protocol_ops;
 mod jit_private_ops;
 pub mod jit_registry;

@@ -18,6 +18,8 @@
 //! - All async-walk state lives in the records map — reaction closures
 //!   capture only module URLs, never `Rc` state or side-channel
 //!   counters.
+//! - Constant indices are resolved through the executing frame's owning
+//!   function so linked sibling chunks never read an ambient constant pool.
 //! - A top-level-await module parks only its own evaluation gate;
 //!   siblings keep evaluating (§16.2.1.5 never awaits a dependency).
 //! - Static namespace imports must already be present in the linked module
@@ -31,7 +33,7 @@
 
 use crate::holt_stack::HoltStack;
 use crate::{
-    ExecutionContext, Frame, Interpreter, JsString, Value, VmError, module_records::ModuleStatus,
+    ExecutionContext, Interpreter, JsString, Value, VmError, module_records::ModuleStatus,
     operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
     write_register,
 };
@@ -48,20 +50,23 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         spec_idx: u32,
     ) -> Result<(), VmError> {
+        let function_id = stack[frame_index].function_id;
         let specifier = context
-            .string_constant_str(spec_idx)
+            .string_constant_str_for_function(function_id, spec_idx)
             .ok_or(VmError::InvalidOperand)?;
         let referrer: String = context
-            .exec_function(frame.function_id)
+            .exec_function(function_id)
             .map(|f| f.module_url.as_ref().to_string())
             .unwrap_or_default();
         let namespace = self
             .resolve_module_namespace(context, referrer.as_str(), specifier)
             .ok_or_else(|| self.err_unknown_intrinsic(format!("import \"{specifier}\"").into()))?;
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::object(namespace))?;
         frame.advance_pc()?;
         Ok(())
@@ -74,16 +79,18 @@ impl Interpreter {
     pub(crate) fn run_module_namespace_object_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         spec_idx: u32,
     ) -> Result<(), VmError> {
+        let function_id = stack[frame_index].function_id;
         let specifier = context
-            .string_constant_str(spec_idx)
+            .string_constant_str_for_function(function_id, spec_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let referrer: String = context
-            .exec_function(frame.function_id)
+            .exec_function(function_id)
             .map(|f| f.module_url.as_ref().to_string())
             .unwrap_or_default();
         let namespace = self
@@ -91,6 +98,7 @@ impl Interpreter {
             .ok_or_else(|| {
                 self.err_unknown_intrinsic(format!("import * as \"{specifier}\"").into())
             })?;
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::object(namespace))?;
         frame.advance_pc()?;
         Ok(())
@@ -105,17 +113,19 @@ impl Interpreter {
     pub(crate) fn run_load_import_binding_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         url_idx: u32,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let function_id = stack[frame_index].function_id;
         let url = context
-            .string_constant_str(url_idx)
+            .string_constant_str_for_function(function_id, url_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let name = context
-            .string_constant_str(name_idx)
+            .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let value = self
@@ -126,6 +136,7 @@ impl Interpreter {
                 (format!("Cannot access '{name}' before initialization")).into(),
             ));
         }
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
@@ -137,16 +148,18 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_deferred_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         spec_idx: u32,
     ) -> Result<(), VmError> {
+        let function_id = stack[frame_index].function_id;
         let specifier = context
-            .string_constant_str(spec_idx)
+            .string_constant_str_for_function(function_id, spec_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let referrer: String = context
-            .exec_function(frame.function_id)
+            .exec_function(function_id)
             .map(|f| f.module_url.as_ref().to_string())
             .unwrap_or_default();
         let target = context
@@ -157,6 +170,7 @@ impl Interpreter {
             .to_string();
         let target_url: std::sync::Arc<str> = std::sync::Arc::from(target.as_str());
         let ns = self.get_or_create_deferred_namespace(target_url)?;
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::object(ns))?;
         frame.advance_pc()?;
         Ok(())
@@ -170,18 +184,39 @@ impl Interpreter {
     pub(crate) fn run_evaluate_module_const(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         url_idx: u32,
     ) -> Result<(), VmError> {
+        let function_id = stack[frame_index].function_id;
         let url = context
-            .string_constant_str(url_idx)
+            .string_constant_str_for_function(function_id, url_idx)
             .ok_or(VmError::InvalidOperand)?
             .to_string();
         let gate = self.evaluate_module(context, &url)?;
         let value = gate.map_or_else(Value::undefined, Value::promise);
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// `Op::MarkModuleEvaluated` — mark one owning-chunk module record as
+    /// evaluated and advance the current frame.
+    pub(crate) fn run_mark_module_evaluated_const(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        url_idx: u32,
+    ) -> Result<(), VmError> {
+        let function_id = stack[frame_index].function_id;
+        if let Some(url) = context.string_constant_str_for_function(function_id, url_idx) {
+            let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
+            self.module_record_mut(&url_arc).status = ModuleStatus::Evaluated;
+        }
+        stack[frame_index].advance_pc()?;
         Ok(())
     }
 
@@ -1178,21 +1213,24 @@ impl Interpreter {
     pub(crate) fn run_import_meta_resolve_regs(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         spec_reg: u16,
     ) -> Result<(), VmError> {
-        let spec_value = *read_register(frame, spec_reg)?;
+        let function_id = stack[frame_index].function_id;
+        let spec_value = *read_register(&stack[frame_index], spec_reg)?;
         let specifier = spec_value
             .as_string(&self.gc_heap)
             .ok_or(VmError::TypeMismatch)?
             .to_lossy_string(&self.gc_heap);
         let referrer: Option<&str> = context
-            .exec_function(frame.function_id)
+            .exec_function(function_id)
             .map(|f| f.module_url.as_ref());
         let resolved = resolve_relative_url(referrer, &specifier);
         let resolved_str =
             JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::string(resolved_str))?;
         frame.advance_pc()?;
         Ok(())

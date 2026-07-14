@@ -41,6 +41,7 @@ mod exceptions;
 mod functions;
 mod globals;
 mod iterators;
+mod module_op;
 mod private_access;
 mod properties;
 mod protocol;
@@ -927,6 +928,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 class_value::emit_class_value_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ModuleOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                module_op::emit_module_op(
                     &mut ops,
                     transitions,
                     opcode,

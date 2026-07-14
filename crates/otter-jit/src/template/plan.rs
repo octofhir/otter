@@ -462,6 +462,16 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete synchronous module namespace/binding operations, star
+    /// re-export, module-record marking, and `import.meta.resolve` through the
+    /// shared VM transition. Promise-producing module operations remain exact
+    /// side exits.
+    ModuleOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -1267,6 +1277,42 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
+                Op::ImportNamespace | Op::ImportNamespaceDeferred | Op::ModuleNamespaceObject => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::ModuleOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.constant),
+                        arg2: 0,
+                    }
+                }
+                Op::LoadImportBinding => {
+                    let operands = lowered.import_binding_operands()?;
+                    TemplateOp::ModuleOp {
+                        opcode: Op::LoadImportBinding as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.module_url),
+                        arg2: u64::from(operands.binding_name),
+                    }
+                }
+                Op::StarReexport | Op::ImportMetaResolve => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ModuleOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.src),
+                        arg2: 0,
+                    }
+                }
+                Op::MarkModuleEvaluated => {
+                    let operands = lowered.constant_only_operands()?;
+                    TemplateOp::ModuleOp {
+                        opcode: Op::MarkModuleEvaluated as u8,
+                        arg0: u64::from(operands.constant),
+                        arg1: 0,
+                        arg2: 0,
+                    }
+                }
                 Op::Nop => TemplateOp::NoOp,
                 Op::Instanceof | Op::HasProperty => {
                     let operands = lowered.triple_operands()?;
@@ -1659,6 +1705,107 @@ mod tests {
         assert_eq!(
             plan.instructions[5].op,
             TemplateOp::GetIterator { dst: 5, src: 1 }
+        );
+    }
+
+    #[test]
+    fn plan_maps_synchronous_module_completion() {
+        let v = view(&[
+            (
+                Op::ImportNamespace,
+                vec![Operand::Register(0), Operand::ConstIndex(10)],
+            ),
+            (
+                Op::ImportNamespaceDeferred,
+                vec![Operand::Register(1), Operand::ConstIndex(11)],
+            ),
+            (
+                Op::ModuleNamespaceObject,
+                vec![Operand::Register(2), Operand::ConstIndex(12)],
+            ),
+            (
+                Op::LoadImportBinding,
+                vec![
+                    Operand::Register(3),
+                    Operand::ConstIndex(13),
+                    Operand::ConstIndex(14),
+                ],
+            ),
+            (
+                Op::StarReexport,
+                vec![Operand::Register(4), Operand::Register(5)],
+            ),
+            (Op::MarkModuleEvaluated, vec![Operand::ConstIndex(15)]),
+            (
+                Op::ImportMetaResolve,
+                vec![Operand::Register(6), Operand::Register(7)],
+            ),
+            (Op::ReturnUndefined, vec![]),
+        ]);
+        let plan = TemplatePlan::build(&v).expect("module plan");
+        assert!(!plan.osr_only);
+        assert_eq!(
+            plan.instructions[0].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::ImportNamespace as u8,
+                arg0: 0,
+                arg1: 10,
+                arg2: 0,
+            }
+        );
+        assert_eq!(
+            plan.instructions[1].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::ImportNamespaceDeferred as u8,
+                arg0: 1,
+                arg1: 11,
+                arg2: 0,
+            }
+        );
+        assert_eq!(
+            plan.instructions[2].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::ModuleNamespaceObject as u8,
+                arg0: 2,
+                arg1: 12,
+                arg2: 0,
+            }
+        );
+        assert_eq!(
+            plan.instructions[3].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::LoadImportBinding as u8,
+                arg0: 3,
+                arg1: 13,
+                arg2: 14,
+            }
+        );
+        assert_eq!(
+            plan.instructions[4].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::StarReexport as u8,
+                arg0: 4,
+                arg1: 5,
+                arg2: 0,
+            }
+        );
+        assert_eq!(
+            plan.instructions[5].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::MarkModuleEvaluated as u8,
+                arg0: 15,
+                arg1: 0,
+                arg2: 0,
+            }
+        );
+        assert_eq!(
+            plan.instructions[6].op,
+            TemplateOp::ModuleOp {
+                opcode: Op::ImportMetaResolve as u8,
+                arg0: 6,
+                arg1: 7,
+                arg2: 0,
+            }
         );
     }
 

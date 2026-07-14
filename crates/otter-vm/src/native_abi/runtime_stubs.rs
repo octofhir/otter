@@ -1127,6 +1127,19 @@ pub const STUB_JIT_CLASS_VALUE_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes synchronous static-module namespace/binding operations,
+/// star re-export, module-record marking, and `import.meta.resolve` through
+/// shared VM helpers. Promise-producing module operations remain side exits.
+pub const STUB_JIT_MODULE_OP: RuntimeStubDescriptor = descriptor(
+    74,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1204,6 +1217,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         71 => "jit_control_op",
         72 => "jit_spread_call_op",
         73 => "jit_class_value_op",
+        74 => "jit_module_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1283,6 +1297,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CONTROL_OP,
     STUB_JIT_SPREAD_CALL_OP,
     STUB_JIT_CLASS_VALUE_OP,
+    STUB_JIT_MODULE_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

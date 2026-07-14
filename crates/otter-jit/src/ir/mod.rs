@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`cfg`] — typed bytecode basic blocks and complete control-flow edges.
 //! - [`dom`] — dominator tree and dominance-frontier analyses.
+//! - [`deopt_lower`] — concrete exact-PC interpreter-frame reconstruction.
 //! - [`frame_state`] — abstract exact-PC interpreter-frame reconstruction.
 //! - [`liveness`] — backward SSA-value liveness over normal control edges.
 //! - [`regalloc`] — backend-independent linear-scan SSA register allocation.
@@ -19,6 +20,7 @@
 //! - [`crate::template`]
 
 pub mod cfg;
+pub mod deopt_lower;
 pub mod dom;
 pub mod frame_state;
 pub mod liveness;

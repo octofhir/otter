@@ -336,6 +336,17 @@ impl DeoptTable {
         Self { entries: states }
     }
 
+    /// Build a table while preserving the caller's entry order.
+    ///
+    /// This constructor is intended for decoders and verifiers that must retain
+    /// potentially invalid input long enough for [`Self::verify`] to report the
+    /// precise ordering error. Producers of new metadata should normally use
+    /// [`Self::from_states`].
+    #[must_use]
+    pub fn from_unverified_states(states: Vec<FrameState>) -> Self {
+        Self { entries: states }
+    }
+
     /// The frame state for `byte_pc`, or `None` when the PC is not a deopt
     /// point.
     #[must_use]

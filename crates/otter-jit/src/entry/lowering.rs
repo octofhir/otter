@@ -585,6 +585,7 @@ impl BaselinePlan {
                 | Op::LoadBigInt
                 | Op::LoadGlobalOrThrow
                 | Op::LoadGlobalOrUndefined
+                | Op::DeleteDynamic
                 | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,
@@ -749,7 +750,7 @@ impl BaselinePlan {
                         third,
                     })
                 }
-                Op::IteratorNext | Op::Instanceof | Op::HasProperty => {
+                Op::IteratorNext | Op::Instanceof | Op::HasProperty | Op::DeleteElement => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,
@@ -757,11 +758,13 @@ impl BaselinePlan {
                         third,
                     })
                 }
-                Op::LoadProperty => LoweredOperands::PropertyLoad(PropertyLoadOperands {
-                    dst: reg(operands, 0)?,
-                    object: reg(operands, 1)?,
-                    name: const_index(operands, 2)?,
-                }),
+                Op::LoadProperty | Op::DeleteProperty => {
+                    LoweredOperands::PropertyLoad(PropertyLoadOperands {
+                        dst: reg(operands, 0)?,
+                        object: reg(operands, 1)?,
+                        name: const_index(operands, 2)?,
+                    })
+                }
                 Op::StoreProperty => LoweredOperands::PropertyStore(PropertyStoreOperands {
                     object: reg(operands, 0)?,
                     name: const_index(operands, 1)?,

@@ -842,3 +842,27 @@ passed with 0 failures/crashes. The release differential corpus passed 11/11
 under GC stress strides 1 through 16 with verification enabled. The frozen full
 Test262 reference remains 99.02% (51,480/53,173 excluding skips). Performance
 remains subordinate to coverage for this batch.
+
+### Phase 2 production delete completion
+
+The template tier now compiles the `delete` family: `DeleteProperty`,
+`DeleteElement`, and `DeleteDynamic`. They share reentrant runtime stub 61. The
+transition mirrors interpreter dispatch exactly — the same deferred-namespace
+readiness step, the same `drive_delete_*_proxy` driver (Proxy `deleteProperty`
+trap through `run_callable_sync`) and `run_delete_*` fast path, and the same
+unqualified-delete helper — so no delete semantics are copied into JIT code. A
+committed delete, including a strict-mode `Cannot delete property` throw, is
+never replayed by an exact side exit.
+
+Template coverage is 89 of 172 active opcodes (up from 86); 83 remain
+unsupported.
+
+The focused interpreter/template OSR matrix covers named and computed `delete`
+on ordinary objects, a Proxy whose `deleteProperty` trap call count is
+observable, and unqualified `delete` of a configurable global; the compiled
+counter and every result match the interpreter oracle at normal GC and under
+`OTTER_GC_STRESS`. Targeted Test262 `language/expressions/delete` passed 69/69
+with 0 failures/crashes. The release differential corpus passed 11/11 under GC
+stress strides 1 through 16 with verification enabled. The frozen full Test262
+reference remains 99.02% (51,480/53,173 excluding skips). Performance remains
+subordinate to coverage for this batch.

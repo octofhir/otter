@@ -7,9 +7,13 @@
 //!
 //! # Invariants
 //! - Entry is rejected before execution when any layout/build/stub version
-//!   differs from the installed VM.
+//!   differs from the installed VM or a recorded dependency epoch is not
+//!   exactly current for its `(kind, identity)` family.
 //! - Metadata contains offsets/counts and stable ids, never Rust slices or
 //!   container layouts.
+//! - Epoch invalidation is monotonic: dependencies older than the current
+//!   epoch are invalidated; future epochs are not invalidated but fail the
+//!   exact-equality install/entry consistency check.
 //! - Invalid code is unlinked before retirement and retained while any active
 //!   frame can return into it.
 //!
@@ -25,6 +29,11 @@ pub const RUNTIME_STUB_TABLE_VERSION: u32 = 1;
 pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 1;
 /// Reproducible build identity for transient native code.
 pub const VM_BUILD_VERSION: u64 = 0x4f54_5445_525f_0001;
+
+/// Stable identity of the array-index accessor protector epoch.
+pub const ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY: u32 = 0;
+/// Stable identity of the ordinary-object prototype shape epoch.
+pub const ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY: u32 = 0;
 
 /// Complete native-layout compatibility record.
 #[repr(C)]
@@ -106,7 +115,7 @@ impl CodeObjectMetadata {
 
 /// Kind of assumption that can invalidate installed native code.
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodeDependencyKind {
     /// VM field layout/build compatibility.
     VmLayout = 0,
@@ -134,6 +143,19 @@ pub struct CodeDependency {
     pub identity: u32,
     /// Expected version/value at code entry.
     pub expected: u64,
+}
+
+impl CodeDependency {
+    /// Construct one exact-match epoch dependency with version-1 flags.
+    #[must_use]
+    pub const fn epoch(kind: CodeDependencyKind, identity: u32, expected: u64) -> Self {
+        Self {
+            kind,
+            flags: 0,
+            identity,
+            expected,
+        }
+    }
 }
 
 /// Lifecycle state for installed code.

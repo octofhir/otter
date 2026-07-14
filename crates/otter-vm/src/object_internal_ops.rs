@@ -13,6 +13,7 @@
 //! - String exotic property reads/descriptors.
 //! - Proxy invariant validation helpers.
 //! - Realm constructor prototype lookup.
+//! - Protector/shape epoch publication at the two Slice 11.8 mutation funnels.
 //!
 //! # Invariants
 //! - Proxy traps are invoked through the normal callable path.
@@ -20,6 +21,13 @@
 //!   exotics run first and the generic internal-method fallback owns the rest.
 //! - String exotic keys only synthesize `length` and index descriptors.
 //! - Constructor prototype lookup preserves existing global-object semantics.
+//! - The array-index accessor protector epoch advances only on the existing
+//!   latch's `false -> true` transition.
+//! - The shape epoch covers only actual ordinary-`JsObject` prototype changes
+//!   through `set_prototype_value_proxy_aware` (including proxy fallthrough and
+//!   class-statics recursion). Array, TypedArray, function-side-table, direct
+//!   low-level/bootstrap prototype writes, and property shape transitions do
+//!   not advance it in Slice 11.8.
 //!
 //! # See also
 //! - [`crate::property_dispatch`]
@@ -1320,6 +1328,37 @@ impl Interpreter {
         Ok(None)
     }
 
+    /// Flip the existing array-index accessor protector latch and publish its
+    /// sole epoch transition. Redundant observations are strict no-ops.
+    pub(crate) fn activate_array_index_accessor_protector(&mut self) {
+        if self.array_index_accessor_protector {
+            return;
+        }
+        self.array_index_accessor_protector = true;
+        self.array_index_accessor_protector_epoch = self
+            .array_index_accessor_protector_epoch
+            .checked_add(1)
+            .expect("array-index accessor protector epoch exhausted");
+        self.jit_code_registry.invalidate_dependents(
+            crate::native_abi::CodeDependencyKind::Protector,
+            crate::native_abi::ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY,
+            self.array_index_accessor_protector_epoch,
+        );
+    }
+
+    /// Publish one successful ordinary-object prototype mutation.
+    fn bump_ordinary_object_prototype_shape_epoch(&mut self) {
+        self.shape_epoch = self
+            .shape_epoch
+            .checked_add(1)
+            .expect("ordinary-object prototype shape epoch exhausted");
+        self.jit_code_registry.invalidate_dependents(
+            crate::native_abi::CodeDependencyKind::ShapeEpoch,
+            crate::native_abi::ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY,
+            self.shape_epoch,
+        );
+    }
+
     pub(crate) fn define_own_property_value(
         &mut self,
         context: &ExecutionContext,
@@ -1362,7 +1401,7 @@ impl Interpreter {
                 .string_name()
                 .is_some_and(|name| crate::object::array_index_property_name(name).is_some())
         {
-            self.array_index_accessor_protector = true;
+            self.activate_array_index_accessor_protector();
         }
         self.ensure_deferred_namespace_ready(
             context,
@@ -3258,11 +3297,11 @@ impl Interpreter {
                 }
             }
             let proto_opt = if proto.is_null() { None } else { Some(*proto) };
-            return Ok(object::set_prototype_value(
-                obj,
-                &mut self.gc_heap,
-                proto_opt,
-            ));
+            let changed = object::set_prototype_value(obj, &mut self.gc_heap, proto_opt);
+            if changed {
+                self.bump_ordinary_object_prototype_shape_epoch();
+            }
+            return Ok(changed);
         }
         // §10.1.2 — TypedArrays accept ordinary [[SetPrototypeOf]];
         // the override rides a dedicated body slot consulted by every

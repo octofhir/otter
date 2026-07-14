@@ -6,7 +6,8 @@
 //! - Host-realm construction publishes a provisional traced `RealmState`
 //!   before any later allocation and finalizes JS-visible error globals through
 //!   the handle arena.
-//! - Introspection accessors expose property-IC and JIT counters.
+//! - Introspection accessors expose property-IC, JIT, protector, and shape
+//!   epoch counters.
 //!
 //! # Invariants
 //! - Every partially built GC graph is owned either by an RAII bootstrap root
@@ -14,6 +15,8 @@
 //! - Root providers are dropped before their stack slots move into the
 //!   interpreter, and no GC allocation occurs during that move.
 //! - A half-built interpreter is never observable outside this module.
+//! - Protector and shape epochs start at zero and are isolate-local plain data,
+//!   not GC roots.
 #![allow(unused_imports)]
 use crate::rooting::RootScopeExt;
 use crate::*;
@@ -47,6 +50,26 @@ impl Interpreter {
     #[must_use]
     pub fn new() -> Self {
         Self::with_string_heap_cap(0)
+    }
+
+    /// Current array-index accessor protector epoch.
+    ///
+    /// This starts at zero and advances exactly once when the one-shot
+    /// protector latch first observes an array-index accessor definition.
+    #[must_use]
+    pub fn array_index_accessor_protector_epoch(&self) -> u64 {
+        self.array_index_accessor_protector_epoch
+    }
+
+    /// Current ordinary-object prototype shape epoch.
+    ///
+    /// Slice 11.8 advances this only for an actual prototype change in the
+    /// ordinary-`JsObject` branch of the proxy-aware `[[SetPrototypeOf]]`
+    /// funnel. Other exotic or low-level shape/prototype mutations are not
+    /// covered by this epoch yet.
+    #[must_use]
+    pub fn shape_epoch(&self) -> u64 {
+        self.shape_epoch
     }
 
     /// Construct an interpreter with a string heap cap (`0` =
@@ -173,12 +196,14 @@ impl Interpreter {
             json_stringify_capacity_hint: 0,
             external_memory_adjustment: None,
             array_index_accessor_protector: false,
+            array_index_accessor_protector_epoch: 0,
             interrupt: InterruptFlag::new(),
             jit_backedge_fuel: Self::JIT_BACKEDGE_POLL_BATCH,
             gc_heap,
             code_space: std::sync::Arc::new(code_space::CodeSpace::default()),
             realm_context: None,
             shape_runtime,
+            shape_epoch: 0,
             simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,

@@ -14,6 +14,9 @@
 //! leave the frame stack exactly as the interpreter expects to resume.
 //! Reentrant unary coercion owns moving values through the handle arena and
 //! commits its destination only after the abstract operation succeeds.
+//! Every VM-side compiled entry selection applies both native-layout metadata
+//! compatibility and exact isolate-epoch dependency consistency. Safepoint
+//! resolution for already-active Invalid code remains independent.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -223,6 +226,12 @@ impl Interpreter {
             self.jit_osr_disabled.insert((fid, osr_pc));
             return Ok(None);
         };
+        if !self
+            .jit_code_registry
+            .dependencies_are_current_for_entry(code.as_ref())
+        {
+            return Ok(None);
+        }
         // See `run_compiled_frame`: the activation must name the chunk owning
         // the OSR-entered frame, not the caller tick's chunk.
         let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
@@ -452,7 +461,9 @@ impl Interpreter {
         // so it needs no further filtering.
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
-            && code.metadata().is_compatible_with_current_vm()
+            && self
+                .jit_code_registry
+                .is_compatible_for_entry(code.as_ref())
         {
             return Some(code.clone());
         }
@@ -483,7 +494,9 @@ impl Interpreter {
         // The function-entry path never runs OSR-only code (compiled with
         // unsupported opcodes emitted as bails); only loop OSR enters it, at a
         // supported loop header. The code stays cached for that OSR path.
-        let code = code.filter(|c| c.metadata().is_compatible_with_current_vm() && !c.osr_only());
+        let code = code.filter(|c| {
+            self.jit_code_registry.is_compatible_for_entry(c.as_ref()) && !c.osr_only()
+        });
         if let Some(c) = &code {
             self.jit_code_cache = Some((fid, c.clone()));
         } else {
@@ -539,12 +552,18 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
-            && code.metadata().is_compatible_with_current_vm()
+            && self
+                .jit_code_registry
+                .is_compatible_for_entry(code.as_ref())
         {
             return Some(code.clone());
         }
         let code = self.jit_code.get(&fid)?.clone()?;
-        if code.osr_only() || !code.metadata().is_compatible_with_current_vm() {
+        if code.osr_only()
+            || !self
+                .jit_code_registry
+                .is_compatible_for_entry(code.as_ref())
+        {
             return None;
         }
         self.jit_code_cache = Some((fid, code.clone()));
@@ -552,10 +571,11 @@ impl Interpreter {
     }
 
     pub(crate) fn jit_direct_call_plan_for(
+        &self,
         function: &crate::executable::CodeBlock,
         code: &dyn jit::JitFunctionCode,
     ) -> Option<jit::JitDirectCallPlan> {
-        if !code.metadata().is_compatible_with_current_vm() {
+        if !self.jit_code_registry.is_compatible_for_entry(code) {
             return None;
         }
         Some(jit::JitDirectCallPlan {
@@ -821,7 +841,7 @@ impl Interpreter {
         let Some(function) = context.exec_function(function_id) else {
             return Ok(None);
         };
-        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+        let Some(plan) = self.jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
 
@@ -1062,7 +1082,7 @@ impl Interpreter {
         let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
             return Ok(None);
         };
-        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+        let Some(plan) = self.jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
         self.install_jit_direct_method_cache(site, obj, key, method, function_id, code.clone());
@@ -1480,7 +1500,7 @@ impl Interpreter {
         let Some(code) = self.jit_resolve_compiled_cached(function_id) else {
             return Ok(None);
         };
-        let Some(plan) = Self::jit_direct_call_plan_for(function, code.as_ref()) else {
+        let Some(plan) = self.jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
         self.enter_sync_reentry()?;

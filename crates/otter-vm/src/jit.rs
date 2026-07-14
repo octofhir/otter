@@ -13,7 +13,8 @@
 //! - [`JitCompilerHook`] — runtime-installed compile hook implemented outside
 //!   `otter-vm`.
 //! - [`JitFunctionCode`] and [`JitCompileStatus`] — type-erased compiled-code
-//!   result handles that keep executable memory ownership outside this crate.
+//!   result handles and validity dependencies that keep executable memory
+//!   ownership outside this crate.
 //!
 //! # Invariants
 //! - DTOs are owned and borrow-free. JIT compilation must not hold references
@@ -862,6 +863,15 @@ pub enum JitExecOutcome {
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// Immutable versioned metadata for this installed code object.
     fn metadata(&self) -> crate::native_abi::CodeObjectMetadata;
+
+    /// Immutable isolate-state dependencies declared by this code object.
+    ///
+    /// Implementations that record dependencies own the backing slice for the
+    /// code object's lifetime and set `metadata().dependency_count` to the
+    /// exact slice length. Baseline/template code uses the empty default.
+    fn dependencies(&self) -> &[crate::native_abi::CodeDependency] {
+        &[]
+    }
 
     /// Size in bytes of the finalized native code mapping.
     fn code_len(&self) -> usize;

@@ -10,6 +10,8 @@
 //! Baked pointers (shape ids, global cells, prototype slots) must only
 //! reference permanent or non-moving allocations; anything movable goes
 //! through a runtime stub instead.
+//! Compiled code is published only after the registry accepts its metadata and
+//! exact isolate-epoch dependency snapshot.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -131,8 +133,8 @@ impl Interpreter {
                 // is the registry itself retires here.
                 self.jit_code_registry.retire_unreferenced();
                 self.jit_code_registry
-                    .register(code_object_id, code.clone());
-                Some(code)
+                    .register(code_object_id, code.clone())
+                    .then_some(code)
             }
             _ => None,
         }

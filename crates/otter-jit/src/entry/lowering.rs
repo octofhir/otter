@@ -713,7 +713,11 @@ impl BaselinePlan {
                         arguments,
                     })
                 }
-                Op::NewArray => {
+                Op::NewArray
+                | Op::ArrayConstruct
+                | Op::ArrayFrom
+                | Op::ArrayOf
+                | Op::QueueMicrotask => {
                     let count = const_index(operands, 1)? as usize;
                     let elements = append_register_tail(
                         &mut register_operands,
@@ -721,7 +725,7 @@ impl BaselinePlan {
                         operands.len(),
                         2,
                         count,
-                        "NewArray register tail",
+                        "variadic register tail",
                     )?;
                     LoweredOperands::NewArray(NewArrayOperands {
                         dst: reg(operands, 0)?,

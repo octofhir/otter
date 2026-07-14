@@ -112,6 +112,42 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
     }
 }
 
+/// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
+/// `ArrayOf`, `QueueMicrotask`). `0` means the VM committed the opcode and the
+/// template may fall through; `1` reports a parked throw; `2` remains an exact
+/// pre-effect side exit for an absent activation.
+pub(crate) extern "C" fn jit_variadic_op_stub(
+    ctx: *mut JitCtx,
+    opcode: u64,
+    prefix: u64,
+    count: u64,
+    packed_args: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return STATUS_BAILED;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_variadic_op(
+        context,
+        stack,
+        ctx.frame_index,
+        opcode as u8,
+        prefix,
+        count,
+        packed_args,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            STATUS_THREW
+        }
+    }
+}
+
 /// Complete one class-construction opcode (`BindThisValue`, `ClassCheck`,
 /// `SetFunctionName`). `0` means the VM committed the opcode and the template
 /// may fall through; `1` reports a parked throw; `2` remains an exact pre-effect

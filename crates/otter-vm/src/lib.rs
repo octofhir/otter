@@ -116,6 +116,7 @@ mod jit_scalar_ops;
 mod jit_structural_ops;
 mod jit_super_ops;
 mod jit_value_load_ops;
+mod jit_variadic_ops;
 pub mod js_surface;
 pub mod json;
 pub mod marshal;

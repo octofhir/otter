@@ -403,6 +403,16 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one variadic construction opcode (`ArrayConstruct`, `ArrayFrom`,
+    /// `ArrayOf`, `QueueMicrotask`) through the shared reentrant variadic
+    /// transition. `prefix` is the destination/callee register, `argc` the
+    /// argument count, and `packed_args` the argument registers.
+    VariadicOp {
+        opcode: u8,
+        prefix: u16,
+        argc: u16,
+        packed_args: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -1022,6 +1032,24 @@ impl TemplatePlan {
                         opcode: lowered.op as u8,
                         arg0: u64::from(operands.dst),
                         arg1: u64::from(operands.src),
+                    }
+                }
+                Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
+                    let operands = lowered.new_array_operands()?;
+                    let arguments = lowering.register_tail(operands.elements)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        osr_only = true;
+                        instructions.push(TemplateInstr {
+                            pc,
+                            op: TemplateOp::UnsupportedBail,
+                        });
+                        continue;
+                    }
+                    TemplateOp::VariadicOp {
+                        opcode: lowered.op as u8,
+                        prefix: operands.dst,
+                        argc: arguments.len() as u16,
+                        packed_args: pack_method_arg_regs(arguments),
                     }
                 }
                 Op::BindThisValue | Op::ClassCheck | Op::SetFunctionName => {

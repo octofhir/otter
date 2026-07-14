@@ -80,6 +80,15 @@ impl Interpreter {
                     arg2 as u16,
                 )?;
             }
+            value if value == Op::PromiseFulfilledOf as u8 => {
+                self.run_promise_fulfilled_of_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    arg0 as u16,
+                    arg1 as u16,
+                )?;
+            }
             _ => return Err(VmError::InvalidOperand),
         }
         stack[frame_index].pc = saved_pc;

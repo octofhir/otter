@@ -1045,3 +1045,20 @@ active opcodes (up from 129); 36 remain unsupported. The release differential
 corpus passed 11/11 under GC stress strides 1 through 16; targeted Test262
 `language/global-code` (195/195) and `language/statements/variable` (178/178)
 passed with 0 failures/crashes. The frozen full Test262 reference remains 99.02%.
+
+### Phase 2 production intrinsic-call completion
+
+`ArrayBufferCall`, `SharedArrayBufferCall`, `BigIntCall`, and `DataViewCall`
+join the variadic construction stub (runtime stub 69), reconstructing their
+operand list from the packed argument tail and calling the interpreter's
+`run_array_buffer_static_call_operands`/`run_shared_array_buffer_static_call_operands`/
+`run_static_call_operands` helper. `PromiseFulfilledOf` (`Promise.resolve`)
+joins the construction stub (runtime stub 66) through
+`run_promise_fulfilled_of_regs`. No semantics are duplicated in JIT code.
+Template coverage is 141 of 172 active opcodes (up from 136); 31 remain
+unsupported. Interpreter/template parity holds for an
+`ArrayBuffer`/`BigInt`/`DataView`/`Promise.resolve` loop; the release
+differential corpus passed 11/11 under GC stress strides 1 through 16, and
+targeted Test262 `built-ins/ArrayBuffer` (191/191) and `built-ins/DataView`
+(548/548) passed with 0 failures/crashes. The frozen full Test262 reference
+remains 99.02%.

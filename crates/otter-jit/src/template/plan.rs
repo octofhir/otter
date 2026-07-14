@@ -1015,7 +1015,11 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::NewError | Op::ArrayPush | Op::NewWeakRef | Op::NewFinalizationRegistry => {
+                Op::NewError
+                | Op::ArrayPush
+                | Op::NewWeakRef
+                | Op::NewFinalizationRegistry
+                | Op::PromiseFulfilledOf => {
                     let operands = lowered.unary_operands()?;
                     TemplateOp::ConstructOp {
                         opcode: lowered.op as u8,
@@ -1041,7 +1045,14 @@ impl TemplatePlan {
                         arg1: u64::from(operands.src),
                     }
                 }
-                Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
+                Op::ArrayConstruct
+                | Op::ArrayFrom
+                | Op::ArrayOf
+                | Op::QueueMicrotask
+                | Op::ArrayBufferCall
+                | Op::SharedArrayBufferCall
+                | Op::BigIntCall
+                | Op::DataViewCall => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = lowering.register_tail(operands.elements)?;
                     if arguments.len() > MAX_METHOD_ARGS {

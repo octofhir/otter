@@ -3,6 +3,7 @@
 //! # Contents
 //! - Frame-local try-handler installation and removal.
 //! - Throw/finally resumption through the interpreter's canonical unwind code.
+//! - Callee-throw delivery back into a live compiled caller.
 //! - Abrupt jump/return completion without popping a live compiled frame.
 //!
 //! # Invariants
@@ -40,6 +41,43 @@ pub enum JitExceptionOutcome {
 }
 
 impl Interpreter {
+    /// Deliver a propagated compiled-callee throw into `frame_index` when that
+    /// caller still owns an active structured-exception handler.
+    ///
+    /// Compiled call bridges use this before taking their shared throw
+    /// epilogue. A successful unwind updates the caller's canonical frame PC;
+    /// the bridge publishes that PC and bails so interpreter dispatch resumes
+    /// at the selected catch/finally continuation without replaying the call.
+    pub fn jit_resume_caller_throw(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+    ) -> Result<Option<u32>, VmError> {
+        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
+        let has_handler = self
+            .frame_cold(frame)
+            .is_some_and(|cold| !cold.handlers.is_empty());
+        if !has_handler {
+            return Ok(None);
+        }
+        let Some(value) = self.pending_uncaught_throw.take() else {
+            return Ok(None);
+        };
+
+        match self.unwind_throw(context, stack, value) {
+            Ok(()) => {
+                self.pending_uncaught_frames = None;
+                let pc = stack.get(frame_index).ok_or(VmError::InvalidOperand)?.pc;
+                Ok(Some(pc))
+            }
+            Err(err) => {
+                self.pending_uncaught_throw = Some(value);
+                Err(err)
+            }
+        }
+    }
+
     /// Complete one structured-exception opcode for a published compiled frame.
     ///
     /// Arguments are opcode-specific scalar operands already validated by JIT

@@ -9,6 +9,8 @@
 //! - The caller's canonical PC is stamped before the prepare transition; a
 //!   bailed callee reifies at its exact PC through the finish helpers and the
 //!   caller's published frame survives untouched.
+//! - A callee throw caught by the compiled caller publishes the selected
+//!   catch/finally PC and exits through the shared bailout epilogue.
 //! - The callee frame lives exactly as long as its machine-stack
 //!   reservation; the caller's frame is republished before any exit path.
 //! - Ineligible call resolutions complete through the descriptor-classified
@@ -78,7 +80,7 @@ pub(super) fn emit_call(
         ; cmp x0, #2
         ; b.eq =>generic
     );
-    emit_direct_call_tail(ops, table, dst, threw, done);
+    emit_direct_call_tail(ops, table, dst, bail, threw, done);
 
     // Ineligible callee: complete the whole opcode through the generic
     // in-place call transition; only its non-callable report (`2`)
@@ -233,7 +235,7 @@ pub(super) fn emit_method_call(
         ; cmp x0, #2
         ; b.eq =>generic
     );
-    emit_direct_call_tail(ops, table, dst, threw, done);
+    emit_direct_call_tail(ops, table, dst, bail, threw, done);
 
     // Ineligible direct resolution: complete the whole opcode through the
     // generic in-place method transition; only its exotic-receiver report
@@ -276,6 +278,7 @@ fn emit_direct_call_tail(
     ops: &mut Assembler,
     table: &TransitionTable,
     dst: u16,
+    bail: DynamicLabel,
     threw: DynamicLabel,
     done: DynamicLabel,
 ) {
@@ -424,7 +427,8 @@ fn emit_direct_call_tail(
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
-        ; cbnz x0, =>threw
+        ; cmp x0, #2
+        ; b.eq =>bail
         ; b =>threw
     );
 }

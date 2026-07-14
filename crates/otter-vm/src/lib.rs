@@ -5,6 +5,8 @@
 //! - [`Frame`] — compact call frame.
 //! - [`Interpreter`] — match-based dispatch loop over the frozen
 //!   executable view inside [`ExecutionContext`].
+//! - [`tier_policy::OptimizingDecision`] — additive optimizing-tier promotion
+//!   classification over hotness and feedback stability.
 //! - [`InterruptFlag`] — atomic flag observed at back-edges; cheap.
 //! - [`VmError`] — runtime errors the interpreter can raise.
 //!
@@ -171,6 +173,7 @@ pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
+pub mod tier_policy;
 pub mod timers;
 pub mod uint8_base64;
 pub mod upvalue;
@@ -933,6 +936,11 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
+    /// Additive optimizing-tier promotion telemetry. It counts calls and
+    /// back-edges independently of the baseline counters and is consumed only
+    /// by the explicit [`Self::optimizing_tier_decision`] query; no current
+    /// compile or dispatch path reads its decisions.
+    optimizing_tier_policy: tier_policy::TierPolicy,
     /// Bounded ordinary-call target distributions for the future optimizing
     /// tier, keyed by `(caller function id, canonical instruction index)`.
     /// Populated additively; no current decision reads this table.

@@ -122,6 +122,17 @@ impl CodeSpace {
         let chunk = inner.chunks.get(idx.checked_sub(1)?)?;
         (function_id - chunk.function_base < chunk.function_count).then(|| chunk.clone())
     }
+
+    /// Read one function's material-feedback epoch without requiring an
+    /// ambient execution context. Used only by the explicit optimizing-tier
+    /// policy query; baseline compilation and dispatch do not call it.
+    pub(crate) fn feedback_epoch(&self, function_id: u32) -> Option<u32> {
+        let chunk = self.chunk_for(function_id)?;
+        chunk
+            .executable
+            .function(function_id - chunk.function_base)
+            .map(crate::executable::CodeBlock::feedback_epoch)
+    }
 }
 
 /// A chunk resolved for one function id: either the caller's ambient

@@ -6,7 +6,8 @@
 //! direct-call and direct-method-call preparation/finish/abort, the
 //! per-fid direct-method inline cache, in-place coercive unary operations, and
 //! raw frame-pointer accessors the emitted code reads (`jit_frame_regs_ptr`
-//! and friends).
+//! and friends). Call and back-edge accounting also feeds the additive
+//! optimizing-tier policy without consulting its decision.
 //!
 //! # Invariants
 //! Every publish of a callee frame is paired with a finish/abort helper
@@ -17,6 +18,8 @@
 //! Every VM-side compiled entry selection applies both native-layout metadata
 //! compatibility and exact isolate-epoch dependency consistency. Safepoint
 //! resolution for already-active Invalid code remains independent.
+//! Optimizing-policy accounting never changes baseline counters, thresholds,
+//! compilation, or entry selection.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -453,6 +456,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        self.optimizing_tier_policy.record_hotness(fid, 1);
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
@@ -556,6 +560,7 @@ impl Interpreter {
                 .jit_code_registry
                 .is_compatible_for_entry(code.as_ref())
         {
+            self.optimizing_tier_policy.record_hotness(fid, 1);
             return Some(code.clone());
         }
         let code = self.jit_code.get(&fid)?.clone()?;
@@ -567,6 +572,7 @@ impl Interpreter {
             return None;
         }
         self.jit_code_cache = Some((fid, code.clone()));
+        self.optimizing_tier_policy.record_hotness(fid, 1);
         Some(code)
     }
 

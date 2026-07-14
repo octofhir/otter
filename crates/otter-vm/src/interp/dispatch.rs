@@ -2,9 +2,9 @@
 //!
 //! # Contents
 //! `dispatch_loop_inner`: one `match` arm per opcode, inline caches,
-//! and the JIT tier-up/backedge hooks. Deliberately a single function —
-//! splitting it would defeat the dispatch-locality the interpreter
-//! depends on.
+//! the JIT tier-up/backedge hooks, and additive optimizing-tier back-edge
+//! accounting. Deliberately a single function — splitting it would defeat the
+//! dispatch-locality the interpreter depends on.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -1892,6 +1892,9 @@ impl Interpreter {
                         .exec_imm32(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     apply_branch(&mut stack[top_idx], offset, &self.interrupt)?;
+                    if offset < 0 && jit_installed {
+                        self.optimizing_tier_policy.record_hotness(function_id, 1);
+                    }
                     if offset < 0
                         && let Some(Some(value)) =
                             self.note_backedge_and_maybe_osr(stack, context, top_idx)?
@@ -1914,6 +1917,9 @@ impl Interpreter {
                     }
                     if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
+                        if offset < 0 && jit_installed {
+                            self.optimizing_tier_policy.record_hotness(function_id, 1);
+                        }
                         if offset < 0
                             && let Some(Some(value)) =
                                 self.note_backedge_and_maybe_osr(stack, context, top_idx)?
@@ -1939,6 +1945,9 @@ impl Interpreter {
                     }
                     if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
+                        if offset < 0 && jit_installed {
+                            self.optimizing_tier_policy.record_hotness(function_id, 1);
+                        }
                         if offset < 0
                             && let Some(Some(value)) =
                                 self.note_backedge_and_maybe_osr(stack, context, top_idx)?

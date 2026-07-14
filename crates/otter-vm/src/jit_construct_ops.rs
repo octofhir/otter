@@ -1,8 +1,9 @@
 //! Compiled allocating-construction transitions.
 //!
 //! # Contents
-//! - `CollectRest`, `NewError`, `NewBuiltinError`, and `ArrayPush` completion
-//!   through the VM's allocating construction helpers.
+//! - `CollectRest`, `NewError`, `NewBuiltinError`, `ArrayPush`, `NewWeakRef`,
+//!   `NewFinalizationRegistry`, and `NewCollection` completion through the VM's
+//!   allocating construction helpers.
 //!
 //! # Invariants
 //! - No construction semantics are duplicated in JIT code; each opcode calls the
@@ -56,6 +57,28 @@ impl Interpreter {
             }
             value if value == Op::ArrayPush as u8 => {
                 self.run_array_push_regs(stack, frame_index, arg0 as u16, arg1 as u16)?;
+            }
+            value if value == Op::NewWeakRef as u8 => {
+                self.run_new_weak_ref_regs(stack, frame_index, arg0 as u16, arg1 as u16)?;
+            }
+            value if value == Op::NewFinalizationRegistry as u8 => {
+                self.run_new_finalization_registry_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    arg0 as u16,
+                    arg1 as u16,
+                )?;
+            }
+            value if value == Op::NewCollection as u8 => {
+                self.run_new_collection_regs(
+                    context,
+                    stack,
+                    frame_index,
+                    arg0 as u16,
+                    arg1 as u32,
+                    arg2 as u16,
+                )?;
             }
             _ => return Err(VmError::InvalidOperand),
         }

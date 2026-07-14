@@ -562,6 +562,19 @@ pub(super) fn compile(
                     threw,
                 );
             }
+            TemplateOp::TdzError { local_index } => {
+                exceptions::emit_exception_op(
+                    &mut ops,
+                    transitions,
+                    Op::TdzError as u8,
+                    u64::from(local_index),
+                    0,
+                    0,
+                    bail,
+                    returned,
+                    threw,
+                );
+            }
             TemplateOp::EndFinally => {
                 exceptions::emit_exception_op(
                     &mut ops,

@@ -902,7 +902,8 @@ pub const STUB_JIT_NUMERIC_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
-/// Completes structured exception-region state changes and abrupt unwinds.
+/// Completes structured exception-region state changes, abrupt unwinds, and
+/// TDZ `ReferenceError` materialization.
 pub const STUB_JIT_EXCEPTION_OP: RuntimeStubDescriptor = descriptor(
     56,
     RuntimeStubClass::Reentrant,

@@ -918,10 +918,17 @@ impl TemplatePlan {
                         arg2: u64::from(operands.extra),
                     }
                 }
-                Op::StoreGlobalChecked => {
+                Op::StoreGlobalChecked
+                | Op::DeclareGlobalVar
+                | Op::DeclareGlobalLex
+                | Op::ValidateGlobalDecl
+                | Op::DefineGlobalVar
+                | Op::DefineGlobalFunction
+                | Op::InitGlobalLex
+                | Op::GlobalBindingExists => {
                     let operands = lowered.global_store_operands()?;
                     TemplateOp::GlobalOp {
-                        opcode: Op::StoreGlobalChecked as u8,
+                        opcode: lowered.op as u8,
                         arg0: u64::from(operands.value),
                         arg1: u64::from(operands.name),
                         arg2: u64::from(operands.extra),

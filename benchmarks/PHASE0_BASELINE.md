@@ -1031,3 +1031,17 @@ differential corpus passed 11/11 under GC stress strides 1 through 16, and
 targeted Test262 `built-ins/Array/of` (15/16) and `built-ins/Array/from`
 (142/143) passed with 0 failures/crashes. The frozen full Test262 reference
 remains 99.02%.
+
+### Phase 2 production global-declaration completion
+
+The one-time global-declaration opcodes now compile through the existing global
+environment-record stub (runtime stub 59): `DeclareGlobalVar`,
+`DeclareGlobalLex`, `ValidateGlobalDecl`, `DefineGlobalVar`,
+`DefineGlobalFunction`, `InitGlobalLex`, and `GlobalBindingExists`. Each reuses
+the interpreter's `run_*_reg` helper, so no new stub or emitter was added. These
+run once at script/module top level (no hot-loop value), so they are validated
+by conformance rather than a loop-OSR fixture. Template coverage is 136 of 172
+active opcodes (up from 129); 36 remain unsupported. The release differential
+corpus passed 11/11 under GC stress strides 1 through 16; targeted Test262
+`language/global-code` (195/195) and `language/statements/variable` (178/178)
+passed with 0 failures/crashes. The frozen full Test262 reference remains 99.02%.

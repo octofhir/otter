@@ -811,6 +811,30 @@ impl BaselinePlan {
                     name: 0,
                     extra: 0,
                 }),
+                Op::DeclareGlobalVar | Op::DeclareGlobalLex | Op::ValidateGlobalDecl => {
+                    LoweredOperands::GlobalStore(GlobalStoreOperands {
+                        value: 0,
+                        name: const_index(operands, 0)?,
+                        extra: imm32(operands, 1)? as u32,
+                    })
+                }
+                Op::DefineGlobalVar => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 1)?,
+                    name: const_index(operands, 0)?,
+                    extra: 0,
+                }),
+                Op::DefineGlobalFunction => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 1)?,
+                    name: const_index(operands, 0)?,
+                    extra: imm32(operands, 2)? as u32,
+                }),
+                Op::InitGlobalLex | Op::GlobalBindingExists => {
+                    LoweredOperands::GlobalStore(GlobalStoreOperands {
+                        value: reg(operands, 0)?,
+                        name: const_index(operands, 1)?,
+                        extra: 0,
+                    })
+                }
                 Op::ClassCheck => LoweredOperands::GlobalStore(GlobalStoreOperands {
                     value: reg(operands, 1)?,
                     name: imm32(operands, 0)? as u32,

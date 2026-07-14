@@ -78,6 +78,33 @@ impl Interpreter {
             value if value == Op::TypeofDynamic as u8 => {
                 self.run_typeof_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
             }
+            value if value == Op::DeclareGlobalVar as u8 => {
+                self.run_declare_global_var_reg(context, frame, arg1 as u32, arg2 != 0)?;
+            }
+            value if value == Op::DeclareGlobalLex as u8 => {
+                self.run_declare_global_lex_reg(context, frame, arg1 as u32, arg2 != 0)?;
+            }
+            value if value == Op::ValidateGlobalDecl as u8 => {
+                self.run_validate_global_decl_reg(context, frame, arg1 as u32, arg2 as u32 as i32)?;
+            }
+            value if value == Op::DefineGlobalVar as u8 => {
+                self.run_define_global_var_reg(context, frame, arg1 as u32, arg0 as u16)?;
+            }
+            value if value == Op::DefineGlobalFunction as u8 => {
+                self.run_define_global_function_reg(
+                    context,
+                    frame,
+                    arg1 as u32,
+                    arg0 as u16,
+                    arg2 != 0,
+                )?;
+            }
+            value if value == Op::InitGlobalLex as u8 => {
+                self.run_init_global_lex_reg(context, frame, arg0 as u16, arg1 as u32)?;
+            }
+            value if value == Op::GlobalBindingExists as u8 => {
+                self.run_global_binding_exists_reg(context, frame, arg0 as u16, arg1 as u32)?;
+            }
             _ => return Err(VmError::InvalidOperand),
         }
         stack[frame_index].pc = saved_pc;

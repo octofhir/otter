@@ -909,3 +909,18 @@ unsupported. Interpreter/template parity holds for a `with`-block fixture;
 targeted Test262 `language/statements/with` passed 181/181 and the release
 differential corpus passed 11/11 under GC stress strides 1 through 16. The
 frozen full Test262 reference remains 99.02% (51,480/53,173 excluding skips).
+
+### Phase 2 production super-access completion
+
+`LoadSuperProperty`, `LoadSuperElement`, `SetSuperProperty`, and
+`SetSuperElement` now compile through reentrant runtime stub 63; each calls the
+same `run_load_super_property`/`run_store_super_property` helper the interpreter
+dispatches, so home-object `[[Prototype]]` accessor getters/setters fire
+identically and no super semantics are copied into JIT code. A committed super
+effect is never replayed by an exact side exit. Template coverage is 104 of 172
+active opcodes (up from 100); 68 remain unsupported. The interpreter/template
+OSR matrix covers `super.prop` accessor get/set, `super.method()`, and computed
+`super[key]` inside a derived-class method with observable getter/setter
+counters; the release differential corpus passed 11/11 under GC stress strides
+1 through 16, and targeted Test262 `language/expressions/super` passed 93/94
+(1 skip). The frozen full Test262 reference remains 99.02%.

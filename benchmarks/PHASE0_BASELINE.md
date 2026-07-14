@@ -984,3 +984,17 @@ GC stress strides 1 through 16. Targeted Test262 `language/statements/for-in`
 was 121/122 — the single failure reproduces identically under interpreter-only
 execution, so it is a tier-independent pre-existing baseline failure, not a
 regression. The frozen full Test262 reference remains 99.02%.
+
+### Phase 2 production collection-allocation completion
+
+`NewWeakRef`, `NewFinalizationRegistry`, and `NewCollection` (Map/Set/WeakMap/
+WeakSet with an optional iterable) now compile through the existing construction
+stub (runtime stub 66); each reuses the interpreter's
+`run_new_weak_ref_regs`/`run_new_finalization_registry_regs`/
+`run_new_collection_regs` helper, so no new stub or emitter was added. Template
+coverage is 122 of 172 active opcodes (up from 119); 50 remain unsupported.
+Interpreter/template parity holds for a `new Map`/`new Set`/`new WeakRef`/
+`new FinalizationRegistry` loop; the release differential corpus passed 11/11
+under GC stress strides 1 through 16, and targeted Test262 `built-ins/WeakRef`
+(28/29) and `built-ins/FinalizationRegistry` (46/47) passed with 0
+failures/crashes. The frozen full Test262 reference remains 99.02%.

@@ -641,7 +641,9 @@ impl BaselinePlan {
                 | Op::NewError
                 | Op::ArrayPush
                 | Op::ForInKeys
-                | Op::CopyDataProperties => LoweredOperands::Unary(UnaryOperands {
+                | Op::CopyDataProperties
+                | Op::NewWeakRef
+                | Op::NewFinalizationRegistry => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
@@ -793,7 +795,7 @@ impl BaselinePlan {
                         name: const_index(operands, 2)?,
                     })
                 }
-                Op::SetSuperProperty | Op::NewBuiltinError => {
+                Op::SetSuperProperty | Op::NewBuiltinError | Op::NewCollection => {
                     LoweredOperands::GlobalStore(GlobalStoreOperands {
                         value: reg(operands, 0)?,
                         name: const_index(operands, 1)?,

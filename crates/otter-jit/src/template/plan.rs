@@ -990,7 +990,7 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::NewError | Op::ArrayPush => {
+                Op::NewError | Op::ArrayPush | Op::NewWeakRef | Op::NewFinalizationRegistry => {
                     let operands = lowered.unary_operands()?;
                     TemplateOp::ConstructOp {
                         opcode: lowered.op as u8,
@@ -999,10 +999,10 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
-                Op::NewBuiltinError => {
+                Op::NewBuiltinError | Op::NewCollection => {
                     let operands = lowered.global_store_operands()?;
                     TemplateOp::ConstructOp {
-                        opcode: Op::NewBuiltinError as u8,
+                        opcode: lowered.op as u8,
                         arg0: u64::from(operands.value),
                         arg1: u64::from(operands.name),
                         arg2: u64::from(operands.extra),

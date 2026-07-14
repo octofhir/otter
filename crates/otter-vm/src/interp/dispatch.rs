@@ -1892,9 +1892,6 @@ impl Interpreter {
                         .exec_imm32(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     apply_branch(&mut stack[top_idx], offset, &self.interrupt)?;
-                    if offset < 0 && jit_installed {
-                        self.optimizing_tier_policy.record_hotness(function_id, 1);
-                    }
                     if offset < 0
                         && let Some(Some(value)) =
                             self.note_backedge_and_maybe_osr(stack, context, top_idx)?
@@ -1917,9 +1914,6 @@ impl Interpreter {
                     }
                     if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
-                        if offset < 0 && jit_installed {
-                            self.optimizing_tier_policy.record_hotness(function_id, 1);
-                        }
                         if offset < 0
                             && let Some(Some(value)) =
                                 self.note_backedge_and_maybe_osr(stack, context, top_idx)?
@@ -1945,9 +1939,6 @@ impl Interpreter {
                     }
                     if taken {
                         apply_branch(frame, offset, &self.interrupt)?;
-                        if offset < 0 && jit_installed {
-                            self.optimizing_tier_policy.record_hotness(function_id, 1);
-                        }
                         if offset < 0
                             && let Some(Some(value)) =
                                 self.note_backedge_and_maybe_osr(stack, context, top_idx)?

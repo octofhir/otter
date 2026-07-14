@@ -243,6 +243,8 @@ impl Interpreter {
                 .filter(|&t| t > 0)
                 .unwrap_or(Self::JIT_OSR_THRESHOLD),
             jit_code: rustc_hash::FxHashMap::default(),
+            jit_optimized_code: rustc_hash::FxHashMap::default(),
+            jit_optimized_code_cache: None,
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),

@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
+use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 
 use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
@@ -55,6 +56,7 @@ const MAX_PARAMETER_OFFSET: u32 = 32_760;
 struct GuardedParam {
     value: ValueId,
     index: u32,
+    first_use_pc: u32,
     deopt_byte_pc: u32,
 }
 
@@ -102,13 +104,15 @@ pub(super) fn compile(
         .map_err(|_| Unsupported::OperandShape("optimizing deopt lowering"))?;
 
     let eligibility = check_eligibility(view, &cfg, &ssa, &reprs, &allocation)?;
-    let code = emit(view, &ssa, &allocation, &eligibility)?;
+    let code = emit(view, &ssa, &allocation, &eligibility, deopt.table())?;
     Ok(OptimizedCode::new(
         code,
         deopt.table().clone(),
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
+            param_count: view.code_block.param_count,
+            register_count: view.code_block.register_count,
             machine_register_count: allocation.register_count,
             linear_scan_spill_slot_count,
             spill_slot_count: allocation.spill_slot_count,
@@ -295,6 +299,7 @@ fn check_eligibility(
         guarded_params.push(GuardedParam {
             value,
             index,
+            first_use_pc,
             deopt_byte_pc: byte_pc(view, first_use_pc)?,
         });
     }
@@ -341,6 +346,7 @@ fn emit(
     ssa: &SsaFunction,
     allocation: &Allocation,
     eligibility: &Eligibility,
+    deopt_table: &DeoptTable,
 ) -> Result<CompiledCode, Unsupported> {
     let spill_frame_bytes = aligned_spill_bytes(allocation.spill_slot_count)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
@@ -348,23 +354,38 @@ fn emit(
     let entry = ops.offset();
     emit_prologue(&mut ops, spill_frame_bytes);
 
-    dynasm!(ops ; .arch aarch64 ; mov x8, x0);
-    for param in &eligibility.guarded_params {
-        let deopt = ops.new_dynamic_label();
-        let offset = param.index * STACK_SLOT_BYTES;
-        dynasm!(ops
-            ; .arch aarch64
-            ; ldr x9, [x8, offset]
-            ; lsr x10, x9, #48
-            ; movz x11, #0xfffe
-            ; cmp x10, x11
-            ; b.ne =>deopt
-        );
-        emit_store_location(&mut ops, allocation.location(param.value), 9)?;
-        deopt_exits.push((deopt, param.deopt_byte_pc));
+    dynasm!(ops ; .arch aarch64 ; mov x8, x0 ; mov x13, x1);
+    for value in &ssa.values {
+        match value.def {
+            ValueDef::Param { index, .. } => {
+                emit_load_parameter(&mut ops, index, 9);
+                emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
+            }
+            ValueDef::Uninitialized { .. } => {
+                emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
+                emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
+            }
+            ValueDef::ExceptionInput { .. } | ValueDef::Phi { .. } | ValueDef::Op { .. } => {}
+        }
     }
 
     for instruction in &ssa.blocks[0].instrs {
+        for param in eligibility
+            .guarded_params
+            .iter()
+            .filter(|param| param.first_use_pc == instruction.pc)
+        {
+            let deopt = ops.new_dynamic_label();
+            emit_load_tagged_location(&mut ops, allocation.location(param.value), 9)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; lsr x10, x9, #48
+                ; movz x11, #0xfffe
+                ; cmp x10, x11
+                ; b.ne =>deopt
+            );
+            deopt_exits.push((deopt, param.deopt_byte_pc));
+        }
         match instruction.op {
             Op::LoadInt32 => {
                 let value = load_int32(view, instruction.pc)?;
@@ -431,6 +452,12 @@ fn emit(
 
     for (label, deopt_byte_pc) in deopt_exits {
         dynasm!(ops ; .arch aarch64 ; =>label);
+        let frame_state = deopt_table
+            .lookup(deopt_byte_pc)
+            .ok_or(Unsupported::OperandShape(
+                "optimizing deopt exit missing frame state",
+            ))?;
+        emit_deopt_writeback(&mut ops, frame_state)?;
         emit_load_u32(&mut ops, 0, deopt_byte_pc);
         dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_DEOPT as u32);
         emit_epilogue(&mut ops, spill_frame_bytes);
@@ -440,6 +467,94 @@ fn emit(
         .finalize()
         .expect("arm64 optimizing assembler finalization");
     Ok(CompiledCode::new(buffer, entry))
+}
+
+fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
+    let offset = index * STACK_SLOT_BYTES;
+    if offset <= MAX_PARAMETER_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x8, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x8, x12]);
+    }
+}
+
+fn emit_deopt_writeback(ops: &mut Assembler, frame_state: &FrameState) -> Result<(), Unsupported> {
+    for (register, slot) in frame_state.slots.iter().enumerate() {
+        match slot.location {
+            DeoptLocation::Register(register) => {
+                let physical = VALUE_REGISTERS.get(register as usize).copied().ok_or(
+                    Unsupported::OperandShape("optimizing deopt register mapping"),
+                )?;
+                match slot.repr {
+                    DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; mov w9, W(physical)),
+                    DeoptRepr::Tagged | DeoptRepr::Float64 => {
+                        dynasm!(ops ; .arch aarch64 ; mov x9, X(physical));
+                    }
+                }
+            }
+            DeoptLocation::StackSlot(offset) => {
+                let offset = u32::try_from(offset).map_err(|_| {
+                    Unsupported::OperandShape("optimizing negative deopt spill offset")
+                })?;
+                match slot.repr {
+                    DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; ldr w9, [sp, offset]),
+                    DeoptRepr::Tagged | DeoptRepr::Float64 => {
+                        dynasm!(ops ; .arch aarch64 ; ldr x9, [sp, offset]);
+                    }
+                }
+            }
+            DeoptLocation::Constant(_) => {
+                emit_load_u32(ops, 9, otter_vm::Value::undefined().to_bits() as u32);
+            }
+        }
+        match slot.repr {
+            DeoptRepr::Tagged => {}
+            DeoptRepr::Int32 => dynasm!(ops
+                ; .arch aarch64
+                ; movz x10, #0xfffe, lsl #48
+                ; orr x9, x10, x9
+            ),
+            DeoptRepr::Float64 => emit_box_float64(ops),
+        }
+        emit_store_frame_register(ops, register as u32, 9)?;
+    }
+    Ok(())
+}
+
+fn emit_box_float64(ops: &mut Assembler) {
+    let not_nan = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; ubfx x10, x9, #52, #11
+        ; cmp x10, #0x7ff
+        ; b.ne =>not_nan
+        ; lsl x10, x9, #12
+        ; cbz x10, =>not_nan
+        ; movz x9, #0x7ff8, lsl #48
+        ; =>not_nan
+        ; movz x10, #2, lsl #48
+        ; add x9, x9, x10
+    );
+}
+
+fn emit_store_frame_register(
+    ops: &mut Assembler,
+    register: u32,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    let offset = register
+        .checked_mul(STACK_SLOT_BYTES)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing frame register offset",
+        ))?;
+    if offset <= MAX_PARAMETER_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x13, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x13, x12]);
+    }
+    Ok(())
 }
 
 fn load_int32(view: &JitCompileSnapshot, pc: u32) -> Result<i32, Unsupported> {
@@ -509,6 +624,48 @@ fn emit_store_location(
         Location::Spill(slot) => {
             let offset = spill_offset(slot)?;
             dynasm!(ops ; .arch aarch64 ; str W(scratch), [sp, offset]);
+        }
+    }
+    Ok(())
+}
+
+fn emit_load_tagged_location(
+    ops: &mut Assembler,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(register) => {
+            let physical = VALUE_REGISTERS
+                .get(register as usize)
+                .copied()
+                .ok_or(Unsupported::OperandShape("optimizing register mapping"))?;
+            dynasm!(ops ; .arch aarch64 ; mov X(scratch), X(physical));
+        }
+        Location::Spill(slot) => {
+            let offset = spill_offset(slot)?;
+            dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [sp, offset]);
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_tagged_location(
+    ops: &mut Assembler,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(register) => {
+            let physical = VALUE_REGISTERS
+                .get(register as usize)
+                .copied()
+                .ok_or(Unsupported::OperandShape("optimizing register mapping"))?;
+            dynasm!(ops ; .arch aarch64 ; mov X(physical), X(scratch));
+        }
+        Location::Spill(slot) => {
+            let offset = spill_offset(slot)?;
+            dynasm!(ops ; .arch aarch64 ; str X(scratch), [sp, offset]);
         }
     }
     Ok(())
@@ -602,11 +759,18 @@ mod tests {
     }
 
     fn execute(code: &OptimizedCode, args: &[u64]) -> OptimizedLeafRet {
+        execute_with_frame(code, args).0
+    }
+
+    fn execute_with_frame(code: &OptimizedCode, args: &[u64]) -> (OptimizedLeafRet, Vec<u64>) {
         // SAFETY: the compiler emitted `OptimizedLeafEntry`, `code` owns the
         // mapping through the call, and `args` covers every used parameter.
         let entry: OptimizedLeafEntry =
             unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
-        entry(args.as_ptr())
+        let mut frame =
+            vec![otter_vm::Value::undefined().to_bits(); code.metadata().register_count as usize];
+        let result = entry(args.as_ptr(), frame.as_mut_ptr());
+        (result, frame)
     }
 
     #[test]
@@ -726,9 +890,13 @@ mod tests {
             ],
         );
         let code = compile(&view, 4).expect("guarded add is eligible");
-        let result = execute(&code, &[0, box_i32(9)]);
+        let (result, frame) = execute_with_frame(&code, &[0, box_i32(9)]);
         assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
         assert_eq!(result.value, 3);
+        assert_eq!(
+            frame,
+            vec![0, box_i32(9), otter_vm::Value::undefined().to_bits()]
+        );
     }
 
     #[test]
@@ -749,9 +917,54 @@ mod tests {
             ],
         );
         let code = compile(&view, 5).expect("overflow-checked add is eligible");
-        let result = execute(&code, &[box_i32(i32::MAX), box_i32(1)]);
+        let (result, frame) = execute_with_frame(&code, &[box_i32(i32::MAX), box_i32(1)]);
         assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
         assert_eq!(result.value, 3);
+        assert_eq!(
+            frame,
+            vec![
+                box_i32(i32::MAX),
+                box_i32(1),
+                otter_vm::Value::undefined().to_bits()
+            ]
+        );
+    }
+
+    #[test]
+    fn later_parameter_guard_materializes_prior_intermediates() {
+        let view = view(
+            2,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(7)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+            ],
+        );
+        let code = compile(&view, 6).expect("later guard leaf is eligible");
+        let undefined = otter_vm::Value::undefined().to_bits();
+        let (result, frame) = execute_with_frame(&code, &[box_i32(5), undefined]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
+        assert_eq!(result.value, 19);
+        assert_eq!(
+            frame,
+            vec![box_i32(5), undefined, box_i32(7), box_i32(12), undefined]
+        );
     }
 
     #[test]

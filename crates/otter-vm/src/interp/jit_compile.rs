@@ -36,10 +36,16 @@ impl Interpreter {
         for code in self.jit_code.values().flatten() {
             record(code);
         }
+        for code in self.jit_optimized_code.values().flatten() {
+            record(code);
+        }
         for code in self.jit_osr_code.values().flatten() {
             record(code);
         }
         if let Some((_, code)) = &self.jit_code_cache {
+            record(code);
+        }
+        if let Some((_, code)) = &self.jit_optimized_code_cache {
             record(code);
         }
         for (_, code) in &self.jit_direct_code_anchors {
@@ -52,10 +58,39 @@ impl Interpreter {
         }
 
         jit::JitCodeResidency {
+            installed_optimized_bodies: self.jit_optimized_code.values().flatten().count() as u64,
             installed_entry_bodies: self.jit_code.values().flatten().count() as u64,
             installed_osr_bodies: self.jit_osr_code.values().flatten().count() as u64,
             unique_code_objects: seen.len() as u64,
             code_bytes,
+        }
+    }
+
+    /// Compile and register one optimizing-tier leaf from the current feedback
+    /// snapshot. Unsupported functions return `None` and keep using the
+    /// template/interpreter path.
+    pub(crate) fn compile_optimized_jit_function(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        let snapshot = context.jit_compile_snapshot(fid)?;
+        let hook = self.jit_hook.as_ref()?.clone();
+        let code_object_id = self.jit_next_code_object_id;
+        let status = hook.compile_optimized_function(jit::JitCompileRequest {
+            snapshot,
+            osr_pc: None,
+            code_object_id,
+        });
+        match status {
+            Ok(jit::JitCompileStatus::Compiled { code }) => {
+                self.jit_next_code_object_id += 1;
+                self.jit_code_registry.retire_unreferenced();
+                self.jit_code_registry
+                    .register(code_object_id, code.clone())
+                    .then_some(code)
+            }
+            _ => None,
         }
     }
 

@@ -1,6 +1,6 @@
 //! Native JIT tiers for the Otter VM.
 //!
-//! The production compiler is a Sparkplug-style template macro-assembler that
+//! The baseline compiler is a Sparkplug-style template macro-assembler that
 //! lowers Otter register bytecode directly to native machine code with no
 //! register allocation or deopt. Backend-independent optimizing analyses are
 //! inert until a separate compiler consumes them. Native execution reuses the
@@ -12,7 +12,7 @@
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
 //! - [`ir`] — backend-independent analysis structures for optimizing compilers.
-//! - [`optimizing`] — the unwired single-block int32 optimizing compiler.
+//! - [`optimizing`] — the production-wired single-block int32 optimizing tier.
 //!
 //! # Invariants
 //! - **`unsafe` is contained here.** This crate lifts the workspace
@@ -25,10 +25,9 @@
 //!   explicit safepoint record for allocating calls, and reloads derived object
 //!   pointers after every safepoint. A value cached only in a machine register
 //!   across a safepoint would be a use-after-move bug.
-//! - **One production compiler.** The template baseline is the only native
-//!   compiler; the pre-refactor experimental optimizer, its parallel IR, and
-//!   the first-generation baseline emitter were deleted rather than parked as
-//!   second engine stacks.
+//! - **One runtime stack.** The optimizing tier and template baseline share the
+//!   VM-owned hook, registry, frame array, and fallback interpreter; neither is
+//!   a parallel engine/runtime stack.
 //! - **JIT is runtime-optional.** When executable memory cannot be obtained
 //!   (missing macOS `allow-jit` entitlement, locked sandbox, etc.) the engine
 //!   falls back to the interpreter; the JIT never hard-fails execution.
@@ -49,10 +48,10 @@ pub use entry::{TransitionTable, Unsupported};
 pub use optimizing::{OptimizedCode, compile_optimized};
 pub use template::{TemplateCode, compile};
 
-/// Baseline JIT compiler implementation wired into `otter-vm` through the
+/// Production JIT compiler implementation wired into `otter-vm` through the
 /// VM-owned [`otter_vm::JitCompilerHook`] trait.
 ///
-/// Drives the [`template`] compiler — the one production tier. There is no
+/// Drives the optimizing leaf tier before the [`template`] compiler. There is no
 /// environment or runtime toggle for compiler selection; hosts opt out of
 /// native execution by not installing the hook at all.
 #[derive(Default)]
@@ -98,6 +97,21 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in template subset: {reason:?}"),
+            }),
+        }
+    }
+
+    fn compile_optimized_function(
+        &self,
+        request: otter_vm::JitCompileRequest,
+    ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
+        let fid = request.snapshot.code_block.id;
+        match optimizing::compile_optimized(&request.snapshot, request.code_object_id) {
+            Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
+                code: std::sync::Arc::new(code),
+            }),
+            Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
+                reason: format!("function {fid} not in optimizing subset: {reason:?}"),
             }),
         }
     }

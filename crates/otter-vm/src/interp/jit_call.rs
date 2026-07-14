@@ -18,8 +18,8 @@
 //! Every VM-side compiled entry selection applies both native-layout metadata
 //! compatibility and exact isolate-epoch dependency consistency. Safepoint
 //! resolution for already-active Invalid code remains independent.
-//! Optimizing-policy accounting never changes baseline counters, thresholds,
-//! compilation, or entry selection.
+//! Optimized leaves run only over fresh ordinary frames; every deopt resumes
+//! the interpreter on the generated exit's fully reconstructed register file.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -66,6 +66,23 @@ impl Interpreter {
         context: &ExecutionContext,
     ) -> Result<Option<Option<Value>>, VmError> {
         let top_idx = stack.len() - 1;
+        if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
+            match outcome {
+                jit::JitOptimizedExecOutcome::Returned(value) => {
+                    let popped = self.return_running_finally(stack, value)?;
+                    return Ok(Some(popped));
+                }
+                jit::JitOptimizedExecOutcome::Deopt(byte_pc) => {
+                    let fid = stack[top_idx].function_id;
+                    let pc = context
+                        .exec_function(fid)
+                        .and_then(|function| function.instruction_index_for_byte_pc(byte_pc))
+                        .ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].pc = pc;
+                    return Ok(None);
+                }
+            }
+        }
         let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
             return Ok(None);
         };
@@ -376,6 +393,8 @@ impl Interpreter {
     /// Drop every installed optimizing-tier body for `fid` so the next tier-up
     /// sees the latest compile policy / feedback snapshot.
     pub(crate) fn invalidate_jit_function(&mut self, fid: u32) {
+        self.jit_optimized_code.remove(&fid);
+        self.jit_optimized_code_cache = None;
         self.jit_code.remove(&fid);
         self.jit_entry_osr_only.remove(&fid);
         self.jit_code_cache = None;
@@ -406,6 +425,20 @@ impl Interpreter {
             return Ok(None);
         }
         let top_idx = stack.len() - 1;
+        if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
+            return match outcome {
+                jit::JitOptimizedExecOutcome::Returned(value) => Ok(Some(value)),
+                jit::JitOptimizedExecOutcome::Deopt(byte_pc) => {
+                    let fid = stack[top_idx].function_id;
+                    let pc = context
+                        .exec_function(fid)
+                        .and_then(|function| function.instruction_index_for_byte_pc(byte_pc))
+                        .ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].pc = pc;
+                    Ok(None)
+                }
+            };
+        }
         let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
             return Ok(None);
         };
@@ -446,6 +479,79 @@ impl Interpreter {
         self.resolve_jit_code_for_fid(context, frame.function_id)
     }
 
+    /// Resolve and enter an installed optimized leaf over a fresh interpreter
+    /// frame. The parameter copy keeps the immutable argument ABI disjoint from
+    /// deopt writeback into the mutable register file.
+    pub(crate) fn run_optimized_frame(
+        &mut self,
+        stack: &mut HoltStack,
+        context: &ExecutionContext,
+        top_idx: usize,
+    ) -> Option<jit::JitOptimizedExecOutcome> {
+        let frame = stack.get(top_idx)?;
+        if frame.pc != 0 || frame.async_state.is_some() || frame.generator_owner.is_some() {
+            return None;
+        }
+        let fid = frame.function_id;
+        let code = self.resolve_optimized_code_for_fid(context, fid)?;
+        let function = context.exec_function(fid)?;
+        let param_count = usize::from(function.param_count);
+        if param_count > stack[top_idx].registers.len() {
+            return None;
+        }
+        let params: smallvec::SmallVec<[u64; 8]> = stack[top_idx].registers[..param_count]
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        self.jit_runtime_stats.optimized_entries =
+            self.jit_runtime_stats.optimized_entries.saturating_add(1);
+        let outcome = code.run_optimized_entry(&params, &mut stack[top_idx].registers)?;
+        if matches!(outcome, jit::JitOptimizedExecOutcome::Deopt(_)) {
+            self.jit_runtime_stats.optimized_deopts =
+                self.jit_runtime_stats.optimized_deopts.saturating_add(1);
+        }
+        Some(outcome)
+    }
+
+    /// Resolve a separately installed optimizing body, compiling exactly once
+    /// after the deterministic promotion policy reaches `Promote`.
+    pub(crate) fn resolve_optimized_code_for_fid(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if let Some((cached_fid, code)) = &self.jit_optimized_code_cache
+            && *cached_fid == fid
+            && self
+                .jit_code_registry
+                .is_compatible_for_entry(code.as_ref())
+        {
+            return Some(code.clone());
+        }
+        let code = if let Some(slot) = self.jit_optimized_code.get(&fid) {
+            slot.clone()
+        } else {
+            if self.optimizing_tier_decision(fid) != crate::tier_policy::OptimizingDecision::Promote
+            {
+                return None;
+            }
+            self.jit_runtime_stats.compile_attempts =
+                self.jit_runtime_stats.compile_attempts.saturating_add(1);
+            let compiled = self.compile_optimized_jit_function(context, fid);
+            self.jit_optimized_code.insert(fid, compiled.clone());
+            self.jit_optimized_code_cache = None;
+            compiled
+        };
+        let code = code.filter(|code| {
+            self.jit_code_registry
+                .is_compatible_for_entry(code.as_ref())
+        });
+        if let Some(code) = &code {
+            self.jit_optimized_code_cache = Some((fid, code.clone()));
+        }
+        code
+    }
+
     /// Resolve (and compile-once at the tier-up threshold) the installed non-OSR
     /// baseline body for `fid`, independent of any stack frame. The lean
     /// callback loop uses this to tier up its callee without synthesizing a
@@ -456,6 +562,7 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        let count = self.note_jit_function_entry(fid);
         // Single-entry compiled-code cache. A hot synchronous re-entry (Array
         // callbacks, comparators, `@@iterator` drives) resolves the SAME callee
         // every call; this skips the `jit_code` FxHashMap lookup + `Arc` clone
@@ -478,11 +585,6 @@ impl Interpreter {
         let code = if let Some(slot) = self.jit_code.get(&fid) {
             slot.clone()
         } else {
-            let count = {
-                let counter = self.jit_call_counts.entry(fid).or_insert(0);
-                *counter = counter.saturating_add(1);
-                *counter
-            };
             if count < Self::JIT_TIER_UP_THRESHOLD {
                 return None;
             }
@@ -510,6 +612,14 @@ impl Interpreter {
             self.jit_entry_osr_only.insert(fid);
         }
         code
+    }
+
+    /// Advance the shared function-entry hotness counter once.
+    #[inline]
+    pub(crate) fn note_jit_function_entry(&mut self, fid: u32) -> u32 {
+        let counter = self.jit_call_counts.entry(fid).or_insert(0);
+        *counter = counter.saturating_add(1);
+        *counter
     }
 
     /// Run compiled `code` over the rooted register window of frame `top_idx`.

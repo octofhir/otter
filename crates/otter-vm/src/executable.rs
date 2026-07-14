@@ -329,8 +329,8 @@ impl CodeBlock {
 
     /// CodeBlock-wide version of material feedback transitions.
     ///
-    /// This telemetry is intentionally not consumed by the current baseline
-    /// tier; it is exposed for a future optimizing tier to compare snapshots.
+    /// The baseline tier ignores this telemetry; optimizing promotion samples
+    /// it to require stable feedback before compilation.
     #[must_use]
     pub fn feedback_epoch(&self) -> u32 {
         self.feedback_epoch.load(Ordering::Acquire)
@@ -361,6 +361,15 @@ impl CodeBlock {
     #[must_use]
     pub(crate) fn instruction_byte_pc(&self, index: usize) -> Option<u32> {
         self.byte_pcs.get(index).copied()
+    }
+
+    /// Resolve one exact serialized byte PC to its dense interpreter index.
+    #[must_use]
+    pub(crate) fn instruction_index_for_byte_pc(&self, byte_pc: u32) -> Option<u32> {
+        self.byte_pcs
+            .binary_search(&byte_pc)
+            .ok()
+            .and_then(|index| u32::try_from(index).ok())
     }
 
     /// Operands in schema declaration order.

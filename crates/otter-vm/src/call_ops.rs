@@ -2492,10 +2492,14 @@ impl Interpreter {
         // no per-element frame allocation, register draw, tier probe, or
         // dispatch envelope.
         if state.fast_reuse {
+            let already_compiled = state.compiled.is_some();
             if state.compiled.is_none() {
                 state.compiled = self.resolve_jit_code_for_fid(context, state.function_id);
             }
             if let Some(code) = state.compiled.clone() {
+                if already_compiled {
+                    self.note_jit_function_entry(state.function_id);
+                }
                 return self.invoke_prepared_lean(
                     state,
                     context,
@@ -2601,6 +2605,23 @@ impl Interpreter {
         }
         state.stack.push(frame);
         let top_idx = state.stack.len() - 1;
+        if let Some(outcome) = self.run_optimized_frame(&mut state.stack, context, top_idx) {
+            match outcome {
+                crate::jit::JitOptimizedExecOutcome::Returned(value) => {
+                    state.reuse_frame = state.stack.pop();
+                    window_rollback.commit();
+                    return Ok(value);
+                }
+                crate::jit::JitOptimizedExecOutcome::Deopt(byte_pc) => {
+                    let pc = context
+                        .exec_function(state.function_id)
+                        .and_then(|function| function.instruction_index_for_byte_pc(byte_pc))
+                        .ok_or(VmError::InvalidOperand)?;
+                    state.stack[top_idx].pc = pc;
+                    return self.dispatch_loop(context, &mut state.stack);
+                }
+            }
+        }
         match self.run_compiled_frame(&mut state.stack, context, top_idx, code) {
             crate::jit::JitExecOutcome::Returned(value) => {
                 // The body ran to completion and left its frame on the stack;

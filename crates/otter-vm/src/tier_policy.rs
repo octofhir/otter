@@ -10,18 +10,13 @@
 //! # Invariants
 //! - The policy is deterministic and isolate-local; it reads no environment or
 //!   process-global state.
-//! - It adds ZERO work to the interpreter hot path: hotness is read lazily from
-//!   the baseline call counter when a decision is queried, never accumulated
-//!   per call or per back-edge. Only [`Interpreter::optimizing_tier_decision`]
-//!   touches the policy table, and no execution path calls it yet.
+//! - Function entry advances the shared tiering call counter. Entry selection
+//!   samples feedback stability only while a hot function has no installed
+//!   optimizing body; back-edge OSR policy remains independent.
 //! - Promotion requires both sustained hotness and an unchanged feedback epoch
 //!   across [`STABLE_SAMPLES`] consecutive checks.
-//! - A decision never compiles or installs code and is not consulted by the
-//!   baseline function-entry or loop-OSR paths.
-//! - All thresholds are provisional Phase 11 values to be tuned against real
-//!   workloads when the optimizing compiler lands in Phase 12; the hotness
-//!   source itself (baseline call count) is provisional and will be replaced by
-//!   dedicated post-baseline accounting when Phase 12 consumes this decision.
+//! - A decision itself never compiles or installs code. The function-entry path
+//!   owns compilation after a `Promote` result; loop OSR remains unchanged.
 //!
 //! # See also
 //! - [`crate::executable::CodeBlock::feedback_epoch`]
@@ -31,13 +26,11 @@ use rustc_hash::FxHashMap;
 
 use crate::Interpreter;
 
-/// Provisional optimizing-tier hotness threshold, compared against the baseline
-/// call counter so a candidate must stay hot well after baseline tier-up.
-/// Phase 12 will tune it against production workloads.
+/// Optimizing-tier hotness threshold, compared against the shared function-entry
+/// call counter so a candidate stays hot well after baseline tier-up.
 pub const OPTIMIZING_HOTNESS_THRESHOLD: u32 = 4_000;
 
-/// Provisional number of consecutive unchanged feedback-epoch checks required
-/// before promotion. Phase 12 will tune this against deoptimization behavior.
+/// Number of consecutive unchanged feedback-epoch checks required before promotion.
 pub const STABLE_SAMPLES: u8 = 3;
 
 /// Optimizing-tier candidacy for one bytecode function.
@@ -91,16 +84,15 @@ impl FunctionTierState {
     }
 }
 
-/// Isolate-local promotion telemetry. No current execution path consumes its
-/// decisions; Phase 12 may consult it before requesting optimizing compilation.
-/// The table is touched only when a decision is queried — never on the hot path.
+/// Isolate-local promotion telemetry. The table is touched only when a hot
+/// entry without installed optimized code queries a decision.
 #[derive(Debug, Default)]
 pub(crate) struct TierPolicy {
     functions: FxHashMap<u32, FunctionTierState>,
 }
 
 impl TierPolicy {
-    /// Classify one function from its lazily-supplied baseline hotness and its
+    /// Classify one function from its shared entry hotness and its
     /// current feedback epoch. A cold function creates no state; a hot one
     /// accumulates only feedback-stability history. This is the sole mutator of
     /// the policy table and runs only from a decision query, never per call.
@@ -129,18 +121,12 @@ impl Interpreter {
     /// epoch must then remain unchanged across [`STABLE_SAMPLES`] consecutive
     /// checks before this returns [`OptimizingDecision::Promote`]. Calling this
     /// method records only policy-local stability history. It never compiles,
-    /// installs, or executes JIT code, and no baseline path calls it.
+    /// installs, or executes JIT code.
     #[must_use]
     pub fn optimizing_tier_decision(&mut self, function_id: u32) -> OptimizingDecision {
-        // Hotness is read lazily from the existing baseline call counter, so the
-        // hot path pays nothing for this policy. (Provisional source — Phase 12
-        // replaces it with dedicated post-baseline accounting when it consumes
-        // the decision.)
-        let hotness = self
-            .jit_call_counts
-            .get(&function_id)
-            .copied()
-            .unwrap_or(0);
+        // Hotness is read lazily from the shared entry counter, so cold calls do
+        // not touch policy-local stability state.
+        let hotness = self.jit_call_counts.get(&function_id).copied().unwrap_or(0);
         let feedback_epoch = self.code_space.feedback_epoch(function_id);
         self.optimizing_tier_policy
             .sample_and_decide(function_id, hotness, feedback_epoch)

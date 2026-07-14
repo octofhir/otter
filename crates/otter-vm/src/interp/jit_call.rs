@@ -20,6 +20,8 @@
 //! resolution for already-active Invalid code remains independent.
 //! Optimized leaves run only over fresh ordinary frames; every deopt resumes
 //! the interpreter on the generated exit's fully reconstructed register file.
+//! Their call-scoped VM thread record points at the isolate's real interrupt
+//! byte and shared back-edge fuel counter for the entire native entry.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -503,9 +505,16 @@ impl Interpreter {
             .iter()
             .map(|value| value.to_bits())
             .collect();
+        let mut thread = crate::native_abi::VmThread::empty();
+        thread.interrupt_cell = self.jit_interrupt_flag_ptr() as u64;
+        thread.backedge_fuel_cell = self.jit_backedge_fuel_ptr() as u64;
         self.jit_runtime_stats.optimized_entries =
             self.jit_runtime_stats.optimized_entries.saturating_add(1);
-        let outcome = code.run_optimized_entry(&params, &mut stack[top_idx].registers)?;
+        let outcome = code.run_optimized_entry(
+            &params,
+            &mut stack[top_idx].registers,
+            std::ptr::addr_of_mut!(thread),
+        )?;
         if matches!(outcome, jit::JitOptimizedExecOutcome::Deopt(_)) {
             self.jit_runtime_stats.optimized_deopts =
                 self.jit_runtime_stats.optimized_deopts.saturating_add(1);

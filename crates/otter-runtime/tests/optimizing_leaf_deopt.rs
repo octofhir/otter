@@ -1,17 +1,18 @@
-//! Optimizing-leaf entry, branches, phis, and in-place deopt parity.
+//! Optimizing entry, branches, loop phis, polls, and in-place deopt parity.
 //!
 //! # Contents
-//! - Hand-authored arithmetic and max-diamond leaves matching the optimizer's
-//!   deliberately narrow production subset.
+//! - Hand-authored arithmetic, max-diamond, and int32-loop functions matching
+//!   the optimizer's deliberately narrow production subset.
 //! - Hot optimized return and non-int32 guard-deopt comparisons against
 //!   [`JitSelection::InterpreterOnly`].
+//! - Cooperative cancellation after a hot loop has entered optimized code.
 //!
 //! # Invariants
 //! - Both tier selections execute the identical linked bytecode module.
 //! - The tiered run must prove machine-code entry and reconstructed deopt via
 //!   isolate-owned execution statistics.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use otter_bytecode::{BytecodeModule, Function, FunctionCodeBuilder, Op, Operand, SourceKind};
 use otter_jit::BaselineJitCompiler;
@@ -64,6 +65,61 @@ fn fixture_module() -> BytecodeModule {
     );
     max.push(Op::ReturnValue, &[Operand::Register(4)]);
 
+    let mut sum = FunctionCodeBuilder::new();
+    sum.push(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(0)]);
+    sum.push(Op::LoadInt32, &[Operand::Register(2), Operand::Imm32(0)]);
+    sum.push(Op::LoadInt32, &[Operand::Register(3), Operand::Imm32(1)]);
+    sum.push(
+        Op::LessThan,
+        &[
+            Operand::Register(4),
+            Operand::Register(1),
+            Operand::Register(0),
+        ],
+    );
+    sum.push(Op::JumpIfFalse, &[Operand::Imm32(3), Operand::Register(4)]);
+    sum.push(
+        Op::Add,
+        &[
+            Operand::Register(2),
+            Operand::Register(2),
+            Operand::Register(1),
+        ],
+    );
+    sum.push(
+        Op::Add,
+        &[
+            Operand::Register(1),
+            Operand::Register(1),
+            Operand::Register(3),
+        ],
+    );
+    sum.push(Op::Jump, &[Operand::Imm32(-5)]);
+    sum.push(Op::ReturnValue, &[Operand::Register(2)]);
+
+    let mut count = FunctionCodeBuilder::new();
+    count.push(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(0)]);
+    count.push(Op::LoadInt32, &[Operand::Register(2), Operand::Imm32(1)]);
+    count.push(
+        Op::LessThan,
+        &[
+            Operand::Register(3),
+            Operand::Register(1),
+            Operand::Register(0),
+        ],
+    );
+    count.push(Op::JumpIfFalse, &[Operand::Imm32(2), Operand::Register(3)]);
+    count.push(
+        Op::Add,
+        &[
+            Operand::Register(1),
+            Operand::Register(1),
+            Operand::Register(2),
+        ],
+    );
+    count.push(Op::Jump, &[Operand::Imm32(-4)]);
+    count.push(Op::ReturnValue, &[Operand::Register(1)]);
+
     BytecodeModule {
         module: "optimizing-leaf-deopt.js".to_string(),
         template_sites: Vec::new(),
@@ -89,6 +145,22 @@ fn fixture_module() -> BytecodeModule {
                 param_count: 2,
                 scratch: 3,
                 code: max.finish(),
+                ..Function::default()
+            },
+            Function {
+                id: 3,
+                name: "sum".to_string(),
+                param_count: 1,
+                scratch: 4,
+                code: sum.finish(),
+                ..Function::default()
+            },
+            Function {
+                id: 4,
+                name: "count".to_string(),
+                param_count: 1,
+                scratch: 3,
+                code: count.finish(),
                 ..Function::default()
             },
         ],
@@ -122,7 +194,22 @@ fn call_max(
         .expect("max call")
 }
 
-fn run(selection: JitSelection) -> (Value, Value, Value, Value, JitRuntimeStats) {
+fn call_int(
+    interp: &mut Interpreter,
+    context: &otter_vm::ExecutionContext,
+    function_id: u32,
+    value: i32,
+) -> Result<Value, otter_vm::VmError> {
+    let args: SmallVec<[Value; 8]> = smallvec![Value::number_i32(value)];
+    interp.run_callable_sync(
+        context,
+        &Value::function_id(function_id),
+        Value::undefined(),
+        args,
+    )
+}
+
+fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntimeStats) {
     let mut interp = Interpreter::new();
     if !matches!(selection, JitSelection::InterpreterOnly) {
         interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
@@ -149,6 +236,12 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, JitRuntimeStats)
             .as_i32(),
             Some(31)
         );
+        assert_eq!(
+            call_int(&mut interp, &context, 3, 10)
+                .expect("sum call")
+                .as_i32(),
+            Some(45)
+        );
     }
     let optimized = call_add(
         &mut interp,
@@ -174,20 +267,22 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, JitRuntimeStats)
         Value::number_i32(-4),
         Value::number_i32(12),
     );
+    let sum = call_int(&mut interp, &context, 3, 100).expect("optimized sum call");
     (
         optimized,
         deoptimized,
         max_left,
         max_right,
+        sum,
         interp.jit_runtime_stats(),
     )
 }
 
 #[test]
 fn optimized_return_and_deopt_match_interpreter() {
-    let (oracle_return, oracle_deopt, oracle_max_left, oracle_max_right, _) =
+    let (oracle_return, oracle_deopt, oracle_max_left, oracle_max_right, oracle_sum, _) =
         run(JitSelection::InterpreterOnly);
-    let (tiered_return, tiered_deopt, tiered_max_left, tiered_max_right, stats) =
+    let (tiered_return, tiered_deopt, tiered_max_left, tiered_max_right, tiered_sum, stats) =
         run(JitSelection::Baseline);
 
     assert_eq!(oracle_return.as_i32(), Some(16));
@@ -198,12 +293,50 @@ fn optimized_return_and_deopt_match_interpreter() {
     assert_eq!(oracle_max_right.as_i32(), Some(12));
     assert_eq!(tiered_max_left.to_bits(), oracle_max_left.to_bits());
     assert_eq!(tiered_max_right.to_bits(), oracle_max_right.to_bits());
+    assert_eq!(oracle_sum.as_i32(), Some(4_950));
+    assert_eq!(tiered_sum.to_bits(), oracle_sum.to_bits());
     assert!(
-        stats.optimized_entries >= 4,
-        "arithmetic and diamond fixtures must enter optimized code: {stats:?}"
+        stats.optimized_entries >= 5,
+        "arithmetic, diamond, and loop fixtures must enter optimized code: {stats:?}"
     );
     assert!(
         stats.optimized_deopts >= 1,
         "non-int32 argument must take a reconstructed deopt exit: {stats:?}"
+    );
+}
+
+#[test]
+fn optimized_long_loop_terminates_through_interrupt_path() {
+    let mut interp = Interpreter::new();
+    interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+    let context = interp.link_module(fixture_module());
+    for _ in 0..4010 {
+        assert_eq!(
+            call_int(&mut interp, &context, 4, 10)
+                .expect("count warmup")
+                .as_i32(),
+            Some(10)
+        );
+    }
+    let entries_before = interp.jit_runtime_stats().optimized_entries;
+    assert!(
+        entries_before > 0,
+        "count loop must be optimized after warmup"
+    );
+
+    let interrupt = interp.interrupt_handle();
+    let interrupter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        interrupt.interrupt();
+    });
+    let result = call_int(&mut interp, &context, 4, i32::MAX);
+    interrupter.join().expect("interrupt setter");
+
+    assert_eq!(result, Err(otter_vm::VmError::Interrupted));
+    let stats = interp.jit_runtime_stats();
+    assert!(stats.optimized_entries > entries_before, "{stats:?}");
+    assert!(
+        stats.optimized_deopts > 0,
+        "poll must reconstruct the loop: {stats:?}"
     );
 }

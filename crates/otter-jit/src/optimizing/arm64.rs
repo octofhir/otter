@@ -1,8 +1,9 @@
-//! Arm64 emission for the acyclic multi-block int32 optimizing subset.
+//! Arm64 emission for the reducible multi-block int32 optimizing subset.
 //!
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
-//! - Forward branches, tagged comparisons, and per-edge phi copies.
+//! - Reducible loop checks, tagged comparisons, and per-edge phi copies.
+//! - Cooperative back-edge polling with loop-header deoptimization.
 //! - Parameter tag guards, unboxed arithmetic, spills, boxing, and deopt exits.
 //!
 //! # Invariants
@@ -16,9 +17,13 @@
 //!   the arithmetic instruction's exact byte PC; it never silently wraps.
 //! - Every CFG edge targets a block label in reverse postorder. Sequentialized
 //!   phi moves execute only on their owning edge before its final jump.
+//! - Every backwards bytecode edge targets a dominating loop header. Its phi moves
+//!   execute before the interrupt/fuel poll so a poll exit reconstructs the
+//!   loop-header frame, and no optimized loop can bypass cooperative polling.
 //! - Conditional inputs are optimizer-produced tagged booleans and branch by
 //!   exact comparison with the VM's `true` immediate.
-//! - The emitted function is a standalone leaf and never re-enters the VM.
+//! - The emitted function is a standalone leaf and never re-enters the VM;
+//!   poll slow paths deopt so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
 //! - [`super`] — public code object and leaf ABI.
@@ -38,7 +43,10 @@ use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
     CompiledCode,
-    entry::{STATUS_DEOPT, STATUS_RETURNED, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE},
+    entry::{
+        STATUS_DEOPT, STATUS_RETURNED, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+    },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
         deopt_lower::DeoptLowering,
@@ -68,6 +76,7 @@ struct GuardedParam {
 #[derive(Debug)]
 struct Eligibility {
     guarded_params: Vec<GuardedParam>,
+    back_edges: BTreeMap<(BlockId, BlockId), u32>,
 }
 
 pub(super) fn compile(
@@ -180,10 +189,7 @@ fn check_eligibility(
             "optimizing subset requires one reachable entry graph",
         ));
     }
-    let mut rpo_position = vec![0usize; cfg.blocks.len()];
-    for (position, block) in dom.reverse_postorder().iter().copied().enumerate() {
-        rpo_position[block.0 as usize] = position;
-    }
+    let mut back_edges = BTreeMap::new();
     for block in &cfg.blocks {
         if !block.exception_succs.is_empty() {
             return Err(Unsupported::OperandShape(
@@ -191,10 +197,16 @@ fn check_eligibility(
             ));
         }
         for successor in block.normal_succs.iter().copied() {
-            if rpo_position[successor.0 as usize] <= rpo_position[block.id.0 as usize] {
-                return Err(Unsupported::OperandShape(
-                    "optimizing subset rejects loops and back-edges",
-                ));
+            if cfg.blocks[successor.0 as usize].start_pc <= block.start_pc {
+                if !dom.dominates(successor, block.id) {
+                    return Err(Unsupported::OperandShape(
+                        "optimizing subset rejects irreducible back-edges",
+                    ));
+                }
+                back_edges.insert(
+                    (block.id, successor),
+                    byte_pc(view, cfg.blocks[successor.0 as usize].start_pc)?,
+                );
             }
         }
         match block.terminator {
@@ -210,10 +222,10 @@ fn check_eligibility(
     }
     for value in &ssa.values {
         if matches!(value.def, ValueDef::Phi { .. })
-            && reprs.representation(value.id) != Representation::Int32
+            && reprs.representation(value.id) == Representation::Float64
         {
             return Err(Unsupported::OperandShape(
-                "optimizing subset requires int32 phis",
+                "optimizing subset rejects float64 phis",
             ));
         }
     }
@@ -351,7 +363,10 @@ fn check_eligibility(
         });
     }
     guarded_params.sort_by_key(|param| (param.use_pc, param.index, param.value));
-    Ok(Eligibility { guarded_params })
+    Ok(Eligibility {
+        guarded_params,
+        back_edges,
+    })
 }
 
 fn check_int32_inputs(
@@ -589,9 +604,15 @@ fn emit(
                 }
                 Op::Jump => {
                     let target = block.normal_succs[0];
-                    emit_edge_moves(&mut ops, edge_moves(allocation, block_id, target)?)?;
-                    let target_label = block_labels[target.0 as usize];
-                    dynasm!(ops ; .arch aarch64 ; b =>target_label);
+                    emit_cfg_edge(
+                        &mut ops,
+                        allocation,
+                        eligibility,
+                        &mut deopt_exits,
+                        &block_labels,
+                        block_id,
+                        target,
+                    )?;
                 }
                 Op::JumpIfTrue | Op::JumpIfFalse => {
                     let Terminator::Branch { taken, fallthrough } = block.terminator else {
@@ -610,13 +631,26 @@ fn emit(
                         dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>taken_edge);
                     }
 
-                    emit_edge_moves(&mut ops, edge_moves(allocation, block_id, fallthrough)?)?;
-                    let fallthrough_label = block_labels[fallthrough.0 as usize];
-                    dynasm!(ops ; .arch aarch64 ; b =>fallthrough_label ; =>taken_edge);
+                    emit_cfg_edge(
+                        &mut ops,
+                        allocation,
+                        eligibility,
+                        &mut deopt_exits,
+                        &block_labels,
+                        block_id,
+                        fallthrough,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; =>taken_edge);
 
-                    emit_edge_moves(&mut ops, edge_moves(allocation, block_id, taken)?)?;
-                    let taken_label = block_labels[taken.0 as usize];
-                    dynasm!(ops ; .arch aarch64 ; b =>taken_label);
+                    emit_cfg_edge(
+                        &mut ops,
+                        allocation,
+                        eligibility,
+                        &mut deopt_exits,
+                        &block_labels,
+                        block_id,
+                        taken,
+                    )?;
                 }
                 Op::Return | Op::ReturnValue => {
                     emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
@@ -634,9 +668,15 @@ fn emit(
 
         if block.terminator == Terminator::FallThrough {
             let target = block.normal_succs[0];
-            emit_edge_moves(&mut ops, edge_moves(allocation, block_id, target)?)?;
-            let target_label = block_labels[target.0 as usize];
-            dynasm!(ops ; .arch aarch64 ; b =>target_label);
+            emit_cfg_edge(
+                &mut ops,
+                allocation,
+                eligibility,
+                &mut deopt_exits,
+                &block_labels,
+                block_id,
+                target,
+            )?;
         }
     }
 
@@ -657,6 +697,53 @@ fn emit(
         .finalize()
         .expect("arm64 optimizing assembler finalization");
     Ok(CompiledCode::new(buffer, entry))
+}
+
+/// Emit one normal edge. Loop-carried phi destinations are populated before
+/// the poll because the poll's deopt state is the target header's entry state.
+fn emit_cfg_edge(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    eligibility: &Eligibility,
+    deopt_exits: &mut Vec<(DynamicLabel, u32)>,
+    block_labels: &[DynamicLabel],
+    predecessor: BlockId,
+    target: BlockId,
+) -> Result<(), Unsupported> {
+    emit_edge_moves(ops, edge_moves(allocation, predecessor, target)?)?;
+    if let Some(&header_byte_pc) = eligibility.back_edges.get(&(predecessor, target)) {
+        let deopt = ops.new_dynamic_label();
+        emit_backedge_poll(ops, deopt);
+        deopt_exits.push((deopt, header_byte_pc));
+    }
+    let target_label = block_labels[target.0 as usize];
+    dynasm!(ops ; .arch aarch64 ; b =>target_label);
+    Ok(())
+}
+
+/// Poll every optimized back-edge without re-entering the VM.
+///
+/// The policy mirrors the baseline read/decrement pattern: the interrupt byte
+/// is read first, then the shared fuel is decremented and stored (clamped at
+/// zero so repeated entries cannot underflow it). An interrupt or non-positive
+/// fuel value deopts at the loop header. The interpreter then
+/// resumes with the shared fuel still exhausted and performs its ordinary
+/// interrupt/budget checkpoint on its next back-edge. Thus optimized code
+/// deopts at least as often as the interpreter/baseline poll cadence, never
+/// less often, while keeping all refill and error policy inside the VM.
+fn emit_backedge_poll(ops: &mut Assembler, deopt: DynamicLabel) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x9, [x2, VM_THREAD_INTERRUPT_CELL_OFFSET]
+        ; ldrb w10, [x9]
+        ; cbnz w10, =>deopt
+        ; ldr x9, [x2, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
+        ; ldr x10, [x9]
+        ; subs x10, x10, #1
+        ; csel x10, x10, xzr, gt
+        ; str x10, [x9]
+        ; b.le =>deopt
+    );
 }
 
 fn emit_comparison(ops: &mut Assembler, op: Op) {
@@ -703,25 +790,25 @@ fn emit_move(ops: &mut Assembler, movement: Move) -> Result<(), Unsupported> {
         (Location::Register(src), Location::Register(dst)) => {
             let src = move_register(src)?;
             let dst = move_register(dst)?;
-            dynasm!(ops ; .arch aarch64 ; mov W(dst), W(src));
+            dynasm!(ops ; .arch aarch64 ; mov X(dst), X(src));
         }
         (Location::Register(src), Location::Spill(dst)) => {
             let src = move_register(src)?;
             let offset = spill_offset(dst)?;
-            dynasm!(ops ; .arch aarch64 ; str W(src), [sp, offset]);
+            dynasm!(ops ; .arch aarch64 ; str X(src), [sp, offset]);
         }
         (Location::Spill(src), Location::Register(dst)) => {
             let dst = move_register(dst)?;
             let offset = spill_offset(src)?;
-            dynasm!(ops ; .arch aarch64 ; ldr W(dst), [sp, offset]);
+            dynasm!(ops ; .arch aarch64 ; ldr X(dst), [sp, offset]);
         }
         (Location::Spill(src), Location::Spill(dst)) => {
             let src_offset = spill_offset(src)?;
             let dst_offset = spill_offset(dst)?;
             dynasm!(ops
                 ; .arch aarch64
-                ; ldr w9, [sp, src_offset]
-                ; str w9, [sp, dst_offset]
+                ; ldr x9, [sp, src_offset]
+                ; str x9, [sp, dst_offset]
             );
         }
     }
@@ -982,6 +1069,14 @@ fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
     use otter_vm::{
         jit::JitTestInstruction,
         jit_feedback::{ARITH_INT32, ArithFeedback},
@@ -1043,14 +1138,71 @@ mod tests {
     }
 
     fn execute_with_frame(code: &OptimizedCode, args: &[u64]) -> (OptimizedLeafRet, Vec<u64>) {
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        execute_with_poll_cells(code, args, std::ptr::addr_of!(interrupt), &mut fuel)
+    }
+
+    fn execute_with_poll_cells(
+        code: &OptimizedCode,
+        args: &[u64],
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (OptimizedLeafRet, Vec<u64>) {
         // SAFETY: the compiler emitted `OptimizedLeafEntry`, `code` owns the
-        // mapping through the call, and `args` covers every used parameter.
+        // mapping through the call, `args` covers every used parameter, and
+        // both poll cells remain valid until the entry returns.
         let entry: OptimizedLeafEntry =
             unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let mut frame =
             vec![otter_vm::Value::undefined().to_bits(); code.metadata().register_count as usize];
-        let result = entry(args.as_ptr(), frame.as_mut_ptr());
+        let mut thread = otter_vm::native_abi::VmThread::empty();
+        thread.interrupt_cell = interrupt as u64;
+        thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
+        let result = entry(args.as_ptr(), frame.as_mut_ptr(), &mut thread);
         (result, frame)
+    }
+
+    fn summation_view() -> JitCompileSnapshot {
+        view(
+            1,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(4)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-5)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        )
     }
 
     #[test]
@@ -1521,15 +1673,225 @@ mod tests {
     }
 
     #[test]
-    fn refuses_back_edge() {
+    fn executes_summation_loop_with_header_phis() {
+        let view = summation_view();
+        let cfg = ControlFlowGraph::build(&view).expect("summation CFG");
+        let header = cfg
+            .blocks
+            .iter()
+            .find(|block| block.is_loop_header)
+            .expect("summation loop header")
+            .id;
+        let ssa = SsaFunction::build(&view, &cfg).expect("summation SSA");
+        assert!(ssa.blocks[header.0 as usize].phis.len() >= 2);
+        let liveness = Liveness::compute(&ssa, &cfg);
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, ALLOCATABLE_REGISTER_COUNT)
+            .expect("summation allocation");
+        assert!(
+            allocation
+                .edge_moves
+                .iter()
+                .any(|edge| edge.block == header && !edge.moves.is_empty()),
+            "fixture must require concrete loop-header phi moves"
+        );
+
+        let code = compile(&view, 12).expect("summation loop is eligible");
+        for (n, expected) in [(0, 0), (1, 0), (5, 10), (10, 45), (100, 4_950)] {
+            let result = execute(&code, &[box_i32(n)]);
+            assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+            assert_eq!(unbox_i32(result.value), expected, "n={n}");
+        }
+    }
+
+    #[test]
+    fn loop_overflow_deopts_with_reconstructed_mid_loop_frame() {
+        let view = view(
+            1,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(i32::MAX - 2)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(4)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-5)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let code = compile(&view, 13).expect("overflowing loop is eligible");
+        let (result, frame) = execute_with_frame(&code, &[box_i32(5)]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
+        assert_eq!(result.value, u64::from(5 * STRIDE + 3));
+        assert_eq!(frame[0], box_i32(5));
+        assert_eq!(frame[1], box_i32(2));
+        assert_eq!(frame[2], box_i32(i32::MAX));
+        assert_eq!(frame[3], box_i32(1));
+        assert_eq!(frame[4], VALUE_TRUE);
+    }
+
+    #[test]
+    fn executes_nested_loops() {
+        let view = view(
+            1,
+            4,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(9), Operand::Register(3)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(3)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-5)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-11)]),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        let code = compile(&view, 14).expect("nested loops are eligible");
+        for n in [0, 1, 5, 20] {
+            let result = execute(&code, &[box_i32(n)]);
+            assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+            assert_eq!(unbox_i32(result.value), n, "n={n}");
+        }
+    }
+
+    #[test]
+    fn backedge_interrupt_deopts_near_infinite_loop_at_header() {
+        let view = view(
+            0,
+            2,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(0)]),
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-2)]),
+            ],
+        );
+        let code = compile(&view, 15).expect("reducible infinite loop is eligible");
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&interrupt);
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            setter.store(true, Ordering::Release);
+        });
+        let mut fuel = i64::MAX as u64;
+        let (result, frame) =
+            execute_with_poll_cells(&code, &[], Arc::as_ptr(&interrupt).cast::<u8>(), &mut fuel);
+        interrupter.join().expect("interrupt setter");
+
+        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
+        assert_eq!(result.value, u64::from(2 * STRIDE + 3));
+        assert_eq!(frame, vec![box_i32(0), box_i32(0)]);
+    }
+
+    #[test]
+    fn exhausted_backedge_fuel_deopts_at_header_after_phi_moves() {
+        let view = summation_view();
+        let code = compile(&view, 16).expect("summation loop is eligible");
+        let interrupt = 0_u8;
+        let mut fuel = 1_u64;
+        let (result, frame) = execute_with_poll_cells(
+            &code,
+            &[box_i32(5)],
+            std::ptr::addr_of!(interrupt),
+            &mut fuel,
+        );
+
+        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
+        assert_eq!(result.value, u64::from(3 * STRIDE + 3));
+        assert_eq!(fuel, 0);
+        assert_eq!(frame[1], box_i32(1));
+        assert_eq!(frame[2], box_i32(0));
+    }
+
+    #[test]
+    fn refuses_irreducible_loop() {
         let view = view(
             0,
             1,
             vec![
-                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
+                (Op::LoadTrue, vec![Operand::Register(0)]),
+                (
+                    Op::JumpIfTrue,
+                    vec![Operand::Imm32(1), Operand::Register(0)],
+                ),
+                (Op::Jump, vec![Operand::Imm32(0)]),
                 (Op::Jump, vec![Operand::Imm32(-2)]),
             ],
         );
-        assert!(compile(&view, 12).is_err());
+        assert!(compile(&view, 17).is_err());
     }
 }

@@ -25,7 +25,9 @@
 //!   provider. Values may be cached in machine registers only between
 //!   safepoints; allocation and call slow paths must reload from frame slots.
 //! - Optimized leaves allocate and call nowhere; before deopt they reconstruct
-//!   every interpreter register in the same rooted frame array.
+//!   every interpreter register in the same rooted frame array. Their VM thread
+//!   pointer is valid only for the dynamic entry call and exposes cooperative
+//!   interrupt/fuel cells, not a retained runtime capability.
 //!
 //! # See also
 //! - [`crate::execution_context`] for snapshot creation from frozen bytecode.
@@ -971,11 +973,14 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     ///
     /// The default identifies baseline/template objects. Optimized code owns
     /// the unsafe machine entry and returns `Some` only after validating the
-    /// supplied parameter and frame-register windows.
+    /// supplied parameter and frame-register windows. `thread` names a
+    /// call-scoped machine-visible record whose poll-cell pointers stay valid
+    /// until this method returns.
     fn run_optimized_entry(
         &self,
         _params: &[u64],
         _frame_registers: &mut [crate::Value],
+        _thread: *mut crate::native_abi::VmThread,
     ) -> Option<JitOptimizedExecOutcome> {
         None
     }

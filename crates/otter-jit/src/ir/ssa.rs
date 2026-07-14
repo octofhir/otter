@@ -14,6 +14,8 @@
 //!   tree, including same-block definition order.
 //! - Operand reads and writes come only from the authoritative bytecode operand
 //!   schema; this module owns no opcode classification table.
+//! - Renamed instructions retain the source and destination register identities
+//!   needed by later frame-state reconstruction.
 //! - Values are dense and deterministic in normal-edge block RPO, with block
 //!   head definitions before bytecode results.
 //!
@@ -104,8 +106,12 @@ pub struct SsaInstr {
     pub op: Op,
     /// SSA values for schema-declared read registers, in operand order.
     pub inputs: SmallVec<[ValueId; 4]>,
+    /// Source registers corresponding one-for-one with [`Self::inputs`].
+    pub input_registers: SmallVec<[u16; 4]>,
     /// SSA result when the instruction writes one register.
     pub result: Option<ValueId>,
+    /// Destination register corresponding to [`Self::result`].
+    pub result_register: Option<u16>,
 }
 
 /// SSA contents attached to one CFG block.
@@ -275,6 +281,20 @@ pub enum SsaError {
     InstructionLayoutMismatch {
         /// Block with the mismatched instruction layout.
         block: BlockId,
+    },
+    /// An instruction does not retain one source register per SSA input.
+    InputRegisterCountMismatch {
+        /// Instruction with mismatched input metadata.
+        pc: u32,
+        /// Number of SSA inputs.
+        inputs: usize,
+        /// Number of retained source registers.
+        registers: usize,
+    },
+    /// An instruction's result and retained destination register disagree.
+    ResultRegisterMismatch {
+        /// Instruction with mismatched result metadata.
+        pc: u32,
     },
     /// A phi does not have exactly one input per normal predecessor.
     PhiInputCountMismatch {
@@ -540,7 +560,9 @@ impl SsaFunction {
                     pc,
                     op,
                     inputs: SmallVec::new(),
+                    input_registers: flows[pc as usize].uses.clone(),
                     result,
+                    result_register: flows[pc as usize].def,
                 });
             }
         }
@@ -826,6 +848,22 @@ impl SsaFunction {
                 return Err(SsaError::InstructionLayoutMismatch { block: block_id });
             }
             for (instruction_index, instruction) in block.instrs.iter().enumerate() {
+                if instruction.input_registers.len() != instruction.inputs.len() {
+                    return Err(SsaError::InputRegisterCountMismatch {
+                        pc: instruction.pc,
+                        inputs: instruction.inputs.len(),
+                        registers: instruction.input_registers.len(),
+                    });
+                }
+                for &register in &instruction.input_registers {
+                    check_register(Some(instruction.pc), register, self.register_count)?;
+                }
+                if instruction.result.is_some() != instruction.result_register.is_some() {
+                    return Err(SsaError::ResultRegisterMismatch { pc: instruction.pc });
+                }
+                if let Some(register) = instruction.result_register {
+                    check_register(Some(instruction.pc), register, self.register_count)?;
+                }
                 if let Some(value_id) = instruction.result {
                     let value = self.value(value_id)?;
                     record_placement(

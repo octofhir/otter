@@ -6,6 +6,13 @@
 //! reconstitution rules, so the contract is final before any code bakes
 //! against it.
 //!
+//! # Contents
+//! - [`FrameState`], [`DeoptSlot`], and [`DeoptTable`] — exact-PC frame
+//!   reconstruction metadata.
+//! - [`DeoptVerifyLimits`] and [`DeoptVerifyError`] — pure schema verification.
+//! - [`StackMap`], [`Safepoint`], and [`SafepointTable`] — compiled-frame GC
+//!   root metadata.
+//!
 //! 1. **Frame-state table** ([`DeoptTable`]) — keyed by interpreter byte-PC.
 //!    For each deopt point it records, per interpreter virtual register, where
 //!    the value lives ([`DeoptLocation`]) and how to turn its raw bits back
@@ -38,7 +45,120 @@
 //! - A [`StackMap`] indexes the same compiled slots the frame state locates;
 //!   bit `i` set means slot `i` holds a tagged pointer the collector relocates.
 
+use std::collections::BTreeMap;
+
 use crate::Value;
+
+/// Declared bounds used to verify one compiled function's deopt metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeoptVerifyLimits {
+    /// Maximum number of interpreter-register slots in one frame state.
+    pub max_frame_slots: usize,
+    /// Number of machine registers addressable by [`DeoptLocation::Register`].
+    pub machine_register_count: u16,
+    /// Smallest valid frame-pointer-relative stack-slot byte offset.
+    pub min_stack_slot_offset: i32,
+    /// Largest valid frame-pointer-relative stack-slot byte offset.
+    pub max_stack_slot_offset: i32,
+    /// Number of constants addressable by [`DeoptLocation::Constant`].
+    pub constant_count: u32,
+}
+
+/// Failure to verify concrete deopt metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeoptVerifyError {
+    /// Stack-slot limits describe an empty or backwards range.
+    InvalidStackSlotRange {
+        /// Declared minimum byte offset.
+        min: i32,
+        /// Declared maximum byte offset.
+        max: i32,
+    },
+    /// A frame state contains more interpreter slots than declared.
+    FrameSlotCountOutOfRange {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Declared maximum slot count.
+        max: usize,
+        /// Stored slot count.
+        actual: usize,
+    },
+    /// Two interpreter slots claim the same concrete location.
+    DuplicateLocation {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// First slot using the location.
+        first_slot: usize,
+        /// Later slot reusing the location.
+        second_slot: usize,
+        /// Duplicated concrete location.
+        location: DeoptLocation,
+    },
+    /// A machine-register location exceeds the declared register file.
+    MachineRegisterOutOfRange {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Interpreter slot containing the location.
+        slot: usize,
+        /// Invalid machine-register id.
+        register: u16,
+        /// Declared machine-register count.
+        register_count: u16,
+    },
+    /// A stack-slot byte offset exceeds the declared frame range.
+    StackSlotOutOfRange {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Interpreter slot containing the location.
+        slot: usize,
+        /// Invalid frame-pointer-relative byte offset.
+        offset: i32,
+        /// Declared minimum byte offset.
+        min: i32,
+        /// Declared maximum byte offset.
+        max: i32,
+    },
+    /// A stack-slot byte offset is not aligned for its raw 64-bit payload.
+    StackSlotMisaligned {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Interpreter slot containing the location.
+        slot: usize,
+        /// Misaligned frame-pointer-relative byte offset.
+        offset: i32,
+    },
+    /// A constant location exceeds the function's declared constant pool.
+    ConstantOutOfRange {
+        /// Frame state's exact byte-PC.
+        byte_pc: u32,
+        /// Interpreter slot containing the location.
+        slot: usize,
+        /// Invalid constant-pool index.
+        constant: u32,
+        /// Declared constant count.
+        constant_count: u32,
+    },
+    /// Deopt table entries move backwards by byte-PC.
+    EntriesNotSorted {
+        /// Earlier entry's byte-PC.
+        previous: u32,
+        /// Later entry's byte-PC.
+        current: u32,
+    },
+    /// More than one deopt entry names the same exact byte-PC.
+    DuplicateBytePc {
+        /// Duplicated byte-PC.
+        byte_pc: u32,
+    },
+}
+
+impl std::fmt::Display for DeoptVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid concrete deopt metadata: {self:?}")
+    }
+}
+
+impl std::error::Error for DeoptVerifyError {}
 
 /// How a deopt slot's raw bits reconstitute into a full tagged [`Value`].
 ///
@@ -104,6 +224,97 @@ pub struct FrameState {
     pub slots: Box<[DeoptSlot]>,
 }
 
+impl FrameState {
+    /// Verify slot count, concrete-location uniqueness, and location bounds.
+    ///
+    /// [`DeoptRepr`] is a closed Rust enum, so every safely constructed value
+    /// is intrinsically one of the three supported representations.
+    pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
+        if limits.min_stack_slot_offset > limits.max_stack_slot_offset {
+            return Err(DeoptVerifyError::InvalidStackSlotRange {
+                min: limits.min_stack_slot_offset,
+                max: limits.max_stack_slot_offset,
+            });
+        }
+        if self.slots.len() > limits.max_frame_slots {
+            return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
+                byte_pc: self.byte_pc,
+                max: limits.max_frame_slots,
+                actual: self.slots.len(),
+            });
+        }
+
+        let mut locations = BTreeMap::new();
+        for (slot_index, slot) in self.slots.iter().enumerate() {
+            let key = location_key(slot.location);
+            if let Some(first_slot) = locations.insert(key, slot_index) {
+                return Err(DeoptVerifyError::DuplicateLocation {
+                    byte_pc: self.byte_pc,
+                    first_slot,
+                    second_slot: slot_index,
+                    location: slot.location,
+                });
+            }
+
+            match slot.location {
+                DeoptLocation::Register(register) if register >= limits.machine_register_count => {
+                    return Err(DeoptVerifyError::MachineRegisterOutOfRange {
+                        byte_pc: self.byte_pc,
+                        slot: slot_index,
+                        register,
+                        register_count: limits.machine_register_count,
+                    });
+                }
+                DeoptLocation::StackSlot(offset)
+                    if offset < limits.min_stack_slot_offset
+                        || offset > limits.max_stack_slot_offset =>
+                {
+                    return Err(DeoptVerifyError::StackSlotOutOfRange {
+                        byte_pc: self.byte_pc,
+                        slot: slot_index,
+                        offset,
+                        min: limits.min_stack_slot_offset,
+                        max: limits.max_stack_slot_offset,
+                    });
+                }
+                DeoptLocation::StackSlot(offset)
+                    if offset % std::mem::size_of::<u64>() as i32 != 0 =>
+                {
+                    return Err(DeoptVerifyError::StackSlotMisaligned {
+                        byte_pc: self.byte_pc,
+                        slot: slot_index,
+                        offset,
+                    });
+                }
+                DeoptLocation::Constant(constant) if constant >= limits.constant_count => {
+                    return Err(DeoptVerifyError::ConstantOutOfRange {
+                        byte_pc: self.byte_pc,
+                        slot: slot_index,
+                        constant,
+                        constant_count: limits.constant_count,
+                    });
+                }
+                DeoptLocation::Register(_)
+                | DeoptLocation::StackSlot(_)
+                | DeoptLocation::Constant(_) => {}
+            }
+
+            match slot.repr {
+                DeoptRepr::Tagged | DeoptRepr::Int32 | DeoptRepr::Float64 => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn location_key(location: DeoptLocation) -> (u8, i64) {
+    match location {
+        DeoptLocation::Register(register) => (0, i64::from(register)),
+        DeoptLocation::StackSlot(offset) => (1, i64::from(offset)),
+        DeoptLocation::Constant(constant) => (2, i64::from(constant)),
+    }
+}
+
 /// Per-compiled-function deopt table, looked up by interpreter byte-PC.
 ///
 /// Sorted by `byte_pc`; [`Self::lookup`] is an exact-match binary search.
@@ -146,6 +357,33 @@ impl DeoptTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Verify exact-PC ordering and every frame state's declared bounds.
+    pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
+        if limits.min_stack_slot_offset > limits.max_stack_slot_offset {
+            return Err(DeoptVerifyError::InvalidStackSlotRange {
+                min: limits.min_stack_slot_offset,
+                max: limits.max_stack_slot_offset,
+            });
+        }
+        for pair in self.entries.windows(2) {
+            if pair[0].byte_pc == pair[1].byte_pc {
+                return Err(DeoptVerifyError::DuplicateBytePc {
+                    byte_pc: pair[0].byte_pc,
+                });
+            }
+            if pair[0].byte_pc > pair[1].byte_pc {
+                return Err(DeoptVerifyError::EntriesNotSorted {
+                    previous: pair[0].byte_pc,
+                    current: pair[1].byte_pc,
+                });
+            }
+        }
+        for state in &self.entries {
+            state.verify(limits)?;
+        }
+        Ok(())
     }
 }
 
@@ -247,6 +485,16 @@ impl SafepointTable {
 mod tests {
     use super::*;
 
+    fn verify_limits() -> DeoptVerifyLimits {
+        DeoptVerifyLimits {
+            max_frame_slots: 4,
+            machine_register_count: 8,
+            min_stack_slot_offset: -64,
+            max_stack_slot_offset: 64,
+            constant_count: 4,
+        }
+    }
+
     #[test]
     fn reconstitute_matches_the_value_encoding() {
         assert_eq!(DeoptRepr::Int32.reconstitute(5), Value::number_i32(5));
@@ -258,8 +506,45 @@ mod tests {
             DeoptRepr::Float64.reconstitute(3.5f64.to_bits()),
             Value::number_f64(3.5)
         );
-        let v = Value::number_i32(42);
-        assert_eq!(DeoptRepr::Tagged.reconstitute(v.to_bits()), v);
+        let value = Value::number_i32(42);
+        assert_eq!(DeoptRepr::Tagged.reconstitute(value.to_bits()), value);
+    }
+
+    #[test]
+    fn reconstitute_round_trips_boundaries_and_special_values() {
+        for tagged in [Value::undefined(), Value::null(), Value::number_i32(42)] {
+            assert_eq!(DeoptRepr::Tagged.reconstitute(tagged.to_bits()), tagged);
+        }
+
+        for integer in [i32::MIN, -1, 0, 1, i32::MAX] {
+            assert_eq!(
+                DeoptRepr::Int32.reconstitute(integer as u32 as u64),
+                Value::number_i32(integer)
+            );
+        }
+        assert_eq!(
+            DeoptRepr::Int32.reconstitute(0xdead_beef_8000_0000),
+            Value::number_i32(i32::MIN),
+            "Int32 uses only the low 32 bits"
+        );
+
+        for number in [0.0, -0.0, 3.5, f64::MIN, f64::MAX, f64::INFINITY] {
+            assert_eq!(
+                DeoptRepr::Float64.reconstitute(number.to_bits()),
+                Value::number_f64(number)
+            );
+        }
+        assert_ne!(
+            DeoptRepr::Float64.reconstitute((-0.0_f64).to_bits()),
+            DeoptRepr::Float64.reconstitute(0.0_f64.to_bits()),
+            "negative zero keeps its sign bit"
+        );
+        let payload_nan = f64::from_bits(0x7ff8_1234_5678_9abc);
+        assert_eq!(
+            DeoptRepr::Float64.reconstitute(payload_nan.to_bits()),
+            Value::number_f64(f64::NAN),
+            "NaN is purified by the frozen Value encoding"
+        );
     }
 
     #[test]
@@ -278,11 +563,146 @@ mod tests {
                 slots: vec![slot].into(),
             },
         ]);
+        table.verify(verify_limits()).unwrap();
         assert_eq!(table.len(), 2);
         assert!(table.lookup(8).is_some());
         assert_eq!(table.lookup(40).unwrap().slots[0].location, slot.location);
         // A non-deopt PC has no entry — exact match, no nearest-PC fallback.
         assert!(table.lookup(20).is_none());
+    }
+
+    #[test]
+    fn frame_state_verifier_accepts_well_formed_slots() {
+        let state = FrameState {
+            byte_pc: 12,
+            slots: vec![
+                DeoptSlot {
+                    location: DeoptLocation::Register(3),
+                    repr: DeoptRepr::Tagged,
+                },
+                DeoptSlot {
+                    location: DeoptLocation::StackSlot(-8),
+                    repr: DeoptRepr::Float64,
+                },
+                DeoptSlot {
+                    location: DeoptLocation::Constant(2),
+                    repr: DeoptRepr::Int32,
+                },
+            ]
+            .into(),
+        };
+
+        assert_eq!(state.verify(verify_limits()), Ok(()));
+    }
+
+    #[test]
+    fn frame_state_verifier_rejects_duplicate_and_out_of_range_locations() {
+        let duplicate = FrameState {
+            byte_pc: 12,
+            slots: vec![
+                DeoptSlot {
+                    location: DeoptLocation::Register(3),
+                    repr: DeoptRepr::Tagged,
+                },
+                DeoptSlot {
+                    location: DeoptLocation::Register(3),
+                    repr: DeoptRepr::Int32,
+                },
+            ]
+            .into(),
+        };
+        assert_eq!(
+            duplicate.verify(verify_limits()),
+            Err(DeoptVerifyError::DuplicateLocation {
+                byte_pc: 12,
+                first_slot: 0,
+                second_slot: 1,
+                location: DeoptLocation::Register(3),
+            })
+        );
+
+        let out_of_range = FrameState {
+            byte_pc: 20,
+            slots: vec![DeoptSlot {
+                location: DeoptLocation::Constant(4),
+                repr: DeoptRepr::Tagged,
+            }]
+            .into(),
+        };
+        assert_eq!(
+            out_of_range.verify(verify_limits()),
+            Err(DeoptVerifyError::ConstantOutOfRange {
+                byte_pc: 20,
+                slot: 0,
+                constant: 4,
+                constant_count: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn frame_state_verifier_checks_all_declared_bounds() {
+        let state_with = |location| FrameState {
+            byte_pc: 24,
+            slots: vec![DeoptSlot {
+                location,
+                repr: DeoptRepr::Tagged,
+            }]
+            .into(),
+        };
+
+        let mut limits = verify_limits();
+        limits.max_frame_slots = 0;
+        assert!(matches!(
+            state_with(DeoptLocation::Register(0)).verify(limits),
+            Err(DeoptVerifyError::FrameSlotCountOutOfRange { .. })
+        ));
+        assert!(matches!(
+            state_with(DeoptLocation::Register(8)).verify(verify_limits()),
+            Err(DeoptVerifyError::MachineRegisterOutOfRange { .. })
+        ));
+        assert!(matches!(
+            state_with(DeoptLocation::StackSlot(72)).verify(verify_limits()),
+            Err(DeoptVerifyError::StackSlotOutOfRange { .. })
+        ));
+        assert!(matches!(
+            state_with(DeoptLocation::StackSlot(4)).verify(verify_limits()),
+            Err(DeoptVerifyError::StackSlotMisaligned { .. })
+        ));
+
+        let mut invalid_range = verify_limits();
+        invalid_range.min_stack_slot_offset = 8;
+        invalid_range.max_stack_slot_offset = -8;
+        assert_eq!(
+            DeoptTable::default().verify(invalid_range),
+            Err(DeoptVerifyError::InvalidStackSlotRange { min: 8, max: -8 })
+        );
+    }
+
+    #[test]
+    fn deopt_table_verifier_rejects_unsorted_and_duplicate_pcs() {
+        let empty = |byte_pc| FrameState {
+            byte_pc,
+            slots: Box::new([]),
+        };
+        let unsorted = DeoptTable {
+            entries: vec![empty(20), empty(8)],
+        };
+        assert_eq!(
+            unsorted.verify(verify_limits()),
+            Err(DeoptVerifyError::EntriesNotSorted {
+                previous: 20,
+                current: 8,
+            })
+        );
+
+        let duplicate = DeoptTable {
+            entries: vec![empty(8), empty(8)],
+        };
+        assert_eq!(
+            duplicate.verify(verify_limits()),
+            Err(DeoptVerifyError::DuplicateBytePc { byte_pc: 8 })
+        );
     }
 
     #[test]

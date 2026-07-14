@@ -11,6 +11,8 @@
 //! - Program points are dense in CFG block order, with block heads before
 //!   instructions, and intervals conservatively cover holes in liveness.
 //! - Phi inputs are live through the final point of their normal predecessor.
+//! - Definitions at one block head overlap through its final head point because
+//!   phi destinations are simultaneous even when individual phis are dead.
 //! - Overlapping closed intervals never share a register or spill slot.
 //! - Phi edge moves preserve parallel-copy semantics; register
 //!   `register_count` is a move-only scratch and is never assigned to a value.
@@ -688,6 +690,8 @@ fn build_intervals(
         });
     }
 
+    extend_simultaneous_block_heads(ssa, linear, &mut intervals)?;
+
     for point in &linear.points {
         let PointKind::Instruction(instruction_index) = point.kind else {
             continue;
@@ -700,6 +704,24 @@ fn build_intervals(
 
     extend_phi_and_live_out_intervals(ssa, cfg, liveness, linear, &mut intervals)?;
     Ok(intervals)
+}
+
+fn extend_simultaneous_block_heads(
+    ssa: &SsaFunction,
+    linear: &Linearization,
+    intervals: &mut [LiveInterval],
+) -> Result<(), RegallocError> {
+    for block in &ssa.blocks {
+        let Some(&last_head) = block.phis.last() else {
+            continue;
+        };
+        let last_position = linear.definition_positions[value_index(last_head, ssa.values.len())?]
+            .ok_or(RegallocError::MissingDefinition { value: last_head })?;
+        for &head in &block.phis {
+            extend_interval(intervals, head, last_position, ssa.values.len())?;
+        }
+    }
+    Ok(())
 }
 
 fn extend_phi_and_live_out_intervals(
@@ -768,6 +790,18 @@ fn verify_intervals(
             });
         }
         required_ends.push(start);
+    }
+
+    for block in &ssa.blocks {
+        let Some(&last_head) = block.phis.last() else {
+            continue;
+        };
+        let last_position = linear.definition_positions[value_index(last_head, value_count)?]
+            .ok_or(RegallocError::MissingDefinition { value: last_head })?;
+        for &head in &block.phis {
+            let index = value_index(head, value_count)?;
+            required_ends[index] = required_ends[index].max(last_position);
+        }
     }
 
     for point in &linear.points {

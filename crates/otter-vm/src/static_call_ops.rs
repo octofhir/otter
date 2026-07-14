@@ -252,31 +252,47 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
-        let (target, src) = {
-            let frame = &stack[top_idx];
-            let target_reg = register_operand(operands.first())?;
-            let src_reg = register_operand(operands.get(1))?;
-            (
-                *read_register(frame, target_reg)?,
-                *read_register(frame, src_reg)?,
-            )
-        };
-        if let (Some(mut target_obj), Some(src_obj)) = (target.as_object(), src.as_object()) {
+        let target_reg = register_operand(operands.first())?;
+        let src_reg = register_operand(operands.get(1))?;
+        self.run_star_reexport_regs(context, stack, top_idx, target_reg, src_reg)
+    }
+
+    pub(crate) fn run_star_reexport_regs(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
+        target_reg: u16,
+        src_reg: u16,
+    ) -> Result<(), VmError> {
+        let target = *read_register(&stack[frame_index], target_reg)?;
+        if target.is_object() {
             let existing: std::collections::HashSet<String> = self
                 .enumerable_own_string_keys_for_value(context, target, 0)?
                 .into_iter()
                 .collect();
+            let src = *read_register(&stack[frame_index], src_reg)?;
+            if !src.is_object() {
+                stack[frame_index].advance_pc()?;
+                return Ok(());
+            }
             let names = self.enumerable_own_string_keys_for_value(context, src, 0)?;
             for name in names {
                 if name == "default" || existing.contains(&name) {
                     continue;
                 }
+                let mut target_obj = read_register(&stack[frame_index], target_reg)?
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
+                let src_obj = read_register(&stack[frame_index], src_reg)?
+                    .as_object()
+                    .ok_or(VmError::TypeMismatch)?;
                 if let Some(value) = crate::object::get(src_obj, &self.gc_heap, &name) {
                     crate::object::set(&mut target_obj, &mut self.gc_heap, &name, value);
                 }
             }
         }
-        let frame = &mut stack[top_idx];
+        let frame = &mut stack[frame_index];
         frame.advance_pc()?;
         Ok(())
     }

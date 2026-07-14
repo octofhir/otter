@@ -1649,8 +1649,7 @@ impl Interpreter {
                     let spec_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_import_namespace_reg(context, frame, dst, spec_idx)?;
+                    self.run_import_namespace_reg(context, stack, top_idx, dst, spec_idx)?;
                     continue;
                 }
                 Op::ImportNamespaceDeferred => {
@@ -1660,8 +1659,7 @@ impl Interpreter {
                     let spec_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_import_namespace_deferred_reg(context, frame, dst, spec_idx)?;
+                    self.run_import_namespace_deferred_reg(context, stack, top_idx, dst, spec_idx)?;
                     continue;
                 }
                 Op::ModuleNamespaceObject => {
@@ -1671,8 +1669,7 @@ impl Interpreter {
                     let spec_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_module_namespace_object_reg(context, frame, dst, spec_idx)?;
+                    self.run_module_namespace_object_reg(context, stack, top_idx, dst, spec_idx)?;
                     continue;
                 }
                 Op::LoadImportBinding => {
@@ -1685,8 +1682,9 @@ impl Interpreter {
                     let name_idx = context
                         .exec_const_index(instr, 2)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_import_binding_reg(context, frame, dst, url_idx, name_idx)?;
+                    self.run_load_import_binding_reg(
+                        context, stack, top_idx, dst, url_idx, name_idx,
+                    )?;
                     continue;
                 }
                 Op::EvaluateModule => {
@@ -1696,20 +1694,14 @@ impl Interpreter {
                     let url_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_evaluate_module_const(context, frame, dst, url_idx)?;
+                    self.run_evaluate_module_const(context, stack, top_idx, dst, url_idx)?;
                     continue;
                 }
                 Op::MarkModuleEvaluated => {
                     let url_idx = context
                         .exec_const_index(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    if let Some(url) = context.string_constant_str(url_idx) {
-                        let url_arc: std::sync::Arc<str> = std::sync::Arc::from(url);
-                        self.module_record_mut(&url_arc).status =
-                            module_records::ModuleStatus::Evaluated;
-                    }
-                    stack[top_idx].advance_pc()?;
+                    self.run_mark_module_evaluated_const(context, stack, top_idx, url_idx)?;
                     continue;
                 }
                 Op::ImportMetaResolve => {
@@ -1719,8 +1711,7 @@ impl Interpreter {
                     let spec_reg = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_import_meta_resolve_regs(context, frame, dst, spec_reg)?;
+                    self.run_import_meta_resolve_regs(context, stack, top_idx, dst, spec_reg)?;
                     continue;
                 }
                 Op::PromiseFulfilledOf => {

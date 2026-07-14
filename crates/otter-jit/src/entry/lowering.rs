@@ -60,6 +60,12 @@ pub(crate) struct ConstantOperands {
     pub(crate) constant: u32,
 }
 
+/// Typed standalone constant-pool index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConstantOnlyOperands {
+    pub(crate) constant: u32,
+}
+
 /// Typed immediate load operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LoadInt32Operands {
@@ -129,6 +135,14 @@ pub(crate) struct EvalOperands {
     pub(crate) dst: u16,
     pub(crate) src: u16,
     pub(crate) flags: i32,
+}
+
+/// Typed named-import binding operands (`dst`, module URL, exported name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImportBindingOperands {
+    pub(crate) dst: u16,
+    pub(crate) module_url: u32,
+    pub(crate) binding_name: u32,
 }
 
 /// Typed named-property load operands.
@@ -315,6 +329,7 @@ enum LoweredOperands {
     Destination(DestinationOperands),
     Source(SourceOperands),
     Constant(ConstantOperands),
+    ConstantOnly(ConstantOnlyOperands),
     LoadInt32(LoadInt32Operands),
     Local(LocalOperands),
     Unary(UnaryOperands),
@@ -324,6 +339,7 @@ enum LoweredOperands {
     ElementStore(ElementStoreOperands),
     Increment(IncrementOperands),
     Eval(EvalOperands),
+    ImportBinding(ImportBindingOperands),
     PropertyLoad(PropertyLoadOperands),
     PropertyStore(PropertyStoreOperands),
     Upvalue(UpvalueOperands),
@@ -378,6 +394,14 @@ impl LoweredInstr {
         }
     }
 
+    pub(crate) fn constant_only_operands(self) -> Result<ConstantOnlyOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ConstantOnly(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape(
+                "lowered standalone constant operands",
+            )),
+        }
+    }
     pub(crate) fn load_int32_operands(self) -> Result<LoadInt32Operands, Unsupported> {
         match self.operands {
             LoweredOperands::LoadInt32(operands) => Ok(operands),
@@ -438,6 +462,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Eval(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered Eval operands")),
+        }
+    }
+
+    pub(crate) fn import_binding_operands(self) -> Result<ImportBindingOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::ImportBinding(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered import-binding operands")),
         }
     }
 
@@ -703,9 +734,20 @@ impl BaselinePlan {
                 | Op::TemporalLoad
                 | Op::LoadBuiltinError
                 | Op::GetTemplateObject
-                | Op::NewPrivateName => LoweredOperands::Constant(ConstantOperands {
+                | Op::NewPrivateName
+                | Op::ImportNamespace
+                | Op::ImportNamespaceDeferred
+                | Op::ModuleNamespaceObject => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,
+                }),
+                Op::MarkModuleEvaluated => LoweredOperands::ConstantOnly(ConstantOnlyOperands {
+                    constant: const_index(operands, 0)?,
+                }),
+                Op::LoadImportBinding => LoweredOperands::ImportBinding(ImportBindingOperands {
+                    dst: reg(operands, 0)?,
+                    module_url: const_index(operands, 1)?,
+                    binding_name: const_index(operands, 2)?,
                 }),
                 Op::Return | Op::ReturnValue => LoweredOperands::Source(SourceOperands {
                     src: reg(operands, 0)?,
@@ -752,6 +794,8 @@ impl BaselinePlan {
                 | Op::ArrayPush
                 | Op::ForInKeys
                 | Op::CopyDataProperties
+                | Op::StarReexport
+                | Op::ImportMetaResolve
                 | Op::NewWeakRef
                 | Op::NewFinalizationRegistry
                 | Op::PromiseFulfilledOf => LoweredOperands::Unary(UnaryOperands {

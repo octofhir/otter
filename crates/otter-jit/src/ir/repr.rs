@@ -501,7 +501,9 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         {
             Representation::Int32
         }
-        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq if feedback.is_int32_only() => {
+        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
+            if feedback.is_int32_only() =>
+        {
             Representation::Int32
         }
         Op::Add
@@ -520,6 +522,8 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         | Op::LessEq
         | Op::GreaterThan
         | Op::GreaterEq
+        | Op::Equal
+        | Op::NotEqual
             if feedback.is_numeric_only() =>
         {
             Representation::Float64
@@ -541,12 +545,12 @@ fn verified_input_representation(op: Op, feedback: ArithFeedback) -> Representat
             | Op::Shl
             | Op::Shr
     );
-    let relational = matches!(
+    let comparison = matches!(
         op,
-        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq
+        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq | Op::Equal | Op::NotEqual
     );
-    let numeric = int32_closed || relational || matches!(op, Op::Div | Op::Rem | Op::Pow);
-    if feedback.is_int32_only() && (int32_closed || relational) {
+    let numeric = int32_closed || comparison || matches!(op, Op::Div | Op::Rem | Op::Pow);
+    if feedback.is_int32_only() && (int32_closed || comparison) {
         Representation::Int32
     } else if feedback.is_numeric_only() && numeric {
         Representation::Float64

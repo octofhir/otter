@@ -1,10 +1,12 @@
-//! Feedback-guided optimizing tier for narrow arithmetic leaves.
+//! Feedback-guided optimizing tier for acyclic arithmetic leaves.
 //!
-//! This module compiles only one-basic-block int32 arithmetic leaves. It runs
+//! This module compiles acyclic multi-block int32 arithmetic leaves. It runs
 //! the complete CFG, dominance, SSA, liveness, register-allocation,
 //! representation, frame-state, and deopt-lowering pipeline before the arm64
-//! backend checks the deliberately narrow eligibility contract. Installed code
-//! reconstructs the interpreter register file in place before every deopt.
+//! backend checks the deliberately narrow eligibility contract. Forward
+//! branches carry sequentialized phi moves on their individual CFG edges.
+//! Installed code reconstructs the interpreter register file in place before
+//! every deopt.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
@@ -13,6 +15,8 @@
 //!
 //! # Invariants
 //! - Entries are leaves: they never allocate, call, safepoint, or re-enter the VM.
+//! - Every normal CFG edge moves forward in reverse postorder; loops and
+//!   exception edges are rejected.
 //! - ABI argument `x0` points to tagged `u64` parameters and `x1` points to
 //!   the interpreter register file. A two-word return uses `x0` for a boxed
 //!   result or deopt byte PC and `x1` for status.

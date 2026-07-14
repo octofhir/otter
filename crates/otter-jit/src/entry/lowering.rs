@@ -639,7 +639,9 @@ impl BaselinePlan {
                 | Op::LoadLength
                 | Op::PrivateBrandCheck
                 | Op::NewError
-                | Op::ArrayPush => LoweredOperands::Unary(UnaryOperands {
+                | Op::ArrayPush
+                | Op::ForInKeys
+                | Op::CopyDataProperties => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),

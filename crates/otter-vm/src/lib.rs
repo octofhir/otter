@@ -112,6 +112,7 @@ mod jit_private_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
 mod jit_scalar_ops;
+mod jit_structural_ops;
 mod jit_super_ops;
 mod jit_value_load_ops;
 pub mod js_surface;

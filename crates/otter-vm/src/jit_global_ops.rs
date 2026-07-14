@@ -4,6 +4,8 @@
 //! - `LoadGlobalThis`, `LoadGlobalOrUndefined`, `StoreGlobalBinding`, and
 //!   `StoreGlobalChecked` completion through the VM's global environment-record
 //!   helpers.
+//! - Dynamic-scope `LoadDynamic`, `StoreDynamic`, and `TypeofDynamic` name
+//!   resolution through the same environment helpers.
 //!
 //! # Invariants
 //! - Every transition delegates to the same `run_*_reg` helper the interpreter
@@ -66,6 +68,15 @@ impl Interpreter {
                     arg1 as u32,
                     arg2 as u16,
                 )?;
+            }
+            value if value == Op::LoadDynamic as u8 => {
+                self.run_load_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
+            }
+            value if value == Op::StoreDynamic as u8 => {
+                self.run_store_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
+            }
+            value if value == Op::TypeofDynamic as u8 => {
+                self.run_typeof_dynamic_reg(context, frame, arg0 as u16, arg1 as u32)?;
             }
             _ => return Err(VmError::InvalidOperand),
         }

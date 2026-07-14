@@ -862,6 +862,15 @@ impl TemplatePlan {
                         arg2: u64::from(operands.extra),
                     }
                 }
+                Op::LoadDynamic | Op::StoreDynamic | Op::TypeofDynamic => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::GlobalOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.constant),
+                        arg2: 0,
+                    }
+                }
                 Op::Instanceof | Op::HasProperty => {
                     let operands = lowered.triple_operands()?;
                     TemplateOp::ObjectProtocolOp {

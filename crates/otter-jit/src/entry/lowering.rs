@@ -643,7 +643,8 @@ impl BaselinePlan {
                 | Op::ForInKeys
                 | Op::CopyDataProperties
                 | Op::NewWeakRef
-                | Op::NewFinalizationRegistry => LoweredOperands::Unary(UnaryOperands {
+                | Op::NewFinalizationRegistry
+                | Op::PromiseFulfilledOf => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
@@ -717,7 +718,11 @@ impl BaselinePlan {
                 | Op::ArrayConstruct
                 | Op::ArrayFrom
                 | Op::ArrayOf
-                | Op::QueueMicrotask => {
+                | Op::QueueMicrotask
+                | Op::ArrayBufferCall
+                | Op::SharedArrayBufferCall
+                | Op::BigIntCall
+                | Op::DataViewCall => {
                     let count = const_index(operands, 1)? as usize;
                     let elements = append_register_tail(
                         &mut register_operands,

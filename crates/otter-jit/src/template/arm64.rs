@@ -37,6 +37,7 @@ mod exceptions;
 mod functions;
 mod globals;
 mod iterators;
+mod private_access;
 mod properties;
 mod protocol;
 mod scalar;
@@ -718,6 +719,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 super_access::emit_super_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::PrivateOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                private_access::emit_private_op(
                     &mut ops,
                     transitions,
                     opcode,

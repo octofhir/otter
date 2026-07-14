@@ -631,7 +631,8 @@ impl BaselinePlan {
                 | Op::TypeOf
                 | Op::IsArray
                 | Op::ArrayLength
-                | Op::LoadLength => LoweredOperands::Unary(UnaryOperands {
+                | Op::LoadLength
+                | Op::PrivateBrandCheck => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
@@ -765,7 +766,9 @@ impl BaselinePlan {
                 | Op::DeleteElement
                 | Op::SameValue
                 | Op::LoadSuperElement
-                | Op::SetSuperElement => {
+                | Op::SetSuperElement
+                | Op::PrivateGet
+                | Op::PrivateSet => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,

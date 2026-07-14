@@ -361,6 +361,16 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one private-member opcode (`PrivateGet`, `PrivateSet`,
+    /// `PrivateBrandCheck`) through the shared reentrant private transition.
+    /// Private accessor getters/setters fire in the VM. `arg0`/`arg1`/`arg2`
+    /// name the operand registers per opcode.
+    PrivateOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -907,6 +917,24 @@ impl TemplatePlan {
                         arg0: u64::from(operands.first),
                         arg1: u64::from(operands.second),
                         arg2: u64::from(operands.third),
+                    }
+                }
+                Op::PrivateGet | Op::PrivateSet => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::PrivateOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
+                    }
+                }
+                Op::PrivateBrandCheck => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::PrivateOp {
+                        opcode: Op::PrivateBrandCheck as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.src),
+                        arg2: 0,
                     }
                 }
                 Op::Instanceof | Op::HasProperty => {

@@ -1806,44 +1806,7 @@ impl Interpreter {
                     let (dst, obj_reg, key_reg) = context
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
-                    let key = *read_register(&stack[top_idx], key_reg)?;
-                    // A non-symbol key means the private-name binding
-                    // failed to resolve through the capture chain —
-                    // surface the spec's brand-check TypeError rather
-                    // than a VM invariant crash.
-                    let Some(sym) = key.as_symbol(&self.gc_heap) else {
-                        return Err(self.err_type((
-                                "Cannot read private member from an object whose class did not declare it"
-                                    .to_string()).into()));
-                    };
-                    let found = self.private_element_lookup(context, &receiver, sym)?;
-                    let result = match found {
-                        None => {
-                            return Err(self.err_type((
-                                    "Cannot read private member from an object whose class did not declare it"
-                                        .to_string()).into()));
-                        }
-                        Some((_, desc)) => match desc.kind {
-                            object::DescriptorKind::Data { value } => value,
-                            object::DescriptorKind::Accessor { getter, .. } => match getter {
-                                Some(getter) => self.run_callable_sync(
-                                    context,
-                                    &getter,
-                                    receiver,
-                                    smallvec::SmallVec::new(),
-                                )?,
-                                None => {
-                                    return Err(self.err_type(
-                                        ("'#x' was defined without a getter".to_string()).into(),
-                                    ));
-                                }
-                            },
-                        },
-                    };
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, result)?;
-                    frame.advance_pc()?;
+                    self.run_private_get_reg(context, stack, top_idx, dst, obj_reg, key_reg)?;
                     continue;
                 }
                 // §7.3.32 PrivateSet — brand check, private methods
@@ -1853,55 +1816,7 @@ impl Interpreter {
                     let (obj_reg, key_reg, value_reg) = context
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
-                    let key = *read_register(&stack[top_idx], key_reg)?;
-                    let value = *read_register(&stack[top_idx], value_reg)?;
-                    let Some(sym) = key.as_symbol(&self.gc_heap) else {
-                        return Err(self.err_type((
-                                "Cannot write private member to an object whose class did not declare it"
-                                    .to_string()).into()));
-                    };
-                    let found = self.private_element_lookup(context, &receiver, sym)?;
-                    match found {
-                        None => {
-                            return Err(self.err_type((
-                                    "Cannot write private member to an object whose class did not declare it"
-                                        .to_string()).into()));
-                        }
-                        Some((holder, desc)) => match desc.kind {
-                            object::DescriptorKind::Accessor { setter, .. } => match setter {
-                                Some(setter) => {
-                                    let argv: smallvec::SmallVec<[Value; 8]> =
-                                        smallvec::smallvec![value];
-                                    self.run_callable_sync(context, &setter, receiver, argv)?;
-                                }
-                                None => {
-                                    return Err(self.err_type(
-                                        ("'#x' was defined without a setter".to_string()).into(),
-                                    ));
-                                }
-                            },
-                            object::DescriptorKind::Data { .. } => {
-                                if holder != receiver || !desc.flags.writable() {
-                                    // Prototype side or a non-writable
-                                    // own slot — a private method.
-                                    return Err(self.err_type(
-                                        ("Private method is not writable".to_string()).into(),
-                                    ));
-                                }
-                                let descriptor = object::PartialPropertyDescriptor {
-                                    value: Some(value),
-                                    ..Default::default()
-                                };
-                                let vm_key = VmPropertyKey::Symbol(sym);
-                                self.define_own_property_value(
-                                    context, &receiver, &vm_key, descriptor,
-                                )?;
-                            }
-                        },
-                    }
-                    let frame = &mut stack[top_idx];
-                    frame.advance_pc()?;
+                    self.run_private_set_reg(context, stack, top_idx, obj_reg, key_reg, value_reg)?;
                     continue;
                 }
                 // §7.1.3 ToNumeric on an already-primitive operand:
@@ -1972,36 +1887,7 @@ impl Interpreter {
                     let brand_reg = context
                         .exec_register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
-                    let brand = *read_register(&stack[top_idx], brand_reg)?;
-                    let Some(sym) = brand.as_symbol(&self.gc_heap) else {
-                        return Err(self.err_type((
-                                "Cannot read private member from an object whose class did not declare it"
-                                    .to_string()).into()));
-                    };
-                    let key = VmPropertyKey::Symbol(sym);
-                    // §6.2.12 — a Proxy answers brand checks from its
-                    // own [[PrivateElements]] bag, never from traps.
-                    let found = if let Some(p) = receiver.as_proxy() {
-                        self.proxy_private_find(&p, sym).is_some()
-                    } else {
-                        self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                            context,
-                            receiver,
-                            &key,
-                            0,
-                            &[&receiver, &brand],
-                            &[],
-                        )?
-                        .is_some()
-                    };
-                    if !found {
-                        return Err(self.err_type((
-                                "Cannot read private member from an object whose class did not declare it"
-                                    .to_string()).into()));
-                    }
-                    let frame = &mut stack[top_idx];
-                    frame.advance_pc()?;
+                    self.run_private_brand_check_reg(context, stack, top_idx, obj_reg, brand_reg)?;
                     continue;
                 }
                 // §13.4.2 UpdateExpression numeric step — ToNumeric

@@ -43,6 +43,7 @@ mod private_access;
 mod properties;
 mod protocol;
 mod scalar;
+mod static_call;
 mod structural;
 mod super_access;
 mod transitions;
@@ -825,6 +826,23 @@ pub(super) fn compile(
                     opcode,
                     prefix,
                     argc,
+                    packed_args,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::StaticCallOp {
+                opcode,
+                packed_head,
+                method,
+                packed_args,
+            } => {
+                static_call::emit_static_call_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    packed_head,
+                    method,
                     packed_args,
                     bail,
                     threw,

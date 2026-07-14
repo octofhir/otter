@@ -61,28 +61,6 @@ impl Interpreter {
             value if value == Op::QueueMicrotask as u8 => {
                 self.run_queue_microtask_operands(context, &mut stack[frame_index], &ops[..])?;
             }
-            value if value == Op::ArrayBufferCall as u8 => {
-                self.run_array_buffer_static_call_operands(stack, &ops[..])?;
-            }
-            value if value == Op::SharedArrayBufferCall as u8 => {
-                self.run_shared_array_buffer_static_call_operands(stack, &ops[..])?;
-            }
-            value if value == Op::BigIntCall as u8 => {
-                self.run_static_call_operands(
-                    Op::BigIntCall,
-                    context,
-                    &mut stack[frame_index],
-                    &ops[..],
-                )?;
-            }
-            value if value == Op::DataViewCall as u8 => {
-                self.run_static_call_operands(
-                    Op::DataViewCall,
-                    context,
-                    &mut stack[frame_index],
-                    &ops[..],
-                )?;
-            }
             _ => return Err(VmError::InvalidOperand),
         }
         stack[frame_index].pc = saved_pc;

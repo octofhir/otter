@@ -896,3 +896,16 @@ Targeted Test262 `language/expressions/typeof` (17/17),
 11/11 under GC stress strides 1 through 16 with verification enabled. The frozen
 full Test262 reference remains 99.02% (51,480/53,173 excluding skips).
 Performance remains subordinate to coverage for this batch.
+
+### Phase 2 production dynamic-scope access completion
+
+`LoadDynamic`, `StoreDynamic`, and `TypeofDynamic` now compile through the
+existing global environment-record stub (runtime stub 59); they reuse the same
+`run_load_dynamic_reg`/`run_store_dynamic_reg`/`run_typeof_dynamic_reg` helpers
+the interpreter dispatches, so `with`-scope and sloppy dynamic name resolution
+is identical across tiers and no new stub, emitter, or binding was added.
+Template coverage is 100 of 172 active opcodes (up from 97); 72 remain
+unsupported. Interpreter/template parity holds for a `with`-block fixture;
+targeted Test262 `language/statements/with` passed 181/181 and the release
+differential corpus passed 11/11 under GC stress strides 1 through 16. The
+frozen full Test262 reference remains 99.02% (51,480/53,173 excluding skips).

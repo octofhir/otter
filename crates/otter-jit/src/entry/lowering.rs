@@ -586,6 +586,9 @@ impl BaselinePlan {
                 | Op::LoadGlobalOrThrow
                 | Op::LoadGlobalOrUndefined
                 | Op::DeleteDynamic
+                | Op::LoadDynamic
+                | Op::StoreDynamic
+                | Op::TypeofDynamic
                 | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,

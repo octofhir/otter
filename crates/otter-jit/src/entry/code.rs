@@ -1,8 +1,8 @@
 //! Shared VM entry invocation for compiled code.
 //!
 //! # Contents
-//! - [`enter_compiled`] — builds the `JitCtx` for one activation and invokes a
-//!   compiled entry, mapping the returned status to a [`JitExecOutcome`].
+//! - [`enter_compiled`] — builds the `JitCtx` for one baseline or optimizing
+//!   activation and maps its returned status to a [`JitExecOutcome`].
 //!
 //! # Invariants
 //! - Entry pointers are called only through the frozen compiled-entry ABI
@@ -12,10 +12,11 @@
 //!
 //! # See also
 //! - [`super::abi`] defines the entry and context layouts.
-//! - `crate::template::code` owns the finalized code objects that call this.
+//! - `crate::template::code` and [`crate::optimizing`] own finalized code
+//!   objects that call this.
 
 use super::{
-    JitCtx, JitEntry, STATUS_BAILED, STATUS_RETURNED, jit_pop_native_activation_stub,
+    JitCtx, JitEntry, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, jit_pop_native_activation_stub,
     jit_push_native_activation_stub,
 };
 use otter_vm::{
@@ -147,7 +148,8 @@ pub(crate) unsafe fn enter_compiled(
         match ret.status {
             STATUS_RETURNED => JitExecOutcome::Returned(Value::from_bits(ret.value)),
             STATUS_BAILED => JitExecOutcome::Bailed(native_frame.header.pc),
-            _ => JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand)),
+            STATUS_THREW => JitExecOutcome::Threw(error.take().unwrap_or(VmError::InvalidOperand)),
+            _ => JitExecOutcome::Threw(VmError::InvalidOperand),
         }
     }
 }

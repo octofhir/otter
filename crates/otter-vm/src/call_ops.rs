@@ -2607,18 +2607,21 @@ impl Interpreter {
         let top_idx = state.stack.len() - 1;
         if let Some(outcome) = self.run_optimized_frame(&mut state.stack, context, top_idx) {
             match outcome {
-                crate::jit::JitOptimizedExecOutcome::Returned(value) => {
+                crate::jit::JitExecOutcome::Returned(value) => {
                     state.reuse_frame = state.stack.pop();
                     window_rollback.commit();
                     return Ok(value);
                 }
-                crate::jit::JitOptimizedExecOutcome::Deopt(byte_pc) => {
-                    let pc = context
-                        .exec_function(state.function_id)
-                        .and_then(|function| function.instruction_index_for_byte_pc(byte_pc))
-                        .ok_or(VmError::InvalidOperand)?;
+                crate::jit::JitExecOutcome::Bailed(pc) => {
                     state.stack[top_idx].pc = pc;
                     return self.dispatch_loop(context, &mut state.stack);
+                }
+                crate::jit::JitExecOutcome::Threw(err) => {
+                    if let Some(mut frame) = state.stack.pop() {
+                        self.frame_release_cold(&mut frame);
+                        self.reclaim_registers(&mut frame);
+                    }
+                    return Err(err);
                 }
             }
         }

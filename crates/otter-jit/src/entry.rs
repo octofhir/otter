@@ -1,7 +1,7 @@
-//! Shared native-compilation infrastructure for the template compiler.
+//! Shared native-compilation infrastructure for compiled tiers.
 //!
 //! Owns everything the machine backend consumes that is not itself a code
-//! template: the frozen compiled-entry ABI (`JitCtx`/`JitRet` and their field
+//! tiers: the frozen compiled-entry ABI (`JitCtx`/`JitRet` and their field
 //! offsets), the boxed-value encoding constants, the backend-neutral typed
 //! lowering plan, the classified runtime-stub entries, and the shared VM
 //! entry path ([`enter_compiled`]).
@@ -29,7 +29,8 @@
 //!   sets cannot drift.
 //!
 //! # See also
-//! - [`crate::template`] — the production compiler consuming this module.
+//! - [`crate::template`] — the baseline compiler consuming this module.
+//! - [`crate::optimizing`] — the feedback-guided optimizing consumer.
 //! - `JIT_DESIGN.md` §3.2 (backend), §3.5 (GC contract).
 
 mod abi;

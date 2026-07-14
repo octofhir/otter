@@ -1,15 +1,15 @@
-//! Optimizing entry, branches, loop phis, polls, and in-place deopt parity.
+//! Optimizing entry, branches, loop phis, polls, and in-place bail parity.
 //!
 //! # Contents
 //! - Hand-authored int32 and float64 arithmetic, max-diamond, and loop
 //!   functions matching the optimizer's deliberately narrow production subset.
-//! - Hot optimized return and non-int32 guard-deopt comparisons against
+//! - Hot optimized return and non-int32 guard-bail comparisons against
 //!   [`JitSelection::InterpreterOnly`].
 //! - Cooperative cancellation after a hot loop has entered optimized code.
 //!
 //! # Invariants
 //! - Both tier selections execute the identical linked bytecode module.
-//! - The tiered run must prove machine-code entry and reconstructed deopt via
+//! - The tiered run must prove machine-code entry and reconstructed bail via
 //!   isolate-owned execution statistics.
 
 use std::{sync::Arc, time::Duration};

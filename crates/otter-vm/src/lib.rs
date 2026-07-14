@@ -229,8 +229,8 @@ pub use jit::{
     JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
     JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
     JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFunctionCode,
-    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitOptimizedExecOutcome,
-    JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
+    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPrimitiveMethodGuard,
+    JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,

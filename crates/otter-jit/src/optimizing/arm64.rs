@@ -3,34 +3,37 @@
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
 //! - Reducible loop checks, numeric comparisons, and per-edge phi copies.
-//! - Cooperative back-edge polling with loop-header deoptimization.
+//! - Cooperative back-edge polling with loop-header bail writeback.
 //! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
-//!   and deopt exits.
+//!   and bail exits backed by exact deopt frame states.
 //!
 //! # Invariants
-//! - GPR linear-scan registers `0..4` map to `x19..x22`; FP registers `0..8`
-//!   map to the AAPCS64 callee-saved `d8..d15`. `x8..x15` and `d16..d17` are
-//!   caller-saved scratch registers. GPR spill slots precede FP spill slots in
-//!   one aligned stack frame.
+//! - `x20` retains the sole `JitCtx` argument and `x19` retains `ctx.regs`.
+//!   GPR linear-scan registers `0..4` map to `x21..x24`, disjoint from both
+//!   fixed ABI registers; FP registers `0..8` map to the AAPCS64 callee-saved
+//!   `d8..d15`. `x8..x15` and `d16..d17` are caller-saved scratch registers.
+//!   GPR spill slots precede FP spill slots in one aligned stack frame.
 //! - Every used tagged numeric parameter is checked with the VM's frozen
 //!   number-tag mask before its payload enters an unboxed operation.
 //! - `Add`/`Sub` use the arm64 signed-overflow flag and `Mul` compares its
-//!   signed 64-bit product with the sign-extended low word. Overflow deopts at
-//!   the arithmetic instruction's exact byte PC; it never silently wraps.
+//!   signed 64-bit product with the sign-extended low word. Overflow bails at
+//!   the arithmetic instruction's exact logical PC; it never silently wraps.
 //! - Every CFG edge targets a block label in reverse postorder. Sequentialized
 //!   phi moves execute only on their owning edge before its final jump.
-//! - Float64 arithmetic never deopts for overflow or division by zero. NaNs
+//! - Float64 arithmetic never bails for overflow or division by zero. NaNs
 //!   remain unordered in comparisons and are canonicalized whenever boxed.
 //! - Every backwards bytecode edge targets a dominating loop header. Its phi moves
 //!   execute before the interrupt/fuel poll so a poll exit reconstructs the
 //!   loop-header frame, and no optimized loop can bypass cooperative polling.
 //! - Conditional inputs are optimizer-produced tagged booleans and branch by
 //!   exact comparison with the VM's `true` immediate.
-//! - The emitted function is a standalone leaf and never re-enters the VM;
-//!   poll slow paths deopt so the interpreter owns interrupt/budget handling.
+//! - The current arithmetic body makes no runtime call or safepoint, but enters
+//!   through the shared reentrant `JitCtx` ABI. Poll slow paths bail so the
+//!   interpreter owns interrupt/budget handling.
 //!
 //! # See also
-//! - [`super`] — public code object and leaf ABI.
+//! - [`super`] — public optimizing code object.
+//! - [`crate::entry`] — shared reentrant entry ABI and activation publication.
 //! - [`crate::ir`] — source analyses and allocation contracts.
 
 // dynasm's dynamic-register forms inject an internal conversion that Clippy
@@ -48,8 +51,9 @@ use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
     CompiledCode,
     entry::{
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16, STATUS_DEOPT, STATUS_RETURNED,
-        Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
+        NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_FALSE,
+        VALUE_FALSE_LOW, VALUE_TRUE, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     ir::{
@@ -69,7 +73,7 @@ const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
     gpr: ALLOCATABLE_REGISTER_COUNT,
     fp: 8,
 };
-const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [19, 20, 21, 22];
+const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 24];
 const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 const FP_SCRATCH_2: u8 = 17;
@@ -86,7 +90,8 @@ struct GuardedParam {
 #[derive(Debug)]
 struct Eligibility {
     guarded_params: Vec<GuardedParam>,
-    back_edges: BTreeMap<(BlockId, BlockId), u32>,
+    /// `(deopt-table byte PC, native-frame logical resume PC)` per back-edge.
+    back_edges: BTreeMap<(BlockId, BlockId), (u32, u32)>,
 }
 
 struct EmissionPlan<'a> {
@@ -235,7 +240,10 @@ fn check_eligibility(
                 }
                 back_edges.insert(
                     (block.id, successor),
-                    byte_pc(view, cfg.blocks[successor.0 as usize].start_pc)?,
+                    (
+                        byte_pc(view, cfg.blocks[successor.0 as usize].start_pc)?,
+                        cfg.blocks[successor.0 as usize].start_pc,
+                    ),
                 );
             }
         }
@@ -557,14 +565,18 @@ fn emit(
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
-    let mut deopt_exits = Vec::<(DynamicLabel, u32)>::new();
+    let mut deopt_exits = Vec::<(DynamicLabel, u32, u32)>::new();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
         .map(|_| ops.new_dynamic_label())
         .collect();
     let entry = ops.offset();
     emit_prologue(&mut ops, spill_frame_bytes);
 
-    dynasm!(ops ; .arch aarch64 ; mov x8, x0 ; mov x13, x1);
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov x20, x0
+        ; ldr x19, [x20]
+    );
     for value in &ssa.values {
         match value.def {
             ValueDef::Param { index, .. } => {
@@ -590,7 +602,7 @@ fn emit(
                 .find(|param| param.use_pc == instruction.pc)
                 .map(|param| {
                     let label = ops.new_dynamic_label();
-                    deopt_exits.push((label, param.deopt_byte_pc));
+                    deopt_exits.push((label, param.deopt_byte_pc, instruction.pc));
                     label
                 });
             match instruction.op {
@@ -683,7 +695,11 @@ fn emit(
                                 _ => unreachable!("int32 division is ineligible"),
                             }
                             emit_store_location(&mut ops, allocation.location(result), 11)?;
-                            deopt_exits.push((deopt, byte_pc(view, instruction.pc)?));
+                            deopt_exits.push((
+                                deopt,
+                                byte_pc(view, instruction.pc)?,
+                                instruction.pc,
+                            ));
                         }
                         Representation::Float64 => {
                             emit_load_float_operand(
@@ -880,7 +896,7 @@ fn emit(
         }
     }
 
-    for (label, deopt_byte_pc) in deopt_exits {
+    for (label, deopt_byte_pc, resume_pc) in deopt_exits {
         dynasm!(ops ; .arch aarch64 ; =>label);
         let frame_state = deopt_table
             .lookup(deopt_byte_pc)
@@ -888,8 +904,14 @@ fn emit(
                 "optimizing deopt exit missing frame state",
             ))?;
         emit_deopt_writeback(&mut ops, allocation, frame_state)?;
-        emit_load_u32(&mut ops, 0, deopt_byte_pc);
-        dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_DEOPT as u32);
+        emit_load_u32(&mut ops, 9, resume_pc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+            ; mov x0, xzr
+            ; movz x1, STATUS_BAILED as u32
+        );
         emit_epilogue(&mut ops, spill_frame_bytes);
     }
 
@@ -905,7 +927,7 @@ fn emit_cfg_edge(
     ops: &mut Assembler,
     allocation: &Allocation,
     eligibility: &Eligibility,
-    deopt_exits: &mut Vec<(DynamicLabel, u32)>,
+    deopt_exits: &mut Vec<(DynamicLabel, u32, u32)>,
     block_labels: &[DynamicLabel],
     predecessor: BlockId,
     target: BlockId,
@@ -915,10 +937,10 @@ fn emit_cfg_edge(
         allocation,
         edge_moves(allocation, predecessor, target)?,
     )?;
-    if let Some(&header_byte_pc) = eligibility.back_edges.get(&(predecessor, target)) {
+    if let Some(&(header_byte_pc, header_pc)) = eligibility.back_edges.get(&(predecessor, target)) {
         let deopt = ops.new_dynamic_label();
         emit_backedge_poll(ops, deopt);
-        deopt_exits.push((deopt, header_byte_pc));
+        deopt_exits.push((deopt, header_byte_pc, header_pc));
     }
     let target_label = block_labels[target.0 as usize];
     dynasm!(ops ; .arch aarch64 ; b =>target_label);
@@ -930,18 +952,20 @@ fn emit_cfg_edge(
 /// The policy mirrors the baseline read/decrement pattern: the interrupt byte
 /// is read first, then the shared fuel is decremented and stored (clamped at
 /// zero so repeated entries cannot underflow it). An interrupt or non-positive
-/// fuel value deopts at the loop header. The interpreter then
+/// fuel value bails at the loop header. The interpreter then
 /// resumes with the shared fuel still exhausted and performs its ordinary
 /// interrupt/budget checkpoint on its next back-edge. Thus optimized code
-/// deopts at least as often as the interpreter/baseline poll cadence, never
+/// bails at least as often as the interpreter/baseline poll cadence, never
 /// less often, while keeping all refill and error policy inside the VM.
 fn emit_backedge_poll(ops: &mut Assembler, deopt: DynamicLabel) {
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x9, [x2, VM_THREAD_INTERRUPT_CELL_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; ldr x9, [x9, VM_THREAD_INTERRUPT_CELL_OFFSET]
         ; ldrb w10, [x9]
         ; cbnz w10, =>deopt
-        ; ldr x9, [x2, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; ldr x9, [x9, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
         ; subs x10, x10, #1
         ; csel x10, x10, xzr, gt
@@ -1103,10 +1127,10 @@ fn fp_move_register(register: u8) -> Result<u8, Unsupported> {
 fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
     let offset = index * STACK_SLOT_BYTES;
     if offset <= MAX_PARAMETER_OFFSET {
-        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x8, offset]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, offset]);
     } else {
         emit_load_u32(ops, 12, offset);
-        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x8, x12]);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, x12]);
     }
 }
 
@@ -1188,10 +1212,10 @@ fn emit_store_frame_register(
             "optimizing frame register offset",
         ))?;
     if offset <= MAX_PARAMETER_OFFSET {
-        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x13, offset]);
+        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x19, offset]);
     } else {
         emit_load_u32(ops, 12, offset);
-        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x13, x12]);
+        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x19, x12]);
     }
     Ok(())
 }
@@ -1570,8 +1594,9 @@ fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
 fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {
     dynasm!(ops
         ; .arch aarch64
-        ; stp x19, x20, [sp, #-32]!
+        ; stp x19, x20, [sp, #-48]!
         ; stp x21, x22, [sp, #16]
+        ; stp x23, x24, [sp, #32]
         ; stp d8, d9, [sp, #-64]!
         ; stp d10, d11, [sp, #16]
         ; stp d12, d13, [sp, #32]
@@ -1592,8 +1617,9 @@ fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
         ; ldp d12, d13, [sp, #32]
         ; ldp d10, d11, [sp, #16]
         ; ldp d8, d9, [sp], #64
+        ; ldp x23, x24, [sp, #32]
         ; ldp x21, x22, [sp, #16]
-        ; ldp x19, x20, [sp], #32
+        ; ldp x19, x20, [sp], #48
         ; ret
     );
 }
@@ -1611,12 +1637,11 @@ mod tests {
     use otter_vm::{
         jit::JitTestInstruction,
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
+        native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
     };
 
     use super::*;
-    use crate::optimizing::{
-        OPTIMIZED_STATUS_DEOPT, OPTIMIZED_STATUS_RETURNED, OptimizedLeafEntry, OptimizedLeafRet,
-    };
+    use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
 
     const STRIDE: u32 = 8;
 
@@ -1685,11 +1710,11 @@ mod tests {
         view
     }
 
-    fn execute(code: &OptimizedCode, args: &[u64]) -> OptimizedLeafRet {
+    fn execute(code: &OptimizedCode, args: &[u64]) -> JitRet {
         execute_with_frame(code, args).0
     }
 
-    fn execute_with_frame(code: &OptimizedCode, args: &[u64]) -> (OptimizedLeafRet, Vec<u64>) {
+    fn execute_with_frame(code: &OptimizedCode, args: &[u64]) -> (JitRet, Vec<u64>, u32) {
         let interrupt = 0_u8;
         let mut fuel = i64::MAX as u64;
         execute_with_poll_cells(code, args, std::ptr::addr_of!(interrupt), &mut fuel)
@@ -1700,19 +1725,65 @@ mod tests {
         args: &[u64],
         interrupt: *const u8,
         fuel: &mut u64,
-    ) -> (OptimizedLeafRet, Vec<u64>) {
-        // SAFETY: the compiler emitted `OptimizedLeafEntry`, `code` owns the
-        // mapping through the call, `args` covers every used parameter, and
-        // both poll cells remain valid until the entry returns.
-        let entry: OptimizedLeafEntry =
-            unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+    ) -> (JitRet, Vec<u64>, u32) {
+        // SAFETY: the compiler emitted `JitEntry`, `code` owns the mapping
+        // through the call, and the context plus poll cells remain valid until
+        // the entry returns.
+        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
         let mut frame =
             vec![otter_vm::Value::undefined().to_bits(); code.metadata().register_count as usize];
-        let mut thread = otter_vm::native_abi::VmThread::empty();
+        frame[..args.len()].copy_from_slice(args);
+        let metadata = code.metadata();
+        let mut native_frame = NativeFrame {
+            header: VmFrameHeader {
+                function_id: metadata.function_id,
+                code_block_id: metadata.function_id,
+                pc: 0,
+                register_count: metadata.register_count,
+                kind: NativeFrameKind::Baseline,
+                flags: NativeFrameFlags::empty(),
+            },
+            previous_frame: 0,
+            register_base: frame.as_mut_ptr() as u64,
+            argument_base: 0,
+            feedback_base: 0,
+            code_object_id: metadata.code_object_id,
+            this_value_bits: otter_vm::Value::undefined().to_bits(),
+            new_target_bits: otter_vm::Value::undefined().to_bits(),
+            return_register: u32::MAX,
+            cold_state_index: u32::MAX,
+            argument_count: 0,
+            reserved0: 0,
+            feedback_id: 0,
+        };
+        let mut thread = VmThread::empty();
+        thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
         thread.interrupt_cell = interrupt as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
-        let result = entry(args.as_ptr(), frame.as_mut_ptr(), &mut thread);
-        (result, frame)
+        let mut error = None;
+        let mut ctx = JitCtx {
+            regs: frame.as_mut_ptr(),
+            self_closure: otter_vm::Value::undefined().to_bits(),
+            this_value: otter_vm::Value::undefined().to_bits(),
+            thread: std::ptr::addr_of_mut!(thread),
+            native_frame: std::ptr::addr_of_mut!(native_frame),
+            frame_index: 0,
+            upvalues_ptr: 0,
+            error: &mut error,
+            direct_entry_addr: 0,
+            direct_regs: std::ptr::null_mut(),
+            direct_self_closure: 0,
+            direct_this_value: 0,
+            direct_frame_index: 0,
+            direct_upvalues_ptr: 0,
+            direct_frame_ids: 0,
+            direct_frame_meta: 0,
+            direct_code_object_id: 0,
+            reg_stack_base: std::ptr::null_mut(),
+            reg_top_ptr: std::ptr::null_mut(),
+        };
+        let result = entry(&mut ctx);
+        (result, frame, native_frame.header.pc)
     }
 
     fn summation_view() -> JitCompileSnapshot {
@@ -1776,7 +1847,7 @@ mod tests {
         );
         let code = compile(&view, 1).expect("add is eligible");
         let result = execute(&code, &[box_i32(17), box_i32(-5)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(result.value), 12);
     }
 
@@ -1816,7 +1887,7 @@ mod tests {
         );
         let code = compile(&view, 2).expect("three-op expression is eligible");
         let result = execute(&code, &[box_i32(6), box_i32(4), box_i32(3)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(result.value), 23);
     }
 
@@ -1849,7 +1920,7 @@ mod tests {
         );
         let code = compile(&view, 101).expect("float add/mul chain is eligible");
         let result = execute(&code, &[box_f64(1.5), box_f64(2.0), box_f64(4.0)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(14.0));
     }
 
@@ -1876,7 +1947,7 @@ mod tests {
         );
         let code = compile(&view, 102).expect("float division is eligible");
         let result = execute(&code, &[]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(3.5));
     }
 
@@ -1901,7 +1972,7 @@ mod tests {
         );
         let code = compile(&view, 103).expect("mixed division is eligible");
         let result = execute(&code, &[box_i32(7), box_f64(2.0)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(3.5));
         assert_eq!(
             execute(&code, &[box_f64(1.0), box_f64(0.0)]).value,
@@ -2024,7 +2095,7 @@ mod tests {
         );
         let code = compile(&view, 105).expect("float accumulation loop is eligible");
         let result = execute(&code, &[box_i32(5)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(15.0));
     }
 
@@ -2082,7 +2153,7 @@ mod tests {
         );
         let code = compile(&view, 106).expect("NaN comparison is eligible");
         let result = execute(&code, &[]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(22.5));
     }
 
@@ -2119,9 +2190,10 @@ mod tests {
         );
         let code = compile(&view, 107).expect("float deopt fixture is eligible");
         let undefined = otter_vm::Value::undefined().to_bits();
-        let (result, frame) = execute_with_frame(&code, &[box_f64(2.0), undefined]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, u64::from(2 * STRIDE + 3));
+        let (result, frame, resume_pc) = execute_with_frame(&code, &[box_f64(2.0), undefined]);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 2);
         assert_eq!(frame[0], box_f64(2.0));
         assert_eq!(frame[1], undefined);
         assert_eq!(frame[2], box_f64(3.5));
@@ -2160,11 +2232,11 @@ mod tests {
         let code = compile(&view, 7).expect("if/else is eligible");
 
         let taken = execute(&code, &[box_i32(3), box_i32(8)]);
-        assert_eq!(taken.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(taken.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(taken.value), 11);
 
         let fallthrough = execute(&code, &[box_i32(9), box_i32(4)]);
-        assert_eq!(fallthrough.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(fallthrough.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(fallthrough.value), 22);
     }
 
@@ -2236,11 +2308,11 @@ mod tests {
         let code = compile(&view, 8).expect("max diamond is eligible");
 
         let left = execute(&code, &[box_i32(19), box_i32(7)]);
-        assert_eq!(left.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(left.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(left.value), 19);
 
         let right = execute(&code, &[box_i32(-4), box_i32(12)]);
-        assert_eq!(right.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(right.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(right.value), 12);
     }
 
@@ -2337,9 +2409,10 @@ mod tests {
             ],
         );
         let code = compile(&view, 10).expect("branch-local overflow is eligible");
-        let (result, frame) = execute_with_frame(&code, &[box_i32(1)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, u64::from(4 * STRIDE + 3));
+        let (result, frame, resume_pc) = execute_with_frame(&code, &[box_i32(1)]);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 4);
         assert_eq!(frame[0], box_i32(1));
         assert_eq!(frame[1], box_i32(0));
         assert_eq!(frame[2], VALUE_TRUE);
@@ -2413,7 +2486,7 @@ mod tests {
         assert!(code.metadata().linear_scan_spill_slot_count > 0);
         assert!(code.metadata().spill_slot_count > 0);
         let result = execute(&code, &[box_i32(10), box_i32(20), box_i32(30), box_i32(40)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(result.value), 110);
     }
 
@@ -2454,12 +2527,12 @@ mod tests {
         assert!(code.metadata().linear_scan_spill_slot_count > 0);
         assert!(code.metadata().spill_slot_count > 0);
         let result = execute(&code, &[]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(40.5));
     }
 
     #[test]
-    fn parameter_guard_deopts_at_first_use_byte_pc() {
+    fn parameter_guard_bails_at_first_use_logical_pc() {
         let view = view(
             2,
             3,
@@ -2476,9 +2549,10 @@ mod tests {
             ],
         );
         let code = compile(&view, 4).expect("guarded add is eligible");
-        let (result, frame) = execute_with_frame(&code, &[0, box_i32(9)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, 3);
+        let (result, frame, resume_pc) = execute_with_frame(&code, &[0, box_i32(9)]);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 0);
         assert_eq!(
             frame,
             vec![0, box_i32(9), otter_vm::Value::undefined().to_bits()]
@@ -2486,7 +2560,7 @@ mod tests {
     }
 
     #[test]
-    fn int32_overflow_deopts_at_arithmetic_byte_pc() {
+    fn int32_overflow_bails_at_arithmetic_logical_pc() {
         let view = view(
             2,
             3,
@@ -2503,9 +2577,11 @@ mod tests {
             ],
         );
         let code = compile(&view, 5).expect("overflow-checked add is eligible");
-        let (result, frame) = execute_with_frame(&code, &[box_i32(i32::MAX), box_i32(1)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, 3);
+        let (result, frame, resume_pc) =
+            execute_with_frame(&code, &[box_i32(i32::MAX), box_i32(1)]);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 0);
         assert_eq!(
             frame,
             vec![
@@ -2544,9 +2620,10 @@ mod tests {
         );
         let code = compile(&view, 6).expect("later guard leaf is eligible");
         let undefined = otter_vm::Value::undefined().to_bits();
-        let (result, frame) = execute_with_frame(&code, &[box_i32(5), undefined]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, 19);
+        let (result, frame, resume_pc) = execute_with_frame(&code, &[box_i32(5), undefined]);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 2);
         assert_eq!(
             frame,
             vec![box_i32(5), undefined, box_i32(7), box_i32(12), undefined]
@@ -2600,7 +2677,7 @@ mod tests {
         let code = compile(&view, 12).expect("summation loop is eligible");
         for (n, expected) in [(0, 0), (1, 0), (5, 10), (10, 45), (100, 4_950)] {
             let result = execute(&code, &[box_i32(n)]);
-            assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+            assert_eq!(result.status, STATUS_RETURNED);
             assert_eq!(unbox_i32(result.value), expected, "n={n}");
         }
     }
@@ -2650,9 +2727,10 @@ mod tests {
             ],
         );
         let code = compile(&view, 13).expect("overflowing loop is eligible");
-        let (result, frame) = execute_with_frame(&code, &[box_i32(5)]);
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, u64::from(5 * STRIDE + 3));
+        let (result, frame, resume_pc) = execute_with_frame(&code, &[box_i32(5)]);
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 5);
         assert_eq!(frame[0], box_i32(5));
         assert_eq!(frame[1], box_i32(2));
         assert_eq!(frame[2], box_i32(i32::MAX));
@@ -2718,7 +2796,7 @@ mod tests {
         let code = compile(&view, 14).expect("nested loops are eligible");
         for n in [0, 1, 5, 20] {
             let result = execute(&code, &[box_i32(n)]);
-            assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
+            assert_eq!(result.status, STATUS_RETURNED);
             assert_eq!(unbox_i32(result.value), n, "n={n}");
         }
     }
@@ -2750,12 +2828,13 @@ mod tests {
             setter.store(true, Ordering::Release);
         });
         let mut fuel = i64::MAX as u64;
-        let (result, frame) =
+        let (result, frame, resume_pc) =
             execute_with_poll_cells(&code, &[], Arc::as_ptr(&interrupt).cast::<u8>(), &mut fuel);
         interrupter.join().expect("interrupt setter");
 
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, u64::from(2 * STRIDE + 3));
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 2);
         assert_eq!(frame, vec![box_i32(0), box_i32(0)]);
     }
 
@@ -2765,15 +2844,16 @@ mod tests {
         let code = compile(&view, 16).expect("summation loop is eligible");
         let interrupt = 0_u8;
         let mut fuel = 1_u64;
-        let (result, frame) = execute_with_poll_cells(
+        let (result, frame, resume_pc) = execute_with_poll_cells(
             &code,
             &[box_i32(5)],
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
 
-        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
-        assert_eq!(result.value, u64::from(3 * STRIDE + 3));
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 3);
         assert_eq!(fuel, 0);
         assert_eq!(frame[1], box_i32(1));
         assert_eq!(frame[2], box_i32(0));

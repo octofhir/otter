@@ -18,10 +18,10 @@
 //! Every VM-side compiled entry selection applies both native-layout metadata
 //! compatibility and exact isolate-epoch dependency consistency. Safepoint
 //! resolution for already-active Invalid code remains independent.
-//! Optimized leaves run only over fresh ordinary frames; every deopt resumes
-//! the interpreter on the generated exit's fully reconstructed register file.
-//! Their call-scoped VM thread record points at the isolate's real interrupt
-//! byte and shared back-edge fuel counter for the entire native entry.
+//! Optimized entries run only over fresh ordinary frames; every bail resumes
+//! the interpreter on the generated exit's fully reconstructed register
+//! window. They use the same fully wired runtime activation, published native
+//! frame, and call-scoped VM thread as baseline entries.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -68,38 +68,34 @@ impl Interpreter {
         context: &ExecutionContext,
     ) -> Result<Option<Option<Value>>, VmError> {
         let top_idx = stack.len() - 1;
-        if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
-            match outcome {
-                jit::JitOptimizedExecOutcome::Returned(value) => {
-                    let popped = self.return_running_finally(stack, value)?;
-                    return Ok(Some(popped));
-                }
-                jit::JitOptimizedExecOutcome::Deopt(byte_pc) => {
-                    let fid = stack[top_idx].function_id;
-                    let pc = context
-                        .exec_function(fid)
-                        .and_then(|function| function.instruction_index_for_byte_pc(byte_pc))
-                        .ok_or(VmError::InvalidOperand)?;
-                    stack[top_idx].pc = pc;
+        let (outcome, optimized) =
+            if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
+                (outcome, true)
+            } else {
+                let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
                     return Ok(None);
-                }
-            }
-        }
-        let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
-            return Ok(None);
-        };
-        match self.run_compiled_frame(stack, context, top_idx, &code) {
+                };
+                (
+                    self.run_compiled_frame(stack, context, top_idx, &code),
+                    false,
+                )
+            };
+        match outcome {
             jit::JitExecOutcome::Bailed(pc) => {
-                let fid = stack[top_idx].function_id;
-                Self::trace_jit_bail(context, fid, "entry", None, pc);
                 stack[top_idx].pc = pc;
-                if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
-                    self.note_jit_entry_bail(fid);
+                if !optimized {
+                    let fid = stack[top_idx].function_id;
+                    Self::trace_jit_bail(context, fid, "entry", None, pc);
+                    if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                        self.note_jit_entry_bail(fid);
+                    }
                 }
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => {
-                self.note_jit_entry_success(stack[top_idx].function_id);
+                if !optimized {
+                    self.note_jit_entry_success(stack[top_idx].function_id);
+                }
                 let popped = self.return_running_finally(stack, value)?;
                 Ok(Some(popped))
             }
@@ -427,35 +423,34 @@ impl Interpreter {
             return Ok(None);
         }
         let top_idx = stack.len() - 1;
-        if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
-            return match outcome {
-                jit::JitOptimizedExecOutcome::Returned(value) => Ok(Some(value)),
-                jit::JitOptimizedExecOutcome::Deopt(byte_pc) => {
-                    let fid = stack[top_idx].function_id;
-                    let pc = context
-                        .exec_function(fid)
-                        .and_then(|function| function.instruction_index_for_byte_pc(byte_pc))
-                        .ok_or(VmError::InvalidOperand)?;
-                    stack[top_idx].pc = pc;
-                    Ok(None)
-                }
+        let (outcome, optimized) =
+            if let Some(outcome) = self.run_optimized_frame(stack, context, top_idx) {
+                (outcome, true)
+            } else {
+                let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
+                    return Ok(None);
+                };
+                (
+                    self.run_compiled_frame(stack, context, top_idx, &code),
+                    false,
+                )
             };
-        }
-        let Some(code) = self.resolve_jit_code(stack, context, top_idx) else {
-            return Ok(None);
-        };
-        match self.run_compiled_frame(stack, context, top_idx, &code) {
+        match outcome {
             jit::JitExecOutcome::Bailed(pc) => {
-                let fid = stack[top_idx].function_id;
-                Self::trace_jit_bail(context, fid, "sync-entry", None, pc);
                 stack[top_idx].pc = pc;
-                if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
-                    self.note_jit_entry_bail(fid);
+                if !optimized {
+                    let fid = stack[top_idx].function_id;
+                    Self::trace_jit_bail(context, fid, "sync-entry", None, pc);
+                    if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
+                        self.note_jit_entry_bail(fid);
+                    }
                 }
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => {
-                self.note_jit_entry_success(stack[top_idx].function_id);
+                if !optimized {
+                    self.note_jit_entry_success(stack[top_idx].function_id);
+                }
                 Ok(Some(value))
             }
             jit::JitExecOutcome::Threw(err) => Err(err),
@@ -481,15 +476,14 @@ impl Interpreter {
         self.resolve_jit_code_for_fid(context, frame.function_id)
     }
 
-    /// Resolve and enter an installed optimized leaf over a fresh interpreter
-    /// frame. The parameter copy keeps the immutable argument ABI disjoint from
-    /// deopt writeback into the mutable register file.
+    /// Resolve and enter installed optimized code over a fresh interpreter
+    /// frame through the same runtime activation used by baseline code.
     pub(crate) fn run_optimized_frame(
         &mut self,
         stack: &mut HoltStack,
         context: &ExecutionContext,
         top_idx: usize,
-    ) -> Option<jit::JitOptimizedExecOutcome> {
+    ) -> Option<jit::JitExecOutcome> {
         let frame = stack.get(top_idx)?;
         if frame.pc != 0 || frame.async_state.is_some() || frame.generator_owner.is_some() {
             return None;
@@ -501,21 +495,11 @@ impl Interpreter {
         if param_count > stack[top_idx].registers.len() {
             return None;
         }
-        let params: smallvec::SmallVec<[u64; 8]> = stack[top_idx].registers[..param_count]
-            .iter()
-            .map(|value| value.to_bits())
-            .collect();
-        let mut thread = crate::native_abi::VmThread::empty();
-        thread.interrupt_cell = self.jit_interrupt_flag_ptr() as u64;
-        thread.backedge_fuel_cell = self.jit_backedge_fuel_ptr() as u64;
         self.jit_runtime_stats.optimized_entries =
             self.jit_runtime_stats.optimized_entries.saturating_add(1);
-        let outcome = code.run_optimized_entry(
-            &params,
-            &mut stack[top_idx].registers,
-            std::ptr::addr_of_mut!(thread),
-        )?;
-        if matches!(outcome, jit::JitOptimizedExecOutcome::Deopt(_)) {
+        let activation = VmRuntimeActivation::new(self, stack, context, top_idx);
+        let outcome = code.run_optimized_entry(activation)?;
+        if matches!(outcome, jit::JitExecOutcome::Bailed(_)) {
             self.jit_runtime_stats.optimized_deopts =
                 self.jit_runtime_stats.optimized_deopts.saturating_add(1);
         }

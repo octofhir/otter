@@ -363,15 +363,6 @@ impl CodeBlock {
         self.byte_pcs.get(index).copied()
     }
 
-    /// Resolve one exact serialized byte PC to its dense interpreter index.
-    #[must_use]
-    pub(crate) fn instruction_index_for_byte_pc(&self, byte_pc: u32) -> Option<u32> {
-        self.byte_pcs
-            .binary_search(&byte_pc)
-            .ok()
-            .and_then(|index| u32::try_from(index).ok())
-    }
-
     /// Operands in schema declaration order.
     #[cfg(test)]
     #[must_use]

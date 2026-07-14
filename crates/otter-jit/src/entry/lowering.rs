@@ -802,6 +802,21 @@ impl BaselinePlan {
                         extra: u32::from(reg(operands, 2)?),
                     })
                 }
+                Op::BindThisValue => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 0)?,
+                    name: 0,
+                    extra: 0,
+                }),
+                Op::ClassCheck => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 1)?,
+                    name: imm32(operands, 0)? as u32,
+                    extra: 0,
+                }),
+                Op::SetFunctionName => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 0)?,
+                    name: const_index(operands, 2)?,
+                    extra: u32::from(reg(operands, 1)?),
+                }),
                 Op::StoreProperty => LoweredOperands::PropertyStore(PropertyStoreOperands {
                     object: reg(operands, 0)?,
                     name: const_index(operands, 1)?,

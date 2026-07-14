@@ -395,6 +395,14 @@ pub(crate) enum TemplateOp {
     /// `CopyDataProperties`) through the shared reentrant structural transition.
     /// `arg0`/`arg1` name the destination/target and source registers.
     StructuralOp { opcode: u8, arg0: u64, arg1: u64 },
+    /// Complete one class-construction opcode (`BindThisValue`, `ClassCheck`,
+    /// `SetFunctionName`) through the shared reentrant class transition.
+    ClassOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -1014,6 +1022,15 @@ impl TemplatePlan {
                         opcode: lowered.op as u8,
                         arg0: u64::from(operands.dst),
                         arg1: u64::from(operands.src),
+                    }
+                }
+                Op::BindThisValue | Op::ClassCheck | Op::SetFunctionName => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::ClassOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.value),
+                        arg1: u64::from(operands.name),
+                        arg2: u64::from(operands.extra),
                     }
                 }
                 Op::Nop => TemplateOp::NoOp,

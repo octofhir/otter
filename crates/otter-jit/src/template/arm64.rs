@@ -31,6 +31,7 @@
 
 mod arith;
 mod calls;
+mod class_ops;
 mod collections;
 mod construct;
 mod delete;
@@ -790,6 +791,23 @@ pub(super) fn compile(
                     opcode,
                     arg0,
                     arg1,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ClassOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                class_ops::emit_class_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
                     bail,
                     threw,
                 );

@@ -11,6 +11,8 @@
 //! # Invariants
 //! - One thread, one [`Interpreter`]. `Send`/`Sync` are not
 //!   implemented.
+//! - Protector and shape epochs are isolate-local monotonic counters; they are
+//!   plain non-GC state and never enter the root graph.
 //! - The dispatch loop polls [`InterruptFlag`] before every
 //!   instruction in the harness slice (back-edges arrive in slice
 //!   `12`).
@@ -757,6 +759,9 @@ pub struct Interpreter {
     /// before creating an own element. Stays `false` for the
     /// overwhelmingly common unpolluted heap, keeping appends cheap.
     array_index_accessor_protector: bool,
+    /// Monotonic version of `array_index_accessor_protector`. Advances exactly
+    /// once, on the latch's sole `false -> true` transition.
+    array_index_accessor_protector_epoch: u64,
     interrupt: InterruptFlag,
     /// Countdown of remaining compiled back-edges before the next cooperative
     /// budget checkpoint. Compiled code decrements this inline at every
@@ -790,6 +795,9 @@ pub struct Interpreter {
     /// Runtime object storage uses the root, interned shape keys, and
     /// transition/cache tables here.
     shape_runtime: object::ShapeRuntime,
+    /// Monotonic epoch for successful ordinary-object prototype changes made
+    /// through the proxy-aware `[[SetPrototypeOf]]` funnel.
+    shape_epoch: u64,
     /// Per-function cache for conservative base-class constructor initializers
     /// recognized by `constructor_fast_path`. Entries hold owned strings and
     /// source descriptors only; GC shape handles stay in `shape_runtime`.

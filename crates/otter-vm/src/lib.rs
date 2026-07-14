@@ -204,6 +204,7 @@ use arithmetic_dispatch::{
 pub(crate) use error_ops::{
     native_to_vm_error, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
 };
+pub use executable::code_block_cfg::{CodeBlockControlFlowView, CodeBlockExceptionRegion};
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
 use operand_decode::{apply_branch, const_operand, register_operand};
 

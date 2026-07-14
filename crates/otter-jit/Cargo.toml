@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "Baseline JIT for the Otter VM: Sparkplug-style template macro-assembler (bytecode → machine code) with no IR, no deopt, and reused interpreter-frame rooting."
+description = "Native JIT tiers for the Otter VM with direct baseline lowering and backend-independent optimizing analyses."
 
 # `unsafe_code` ban lifted for this crate (mirrors otter-gc): a JIT must mmap
 # W^X executable memory and transmute emitted bytes to function pointers. All
@@ -21,6 +21,7 @@ all = { level = "deny", priority = -1 }
 otter-bytecode = { workspace = true }
 otter-vm = { workspace = true }
 rustc-hash = { workspace = true }
+smallvec = { workspace = true }
 # Template macro-assembler chosen by the §3.2 prototype gate (M1/M2 confirmed
 # toolchain + latency + codegen on arm64). x86_64 emitter follows arm64.
 dynasm = "5"

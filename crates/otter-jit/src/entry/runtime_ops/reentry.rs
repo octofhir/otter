@@ -3,6 +3,7 @@
 //! # Contents
 //! - Native activation publication and release.
 //! - Direct-call preparation, completion, and bailout recovery.
+//! - Propagated-throw resumption in live compiled callers.
 //! - Reentrant equality, numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
@@ -27,6 +28,27 @@ pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     unsafe {
         *ctx.error = Some(err);
     }
+}
+
+/// Try to deliver an uncaught compiled-callee throw to the current compiled
+/// caller. On success, publish the catch/finally PC so status `2` from a call
+/// bridge becomes a committed bailout rather than a replay of the call site.
+fn try_resume_caller_throw(ctx: &mut JitCtx, is_uncaught: bool) -> Result<bool, VmError> {
+    if !is_uncaught {
+        return Ok(false);
+    }
+    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let Some(pc) = vm.jit_resume_caller_throw(context, stack, ctx.frame_index)? else {
+        return Ok(false);
+    };
+    // SAFETY: runtime-capable JIT contexts always publish the current native
+    // frame for the full compiled entry dynamic extent.
+    let native_frame = unsafe { ctx.native_frame.as_mut() }.ok_or(VmError::InvalidOperand)?;
+    native_frame.header.pc = pc;
+    Ok(true)
 }
 
 /// Complete one structured-exception opcode. Unlike ordinary status-word
@@ -752,10 +774,17 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
     ) {
         Ok(true) => 0,
         Ok(false) => 2,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
+        Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
+            Ok(true) => 2,
+            Ok(false) => {
+                park_jit_error(ctx, err);
+                1
+            }
+            Err(unwind_err) => {
+                park_jit_error(ctx, unwind_err);
+                1
+            }
+        },
     }
 }
 
@@ -788,10 +817,17 @@ pub(crate) extern "C" fn jit_call_generic_stub(
     ) {
         Ok(true) => 0,
         Ok(false) => 2,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
+        Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
+            Ok(true) => 2,
+            Ok(false) => {
+                park_jit_error(ctx, err);
+                1
+            }
+            Err(unwind_err) => {
+                park_jit_error(ctx, unwind_err);
+                1
+            }
+        },
     }
 }
 
@@ -824,10 +860,17 @@ pub(crate) extern "C" fn jit_construct_stub(
     ) {
         Ok(true) => 0,
         Ok(false) => 2,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            1
-        }
+        Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
+            Ok(true) => 2,
+            Ok(false) => {
+                park_jit_error(ctx, err);
+                1
+            }
+            Err(unwind_err) => {
+                park_jit_error(ctx, unwind_err);
+                1
+            }
+        },
     }
 }
 
@@ -992,10 +1035,28 @@ pub(crate) extern "C" fn jit_abort_direct_call_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    // SAFETY: direct callees share the caller's initialized error slot.
+    let can_resume = unsafe { &*ctx.error }
+        .as_ref()
+        .is_some_and(|err| matches!(err, VmError::Uncaught));
+    let resume = try_resume_caller_throw(ctx, can_resume);
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     vm.jit_abort_direct_call(stack, callee_frame_index as usize);
-    0
+    match resume {
+        Ok(true) => {
+            // SAFETY: this throw was absorbed by the caller handler.
+            unsafe {
+                *ctx.error = None;
+            }
+            2
+        }
+        Ok(false) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
 }
 
 /// Bridge stub for a *frameless* self-recursive callee that bailed: rebuild an

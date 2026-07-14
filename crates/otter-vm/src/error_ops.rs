@@ -62,8 +62,11 @@ impl Interpreter {
         kind_idx: u32,
         msg_reg: u16,
     ) -> Result<(), VmError> {
+        // Resolve the kind constant against the frame's own function so a
+        // reentrant compiled cross-chunk entry decodes it against the owning
+        // chunk, not the caller's constant pool.
         let kind_name = context
-            .string_constant_str(kind_idx)
+            .string_constant_str_for_function(stack[top_idx].function_id, kind_idx)
             .ok_or(VmError::InvalidOperand)?;
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];

@@ -123,6 +123,14 @@ pub(crate) struct IncrementOperands {
     pub(crate) delta: i32,
 }
 
+/// Typed direct-eval operands including compiler-emitted context flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvalOperands {
+    pub(crate) dst: u16,
+    pub(crate) src: u16,
+    pub(crate) flags: i32,
+}
+
 /// Typed named-property load operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PropertyLoadOperands {
@@ -254,6 +262,17 @@ pub(crate) struct QuadOperands {
     pub(crate) fourth: u16,
 }
 
+/// Typed class-construction operand set (`dst`, ctor, prototype, statics,
+/// parent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MakeClassOperands {
+    pub(crate) dst: u16,
+    pub(crate) ctor: u16,
+    pub(crate) prototype: u16,
+    pub(crate) statics: u16,
+    pub(crate) parent: u16,
+}
+
 /// Canonical control-flow target resolved to a verified logical PC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BranchOperands {
@@ -304,6 +323,7 @@ enum LoweredOperands {
     ElementLoad(ElementLoadOperands),
     ElementStore(ElementStoreOperands),
     Increment(IncrementOperands),
+    Eval(EvalOperands),
     PropertyLoad(PropertyLoadOperands),
     PropertyStore(PropertyStoreOperands),
     Upvalue(UpvalueOperands),
@@ -319,6 +339,7 @@ enum LoweredOperands {
     Immediate(ImmediateOperands),
     Triple(TripleOperands),
     Quad(QuadOperands),
+    MakeClass(MakeClassOperands),
     Branch(BranchOperands),
     ConditionalBranch(ConditionalBranchOperands),
     ShadowedUpvalue(ShadowedUpvalueOperands),
@@ -410,6 +431,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Increment(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered increment operands")),
+        }
+    }
+
+    pub(crate) fn eval_operands(self) -> Result<EvalOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::Eval(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered Eval operands")),
         }
     }
 
@@ -517,6 +545,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::Quad(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered quad operands")),
+        }
+    }
+
+    pub(crate) fn make_class_operands(self) -> Result<MakeClassOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::MakeClass(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered MakeClass operands")),
         }
     }
 
@@ -666,7 +701,9 @@ impl BaselinePlan {
                 | Op::MathLoad
                 | Op::SymbolLoad
                 | Op::TemporalLoad
-                | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
+                | Op::LoadBuiltinError
+                | Op::GetTemplateObject
+                | Op::NewPrivateName => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,
                 }),
@@ -695,6 +732,7 @@ impl BaselinePlan {
                     hint: const_index(operands, 2)?,
                 }),
                 Op::ToNumeric
+                | Op::ToNumber
                 | Op::Neg
                 | Op::BitwiseNot
                 | Op::ToBoolean
@@ -720,10 +758,19 @@ impl BaselinePlan {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
+                Op::IsEvalIntrinsic => LoweredOperands::Unary(UnaryOperands {
+                    dst: reg(operands, 0)?,
+                    src: reg(operands, 1)?,
+                }),
                 Op::Increment => LoweredOperands::Increment(IncrementOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                     delta: imm32(operands, 2)?,
+                }),
+                Op::Eval => LoweredOperands::Eval(EvalOperands {
+                    dst: reg(operands, 0)?,
+                    src: reg(operands, 1)?,
+                    flags: imm32(operands, 2)?,
                 }),
                 Op::LoadElement => LoweredOperands::ElementLoad(ElementLoadOperands {
                     dst: reg(operands, 0)?,
@@ -807,6 +854,7 @@ impl BaselinePlan {
                 | Op::ArrayConstruct
                 | Op::ArrayFrom
                 | Op::ArrayOf
+                | Op::NewFunction
                 | Op::QueueMicrotask => {
                     let count = const_index(operands, 1)? as usize;
                     let elements = append_register_tail(
@@ -910,6 +958,13 @@ impl BaselinePlan {
                     second: reg(operands, 1)?,
                     third: reg(operands, 2)?,
                     fourth: reg(operands, 3)?,
+                }),
+                Op::MakeClass => LoweredOperands::MakeClass(MakeClassOperands {
+                    dst: reg(operands, 0)?,
+                    ctor: reg(operands, 1)?,
+                    prototype: reg(operands, 2)?,
+                    statics: reg(operands, 3)?,
+                    parent: reg(operands, 4)?,
                 }),
                 Op::LoadProperty | Op::DeleteProperty | Op::LoadSuperProperty => {
                     LoweredOperands::PropertyLoad(PropertyLoadOperands {

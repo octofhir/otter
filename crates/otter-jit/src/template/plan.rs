@@ -453,6 +453,15 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete class creation, dynamic evaluation/function construction,
+    /// template/private-name materialization, eval identity, and `ToNumber`
+    /// through the shared VM transition.
+    ClassValueOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -1199,6 +1208,63 @@ impl TemplatePlan {
                         arg0: u64::from(operands.value),
                         arg1: u64::from(operands.name),
                         arg2: u64::from(operands.extra),
+                    }
+                }
+                Op::MakeClass => {
+                    let operands = lowered.make_class_operands()?;
+                    TemplateOp::ClassValueOp {
+                        opcode: Op::MakeClass as u8,
+                        arg0: u64::from(operands.dst)
+                            | (u64::from(operands.ctor) << 16)
+                            | (u64::from(operands.prototype) << 32)
+                            | (u64::from(operands.statics) << 48),
+                        arg1: u64::from(operands.parent),
+                        arg2: 0,
+                    }
+                }
+                Op::NewFunction => {
+                    let operands = lowered.new_array_operands()?;
+                    let arguments = lowering.register_tail(operands.elements)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        osr_only = true;
+                        instructions.push(TemplateInstr {
+                            pc,
+                            op: TemplateOp::UnsupportedBail,
+                        });
+                        continue;
+                    }
+                    TemplateOp::ClassValueOp {
+                        opcode: Op::NewFunction as u8,
+                        arg0: u64::from(operands.dst) | ((arguments.len() as u64) << 16),
+                        arg1: pack_method_arg_regs(arguments),
+                        arg2: 0,
+                    }
+                }
+                Op::GetTemplateObject | Op::NewPrivateName => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::ClassValueOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.constant),
+                        arg2: 0,
+                    }
+                }
+                Op::Eval => {
+                    let operands = lowered.eval_operands()?;
+                    TemplateOp::ClassValueOp {
+                        opcode: Op::Eval as u8,
+                        arg0: u64::from(operands.dst) | (u64::from(operands.src) << 16),
+                        arg1: operands.flags as u32 as u64,
+                        arg2: 0,
+                    }
+                }
+                Op::IsEvalIntrinsic | Op::ToNumber => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ClassValueOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst) | (u64::from(operands.src) << 16),
+                        arg1: 0,
+                        arg2: 0,
                     }
                 }
                 Op::Nop => TemplateOp::NoOp,

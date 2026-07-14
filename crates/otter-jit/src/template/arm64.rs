@@ -32,6 +32,7 @@
 mod arith;
 mod calls;
 mod class_ops;
+mod class_value;
 mod collections;
 mod construct;
 mod control;
@@ -909,7 +910,31 @@ pub(super) fn compile(
                 arg2,
             } => {
                 spread_call::emit_spread_call_op(
-                    &mut ops, transitions, opcode, arg0, arg1, arg2, bail, threw,
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ClassValueOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                class_value::emit_class_value_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
                 );
             }
             TemplateOp::NoOp => {}

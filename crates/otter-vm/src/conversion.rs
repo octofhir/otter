@@ -5,13 +5,14 @@
 //! arithmetic helpers.
 //!
 //! # Contents
-//! - Primitive `ToNumber` for opcode and builtin tails.
+//! - Full `ToNumber` register completion plus primitive coercion tails.
 //! - Primitive `ToString` helpers for string concatenation and `String(...)`.
 //! - `ToPrimitive` / `[Symbol.toPrimitive]` dispatch helpers.
 //! - Register entrypoints used by dense VM dispatch.
 //!
 //! # Invariants
-//! - Object `ToPrimitive` dispatch is driven here before primitive tails.
+//! - Opcode `ToNumber` uses the same synchronous `ToPrimitive(number)` ladder
+//!   as builtin coercion before committing its destination register.
 //! - `ToString(Symbol)` is an error, while bare `String(symbol)` returns the
 //!   symbol descriptive form per §22.1.1.1.
 //!
@@ -24,34 +25,11 @@ use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, PendingToPrimitive,
-    ToPrimitiveStage, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops, number, object,
-    object_prototype_intercept,
+    ExecutionContext, Interpreter, JsObject, JsString, PendingToPrimitive, ToPrimitiveStage, Value,
+    VmError, VmGetOutcome, VmPropertyKey, abstract_ops, number, object, object_prototype_intercept,
     operand_decode::{const_operand, register_operand},
     ordinary_method_for, read_register, symbol, write_register,
 };
-
-pub(crate) fn to_number_primitive(
-    value: &Value,
-    gc_heap: &otter_gc::GcHeap,
-) -> Result<NumberValue, VmError> {
-    if let Some(n) = value.as_number() {
-        return Ok(n);
-    }
-    if let Some(b) = value.as_boolean() {
-        return Ok(NumberValue::Smi(if b { 1 } else { 0 }));
-    }
-    if value.is_null() {
-        return Ok(NumberValue::Smi(0));
-    }
-    if value.is_big_int() || value.is_symbol() {
-        return Err(VmError::TypeMismatch);
-    }
-    if let Some(s) = value.as_string(gc_heap) {
-        return Ok(number::to_number_from_string(&s.to_lossy_string(gc_heap)));
-    }
-    Ok(NumberValue::Double(f64::NAN))
-}
 
 pub(crate) fn to_string_primitive(
     value: &Value,
@@ -133,62 +111,19 @@ pub(crate) fn string_constructor_js_string(
 
 impl Interpreter {
     pub(crate) fn run_to_number_regs(
-        &self,
-        frame: &mut Frame,
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        frame_index: usize,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let value = to_number_primitive(read_register(frame, src)?, &self.gc_heap)?;
+        let input = *read_register(&stack[frame_index], src)?;
+        let value = self.coerce_to_number(context, &input)?;
+        let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::number(value))?;
         frame.advance_pc()?;
         Ok(())
-    }
-
-    /// Pre-dispatch hook for [`Op::ToNumber`] that consults
-    /// `[Symbol.toPrimitive]` on object operands.
-    ///
-    /// # Algorithm
-    /// 1. If the source register holds a [`Value::Object`] whose
-    ///    `[Symbol.toPrimitive]` symbol-keyed property is callable,
-    ///    advance pc past the `ToNumber` instruction and invoke
-    ///    the hook with `this = obj` and `args = ["number"]`.
-    /// 2. The hook's return value lands in the `ToNumber`'s
-    ///    destination register on frame pop. The foundation does
-    ///    not re-coerce; tests targeting this slice return a
-    ///    Number directly.
-    /// 3. Return `Ok(Some(()))` when the hook fired (caller
-    ///    `continue`s the dispatch loop), `Ok(None)` otherwise so
-    ///    the in-frame fast path runs.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-toprimitive>
-    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
-    pub(crate) fn try_to_primitive_dispatch(
-        &mut self,
-        stack: &mut HoltStack,
-        context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<Option<()>, VmError> {
-        let dst = register_operand(operands.first())?;
-        let src = register_operand(operands.get(1))?;
-        let top_idx = stack.len() - 1;
-        let recv = *read_register(&stack[top_idx], src)?;
-        let Some(obj) = recv.as_object() else {
-            return Ok(None);
-        };
-        let to_primitive_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, to_primitive_sym) else {
-            return Ok(None);
-        };
-        if !self.is_callable_runtime(&callee) {
-            return Ok(None);
-        }
-        let hint = JsString::from_str("number", self.gc_heap_mut())?;
-        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-        args.push(Value::string(hint));
-        stack[top_idx].advance_pc()?;
-        self.invoke(stack, context, &callee, recv, args, dst)?;
-        Ok(Some(()))
     }
 
     /// Drive one tick of the [`Op::ToPrimitive`] ladder.

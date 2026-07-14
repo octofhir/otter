@@ -199,6 +199,34 @@ impl ExecutionContext {
         self.module.template_sites.get(idx as usize)
     }
 
+    /// Resolve a tagged-template site in the chunk that owns `function_id`.
+    ///
+    /// Compiled frames may re-enter through an ambient sibling context, while
+    /// template-site indices remain local to the frame's owning chunk.
+    #[must_use]
+    pub(crate) fn template_site_for_function(
+        &self,
+        function_id: u32,
+        idx: u32,
+    ) -> Option<&otter_bytecode::TemplateSite> {
+        if self.local_function_index(function_id).is_some() {
+            return self.module.template_sites.get(idx as usize);
+        }
+        self.sibling_tables(function_id)?
+            .module
+            .template_sites
+            .get(idx as usize)
+    }
+
+    /// Return the stable linked-chunk base that owns `function_id`.
+    #[must_use]
+    pub(crate) fn function_base_for_function(&self, function_id: u32) -> Option<u32> {
+        if self.local_function_index(function_id).is_some() {
+            return Some(self.function_base);
+        }
+        Some(self.sibling_tables(function_id)?.function_base)
+    }
+
     /// Module initialization records for linked module graphs.
     #[must_use]
     pub fn module_inits(&self) -> &[ModuleInit] {

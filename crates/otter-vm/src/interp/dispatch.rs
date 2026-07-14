@@ -471,24 +471,16 @@ impl Interpreter {
                     owner.park_frame(&mut self.gc_heap, popped, detached_cold);
                     return Ok(Value::undefined());
                 }
-                // ToNumber on an object whose `[Symbol.toPrimitive]`
-                // is callable must invoke that hook (ECMA-262
-                // §7.1.1 OrdinaryToPrimitive). The synchronous path
-                // pushes a frame, so the dispatch happens here —
-                // outside the in-frame mutable borrow below.
+                // §7.1.4 ToNumber — the shared synchronous helper owns the
+                // full ToPrimitive(number) ladder before committing `dst`.
                 Op::ToNumber => {
-                    let operands = function.operand_view(instr);
-                    if let Some(()) = self.try_to_primitive_dispatch(stack, context, operands)? {
-                        continue;
-                    }
                     let dst = function
                         .register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let src = function
                         .register(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_to_number_regs(frame, dst, src)?;
+                    self.run_to_number_regs(context, stack, top_idx, dst, src)?;
                     continue;
                 }
                 // §7.1.1 `ToPrimitive` ladder. Each invocation of
@@ -1363,18 +1355,7 @@ impl Interpreter {
                     let site_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let key = (context.function_base(), site_idx);
-                    let value = match self.template_objects.get(&key) {
-                        Some(v) => *v,
-                        None => {
-                            let built = self.build_template_object(context, &*stack, site_idx)?;
-                            self.template_objects.insert(key, built);
-                            built
-                        }
-                    };
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, value)?;
-                    frame.advance_pc()?;
+                    self.run_get_template_object_reg(context, stack, top_idx, dst, site_idx)?;
                     continue;
                 }
                 // §9.1 — captured-binding read in a frame whose
@@ -1447,16 +1428,7 @@ impl Interpreter {
                     let desc_idx = context
                         .exec_const_index(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let desc = context
-                        .string_constant_str(desc_idx)
-                        .ok_or_else(|| VmError::InvalidOperand)?
-                        .to_string();
-                    let desc_str = JsString::from_str(&desc, &mut self.gc_heap)?;
-                    let sym =
-                        crate::symbol::JsSymbol::new_private(&mut self.gc_heap, Some(desc_str))?;
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::symbol(sym))?;
-                    frame.advance_pc()?;
+                    self.run_new_private_name_reg(context, stack, top_idx, dst, desc_idx)?;
                     continue;
                 }
                 Op::DefineGlobalFunction => {
@@ -2282,21 +2254,13 @@ impl Interpreter {
                     continue;
                 }
                 Op::IsEvalIntrinsic => {
-                    // §sec-function-calls 6.a `SameValue(func, %eval%)`:
-                    // is `val` the original global `eval` native?
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let src = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    let value = *read_register(&stack[top_idx], src)?;
-                    let is_eval = value.as_native_function().is_some_and(|n| {
-                        n.is_static_fn(&self.gc_heap, crate::intrinsics::number::global_eval)
-                    });
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::boolean(is_eval))?;
-                    frame.advance_pc()?;
+                    self.run_is_eval_intrinsic_reg(stack, top_idx, dst, src)?;
                     continue;
                 }
                 Op::MakeClosure => {

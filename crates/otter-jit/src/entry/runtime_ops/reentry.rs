@@ -51,6 +51,24 @@ fn try_resume_caller_throw(ctx: &mut JitCtx, is_uncaught: bool) -> Result<bool, 
     Ok(true)
 }
 
+/// Convert an interpreter-style catchable VM error into its JavaScript error
+/// object and publish the selected catch/finally continuation when present.
+fn try_materialize_compiled_error(ctx: &mut JitCtx, err: VmError) -> Result<bool, VmError> {
+    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let Some(pc) = vm.jit_materialize_error_from_compiled(context, stack, ctx.frame_index, err)?
+    else {
+        return Ok(false);
+    };
+    // SAFETY: runtime-capable JIT contexts publish this native frame for the
+    // full compiled entry dynamic extent.
+    let native_frame = unsafe { ctx.native_frame.as_mut() }.ok_or(VmError::InvalidOperand)?;
+    native_frame.header.pc = pc;
+    Ok(true)
+}
+
 /// Complete one structured-exception opcode, including TDZ `ReferenceError`
 /// materialization. Unlike ordinary status-word transitions this returns the
 /// full compiled-entry pair: a committed handler mutation may continue, resume
@@ -246,6 +264,55 @@ pub(crate) extern "C" fn jit_spread_call_op_stub(
                 STATUS_THREW
             }
         },
+    }
+}
+
+/// Complete one class/value-family opcode. Dynamic evaluation, function
+/// construction, and numeric coercion may synchronously throw from JavaScript;
+/// offer uncaught values to the compiled caller before parking the error.
+pub(crate) extern "C" fn jit_class_value_op_stub(
+    ctx: *mut JitCtx,
+    opcode: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return STATUS_BAILED;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_class_value_op(
+        context,
+        stack,
+        ctx.frame_index,
+        opcode as u8,
+        arg0,
+        arg1,
+        arg2,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            let materialized = if matches!(err, VmError::Uncaught) {
+                try_resume_caller_throw(ctx, true)
+            } else {
+                try_materialize_compiled_error(ctx, err)
+            };
+            match materialized {
+                Ok(true) => STATUS_BAILED,
+                Ok(false) => {
+                    park_jit_error(ctx, err);
+                    STATUS_THREW
+                }
+                Err(unwind_err) => {
+                    park_jit_error(ctx, unwind_err);
+                    STATUS_THREW
+                }
+            }
+        }
     }
 }
 

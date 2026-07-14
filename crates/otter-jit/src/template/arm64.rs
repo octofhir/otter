@@ -39,6 +39,7 @@ mod globals;
 mod iterators;
 mod properties;
 mod protocol;
+mod scalar;
 mod transitions;
 mod values;
 
@@ -682,6 +683,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 delete::emit_delete_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ScalarOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                scalar::emit_scalar_op(
                     &mut ops,
                     transitions,
                     opcode,

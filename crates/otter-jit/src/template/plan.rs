@@ -339,6 +339,17 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one scalar value-query/coercion opcode (`ToObject`,
+    /// `ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
+    /// `ArrayLength`, `LoadLength`) through the shared reentrant scalar
+    /// transition. `arg0`/`arg1`/`arg2` name the destination and source (or
+    /// left/right) registers per opcode.
+    ScalarOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -894,6 +905,38 @@ impl TemplatePlan {
                         arg0: u64::from(operands.dst),
                         arg1: u64::from(operands.constant),
                         arg2: 0,
+                    }
+                }
+                Op::ToObject
+                | Op::ToPropertyKey
+                | Op::TypeOf
+                | Op::IsArray
+                | Op::ArrayLength
+                | Op::LoadLength => {
+                    let operands = lowered.unary_operands()?;
+                    TemplateOp::ScalarOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.src),
+                        arg2: 0,
+                    }
+                }
+                Op::LoadNewTarget => {
+                    let dst = lowered.destination_operands()?.dst;
+                    TemplateOp::ScalarOp {
+                        opcode: Op::LoadNewTarget as u8,
+                        arg0: u64::from(dst),
+                        arg1: 0,
+                        arg2: 0,
+                    }
+                }
+                Op::SameValue => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::ScalarOp {
+                        opcode: Op::SameValue as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
                     }
                 }
                 Op::LessThan

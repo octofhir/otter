@@ -326,6 +326,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             abi::STUB_JIT_DELETE_OP,
             jit_delete_op_stub as *const () as usize,
         ),
+        binding(
+            abi::STUB_JIT_SCALAR_OP,
+            jit_scalar_op_stub as *const () as usize,
+        ),
     ]
 }
 

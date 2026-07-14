@@ -564,7 +564,7 @@ impl BaselinePlan {
                         dst: reg(operands, 0)?,
                     })
                 }
-                Op::NewObject | Op::LoadThis | Op::LoadGlobalThis => {
+                Op::NewObject | Op::LoadThis | Op::LoadGlobalThis | Op::LoadNewTarget => {
                     LoweredOperands::Destination(DestinationOperands {
                         dst: reg(operands, 0)?,
                     })
@@ -622,7 +622,13 @@ impl BaselinePlan {
                 | Op::GetIterator
                 | Op::GetAsyncIterator
                 | Op::GetPrototype
-                | Op::SetPrototype => LoweredOperands::Unary(UnaryOperands {
+                | Op::SetPrototype
+                | Op::ToObject
+                | Op::ToPropertyKey
+                | Op::TypeOf
+                | Op::IsArray
+                | Op::ArrayLength
+                | Op::LoadLength => LoweredOperands::Unary(UnaryOperands {
                     dst: reg(operands, 0)?,
                     src: reg(operands, 1)?,
                 }),
@@ -750,7 +756,11 @@ impl BaselinePlan {
                         third,
                     })
                 }
-                Op::IteratorNext | Op::Instanceof | Op::HasProperty | Op::DeleteElement => {
+                Op::IteratorNext
+                | Op::Instanceof
+                | Op::HasProperty
+                | Op::DeleteElement
+                | Op::SameValue => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,

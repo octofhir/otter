@@ -42,6 +42,7 @@ mod private_access;
 mod properties;
 mod protocol;
 mod scalar;
+mod structural;
 mod super_access;
 mod transitions;
 mod value_load;
@@ -778,6 +779,17 @@ pub(super) fn compile(
                     arg0,
                     arg1,
                     arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::StructuralOp { opcode, arg0, arg1 } => {
+                structural::emit_structural_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
                     bail,
                     threw,
                 );

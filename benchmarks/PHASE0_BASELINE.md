@@ -969,3 +969,18 @@ Interpreter/template parity holds for a rest-parameter/array-spread/`new Error`
 loop; the release differential corpus passed 11/11 under GC stress strides 1
 through 16, and targeted Test262 `built-ins/Error` passed 88/93. The frozen
 full Test262 reference remains 99.02%.
+
+### Phase 2 production structural-object completion
+
+`ForInKeys` and `CopyDataProperties` now compile through reentrant runtime stub
+67; each rebuilds its register operands and calls the same
+`run_for_in_keys_operands`/`run_copy_data_properties_operands` helper the
+interpreter dispatches (`CopyDataProperties` reenters any Proxy
+`ownKeys`/descriptor trap through the shared path). No structural semantics are
+duplicated in JIT code. Template coverage is 119 of 172 active opcodes (up from
+117); 53 remain unsupported. Interpreter/template parity holds for a
+`for-in`/object-spread loop; the release differential corpus passed 11/11 under
+GC stress strides 1 through 16. Targeted Test262 `language/statements/for-in`
+was 121/122 — the single failure reproduces identically under interpreter-only
+execution, so it is a tier-independent pre-existing baseline failure, not a
+regression. The frozen full Test262 reference remains 99.02%.

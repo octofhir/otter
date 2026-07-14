@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - [`cfg`] — typed bytecode basic blocks and complete control-flow edges.
+//! - [`dom`] — dominator tree and dominance-frontier analyses.
 //!
 //! # Invariants
 //! - IR construction consumes immutable VM snapshots and has no runtime effect.
@@ -12,3 +13,4 @@
 //! - [`crate::template`]
 
 pub mod cfg;
+pub mod dom;

@@ -763,7 +763,9 @@ impl BaselinePlan {
                 | Op::Instanceof
                 | Op::HasProperty
                 | Op::DeleteElement
-                | Op::SameValue => {
+                | Op::SameValue
+                | Op::LoadSuperElement
+                | Op::SetSuperElement => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,
@@ -771,13 +773,18 @@ impl BaselinePlan {
                         third,
                     })
                 }
-                Op::LoadProperty | Op::DeleteProperty => {
+                Op::LoadProperty | Op::DeleteProperty | Op::LoadSuperProperty => {
                     LoweredOperands::PropertyLoad(PropertyLoadOperands {
                         dst: reg(operands, 0)?,
                         object: reg(operands, 1)?,
                         name: const_index(operands, 2)?,
                     })
                 }
+                Op::SetSuperProperty => LoweredOperands::GlobalStore(GlobalStoreOperands {
+                    value: reg(operands, 0)?,
+                    name: const_index(operands, 1)?,
+                    extra: u32::from(reg(operands, 2)?),
+                }),
                 Op::StoreProperty => LoweredOperands::PropertyStore(PropertyStoreOperands {
                     object: reg(operands, 0)?,
                     name: const_index(operands, 1)?,

@@ -112,6 +112,42 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
     }
 }
 
+/// Complete one `super` property opcode (`LoadSuperProperty`,
+/// `LoadSuperElement`, `SetSuperProperty`, `SetSuperElement`). `0` means the VM
+/// committed the opcode and the template may fall through; `1` reports a parked
+/// throw; `2` remains an exact pre-effect side exit for an absent activation.
+pub(crate) extern "C" fn jit_super_op_stub(
+    ctx: *mut JitCtx,
+    opcode: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let Some(activation) = ctx.checked_activation() else {
+        return STATUS_BAILED;
+    };
+    let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
+    let context = unsafe { &*activation.context_ptr() };
+    match vm.jit_runtime_super_op(
+        context,
+        stack,
+        ctx.frame_index,
+        opcode as u8,
+        arg0,
+        arg1,
+        arg2,
+    ) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            STATUS_THREW
+        }
+    }
+}
+
 /// Complete one scalar value-query/coercion opcode (`ToObject`,
 /// `ToPropertyKey`, `TypeOf`, `LoadNewTarget`, `SameValue`, `IsArray`,
 /// `ArrayLength`, `LoadLength`). `0` means the VM committed the opcode and the

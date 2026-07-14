@@ -350,6 +350,17 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one `super` property access (`LoadSuperProperty`,
+    /// `LoadSuperElement`, `SetSuperProperty`, `SetSuperElement`) through the
+    /// shared reentrant super transition. Home-prototype accessor
+    /// getters/setters fire in the VM. `arg0`/`arg1`/`arg2` name the
+    /// destination/home/name-or-key (or home/name-or-key/value) operands.
+    SuperOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -869,6 +880,33 @@ impl TemplatePlan {
                         arg0: u64::from(operands.dst),
                         arg1: u64::from(operands.constant),
                         arg2: 0,
+                    }
+                }
+                Op::LoadSuperProperty => {
+                    let operands = lowered.property_load_operands()?;
+                    TemplateOp::SuperOp {
+                        opcode: Op::LoadSuperProperty as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.object),
+                        arg2: u64::from(operands.name),
+                    }
+                }
+                Op::SetSuperProperty => {
+                    let operands = lowered.global_store_operands()?;
+                    TemplateOp::SuperOp {
+                        opcode: Op::SetSuperProperty as u8,
+                        arg0: u64::from(operands.value),
+                        arg1: u64::from(operands.name),
+                        arg2: u64::from(operands.extra),
+                    }
+                }
+                Op::LoadSuperElement | Op::SetSuperElement => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::SuperOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
                     }
                 }
                 Op::Instanceof | Op::HasProperty => {

@@ -40,6 +40,7 @@ mod iterators;
 mod properties;
 mod protocol;
 mod scalar;
+mod super_access;
 mod transitions;
 mod values;
 
@@ -700,6 +701,23 @@ pub(super) fn compile(
                 arg2,
             } => {
                 scalar::emit_scalar_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::SuperOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                super_access::emit_super_op(
                     &mut ops,
                     transitions,
                     opcode,

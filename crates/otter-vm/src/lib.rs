@@ -110,6 +110,7 @@ mod jit_object_protocol_ops;
 pub mod jit_registry;
 mod jit_runtime_ops;
 mod jit_scalar_ops;
+mod jit_super_ops;
 pub mod js_surface;
 pub mod json;
 pub mod marshal;

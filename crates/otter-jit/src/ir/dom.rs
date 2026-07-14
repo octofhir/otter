@@ -6,11 +6,12 @@
 //! - [`DomError`] — precise, pure verification failures.
 //!
 //! # Invariants
-//! - Dominance includes every normal and exception control-transfer edge.
+//! - Full-edge dominance includes every normal and exception control transfer;
+//!   normal-edge dominance uses the same algorithms over normal flow only.
 //! - Block-indexed storage is dense and deterministic; frontier sets are sorted
 //!   and duplicate-free.
-//! - The entry block is `BlockId(0)` and is the only block without an exposed
-//!   immediate dominator.
+//! - Normal-edge analysis is a forest rooted at entry and exception handlers;
+//!   its conceptual virtual root is never exposed as a [`BlockId`].
 //! - Analysis construction reads immutable CFG data and has no runtime effect.
 //!
 //! # See also
@@ -23,10 +24,17 @@ use super::cfg::{Block, BlockId, ControlFlowGraph};
 /// Immediate dominators and reverse-postorder for one verified CFG.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DominatorTree {
-    /// Immediate dominator by dense block id; only entry stores `None`.
+    /// Immediate dominator by dense block id; virtual-root children store `None`.
     idom: Box<[Option<BlockId>]>,
-    /// Reverse-postorder over normal and exception successors.
+    /// Reverse-postorder over the selected edge set, excluding the virtual root.
     rpo: Box<[BlockId]>,
+    edges: EdgeSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeSelection {
+    Full,
+    Normal,
 }
 
 /// Sorted dominance-frontier sets indexed by dense block id.
@@ -104,6 +112,20 @@ pub enum DomError {
         /// Stored immediate dominator.
         actual: BlockId,
     },
+    /// A block is attached to the virtual root unexpectedly.
+    UnexpectedDominatorRoot {
+        /// Block whose expected immediate dominator is a real block.
+        block: BlockId,
+        /// Recomputed immediate dominator.
+        expected: BlockId,
+    },
+    /// A block is attached below a real block instead of the virtual root.
+    MissingDominatorRoot {
+        /// Block that should be a dominance-forest root.
+        block: BlockId,
+        /// Unexpected stored immediate dominator.
+        actual: BlockId,
+    },
     /// Frontier storage does not cover exactly the CFG blocks.
     DominanceFrontierCountMismatch {
         /// Number of CFG blocks.
@@ -146,12 +168,25 @@ impl DominatorTree {
     /// Compute immediate dominators with the Cooper-Harvey-Kennedy algorithm.
     #[must_use]
     pub fn compute(cfg: &ControlFlowGraph) -> Self {
-        let rpo = reverse_postorder(cfg);
-        let mut idom = compute_idoms(cfg, &rpo);
-        idom[cfg.entry.0 as usize] = None;
+        Self::compute_with_edges(cfg, EdgeSelection::Full)
+    }
+
+    /// Compute normal-flow dominators with the same CHK implementation.
+    ///
+    /// Entry and every exception-handler target are children of a conceptual
+    /// virtual root, so handler-only regions form independent dominance trees.
+    #[must_use]
+    pub fn compute_normal(cfg: &ControlFlowGraph) -> Self {
+        Self::compute_with_edges(cfg, EdgeSelection::Normal)
+    }
+
+    fn compute_with_edges(cfg: &ControlFlowGraph, edges: EdgeSelection) -> Self {
+        let rpo = reverse_postorder(cfg, edges);
+        let idom = compute_idoms(cfg, &rpo, edges);
         Self {
             idom: idom.into_boxed_slice(),
             rpo: rpo.into_boxed_slice(),
+            edges,
         }
     }
 
@@ -181,10 +216,14 @@ impl DominatorTree {
         a != b && self.dominates(a, b)
     }
 
-    /// Return deterministic reverse-postorder over the full edge set.
+    /// Return deterministic reverse-postorder over the selected edge set.
     #[must_use]
     pub fn reverse_postorder(&self) -> &[BlockId] {
         &self.rpo
+    }
+
+    pub(crate) fn includes_exception_edges(&self) -> bool {
+        self.edges == EdgeSelection::Full
     }
 
     /// Verify tree shape, CHK fixpoint, ordering, and predecessor soundness.
@@ -197,7 +236,7 @@ impl DominatorTree {
             });
         }
 
-        let expected_rpo = reverse_postorder(cfg);
+        let expected_rpo = reverse_postorder(cfg, self.edges);
         if self.rpo.as_ref() != expected_rpo {
             return Err(DomError::ReversePostorderMismatch {
                 expected: expected_rpo.into_boxed_slice(),
@@ -211,33 +250,31 @@ impl DominatorTree {
         }
 
         for index in 0..block_count {
-            if index == entry_index {
-                continue;
-            }
             let block = BlockId(index as u32);
-            let Some(dominator) = self.idom[index] else {
-                return Err(DomError::MissingImmediateDominator { block });
-            };
-            if dominator.0 as usize >= block_count {
-                return Err(DomError::ImmediateDominatorOutOfRange { block, dominator });
-            }
-            if dominator == block {
-                return Err(DomError::ImmediateDominatorIsSelf { block });
+            if let Some(dominator) = self.idom[index] {
+                if dominator.0 as usize >= block_count {
+                    return Err(DomError::ImmediateDominatorOutOfRange { block, dominator });
+                }
+                if dominator == block {
+                    return Err(DomError::ImmediateDominatorIsSelf { block });
+                }
             }
         }
 
         for start in 0..block_count {
             let mut seen = vec![false; block_count];
             let mut block = BlockId(start as u32);
-            while block != cfg.entry {
+            loop {
                 let index = block.0 as usize;
                 if std::mem::replace(&mut seen[index], true) {
                     return Err(DomError::ImmediateDominatorCycle {
                         block: BlockId(start as u32),
                     });
                 }
-                block =
-                    self.idom[index].expect("non-entry immediate dominators were validated above");
+                let Some(parent) = self.idom[index] else {
+                    break;
+                };
+                block = parent;
             }
         }
 
@@ -246,21 +283,19 @@ impl DominatorTree {
             rpo_position[block.0 as usize] = position;
         }
         for index in 0..block_count {
-            if index == entry_index {
-                continue;
-            }
             let block = BlockId(index as u32);
-            let dominator =
-                self.idom[index].expect("non-entry immediate dominators were validated above");
-            if rpo_position[dominator.0 as usize] >= rpo_position[index] {
+            if let Some(dominator) = self.idom[index]
+                && rpo_position[dominator.0 as usize] >= rpo_position[index]
+            {
                 return Err(DomError::ImmediateDominatorNotBeforeBlock { block, dominator });
             }
         }
 
-        for block in self.rpo.iter().copied().skip(1) {
-            let dominator = self.idom[block.0 as usize]
-                .expect("non-entry immediate dominators were validated above");
-            for &predecessor in &cfg.blocks[block.0 as usize].preds {
+        for block in self.rpo.iter().copied() {
+            let Some(dominator) = self.idom[block.0 as usize] else {
+                continue;
+            };
+            for predecessor in predecessors(cfg, block, self.edges) {
                 if !self.dominates(dominator, predecessor) {
                     return Err(DomError::ImmediateDominatorDoesNotDominatePredecessor {
                         block,
@@ -271,18 +306,23 @@ impl DominatorTree {
             }
         }
 
-        let expected_idom = compute_idoms(cfg, &self.rpo);
-        for block in self.rpo.iter().copied().skip(1) {
-            let expected = expected_idom[block.0 as usize]
-                .expect("reachable non-entry blocks have CHK immediate dominators");
-            let actual = self.idom[block.0 as usize]
-                .expect("non-entry immediate dominators were validated above");
-            if actual != expected {
-                return Err(DomError::ImmediateDominatorFixpointMismatch {
-                    block,
-                    expected,
-                    actual,
-                });
+        let expected_idom = compute_idoms(cfg, &self.rpo, self.edges);
+        for block in self.rpo.iter().copied() {
+            match (expected_idom[block.0 as usize], self.idom[block.0 as usize]) {
+                (Some(expected), Some(actual)) if actual != expected => {
+                    return Err(DomError::ImmediateDominatorFixpointMismatch {
+                        block,
+                        expected,
+                        actual,
+                    });
+                }
+                (Some(expected), None) => {
+                    return Err(DomError::UnexpectedDominatorRoot { block, expected });
+                }
+                (None, Some(actual)) => {
+                    return Err(DomError::MissingDominatorRoot { block, actual });
+                }
+                _ => {}
             }
         }
 
@@ -296,32 +336,21 @@ impl DominanceFrontier {
     pub fn compute(cfg: &ControlFlowGraph, dom: &DominatorTree) -> Self {
         let mut df = vec![SmallVec::<[BlockId; 4]>::new(); cfg.blocks.len()];
         for block in &cfg.blocks {
-            // The entry has an implicit predecessor from the virtual CFG root.
-            let is_join =
-                block.preds.len() >= 2 || (block.id == cfg.entry && !block.preds.is_empty());
+            let block_predecessors = predecessors(cfg, block.id, dom.edges);
+            let virtual_predecessor = is_analysis_root(cfg, block.id, dom.edges);
+            let is_join = block_predecessors.len() + usize::from(virtual_predecessor) >= 2;
             if !is_join {
                 continue;
             }
-            for &predecessor in &block.preds {
-                let mut runner = predecessor;
-                if block.id == cfg.entry {
-                    // Model the virtual root's edge to entry: unlike an ordinary
-                    // join, entry itself lies on the walk before that root.
-                    loop {
-                        df[runner.0 as usize].push(block.id);
-                        let Some(parent) = dom.immediate_dominator(runner) else {
-                            break;
-                        };
-                        runner = parent;
-                    }
-                    continue;
-                }
-                let stop = dom
-                    .immediate_dominator(block.id)
-                    .expect("non-entry blocks have immediate dominators");
+            let stop = dom.immediate_dominator(block.id);
+            for predecessor in block_predecessors {
+                let mut runner = Some(predecessor);
                 while runner != stop {
-                    df[runner.0 as usize].push(block.id);
-                    runner = dom.immediate_dominator(runner).unwrap_or(cfg.entry);
+                    let Some(current) = runner else {
+                        break;
+                    };
+                    df[current.0 as usize].push(block.id);
+                    runner = dom.immediate_dominator(current);
                 }
             }
         }
@@ -368,10 +397,9 @@ impl DominanceFrontier {
                 .blocks
                 .iter()
                 .filter(|candidate| {
-                    candidate
-                        .preds
-                        .iter()
-                        .any(|&predecessor| dom.dominates(block, predecessor))
+                    predecessors(cfg, candidate.id, dom.edges)
+                        .into_iter()
+                        .any(|predecessor| dom.dominates(block, predecessor))
                         && !dom.strictly_dominates(block, candidate.id)
                 })
                 .map(|candidate| candidate.id)
@@ -389,24 +417,31 @@ impl DominanceFrontier {
     }
 }
 
-fn reverse_postorder(cfg: &ControlFlowGraph) -> Vec<BlockId> {
-    let successors: Vec<_> = cfg.blocks.iter().map(full_successors).collect();
+fn reverse_postorder(cfg: &ControlFlowGraph, edges: EdgeSelection) -> Vec<BlockId> {
+    let successors: Vec<_> = cfg
+        .blocks
+        .iter()
+        .map(|block| successors(block, edges))
+        .collect();
     let mut visited = vec![false; cfg.blocks.len()];
     let mut postorder = Vec::with_capacity(cfg.blocks.len());
-    let mut stack = vec![(cfg.entry, 0_usize)];
-    visited[cfg.entry.0 as usize] = true;
-
-    while let Some((block, successor_index)) = stack.last_mut() {
-        let block_index = block.0 as usize;
-        if let Some(&successor) = successors[block_index].get(*successor_index) {
-            *successor_index += 1;
-            let successor_index = successor.0 as usize;
-            if !std::mem::replace(&mut visited[successor_index], true) {
-                stack.push((successor, 0));
+    for root in analysis_roots(cfg, edges) {
+        if std::mem::replace(&mut visited[root.0 as usize], true) {
+            continue;
+        }
+        let mut stack = vec![(root, 0_usize)];
+        while let Some((block, successor_index)) = stack.last_mut() {
+            let block_index = block.0 as usize;
+            if let Some(&successor) = successors[block_index].get(*successor_index) {
+                *successor_index += 1;
+                let successor_index = successor.0 as usize;
+                if !std::mem::replace(&mut visited[successor_index], true) {
+                    stack.push((successor, 0));
+                }
+            } else {
+                postorder.push(*block);
+                stack.pop();
             }
-        } else {
-            postorder.push(*block);
-            stack.pop();
         }
     }
 
@@ -414,64 +449,126 @@ fn reverse_postorder(cfg: &ControlFlowGraph) -> Vec<BlockId> {
     postorder
 }
 
-fn full_successors(block: &Block) -> SmallVec<[BlockId; 4]> {
-    let mut successors: SmallVec<_> = block
-        .normal_succs
-        .iter()
-        .chain(&block.exception_succs)
-        .copied()
-        .collect();
+fn successors(block: &Block, edges: EdgeSelection) -> SmallVec<[BlockId; 4]> {
+    let mut successors: SmallVec<_> = match edges {
+        EdgeSelection::Full => block
+            .normal_succs
+            .iter()
+            .chain(&block.exception_succs)
+            .copied()
+            .collect(),
+        EdgeSelection::Normal => block.normal_succs.iter().copied().collect(),
+    };
     successors.sort_unstable();
     successors.dedup();
     successors
 }
 
-fn compute_idoms(cfg: &ControlFlowGraph, rpo: &[BlockId]) -> Vec<Option<BlockId>> {
-    let mut postorder_number = vec![0; cfg.blocks.len()];
+fn predecessors(
+    cfg: &ControlFlowGraph,
+    block: BlockId,
+    edges: EdgeSelection,
+) -> SmallVec<[BlockId; 4]> {
+    cfg.blocks[block.0 as usize]
+        .preds
+        .iter()
+        .copied()
+        .filter(|predecessor| {
+            edges == EdgeSelection::Full
+                || cfg.blocks[predecessor.0 as usize]
+                    .normal_succs
+                    .contains(&block)
+        })
+        .collect()
+}
+
+fn analysis_roots(cfg: &ControlFlowGraph, edges: EdgeSelection) -> Vec<BlockId> {
+    let mut roots = vec![cfg.entry];
+    if edges == EdgeSelection::Normal {
+        roots.extend(
+            cfg.blocks
+                .iter()
+                .flat_map(|block| block.exception_succs.iter().copied()),
+        );
+        roots.sort_unstable();
+        roots.dedup();
+    }
+    roots
+}
+
+fn is_analysis_root(cfg: &ControlFlowGraph, block: BlockId, edges: EdgeSelection) -> bool {
+    block == cfg.entry
+        || (edges == EdgeSelection::Normal
+            && cfg
+                .blocks
+                .iter()
+                .any(|candidate| candidate.exception_succs.contains(&block)))
+}
+
+fn compute_idoms(
+    cfg: &ControlFlowGraph,
+    rpo: &[BlockId],
+    edges: EdgeSelection,
+) -> Vec<Option<BlockId>> {
+    let virtual_root = cfg.blocks.len();
+    let mut postorder_number = vec![0; cfg.blocks.len() + 1];
+    postorder_number[virtual_root] = rpo.len();
     for (rpo_index, block) in rpo.iter().copied().enumerate() {
         postorder_number[block.0 as usize] = rpo.len() - 1 - rpo_index;
     }
 
-    let mut idom = vec![None; cfg.blocks.len()];
-    idom[cfg.entry.0 as usize] = Some(cfg.entry);
+    let mut idom = vec![None; cfg.blocks.len() + 1];
+    idom[virtual_root] = Some(virtual_root);
     let mut changed = true;
     while changed {
         changed = false;
-        for &block in &rpo[1..] {
-            let predecessors = &cfg.blocks[block.0 as usize].preds;
-            let mut processed = predecessors
-                .iter()
-                .copied()
-                .filter(|predecessor| idom[predecessor.0 as usize].is_some());
+        for &block in rpo {
+            let mut block_predecessors: SmallVec<[usize; 5]> = predecessors(cfg, block, edges)
+                .into_iter()
+                .map(|predecessor| predecessor.0 as usize)
+                .collect();
+            if is_analysis_root(cfg, block, edges) {
+                block_predecessors.push(virtual_root);
+            }
+            let mut processed = block_predecessors
+                .into_iter()
+                .filter(|&predecessor| idom[predecessor].is_some());
             let Some(mut new_idom) = processed.next() else {
                 continue;
             };
             for predecessor in processed {
                 new_idom = intersect(new_idom, predecessor, &idom, &postorder_number);
             }
-            if idom[block.0 as usize] != Some(new_idom) {
-                idom[block.0 as usize] = Some(new_idom);
+            let block_index = block.0 as usize;
+            if idom[block_index] != Some(new_idom) {
+                idom[block_index] = Some(new_idom);
                 changed = true;
             }
         }
     }
-    idom
+    idom.pop();
+    idom.into_iter()
+        .map(|parent| match parent {
+            Some(parent) if parent != virtual_root => Some(BlockId(parent as u32)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn intersect(
-    mut finger1: BlockId,
-    mut finger2: BlockId,
-    idom: &[Option<BlockId>],
+    mut finger1: usize,
+    mut finger2: usize,
+    idom: &[Option<usize>],
     postorder_number: &[usize],
-) -> BlockId {
+) -> usize {
     while finger1 != finger2 {
-        while postorder_number[finger1.0 as usize] < postorder_number[finger2.0 as usize] {
-            finger1 = idom[finger1.0 as usize]
-                .expect("CHK intersects only predecessors with known dominators");
+        while postorder_number[finger1] < postorder_number[finger2] {
+            finger1 =
+                idom[finger1].expect("CHK intersects only predecessors with known dominators");
         }
-        while postorder_number[finger2.0 as usize] < postorder_number[finger1.0 as usize] {
-            finger2 = idom[finger2.0 as usize]
-                .expect("CHK intersects only predecessors with known dominators");
+        while postorder_number[finger2] < postorder_number[finger1] {
+            finger2 =
+                idom[finger2].expect("CHK intersects only predecessors with known dominators");
         }
     }
     finger1
@@ -636,6 +733,41 @@ mod tests {
         assert_eq!(dom.immediate_dominator(catch.id), Some(enclosing));
         assert!(dom.dominates(enclosing, catch.id));
         assert!(frontier.frontier(try_body.id).contains(&catch.id));
+    }
+
+    #[test]
+    fn normal_dominance_roots_handler_and_excludes_exception_frontier() {
+        let cfg = ControlFlowGraph::build(&snapshot(vec![
+            (
+                Op::EnterTry,
+                vec![
+                    Operand::Imm32(3),
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Register(1),
+                ],
+            ),
+            (
+                Op::LoadGlobalOrThrow,
+                vec![Operand::Register(0), Operand::ConstIndex(0)],
+            ),
+            (Op::LeaveTry, vec![]),
+            (Op::Jump, vec![Operand::Imm32(1)]),
+            (Op::Nop, vec![]),
+            (Op::Nop, vec![]),
+            (Op::ReturnUndefined, vec![]),
+        ]))
+        .expect("CFG builds");
+        let dom = DominatorTree::compute_normal(&cfg);
+        let frontier = DominanceFrontier::compute(&cfg, &dom);
+        dom.verify(&cfg).expect("normal dominators verify");
+        frontier
+            .verify(&cfg, &dom)
+            .expect("normal dominance frontier verifies");
+
+        let try_body = cfg.blocks.iter().find(|block| block.start_pc == 1).unwrap();
+        let catch = cfg.blocks.iter().find(|block| block.start_pc == 4).unwrap();
+        assert_eq!(dom.immediate_dominator(catch.id), None);
+        assert!(!frontier.frontier(try_body.id).contains(&catch.id));
     }
 
     #[test]

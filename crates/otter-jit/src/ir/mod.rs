@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`cfg`] — typed bytecode basic blocks and complete control-flow edges.
 //! - [`dom`] — dominator tree and dominance-frontier analyses.
+//! - [`ssa`] — Cytron SSA construction over bytecode virtual registers.
 //!
 //! # Invariants
 //! - IR construction consumes immutable VM snapshots and has no runtime effect.
@@ -14,3 +15,4 @@
 
 pub mod cfg;
 pub mod dom;
+pub mod ssa;

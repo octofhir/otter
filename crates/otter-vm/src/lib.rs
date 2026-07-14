@@ -229,8 +229,8 @@ pub use jit::{
     JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
     JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
     JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFunctionCode,
-    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPrimitiveMethodGuard,
-    JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
+    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitOptimizedExecOutcome,
+    JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -411,9 +411,13 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
     }
 }
 
-/// Aggregate baseline-JIT runtime counters.
+/// Aggregate native-tier runtime counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitRuntimeStats {
+    /// Optimizing-tier leaf entries.
+    pub optimized_entries: u64,
+    /// Optimizing-tier exits that reconstructed and resumed an interpreter frame.
+    pub optimized_deopts: u64,
     /// Compiled `Op::Call` bridge invocations.
     pub runtime_calls: u64,
     /// Compiled `Op::New` in-place construct bridge invocations.
@@ -422,7 +426,7 @@ pub struct JitRuntimeStats {
     pub direct_calls: u64,
     /// Bridge calls that fell back to the generic Rust callable path.
     pub rust_call_fallbacks: u64,
-    /// Function-entry compile attempts.
+    /// Function-entry compile attempts across native tiers.
     pub compile_attempts: u64,
     /// Loop-OSR compile/entry attempts at threshold crossings.
     pub osr_attempts: u64,
@@ -928,7 +932,7 @@ pub struct Interpreter {
     method_call_ics: Vec<Option<method_ops::MethodCallIc>>,
     /// Cheap aggregate counters for interpreter property IC behavior.
     property_ic_stats: property_ic::PropertyIcStats,
-    /// Runtime-installed baseline JIT compiler hook. The hook lives behind a VM
+    /// Runtime-installed native-tier compiler hook. The hook lives behind a VM
     /// trait object so `otter-vm` never depends on executable-memory code.
     /// `Some` is also the tier-up gate: with no hook installed, all tier-up
     /// bookkeeping below stays untouched and execution is interpreter-only.
@@ -936,10 +940,8 @@ pub struct Interpreter {
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,
-    /// Additive optimizing-tier promotion telemetry. It counts calls and
-    /// back-edges independently of the baseline counters and is consumed only
-    /// by the explicit [`Self::optimizing_tier_decision`] query; no current
-    /// compile or dispatch path reads its decisions.
+    /// Isolate-local optimizing-tier feedback-stability telemetry. Entry
+    /// selection samples it only after the shared call counter is hot.
     optimizing_tier_policy: tier_policy::TierPolicy,
     /// Bounded ordinary-call target distributions for the future optimizing
     /// tier, keyed by `(caller function id, canonical instruction index)`.
@@ -991,6 +993,12 @@ pub struct Interpreter {
     /// installed baseline body; `None` records a function the emitter could not
     /// compile (outside the supported subset), so it is never retried.
     jit_code: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    /// Separately installed optimizing-tier leaves keyed by function id.
+    /// `None` records a hot function outside the deliberately narrow subset.
+    jit_optimized_code:
+        rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
+    /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
+    jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
     /// OSR-target compiled-code cache keyed by `(function_id, loop_header_pc)`.
     /// A target compile is not interchangeable with another header in the same
     /// function: its synthetic entry edge and captured OSR reload set are rooted

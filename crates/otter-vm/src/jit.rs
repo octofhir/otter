@@ -1,4 +1,4 @@
-//! Dependency-inverted baseline-JIT hook surface.
+//! Dependency-inverted native-tier hook surface.
 //!
 //! This module defines the safe VM-side contract used by an external JIT crate.
 //! `otter-vm` owns bytecode metadata, call-frame layout, property-IC site ids,
@@ -21,9 +21,11 @@
 //!   into `ExecutionContext`, `CodeBlock`, or interpreter frames.
 //! - No unsafe is required here. Native entry pointers, executable mappings, and
 //!   call ABI details remain encapsulated by the JIT implementation crate.
-//! - Baseline v1 uses the interpreter frame register array as its precise root
+//! - Baseline code uses the interpreter frame register array as its precise root
 //!   provider. Values may be cached in machine registers only between
 //!   safepoints; allocation and call slow paths must reload from frame slots.
+//! - Optimized leaves allocate and call nowhere; before deopt they reconstruct
+//!   every interpreter register in the same rooted frame array.
 //!
 //! # See also
 //! - [`crate::execution_context`] for snapshot creation from frozen bytecode.
@@ -880,6 +882,16 @@ pub enum JitExecOutcome {
     Threw(crate::run_control::VmError),
 }
 
+/// Outcome of entering a leaf from the feedback-guided optimizing tier.
+#[derive(Debug)]
+pub enum JitOptimizedExecOutcome {
+    /// The optimized leaf completed and returned one boxed value.
+    Returned(crate::Value),
+    /// Speculation failed after the generated exit reconstructed the complete
+    /// interpreter register file; carries the exact interpreter byte PC.
+    Deopt(u32),
+}
+
 /// Type-erased compiled-code handle owned by the JIT implementation.
 ///
 /// The JIT implementation owns executable memory and the unsafe ABI calls. The
@@ -955,6 +967,19 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// stack throughout, so allocation/calls in the body are GC-safe.
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome;
 
+    /// Execute this object through the optimizing-leaf ABI.
+    ///
+    /// The default identifies baseline/template objects. Optimized code owns
+    /// the unsafe machine entry and returns `Some` only after validating the
+    /// supplied parameter and frame-register windows.
+    fn run_optimized_entry(
+        &self,
+        _params: &[u64],
+        _frame_registers: &mut [crate::Value],
+    ) -> Option<JitOptimizedExecOutcome> {
+        None
+    }
+
     /// Enter compiled code mid-function at the loop header whose logical PC is
     /// `logical_pc` (on-stack replacement). Returns `None` when this code has no
     /// OSR entry for that PC (the VM keeps interpreting).
@@ -979,6 +1004,8 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
 /// native buffer lengths, not Rust metadata or page-rounding overhead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCodeResidency {
+    /// Installed optimizing-tier entry bodies.
+    pub installed_optimized_bodies: u64,
     /// Installed non-OSR function bodies.
     pub installed_entry_bodies: u64,
     /// Installed OSR-target bodies.
@@ -1063,4 +1090,15 @@ pub trait JitCompilerHook: Send + Sync {
         &self,
         request: JitCompileRequest,
     ) -> Result<JitCompileStatus, JitCompileError>;
+
+    /// Attempt the narrow optimizing tier before template compilation.
+    ///
+    /// Hooks that provide only a baseline compiler keep the default and leave
+    /// execution on their existing tier without changing semantics.
+    fn compile_optimized_function(
+        &self,
+        _request: JitCompileRequest,
+    ) -> Result<JitCompileStatus, JitCompileError> {
+        Ok(JitCompileStatus::Unavailable)
+    }
 }

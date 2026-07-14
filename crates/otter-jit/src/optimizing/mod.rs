@@ -1,28 +1,34 @@
-//! First machine-code slice of the feedback-guided optimizing tier.
+//! Feedback-guided optimizing tier for narrow arithmetic leaves.
 //!
 //! This module compiles only one-basic-block int32 arithmetic leaves. It runs
 //! the complete CFG, dominance, SSA, liveness, register-allocation,
 //! representation, frame-state, and deopt-lowering pipeline before the arm64
-//! backend checks the deliberately narrow eligibility contract. It is not
-//! installed in runtime tier selection.
+//! backend checks the deliberately narrow eligibility contract. Installed code
+//! reconstructs the interpreter register file in place before every deopt.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
-//! - [`OptimizedLeafEntry`] and [`OptimizedLeafRet`] — standalone test ABI.
+//! - [`OptimizedLeafEntry`] and [`OptimizedLeafRet`] — production leaf ABI.
 //!
 //! # Invariants
 //! - Entries are leaves: they never allocate, call, safepoint, or re-enter the VM.
-//! - ABI argument `x0` points to tagged `u64` parameters. A two-word return
-//!   uses `x0` for a boxed result or deopt byte PC and `x1` for status.
+//! - ABI argument `x0` points to tagged `u64` parameters and `x1` points to
+//!   the interpreter register file. A two-word return uses `x0` for a boxed
+//!   result or deopt byte PC and `x1` for status.
 //! - Tagged int32 values are `(0xfffe << 48) | payload_u32`.
-//! - This compiler is additive and no runtime path calls it.
+//! - Deopt writeback is generated from the same [`DeoptTable`] published with
+//!   the code object; every interpreter register is materialized before return.
 //!
 //! # See also
 //! - [`crate::ir`] — the reusable optimizing analyses consumed here.
 //! - [`crate::template`] — the runtime-wired baseline compiler.
 
-use otter_vm::{JitCompileSnapshot, deopt::DeoptTable};
+use otter_vm::{
+    JitCompileSnapshot, JitExecOutcome, JitFunctionCode, JitOptimizedExecOutcome, Value,
+    deopt::DeoptTable,
+    native_abi::{BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION},
+};
 
 use crate::{CompiledCode, Unsupported};
 
@@ -48,11 +54,12 @@ pub struct OptimizedLeafRet {
     pub status: u64,
 }
 
-/// Standalone optimizing-leaf calling convention.
+/// Optimizing-leaf calling convention.
 ///
-/// The pointer names a contiguous tagged-`u64` parameter array. On arm64 it
-/// arrives in `x0`; [`OptimizedLeafRet`] returns in `x0`/`x1` per AAPCS64.
-pub type OptimizedLeafEntry = extern "C" fn(*const u64) -> OptimizedLeafRet;
+/// The first pointer names a contiguous tagged-`u64` parameter array and the
+/// second names the writable interpreter register file. On arm64 they arrive
+/// in `x0`/`x1`; [`OptimizedLeafRet`] returns in `x0`/`x1` per AAPCS64.
+pub type OptimizedLeafEntry = extern "C" fn(*const u64, *mut u64) -> OptimizedLeafRet;
 
 /// Deterministic metadata for one optimized leaf compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +68,10 @@ pub struct OptimizedMetadata {
     pub code_object_id: u64,
     /// Source bytecode function identity.
     pub function_id: u32,
+    /// Number of tagged parameters consumed by the leaf ABI.
+    pub param_count: u16,
+    /// Number of writable interpreter registers reconstructed on deopt.
+    pub register_count: u16,
     /// Number of allocatable machine registers used by linear scan.
     pub machine_register_count: u8,
     /// Spill slots forced by linear scan before deopt-location legalization.
@@ -74,6 +85,7 @@ pub struct OptimizedCode {
     code: CompiledCode,
     deopt_table: DeoptTable,
     metadata: OptimizedMetadata,
+    code_metadata: CodeObjectMetadata,
 }
 
 impl OptimizedCode {
@@ -82,10 +94,28 @@ impl OptimizedCode {
         deopt_table: DeoptTable,
         metadata: OptimizedMetadata,
     ) -> Self {
+        const AARCH64_OPTIMIZED_LEAF_ABI: u64 = 0x4136_344f_5054_0002;
+        let code_metadata = CodeObjectMetadata {
+            id: metadata.code_object_id,
+            code_block_id: metadata.function_id,
+            entry_offset: 0,
+            code_size: code.len() as u32,
+            safepoint_count: 0,
+            frame_map_count: 0,
+            spill_map_count: 0,
+            dependency_count: 0,
+            reserved: 0,
+            layout: LayoutVersionRecord::CURRENT,
+            build: BuildVersionRecord {
+                vm_build: VM_BUILD_VERSION,
+                target_abi: AARCH64_OPTIMIZED_LEAF_ABI,
+            },
+        };
         Self {
             code,
             deopt_table,
             metadata,
+            code_metadata,
         }
     }
 
@@ -115,6 +145,46 @@ impl std::fmt::Debug for OptimizedCode {
             .field("deopt_points", &self.deopt_table.len())
             .field("metadata", &self.metadata)
             .finish()
+    }
+}
+
+impl JitFunctionCode for OptimizedCode {
+    fn metadata(&self) -> CodeObjectMetadata {
+        self.code_metadata
+    }
+
+    fn code_len(&self) -> usize {
+        self.code.len()
+    }
+
+    fn run_entry(&self, _activation: otter_vm::VmRuntimeActivation) -> JitExecOutcome {
+        JitExecOutcome::Threw(otter_vm::VmError::InvalidOperand)
+    }
+
+    fn run_optimized_entry(
+        &self,
+        params: &[u64],
+        frame_registers: &mut [Value],
+    ) -> Option<JitOptimizedExecOutcome> {
+        if params.len() < usize::from(self.metadata.param_count)
+            || frame_registers.len() < usize::from(self.metadata.register_count)
+        {
+            return None;
+        }
+        // SAFETY: the compiler emitted `OptimizedLeafEntry`, this object owns
+        // the executable mapping through the call, and both slices satisfy the
+        // lengths recorded in immutable compilation metadata.
+        let entry: OptimizedLeafEntry = unsafe { std::mem::transmute(self.code.entry_ptr()) };
+        let result = entry(params.as_ptr(), frame_registers.as_mut_ptr().cast::<u64>());
+        match result.status {
+            OPTIMIZED_STATUS_RETURNED => Some(JitOptimizedExecOutcome::Returned(Value::from_bits(
+                result.value,
+            ))),
+            OPTIMIZED_STATUS_DEOPT if self.deopt_table.lookup(result.value as u32).is_some() => {
+                Some(JitOptimizedExecOutcome::Deopt(result.value as u32))
+            }
+            _ => None,
+        }
     }
 }
 

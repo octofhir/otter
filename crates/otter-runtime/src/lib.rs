@@ -765,7 +765,11 @@ pub struct RuntimeExecutionStats {
     pub jit_direct_calls: u64,
     /// Compiled calls that fell back to the Rust callable path.
     pub jit_rust_call_fallbacks: u64,
-    /// Function-entry compile attempts.
+    /// Optimizing-tier leaf entries.
+    pub jit_optimized_entries: u64,
+    /// Optimizing-tier deopts resumed on reconstructed interpreter frames.
+    pub jit_optimized_deopts: u64,
+    /// Function-entry compile attempts across native tiers.
     pub jit_compile_attempts: u64,
     /// Loop-OSR threshold attempts.
     pub jit_osr_attempts: u64,
@@ -1340,11 +1344,10 @@ pub(crate) struct RuntimeConfig {
 /// compiler; there is no environment toggle for tier selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum JitSelection {
-    /// Interpreter plus the production compiler (the template tier).
+    /// Interpreter plus the production optimizing and template tiers.
     #[default]
     Baseline,
-    /// Interpreter plus the template compiler (explicit selection; same as
-    /// the default).
+    /// Explicit production-tier selection; equivalent to the default.
     Template,
     /// Interpreter only — the semantic oracle for differential runs.
     InterpreterOnly,
@@ -3159,6 +3162,8 @@ impl Runtime {
             jit_runtime_calls: jit.runtime_calls,
             jit_direct_calls: jit.direct_calls,
             jit_rust_call_fallbacks: jit.rust_call_fallbacks,
+            jit_optimized_entries: jit.optimized_entries,
+            jit_optimized_deopts: jit.optimized_deopts,
             jit_compile_attempts: jit.compile_attempts,
             jit_osr_attempts: jit.osr_attempts,
             jit_runtime_property_stubs: jit.runtime_property_stubs,

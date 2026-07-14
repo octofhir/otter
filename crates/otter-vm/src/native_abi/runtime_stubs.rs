@@ -1074,6 +1074,19 @@ pub const STUB_JIT_VARIADIC_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes static intrinsic-call opcodes (`ArrayBufferCall`,
+/// `SharedArrayBufferCall`, `BigIntCall`, `DataViewCall`) through the VM's
+/// static-call helpers, rebuilding their method-id operand layout.
+pub const STUB_JIT_STATIC_CALL_OP: RuntimeStubDescriptor = descriptor(
+    70,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1147,6 +1160,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         67 => "jit_structural_op",
         68 => "jit_class_op",
         69 => "jit_variadic_op",
+        70 => "jit_static_call_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1222,6 +1236,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_STRUCTURAL_OP,
     STUB_JIT_CLASS_OP,
     STUB_JIT_VARIADIC_OP,
+    STUB_JIT_STATIC_CALL_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

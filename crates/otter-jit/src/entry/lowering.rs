@@ -204,6 +204,15 @@ pub(crate) struct BindFunctionOperands {
     pub(crate) arguments: OperandRange,
 }
 
+/// Typed static intrinsic-call prefix (`dst`, method-id constant) plus
+/// plan-owned argument-register range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StaticCallOperands {
+    pub(crate) dst: u16,
+    pub(crate) method: u32,
+    pub(crate) arguments: OperandRange,
+}
+
 /// Typed method-call prefix plus plan-owned argument-register range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MethodCallOperands {
@@ -277,6 +286,7 @@ enum LoweredOperands {
     MakeClosure(MakeClosureOperands),
     Call(CallOperands),
     MethodCall(MethodCallOperands),
+    StaticCall(StaticCallOperands),
     BindFunction(BindFunctionOperands),
     GlobalStore(GlobalStoreOperands),
     Immediate(ImmediateOperands),
@@ -436,6 +446,13 @@ impl LoweredInstr {
         match self.operands {
             LoweredOperands::BindFunction(operands) => Ok(operands),
             _ => Err(Unsupported::OperandShape("lowered BindFunction operands")),
+        }
+    }
+
+    pub(crate) fn static_call_operands(self) -> Result<StaticCallOperands, Unsupported> {
+        match self.operands {
+            LoweredOperands::StaticCall(operands) => Ok(operands),
+            _ => Err(Unsupported::OperandShape("lowered static-call operands")),
         }
     }
 
@@ -718,11 +735,7 @@ impl BaselinePlan {
                 | Op::ArrayConstruct
                 | Op::ArrayFrom
                 | Op::ArrayOf
-                | Op::QueueMicrotask
-                | Op::ArrayBufferCall
-                | Op::SharedArrayBufferCall
-                | Op::BigIntCall
-                | Op::DataViewCall => {
+                | Op::QueueMicrotask => {
                     let count = const_index(operands, 1)? as usize;
                     let elements = append_register_tail(
                         &mut register_operands,
@@ -735,6 +748,27 @@ impl BaselinePlan {
                     LoweredOperands::NewArray(NewArrayOperands {
                         dst: reg(operands, 0)?,
                         elements,
+                    })
+                }
+                // Static intrinsic calls carry a method-id constant before the
+                // count: dst, method(const), argc(const), args…
+                Op::ArrayBufferCall
+                | Op::SharedArrayBufferCall
+                | Op::BigIntCall
+                | Op::DataViewCall => {
+                    let count = const_index(operands, 2)? as usize;
+                    let elements = append_register_tail(
+                        &mut register_operands,
+                        operands,
+                        operands.len(),
+                        3,
+                        count,
+                        "static-call register tail",
+                    )?;
+                    LoweredOperands::StaticCall(StaticCallOperands {
+                        dst: reg(operands, 0)?,
+                        method: const_index(operands, 1)?,
+                        arguments: elements,
                     })
                 }
                 Op::MathCall => {

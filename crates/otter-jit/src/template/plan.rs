@@ -413,6 +413,17 @@ pub(crate) enum TemplateOp {
         argc: u16,
         packed_args: u64,
     },
+    /// Complete one static intrinsic-call opcode (`ArrayBufferCall`,
+    /// `SharedArrayBufferCall`, `BigIntCall`, `DataViewCall`) through the shared
+    /// reentrant static-call transition. `packed_head` is `dst | argc<<16`,
+    /// `method` the method-id constant, and `packed_args` the argument
+    /// registers.
+    StaticCallOp {
+        opcode: u8,
+        packed_head: u64,
+        method: u64,
+        packed_args: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -1045,14 +1056,7 @@ impl TemplatePlan {
                         arg1: u64::from(operands.src),
                     }
                 }
-                Op::ArrayConstruct
-                | Op::ArrayFrom
-                | Op::ArrayOf
-                | Op::QueueMicrotask
-                | Op::ArrayBufferCall
-                | Op::SharedArrayBufferCall
-                | Op::BigIntCall
-                | Op::DataViewCall => {
+                Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf | Op::QueueMicrotask => {
                     let operands = lowered.new_array_operands()?;
                     let arguments = lowering.register_tail(operands.elements)?;
                     if arguments.len() > MAX_METHOD_ARGS {
@@ -1067,6 +1071,27 @@ impl TemplatePlan {
                         opcode: lowered.op as u8,
                         prefix: operands.dst,
                         argc: arguments.len() as u16,
+                        packed_args: pack_method_arg_regs(arguments),
+                    }
+                }
+                Op::ArrayBufferCall
+                | Op::SharedArrayBufferCall
+                | Op::BigIntCall
+                | Op::DataViewCall => {
+                    let operands = lowered.static_call_operands()?;
+                    let arguments = lowering.register_tail(operands.arguments)?;
+                    if arguments.len() > MAX_METHOD_ARGS {
+                        osr_only = true;
+                        instructions.push(TemplateInstr {
+                            pc,
+                            op: TemplateOp::UnsupportedBail,
+                        });
+                        continue;
+                    }
+                    TemplateOp::StaticCallOp {
+                        opcode: lowered.op as u8,
+                        packed_head: u64::from(operands.dst) | ((arguments.len() as u64) << 16),
+                        method: u64::from(operands.method),
                         packed_args: pack_method_arg_regs(arguments),
                     }
                 }

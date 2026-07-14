@@ -1014,6 +1014,18 @@ pub const STUB_JIT_PRIVATE_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Completes static value loads (`MathLoad`, `SymbolLoad`, `TemporalLoad`,
+/// `LoadBigInt`, `GetStringIndex`) through the VM's load helpers.
+pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
+    65,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1082,6 +1094,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         62 => "jit_scalar_op",
         63 => "jit_super_op",
         64 => "jit_private_op",
+        65 => "jit_value_load_op",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1152,6 +1165,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_SCALAR_OP,
     STUB_JIT_SUPER_OP,
     STUB_JIT_PRIVATE_OP,
+    STUB_JIT_VALUE_LOAD_OP,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

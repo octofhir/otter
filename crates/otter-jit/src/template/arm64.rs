@@ -43,6 +43,7 @@ mod protocol;
 mod scalar;
 mod super_access;
 mod transitions;
+mod value_load;
 mod values;
 
 use std::collections::BTreeMap;
@@ -746,6 +747,24 @@ pub(super) fn compile(
                     threw,
                 );
             }
+            TemplateOp::ValueLoadOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                value_load::emit_value_load_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::NoOp => {}
             TemplateOp::GetIterator { dst, src } => {
                 iterators::emit_iterator_op(
                     &mut ops,

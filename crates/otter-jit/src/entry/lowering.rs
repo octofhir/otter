@@ -589,6 +589,9 @@ impl BaselinePlan {
                 | Op::LoadDynamic
                 | Op::StoreDynamic
                 | Op::TypeofDynamic
+                | Op::MathLoad
+                | Op::SymbolLoad
+                | Op::TemporalLoad
                 | Op::LoadBuiltinError => LoweredOperands::Constant(ConstantOperands {
                     dst: reg(operands, 0)?,
                     constant: const_index(operands, 1)?,
@@ -768,7 +771,8 @@ impl BaselinePlan {
                 | Op::LoadSuperElement
                 | Op::SetSuperElement
                 | Op::PrivateGet
-                | Op::PrivateSet => {
+                | Op::PrivateSet
+                | Op::GetStringIndex => {
                     let (first, second, third) = reg3(operands)?;
                     LoweredOperands::Triple(TripleOperands {
                         first,

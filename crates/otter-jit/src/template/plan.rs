@@ -371,6 +371,18 @@ pub(crate) enum TemplateOp {
         arg1: u64,
         arg2: u64,
     },
+    /// Complete one static value-load opcode (`MathLoad`, `SymbolLoad`,
+    /// `TemporalLoad`, `LoadBigInt`, `GetStringIndex`) through the shared
+    /// reentrant value-load transition. `arg0`/`arg1`/`arg2` name the
+    /// destination plus a constant name index or receiver/index registers.
+    ValueLoadOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
+    /// No-op: advance to the next instruction with no effect (`Op::Nop`).
+    NoOp,
     /// Return `r<src>` as the completion value.
     Return { src: u16 },
     /// Return `undefined` as the completion value.
@@ -937,6 +949,25 @@ impl TemplatePlan {
                         arg2: 0,
                     }
                 }
+                Op::MathLoad | Op::SymbolLoad | Op::TemporalLoad | Op::LoadBigInt => {
+                    let operands = lowered.constant_operands()?;
+                    TemplateOp::ValueLoadOp {
+                        opcode: lowered.op as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.constant),
+                        arg2: 0,
+                    }
+                }
+                Op::GetStringIndex => {
+                    let operands = lowered.triple_operands()?;
+                    TemplateOp::ValueLoadOp {
+                        opcode: Op::GetStringIndex as u8,
+                        arg0: u64::from(operands.first),
+                        arg1: u64::from(operands.second),
+                        arg2: u64::from(operands.third),
+                    }
+                }
+                Op::Nop => TemplateOp::NoOp,
                 Op::Instanceof | Op::HasProperty => {
                     let operands = lowered.triple_operands()?;
                     TemplateOp::ObjectProtocolOp {

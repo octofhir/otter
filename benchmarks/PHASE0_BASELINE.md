@@ -942,3 +942,17 @@ observable getter/setter counters; the release differential corpus passed 11/11
 under GC stress strides 1 through 16, and targeted Test262
 `language/statements/class/elements/private` passed 187/187. The frozen full
 Test262 reference remains 99.02%.
+
+### Phase 2 production static value-load completion
+
+`MathLoad`, `SymbolLoad`, `TemporalLoad`, `LoadBigInt`, and `GetStringIndex`
+now compile through reentrant runtime stub 65 (each reuses the interpreter's
+`run_math_load_reg`/`run_symbol_load_reg`/`run_temporal_load_reg`/
+`run_load_bigint_reg`/`run_get_string_index_regs` helper; the published frame
+roots any BigInt-constant or single-code-unit-string allocation). `Nop` lowers
+to an empty template no-op. No load semantics are duplicated in JIT code.
+Template coverage is 113 of 172 active opcodes (up from 107); 59 remain
+unsupported. Interpreter/template parity holds for a `Math.*`/`Symbol.*`/BigInt-
+literal/string-index loop; the release differential corpus passed 11/11 under GC
+stress strides 1 through 16, and targeted Test262 `built-ins/BigInt` passed
+76/77. The frozen full Test262 reference remains 99.02%.

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Argument register indices occupy one 16-bit lane each in a single word.
 pub(crate) const MAX_METHOD_ARGS: usize = 4;
 
-/// Why a function could not be baseline-compiled.
+/// Why a function could not be native-compiled by a selected JIT tier.
 ///
 /// Every variant maps to a silent interpreter fallback and is never exposed as
 /// a JavaScript error.

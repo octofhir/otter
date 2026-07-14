@@ -119,6 +119,12 @@ pub(crate) struct JitRet {
 pub(crate) const STATUS_RETURNED: u64 = 0;
 pub(crate) const STATUS_BAILED: u64 = 1;
 pub(crate) const STATUS_THREW: u64 = 2;
+/// Standalone optimizing-leaf result: a speculative guard requested deopt.
+///
+/// This value belongs to the optimizing leaf ABI, while [`STATUS_CONTINUE`]
+/// belongs to the disjoint runtime-transition ABI; both intentionally use the
+/// first status value after the shared returned/bailed/threw prefix.
+pub(crate) const STATUS_DEOPT: u64 = 3;
 /// Internal runtime-transition result: the committed opcode completed and the
 /// current machine-code fallthrough remains authoritative.
 pub(crate) const STATUS_CONTINUE: u64 = 3;

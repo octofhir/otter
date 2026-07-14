@@ -34,6 +34,7 @@ mod calls;
 mod class_ops;
 mod collections;
 mod construct;
+mod control;
 mod delete;
 mod exceptions;
 mod functions;
@@ -160,6 +161,28 @@ pub(super) fn compile(
                 } else {
                     dynasm!(ops ; .arch aarch64 ; b.ne =>tgt);
                 }
+            }
+            TemplateOp::BranchNullish {
+                condition,
+                target,
+                back_edge,
+            } => {
+                let tgt = labels[&target];
+                emit_load_reg(&mut ops, 9, condition)?;
+                let taken = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; cmp x9, VALUE_NULL_IMM
+                    ; b.eq =>taken
+                    ; cmp x9, VALUE_UNDEFINED_IMM
+                    ; b.eq =>taken
+                );
+                let fallthrough = ops.new_dynamic_label();
+                dynasm!(ops ; .arch aarch64 ; b =>fallthrough ; =>taken);
+                if back_edge {
+                    emit_backedge_poll(&mut ops, poll_entry, threw);
+                }
+                dynasm!(ops ; .arch aarch64 ; b =>tgt ; =>fallthrough);
             }
             TemplateOp::Truthiness { dst, src, negate } => {
                 emit_load_reg(&mut ops, 9, src)?;
@@ -844,6 +867,23 @@ pub(super) fn compile(
                     packed_head,
                     method,
                     packed_args,
+                    bail,
+                    threw,
+                );
+            }
+            TemplateOp::ControlOp {
+                opcode,
+                arg0,
+                arg1,
+                arg2,
+            } => {
+                control::emit_control_op(
+                    &mut ops,
+                    transitions,
+                    opcode,
+                    arg0,
+                    arg1,
+                    arg2,
                     bail,
                     threw,
                 );

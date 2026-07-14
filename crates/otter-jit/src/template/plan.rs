@@ -78,6 +78,13 @@ pub(crate) enum TemplateOp {
         when_truthy: bool,
         back_edge: bool,
     },
+    /// Branch to `target` when `r<condition>` is the `null` or `undefined`
+    /// immediate; fall through for every other value without `ToBoolean`.
+    BranchNullish {
+        condition: u16,
+        target: u32,
+        back_edge: bool,
+    },
     /// `r<dst> = ToBoolean(r<src>)`, inverted when `negate` is set.
     Truthiness { dst: u16, src: u16, negate: bool },
     /// `r<dst> = r<lhs> <op> r<rhs>` over tagged numbers: int32 fast path with
@@ -424,6 +431,14 @@ pub(crate) enum TemplateOp {
         method: u64,
         packed_args: u64,
     },
+    /// Complete one dynamic control-family opcode (`LoadShadowedUpvalue`)
+    /// through the shared reentrant VM transition.
+    ControlOp {
+        opcode: u8,
+        arg0: u64,
+        arg1: u64,
+        arg2: u64,
+    },
     /// No-op: advance to the next instruction with no effect (`Op::Nop`).
     NoOp,
     /// Return `r<src>` as the completion value.
@@ -553,6 +568,14 @@ impl TemplatePlan {
                         condition: operands.condition,
                         target: operands.target,
                         when_truthy: lowered.op == Op::JumpIfTrue,
+                        back_edge: operands.target <= pc,
+                    }
+                }
+                Op::JumpIfNullish => {
+                    let operands = lowered.conditional_branch_operands()?;
+                    TemplateOp::BranchNullish {
+                        condition: operands.condition,
+                        target: operands.target,
                         back_edge: operands.target <= pc,
                     }
                 }
@@ -743,6 +766,15 @@ impl TemplatePlan {
                     TemplateOp::StoreUpvalueChecked {
                         src: operands.value,
                         index: operands.index,
+                    }
+                }
+                Op::LoadShadowedUpvalue => {
+                    let operands = lowered.shadowed_upvalue_operands()?;
+                    TemplateOp::ControlOp {
+                        opcode: Op::LoadShadowedUpvalue as u8,
+                        arg0: u64::from(operands.dst),
+                        arg1: u64::from(operands.name),
+                        arg2: operands.index as u64,
                     }
                 }
                 Op::LoadProperty => {

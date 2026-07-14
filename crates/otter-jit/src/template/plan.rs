@@ -283,6 +283,9 @@ pub(crate) enum TemplateOp {
     LeaveTry,
     /// Throw `r<src>` through the canonical VM unwind implementation.
     Throw { src: u16 },
+    /// Materialize and throw the interpreter's TDZ `ReferenceError` for the
+    /// encoded local index through the canonical VM unwind implementation.
+    TdzError { local_index: u32 },
     /// Resume the completion parked by the active finally body.
     EndFinally,
     /// Abandon `count` parked finally completions.
@@ -889,6 +892,9 @@ impl TemplatePlan {
                 Op::LeaveTry => TemplateOp::LeaveTry,
                 Op::Throw => TemplateOp::Throw {
                     src: lowered.source_operands()?.src,
+                },
+                Op::TdzError => TemplateOp::TdzError {
+                    local_index: lowered.immediate_operands()?.value as u32,
                 },
                 Op::EndFinally => TemplateOp::EndFinally,
                 Op::PopParkedFinally => {

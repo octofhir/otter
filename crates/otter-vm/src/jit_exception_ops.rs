@@ -5,6 +5,8 @@
 //! - Throw/finally resumption through the interpreter's canonical unwind code.
 //! - Callee-throw delivery back into a live compiled caller.
 //! - Abrupt jump/return completion without popping a live compiled frame.
+//! - TDZ `ReferenceError` materialization through the same throwable builder as
+//!   interpreter dispatch.
 //!
 //! # Invariants
 //! - A transition that mutates cold-frame state never asks the interpreter to
@@ -133,6 +135,15 @@ impl Interpreter {
             ),
             value if value == Op::Throw as u8 => {
                 let value = *read_register(&stack[frame_index], arg0 as u16)?;
+                self.jit_throw_from_compiled(context, stack, frame_index, value)
+            }
+            value if value == Op::TdzError as u8 => {
+                let err = VmError::TemporalDeadZone {
+                    local_index: arg0 as u32,
+                };
+                let value = self
+                    .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
+                    .ok_or(err)?;
                 self.jit_throw_from_compiled(context, stack, frame_index, value)
             }
             value if value == Op::EndFinally as u8 => {

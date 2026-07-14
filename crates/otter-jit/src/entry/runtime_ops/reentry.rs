@@ -51,10 +51,10 @@ fn try_resume_caller_throw(ctx: &mut JitCtx, is_uncaught: bool) -> Result<bool, 
     Ok(true)
 }
 
-/// Complete one structured-exception opcode. Unlike ordinary status-word
-/// transitions this returns the full compiled-entry pair: a committed handler
-/// mutation may continue, resume at a dynamic logical PC, return a value, or
-/// propagate a parked error.
+/// Complete one structured-exception opcode, including TDZ `ReferenceError`
+/// materialization. Unlike ordinary status-word transitions this returns the
+/// full compiled-entry pair: a committed handler mutation may continue, resume
+/// at a dynamic logical PC, return a value, or propagate a parked error.
 pub(crate) extern "C" fn jit_exception_op_stub(
     ctx: *mut JitCtx,
     opcode: u64,

@@ -591,9 +591,11 @@ impl BaselinePlan {
                         src: reg(operands, 0)?,
                     })
                 }
-                Op::PopParkedFinally => LoweredOperands::Immediate(ImmediateOperands {
-                    value: imm32(operands, 0)?,
-                }),
+                Op::PopParkedFinally | Op::TdzError => {
+                    LoweredOperands::Immediate(ImmediateOperands {
+                        value: imm32(operands, 0)?,
+                    })
+                }
                 Op::MakeFunction | Op::MakeClosure if instr.make_self => {
                     LoweredOperands::Destination(DestinationOperands {
                         dst: reg(operands, 0)?,

@@ -353,6 +353,21 @@ impl Allocation {
         self.locations[value.0 as usize]
     }
 
+    /// Rebuild sequentialized phi copies after a backend legalizes value homes.
+    ///
+    /// Deopt legalization may move selected values to fresh spill slots after
+    /// linear scan. Edge moves must then be derived from those final locations,
+    /// rather than retaining copies that target the pre-legalization homes.
+    pub(crate) fn rebuild_edge_moves(
+        &mut self,
+        ssa: &SsaFunction,
+        cfg: &ControlFlowGraph,
+    ) -> Result<(), RegallocError> {
+        self.edge_moves =
+            build_edge_moves(ssa, cfg, &self.locations, self.register_count)?.into_boxed_slice();
+        Ok(())
+    }
+
     /// Independently verify interval, allocation, and phi-copy invariants.
     pub fn verify(
         &self,

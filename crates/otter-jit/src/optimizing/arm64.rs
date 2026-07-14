@@ -1,7 +1,8 @@
-//! Arm64 emission for the single-block int32 optimizing subset.
+//! Arm64 emission for the acyclic multi-block int32 optimizing subset.
 //!
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
+//! - Forward branches, tagged comparisons, and per-edge phi copies.
 //! - Parameter tag guards, unboxed arithmetic, spills, boxing, and deopt exits.
 //!
 //! # Invariants
@@ -13,6 +14,10 @@
 //! - `Add`/`Sub` use the arm64 signed-overflow flag and `Mul` compares its
 //!   signed 64-bit product with the sign-extended low word. Overflow deopts at
 //!   the arithmetic instruction's exact byte PC; it never silently wraps.
+//! - Every CFG edge targets a block label in reverse postorder. Sequentialized
+//!   phi moves execute only on their owning edge before its final jump.
+//! - Conditional inputs are optimizer-produced tagged booleans and branch by
+//!   exact comparison with the VM's `true` immediate.
 //! - The emitted function is a standalone leaf and never re-enters the VM.
 //!
 //! # See also
@@ -33,14 +38,14 @@ use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
     CompiledCode,
-    entry::{STATUS_DEOPT, STATUS_RETURNED, Unsupported},
+    entry::{STATUS_DEOPT, STATUS_RETURNED, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE},
     ir::{
-        cfg::{ControlFlowGraph, Terminator},
+        cfg::{BlockId, ControlFlowGraph, Terminator},
         deopt_lower::DeoptLowering,
         dom::DominatorTree,
         frame_state::FrameStateTable,
         liveness::Liveness,
-        regalloc::{Allocation, Location},
+        regalloc::{Allocation, EdgeMoves, Location, Move},
         repr::{ConversionKind, ReprMap, Representation},
         ssa::{SsaFunction, SsaInstr, ValueDef, ValueId},
     },
@@ -56,7 +61,7 @@ const MAX_PARAMETER_OFFSET: u32 = 32_760;
 struct GuardedParam {
     value: ValueId,
     index: u32,
-    first_use_pc: u32,
+    use_pc: u32,
     deopt_byte_pc: u32,
 }
 
@@ -99,12 +104,23 @@ pub(super) fn compile(
         .verify(&ssa, &cfg, &dom)
         .map_err(|_| Unsupported::OperandShape("optimizing frame-state verification"))?;
     let linear_scan_spill_slot_count = allocation.spill_slot_count;
-    let allocation = legalize_deopt_locations(&allocation, &frame_states)?;
+    let mut allocation = legalize_deopt_locations(&allocation, &frame_states)?;
+    allocation
+        .rebuild_edge_moves(&ssa, &cfg)
+        .map_err(|_| Unsupported::OperandShape("optimizing legalized phi moves"))?;
     let deopt = DeoptLowering::build(view, &ssa, &frame_states, &allocation, &reprs)
         .map_err(|_| Unsupported::OperandShape("optimizing deopt lowering"))?;
 
-    let eligibility = check_eligibility(view, &cfg, &ssa, &reprs, &allocation)?;
-    let code = emit(view, &ssa, &allocation, &eligibility, deopt.table())?;
+    let eligibility = check_eligibility(view, &cfg, &dom, &ssa, &reprs, &allocation)?;
+    let code = emit(
+        view,
+        &cfg,
+        dom.reverse_postorder(),
+        &ssa,
+        &allocation,
+        &eligibility,
+        deopt.table(),
+    )?;
     Ok(OptimizedCode::new(
         code,
         deopt.table().clone(),
@@ -154,32 +170,52 @@ fn legalize_deopt_locations(
 fn check_eligibility(
     view: &JitCompileSnapshot,
     cfg: &ControlFlowGraph,
+    dom: &DominatorTree,
     ssa: &SsaFunction,
     reprs: &ReprMap,
     allocation: &Allocation,
 ) -> Result<Eligibility, Unsupported> {
-    if cfg.blocks.len() != 1 || cfg.entry.0 != 0 {
+    if cfg.entry.0 != 0 || dom.reverse_postorder().len() != cfg.blocks.len() {
         return Err(Unsupported::OperandShape(
-            "optimizing subset requires one basic block",
+            "optimizing subset requires one reachable entry graph",
         ));
     }
-    let block = &cfg.blocks[0];
-    if block.terminator != Terminator::Return
-        || !block.normal_succs.is_empty()
-        || !block.exception_succs.is_empty()
-    {
-        return Err(Unsupported::OperandShape(
-            "optimizing subset requires a plain return terminator",
-        ));
+    let mut rpo_position = vec![0usize; cfg.blocks.len()];
+    for (position, block) in dom.reverse_postorder().iter().copied().enumerate() {
+        rpo_position[block.0 as usize] = position;
     }
-    if ssa
-        .values
-        .iter()
-        .any(|value| matches!(value.def, ValueDef::Phi { .. }))
-    {
-        return Err(Unsupported::OperandShape(
-            "optimizing subset does not support phis",
-        ));
+    for block in &cfg.blocks {
+        if !block.exception_succs.is_empty() {
+            return Err(Unsupported::OperandShape(
+                "optimizing subset rejects exception edges",
+            ));
+        }
+        for successor in block.normal_succs.iter().copied() {
+            if rpo_position[successor.0 as usize] <= rpo_position[block.id.0 as usize] {
+                return Err(Unsupported::OperandShape(
+                    "optimizing subset rejects loops and back-edges",
+                ));
+            }
+        }
+        match block.terminator {
+            Terminator::FallThrough | Terminator::Jump if block.normal_succs.len() == 1 => {}
+            Terminator::Branch { .. } if !block.normal_succs.is_empty() => {}
+            Terminator::Return if block.normal_succs.is_empty() => {}
+            _ => {
+                return Err(Unsupported::OperandShape(
+                    "optimizing subset has an unsupported terminator",
+                ));
+            }
+        }
+    }
+    for value in &ssa.values {
+        if matches!(value.def, ValueDef::Phi { .. })
+            && reprs.representation(value.id) != Representation::Int32
+        {
+            return Err(Unsupported::OperandShape(
+                "optimizing subset requires int32 phis",
+            ));
+        }
     }
 
     let spill_bytes = allocation
@@ -194,87 +230,98 @@ fn check_eligibility(
         ));
     }
 
-    let mut used_params = BTreeMap::<ValueId, (u32, u32)>::new();
+    let mut guarded_uses = BTreeMap::<(u32, ValueId), u32>::new();
     let mut allowed_conversions = BTreeSet::new();
-    for instruction in &ssa.blocks[0].instrs {
-        match instruction.op {
-            Op::LoadInt32 => check_constant_result(instruction, reprs)?,
-            Op::LoadNumber => {
-                check_constant_result(instruction, reprs)?;
-                exact_load_number(view, instruction.pc)?;
-            }
-            Op::Add | Op::Sub | Op::Mul => {
-                let result = instruction
-                    .result
-                    .ok_or(Unsupported::OperandShape("arithmetic result"))?;
-                if reprs.representation(result) != Representation::Int32
-                    || instruction.inputs.len() != 2
-                {
-                    return Err(Unsupported::Opcode(instruction.op));
+    for block in dom.reverse_postorder().iter().copied() {
+        for instruction in &ssa.blocks[block.0 as usize].instrs {
+            match instruction.op {
+                Op::LoadInt32 => check_constant_result(instruction, reprs)?,
+                Op::LoadNumber => {
+                    check_constant_result(instruction, reprs)?;
+                    exact_load_number(view, instruction.pc)?;
                 }
-                for (operand_index, &input) in instruction.inputs.iter().enumerate() {
-                    match reprs.representation(input) {
-                        Representation::Int32 => {}
-                        Representation::Tagged => {
-                            let ValueDef::Param { index, .. } = ssa.values[input.0 as usize].def
-                            else {
-                                return Err(Unsupported::Opcode(instruction.op));
-                            };
-                            let conversion = reprs.conversions().iter().find(|conversion| {
-                                conversion.at_pc == instruction.pc
-                                    && conversion.operand_index == operand_index
-                            });
-                            if !matches!(
-                                conversion,
-                                Some(conversion)
-                                    if conversion.value == input
-                                        && conversion.kind
-                                            == ConversionKind::CheckedTaggedToInt32
-                                        && conversion.may_deopt
-                            ) {
-                                return Err(Unsupported::Opcode(instruction.op));
-                            }
-                            used_params
-                                .entry(input)
-                                .and_modify(|entry| {
-                                    if instruction.pc < entry.1 {
-                                        *entry = (index, instruction.pc);
-                                    }
-                                })
-                                .or_insert((index, instruction.pc));
-                            allowed_conversions.insert((instruction.pc, operand_index));
-                        }
-                        Representation::Float64 => {
-                            return Err(Unsupported::Opcode(instruction.op));
-                        }
+                Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
+                Op::Add | Op::Sub | Op::Mul => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("arithmetic result"))?;
+                    if reprs.representation(result) != Representation::Int32
+                        || instruction.inputs.len() != 2
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_int32_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
+                Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("comparison result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 2
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_int32_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
+                Op::Jump => {
+                    if instruction.result.is_some() || !instruction.inputs.is_empty() {
+                        return Err(Unsupported::OperandShape("optimizing jump shape"));
                     }
                 }
+                Op::JumpIfTrue | Op::JumpIfFalse => {
+                    if instruction.result.is_some() || instruction.inputs.len() != 1 {
+                        return Err(Unsupported::OperandShape("optimizing branch shape"));
+                    }
+                    let condition = instruction.inputs[0];
+                    if reprs.representation(condition) != Representation::Tagged
+                        || !is_boolean_value(ssa, condition)
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                }
+                Op::Return | Op::ReturnValue => {
+                    if instruction.result.is_some() || instruction.inputs.len() != 1 {
+                        return Err(Unsupported::OperandShape("optimizing return shape"));
+                    }
+                    let returned = instruction.inputs[0];
+                    if reprs.representation(returned) != Representation::Int32 {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    let conversion = reprs.conversions().iter().find(|conversion| {
+                        conversion.at_pc == instruction.pc && conversion.operand_index == 0
+                    });
+                    if !matches!(
+                        conversion,
+                        Some(conversion)
+                            if conversion.value == returned
+                                && conversion.kind == ConversionKind::BoxInt32
+                                && !conversion.may_deopt
+                    ) {
+                        return Err(Unsupported::OperandShape(
+                            "optimizing return requires int32 boxing",
+                        ));
+                    }
+                    allowed_conversions.insert((instruction.pc, 0));
+                }
+                other => return Err(Unsupported::Opcode(other)),
             }
-            Op::Return | Op::ReturnValue => {
-                if instruction.result.is_some() || instruction.inputs.len() != 1 {
-                    return Err(Unsupported::OperandShape("optimizing return shape"));
-                }
-                let returned = instruction.inputs[0];
-                if reprs.representation(returned) != Representation::Int32 {
-                    return Err(Unsupported::Opcode(instruction.op));
-                }
-                let conversion = reprs.conversions().iter().find(|conversion| {
-                    conversion.at_pc == instruction.pc && conversion.operand_index == 0
-                });
-                if !matches!(
-                    conversion,
-                    Some(conversion)
-                        if conversion.value == returned
-                            && conversion.kind == ConversionKind::BoxInt32
-                            && !conversion.may_deopt
-                ) {
-                    return Err(Unsupported::OperandShape(
-                        "optimizing return requires int32 boxing",
-                    ));
-                }
-                allowed_conversions.insert((instruction.pc, 0));
-            }
-            other => return Err(Unsupported::Opcode(other)),
         }
     }
 
@@ -286,8 +333,8 @@ fn check_eligibility(
         ));
     }
 
-    let mut guarded_params = Vec::with_capacity(used_params.len());
-    for (value, (index, first_use_pc)) in used_params {
+    let mut guarded_params = Vec::with_capacity(guarded_uses.len());
+    for ((use_pc, value), index) in guarded_uses {
         let offset = index
             .checked_mul(STACK_SLOT_BYTES)
             .ok_or(Unsupported::OperandShape("optimizing parameter offset"))?;
@@ -299,12 +346,64 @@ fn check_eligibility(
         guarded_params.push(GuardedParam {
             value,
             index,
-            first_use_pc,
-            deopt_byte_pc: byte_pc(view, first_use_pc)?,
+            use_pc,
+            deopt_byte_pc: byte_pc(view, use_pc)?,
         });
     }
-    guarded_params.sort_by_key(|param| param.index);
+    guarded_params.sort_by_key(|param| (param.use_pc, param.index, param.value));
     Ok(Eligibility { guarded_params })
+}
+
+fn check_int32_inputs(
+    instruction: &SsaInstr,
+    ssa: &SsaFunction,
+    reprs: &ReprMap,
+    guarded_uses: &mut BTreeMap<(u32, ValueId), u32>,
+    allowed_conversions: &mut BTreeSet<(u32, usize)>,
+) -> Result<(), Unsupported> {
+    for (operand_index, &input) in instruction.inputs.iter().enumerate() {
+        match reprs.representation(input) {
+            Representation::Int32 => {}
+            Representation::Tagged => {
+                let ValueDef::Param { index, .. } = ssa.values[input.0 as usize].def else {
+                    return Err(Unsupported::Opcode(instruction.op));
+                };
+                let conversion = reprs.conversions().iter().find(|conversion| {
+                    conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+                });
+                if !matches!(
+                    conversion,
+                    Some(conversion)
+                        if conversion.value == input
+                            && conversion.kind == ConversionKind::CheckedTaggedToInt32
+                            && conversion.may_deopt
+                ) {
+                    return Err(Unsupported::Opcode(instruction.op));
+                }
+                guarded_uses.insert((instruction.pc, input), index);
+                allowed_conversions.insert((instruction.pc, operand_index));
+            }
+            Representation::Float64 => return Err(Unsupported::Opcode(instruction.op)),
+        }
+    }
+    Ok(())
+}
+
+fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
+    matches!(
+        ssa.values[value.0 as usize].def,
+        ValueDef::Op {
+            op: Op::LoadTrue
+                | Op::LoadFalse
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual,
+            ..
+        }
+    )
 }
 
 fn check_constant_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), Unsupported> {
@@ -312,6 +411,16 @@ fn check_constant_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), 
         .result
         .ok_or(Unsupported::OperandShape("optimizing constant result"))?;
     if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Int32 {
+        return Err(Unsupported::Opcode(instruction.op));
+    }
+    Ok(())
+}
+
+fn check_boolean_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), Unsupported> {
+    let result = instruction
+        .result
+        .ok_or(Unsupported::OperandShape("optimizing boolean result"))?;
+    if !instruction.inputs.is_empty() || reprs.representation(result) != Representation::Tagged {
         return Err(Unsupported::Opcode(instruction.op));
     }
     Ok(())
@@ -343,6 +452,8 @@ fn byte_pc(view: &JitCompileSnapshot, pc: u32) -> Result<u32, Unsupported> {
 
 fn emit(
     view: &JitCompileSnapshot,
+    cfg: &ControlFlowGraph,
+    rpo: &[BlockId],
     ssa: &SsaFunction,
     allocation: &Allocation,
     eligibility: &Eligibility,
@@ -351,6 +462,9 @@ fn emit(
     let spill_frame_bytes = aligned_spill_bytes(allocation.spill_slot_count)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
     let mut deopt_exits = Vec::<(DynamicLabel, u32)>::new();
+    let block_labels: Vec<_> = (0..cfg.blocks.len())
+        .map(|_| ops.new_dynamic_label())
+        .collect();
     let entry = ops.offset();
     emit_prologue(&mut ops, spill_frame_bytes);
 
@@ -369,84 +483,160 @@ fn emit(
         }
     }
 
-    for instruction in &ssa.blocks[0].instrs {
-        for param in eligibility
-            .guarded_params
-            .iter()
-            .filter(|param| param.first_use_pc == instruction.pc)
-        {
-            let deopt = ops.new_dynamic_label();
-            emit_load_tagged_location(&mut ops, allocation.location(param.value), 9)?;
-            dynasm!(ops
-                ; .arch aarch64
-                ; lsr x10, x9, #48
-                ; movz x11, #0xfffe
-                ; cmp x10, x11
-                ; b.ne =>deopt
-            );
-            deopt_exits.push((deopt, param.deopt_byte_pc));
-        }
-        match instruction.op {
-            Op::LoadInt32 => {
-                let value = load_int32(view, instruction.pc)?;
-                emit_load_i32(&mut ops, 9, value);
-                emit_store_location(
-                    &mut ops,
-                    allocation.location(instruction.result.expect("eligibility checked result")),
-                    9,
-                )?;
-            }
-            Op::LoadNumber => {
-                let value = exact_load_number(view, instruction.pc)?;
-                emit_load_i32(&mut ops, 9, value);
-                emit_store_location(
-                    &mut ops,
-                    allocation.location(instruction.result.expect("eligibility checked result")),
-                    9,
-                )?;
-            }
-            Op::Add | Op::Sub | Op::Mul => {
-                emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
-                emit_load_location(&mut ops, allocation.location(instruction.inputs[1]), 10)?;
+    for block_id in rpo.iter().copied() {
+        let block = &cfg.blocks[block_id.0 as usize];
+        let label = block_labels[block_id.0 as usize];
+        dynasm!(ops ; .arch aarch64 ; =>label);
+        for instruction in &ssa.blocks[block_id.0 as usize].instrs {
+            for param in eligibility
+                .guarded_params
+                .iter()
+                .filter(|param| param.use_pc == instruction.pc)
+            {
                 let deopt = ops.new_dynamic_label();
-                match instruction.op {
-                    Op::Add => dynasm!(ops
-                        ; .arch aarch64
-                        ; adds w11, w9, w10
-                        ; b.vs =>deopt
-                    ),
-                    Op::Sub => dynasm!(ops
-                        ; .arch aarch64
-                        ; subs w11, w9, w10
-                        ; b.vs =>deopt
-                    ),
-                    Op::Mul => dynasm!(ops
-                        ; .arch aarch64
-                        ; smull x11, w9, w10
-                        ; sxtw x12, w11
-                        ; cmp x11, x12
-                        ; b.ne =>deopt
-                    ),
-                    _ => unreachable!(),
-                }
-                emit_store_location(
-                    &mut ops,
-                    allocation.location(instruction.result.expect("eligibility checked result")),
-                    11,
-                )?;
-                deopt_exits.push((deopt, byte_pc(view, instruction.pc)?));
-            }
-            Op::Return | Op::ReturnValue => {
-                emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
+                emit_load_tagged_location(&mut ops, allocation.location(param.value), 9)?;
                 dynasm!(ops
                     ; .arch aarch64
-                    ; movz x10, #0xfffe, lsl #48
-                    ; orr x0, x10, x9
-                    ; movz x1, STATUS_RETURNED as u32
+                    ; lsr x10, x9, #48
+                    ; movz x11, #0xfffe
+                    ; cmp x10, x11
+                    ; b.ne =>deopt
                 );
-                emit_epilogue(&mut ops, spill_frame_bytes);
+                deopt_exits.push((deopt, param.deopt_byte_pc));
             }
-            _ => unreachable!("eligibility rejected unsupported opcode"),
+            match instruction.op {
+                Op::LoadInt32 => {
+                    let value = load_int32(view, instruction.pc)?;
+                    emit_load_i32(&mut ops, 9, value);
+                    emit_store_location(
+                        &mut ops,
+                        allocation
+                            .location(instruction.result.expect("eligibility checked result")),
+                        9,
+                    )?;
+                }
+                Op::LoadNumber => {
+                    let value = exact_load_number(view, instruction.pc)?;
+                    emit_load_i32(&mut ops, 9, value);
+                    emit_store_location(
+                        &mut ops,
+                        allocation
+                            .location(instruction.result.expect("eligibility checked result")),
+                        9,
+                    )?;
+                }
+                Op::LoadTrue | Op::LoadFalse => {
+                    let value = if instruction.op == Op::LoadTrue {
+                        VALUE_TRUE
+                    } else {
+                        VALUE_FALSE
+                    };
+                    emit_load_u32(&mut ops, 9, value as u32);
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation
+                            .location(instruction.result.expect("eligibility checked result")),
+                        9,
+                    )?;
+                }
+                Op::Add | Op::Sub | Op::Mul => {
+                    emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
+                    emit_load_location(&mut ops, allocation.location(instruction.inputs[1]), 10)?;
+                    let deopt = ops.new_dynamic_label();
+                    match instruction.op {
+                        Op::Add => dynasm!(ops
+                            ; .arch aarch64
+                            ; adds w11, w9, w10
+                            ; b.vs =>deopt
+                        ),
+                        Op::Sub => dynasm!(ops
+                            ; .arch aarch64
+                            ; subs w11, w9, w10
+                            ; b.vs =>deopt
+                        ),
+                        Op::Mul => dynasm!(ops
+                            ; .arch aarch64
+                            ; smull x11, w9, w10
+                            ; sxtw x12, w11
+                            ; cmp x11, x12
+                            ; b.ne =>deopt
+                        ),
+                        _ => unreachable!(),
+                    }
+                    emit_store_location(
+                        &mut ops,
+                        allocation
+                            .location(instruction.result.expect("eligibility checked result")),
+                        11,
+                    )?;
+                    deopt_exits.push((deopt, byte_pc(view, instruction.pc)?));
+                }
+                Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Equal
+                | Op::NotEqual => {
+                    emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
+                    emit_load_location(&mut ops, allocation.location(instruction.inputs[1]), 10)?;
+                    emit_comparison(&mut ops, instruction.op);
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation
+                            .location(instruction.result.expect("eligibility checked result")),
+                        11,
+                    )?;
+                }
+                Op::Jump => {
+                    let target = block.normal_succs[0];
+                    emit_edge_moves(&mut ops, edge_moves(allocation, block_id, target)?)?;
+                    let target_label = block_labels[target.0 as usize];
+                    dynasm!(ops ; .arch aarch64 ; b =>target_label);
+                }
+                Op::JumpIfTrue | Op::JumpIfFalse => {
+                    let Terminator::Branch { taken, fallthrough } = block.terminator else {
+                        unreachable!("eligibility checked branch terminator");
+                    };
+                    emit_load_tagged_location(
+                        &mut ops,
+                        allocation.location(instruction.inputs[0]),
+                        9,
+                    )?;
+                    emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
+                    let taken_edge = ops.new_dynamic_label();
+                    if instruction.op == Op::JumpIfTrue {
+                        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.eq =>taken_edge);
+                    } else {
+                        dynasm!(ops ; .arch aarch64 ; cmp x9, x10 ; b.ne =>taken_edge);
+                    }
+
+                    emit_edge_moves(&mut ops, edge_moves(allocation, block_id, fallthrough)?)?;
+                    let fallthrough_label = block_labels[fallthrough.0 as usize];
+                    dynasm!(ops ; .arch aarch64 ; b =>fallthrough_label ; =>taken_edge);
+
+                    emit_edge_moves(&mut ops, edge_moves(allocation, block_id, taken)?)?;
+                    let taken_label = block_labels[taken.0 as usize];
+                    dynasm!(ops ; .arch aarch64 ; b =>taken_label);
+                }
+                Op::Return | Op::ReturnValue => {
+                    emit_load_location(&mut ops, allocation.location(instruction.inputs[0]), 9)?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; movz x10, #0xfffe, lsl #48
+                        ; orr x0, x10, x9
+                        ; movz x1, STATUS_RETURNED as u32
+                    );
+                    emit_epilogue(&mut ops, spill_frame_bytes);
+                }
+                _ => unreachable!("eligibility rejected unsupported opcode"),
+            }
+        }
+
+        if block.terminator == Terminator::FallThrough {
+            let target = block.normal_succs[0];
+            emit_edge_moves(&mut ops, edge_moves(allocation, block_id, target)?)?;
+            let target_label = block_labels[target.0 as usize];
+            dynasm!(ops ; .arch aarch64 ; b =>target_label);
         }
     }
 
@@ -467,6 +657,88 @@ fn emit(
         .finalize()
         .expect("arm64 optimizing assembler finalization");
     Ok(CompiledCode::new(buffer, entry))
+}
+
+fn emit_comparison(ops: &mut Assembler, op: Op) {
+    dynasm!(ops ; .arch aarch64 ; cmp w9, w10);
+    match op {
+        Op::LessThan => dynasm!(ops ; .arch aarch64 ; cset w11, lt),
+        Op::LessEq => dynasm!(ops ; .arch aarch64 ; cset w11, le),
+        Op::GreaterThan => dynasm!(ops ; .arch aarch64 ; cset w11, gt),
+        Op::GreaterEq => dynasm!(ops ; .arch aarch64 ; cset w11, ge),
+        Op::Equal => dynasm!(ops ; .arch aarch64 ; cset w11, eq),
+        Op::NotEqual => dynasm!(ops ; .arch aarch64 ; cset w11, ne),
+        _ => unreachable!("eligibility checked comparison"),
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz w12, VALUE_FALSE_LOW
+        ; add w11, w11, w12
+    );
+}
+
+fn edge_moves(
+    allocation: &Allocation,
+    predecessor: BlockId,
+    block: BlockId,
+) -> Result<&EdgeMoves, Unsupported> {
+    allocation
+        .edge_moves
+        .iter()
+        .find(|edge| edge.predecessor == predecessor && edge.block == block)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing edge is missing phi moves",
+        ))
+}
+
+fn emit_edge_moves(ops: &mut Assembler, edge: &EdgeMoves) -> Result<(), Unsupported> {
+    for &movement in &edge.moves {
+        emit_move(ops, movement)?;
+    }
+    Ok(())
+}
+
+fn emit_move(ops: &mut Assembler, movement: Move) -> Result<(), Unsupported> {
+    match (movement.src, movement.dst) {
+        (Location::Register(src), Location::Register(dst)) => {
+            let src = move_register(src)?;
+            let dst = move_register(dst)?;
+            dynasm!(ops ; .arch aarch64 ; mov W(dst), W(src));
+        }
+        (Location::Register(src), Location::Spill(dst)) => {
+            let src = move_register(src)?;
+            let offset = spill_offset(dst)?;
+            dynasm!(ops ; .arch aarch64 ; str W(src), [sp, offset]);
+        }
+        (Location::Spill(src), Location::Register(dst)) => {
+            let dst = move_register(dst)?;
+            let offset = spill_offset(src)?;
+            dynasm!(ops ; .arch aarch64 ; ldr W(dst), [sp, offset]);
+        }
+        (Location::Spill(src), Location::Spill(dst)) => {
+            let src_offset = spill_offset(src)?;
+            let dst_offset = spill_offset(dst)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr w9, [sp, src_offset]
+                ; str w9, [sp, dst_offset]
+            );
+        }
+    }
+    Ok(())
+}
+
+fn move_register(register: u8) -> Result<u8, Unsupported> {
+    if register == ALLOCATABLE_REGISTER_COUNT {
+        Ok(12)
+    } else {
+        VALUE_REGISTERS
+            .get(register as usize)
+            .copied()
+            .ok_or(Unsupported::OperandShape(
+                "optimizing phi move register mapping",
+            ))
+    }
 }
 
 fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
@@ -750,7 +1022,15 @@ mod tests {
         for pc in 0..view.instructions.len() {
             if matches!(
                 view.instructions[pc].op(&view.code_block),
-                Op::Add | Op::Sub | Op::Mul
+                Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
+                    | Op::Equal
+                    | Op::NotEqual
             ) {
                 view.seed_arith_feedback_for_test(pc as u32, ArithFeedback::from_bits(ARITH_INT32));
             }
@@ -834,6 +1114,259 @@ mod tests {
         let result = execute(&code, &[box_i32(6), box_i32(4), box_i32(3)]);
         assert_eq!(result.status, OPTIMIZED_STATUS_RETURNED);
         assert_eq!(unbox_i32(result.value), 23);
+    }
+
+    #[test]
+    fn executes_if_else_with_distinct_values() {
+        let view = view(
+            2,
+            4,
+            vec![
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(11)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(22)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        );
+        let code = compile(&view, 7).expect("if/else is eligible");
+
+        let taken = execute(&code, &[box_i32(3), box_i32(8)]);
+        assert_eq!(taken.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(unbox_i32(taken.value), 11);
+
+        let fallthrough = execute(&code, &[box_i32(9), box_i32(4)]);
+        assert_eq!(fallthrough.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(unbox_i32(fallthrough.value), 22);
+    }
+
+    #[test]
+    fn executes_max_diamond_phi_in_both_orders() {
+        let view = view(
+            2,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (
+                    Op::GreaterThan,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(3)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(0),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(1)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+            ],
+        );
+        let cfg = ControlFlowGraph::build(&view).expect("diamond CFG");
+        let ssa = SsaFunction::build(&view, &cfg).expect("diamond SSA");
+        let phi_block =
+            ssa.blocks
+                .iter()
+                .find(|block| {
+                    block.phis.iter().any(|value| {
+                        matches!(ssa.values[value.0 as usize].def, ValueDef::Phi { .. })
+                    })
+                })
+                .expect("diamond must contain a join phi")
+                .id;
+        let liveness = Liveness::compute(&ssa, &cfg);
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, ALLOCATABLE_REGISTER_COUNT)
+            .expect("diamond allocation");
+        let incoming: Vec<_> = allocation
+            .edge_moves
+            .iter()
+            .filter(|edge| edge.block == phi_block)
+            .collect();
+        assert_eq!(incoming.len(), 2);
+        assert!(
+            incoming.iter().any(|edge| !edge.moves.is_empty()),
+            "fixture must execute a concrete phi edge move"
+        );
+        let code = compile(&view, 8).expect("max diamond is eligible");
+
+        let left = execute(&code, &[box_i32(19), box_i32(7)]);
+        assert_eq!(left.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(unbox_i32(left.value), 19);
+
+        let right = execute(&code, &[box_i32(-4), box_i32(12)]);
+        assert_eq!(right.status, OPTIMIZED_STATUS_RETURNED);
+        assert_eq!(unbox_i32(right.value), 12);
+    }
+
+    #[test]
+    fn executes_nested_if() {
+        let view = view(
+            3,
+            6,
+            vec![
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(6), Operand::Register(3)],
+                ),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(4)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(5), Operand::Imm32(11)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(5)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(5), Operand::Imm32(22)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(5)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(5), Operand::Imm32(33)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(5)]),
+            ],
+        );
+        let code = compile(&view, 9).expect("nested if is eligible");
+
+        assert_eq!(
+            unbox_i32(execute(&code, &[box_i32(1), box_i32(2), box_i32(3)]).value),
+            11
+        );
+        assert_eq!(
+            unbox_i32(execute(&code, &[box_i32(1), box_i32(4), box_i32(3)]).value),
+            22
+        );
+        assert_eq!(
+            unbox_i32(execute(&code, &[box_i32(5), box_i32(2), box_i32(3)]).value),
+            33
+        );
+    }
+
+    #[test]
+    fn non_entry_block_overflow_deopts() {
+        let view = view(
+            1,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (Op::LoadTrue, vec![Operand::Register(2)]),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(2)],
+                ),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(3), Operand::Imm32(i32::MAX)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(3),
+                        Operand::Register(0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+                (Op::LoadInt32, vec![Operand::Register(4), Operand::Imm32(7)]),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+            ],
+        );
+        let code = compile(&view, 10).expect("branch-local overflow is eligible");
+        let (result, frame) = execute_with_frame(&code, &[box_i32(1)]);
+        assert_eq!(result.status, OPTIMIZED_STATUS_DEOPT);
+        assert_eq!(result.value, u64::from(4 * STRIDE + 3));
+        assert_eq!(frame[0], box_i32(1));
+        assert_eq!(frame[1], box_i32(0));
+        assert_eq!(frame[2], VALUE_TRUE);
+        assert_eq!(frame[3], box_i32(i32::MAX));
+    }
+
+    #[test]
+    fn executes_strict_int32_equality_branch() {
+        let view = view(
+            2,
+            4,
+            vec![
+                (
+                    Op::Equal,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(2)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(0)]),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        );
+        let code = compile(&view, 11).expect("strict equality branch is eligible");
+        assert_eq!(
+            unbox_i32(execute(&code, &[box_i32(6), box_i32(6)]).value),
+            1
+        );
+        assert_eq!(
+            unbox_i32(execute(&code, &[box_i32(6), box_i32(7)]).value),
+            0
+        );
     }
 
     #[test]
@@ -985,5 +1518,18 @@ mod tests {
             ],
         );
         assert!(compile(&view, 6).is_err());
+    }
+
+    #[test]
+    fn refuses_back_edge() {
+        let view = view(
+            0,
+            1,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(1)]),
+                (Op::Jump, vec![Operand::Imm32(-2)]),
+            ],
+        );
+        assert!(compile(&view, 12).is_err());
     }
 }

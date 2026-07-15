@@ -18,6 +18,8 @@
 //! - GPR and FP values have independent register files and spill namespaces.
 //! - Phi edge moves preserve parallel-copy semantics; each class reserves its
 //!   register-budget count as a move-only scratch never assigned to a value.
+//! - Structurally dead phis emit no edge copy. Backends initialize their homes
+//!   to a representation-valid value at block entry for safe deopt writeback.
 //! - Allocation reads immutable SSA, CFG, and liveness data and has no runtime
 //!   effect.
 //!
@@ -1228,6 +1230,9 @@ fn phi_move_requirements(
         .expect("normal edge source is a normal predecessor");
     let mut requirements = Vec::new();
     for &phi in &ssa.blocks[block.0 as usize].phis {
+        if is_dead_phi(ssa, phi) {
+            continue;
+        }
         let phi_index = value_index(phi, ssa.values.len())?;
         let ValueDef::Phi { inputs, .. } = &ssa.values[phi_index].def else {
             continue;
@@ -1269,6 +1274,49 @@ fn phi_move_requirements(
         ));
     }
     Ok(requirements)
+}
+
+/// Return whether `value` is a phi with no SSA instruction or phi-input use.
+/// Such a value can only name compiler scratch state retained for complete
+/// frame reconstruction; it cannot affect JavaScript execution.
+pub(crate) fn is_dead_phi(ssa: &SsaFunction, value: ValueId) -> bool {
+    if !matches!(
+        ssa.values.get(value.0 as usize).map(|data| &data.def),
+        Some(ValueDef::Phi { .. })
+    ) {
+        return false;
+    }
+    !ssa.blocks.iter().any(|block| {
+        block
+            .instrs
+            .iter()
+            .any(|instruction| instruction.inputs.contains(&value))
+            || block.phis.iter().copied().any(|phi| {
+                matches!(
+                    &ssa.values[phi.0 as usize].def,
+                    ValueDef::Phi { inputs, .. } if inputs.contains(&value)
+                )
+            })
+    })
+}
+
+/// Return whether `value` reaches an instruction or a non-dead phi. Inputs
+/// consumed only by a structurally dead compiler-scratch phi are not semantic
+/// live-outs and require no transition reload.
+pub(crate) fn has_non_dead_use(ssa: &SsaFunction, value: ValueId) -> bool {
+    ssa.blocks.iter().any(|block| {
+        block
+            .instrs
+            .iter()
+            .any(|instruction| instruction.inputs.contains(&value))
+            || block.phis.iter().copied().any(|phi| {
+                !is_dead_phi(ssa, phi)
+                    && matches!(
+                        &ssa.values[phi.0 as usize].def,
+                        ValueDef::Phi { inputs, .. } if inputs.contains(&value)
+                    )
+            })
+    })
 }
 
 fn sequentialize_class_moves(

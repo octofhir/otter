@@ -1,4 +1,4 @@
-//! Feedback-guided optimizing tier for reducible numeric and element-load functions.
+//! Feedback-guided optimizing tier for reducible numeric and element-access functions.
 //!
 //! This module compiles multi-block int32 and float64 arithmetic functions,
 //! including reducible loops entered only at function entry. It runs
@@ -9,16 +9,17 @@
 //! interrupt and fuel cells before returning to its dominating header.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
 //! reconstructs the interpreter register window in place before every bail and
-//! publishes only precise tagged roots around allocating element-load transitions.
+//! publishes only precise tagged roots around allocating element transitions.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
 //!
 //! # Invariants
-//! - Every `LoadElement` materializes its operands plus tagged SSA values live
-//!   across the call, publishes a code-object-owned precise frame bitmap, and
-//!   reloads only locations that moving GC can rewrite.
+//! - Every `LoadElement` / `StoreElement` materializes its operands plus tagged
+//!   SSA values live across the call, publishes a code-object-owned precise
+//!   frame bitmap, and reloads only locations that moving GC can rewrite.
+//!   Store scratch slots remain non-roots and may be clobbered by the runtime.
 //! - Every backwards bytecode edge targets a header that dominates its predecessor;
 //!   irreducible loops and exception edges are rejected.
 //! - The sole ABI argument is a dynamically valid `JitCtx`; parameters and

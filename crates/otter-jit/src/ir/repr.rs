@@ -12,6 +12,8 @@
 //! # Invariants
 //! - Representations widen monotonically as `Int32 < Float64 < Tagged`.
 //! - Phi representations are the least upper bound of all incoming values.
+//! - `LoadLocal` / `StoreLocal` preserve their input representation; local
+//!   bytecode moves never force an otherwise numeric SSA value to be boxed.
 //! - Speculative numeric representations require arithmetic feedback from the
 //!   immutable compile snapshot.
 //! - Conversions are complete, unique, and ordered by canonical PC and operand.
@@ -176,7 +178,11 @@ impl ReprMap {
             .values
             .iter()
             .map(|value| match value.def {
-                ValueDef::Phi { .. } => Representation::Int32,
+                ValueDef::Phi { .. }
+                | ValueDef::Op {
+                    op: Op::LoadLocal | Op::StoreLocal,
+                    ..
+                } => Representation::Int32,
                 _ => selected_non_phi_representation(view, &value.def),
             })
             .collect();
@@ -184,12 +190,19 @@ impl ReprMap {
         loop {
             let mut changed = false;
             for value in &ssa.values {
-                let ValueDef::Phi { inputs, .. } = &value.def else {
-                    continue;
+                let widened = match &value.def {
+                    ValueDef::Phi { inputs, .. } => {
+                        inputs.iter().fold(Representation::Int32, |acc, input| {
+                            meet(acc, reprs[input.0 as usize])
+                        })
+                    }
+                    ValueDef::Op {
+                        op: Op::LoadLocal | Op::StoreLocal,
+                        inputs,
+                        ..
+                    } if inputs.len() == 1 => reprs[inputs[0].0 as usize],
+                    _ => continue,
                 };
-                let widened = inputs.iter().fold(Representation::Int32, |acc, input| {
-                    meet(acc, reprs[input.0 as usize])
-                });
                 let slot = &mut reprs[value.id.0 as usize];
                 if *slot != widened {
                     *slot = widened;
@@ -204,8 +217,14 @@ impl ReprMap {
         let mut conversions = Vec::new();
         for block in &ssa.blocks {
             for instruction in &block.instrs {
-                let required =
-                    selected_input_representation(instruction.op, view.feedback_at(instruction.pc));
+                let required = if matches!(instruction.op, Op::LoadLocal | Op::StoreLocal) {
+                    reprs[instruction
+                        .result
+                        .expect("local moves have one SSA result")
+                        .0 as usize]
+                } else {
+                    selected_input_representation(instruction.op, view.feedback_at(instruction.pc))
+                };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let from = reprs[value.0 as usize];
                     if let Some((kind, may_deopt)) = conversion_kind(from, required) {
@@ -267,7 +286,14 @@ impl ReprMap {
                     }
                 }
                 def => {
-                    let expected = verified_non_phi_representation(view, def);
+                    let expected = match def {
+                        ValueDef::Op {
+                            op: Op::LoadLocal | Op::StoreLocal,
+                            inputs,
+                            ..
+                        } if inputs.len() == 1 => self.representation(inputs[0]),
+                        _ => verified_non_phi_representation(view, def),
+                    };
                     let actual = self.representation(value.id);
                     if actual != expected {
                         return Err(ReprError::ValueRepresentationMismatch {
@@ -304,8 +330,13 @@ impl ReprMap {
 
         for block in &ssa.blocks {
             for instruction in &block.instrs {
-                let required =
-                    verified_input_representation(instruction.op, view.feedback_at(instruction.pc));
+                let required = if matches!(instruction.op, Op::LoadLocal | Op::StoreLocal) {
+                    self.representation(
+                        instruction.result.expect("local moves have one SSA result"),
+                    )
+                } else {
+                    verified_input_representation(instruction.op, view.feedback_at(instruction.pc))
+                };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let key = (instruction.pc, operand_index);
                     let from = self.representation(value);

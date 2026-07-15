@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
-use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
+use otter_vm::deopt::{DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
@@ -2375,7 +2375,14 @@ fn emit(
             .ok_or(Unsupported::OperandShape(
                 "optimizing deopt exit missing frame state",
             ))?;
-        emit_deopt_writeback(&mut ops, allocation, frame_state)?;
+        // Eligibility rejects spliced frames, so an exit owes the interpreter
+        // this function's frame and nothing else.
+        if !frame_state.is_single_frame() {
+            return Err(Unsupported::OperandShape(
+                "optimizing deopt exit owes an inlined frame chain",
+            ));
+        }
+        emit_deopt_writeback(&mut ops, allocation, frame_state.outermost())?;
         emit_load_u32(&mut ops, 9, resume_pc);
         dynasm!(ops
             ; .arch aarch64
@@ -2828,9 +2835,9 @@ fn emit_osr_materialization(
 fn emit_deopt_writeback(
     ops: &mut Assembler,
     allocation: &Allocation,
-    frame_state: &FrameState,
+    frame: &DeoptFrame,
 ) -> Result<(), Unsupported> {
-    for (register, slot) in frame_state.slots.iter().enumerate() {
+    for (register, slot) in frame.slots.iter().enumerate() {
         match slot.location {
             DeoptLocation::Register(machine_register) => match slot.repr {
                 DeoptRepr::Int32 | DeoptRepr::Tagged => {

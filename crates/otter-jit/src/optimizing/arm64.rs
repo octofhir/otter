@@ -650,10 +650,10 @@ fn check_eligibility(
                         &mut allowed_conversions,
                     )?;
                 }
-                Op::Div => {
+                Op::Div | Op::Rem => {
                     let result = instruction
                         .result
-                        .ok_or(Unsupported::OperandShape("division result"))?;
+                        .ok_or(Unsupported::OperandShape("float arithmetic result"))?;
                     if reprs.representation(result) != Representation::Float64
                         || instruction.inputs.len() != 2
                     {
@@ -1810,7 +1810,7 @@ fn emit(
                     emit_store_location(&mut ops, allocation.location(result), 11)?;
                     deopt_exits.push((deopt, byte_pc(view, instruction.pc)?, instruction.pc));
                 }
-                Op::Add | Op::Sub | Op::Mul | Op::Div => {
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let result = instruction.result.expect("eligibility checked result");
                     match reprs.representation(result) {
                         Representation::Int32 => {
@@ -1896,6 +1896,37 @@ fn emit(
                                     ; .arch aarch64
                                     ; fdiv D(FP_SCRATCH), D(FP_SCRATCH), D(FP_SCRATCH_2)
                                 ),
+                                Op::Rem => {
+                                    // AArch64 has no IEEE-754 fmod instruction.
+                                    // Box the proven numeric operands and call the
+                                    // frozen non-allocating exact remainder leaf,
+                                    // then recover the unboxed Float64 result.
+                                    emit_box_double(&mut ops, FP_SCRATCH, 1);
+                                    emit_box_double(&mut ops, FP_SCRATCH_2, 2);
+                                    dynasm!(ops
+                                        ; .arch aarch64
+                                        ; ldr x0, [x20, THREAD_OFFSET]
+                                        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+                                    );
+                                    emit_load_u64(
+                                        &mut ops,
+                                        16,
+                                        otter_vm::runtime_stubs::NUMBER_REM_LEAF.entry_addr()
+                                            as u64,
+                                    );
+                                    let deopt = ops.new_dynamic_label();
+                                    dynasm!(ops
+                                        ; .arch aarch64
+                                        ; blr x16
+                                        ; cbnz x1, =>deopt
+                                    );
+                                    emit_num_to_double(&mut ops, 0, FP_SCRATCH, deopt);
+                                    deopt_exits.push((
+                                        deopt,
+                                        byte_pc(view, instruction.pc)?,
+                                        instruction.pc,
+                                    ));
+                                }
                                 _ => unreachable!(),
                             }
                             emit_store_fp_location(
@@ -3946,6 +3977,40 @@ mod tests {
         let result = execute(&code, &[]);
         assert_eq!(result.status, STATUS_RETURNED);
         assert_eq!(result.value, box_f64(3.5));
+    }
+
+    #[test]
+    fn executes_float_remainder_with_exact_edge_semantics() {
+        let view = float_view(
+            2,
+            3,
+            vec![
+                (
+                    Op::Rem,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            &[0],
+            &[],
+        );
+        let code = compile(&view, 116).expect("float remainder is eligible");
+
+        let fractional = execute(&code, &[box_f64(7.5), box_f64(2.0)]);
+        assert_eq!(fractional.status, STATUS_RETURNED);
+        assert_eq!(fractional.value, box_f64(1.5));
+
+        let negative_zero = execute(&code, &[box_f64(-6.0), box_f64(3.0)]);
+        assert_eq!(negative_zero.status, STATUS_RETURNED);
+        assert_eq!(negative_zero.value, box_f64(-0.0));
+
+        let zero_divisor = execute(&code, &[box_f64(7.5), box_f64(0.0)]);
+        assert_eq!(zero_divisor.status, STATUS_RETURNED);
+        assert_eq!(zero_divisor.value, box_f64(f64::NAN));
     }
 
     #[test]

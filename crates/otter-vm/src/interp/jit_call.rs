@@ -1263,7 +1263,55 @@ impl Interpreter {
     /// every allocating step.
     ///
     /// # Safety-adjacent contract
-    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
+     /// Rebuild an inlined callee's interpreter frame at a deopt exit.
+    ///
+    /// The optimized code has already written the caller's registers back into
+    /// its window and is about to hand control to the interpreter, but the
+    /// callee body it had spliced in owes the interpreter a frame of its own.
+    ///
+    /// Rather than reproduce the call's frame setup — the upvalue spine, `this`,
+    /// argument binding, the register window — this rewinds the caller to its
+    /// call and runs the interpreter's own `Op::Call` path over the restored
+    /// window. The frame that comes out is by construction the frame a real call
+    /// would have produced, including the advanced caller PC and the return
+    /// register the callee's eventual return writes through.
+    ///
+    /// Returns the new frame's register-window base. The emitted code then
+    /// fast-forwards that frame to where the optimized code actually was.
+    ///
+    /// # Safety
+    /// `stack`'s top frame must be the caller, with its registers already
+    /// restored, and `call_pc` must name an `Op::Call` in the caller's body.
+    pub unsafe fn jit_deopt_reify_inlined_frame(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut HoltStack,
+        call_pc: u32,
+    ) -> Result<*mut crate::Value, VmError> {
+        let caller_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
+        let function_id = stack[caller_index].function_id;
+        let code_block = context
+            .exec_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let instruction = code_block
+            .instr_at_index(call_pc as usize)
+            .ok_or(VmError::InvalidOperand)?;
+        if code_block.op(instruction) != otter_bytecode::Op::Call {
+            return Err(VmError::InvalidOperand);
+        }
+        stack[caller_index].pc = call_pc;
+        let operands = code_block.operand_view(instruction);
+        self.do_call(stack, context, operands)?;
+        // A bytecode callee is now on top; a native or otherwise non-bytecode
+        // callee would have completed in place, which the identity guard at the
+        // spliced call site rules out.
+        if stack.len() != caller_index + 2 {
+            return Err(VmError::InvalidOperand);
+        }
+        Ok(stack[caller_index + 1].registers.as_mut_ptr())
+    }
+
+   /// `caller_regs` is the caller's live register window (`JitCtx.regs`);
     /// compiled code guarantees the destination/receiver/argument registers
     /// are in bounds for that window.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]

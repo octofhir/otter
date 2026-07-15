@@ -1156,6 +1156,28 @@ pub const STUB_JIT_RESOLVE_THREW: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Rebuild the interpreter frame of an inlined callee at a deopt exit.
+///
+/// Optimized code that splices a callee body owes the interpreter that callee's
+/// frame when it exits inside it. Rather than reproduce the call's frame setup
+/// — upvalue spine, `this`, argument binding — the stub rewinds the already
+/// written-back caller to its call and lets the interpreter's own call path
+/// build the frame, so the result is exactly the frame a real call would have
+/// produced. The emitted code then fast-forwards that frame's registers and PC
+/// to where the optimized code actually was.
+///
+/// Returns the new frame's register-window pointer, or `0` when the call path
+/// raised (a stack overflow the interpreter would also have raised).
+pub const STUB_JIT_DEOPT_REIFY_FRAME: RuntimeStubDescriptor = descriptor(
+    76,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1235,6 +1257,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         73 => "jit_class_value_op",
         74 => "jit_module_op",
         75 => "jit_resolve_threw",
+        76 => "jit_deopt_reify_frame",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1316,6 +1339,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_CLASS_VALUE_OP,
     STUB_JIT_MODULE_OP,
     STUB_JIT_RESOLVE_THREW,
+    STUB_JIT_DEOPT_REIFY_FRAME,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

@@ -25,6 +25,8 @@
 //! - `Add`/`Sub` use the arm64 signed-overflow flag and `Mul` compares its
 //!   signed 64-bit product with the sign-extended low word. Overflow bails at
 //!   the arithmetic instruction's exact logical PC; it never silently wraps.
+//!   Int32 `Neg` also bails on zero and overflow so `-0` and `-INT_MIN` retain
+//!   exact ECMAScript number semantics; Float64 `Neg` is a native `fneg`.
 //! - Every CFG edge targets a block label in reverse postorder. Sequentialized
 //!   phi moves execute only on their owning edge before its final jump.
 //!   Structurally dead compiler-scratch phis are initialized at block entry
@@ -40,7 +42,8 @@
 //!   untouched interpreter window.
 //! - Conditional inputs are tagged values. Proven booleans branch by exact
 //!   comparison with the VM's `true` immediate; all other values run the full
-//!   inline `ToBoolean` reduction before selecting an edge.
+//!   inline `ToBoolean` reduction before selecting an edge. `LogicalNot` uses
+//!   the same reduction and materializes the inverted canonical boolean.
 //! - Every reentrant transition boxes its operands plus tagged SSA values live
 //!   across the call into their interpreter-window slots. Its precise frame
 //!   bitmap names every tagged input and live-across value; moving-GC reloads
@@ -681,6 +684,37 @@ fn check_eligibility(
                         &mut guarded_uses,
                         &mut allowed_conversions,
                     )?;
+                }
+                Op::Neg => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("negate result"))?;
+                    let result_repr = reprs.representation(result);
+                    if !matches!(result_repr, Representation::Int32 | Representation::Float64)
+                        || instruction.inputs.len() != 1
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_numeric_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        result_repr,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
+                Op::LogicalNot => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("logical-not result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 1
+                        || instruction.input_registers.len() != 1
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                 }
                 Op::Div | Op::Rem => {
                     let result = instruction
@@ -1884,6 +1918,82 @@ fn emit(
                     // deopt re-runs the opcode to create the canonical TypeError.
                     deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
                 }
+                Op::LogicalNot => {
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked logical-not result");
+                    emit_load_boxed_value(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction.inputs[0],
+                        9,
+                    )?;
+                    let bail = ops.new_dynamic_label();
+                    emit_truthiness_reduce(&mut ops, bail);
+                    emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp w9, w10
+                        ; cset w11, ne
+                        ; movz w12, VALUE_FALSE_LOW
+                        ; add w11, w11, w12
+                    );
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation.location(result),
+                        11,
+                    )?;
+                    deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                }
+                Op::Neg => {
+                    let result = instruction.result.expect("eligibility checked negate result");
+                    match reprs.representation(result) {
+                        Representation::Int32 => {
+                            emit_load_int_operand(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                0,
+                                9,
+                                guard_deopt,
+                            )?;
+                            let deopt = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; cbz w9, =>deopt
+                                ; negs w11, w9
+                                ; b.vs =>deopt
+                            );
+                            emit_store_location(&mut ops, allocation.location(result), 11)?;
+                            deopt_exits.push((
+                                deopt,
+                                byte_pc(view, instruction.pc)?,
+                                instruction.pc,
+                            ));
+                        }
+                        Representation::Float64 => {
+                            emit_load_float_operand(
+                                &mut ops,
+                                reprs,
+                                allocation,
+                                instruction,
+                                0,
+                                FP_SCRATCH,
+                                guard_deopt,
+                            )?;
+                            dynasm!(ops ; .arch aarch64 ; fneg D(FP_SCRATCH), D(FP_SCRATCH));
+                            emit_store_fp_location(
+                                &mut ops,
+                                allocation,
+                                allocation.location(result),
+                                FP_SCRATCH,
+                            )?;
+                        }
+                        Representation::Tagged => unreachable!("eligibility checked negate"),
+                    }
+                }
                 Op::Increment => {
                     let result = instruction.result.expect("eligibility checked increment result");
                     let delta = view.instructions[instruction.pc as usize]
@@ -2805,6 +2915,30 @@ fn emit_materialize_frame_value(
     emit_store_frame_register(ops, u32::from(register), 9)
 }
 
+fn emit_load_boxed_value(
+    ops: &mut Assembler,
+    reprs: &ReprMap,
+    allocation: &Allocation,
+    value: ValueId,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match reprs.representation(value) {
+        Representation::Tagged => {
+            emit_load_tagged_location(ops, allocation.location(value), scratch)
+        }
+        Representation::Int32 => {
+            emit_load_location(ops, allocation.location(value), scratch)?;
+            emit_box_int32(ops, scratch, 10);
+            Ok(())
+        }
+        Representation::Float64 => {
+            emit_load_fp_location(ops, allocation, allocation.location(value), FP_SCRATCH)?;
+            emit_box_double(ops, FP_SCRATCH, scratch);
+            Ok(())
+        }
+    }
+}
+
 /// Reload every tagged value live across moving GC, then optionally load an
 /// element-load result last. Numeric homes and indices stay untouched. Store
 /// scratch slots are deliberately ignored because the runtime may clobber them.
@@ -3385,6 +3519,7 @@ mod tests {
                 Op::Add
                     | Op::Sub
                     | Op::Mul
+                    | Op::Neg
                     | Op::LessThan
                     | Op::LessEq
                     | Op::GreaterThan
@@ -4166,6 +4301,65 @@ mod tests {
         let zero_divisor = execute(&code, &[box_f64(7.5), box_f64(0.0)]);
         assert_eq!(zero_divisor.status, STATUS_RETURNED);
         assert_eq!(zero_divisor.value, box_f64(f64::NAN));
+    }
+
+    #[test]
+    fn executes_numeric_negate_and_deopts_int32_zero() {
+        let int_view = view(
+            1,
+            2,
+            vec![
+                (
+                    Op::Neg,
+                    vec![Operand::Register(1), Operand::Register(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        let int_code = compile(&int_view, 118).expect("int32 negate is eligible");
+        assert_eq!(execute(&int_code, &[box_i32(7)]).value, box_i32(-7));
+        let zero = execute(&int_code, &[box_i32(0)]);
+        assert_eq!(zero.status, STATUS_BAILED);
+
+        let float_view = float_view(
+            1,
+            2,
+            vec![
+                (
+                    Op::Neg,
+                    vec![Operand::Register(1), Operand::Register(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+            &[0],
+            &[],
+        );
+        let float_code = compile(&float_view, 119).expect("float negate is eligible");
+        assert_eq!(
+            execute(&float_code, &[box_f64(-0.0)]).value,
+            box_f64(0.0)
+        );
+    }
+
+    #[test]
+    fn logical_not_inverts_full_inline_truthiness() {
+        let view = view(
+            1,
+            2,
+            vec![
+                (
+                    Op::LogicalNot,
+                    vec![Operand::Register(1), Operand::Register(0)],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        let code = compile(&view, 120).expect("logical-not is eligible");
+
+        assert_eq!(execute(&code, &[VALUE_TRUE]).value, VALUE_FALSE);
+        assert_eq!(execute(&code, &[box_i32(0)]).value, VALUE_TRUE);
+        assert_eq!(execute(&code, &[box_f64(f64::NAN)]).value, VALUE_TRUE);
+        assert_eq!(execute(&code, &[box_f64(1.5)]).value, VALUE_FALSE);
     }
 
     #[test]

@@ -81,7 +81,8 @@ use crate::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
         MAX_METHOD_ARGS, THREAD_OFFSET,
-        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_NULL, VALUE_TRUE,
+        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
+        VALUE_TRUE,
         VALUE_UNDEFINED, pack_method_arg_regs,
         VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET,
@@ -1702,6 +1703,39 @@ fn emit(
                             "optimizing element load missing site",
                         ))?;
                     debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    // Dense fast path: guard an ordinary in-bounds dense read
+                    // and load the element directly — no window materialize, no
+                    // stub, no reload; nothing here can allocate or move. A
+                    // hole is an absent property (the prototype chain answers),
+                    // so it takes the generic path like every other miss.
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    emit_dense_element_guards(
+                        &mut ops,
+                        view,
+                        reprs,
+                        allocation,
+                        instruction.inputs[0],
+                        instruction.inputs[1],
+                        miss,
+                    )?;
+                    emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x9, [x16]
+                        ; cmp x9, x11
+                        ; b.eq =>miss
+                    );
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation.location(
+                            instruction
+                                .result
+                                .expect("eligibility checked element-load result"),
+                        ),
+                        9,
+                    )?;
+                    dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -1741,6 +1775,7 @@ fn emit(
                             ),
                         )),
                     )?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::StoreElement => {
                     let receiver = instruction.input_registers[0];
@@ -1760,6 +1795,64 @@ fn emit(
                             "optimizing element store missing site",
                         ))?;
                     debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    // Dense fast path for a numeric value: an in-bounds store
+                    // over an existing non-hole element replaces a boxed number
+                    // with a boxed number, so no write barrier can be owed (a
+                    // number is never a heap cell) and nothing can allocate. A
+                    // hole is an absent property — a prototype setter may
+                    // observe the store — and a tagged value may be a cell that
+                    // needs the generational barrier, so both take the stub.
+                    let value_repr = reprs.representation(instruction.inputs[2]);
+                    let store_fast = matches!(
+                        value_repr,
+                        Representation::Int32 | Representation::Float64
+                    );
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    if store_fast {
+                        emit_dense_element_guards(
+                            &mut ops,
+                            view,
+                            reprs,
+                            allocation,
+                            instruction.inputs[0],
+                            instruction.inputs[1],
+                            miss,
+                        )?;
+                        emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x16]
+                            ; cmp x9, x11
+                            ; b.eq =>miss
+                        );
+                        match value_repr {
+                            Representation::Int32 => {
+                                emit_load_location(
+                                    &mut ops,
+                                    allocation.location(instruction.inputs[2]),
+                                    9,
+                                )?;
+                                emit_box_int32(&mut ops, 9, 11);
+                            }
+                            Representation::Float64 => {
+                                emit_load_fp_location(
+                                    &mut ops,
+                                    allocation,
+                                    allocation.location(instruction.inputs[2]),
+                                    FP_SCRATCH,
+                                )?;
+                                emit_box_double(&mut ops, FP_SCRATCH, 9);
+                            }
+                            Representation::Tagged => unreachable!("store_fast is numeric"),
+                        }
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; str x9, [x16]
+                            ; b =>done
+                            ; =>miss
+                        );
+                    }
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -1788,6 +1881,7 @@ fn emit(
                         ; =>succeeded
                     );
                     emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LoadProperty => {
                     let dst = instruction
@@ -3779,6 +3873,78 @@ fn emit_store_tagged_location(
             return Err(Unsupported::OperandShape("optimizing FP location"));
         }
     }
+    Ok(())
+}
+
+/// Emit the dense-array fast-path guards for one element access.
+///
+/// On the hit path this leaves the element's address in `x16` and falls
+/// through; any failed guard branches to `miss`, where the reentrant stub
+/// completes the access generically. Guards, in order: the receiver is a heap
+/// cell, its body is an ordinary `ArrayBody` with no exotic sidecar, and the
+/// index is an int32 (untagged inline when its representation is `Tagged`)
+/// inside the dense bounds. The dense base and length load from the
+/// VM-maintained body cache, so `Vec` layout stays unobserved.
+///
+/// Clobbers `x9`, `x11`-`x16`.
+#[allow(clippy::too_many_arguments)]
+fn emit_dense_element_guards(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    reprs: &ReprMap,
+    allocation: &Allocation,
+    receiver: ValueId,
+    index: ValueId,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let layout = view.array_layout;
+    // Receiver: a heap cell whose body is an ordinary dense array.
+    emit_load_tagged_location(ops, allocation.location(receiver), 9)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x11, NUMBER_TAG_HI16, lsl #48
+        ; orr x11, x11, #0x2       // NOT_CELL_MASK
+        ; tst x9, x11
+        ; b.ne =>miss
+        ; mov w12, w9              // low-32 Gc offset
+    );
+    emit_load_u64(ops, 13, view.cage_base as u64);
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; ldrb w14, [x13]
+        ; cmp w14, layout.type_tag as u32
+        ; b.ne =>miss
+        ; ldr x14, [x13, layout.exotic_byte]
+        ; cbnz x14, =>miss         // exotic sidecar: stub owns the semantics
+    );
+    // Index: an int32, untagged inline when it reaches here tagged.
+    match reprs.representation(index) {
+        Representation::Int32 => {
+            emit_load_location(ops, allocation.location(index), 15)?;
+        }
+        Representation::Tagged => {
+            emit_load_tagged_location(ops, allocation.location(index), 15)?;
+            dynasm!(ops
+                ; .arch aarch64
+                ; lsr x11, x15, #48
+                ; movz x12, NUMBER_TAG_HI16
+                ; cmp x11, x12
+                ; b.ne =>miss      // not an int32 payload
+            );
+        }
+        Representation::Float64 => {
+            return Err(Unsupported::OperandShape("dense element float64 index"));
+        }
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w16, [x13, layout.dense_len_byte]
+        ; cmp w15, w16
+        ; b.hs =>miss              // unsigned: negative indices miss too
+        ; ldr x16, [x13, layout.elements_ptr_byte]
+        ; add x16, x16, w15, uxtw #3
+    );
     Ok(())
 }
 

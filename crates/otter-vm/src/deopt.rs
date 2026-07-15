@@ -138,18 +138,8 @@ pub enum DeoptVerifyError {
         /// Declared constant count.
         constant_count: u32,
     },
-    /// Deopt table entries move backwards by byte-PC.
-    EntriesNotSorted {
-        /// Earlier entry's byte-PC.
-        previous: u32,
-        /// Later entry's byte-PC.
-        current: u32,
-    },
-    /// More than one deopt entry names the same exact byte-PC.
-    DuplicateBytePc {
-        /// Duplicated byte-PC.
-        byte_pc: u32,
-    },
+    /// An exit rebuilds no frames at all.
+    EmptyFrameChain,
 }
 
 impl std::fmt::Display for DeoptVerifyError {
@@ -230,13 +220,15 @@ pub struct DeoptFrame {
 ///
 /// Optimized code may inline callee bodies, so one exit can owe the interpreter
 /// a whole chain of frames: the outermost function first, then each inlined
-/// callee it was executing, innermost last. Every frame after the first resumes
-/// a call its caller had already started, so the caller's `byte_pc` names that
-/// call instruction, not the instruction after it.
+/// callee it was executing, innermost last.
+///
+/// Only the innermost frame resumes at the instruction that exited. Every
+/// caller in the chain had already advanced past its call before its callee's
+/// frame was pushed, so a caller's `byte_pc` names the instruction *after* the
+/// call, and the register the call writes is left to the ordinary return
+/// protocol rather than restored here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameState {
-    /// Interpreter byte-PC of the outermost frame; the table's key.
-    pub byte_pc: u32,
     /// Frames to rebuild, outermost first and innermost last. Never empty.
     pub frames: Box<[DeoptFrame]>,
 }
@@ -278,12 +270,8 @@ impl FrameState {
                 max: limits.max_stack_slot_offset,
             });
         }
-        if self.frames.is_empty() || self.outermost().byte_pc != self.byte_pc {
-            return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
-                byte_pc: self.byte_pc,
-                max: limits.max_frame_slots,
-                actual: 0,
-            });
+        if self.frames.is_empty() {
+            return Err(DeoptVerifyError::EmptyFrameChain);
         }
         for frame in &self.frames {
             frame.verify(limits)?;
@@ -381,47 +369,39 @@ fn location_key(location: DeoptLocation) -> (u8, i64) {
     }
 }
 
-/// Per-compiled-function deopt table, looked up by interpreter byte-PC.
+/// Dense identity of one deopt exit in one compiled function.
 ///
-/// Sorted by `byte_pc`; [`Self::lookup`] is an exact-match binary search.
+/// An exit is the unit of deoptimization, so it is what the table is keyed by.
+/// An interpreter PC cannot key it: a body may guard the same instruction more
+/// than once, and once callee bodies are inlined every exit inside a callee
+/// projects onto its caller's one call instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeoptExitId(pub u32);
+
+/// Per-compiled-function deopt table, indexed by [`DeoptExitId`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeoptTable {
     entries: Vec<FrameState>,
 }
 
 impl DeoptTable {
-    /// Build a table from frame states. They are sorted by `byte_pc`; two
-    /// states at the same PC is a builder error (a deopt point is unique).
+    /// Build a table from frame states in exit order; the id of each is its
+    /// index.
     #[must_use]
-    pub fn from_states(mut states: Vec<FrameState>) -> Self {
-        states.sort_by_key(|s| s.byte_pc);
-        debug_assert!(
-            states.windows(2).all(|w| w[0].byte_pc != w[1].byte_pc),
-            "two frame states at the same byte_pc"
-        );
+    pub fn from_states(states: Vec<FrameState>) -> Self {
         Self { entries: states }
     }
 
-    /// Build a table while preserving the caller's entry order.
-    ///
-    /// This constructor is intended for decoders and verifiers that must retain
-    /// potentially invalid input long enough for [`Self::verify`] to report the
-    /// precise ordering error. Producers of new metadata should normally use
-    /// [`Self::from_states`].
+    /// The frame chain for `exit`, or `None` when the id names no exit.
     #[must_use]
-    pub fn from_unverified_states(states: Vec<FrameState>) -> Self {
-        Self { entries: states }
+    pub fn lookup(&self, exit: DeoptExitId) -> Option<&FrameState> {
+        self.entries.get(exit.0 as usize)
     }
 
-    /// The frame state for `byte_pc`, or `None` when the PC is not a deopt
-    /// point.
+    /// All exits in id order.
     #[must_use]
-    pub fn lookup(&self, byte_pc: u32) -> Option<&FrameState> {
-        let i = self
-            .entries
-            .binary_search_by_key(&byte_pc, |s| s.byte_pc)
-            .ok()?;
-        Some(&self.entries[i])
+    pub fn entries(&self) -> &[FrameState] {
+        &self.entries
     }
 
     /// Number of recorded deopt points.
@@ -436,26 +416,13 @@ impl DeoptTable {
         self.entries.is_empty()
     }
 
-    /// Verify exact-PC ordering and every frame state's declared bounds.
+    /// Verify every exit's frame chain and declared bounds.
     pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
         if limits.min_stack_slot_offset > limits.max_stack_slot_offset {
             return Err(DeoptVerifyError::InvalidStackSlotRange {
                 min: limits.min_stack_slot_offset,
                 max: limits.max_stack_slot_offset,
             });
-        }
-        for pair in self.entries.windows(2) {
-            if pair[0].byte_pc == pair[1].byte_pc {
-                return Err(DeoptVerifyError::DuplicateBytePc {
-                    byte_pc: pair[0].byte_pc,
-                });
-            }
-            if pair[0].byte_pc > pair[1].byte_pc {
-                return Err(DeoptVerifyError::EntriesNotSorted {
-                    previous: pair[0].byte_pc,
-                    current: pair[1].byte_pc,
-                });
-            }
         }
         for state in &self.entries {
             state.verify(limits)?;
@@ -628,7 +595,6 @@ mod tests {
     /// inlined into it produces.
     fn single_frame(byte_pc: u32, slots: Vec<DeoptSlot>) -> FrameState {
         FrameState {
-            byte_pc,
             frames: Box::new([DeoptFrame {
                 function_id: 7,
                 byte_pc,
@@ -646,7 +612,6 @@ mod tests {
             repr: DeoptRepr::Tagged,
         };
         let chained = FrameState {
-            byte_pc: 12,
             frames: Box::new([
                 DeoptFrame {
                     function_id: 7,
@@ -665,42 +630,42 @@ mod tests {
         assert!(!chained.is_single_frame());
         assert_eq!(chained.outermost().function_id, 7);
         assert_eq!(chained.innermost().function_id, 9);
-        // The table is keyed by the outermost frame's resume PC.
-        assert_eq!(chained.byte_pc, chained.outermost().byte_pc);
+        // The caller resumes after its call; only the innermost frame resumes
+        // at the instruction that exited.
+        assert_eq!(chained.outermost().byte_pc, 12);
+        assert_eq!(chained.innermost().byte_pc, 0);
     }
 
     #[test]
-    fn a_frame_state_key_must_match_its_outermost_frame() {
-        let mismatched = FrameState {
-            byte_pc: 12,
-            frames: Box::new([DeoptFrame {
-                function_id: 7,
-                byte_pc: 16,
-                slots: Box::new([]),
-            }]),
+    fn a_frame_chain_may_not_be_empty() {
+        let empty = FrameState {
+            frames: Box::new([]),
         };
-        assert!(mismatched.verify(verify_limits()).is_err());
+        assert_eq!(
+            empty.verify(verify_limits()),
+            Err(DeoptVerifyError::EmptyFrameChain)
+        );
     }
 
     #[test]
-    fn deopt_table_is_exact_pc() {
+    fn deopt_table_is_keyed_by_exit_id() {
         let slot = DeoptSlot {
             location: DeoptLocation::Register(3),
             repr: DeoptRepr::Int32,
         };
+        // Two exits may resume the same PC — a body can guard one instruction
+        // more than once — so the id, not the PC, is what names an exit.
         let table = DeoptTable::from_states(vec![
             single_frame(40, vec![slot]),
-            single_frame(8, vec![slot]),
+            single_frame(40, vec![slot]),
         ]);
         table.verify(verify_limits()).unwrap();
         assert_eq!(table.len(), 2);
-        assert!(table.lookup(8).is_some());
         assert_eq!(
-            table.lookup(40).unwrap().innermost().slots[0].location,
+            table.lookup(DeoptExitId(1)).unwrap().innermost().slots[0].location,
             slot.location
         );
-        // A non-deopt PC has no entry — exact match, no nearest-PC fallback.
-        assert!(table.lookup(20).is_none());
+        assert!(table.lookup(DeoptExitId(2)).is_none());
     }
 
     #[test]
@@ -796,26 +761,16 @@ mod tests {
     }
 
     #[test]
-    fn deopt_table_verifier_rejects_unsorted_and_duplicate_pcs() {
-        let empty = |byte_pc| single_frame(byte_pc, Vec::new());
-        let unsorted = DeoptTable {
-            entries: vec![empty(20), empty(8)],
+    fn deopt_table_verifies_every_exit() {
+        let bad_slot = DeoptSlot {
+            location: DeoptLocation::Register(99),
+            repr: DeoptRepr::Tagged,
         };
-        assert_eq!(
-            unsorted.verify(verify_limits()),
-            Err(DeoptVerifyError::EntriesNotSorted {
-                previous: 20,
-                current: 8,
-            })
-        );
-
-        let duplicate = DeoptTable {
-            entries: vec![empty(8), empty(8)],
-        };
-        assert_eq!(
-            duplicate.verify(verify_limits()),
-            Err(DeoptVerifyError::DuplicateBytePc { byte_pc: 8 })
-        );
+        let table = DeoptTable::from_states(vec![
+            single_frame(8, Vec::new()),
+            single_frame(20, vec![bad_slot]),
+        ]);
+        assert!(table.verify(verify_limits()).is_err());
     }
 
     #[test]

@@ -304,14 +304,10 @@ mod tests {
     fn refuses_out_of_subset_on_every_host() {
         let instructions = vec![
             JitTestInstruction::new(
-                Op::LoadProperty,
+                Op::TypeOf,
                 0,
                 11,
-                vec![
-                    Operand::Register(1),
-                    Operand::Register(0),
-                    Operand::ConstIndex(0),
-                ],
+                vec![Operand::Register(1), Operand::Register(0)],
             ),
             JitTestInstruction::new(Op::ReturnValue, 1, 29, vec![Operand::Register(1)]),
         ];

@@ -411,40 +411,35 @@ fn validate_inputs(
             actual: allocation.locations.len(),
         });
     }
-    // The unit covers every frame's body, not just the root's.
-    let unit_instructions: usize = tree
-        .frames
+    // The graph prunes unreachable blocks, so the states cover exactly the
+    // reachable instructions of each frame's body: SSA is the authority for
+    // which those are. A PC and a byte PC are canonical only within one frame,
+    // so every check here is a per-frame invariant, never a unit-wide one.
+    let mut ssa_sites: Vec<(InlineId, u32)> = ssa
+        .blocks
         .iter()
-        .map(|frame| frame.instructions.len())
-        .sum();
-    if frame_states.states().len() != unit_instructions {
+        .flat_map(|block| {
+            block
+                .instrs
+                .iter()
+                .map(|instruction| (instruction.inline, instruction.pc))
+        })
+        .collect();
+    ssa_sites.sort_unstable();
+    let state_sites: Vec<(InlineId, u32)> = frame_states
+        .states()
+        .iter()
+        .map(|state| (state.inline, state.pc))
+        .collect();
+    if ssa_sites != state_sites {
         return Err(DeoptLoweringError::AbstractStateCountMismatch {
-            expected: unit_instructions,
-            actual: frame_states.states().len(),
-        });
-    }
-    let ssa_instruction_count = ssa.blocks.iter().map(|block| block.instrs.len()).sum();
-    if ssa_instruction_count != unit_instructions {
-        return Err(DeoptLoweringError::SsaInstructionCountMismatch {
-            expected: unit_instructions,
-            actual: ssa_instruction_count,
+            expected: ssa_sites.len(),
+            actual: state_sites.len(),
         });
     }
 
-    // States are ordered by (frame, PC) and cover each frame's body densely.
-    // A PC and a byte PC are canonical only within one frame, so density and
-    // byte-PC uniqueness are per-frame invariants, never unit-wide ones.
-    let mut expected_pc_by_frame = vec![0_u32; tree.frames.len()];
     for state in frame_states.states() {
         let frame = &tree.frames[state.inline.0 as usize];
-        let expected_pc = &mut expected_pc_by_frame[state.inline.0 as usize];
-        if state.pc != *expected_pc {
-            return Err(DeoptLoweringError::AbstractStateOrderMismatch {
-                expected: *expected_pc,
-                actual: state.pc,
-            });
-        }
-        *expected_pc += 1;
         let instruction = &frame.instructions[state.pc as usize];
         let actual_pc = instruction.instruction_pc(frame.code_block.as_ref());
         if actual_pc != state.pc {
@@ -463,14 +458,6 @@ fn validate_inputs(
         }
         for (register, &value) in state.registers.iter().enumerate() {
             lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)?;
-        }
-    }
-    for (index, frame) in tree.frames.iter().enumerate() {
-        if expected_pc_by_frame[index] as usize != frame.instructions.len() {
-            return Err(DeoptLoweringError::AbstractStateCountMismatch {
-                expected: frame.instructions.len(),
-                actual: expected_pc_by_frame[index] as usize,
-            });
         }
     }
     Ok(())

@@ -86,11 +86,16 @@ pub struct OptimizedCode {
     frame_map_bitmap_words: Box<[u64]>,
     /// Loop-header logical PC → assembler offset of its OSR trampoline.
     osr_entries: BTreeMap<u32, usize>,
+    /// Per-`MathCall`-site argument window registers. The emitted calls carry
+    /// interior pointers into these boxed slices, so they must live exactly as
+    /// long as the code.
+    _math_call_arguments: BTreeMap<u32, Box<[u16]>>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
 
 impl OptimizedCode {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         code: CompiledCode,
         deopt_table: DeoptTable,
@@ -98,6 +103,7 @@ impl OptimizedCode {
         frame_maps: Box<[FrameMap]>,
         frame_map_bitmap_words: Box<[u64]>,
         osr_entries: BTreeMap<u32, usize>,
+        math_call_arguments: BTreeMap<u32, Box<[u16]>>,
         metadata: OptimizedMetadata,
     ) -> Self {
         const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0005;
@@ -124,6 +130,7 @@ impl OptimizedCode {
             frame_maps,
             frame_map_bitmap_words,
             osr_entries,
+            _math_call_arguments: math_call_arguments,
             metadata,
             code_metadata,
         }

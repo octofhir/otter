@@ -23,6 +23,7 @@
 
 use std::collections::BTreeSet;
 
+use otter_bytecode::Op;
 use otter_vm::{
     JitCompileSnapshot,
     deopt::{
@@ -162,6 +163,30 @@ pub enum DeoptLoweringError {
         /// Required exact byte PC.
         byte_pc: u32,
     },
+    /// A rebuilt frame's shape disagrees with the interpreter frame the VM
+    /// would build for that function.
+    ReifiedFrameShape {
+        /// Function whose frame is malformed.
+        function_id: u32,
+        /// Slots the chain declares.
+        declared: usize,
+        /// Registers the function's own body defines.
+        expected: usize,
+    },
+    /// A caller in a chain does not resume immediately after a call.
+    CallerDoesNotResumeAfterACall {
+        /// Function whose frame is malformed.
+        function_id: u32,
+        /// Byte PC the frame declares.
+        byte_pc: u32,
+    },
+    /// A rebuilt frame resumes outside its own body.
+    ResumePcOutOfRange {
+        /// Function whose frame is malformed.
+        function_id: u32,
+        /// Byte PC the frame declares.
+        byte_pc: u32,
+    },
     /// A concrete frame state is not register-count wide.
     ConcreteSlotCountMismatch {
         /// Exact byte PC owning the state.
@@ -267,6 +292,58 @@ impl DeoptLowering {
                 expected: frame_states.states().len(),
                 actual: self.table.len(),
             });
+        }
+
+        // Every rebuilt frame must be one the interpreter could have built: its
+        // slots must cover exactly that function's register window, it must
+        // resume inside its own body, and every caller must resume immediately
+        // after a real call — the interpreter advances past a call before
+        // pushing its callee, so a caller that resumed anywhere else would
+        // either re-run the call or skip an instruction.
+        for state in self.table.entries() {
+            let frames = &state.frames;
+            for (depth, frame) in frames.iter().enumerate() {
+                let body = tree
+                    .frames
+                    .iter()
+                    .find(|candidate| candidate.function_id == frame.function_id)
+                    .ok_or(DeoptLoweringError::ReifiedFrameShape {
+                        function_id: frame.function_id,
+                        declared: frame.slots.len(),
+                        expected: 0,
+                    })?;
+                let expected = usize::from(body.code_block.register_count);
+                if frame.slots.len() != expected {
+                    return Err(DeoptLoweringError::ReifiedFrameShape {
+                        function_id: frame.function_id,
+                        declared: frame.slots.len(),
+                        expected,
+                    });
+                }
+                let resume = body
+                    .instructions
+                    .iter()
+                    .position(|instruction| instruction.byte_pc == frame.byte_pc)
+                    .ok_or(DeoptLoweringError::ResumePcOutOfRange {
+                        function_id: frame.function_id,
+                        byte_pc: frame.byte_pc,
+                    })?;
+                let is_caller = depth + 1 < frames.len();
+                if is_caller {
+                    let call = resume.checked_sub(1).and_then(|index| {
+                        body.instructions.get(index)
+                    });
+                    let is_call = call.is_some_and(|instruction| {
+                        instruction.op(body.code_block.as_ref()) == Op::Call
+                    });
+                    if !is_call {
+                        return Err(DeoptLoweringError::CallerDoesNotResumeAfterACall {
+                            function_id: frame.function_id,
+                            byte_pc: frame.byte_pc,
+                        });
+                    }
+                }
+            }
         }
 
         for (exit, state) in frame_states.states().iter().enumerate() {
@@ -1045,6 +1122,76 @@ mod tests {
             })
         );
 
+    }
+
+    #[test]
+    fn a_rebuilt_frame_must_match_its_functions_register_window() {
+        let pipeline = pipeline(
+            0,
+            1,
+            budget(8, 8),
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(9)]),
+                (Op::ReturnUndefined, vec![]),
+            ],
+            &[],
+        );
+        let lowering = lower(&pipeline);
+
+        // Drop a slot: the frame no longer covers the function's window, and
+        // the interpreter could never have built it.
+        let mut states: Vec<_> = lowering.table().entries().to_vec();
+        let mut slots = states[0].frames[0].slots.to_vec();
+        slots.pop();
+        states[0].frames[0].slots = slots.into_boxed_slice();
+        let corrupted = DeoptLowering {
+            table: DeoptTable::from_states(states),
+        };
+
+        assert!(matches!(
+            corrupted.verify(
+                &pipeline.view,
+                &pipeline.tree,
+                &pipeline.ssa,
+                &pipeline.frame_states,
+                &pipeline.allocation,
+                &pipeline.reprs
+            ),
+            Err(DeoptLoweringError::ReifiedFrameShape { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rebuilt_frame_must_resume_inside_its_own_body() {
+        let pipeline = pipeline(
+            0,
+            1,
+            budget(8, 8),
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(9)]),
+                (Op::ReturnUndefined, vec![]),
+            ],
+            &[],
+        );
+        let lowering = lower(&pipeline);
+
+        let mut states: Vec<_> = lowering.table().entries().to_vec();
+        states[0].frames[0].byte_pc = u32::MAX;
+        let corrupted = DeoptLowering {
+            table: DeoptTable::from_states(states),
+        };
+
+        assert!(matches!(
+            corrupted.verify(
+                &pipeline.view,
+                &pipeline.tree,
+                &pipeline.ssa,
+                &pipeline.frame_states,
+                &pipeline.allocation,
+                &pipeline.reprs
+            ),
+            Err(DeoptLoweringError::ResumePcOutOfRange { .. })
+        ));
     }
 
     #[test]

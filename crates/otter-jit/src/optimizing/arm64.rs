@@ -62,8 +62,8 @@ use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, STUB_JIT_STORE_ELEMENT, SafepointId,
-    SafepointRecord,
+    FrameMap, NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROP_WINDOW,
+    STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
 
 use super::{OptimizedCode, OptimizedMetadata};
@@ -166,6 +166,11 @@ struct EmissionPlan<'a> {
     deopt_table: &'a DeoptTable,
     load_element_entry: u64,
     store_element_entry: u64,
+    load_property_entry: u64,
+    store_property_entry: u64,
+    /// Owning function id, baked into property transitions so the stub resolves
+    /// the name constant against this function's constant pool.
+    function_id: u64,
 }
 
 struct OptimizedEmission {
@@ -245,6 +250,9 @@ pub(super) fn compile_with_transitions(
             deopt_table: deopt.table(),
             load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
             store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
+            load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
+            store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROP_WINDOW),
+            function_id: u64::from(view.code_block.id),
         },
     )?;
     let frame_maps = eligibility
@@ -460,6 +468,50 @@ fn check_eligibility(
                         || instruction.input_registers.len() != 3
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || reprs.representation(instruction.inputs[1]) != Representation::Int32
+                        || instruction.input_registers.contains(&scratch)
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::LoadProperty => {
+                    // `WRITE_READ_CONST`: the object is the sole register input,
+                    // the name is a constant operand (an immediate, not a window
+                    // slot), and the loaded value is tagged.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("property-load result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 1
+                        || instruction.input_registers.len() != 1
+                        || instruction.result_register.is_none()
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::StoreProperty => {
+                    // `READ_CONST_READ_WRITE`: object + value are register inputs,
+                    // the name is a constant immediate, and the scratch WRITE slot
+                    // is a spare interpreter-window register the stub may clobber.
+                    let scratch = instruction
+                        .result_register
+                        .ok_or(Unsupported::OperandShape("property-store scratch"))?;
+                    if instruction.result.is_none()
+                        || instruction.inputs.len() != 2
+                        || instruction.input_registers.len() != 2
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || instruction.input_registers.contains(&scratch)
                     {
                         return Err(Unsupported::Opcode(instruction.op));
@@ -987,6 +1039,9 @@ fn emit(
         deopt_table,
         load_element_entry,
         store_element_entry,
+        load_property_entry,
+        store_property_entry,
+        function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
@@ -1208,6 +1263,114 @@ fn emit(
                         ; movz x4, scratch as u32
                     );
                     emit_load_u64(&mut ops, 16, store_element_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                }
+                Op::LoadProperty => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked property-load destination");
+                    let object = instruction.input_registers[0];
+                    let name = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("property-load name constant"))?;
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing property load missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, object as u32
+                    );
+                    // The optimizing tier keeps no per-site property IC: a site
+                    // index past the IC table (`u64::MAX`) and a null cell make the
+                    // stub run the full `[[Get]]` resolution without touching a
+                    // cache. `function_id` names the constant pool for the name.
+                    emit_load_u64(&mut ops, 3, u64::from(name));
+                    emit_load_u64(&mut ops, 4, u64::MAX);
+                    emit_load_u64(&mut ops, 5, 0);
+                    emit_load_u64(&mut ops, 6, function_id);
+                    emit_load_u64(&mut ops, 16, load_property_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked property-load result"),
+                            ),
+                        )),
+                    )?;
+                }
+                Op::StoreProperty => {
+                    let object = instruction.input_registers[0];
+                    let value = instruction.input_registers[1];
+                    let name = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 1)
+                        .ok_or(Unsupported::OperandShape("property-store name constant"))?;
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing property store missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, object as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(name));
+                    dynasm!(ops ; .arch aarch64 ; movz x3, value as u32);
+                    emit_load_u64(&mut ops, 4, u64::MAX);
+                    emit_load_u64(&mut ops, 5, 0);
+                    emit_load_u64(&mut ops, 6, function_id);
+                    emit_load_u64(&mut ops, 16, store_property_entry);
                     let succeeded = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
@@ -3847,18 +4010,14 @@ mod tests {
     }
 
     #[test]
-    fn refuses_property_operation() {
+    fn refuses_unsupported_operation() {
         let view = view(
             1,
             2,
             vec![
                 (
-                    Op::LoadProperty,
-                    vec![
-                        Operand::Register(1),
-                        Operand::Register(0),
-                        Operand::ConstIndex(0),
-                    ],
+                    Op::TypeOf,
+                    vec![Operand::Register(1), Operand::Register(0)],
                 ),
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],

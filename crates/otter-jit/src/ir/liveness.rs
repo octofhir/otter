@@ -418,9 +418,14 @@ fn phi_uses(
         .phis
         .iter()
         .filter_map(|&phi| match &ssa.values[phi.0 as usize].def {
-            ValueDef::Phi { inputs, .. } => Some(inputs[predecessor_index]),
+            // A spliced call's result merges the callee's returned values, so
+            // like a phi it uses one input per predecessor edge.
+            ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. } => {
+                Some(inputs[predecessor_index])
+            }
             ValueDef::Param { .. }
             | ValueDef::Uninitialized { .. }
+            | ValueDef::InlineUndefinedReturn { .. }
             | ValueDef::ExceptionInput { .. }
             | ValueDef::Op { .. } => None,
         })

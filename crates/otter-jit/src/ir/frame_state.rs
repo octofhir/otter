@@ -473,8 +473,9 @@ fn head_register(definition: &ValueDef) -> Option<u16> {
         ValueDef::Param { register, .. }
         | ValueDef::Uninitialized { register }
         | ValueDef::ExceptionInput { register, .. }
+        | ValueDef::InlineResult { register, .. }
         | ValueDef::Phi { register, .. } => Some(*register),
-        ValueDef::Op { .. } => None,
+        ValueDef::InlineUndefinedReturn { .. } | ValueDef::Op { .. } => None,
     }
 }
 

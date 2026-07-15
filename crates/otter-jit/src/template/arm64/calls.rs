@@ -274,7 +274,7 @@ pub(super) fn emit_method_call(
 /// callee's safepoints while the caller frame keeps its exact PC). Branches
 /// to the compiled entry and dispatches the returned / bailed / threw finish
 /// helpers, landing at `done`.
-fn emit_direct_call_tail(
+pub(crate) fn emit_direct_call_tail(
     ops: &mut Assembler,
     table: &TransitionTable,
     dst: u16,

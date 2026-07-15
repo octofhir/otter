@@ -30,7 +30,7 @@
 #![allow(clippy::useless_conversion)]
 
 mod arith;
-mod calls;
+pub(crate) mod calls;
 mod class_ops;
 mod class_value;
 mod collections;

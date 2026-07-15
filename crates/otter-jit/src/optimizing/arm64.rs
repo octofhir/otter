@@ -70,6 +70,7 @@ use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTa
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
     STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
+    STUB_JIT_CALL_GENERIC, STUB_JIT_PREPARE_DIRECT_CALL, STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
     STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
@@ -202,6 +203,14 @@ struct EmissionPlan<'a> {
     math_call_entry: u64,
     /// Refills the back-edge budget and reports raised interrupts.
     poll_entry: u64,
+    /// Resolves a method through its IC and stages a compiled-to-compiled call.
+    prepare_direct_method_entry: u64,
+    /// Resolves a plain callee and stages a compiled-to-compiled call.
+    prepare_direct_call_entry: u64,
+    /// Completes an ineligible plain call in place.
+    call_generic_entry: u64,
+    /// Hook-lifetime transition inventory for the shared direct-call tail.
+    transitions: &'a TransitionTable,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -316,6 +325,11 @@ pub(super) fn compile_with_transitions(
             reify_frame_entry: transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
             math_call_entry: transitions.variadic_entry(STUB_JIT_MATH_CALL),
             poll_entry: transitions.entry(STUB_JIT_BACKEDGE_POLL),
+            prepare_direct_method_entry: transitions
+                .entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
+            prepare_direct_call_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
+            call_generic_entry: transitions.entry(STUB_JIT_CALL_GENERIC),
+            transitions,
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -943,6 +957,29 @@ fn check_eligibility(
                         &mut allowed_conversions,
                     )?;
                 }
+                // A plain call resolves through the direct-call prepare stub
+                // and runs compiled-to-compiled; an ineligible callee completes
+                // through the generic in-place transition. Every tagged operand
+                // is materialized in the precise frame window first.
+                Op::Call if !is_spliced_call(cfg, block, instruction) => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("call result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.result_register.is_none()
+                        || instruction.input_registers.is_empty()
+                        || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
+                        || instruction.inputs.len() != instruction.input_registers.len()
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
                 // A spliced call is not lowered as a call: control enters the
                 // callee's body. Its operands stay inputs so the emitter can
                 // guard the callee's identity, and the continuation's merge —
@@ -1535,6 +1572,10 @@ fn emit(
         reify_frame_entry,
         math_call_entry,
         poll_entry,
+        prepare_direct_method_entry,
+        prepare_direct_call_entry,
+        call_generic_entry,
+        transitions,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -2264,6 +2305,9 @@ fn emit(
                     let name = view.instructions[instruction.pc as usize]
                         .const_index(view.code_block.as_ref(), 2)
                         .ok_or(Unsupported::OperandShape("method-call name constant"))?;
+                    let ic_site = view.instructions[instruction.pc as usize]
+                        .property_ic_site(view.code_block.as_ref())
+                        .unwrap_or(usize::MAX) as u64;
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -2284,19 +2328,58 @@ fn emit(
                         ; .arch aarch64
                         ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
                         ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                    );
+
+                    // Direct dispatch first: the prepare transition resolves the
+                    // method through its IC and stages the callee's entry, and
+                    // the shared tail calls it compiled-to-compiled — no
+                    // interpreter dispatch on the hot path. A bailed callee is
+                    // finished by the VM and this caller keeps running compiled;
+                    // only an abort report side-exits at this call.
+                    let succeeded = ops.new_dynamic_label();
+                    let bail = ops.new_dynamic_label();
+                    let generic = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, receiver as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(name));
+                    emit_load_u64(&mut ops, 3, ic_site);
+                    dynasm!(ops ; .arch aarch64 ; movz x4, argc);
+                    emit_load_u64(&mut ops, 5, packed);
+                    emit_load_u64(&mut ops, 16, prepare_direct_method_entry);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>generic
+                    );
+                    crate::template::arm64::calls::emit_direct_call_tail(
+                        &mut ops,
+                        transitions,
+                        dst,
+                        bail,
+                        threw,
+                        succeeded,
+                    );
+
+                    // Ineligible resolution: the generic in-place transition
+                    // completes the whole opcode.
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; =>generic
                         ; mov x0, x20
                         ; movz x1, dst as u32
                         ; movz x2, receiver as u32
                     );
                     emit_load_u64(&mut ops, 3, u64::from(name));
-                    // The optimizing tier keeps no per-site call IC: a site index
-                    // past the IC table runs the full method resolution walk.
-                    emit_load_u64(&mut ops, 4, u64::MAX);
+                    emit_load_u64(&mut ops, 4, ic_site);
                     dynasm!(ops ; .arch aarch64 ; movz x5, argc);
                     emit_load_u64(&mut ops, 6, packed);
                     emit_load_u64(&mut ops, 16, call_method_entry);
-                    let succeeded = ops.new_dynamic_label();
-                    let bail = ops.new_dynamic_label();
                     dynasm!(ops
                         ; .arch aarch64
                         ; blr x16
@@ -2759,6 +2842,102 @@ fn emit(
                         block_id,
                         taken,
                     )?;
+                }
+                // A plain call: prepare resolves the callee against installed
+                // code and the shared tail runs it compiled-to-compiled. An
+                // ineligible callee completes through the generic in-place
+                // transition; only a non-callable report side-exits.
+                Op::Call if !is_spliced_call(cfg, block_id, instruction) => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked call destination");
+                    let callee = instruction.input_registers[0];
+                    let arg_regs = &instruction.input_registers[1..];
+                    let argc = arg_regs.len() as u32;
+                    let packed = pack_method_arg_regs(arg_regs);
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape("optimizing call missing site"))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                    );
+                    let succeeded = ops.new_dynamic_label();
+                    let bail = ops.new_dynamic_label();
+                    let generic = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; mov x0, x20
+                        ; movz x1, callee as u32
+                        ; movz x2, argc
+                    );
+                    emit_load_u64(&mut ops, 3, packed);
+                    emit_load_u64(&mut ops, 16, prepare_direct_call_entry);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>generic
+                    );
+                    crate::template::arm64::calls::emit_direct_call_tail(
+                        &mut ops,
+                        transitions,
+                        dst,
+                        bail,
+                        threw,
+                        succeeded,
+                    );
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; =>generic
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, callee as u32
+                        ; movz x3, argc
+                    );
+                    emit_load_u64(&mut ops, 4, packed);
+                    emit_load_u64(&mut ops, 16, call_generic_entry);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>bail
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked call result"),
+                            ),
+                        )),
+                    )?;
+                    deopt_exits.push((
+                        bail,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
                 }
                 // A spliced call: guard that the callee is still the body that
                 // was spliced, then fall into it. A different callee deopts and

@@ -84,8 +84,8 @@ use crate::{
         TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
         VALUE_TRUE,
         VALUE_UNDEFINED, pack_method_arg_regs,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
+        IC_WAYS, OBJECT_BODY_TYPE_TAG, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
+        VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -282,11 +282,20 @@ pub(super) fn compile_with_transitions(
             frame_states: &frame_states,
         },
     )?;
+    let load_property_sites = dom
+        .reverse_postorder()
+        .iter()
+        .flat_map(|block| ssa.blocks[block.0 as usize].instrs.iter())
+        .filter(|instruction| instruction.op == Op::LoadProperty)
+        .count();
+    let mut load_ic_cells =
+        vec![crate::entry::WhiskerIcCell::default(); load_property_sites].into_boxed_slice();
     let emission = emit(
         view,
         &cfg,
         dom.reverse_postorder(),
         &ssa,
+        &mut load_ic_cells,
         EmissionPlan {
             reprs: &reprs,
             allocation: &allocation,
@@ -337,6 +346,7 @@ pub(super) fn compile_with_transitions(
         eligibility.element_transitions.bitmap_words,
         emission.osr_entries,
         eligibility.math_call_arguments,
+        load_ic_cells,
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -1501,6 +1511,7 @@ fn emit(
     cfg: &ControlFlowGraph,
     rpo: &[BlockId],
     ssa: &SsaFunction,
+    load_ic_cells: &mut [WhiskerIcCell],
     plan: EmissionPlan<'_>,
 ) -> Result<OptimizedEmission, Unsupported> {
     let EmissionPlan {
@@ -1523,6 +1534,7 @@ fn emit(
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
+    let mut next_load_ic = 0usize;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
     let mut deopt_exits = Vec::<(DynamicLabel, DeoptExitId, u32)>::new();
     let threw = ops.new_dynamic_label();
@@ -1888,9 +1900,22 @@ fn emit(
                         .result_register
                         .expect("eligibility checked property-load destination");
                     let object = instruction.input_registers[0];
+                    let result_location = allocation.location(
+                        instruction
+                            .result
+                            .expect("eligibility checked property-load result"),
+                    );
                     let name = view.instructions[instruction.pc as usize]
                         .const_index(view.code_block.as_ref(), 2)
                         .ok_or(Unsupported::OperandShape("property-load name constant"))?;
+                    let ic_site = view.instructions[instruction.pc as usize]
+                        .property_ic_site(view.code_block.as_ref())
+                        .unwrap_or(usize::MAX) as u64;
+                    let cell = load_ic_cells
+                        .get_mut(next_load_ic)
+                        .ok_or(Unsupported::OperandShape("optimizing property IC cell"))?;
+                    let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
+                    next_load_ic += 1;
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -1899,6 +1924,75 @@ fn emit(
                             "optimizing property load missing site",
                         ))?;
                     debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+
+                    // Inline own-data probe through the self-patching cell:
+                    // guard cell tag, body tag, and shape, then read the value
+                    // slab slot straight into the destination. The sequence
+                    // neither allocates nor calls, so it needs no safepoint, no
+                    // frame materialize, and no reload — the receiver pointer is
+                    // re-derived from its rooted location every access.
+                    if view.cage_base != 0 {
+                        let shape_byte = view.object_shape_byte;
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[0]),
+                            9,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; movz x11, NUMBER_TAG_HI16, lsl #48
+                            ; orr x11, x11, #0x2       // NOT_CELL_MASK
+                            ; tst x9, x11
+                            ; b.ne =>miss
+                            ; mov w12, w9              // low-32 Gc offset
+                        );
+                        emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x12        // x13 = GcHeader ptr
+                            ; ldrb w14, [x13]
+                            ; cmp w14, OBJECT_BODY_TYPE_TAG
+                            ; b.ne =>miss
+                            ; ldr w14, [x13, shape_byte]
+                            ; cbz w14, =>miss          // empty-cell sentinel
+                        );
+                        emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        let do_load = ops.new_dynamic_label();
+                        for way in 0..IC_WAYS as u32 {
+                            let shape_off = way * 8;
+                            let value_byte_off = shape_off + 4;
+                            let next = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr w16, [x15, shape_off]
+                                ; cmp w14, w16
+                                ; b.ne =>next
+                                ; ldr w17, [x15, value_byte_off]
+                                ; b =>do_load
+                                ; =>next
+                            );
+                        }
+                        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_load);
+                        crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cbz x13, =>miss
+                            ; ldr w9, [x13, x17]       // 4-byte compressed slot
+                        );
+                        crate::template::arm64::values::emit_decompress_slot(
+                            &mut ops,
+                            view.cage_base as u64,
+                            miss,
+                        );
+                        emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done);
+                    }
+
+                    // Miss: the window transition resolves full `[[Get]]`
+                    // semantics and self-patches this site's cell.
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -1915,13 +2009,9 @@ fn emit(
                         ; movz x1, dst as u32
                         ; movz x2, object as u32
                     );
-                    // The optimizing tier keeps no per-site property IC: a site
-                    // index past the IC table (`u64::MAX`) and a null cell make the
-                    // stub run the full `[[Get]]` resolution without touching a
-                    // cache. `function_id` names the constant pool for the name.
                     emit_load_u64(&mut ops, 3, u64::from(name));
-                    emit_load_u64(&mut ops, 4, u64::MAX);
-                    emit_load_u64(&mut ops, 5, 0);
+                    emit_load_u64(&mut ops, 4, ic_site);
+                    emit_load_u64(&mut ops, 5, cell_addr as u64);
                     emit_load_u64(&mut ops, 6, function_id);
                     emit_load_u64(&mut ops, 16, load_property_entry);
                     let succeeded = ops.new_dynamic_label();
@@ -1936,15 +2026,9 @@ fn emit(
                         &mut ops,
                         allocation,
                         site,
-                        Some((
-                            dst,
-                            allocation.location(
-                                instruction
-                                    .result
-                                    .expect("eligibility checked property-load result"),
-                            ),
-                        )),
+                        Some((dst, result_location)),
                     )?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::StoreProperty => {
                     let object = instruction.input_registers[0];

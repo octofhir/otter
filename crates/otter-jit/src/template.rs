@@ -34,7 +34,7 @@
 use otter_vm::JitCompileSnapshot;
 
 #[cfg(target_arch = "aarch64")]
-mod arm64;
+pub(crate) mod arm64;
 mod code;
 mod plan;
 

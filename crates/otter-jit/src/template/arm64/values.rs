@@ -207,7 +207,7 @@ fn emit_to_int32_common(ops: &mut Assembler, src_x: u8, dst_w: u8, bail: Dynamic
 /// dangles the instant the moving collector relocates the object. A spilled
 /// object's slab is a stable out-of-line allocation, so its base loads from
 /// `values_ptr`.
-pub(super) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg: u8, scratch: u8) {
+pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg: u8, scratch: u8) {
     // Frozen ABI (a `dynasm` immediate must be a compile-time constant): the
     // inline slab capacity and the header-relative offset of the in-body
     // inline slab, checked against the values otter-vm baked from the live
@@ -241,7 +241,7 @@ pub(super) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
 /// boxed slot (a heap-boxed double / wide int) branches to `boxed_bail`,
 /// where the interpreter reads the box. Fixed registers: `x9` is the slot
 /// in/out, `x10` scratch.
-pub(super) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_bail: DynamicLabel) {
+pub(crate) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_bail: DynamicLabel) {
     use otter_vm::value::compressed as cslot;
     // The literal slot tags below are the frozen `compressed` layout.
     debug_assert_eq!(cslot::TAG_MASK, 0b111);

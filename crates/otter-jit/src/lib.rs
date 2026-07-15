@@ -106,7 +106,11 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
-        match optimizing::compile_optimized(&request.snapshot, request.code_object_id) {
+        match optimizing::compile_optimized_with_transitions(
+            &request.snapshot,
+            request.code_object_id,
+            &self.transitions,
+        ) {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),

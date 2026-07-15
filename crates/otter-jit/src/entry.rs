@@ -126,6 +126,21 @@ impl TransitionTable {
         );
         self.entry(descriptor)
     }
+
+    /// Replace one variadic entry in backend execution fixtures.
+    #[cfg(test)]
+    pub(crate) fn replace_variadic_entry_for_test(
+        &mut self,
+        descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
+        entry_addr: usize,
+    ) {
+        assert_eq!(
+            descriptor.signature,
+            otter_vm::native_abi::RuntimeStubSignature::Variadic
+        );
+        assert_ne!(entry_addr, 0);
+        self.entries[descriptor.id as usize - 1] = (entry_addr as u64, Some(descriptor.signature));
+    }
 }
 
 /// JIT-owned runtime transitions installed into the isolate entry table at

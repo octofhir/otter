@@ -7,6 +7,8 @@
 //!
 //! # Invariants
 //! - Nested functions are registered in the shared module builder.
+//! - An implicit undefined return is omitted when the final source statement
+//!   already returns, so the authoritative CFG contains no dead tail block.
 //!
 //! # See also
 //! - `params` and `function_context`
@@ -259,8 +261,15 @@ pub(crate) fn compile_function_full(
     }
     parent.in_field_initializer = saved_field_init;
     parent.exit_scope();
-    // Implicit `return undefined;` at the function tail.
-    parent.emit(Op::ReturnUndefined, vec![], span);
+    // Implicit `return undefined;` at the function tail. Do not manufacture an
+    // unreachable block after a final explicit return: the return already
+    // completes every path reaching the end of the source statement list.
+    let ends_with_return = body
+        .as_ref()
+        .is_some_and(|body| matches!(body.statements.last(), Some(Statement::ReturnStatement(_))));
+    if !ends_with_return {
+        parent.emit(Op::ReturnUndefined, vec![], span);
+    }
 
     let mut child = parent.pop();
     if child.register_overflow {

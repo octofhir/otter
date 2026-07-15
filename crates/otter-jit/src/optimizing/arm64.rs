@@ -1,9 +1,10 @@
-//! Arm64 emission for the reducible multi-block numeric optimizing subset.
+//! Arm64 emission for the reducible numeric and element-load optimizing subset.
 //!
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
 //! - Reducible loop checks, numeric comparisons, and per-edge phi copies.
 //! - Cooperative back-edge polling with loop-header bail writeback.
+//! - Full-window GC safepoints around reentrant element-load transitions.
 //! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
 //!   and bail exits backed by exact deopt frame states.
 //!
@@ -13,8 +14,8 @@
 //!   fixed ABI registers; FP registers `0..8` map to the AAPCS64 callee-saved
 //!   `d8..d15`. `x8..x15` and `d16..d17` are caller-saved scratch registers.
 //!   GPR spill slots precede FP spill slots in one aligned stack frame.
-//! - Every used tagged numeric parameter is checked with the VM's frozen
-//!   number-tag mask before its payload enters an unboxed operation.
+//! - Every tagged numeric input, including an element-load result, is checked
+//!   with the VM's frozen number-tag mask before entering an unboxed operation.
 //! - `Add`/`Sub` use the arm64 signed-overflow flag and `Mul` compares its
 //!   signed 64-bit product with the sign-extended low word. Overflow bails at
 //!   the arithmetic instruction's exact logical PC; it never silently wraps.
@@ -27,9 +28,11 @@
 //!   loop-header frame, and no optimized loop can bypass cooperative polling.
 //! - Conditional inputs are optimizer-produced tagged booleans and branch by
 //!   exact comparison with the VM's `true` immediate.
-//! - The current arithmetic body makes no runtime call or safepoint, but enters
-//!   through the shared reentrant `JitCtx` ABI. Poll slow paths bail so the
-//!   interpreter owns interrupt/budget handling.
+//! - Every element load boxes the exact pre-op frame state into the interpreter
+//!   window before calling the shared stub. The window is the complete root map;
+//!   every tagged machine location is reloaded after the call because moving GC
+//!   may have rewritten it. Poll slow paths still bail so the interpreter owns
+//!   interrupt/budget handling.
 //!
 //! # See also
 //! - [`super`] — public optimizing code object.
@@ -46,15 +49,16 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
+use otter_vm::native_abi::{NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, SafepointId, SafepointRecord};
 
 use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
     CompiledCode,
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET, Unsupported, VALUE_FALSE,
-        VALUE_FALSE_LOW, VALUE_TRUE, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
+        NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
+        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -82,16 +86,18 @@ const MAX_SPILL_FRAME_BYTES: u32 = 4080;
 const MAX_PARAMETER_OFFSET: u32 = 32_760;
 
 #[derive(Debug, Clone, Copy)]
-struct GuardedParam {
+struct GuardedUse {
     use_pc: u32,
     deopt_byte_pc: u32,
 }
 
 #[derive(Debug)]
 struct Eligibility {
-    guarded_params: Vec<GuardedParam>,
+    guarded_uses: Vec<GuardedUse>,
     /// `(deopt-table byte PC, native-frame logical resume PC)` per back-edge.
     back_edges: BTreeMap<(BlockId, BlockId), (u32, u32)>,
+    /// Dense code-object safepoint id per `LoadElement` logical PC.
+    load_element_safepoints: BTreeMap<u32, SafepointId>,
 }
 
 struct EmissionPlan<'a> {
@@ -99,11 +105,19 @@ struct EmissionPlan<'a> {
     allocation: &'a Allocation,
     eligibility: &'a Eligibility,
     deopt_table: &'a DeoptTable,
+    load_element_entry: u64,
 }
 
-pub(super) fn compile(
+#[cfg(test)]
+fn compile(view: &JitCompileSnapshot, code_object_id: u64) -> Result<OptimizedCode, Unsupported> {
+    let transitions = TransitionTable::resolve();
+    compile_with_transitions(view, code_object_id, &transitions)
+}
+
+pub(super) fn compile_with_transitions(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    transitions: &TransitionTable,
 ) -> Result<OptimizedCode, Unsupported> {
     let cfg = ControlFlowGraph::build(view)
         .map_err(|_| Unsupported::OperandShape("optimizing CFG construction"))?;
@@ -153,11 +167,22 @@ pub(super) fn compile(
             allocation: &allocation,
             eligibility: &eligibility,
             deopt_table: deopt.table(),
+            load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
         },
     )?;
+    let safepoint_records = eligibility
+        .load_element_safepoints
+        .values()
+        .copied()
+        .map(|id| {
+            SafepointRecord::frame_slot_window(id, NO_FRAME_STATE, view.code_block.register_count)
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     Ok(OptimizedCode::new(
         code,
         deopt.table().clone(),
+        safepoint_records,
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -269,14 +294,42 @@ fn check_eligibility(
         ));
     }
 
-    let mut guarded_uses = BTreeMap::<(u32, ValueId), u32>::new();
+    let mut guarded_uses = BTreeMap::<(u32, ValueId), Option<u32>>::new();
     let mut allowed_conversions = BTreeSet::new();
+    let mut load_element_pcs = Vec::new();
     for block in dom.reverse_postorder().iter().copied() {
         for instruction in &ssa.blocks[block.0 as usize].instrs {
             match instruction.op {
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
                 Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
                 Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
+                Op::LoadLocal | Op::StoreLocal => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("local move result"))?;
+                    if instruction.inputs.len() != 1
+                        || instruction.input_registers.len() != 1
+                        || instruction.result_register.is_none()
+                        || reprs.representation(result)
+                            != reprs.representation(instruction.inputs[0])
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                }
+                Op::LoadElement => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("element-load result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 2
+                        || instruction.input_registers.len() != 2
+                        || instruction.result_register.is_none()
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    load_element_pcs.push(instruction.pc);
+                }
                 Op::Add | Op::Sub | Op::Mul => {
                     let result = instruction
                         .result
@@ -369,7 +422,7 @@ fn check_eligibility(
                     let expected_conversion = match returned_repr {
                         Representation::Int32 => ConversionKind::BoxInt32,
                         Representation::Float64 => ConversionKind::BoxFloat64,
-                        Representation::Tagged => return Err(Unsupported::Opcode(instruction.op)),
+                        Representation::Tagged => continue,
                     };
                     let conversion = reprs.conversions().iter().find(|conversion| {
                         conversion.at_pc == instruction.pc && conversion.operand_index == 0
@@ -400,27 +453,71 @@ fn check_eligibility(
         ));
     }
 
-    let mut guarded_params = Vec::with_capacity(guarded_uses.len());
-    for ((use_pc, _value), index) in guarded_uses {
-        let offset = index
-            .checked_mul(STACK_SLOT_BYTES)
-            .ok_or(Unsupported::OperandShape("optimizing parameter offset"))?;
-        if offset > MAX_PARAMETER_OFFSET {
-            return Err(Unsupported::OperandShape(
-                "optimizing parameter exceeds arm64 load range",
-            ));
+    let mut guarded_numeric_uses = Vec::with_capacity(guarded_uses.len());
+    for ((use_pc, _value), parameter_index) in guarded_uses {
+        if let Some(index) = parameter_index {
+            let offset = index
+                .checked_mul(STACK_SLOT_BYTES)
+                .ok_or(Unsupported::OperandShape("optimizing parameter offset"))?;
+            if offset > MAX_PARAMETER_OFFSET {
+                return Err(Unsupported::OperandShape(
+                    "optimizing parameter exceeds arm64 load range",
+                ));
+            }
         }
-        guarded_params.push(GuardedParam {
+        guarded_numeric_uses.push(GuardedUse {
             use_pc,
             deopt_byte_pc: byte_pc(view, use_pc)?,
         });
     }
-    guarded_params.sort_by_key(|param| param.use_pc);
-    guarded_params.dedup_by_key(|param| param.use_pc);
+    guarded_numeric_uses.sort_by_key(|guarded| guarded.use_pc);
+    guarded_numeric_uses.dedup_by_key(|guarded| guarded.use_pc);
+    load_element_pcs.sort_unstable();
+    load_element_pcs.dedup();
+    let load_element_safepoints = load_element_pcs
+        .into_iter()
+        .enumerate()
+        .map(|(id, pc)| {
+            let id = u32::try_from(id)
+                .map_err(|_| Unsupported::OperandShape("optimizing safepoint id overflow"))?;
+            Ok((pc, id))
+        })
+        .collect::<Result<BTreeMap<_, _>, Unsupported>>()?;
     Ok(Eligibility {
-        guarded_params,
+        guarded_uses: guarded_numeric_uses,
         back_edges,
+        load_element_safepoints,
     })
+}
+
+fn check_tagged_inputs(
+    instruction: &SsaInstr,
+    reprs: &ReprMap,
+    allowed_conversions: &mut BTreeSet<(u32, usize)>,
+) -> Result<(), Unsupported> {
+    for (operand_index, &input) in instruction.inputs.iter().enumerate() {
+        let expected_kind = match reprs.representation(input) {
+            Representation::Tagged => continue,
+            Representation::Int32 => ConversionKind::BoxInt32,
+            Representation::Float64 => ConversionKind::BoxFloat64,
+        };
+        let conversion = reprs.conversions().iter().find(|conversion| {
+            conversion.at_pc == instruction.pc && conversion.operand_index == operand_index
+        });
+        if !matches!(
+            conversion,
+            Some(conversion)
+                if conversion.value == input
+                    && conversion.kind == expected_kind
+                    && !conversion.may_deopt
+        ) {
+            return Err(Unsupported::OperandShape(
+                "optimizing element load requires tagged operands",
+            ));
+        }
+        allowed_conversions.insert((instruction.pc, operand_index));
+    }
+    Ok(())
 }
 
 fn check_numeric_inputs(
@@ -428,7 +525,7 @@ fn check_numeric_inputs(
     ssa: &SsaFunction,
     reprs: &ReprMap,
     required: Representation,
-    guarded_uses: &mut BTreeMap<(u32, ValueId), u32>,
+    guarded_uses: &mut BTreeMap<(u32, ValueId), Option<u32>>,
     allowed_conversions: &mut BTreeSet<(u32, usize)>,
 ) -> Result<(), Unsupported> {
     for (operand_index, &input) in instruction.inputs.iter().enumerate() {
@@ -461,10 +558,15 @@ fn check_numeric_inputs(
             return Err(Unsupported::Opcode(instruction.op));
         }
         if may_deopt {
-            let ValueDef::Param { index, .. } = ssa.values[input.0 as usize].def else {
-                return Err(Unsupported::Opcode(instruction.op));
+            let parameter_index = match ssa.values[input.0 as usize].def {
+                ValueDef::Param { index, .. } => Some(index),
+                ValueDef::Op {
+                    op: Op::LoadElement,
+                    ..
+                } => None,
+                _ => return Err(Unsupported::Opcode(instruction.op)),
             };
-            guarded_uses.insert((instruction.pc, input), index);
+            guarded_uses.insert((instruction.pc, input), parameter_index);
         }
         allowed_conversions.insert((instruction.pc, operand_index));
     }
@@ -562,10 +664,12 @@ fn emit(
         allocation,
         eligibility,
         deopt_table,
+        load_element_entry,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
     let mut deopt_exits = Vec::<(DynamicLabel, u32, u32)>::new();
+    let threw = ops.new_dynamic_label();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
         .map(|_| ops.new_dynamic_label())
         .collect();
@@ -597,7 +701,7 @@ fn emit(
         dynasm!(ops ; .arch aarch64 ; =>label);
         for instruction in &ssa.blocks[block_id.0 as usize].instrs {
             let guard_deopt = eligibility
-                .guarded_params
+                .guarded_uses
                 .iter()
                 .find(|param| param.use_pc == instruction.pc)
                 .map(|param| {
@@ -649,6 +753,59 @@ fn emit(
                         allocation
                             .location(instruction.result.expect("eligibility checked result")),
                         9,
+                    )?;
+                }
+                Op::LoadLocal | Op::StoreLocal => {
+                    emit_move(
+                        &mut ops,
+                        allocation,
+                        Move {
+                            src: allocation.location(instruction.inputs[0]),
+                            dst: allocation.location(
+                                instruction.result.expect("eligibility checked local move"),
+                            ),
+                        },
+                    )?;
+                }
+                Op::LoadElement => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked element-load destination");
+                    let receiver = instruction.input_registers[0];
+                    let index = instruction.input_registers[1];
+                    let frame_state = deopt_table.lookup(byte_pc(view, instruction.pc)?).ok_or(
+                        Unsupported::OperandShape("optimizing element load missing frame state"),
+                    )?;
+                    emit_deopt_writeback(&mut ops, allocation, frame_state)?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, receiver as u32
+                        ; movz x3, index as u32
+                    );
+                    emit_load_u64(&mut ops, 16, load_element_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_tagged_frame(
+                        &mut ops,
+                        allocation,
+                        frame_state,
+                        dst,
+                        allocation.location(
+                            instruction
+                                .result
+                                .expect("eligibility checked element-load result"),
+                        ),
                     )?;
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div => {
@@ -869,7 +1026,9 @@ fn emit(
                             )?;
                             emit_box_double(&mut ops, FP_SCRATCH, 9);
                         }
-                        Representation::Tagged => unreachable!("eligibility checked return"),
+                        Representation::Tagged => {
+                            emit_load_tagged_location(&mut ops, allocation.location(returned), 9)?;
+                        }
                     }
                     dynasm!(ops
                         ; .arch aarch64
@@ -895,6 +1054,14 @@ fn emit(
             )?;
         }
     }
+
+    dynasm!(ops
+        ; .arch aarch64
+        ; =>threw
+        ; mov x0, xzr
+        ; movz x1, STATUS_THREW as u32
+    );
+    emit_epilogue(&mut ops, spill_frame_bytes);
 
     for (label, deopt_byte_pc, resume_pc) in deopt_exits {
         dynasm!(ops ; .arch aarch64 ; =>label);
@@ -1197,6 +1364,81 @@ fn emit_deopt_writeback(
             DeoptRepr::Float64 => emit_box_double(ops, FP_SCRATCH, 9),
         }
         emit_store_frame_register(ops, register as u32, 9)?;
+    }
+    Ok(())
+}
+
+/// Reload every tagged pre-op SSA home after a moving-GC transition, then load
+/// the transition result from its destination frame slot last. Loading the
+/// result last is required because its newly defined SSA home may reuse the
+/// location of the destination's dead pre-op value.
+fn emit_reload_tagged_frame(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    frame_state: &FrameState,
+    dst_register: u16,
+    dst_location: Location,
+) -> Result<(), Unsupported> {
+    for (register, slot) in frame_state.slots.iter().enumerate() {
+        if register == usize::from(dst_register) || slot.repr != DeoptRepr::Tagged {
+            continue;
+        }
+        let DeoptLocation::Constant(_) = slot.location else {
+            emit_load_frame_register(ops, register as u32, 9)?;
+            emit_store_deopt_tagged_location(ops, allocation, slot.location, 9)?;
+            continue;
+        };
+    }
+    emit_load_frame_register(ops, u32::from(dst_register), 9)?;
+    emit_store_tagged_location(ops, dst_location, 9)
+}
+
+fn emit_store_deopt_tagged_location(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    location: DeoptLocation,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        DeoptLocation::Register(machine_register) => {
+            let register = u8::try_from(machine_register).map_err(|_| {
+                Unsupported::OperandShape("optimizing tagged reload register overflow")
+            })?;
+            emit_store_tagged_location(ops, Location::Register(RegClass::Gpr, register), scratch)
+        }
+        DeoptLocation::StackSlot(offset) => {
+            let byte_offset = u32::try_from(offset).map_err(|_| {
+                Unsupported::OperandShape("optimizing tagged reload negative spill offset")
+            })?;
+            let slot = byte_offset / STACK_SLOT_BYTES;
+            if slot.saturating_mul(STACK_SLOT_BYTES) != byte_offset
+                || slot >= allocation.spill_slot_counts.gpr
+            {
+                return Err(Unsupported::OperandShape(
+                    "optimizing tagged reload spill mapping",
+                ));
+            }
+            emit_store_tagged_location(ops, Location::Spill(RegClass::Gpr, slot), scratch)
+        }
+        DeoptLocation::Constant(_) => Ok(()),
+    }
+}
+
+fn emit_load_frame_register(
+    ops: &mut Assembler,
+    register: u32,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    let offset = register
+        .checked_mul(STACK_SLOT_BYTES)
+        .ok_or(Unsupported::OperandShape(
+            "optimizing frame register offset",
+        ))?;
+    if offset <= MAX_PARAMETER_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, x12]);
     }
     Ok(())
 }
@@ -1594,6 +1836,7 @@ fn emit_load_u64(ops: &mut Assembler, register: u8, value: u64) {
 fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {
     dynasm!(ops
         ; .arch aarch64
+        ; stp x29, x30, [sp, #-16]!
         ; stp x19, x20, [sp, #-48]!
         ; stp x21, x22, [sp, #16]
         ; stp x23, x24, [sp, #32]
@@ -1620,6 +1863,7 @@ fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
         ; ldp x23, x24, [sp, #32]
         ; ldp x21, x22, [sp, #16]
         ; ldp x19, x20, [sp], #48
+        ; ldp x29, x30, [sp], #16
         ; ret
     );
 }
@@ -1635,13 +1879,14 @@ mod tests {
     };
 
     use otter_vm::{
+        JitFunctionCode,
         jit::JitTestInstruction,
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
         native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
     };
 
     use super::*;
-    use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED};
+    use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW};
 
     const STRIDE: u32 = 8;
 
@@ -1826,6 +2071,109 @@ mod tests {
                 (Op::ReturnValue, vec![Operand::Register(2)]),
             ],
         )
+    }
+
+    extern "C" fn relocating_element_load(
+        ctx: *mut JitCtx,
+        dst: u64,
+        receiver: u64,
+        _index: u64,
+    ) -> u64 {
+        // SAFETY: the execution fixture supplies a live three-or-more-slot
+        // register window for the duration of this transition call.
+        let regs = unsafe { (*ctx).regs };
+        unsafe {
+            *regs.add(receiver as usize) = box_i32(5);
+            *regs.add(dst as usize) = box_i32(37);
+        }
+        0
+    }
+
+    extern "C" fn throwing_element_load(
+        ctx: *mut JitCtx,
+        _dst: u64,
+        _receiver: u64,
+        _index: u64,
+    ) -> u64 {
+        // SAFETY: the execution fixture owns the live error slot for the
+        // complete entry call, matching the production transition contract.
+        unsafe {
+            *(*ctx).error = Some(otter_vm::VmError::InvalidOperand);
+        }
+        1
+    }
+
+    fn element_load_transitions(entry: usize) -> TransitionTable {
+        let mut transitions = TransitionTable::resolve();
+        transitions.replace_variadic_entry_for_test(STUB_JIT_LOAD_ELEMENT, entry);
+        transitions
+    }
+
+    #[test]
+    fn executes_element_load_and_reloads_relocated_tagged_values() {
+        let view = view(
+            2,
+            4,
+            vec![
+                (
+                    Op::LoadElement,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(3),
+                        Operand::Register(2),
+                        Operand::Register(0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(3)]),
+            ],
+        );
+        let transitions = element_load_transitions(relocating_element_load as *const () as usize);
+        let code = compile_with_transitions(&view, 109, &transitions)
+            .expect("element load is optimizing-eligible");
+        let result = execute(&code, &[box_i32(99), box_i32(0)]);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(unbox_i32(result.value), 42);
+
+        assert_eq!(code.safepoint_count(), 1);
+        assert_eq!(JitFunctionCode::metadata(&code).safepoint_count, 1);
+        let record = code.safepoint_record(0).expect("element-load safepoint");
+        assert_eq!(record.tagged_locations.len(), 4);
+        assert_eq!(
+            record.tagged_locations[3],
+            otter_vm::native_abi::TaggedLocation::frame_slot(3)
+        );
+    }
+
+    #[test]
+    fn element_load_nonzero_status_uses_shared_throw_exit() {
+        let view = view(
+            2,
+            3,
+            vec![
+                (
+                    Op::LoadElement,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let transitions = element_load_transitions(throwing_element_load as *const () as usize);
+        let code = compile_with_transitions(&view, 110, &transitions)
+            .expect("throwing element load is optimizing-eligible");
+        let result = execute(&code, &[box_i32(99), box_i32(0)]);
+        assert_eq!(result.status, STATUS_THREW);
+        assert_eq!(result.value, 0);
     }
 
     #[test]

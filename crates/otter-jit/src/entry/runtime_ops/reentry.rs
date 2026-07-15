@@ -69,6 +69,44 @@ fn try_materialize_compiled_error(ctx: &mut JitCtx, err: VmError) -> Result<bool
     Ok(true)
 }
 
+/// Shared throw-epilogue resolver.
+///
+/// A value transition (property/element/global/loose-equality/coercion resolves
+/// its miss in the VM and, on a JavaScript throw, parks the error and branches
+/// to the compiled frame's throw epilogue. Before the epilogue propagates the
+/// throw to its caller, this delivers the parked error to the frame's own
+/// structured-exception handlers exactly as an interpreted throw at that PC
+/// would: a `try` in the same compiled function then catches it. Returns
+/// [`STATUS_BAILED`] with the frame's published PC advanced to the catch or
+/// finally continuation when a local handler takes the throw, and
+/// [`STATUS_THREW`] (error re-parked) when it escapes this frame.
+pub(crate) extern "C" fn jit_resolve_threw_stub(ctx: *mut JitCtx) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract; the error slot is initialized
+    // for the compiled entry's dynamic extent.
+    let ctx = unsafe { &mut *ctx };
+    let Some(err) = (unsafe { (*ctx.error).take() }) else {
+        return STATUS_THREW;
+    };
+    // A parked `Uncaught` names a value already staged in `pending_uncaught_throw`
+    // by a deeper frame; anything else is a fresh VM error to materialize here.
+    let materialized = if matches!(err, VmError::Uncaught) {
+        try_resume_caller_throw(ctx, true)
+    } else {
+        try_materialize_compiled_error(ctx, err)
+    };
+    match materialized {
+        Ok(true) => STATUS_BAILED,
+        Ok(false) => {
+            park_jit_error(ctx, err);
+            STATUS_THREW
+        }
+        Err(unwind_err) => {
+            park_jit_error(ctx, unwind_err);
+            STATUS_THREW
+        }
+    }
+}
+
 /// Complete one structured-exception opcode, including TDZ `ReferenceError`
 /// materialization. Unlike ordinary status-word transitions this returns the
 /// full compiled-entry pair: a committed handler mutation may continue, resume

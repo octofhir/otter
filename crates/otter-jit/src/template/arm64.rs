@@ -1024,10 +1024,23 @@ pub(super) fn compile(
         ; movz x1, STATUS_BAILED as u32
     );
     emit_epilogue(&mut ops);
-    // Shared throw epilogue: the poll stub parked the error in the context.
+    // Shared throw epilogue: a transition parked the error in the context.
+    // Before propagating, deliver it to this frame's own structured-exception
+    // handlers so a `try` in the same compiled function catches a
+    // property/element/global/loose-equality/coercion throw. The resolver bails
+    // to the published catch/finally PC when a local handler takes it, and
+    // otherwise re-parks the error for the propagating throw.
     dynasm!(ops
         ; .arch aarch64
         ; =>threw
+        ; mov x0, x20
+    );
+    emit_load_u64(&mut ops, 16, transitions.entry(abi::STUB_JIT_RESOLVE_THREW));
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cmp x0, STATUS_BAILED as u32
+        ; b.eq =>bail
         ; movz x0, #0
         ; movz x1, STATUS_THREW as u32
     );

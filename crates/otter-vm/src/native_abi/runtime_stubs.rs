@@ -1140,6 +1140,22 @@ pub const STUB_JIT_MODULE_OP: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 
+/// Shared throw-epilogue resolver. Delivers a value transition's parked error to
+/// the current compiled frame's own structured-exception handlers before the
+/// throw propagates, so a `try` in the same compiled function catches a
+/// property/element/global/loose-equality/coercion throw. Reports
+/// [`crate::native_abi::runtime_stubs`] status `1` (bailed to the published
+/// catch/finally PC) or `2` (re-parked, propagate).
+pub const STUB_JIT_RESOLVE_THREW: RuntimeStubDescriptor = descriptor(
+    75,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+);
+
 /// Human-readable symbol for a stable runtime-stub id.
 #[must_use]
 pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
@@ -1218,6 +1234,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         72 => "jit_spread_call_op",
         73 => "jit_class_value_op",
         74 => "jit_module_op",
+        75 => "jit_resolve_threw",
         _ => "unknown_runtime_stub",
     }
 }
@@ -1298,6 +1315,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_SPREAD_CALL_OP,
     STUB_JIT_CLASS_VALUE_OP,
     STUB_JIT_MODULE_OP,
+    STUB_JIT_RESOLVE_THREW,
 ];
 
 /// Validate a descriptor and one concrete call-site safepoint id.

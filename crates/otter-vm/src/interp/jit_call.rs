@@ -1276,8 +1276,9 @@ impl Interpreter {
     /// would have produced, including the advanced caller PC and the return
     /// register the callee's eventual return writes through.
     ///
-    /// Returns the new frame's register-window base. The emitted code then
-    /// fast-forwards that frame to where the optimized code actually was.
+    /// The frame is then fast-forwarded to `callee_pc`, the instruction the
+    /// exit names, and its register-window base is returned so emitted code can
+    /// restore the callee's registers into it.
     ///
     /// # Safety
     /// `stack`'s top frame must be the caller, with its registers already
@@ -1287,6 +1288,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut HoltStack,
         call_pc: u32,
+        callee_pc: u32,
     ) -> Result<*mut crate::Value, VmError> {
         let caller_index = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         let function_id = stack[caller_index].function_id;
@@ -1308,7 +1310,18 @@ impl Interpreter {
         if stack.len() != caller_index + 2 {
             return Err(VmError::InvalidOperand);
         }
-        Ok(stack[caller_index + 1].registers.as_mut_ptr())
+        let callee_index = caller_index + 1;
+        // The interpreter's call path starts the callee at its entry; the
+        // optimized code was further in. Fast-forward the frame to the exact
+        // instruction the exit names.
+        let callee_body = context
+            .exec_function(stack[callee_index].function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        if callee_pc as usize >= callee_body.code.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        stack[callee_index].pc = callee_pc;
+        Ok(stack[callee_index].registers.as_mut_ptr())
     }
 
    /// `caller_regs` is the caller's live register window (`JitCtx.regs`);

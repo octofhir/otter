@@ -388,14 +388,7 @@ fn check_eligibility(
             "optimizing subset requires one reachable entry graph",
         ));
     }
-    // The backend resolves every instruction against the root snapshot and
-    // reconstructs one interpreter frame on deopt, so it cannot yet emit a unit
-    // whose graph spans more than one frame.
-    if cfg.blocks.iter().any(|block| block.inline != InlineId::ROOT) {
-        return Err(Unsupported::OperandShape(
-            "optimizing subset rejects spliced frames",
-        ));
-    }
+
     let mut back_edges = BTreeMap::new();
     for block in &cfg.blocks {
         if !block.exception_succs.is_empty() {
@@ -404,7 +397,12 @@ fn check_eligibility(
             ));
         }
         for successor in block.normal_succs.iter().copied() {
-            if cfg.blocks[successor.0 as usize].start_pc <= block.start_pc {
+            // A back edge is a same-frame edge to a leader at or before this
+            // block's. A splice edge leaves the frame — a callee entering at PC
+            // 0 from a call block at PC 0 is not a loop — and PCs of different
+            // frames are not comparable at all.
+            let target = &cfg.blocks[successor.0 as usize];
+            if target.inline == block.inline && target.start_pc <= block.start_pc {
                 if !dom.dominates(successor, block.id) {
                     return Err(Unsupported::OperandShape(
                         "optimizing subset rejects irreducible back-edges",
@@ -892,6 +890,18 @@ fn check_eligibility(
     }
     guarded_numeric_uses.sort_by_key(|guarded| guarded.use_pc);
     guarded_numeric_uses.dedup_by_key(|guarded| guarded.use_pc);
+    // A reentrant stub addresses its operands as indices into the *caller's*
+    // interpreter register window. A spliced callee has no window of its own
+    // until its frame is reified at a deopt exit, so those indices would name
+    // the caller's registers and corrupt them. Splicing is therefore confined
+    // to bodies the tier lowers entirely into machine registers.
+    for &(_, block, _) in &element_transition_instructions {
+        if cfg.blocks[block.0 as usize].inline != InlineId::ROOT {
+            return Err(Unsupported::OperandShape(
+                "optimizing subset rejects a spliced frame that needs a register window",
+            ));
+        }
+    }
     element_transition_instructions.sort_unstable_by_key(|&(pc, _, _)| pc);
     element_transition_instructions.dedup_by_key(|instruction| instruction.0);
     let element_transitions = build_element_transition_sites(
@@ -3531,6 +3541,101 @@ mod tests {
     use crate::entry::{JitCtx, JitEntry, JitRet, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW};
 
     const STRIDE: u32 = 8;
+
+    /// A spliced unit is refused by the specific piece the backend still lacks,
+    /// not by a blanket rule — so each landing piece narrows the refusal.
+    #[test]
+    fn a_spliced_unit_is_still_refused() {
+        use crate::ir::inline::InlineTree;
+
+        let mut view = JitCompileSnapshot::without_feedback(
+            7,
+            1,
+            8,
+            vec![
+                JitTestInstruction::new(
+                    Op::Call,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(0)]),
+            ],
+        );
+        let callee = JitCompileSnapshot::without_feedback(
+            9,
+            1,
+            4,
+            vec![JitTestInstruction::new(
+                Op::ReturnValue,
+                0,
+                0,
+                vec![Operand::Register(0)],
+            )],
+        );
+        let call_byte_pc = view.instructions[0].byte_pc;
+        view.inline_callees.insert(
+            call_byte_pc,
+            otter_vm::JitInlineCallee {
+                code_block: Arc::clone(&callee.code_block),
+                function_id: 9,
+                param_count: 1,
+                register_count: callee.code_block.register_count,
+                instructions: callee.instructions,
+            },
+        );
+
+        let tree = InlineTree::build(&view);
+        assert_eq!(tree.frames.len(), 2, "the fixture must splice");
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
+        let dom = DominatorTree::compute(&cfg);
+        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("a spliced SSA builds");
+        let liveness = Liveness::compute(&ssa, &cfg);
+        let reprs = ReprMap::compute(&tree, &ssa);
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
+            .expect("allocation computes");
+        let frame_states = FrameStateTable::build_inlined(
+            &tree
+                .frames
+                .iter()
+                .map(|frame| frame.call_site.clone())
+                .collect::<Vec<_>>(),
+            &ssa,
+            &cfg,
+        )
+        .expect("frame states build");
+
+        let refusal = check_eligibility(
+            &view,
+            &cfg,
+            &dom,
+            &ssa,
+            EligibilityAnalyses {
+                liveness: &liveness,
+                reprs: &reprs,
+                allocation: &allocation,
+                frame_states: &frame_states,
+            },
+        );
+        // The splice terminator, not a blanket "no spliced frames" rule.
+        // The splice terminator the backend cannot emit yet — not a blanket
+        // "no spliced frames" rule, and not a back edge: a callee entering at
+        // PC 0 from a call block at PC 0 leaves the frame, so it is a splice
+        // edge and never a loop.
+        let Err(refusal) = refusal else {
+            panic!("a spliced unit must still be refused");
+        };
+        assert_eq!(
+            refusal,
+            Unsupported::OperandShape("optimizing subset has an unsupported terminator"),
+        );
+    }
+
 
     fn box_i32(value: i32) -> u64 {
         (0xfffe_u64 << 48) | u64::from(value as u32)

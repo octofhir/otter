@@ -33,6 +33,7 @@ use otter_vm::{
 
 use super::{
     frame_state::FrameStateTable,
+    inline::InlineTree,
     regalloc::{Allocation, Location, RegClass},
     repr::{ReprError, ReprMap, Representation},
     ssa::{SsaFunction, ValueId},
@@ -210,14 +211,15 @@ impl DeoptLowering {
     /// Lower abstract interpreter-register state to the concrete VM deopt schema.
     pub fn build(
         view: &JitCompileSnapshot,
+        tree: &InlineTree,
         ssa: &SsaFunction,
         frame_states: &FrameStateTable,
         allocation: &Allocation,
         reprs: &ReprMap,
     ) -> Result<Self, DeoptLoweringError> {
-        let table = lower_table(view, ssa, frame_states, allocation, reprs)?;
+        let table = lower_table(view, tree, ssa, frame_states, allocation, reprs)?;
         let lowering = Self { table };
-        lowering.verify(view, ssa, frame_states, allocation, reprs)?;
+        lowering.verify(view, tree, ssa, frame_states, allocation, reprs)?;
         Ok(lowering)
     }
 
@@ -231,12 +233,13 @@ impl DeoptLowering {
     pub fn verify(
         &self,
         view: &JitCompileSnapshot,
+        tree: &InlineTree,
         ssa: &SsaFunction,
         frame_states: &FrameStateTable,
         allocation: &Allocation,
         reprs: &ReprMap,
     ) -> Result<(), DeoptLoweringError> {
-        validate_inputs(view, ssa, frame_states, allocation, reprs)?;
+        validate_inputs(view, tree, ssa, frame_states, allocation, reprs)?;
         self.table
             .verify(verify_limits(ssa, allocation)?)
             .map_err(DeoptLoweringError::InvalidDeoptTable)?;
@@ -288,8 +291,8 @@ impl DeoptLowering {
             }
         }
 
-        let first = lower_table(view, ssa, frame_states, allocation, reprs)?;
-        let second = lower_table(view, ssa, frame_states, allocation, reprs)?;
+        let first = lower_table(view, tree, ssa, frame_states, allocation, reprs)?;
+        let second = lower_table(view, tree, ssa, frame_states, allocation, reprs)?;
         if first != second || self.table != first {
             return Err(DeoptLoweringError::NonDeterministic);
         }
@@ -299,13 +302,14 @@ impl DeoptLowering {
 
 fn validate_inputs(
     view: &JitCompileSnapshot,
+    tree: &InlineTree,
     ssa: &SsaFunction,
     frame_states: &FrameStateTable,
     allocation: &Allocation,
     reprs: &ReprMap,
 ) -> Result<(), DeoptLoweringError> {
     reprs
-        .verify(view, ssa)
+        .verify(tree, ssa)
         .map_err(DeoptLoweringError::InvalidRepresentations)?;
     if allocation.locations.len() != ssa.values.len() {
         return Err(DeoptLoweringError::AllocationLocationCountMismatch {
@@ -370,12 +374,13 @@ fn validate_inputs(
 
 fn lower_table(
     view: &JitCompileSnapshot,
+    tree: &InlineTree,
     ssa: &SsaFunction,
     frame_states: &FrameStateTable,
     allocation: &Allocation,
     reprs: &ReprMap,
 ) -> Result<DeoptTable, DeoptLoweringError> {
-    validate_inputs(view, ssa, frame_states, allocation, reprs)?;
+    validate_inputs(view, tree, ssa, frame_states, allocation, reprs)?;
     let mut states = Vec::with_capacity(frame_states.states().len());
     for state in frame_states.states() {
         let slots = state
@@ -545,6 +550,7 @@ mod tests {
 
     struct Pipeline {
         view: JitCompileSnapshot,
+        tree: InlineTree,
         ssa: SsaFunction,
         frame_states: FrameStateTable,
         allocation: Allocation,
@@ -570,17 +576,18 @@ mod tests {
         for &(pc, bits) in feedback {
             view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(bits));
         }
-        let cfg = ControlFlowGraph::build(&view).expect("CFG builds");
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
         cfg.verify().expect("CFG verifies");
-        let ssa = SsaFunction::build(&view, &cfg).expect("SSA builds");
+        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
         let dom = DominatorTree::compute(&cfg);
         ssa.verify(&cfg, &dom).expect("SSA verifies");
         let liveness = Liveness::compute(&ssa, &cfg);
         liveness
             .verify(&ssa, &cfg, &dom)
             .expect("liveness verifies");
-        let reprs = ReprMap::compute(&view, &ssa);
-        reprs.verify(&view, &ssa).expect("representations verify");
+        let reprs = ReprMap::compute(&tree, &ssa);
+        reprs.verify(&tree, &ssa).expect("representations verify");
         let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, register_budget)
             .expect("allocation computes");
         allocation
@@ -592,6 +599,7 @@ mod tests {
             .expect("frame states verify");
         Pipeline {
             view,
+            tree,
             ssa,
             frame_states,
             allocation,
@@ -606,6 +614,7 @@ mod tests {
     fn lower(pipeline: &Pipeline) -> DeoptLowering {
         DeoptLowering::build(
             &pipeline.view,
+            &pipeline.tree,
             &pipeline.ssa,
             &pipeline.frame_states,
             &pipeline.allocation,
@@ -668,6 +677,7 @@ mod tests {
         assert_eq!(
             lowering.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,
@@ -706,6 +716,7 @@ mod tests {
         assert_eq!(
             lowering.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,
@@ -766,6 +777,7 @@ mod tests {
         assert_eq!(
             lowering.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,
@@ -796,6 +808,7 @@ mod tests {
         assert_eq!(
             lowering.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,
@@ -838,6 +851,7 @@ mod tests {
         assert_eq!(
             lowering.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,
@@ -897,6 +911,7 @@ mod tests {
         assert_eq!(
             lowering.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,
@@ -934,6 +949,7 @@ mod tests {
         assert_eq!(
             corrupted.verify(
                 &pipeline.view,
+                &pipeline.tree,
                 &pipeline.ssa,
                 &pipeline.frame_states,
                 &pipeline.allocation,

@@ -94,6 +94,51 @@ impl Interpreter {
         }
     }
 
+    /// Resolve or compile one whole-body optimizer object for loop OSR.
+    ///
+    /// Back-edge hotness is independent of function-entry promotion: a
+    /// single-call loop can therefore compile here before the entry policy is
+    /// hot. Successful code is shared with later function entries. A failed
+    /// early feedback snapshot is not cached as a permanent entry-tier miss;
+    /// the current header falls back to template OSR and future entry feedback
+    /// may still make the function optimizable.
+    pub(crate) fn resolve_optimized_osr_code(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+    ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if let Some(Some(code)) = self.jit_optimized_code.get(&fid) {
+            return self
+                .jit_code_registry
+                .is_compatible_for_entry(code.as_ref())
+                .then(|| code.clone());
+        }
+        // A declined body is retried at a back-edge only when its feedback epoch
+        // has advanced since the last failed attempt: the optimizer's whole-body
+        // subset check is structural (unsupported opcode) except for
+        // feedback-driven representation, so re-running it while the feedback is
+        // unchanged always fails again and would recompile on every hot iteration.
+        let epoch = self.code_space.feedback_epoch(fid);
+        if matches!(self.jit_optimized_code.get(&fid), Some(None))
+            && self.jit_optimized_declined_epoch.get(&fid) == Some(&epoch)
+        {
+            return None;
+        }
+        match self.compile_optimized_jit_function(context, fid) {
+            Some(compiled) => {
+                self.jit_optimized_code.insert(fid, Some(compiled.clone()));
+                self.jit_optimized_declined_epoch.remove(&fid);
+                self.jit_optimized_code_cache = Some((fid, compiled.clone()));
+                Some(compiled)
+            }
+            None => {
+                self.jit_optimized_code.insert(fid, None);
+                self.jit_optimized_declined_epoch.insert(fid, epoch);
+                None
+            }
+        }
+    }
+
     /// Build a compile request for `fid` and run the installed hook. Returns the
     /// installed code, or `None` when the hook declines (unsupported subset or
     /// executable memory unavailable) — either way execution stays correct on

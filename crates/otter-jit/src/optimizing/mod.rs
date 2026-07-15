@@ -1,7 +1,8 @@
 //! Feedback-guided optimizing tier for reducible numeric and element-access functions.
 //!
 //! This module compiles multi-block int32 and float64 arithmetic functions,
-//! including reducible loops entered only at function entry. It runs
+//! including reducible loops entered at function entry or by on-stack
+//! replacement at a hot loop header. It runs
 //! the complete CFG, dominance, SSA, liveness, register-allocation,
 //! representation, frame-state, and deopt-lowering pipeline before the arm64
 //! backend checks the deliberately narrow eligibility contract. CFG edges
@@ -22,8 +23,8 @@
 //!   Store scratch slots remain non-roots and may be clobbered by the runtime.
 //! - Every backwards bytecode edge targets a header that dominates its predecessor;
 //!   irreducible loops and exception edges are rejected.
-//! - The sole ABI argument is a dynamically valid `JitCtx`; parameters and
-//!   deopt writeback both use its rooted interpreter register window.
+//! - The sole ABI argument is a dynamically valid `JitCtx`; parameters, OSR
+//!   materialization, and deopt writeback use its rooted interpreter window.
 //! - A two-word `JitRet` uses `x0` for a boxed returned value and `x1` for
 //!   `RETURNED`, `BAILED`, or `THREW` status.
 //! - Phi moves execute before a back-edge poll. Interrupt or exhausted fuel
@@ -37,6 +38,8 @@
 //! # See also
 //! - [`crate::ir`] — the reusable optimizing analyses consumed here.
 //! - [`crate::template`] — the runtime-wired baseline compiler.
+
+use std::collections::BTreeMap;
 
 use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
@@ -81,6 +84,8 @@ pub struct OptimizedCode {
     safepoint_records: Box<[SafepointRecord]>,
     frame_maps: Box<[FrameMap]>,
     frame_map_bitmap_words: Box<[u64]>,
+    /// Loop-header logical PC → assembler offset of its OSR trampoline.
+    osr_entries: BTreeMap<u32, usize>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
@@ -92,6 +97,7 @@ impl OptimizedCode {
         safepoint_records: Box<[SafepointRecord]>,
         frame_maps: Box<[FrameMap]>,
         frame_map_bitmap_words: Box<[u64]>,
+        osr_entries: BTreeMap<u32, usize>,
         metadata: OptimizedMetadata,
     ) -> Self {
         const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0005;
@@ -117,6 +123,7 @@ impl OptimizedCode {
             safepoint_records,
             frame_maps,
             frame_map_bitmap_words,
+            osr_entries,
             metadata,
             code_metadata,
         }
@@ -152,6 +159,13 @@ impl OptimizedCode {
     fn frame_map_bitmap_words(&self) -> &[u64] {
         &self.frame_map_bitmap_words
     }
+
+    #[cfg(test)]
+    unsafe fn osr_entry_ptr_for_test(&self, logical_pc: u32) -> Option<*const u8> {
+        let offset = *self.osr_entries.get(&logical_pc)?;
+        // SAFETY: tests keep this code object alive through the native call.
+        Some(unsafe { self.code.ptr_at(offset) })
+    }
 }
 
 impl std::fmt::Debug for OptimizedCode {
@@ -161,6 +175,7 @@ impl std::fmt::Debug for OptimizedCode {
             .field("deopt_points", &self.deopt_table.len())
             .field("safepoints", &self.safepoint_records.len())
             .field("frame_maps", &self.frame_maps.len())
+            .field("osr_entries", &self.osr_entries.len())
             .field("frame_map_bitmap_words", &self.frame_map_bitmap_words.len())
             .field("metadata", &self.metadata)
             .finish()
@@ -199,6 +214,30 @@ impl JitFunctionCode for OptimizedCode {
         // emitted with the shared `JitCtx` ABI. `activation` carries the VM's
         // frozen-borrow contract for the dynamic call.
         let entry = unsafe { self.code.entry_ptr() };
+        Some(unsafe {
+            enter_compiled(
+                activation,
+                entry,
+                self.metadata.code_object_id,
+                self.metadata.function_id,
+                self.metadata.register_count,
+                !self.safepoint_records.is_empty(),
+            )
+        })
+    }
+
+    fn run_optimized_osr_entry(
+        &self,
+        activation: VmRuntimeActivation,
+        logical_pc: u32,
+    ) -> Option<JitExecOutcome> {
+        if !self.code_metadata.is_compatible_with_current_vm() {
+            return None;
+        }
+        let offset = *self.osr_entries.get(&logical_pc)?;
+        // SAFETY: the recorded offset belongs to this live executable mapping
+        // and names a trampoline emitted with the shared `JitCtx` ABI.
+        let entry = unsafe { self.code.ptr_at(offset) };
         Some(unsafe {
             enter_compiled(
                 activation,

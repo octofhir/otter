@@ -78,6 +78,25 @@ const hotFloatRmwSum = hotFloatRmw(hotFloatRmwA, hotFloatRmwB, 0.5, 4);
 const hotManySum = hotManyArrays(hotManyA, hotManyB, hotManyC, hotManyD, 4);
 const hotChain = hotTaggedChain(hotChainA, hotChainB, hotChainC, hotChainD, 0);
 
+// A single call dominated by one numeric array loop. Function-entry hotness
+// can never optimize it; the back-edge must enter optimized code at the loop
+// header while the interpreter window remains the canonical GC root set.
+const osrOnceA = [];
+const osrOnceB = [];
+for (let index = 0; index < 2048; index = index + 1) {
+  osrOnceA[index] = 1.25;
+  osrOnceB[index] = 0.5;
+}
+function osrOnceFloatRmw(a, b, scale, limit) {
+  let total = 0.5;
+  for (let index = 0; index < limit; index = index + 1) {
+    a[index] = a[index] * scale + b[index];
+    total = total + a[index];
+  }
+  return total;
+}
+const osrOnceTotal = osrOnceFloatRmw(osrOnceA, osrOnceB, 0.5, 2048);
+
 JSON.stringify({
   dense: dense.length,
   hole: 1 in holey,
@@ -88,6 +107,9 @@ JSON.stringify({
   hotFloatRmw: hotFloatRmwA,
   hotManySum,
   hotChain,
+  osrOnceTotal,
+  osrOnceFirst: osrOnceA[0],
+  osrOnceLast: osrOnceA[2047],
   hotFirst: hotElement(hotValues, 0),
   loadThrow
 });

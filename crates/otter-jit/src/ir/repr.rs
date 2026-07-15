@@ -22,14 +22,36 @@
 //! # See also
 //! - [`super::ssa`] — the SSA graph analyzed here.
 //! - [`otter_vm::jit_feedback::ArithFeedback`] — arithmetic observations.
-//! - [`otter_vm::JitCompileSnapshot`] — immutable analysis input.
+//! - [`crate::ir::inline::InlineTree`] — the frames whose feedback is read.
 
 use std::collections::BTreeMap;
 
 use otter_bytecode::Op;
-use otter_vm::{JitCompileSnapshot, jit_feedback::ArithFeedback};
+use otter_vm::{JitInstructionMetadata, jit_feedback::ArithFeedback};
 
-use super::ssa::{SsaFunction, ValueDef, ValueId};
+use super::{
+    inline::{InlineId, InlineTree},
+    ssa::{SsaFunction, ValueDef, ValueId},
+};
+
+/// The constant a `LoadNumber` in one frame materializes.
+fn load_number_at(tree: &InlineTree, inline: InlineId, pc: u32) -> Option<f64> {
+    tree.frames[inline.0 as usize]
+        .instructions
+        .get(pc as usize)
+        .and_then(|instruction| instruction.load_number)
+}
+
+/// Arithmetic feedback for one instruction of one frame.
+///
+/// A spliced callee carries its own feedback overlay, so a unit-wide lookup
+/// against the root body would read another function's cell.
+fn feedback_at(tree: &InlineTree, inline: InlineId, pc: u32) -> ArithFeedback {
+    tree.frames[inline.0 as usize]
+        .instructions
+        .get(pc as usize)
+        .map_or_else(ArithFeedback::default, JitInstructionMetadata::arith_feedback)
+}
 
 /// Machine representation selected for one SSA value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -173,7 +195,7 @@ pub enum ReprError {
 impl ReprMap {
     /// Select value representations and derive required input conversions.
     #[must_use]
-    pub fn compute(view: &JitCompileSnapshot, ssa: &SsaFunction) -> Self {
+    pub fn compute(tree: &InlineTree, ssa: &SsaFunction) -> Self {
         let mut reprs: Vec<_> = ssa
             .values
             .iter()
@@ -183,7 +205,7 @@ impl ReprMap {
                     op: Op::LoadLocal | Op::StoreLocal,
                     ..
                 } => Representation::Int32,
-                _ => selected_non_phi_representation(view, &value.def),
+                _ => selected_non_phi_representation(tree, &value.def),
             })
             .collect();
 
@@ -223,7 +245,7 @@ impl ReprMap {
                         .expect("local moves have one SSA result")
                         .0 as usize]
                 } else {
-                    selected_input_representation(instruction.op, view.feedback_at(instruction.pc))
+                    selected_input_representation(instruction.op, feedback_at(tree, instruction.inline, instruction.pc))
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let from = reprs[value.0 as usize];
@@ -262,7 +284,7 @@ impl ReprMap {
     }
 
     /// Independently verify coverage, soundness, conversions, and determinism.
-    pub fn verify(&self, view: &JitCompileSnapshot, ssa: &SsaFunction) -> Result<(), ReprError> {
+    pub fn verify(&self, tree: &InlineTree, ssa: &SsaFunction) -> Result<(), ReprError> {
         if self.reprs.len() != ssa.values.len() {
             return Err(ReprError::RepresentationCountMismatch {
                 expected: ssa.values.len(),
@@ -292,7 +314,7 @@ impl ReprMap {
                             inputs,
                             ..
                         } if inputs.len() == 1 => self.representation(inputs[0]),
-                        _ => verified_non_phi_representation(view, def),
+                        _ => verified_non_phi_representation(tree, def),
                     };
                     let actual = self.representation(value.id);
                     if actual != expected {
@@ -335,7 +357,7 @@ impl ReprMap {
                         instruction.result.expect("local moves have one SSA result"),
                     )
                 } else {
-                    verified_input_representation(instruction.op, view.feedback_at(instruction.pc))
+                    verified_input_representation(instruction.op, feedback_at(tree, instruction.inline, instruction.pc))
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let key = (instruction.pc, operand_index);
@@ -400,7 +422,7 @@ impl ReprMap {
             });
         }
 
-        if Self::compute(view, ssa) != Self::compute(view, ssa) {
+        if Self::compute(tree, ssa) != Self::compute(tree, ssa) {
             return Err(ReprError::NonDeterministic);
         }
         Ok(())
@@ -415,44 +437,43 @@ const fn meet(left: Representation, right: Representation) -> Representation {
     }
 }
 
-fn selected_non_phi_representation(view: &JitCompileSnapshot, def: &ValueDef) -> Representation {
+fn selected_non_phi_representation(tree: &InlineTree, def: &ValueDef) -> Representation {
     match *def {
         ValueDef::Op {
             op: Op::LoadInt32, ..
         } => Representation::Int32,
         ValueDef::Op {
+            inline,
             pc,
             op: Op::LoadNumber,
             ..
-        } => view
-            .instructions
-            .get(pc as usize)
-            .and_then(|instruction| instruction.load_number)
+        } => load_number_at(tree, inline, pc)
             .map_or(Representation::Float64, number_representation),
-        ValueDef::Op { pc, op, .. } => selected_result_representation(op, view.feedback_at(pc)),
+        ValueDef::Op { inline, pc, op, .. } => {
+            selected_result_representation(op, feedback_at(tree, inline, pc))
+        }
         _ => Representation::Tagged,
     }
 }
 
-fn verified_non_phi_representation(view: &JitCompileSnapshot, def: &ValueDef) -> Representation {
+fn verified_non_phi_representation(tree: &InlineTree, def: &ValueDef) -> Representation {
     match *def {
         ValueDef::Op {
             op: Op::LoadInt32, ..
         } => Representation::Int32,
         ValueDef::Op {
+            inline,
             pc,
             op: Op::LoadNumber,
             ..
-        } => match view
-            .instructions
-            .get(pc as usize)
-            .and_then(|instruction| instruction.load_number)
-        {
+        } => match load_number_at(tree, inline, pc) {
             Some(number) if is_exact_i32(number) => Representation::Int32,
             Some(_) => Representation::Float64,
             None => Representation::Float64,
         },
-        ValueDef::Op { pc, op, .. } => verified_result_representation(op, view.feedback_at(pc)),
+        ValueDef::Op { inline, pc, op, .. } => {
+            verified_result_representation(op, feedback_at(tree, inline, pc))
+        }
         _ => Representation::Tagged,
     }
 }
@@ -676,6 +697,8 @@ mod tests {
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ARITH_STRING},
     };
 
+    use otter_vm::JitCompileSnapshot;
+
     use super::*;
     use crate::ir::{cfg::ControlFlowGraph, dom::DominatorTree};
 
@@ -684,7 +707,7 @@ mod tests {
         register_count: u16,
         instructions: Vec<(Op, Vec<Operand>)>,
         feedback: &[(u32, u8)],
-    ) -> (JitCompileSnapshot, SsaFunction) {
+    ) -> (InlineTree, SsaFunction) {
         let instructions = instructions
             .into_iter()
             .enumerate()
@@ -697,11 +720,12 @@ mod tests {
         for &(pc, bits) in feedback {
             view.seed_arith_feedback_for_test(pc, ArithFeedback::from_bits(bits));
         }
-        let cfg = ControlFlowGraph::build(&view).expect("CFG builds");
-        let ssa = SsaFunction::build(&view, &cfg).expect("SSA builds");
+        let tree = InlineTree::trivial(&view);
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("CFG builds");
+        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("SSA builds");
         ssa.verify(&cfg, &DominatorTree::compute(&cfg))
             .expect("SSA verifies");
-        (view, ssa)
+        (tree, ssa)
     }
 
     fn op_value_at(ssa: &SsaFunction, pc: u32) -> ValueId {

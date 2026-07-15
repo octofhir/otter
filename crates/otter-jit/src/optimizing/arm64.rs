@@ -87,7 +87,7 @@ use crate::{
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
-        inline::InlineId,
+        inline::{InlineId, InlineTree},
         deopt_lower::DeoptLowering,
         dom::DominatorTree,
         frame_state::{AbstractFrameState, FrameStateTable},
@@ -204,14 +204,18 @@ pub(super) fn compile_with_transitions(
     code_object_id: u64,
     transitions: &TransitionTable,
 ) -> Result<OptimizedCode, Unsupported> {
-    let cfg = ControlFlowGraph::build(view)
+    // The unit is the root function alone until the backend can emit and
+    // deoptimize a spliced frame; the tree is built so the pipeline is the same
+    // shape either way.
+    let tree = InlineTree::trivial(view);
+    let cfg = ControlFlowGraph::build_inlined(&tree)
         .map_err(|_| Unsupported::OperandShape("optimizing CFG construction"))?;
     cfg.verify()
         .map_err(|_| Unsupported::OperandShape("optimizing CFG verification"))?;
     let dom = DominatorTree::compute(&cfg);
     dom.verify(&cfg)
         .map_err(|_| Unsupported::OperandShape("optimizing dominance verification"))?;
-    let ssa = SsaFunction::build(view, &cfg)
+    let ssa = SsaFunction::build_inlined(&tree, &cfg)
         .map_err(|_| Unsupported::OperandShape("optimizing SSA construction"))?;
     ssa.verify(&cfg, &dom)
         .map_err(|_| Unsupported::OperandShape("optimizing SSA verification"))?;
@@ -219,9 +223,9 @@ pub(super) fn compile_with_transitions(
     liveness
         .verify(&ssa, &cfg, &dom)
         .map_err(|_| Unsupported::OperandShape("optimizing liveness verification"))?;
-    let reprs = ReprMap::compute(view, &ssa);
+    let reprs = ReprMap::compute(&tree, &ssa);
     reprs
-        .verify(view, &ssa)
+        .verify(&tree, &ssa)
         .map_err(|_| Unsupported::OperandShape("optimizing representation verification"))?;
     let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
         .map_err(|_| Unsupported::OperandShape("optimizing register allocation"))?;
@@ -238,7 +242,7 @@ pub(super) fn compile_with_transitions(
     allocation
         .rebuild_edge_moves(&ssa, &cfg, &reprs)
         .map_err(|_| Unsupported::OperandShape("optimizing legalized phi moves"))?;
-    let deopt = DeoptLowering::build(view, &ssa, &frame_states, &allocation, &reprs)
+    let deopt = DeoptLowering::build(view, &tree, &ssa, &frame_states, &allocation, &reprs)
         .map_err(|_| Unsupported::OperandShape("optimizing deopt lowering"))?;
 
     let eligibility = check_eligibility(
@@ -4749,7 +4753,8 @@ mod tests {
                 .expect("diamond must contain a join phi")
                 .id;
         let liveness = Liveness::compute(&ssa, &cfg);
-        let reprs = ReprMap::compute(&view, &ssa);
+        let tree = InlineTree::trivial(&view);
+        let reprs = ReprMap::compute(&tree, &ssa);
         let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
             .expect("diamond allocation");
         let incoming: Vec<_> = allocation
@@ -5116,7 +5121,8 @@ mod tests {
         let ssa = SsaFunction::build(&view, &cfg).expect("summation SSA");
         assert!(ssa.blocks[header.0 as usize].phis.len() >= 2);
         let liveness = Liveness::compute(&ssa, &cfg);
-        let reprs = ReprMap::compute(&view, &ssa);
+        let tree = InlineTree::trivial(&view);
+        let reprs = ReprMap::compute(&tree, &ssa);
         let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
             .expect("summation allocation");
         assert!(

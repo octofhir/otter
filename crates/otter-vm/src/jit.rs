@@ -676,6 +676,16 @@ impl JitInstructionMetadata {
             .expect("JIT metadata instruction index belongs to its CodeBlock")
     }
 
+    /// Arithmetic feedback recorded for this instruction.
+    ///
+    /// Read per instruction rather than per compile snapshot: a spliced callee
+    /// carries its own overlay, and a snapshot-wide lookup would read the root
+    /// body's cell for it.
+    #[must_use]
+    pub fn arith_feedback(&self) -> ArithFeedback {
+        self.arith_feedback
+    }
+
     /// Opcode from the authoritative CodeBlock instruction.
     #[must_use]
     pub fn op(&self, code_block: &CodeBlock) -> Op {

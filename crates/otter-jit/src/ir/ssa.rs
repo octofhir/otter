@@ -96,6 +96,8 @@ pub enum ValueDef {
     },
     /// Result of one bytecode instruction.
     Op {
+        /// Frame owning the instruction; [`Self::Op::pc`] is canonical in it.
+        inline: InlineId,
         /// Original canonical bytecode PC.
         pc: u32,
         /// Original bytecode opcode.
@@ -749,6 +751,7 @@ impl SsaFunction {
                     Some(append_value(
                         &mut values,
                         ValueDef::Op {
+                            inline,
                             pc,
                             op,
                             inputs: Box::new([]),
@@ -1232,10 +1235,15 @@ impl SsaFunction {
                         });
                     }
                     match &value.def {
-                        ValueDef::Op { pc, op, inputs }
-                            if *pc == instruction.pc
-                                && *op == instruction.op
-                                && inputs.as_ref() == instruction.inputs.as_slice() => {}
+                        ValueDef::Op {
+                            inline,
+                            pc,
+                            op,
+                            inputs,
+                        } if *inline == instruction.inline
+                            && *pc == instruction.pc
+                            && *op == instruction.op
+                            && inputs.as_ref() == instruction.inputs.as_slice() => {}
                         _ => {
                             return Err(SsaError::OperationDefinitionMismatch {
                                 value: value_id,

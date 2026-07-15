@@ -532,7 +532,10 @@ impl SsaFunction {
     pub fn build_inlined(tree: &InlineTree, cfg: &ControlFlowGraph) -> Result<Self, SsaError> {
         let layout = UnitLayout::new(tree);
         let instruction_count: usize = cfg.blocks.iter().map(|block| block.instr_pcs.len()).sum();
-        if layout.total_instructions != instruction_count {
+        // The graph prunes unreachable blocks, so it may cover fewer
+        // instructions than the bodies declare — never more. Dense per-frame
+        // tables stay full-sized; dead slots are simply never read.
+        if instruction_count > layout.total_instructions {
             return Err(SsaError::SnapshotInstructionCountMismatch {
                 snapshot: layout.total_instructions,
                 cfg: instruction_count,

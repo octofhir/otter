@@ -158,13 +158,6 @@ pub enum CfgError {
         /// Offending canonical PC.
         pc: u32,
     },
-    /// Canonical instruction coverage contains a gap.
-    InstructionGap {
-        /// First missing canonical PC.
-        expected: u32,
-        /// Next PC found in the graph.
-        actual: u32,
-    },
     /// Snapshot metadata does not identify the expected canonical instruction.
     InstructionMetadataMismatch {
         /// Dense metadata index.
@@ -424,17 +417,19 @@ impl ControlFlowGraph {
             if first_pc != block.start_pc {
                 return Err(CfgError::LeaderSetMismatch);
             }
+            // PCs ascend strictly and never overlap. Coverage gaps between
+            // blocks are legitimate: construction prunes unreachable blocks, so
+            // a gap is exactly where dead bytecode was. Within a block PCs are
+            // contiguous by construction (a block spans leader to leader).
+            let mut block_expected = block.start_pc;
             for &pc in &block.instr_pcs {
-                if pc < expected_pc {
+                if pc < expected_pc || pc != block_expected {
                     return Err(CfgError::InstructionOverlap { pc });
                 }
-                if pc > expected_pc {
-                    return Err(CfgError::InstructionGap {
-                        expected: expected_pc,
-                        actual: pc,
-                    });
-                }
-                expected_pc = expected_pc
+                block_expected = block_expected
+                    .checked_add(1)
+                    .ok_or(CfgError::InstructionOverlap { pc })?;
+                expected_pc = pc
                     .checked_add(1)
                     .ok_or(CfgError::InstructionOverlap { pc })?;
             }
@@ -659,6 +654,77 @@ impl FrameBlocks {
             });
         }
 
+        // Real bytecode carries unreachable blocks — code after a return in a
+        // branch, a leader behind an unconditional jump. They never execute, so
+        // no analysis may see them: prune by reachability from the frame entry
+        // and renumber densely. PC coverage then legitimately has gaps exactly
+        // where dead code was.
+        let mut reachable = vec![false; blocks.len()];
+        let mut pending = vec![0_usize];
+        while let Some(index) = pending.pop() {
+            if std::mem::replace(&mut reachable[index], true) {
+                continue;
+            }
+            pending.extend(
+                blocks[index]
+                    .normal_succs
+                    .iter()
+                    .chain(&blocks[index].exception_succs)
+                    .map(|successor| (successor.0 - base) as usize),
+            );
+        }
+        if reachable.iter().any(|&kept| !kept) {
+            let mut remap = vec![None; blocks.len()];
+            let mut next = 0_u32;
+            for (index, &kept) in reachable.iter().enumerate() {
+                if kept {
+                    remap[index] = Some(BlockId(base + next));
+                    next += 1;
+                }
+            }
+            let remap_id = |id: BlockId| {
+                remap[(id.0 - base) as usize].expect("a reachable block only targets reachable")
+            };
+            let mut kept_blocks = Vec::with_capacity(next as usize);
+            for (index, mut block) in blocks.into_iter().enumerate() {
+                if !reachable[index] {
+                    continue;
+                }
+                block.id = remap_id(block.id);
+                for successor in &mut block.normal_succs {
+                    *successor = remap_id(*successor);
+                }
+                for successor in &mut block.exception_succs {
+                    *successor = remap_id(*successor);
+                }
+                if let Terminator::Branch { taken, fallthrough } = &mut block.terminator {
+                    *taken = remap_id(*taken);
+                    *fallthrough = remap_id(*fallthrough);
+                }
+                kept_blocks.push(block);
+            }
+            blocks = kept_blocks;
+            block_by_pc = blocks
+                .iter()
+                .map(|block| (block.start_pc, block.id))
+                .collect();
+            // The VM's loop-header table counted dead back edges too; a header
+            // whose only latch was pruned is a plain block now. Recompute from
+            // the surviving edges with the verifier's own definition.
+            let mut is_header = vec![false; blocks.len()];
+            for block in &blocks {
+                for successor in block.normal_succs.iter().copied() {
+                    let target = &blocks[(successor.0 - base) as usize];
+                    if target.start_pc <= block.start_pc {
+                        is_header[(successor.0 - base) as usize] = true;
+                    }
+                }
+            }
+            for (index, block) in blocks.iter_mut().enumerate() {
+                block.is_loop_header = is_header[index];
+            }
+        }
+
         Ok(Self {
             blocks,
             block_by_pc,
@@ -866,6 +932,26 @@ mod tests {
         let graph = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
         graph.verify().expect("a spliced CFG verifies");
         graph
+    }
+
+    #[test]
+    fn unreachable_blocks_are_pruned_not_rejected() {
+        // `return r0` at pc1 makes pc2 (a jump back to a dead loop) and pc3
+        // unreachable — the shape a branch-with-early-return leaves behind.
+        let graph = graph(vec![
+            (Op::Jump, vec![Operand::Imm32(0)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+            (Op::Jump, vec![Operand::Imm32(-2)]),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ]);
+
+        // Only the entry and the reachable return remain; the PC space keeps a
+        // gap exactly where the dead code was.
+        assert_eq!(graph.blocks.len(), 2);
+        assert_eq!(graph.blocks[0].instr_pcs, vec![0]);
+        assert_eq!(graph.blocks[1].instr_pcs, vec![1]);
+        assert_eq!(graph.blocks[1].terminator, Terminator::Return);
+        assert!(graph.blocks.iter().all(|block| !block.is_loop_header));
     }
 
     #[test]

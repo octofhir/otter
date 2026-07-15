@@ -69,7 +69,7 @@ use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
-    STUB_JIT_DEOPT_REIFY_FRAME,
+    STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
     STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
@@ -131,6 +131,10 @@ struct Eligibility {
     osr_entries: BTreeMap<BlockId, OsrEntrySite>,
     /// Precise transition protocol per element load/store logical PC.
     element_transitions: ElementTransitionSafepoints,
+    /// Per-`MathCall`-site argument window registers, keyed by logical PC. The
+    /// emitted call passes a pointer into the boxed slice, so the arena must
+    /// live exactly as long as the code; `OptimizedCode` takes ownership.
+    math_call_arguments: BTreeMap<u32, Box<[u16]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +197,8 @@ struct EmissionPlan<'a> {
     construct_entry: u64,
     /// Rebuilds a spliced callee's interpreter frame at a deopt exit.
     reify_frame_entry: u64,
+    /// Dispatches a `Math.<method>` intrinsic through the window transition.
+    math_call_entry: u64,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -296,6 +302,7 @@ pub(super) fn compile_with_transitions(
             call_method_entry: transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
             construct_entry: transitions.variadic_entry(STUB_JIT_CONSTRUCT),
             reify_frame_entry: transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
+            math_call_entry: transitions.variadic_entry(STUB_JIT_MATH_CALL),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -328,6 +335,7 @@ pub(super) fn compile_with_transitions(
         frame_maps,
         eligibility.element_transitions.bitmap_words,
         emission.osr_entries,
+        eligibility.math_call_arguments,
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -531,6 +539,7 @@ fn check_eligibility(
     let mut guarded_uses = BTreeMap::<(u32, ValueId), Option<u32>>::new();
     let mut allowed_conversions = BTreeSet::new();
     let mut element_transition_instructions = Vec::new();
+    let mut math_call_arguments = BTreeMap::new();
     for block in dom.reverse_postorder().iter().copied() {
         for (instruction_index, instruction) in
             ssa.blocks[block.0 as usize].instrs.iter().enumerate()
@@ -691,6 +700,31 @@ fn check_eligibility(
                         return Err(Unsupported::Opcode(instruction.op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::MathCall => {
+                    // `dst, method-const, argc-const, arg-regs...`. Dispatches a
+                    // `Math.<method>` intrinsic through the same reentrant window
+                    // transition as a method call: a shadowed `Math` binding or
+                    // an exotic argument coercion may run arbitrary JS.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("math-call result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.result_register.is_none()
+                        || instruction.inputs.len() != instruction.input_registers.len()
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    math_call_arguments.insert(
+                        instruction.pc,
+                        instruction.input_registers.iter().copied().collect(),
+                    );
                     element_transition_instructions.push((
                         instruction.pc,
                         block,
@@ -1041,6 +1075,7 @@ fn check_eligibility(
         back_edges,
         osr_entries,
         element_transitions,
+        math_call_arguments,
     })
 }
 
@@ -1483,6 +1518,7 @@ fn emit(
         call_method_entry,
         construct_entry,
         reify_frame_entry,
+        math_call_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -1968,6 +2004,69 @@ fn emit(
                                 instruction
                                     .result
                                     .expect("eligibility checked loose-eq result"),
+                            ),
+                        )),
+                    )?;
+                }
+                Op::MathCall => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked math-call destination");
+                    let method = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 1)
+                        .ok_or(Unsupported::OperandShape("math-call method constant"))?;
+                    let arguments = eligibility
+                        .math_call_arguments
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape("math-call argument arena"))?;
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing math call missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(method));
+                    // The boxed argument-register slice is owned by the produced
+                    // code object, so its interior pointer is stable for the
+                    // code's whole life.
+                    emit_load_u64(&mut ops, 3, arguments.as_ptr() as u64);
+                    emit_load_u64(&mut ops, 4, arguments.len() as u64);
+                    emit_load_u64(&mut ops, 16, math_call_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked math-call result"),
                             ),
                         )),
                     )?;
@@ -4212,6 +4311,60 @@ mod tests {
         let mut transitions = TransitionTable::resolve();
         transitions.replace_variadic_entry_for_test(STUB_JIT_STORE_ELEMENT, entry);
         transitions
+    }
+
+    extern "C" fn successful_math_call(
+        ctx: *mut JitCtx,
+        dst: u64,
+        method: u64,
+        argument_regs: *const u16,
+        argument_count: u64,
+    ) -> u64 {
+        // SAFETY: the fixture supplies the frame window for the duration of
+        // this transition; the emitted ABI passes window slot ids and an
+        // interior pointer into the code-owned argument arena.
+        let regs = unsafe { (*ctx).regs };
+        unsafe {
+            assert_eq!(method, 15, "Math.floor's method id");
+            assert_eq!(argument_count, 1);
+            let argument = *argument_regs;
+            assert_eq!(*regs.add(argument as usize), box_i32(7));
+            *regs.add(dst as usize) = box_i32(7);
+        }
+        0
+    }
+
+    fn math_call_transitions(entry: usize) -> TransitionTable {
+        let mut transitions = TransitionTable::resolve();
+        transitions.replace_variadic_entry_for_test(STUB_JIT_MATH_CALL, entry);
+        transitions
+    }
+
+    #[test]
+    fn executes_math_call_through_the_window_transition() {
+        let view = view(
+            1,
+            3,
+            vec![
+                (
+                    Op::MathCall,
+                    vec![
+                        Operand::Register(1),
+                        Operand::ConstIndex(15),
+                        Operand::ConstIndex(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(1)]),
+            ],
+        );
+        let transitions = math_call_transitions(successful_math_call as *const () as usize);
+        let code = compile_with_transitions(&view, 141, &transitions)
+            .expect("math call is eligible through the window transition");
+
+        let result = execute(&code, &[box_i32(7)]);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, box_i32(7));
     }
 
     fn construct_transitions(entry: usize) -> TransitionTable {

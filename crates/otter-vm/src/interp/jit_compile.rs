@@ -235,6 +235,8 @@ impl Interpreter {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             length_byte: header + crate::array::ARRAY_BODY_LENGTH_OFFSET as u32,
             exotic_byte: header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+            elements_ptr_byte: header + crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET as u32,
+            dense_len_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
         };
         view.cage_base = otter_gc::cage_base() as usize;
     }

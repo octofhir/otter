@@ -29,6 +29,7 @@ use std::mem;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
+use std::cell::Cell;
 
 use crate::Value;
 use crate::number::NumberValue;
@@ -47,15 +48,16 @@ pub const ARRAY_BODY_TYPE_TAG: u8 = 0x12;
 pub type JsArray = otter_gc::Gc<ArrayBody>;
 
 /// GC-allocated storage backing every [`JsArray`] handle.
-#[derive(Debug, Default, otter_macros::Pelt)]
+#[derive(Debug, otter_macros::Pelt)]
 #[pelt(tag = ARRAY_BODY_TYPE_TAG)]
 pub struct ArrayBody {
     /// Dense element storage. Crate-internal callers must go through
     /// this module's helpers so growth is heap-accounted.
     ///
-    /// This Rust container is deliberately private to the VM. Native code uses
-    /// classified runtime stubs for element access and never observes `Vec`
-    /// field layout.
+    /// This Rust container is deliberately private to the VM. Native code
+    /// never observes `Vec` field layout: compiled fast paths read the cached
+    /// [`Self::elements_ptr`]/[`Self::dense_len`] pair instead, and everything
+    /// else goes through classified runtime stubs.
     pub(crate) elements: Vec<Value>,
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
@@ -68,7 +70,78 @@ pub struct ArrayBody {
     /// logical length in the common case.
     #[pelt(via = trace_array_exotic_slots)]
     pub(crate) exotic: Option<Box<ArrayExoticSlots>>,
+    /// Always-current base of the dense element buffer, kept in a fixed body
+    /// field so compiled code can address elements without knowing `Vec`
+    /// layout. The buffer is a plain Rust allocation, so a moving collection
+    /// of the body leaves it valid; only growth, shrinkage, and reallocation
+    /// change it, and every mutating helper in this module refreshes it.
+    #[pelt(skip)]
+    elements_ptr: Cell<*mut Value>,
+    /// Always-current `elements.len()`, mirrored next to the base pointer for
+    /// the same reason: a compiled bounds check reads it as one 32-bit load.
+    /// Dense storage beyond `u32::MAX` elements is unreachable in practice —
+    /// growth helpers cap dense storage far below it.
+    #[pelt(skip)]
+    dense_len: Cell<u32>,
 }
+
+impl Default for ArrayBody {
+    fn default() -> Self {
+        Self {
+            elements: Vec::new(),
+            length: 0,
+            exotic: None,
+            elements_ptr: Cell::new(std::ptr::null_mut()),
+            dense_len: Cell::new(0),
+        }
+    }
+}
+
+impl ArrayBody {
+    /// Recompute the JIT-visible element cache after any dense mutation.
+    #[inline]
+    pub(crate) fn refresh_element_cache(&self) {
+        self.elements_ptr.set(self.elements.as_ptr().cast_mut());
+        self.dense_len
+            .set(u32::try_from(self.elements.len()).unwrap_or(u32::MAX));
+    }
+
+    /// Debug verifier for the always-current element cache: the cached pair
+    /// must equal what [`Self::refresh_element_cache`] would recompute now, so
+    /// any new mutation path that forgets to refresh fails deterministically.
+    #[cfg(debug_assertions)]
+    pub(crate) fn element_cache_is_current(&self) -> bool {
+        // An empty buffer's base is never dereferenced (every access guards
+        // `index < dense_len` first), so a fresh body's null base is as
+        // current as an empty `Vec`'s dangling one.
+        if self.elements.is_empty() {
+            return self.dense_len.get() == 0;
+        }
+        self.elements_ptr.get() == self.elements.as_ptr().cast_mut()
+            && self.dense_len.get() as usize == self.elements.len().min(u32::MAX as usize)
+    }
+}
+
+/// Push one dense element and keep the JIT-visible cache current.
+#[inline]
+fn body_elements_push(body: &mut ArrayBody, value: Value) {
+    body.elements.push(value);
+    body.refresh_element_cache();
+}
+
+/// Truncate dense elements and keep the JIT-visible cache current.
+#[inline]
+fn body_elements_truncate(body: &mut ArrayBody, len: usize) {
+    body.elements.truncate(len);
+    body.refresh_element_cache();
+}
+
+/// Byte offset of the cached dense-element base within [`ArrayBody`].
+pub(crate) const ARRAY_BODY_ELEMENTS_PTR_OFFSET: usize =
+    std::mem::offset_of!(ArrayBody, elements_ptr);
+
+/// Byte offset of the cached dense length within [`ArrayBody`].
+pub(crate) const ARRAY_BODY_DENSE_LEN_OFFSET: usize = std::mem::offset_of!(ArrayBody, dense_len);
 
 /// Cold sidecar for Array exotic features that are absent from ordinary dense
 /// arrays.
@@ -141,7 +214,7 @@ pub const ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(ArrayBody, leng
 // Keep the JIT-visible dense array shell small and offset-stable: cold array
 // state must stay in `ArrayExoticSlots`, not creep back into `ArrayBody`.
 const _: () = assert!(std::mem::offset_of!(ArrayBody, elements) == 0);
-const _: () = assert!(std::mem::size_of::<ArrayBody>() <= 48);
+const _: () = assert!(std::mem::size_of::<ArrayBody>() <= 64);
 
 /// Trace helper for symbol-keyed own properties: only `Value` parts
 /// of each `(JsSymbol, Value)` pair carry GC slots — the `JsSymbol`
@@ -351,6 +424,7 @@ pub(crate) fn from_elements_old_for_fixture(
     reserve_elements_for_len(&mut body, heap, collected.len())?;
     body.length = collected.len();
     body.elements.extend(collected);
+    body.refresh_element_cache();
     heap.alloc_old(body)
 }
 
@@ -401,6 +475,7 @@ fn alloc_body_with_adopted_elements(
     mut body: ArrayBody,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
+    body.refresh_element_cache();
     let element_bytes = spilled_capacity_bytes(body.elements.capacity());
     let can_reserve_without_collect = heap.max_heap_bytes() == 0;
     let elements_reserved = element_bytes == 0
@@ -456,6 +531,7 @@ fn from_elements_with_source_old_for_fixture(
     };
     reserve_elements_for_len(&mut body, heap, collected.len())?;
     body.elements.extend(collected);
+    body.refresh_element_cache();
     heap.alloc_old(body)
 }
 
@@ -477,6 +553,8 @@ pub(crate) fn from_elements_with_source_and_roots(
             dirty: false,
             ..ArrayExoticSlots::default()
         })),
+        elements_ptr: Cell::new(std::ptr::null_mut()),
+        dense_len: Cell::new(0),
     };
     alloc_body_with_adopted_elements(heap, body, external_visit)
 }
@@ -499,6 +577,11 @@ pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
     heap.read_payload(arr, |body| {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            body.element_cache_is_current(),
+            "stale dense-element cache on array read",
+        );
         let raw = body
             .elements
             .get(idx)
@@ -624,10 +707,11 @@ fn set_index_value(
         }
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        body.refresh_element_cache();
         while body.elements.len() < idx {
-            body.elements.push(Value::hole());
+            body_elements_push(body, Value::hole());
         }
-        body.elements.push(value);
+        body_elements_push(body, value);
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
@@ -687,10 +771,11 @@ pub(crate) fn set_with_roots(
         }
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        body.refresh_element_cache();
         while body.elements.len() < idx {
-            body.elements.push(Value::hole());
+            body_elements_push(body, Value::hole());
         }
-        body.elements.push(value);
+        body_elements_push(body, value);
         body.length = body.length.max(target_len);
         body.mark_dirty();
     });
@@ -768,15 +853,16 @@ pub(crate) fn fill_dense_range_with_roots(
     heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(end.saturating_sub(body.elements.len()));
+        body.refresh_element_cache();
         while body.elements.len() < start {
-            body.elements.push(Value::hole());
+            body_elements_push(body, Value::hole());
         }
         let existing_end = end.min(body.elements.len());
         for idx in start..existing_end {
             body.elements[idx] = value;
         }
         while body.elements.len() < end {
-            body.elements.push(value);
+            body_elements_push(body, value);
         }
         body.length = body.length.max(end);
         body.mark_dirty();
@@ -802,10 +888,11 @@ pub fn push(
     let new_len = heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        body.refresh_element_cache();
         while body.elements.len() + 1 < target_len {
-            body.elements.push(Value::hole());
+            body_elements_push(body, Value::hole());
         }
-        body.elements.push(value);
+        body_elements_push(body, value);
         body.length = target_len;
         body.mark_dirty();
         body.length
@@ -839,10 +926,11 @@ pub(crate) fn push_with_roots(
     let new_len = heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        body.refresh_element_cache();
         while body.elements.len() + 1 < target_len {
-            body.elements.push(Value::hole());
+            body_elements_push(body, Value::hole());
         }
-        body.elements.push(value);
+        body_elements_push(body, value);
         body.length = target_len;
         body.mark_dirty();
         body.length
@@ -872,7 +960,7 @@ pub fn set_length(
     if new_len < cur {
         heap.with_payload(arr, |body| {
             body.length = new_len;
-            body.elements.truncate(new_len);
+            body_elements_truncate(body, new_len);
             if let Some(exotic) = body.exotic.as_deref_mut()
                 && let Some(sparse) = exotic.sparse_elements.as_mut()
             {
@@ -909,8 +997,9 @@ pub fn set_length(
         if new_len <= MAX_DENSE_LENGTH_GROWTH {
             body.elements
                 .reserve_exact(new_len.saturating_sub(body.elements.len()));
+            body.refresh_element_cache();
             while body.elements.len() < new_len {
-                body.elements.push(Value::hole());
+                body_elements_push(body, Value::hole());
             }
         }
         body.length = new_len;
@@ -1031,7 +1120,7 @@ fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
 
 fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
     body.length = len;
-    body.elements.truncate(len);
+    body_elements_truncate(body, len);
     if let Some(exotic) = body.exotic.as_deref_mut()
         && let Some(sparse) = exotic.sparse_elements.as_mut()
     {
@@ -1797,8 +1886,9 @@ pub(crate) fn write_dense_range_with_roots(
     heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(end.saturating_sub(body.elements.len()));
+        body.refresh_element_cache();
         while body.elements.len() < start {
-            body.elements.push(Value::hole());
+            body_elements_push(body, Value::hole());
         }
         let existing_end = end.min(body.elements.len());
         for (slot, value) in body.elements[start..existing_end]
@@ -1808,7 +1898,7 @@ pub(crate) fn write_dense_range_with_roots(
             *slot = value;
         }
         for value in &values[existing_end.saturating_sub(start)..] {
-            body.elements.push(*value);
+            body_elements_push(body, *value);
         }
         body.length = body.length.max(end);
         body.mark_dirty();
@@ -1922,6 +2012,7 @@ fn reserve_elements_for_len(
     }
     body.elements
         .reserve_exact(target_len.saturating_sub(body.elements.len()));
+    body.refresh_element_cache();
     Ok(())
 }
 

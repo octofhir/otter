@@ -71,7 +71,8 @@ use crate::{
     CompiledCode,
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET,
+        NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
+        THREAD_OFFSET,
         TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
         VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
@@ -411,6 +412,7 @@ fn check_eligibility(
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
                 Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
                 Op::LoadUndefined => check_tagged_constant_result(instruction, reprs)?,
+                Op::LoadThis => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
                 Op::LoadLocal | Op::StoreLocal => {
                     let result = instruction
@@ -1147,6 +1149,19 @@ fn emit(
                             instruction
                                 .result
                                 .expect("eligibility checked undefined result"),
+                        ),
+                        9,
+                    )?;
+                }
+                Op::LoadThis => {
+                    // `this` is a tagged value published in the JitCtx.
+                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation.location(
+                            instruction
+                                .result
+                                .expect("eligibility checked LoadThis result"),
                         ),
                         9,
                     )?;

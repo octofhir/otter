@@ -42,3 +42,22 @@ globalThis.propFloatSum = floatSum;
 let propThrow = "";
 try { hotProperty(null); } catch (error) { propThrow = error.name; }
 globalThis.propThrow = propThrow;
+
+// A wholly-eligible method that reads `this` — LoadThis x3 + property RMW, no loop
+// counter/global/call — so it runs through the optimizing tier and exercises the
+// tagged `this` load under GC stress.
+function Point(a, b) { this.a = a; this.b = b; this.c = 0; }
+Point.prototype.mix = function () {
+  this.c = this.a + this.b;
+  return this.c + this.a;
+};
+let warmThis = "";
+for (let i = 0; i < 4010; i++) { warmThis += "sink.mix();"; }
+globalThis.sink = new Point(1, 2);
+eval(warmThis);
+let thisSum = 0;
+for (let k = 0; k < 800; k++) {
+  const p = new Point(k & 7, (k + 1) & 7);
+  thisSum += p.mix();
+}
+globalThis.thisSum = thisSum;

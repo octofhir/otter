@@ -333,7 +333,7 @@ pub(crate) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_ba
 /// window transition re-runs the store — a boxed number allocates, a cell
 /// needs the write barrier). The caller has already excluded cells. Fixed
 /// registers: `x9` value in, `w10` compressed slot out, `x11` scratch.
-pub(super) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel) {
+pub(crate) fn emit_compress_slot_or_bail(ops: &mut Assembler, bail: DynamicLabel) {
     use otter_vm::value::compressed as cslot;
     // The literal compressed-immediate words below are `(kind << 3) | 0b100`.
     debug_assert_eq!(cslot::TAG_IMMEDIATE, 0b100);

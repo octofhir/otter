@@ -94,6 +94,8 @@ pub struct OptimizedCode {
     /// the emitted probes and self-patched by the miss transition, so the
     /// allocation must live exactly as long as the code.
     _load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+    /// Per-`StoreProperty`-site inline caches, same ownership contract.
+    _store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
@@ -109,6 +111,7 @@ impl OptimizedCode {
         osr_entries: BTreeMap<u32, usize>,
         math_call_arguments: BTreeMap<u32, Box<[u16]>>,
         load_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
+        store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
         metadata: OptimizedMetadata,
     ) -> Self {
         const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0005;
@@ -137,6 +140,7 @@ impl OptimizedCode {
             osr_entries,
             _math_call_arguments: math_call_arguments,
             _load_ic_cells: load_ic_cells,
+            _store_ic_cells: store_ic_cells,
             metadata,
             code_metadata,
         }

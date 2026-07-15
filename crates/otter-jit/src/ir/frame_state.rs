@@ -21,18 +21,27 @@
 use super::{
     cfg::{BlockId, ControlFlowGraph},
     dom::{DomError, DominatorTree},
+    inline::{InlineCallSite, InlineId},
     ssa::{SsaError, SsaFunction, ValueDef, ValueId},
 };
 
 /// Reaching SSA values for all interpreter registers at one deopt point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AbstractFrameState {
+    /// Frame owning the instruction; [`Self::pc`] is canonical within it.
+    pub inline: InlineId,
     /// Canonical bytecode PC of the instruction about to execute.
     pub pc: u32,
     /// CFG block containing the instruction.
     pub block: BlockId,
-    /// Reaching SSA value per interpreter register.
+    /// Reaching SSA value per interpreter register of [`Self::inline`].
     pub registers: Box<[Option<ValueId>]>,
+    /// State of the caller at the call that created this frame, as an index
+    /// into [`FrameStateTable::states`]. `None` for the root frame.
+    ///
+    /// Deoptimizing inside a spliced frame must rebuild the whole chain: the
+    /// caller paused at its call, then this frame at its own PC.
+    pub caller: Option<usize>,
 }
 
 /// Exact-PC abstract frame states for one SSA function.
@@ -209,7 +218,20 @@ impl std::error::Error for FrameStateError {}
 
 impl FrameStateTable {
     /// Build one abstract frame state before every SSA instruction.
+    /// Build the table for one function with nothing spliced into it.
     pub fn build(ssa: &SsaFunction, cfg: &ControlFlowGraph) -> Result<Self, FrameStateError> {
+        Self::build_inlined(&[None], ssa, cfg)
+    }
+
+    /// Build the table for a whole compiled unit.
+    ///
+    /// `call_sites` gives each frame the call it was spliced at, indexed by
+    /// [`InlineId`]; the root's entry is `None`.
+    pub fn build_inlined(
+        call_sites: &[Option<InlineCallSite>],
+        ssa: &SsaFunction,
+        cfg: &ControlFlowGraph,
+    ) -> Result<Self, FrameStateError> {
         let full_dom = DominatorTree::compute(cfg);
         ssa.verify(cfg, &full_dom)
             .map_err(FrameStateError::InvalidSsa)?;
@@ -217,7 +239,7 @@ impl FrameStateTable {
 
         enum Event {
             Enter(BlockId),
-            Exit(Vec<u16>),
+            Exit(Vec<usize>),
         }
 
         let mut children = vec![Vec::new(); cfg.blocks.len()];
@@ -232,7 +254,12 @@ impl FrameStateTable {
             .copied()
             .filter(|&block| normal_dom.immediate_dominator(block).is_none())
             .collect();
-        let mut stacks = vec![Vec::new(); usize::from(ssa.register_count)];
+        let total_registers: usize = ssa
+            .frames
+            .iter()
+            .map(|frame| usize::from(frame.register_count))
+            .sum();
+        let mut stacks = vec![Vec::new(); total_registers];
         let mut states = Vec::new();
 
         for root in roots {
@@ -240,8 +267,8 @@ impl FrameStateTable {
             while let Some(event) = events.pop() {
                 match event {
                     Event::Exit(pushed) => {
-                        for register in pushed.into_iter().rev() {
-                            stacks[usize::from(register)]
+                        for slot in pushed.into_iter().rev() {
+                            stacks[slot]
                                 .pop()
                                 .expect("frame-state walk pops exactly the values it pushed");
                         }
@@ -249,33 +276,70 @@ impl FrameStateTable {
                     Event::Enter(block) => {
                         let block_index = block.0 as usize;
                         let mut pushed = Vec::new();
+                        let inline = cfg.blocks[block_index].inline;
+                        let frame_registers = ssa.frame_registers(inline);
+                        // A spliced frame's parameters are the caller's argument
+                        // values: they hold a register in this frame without
+                        // being defined in it.
+                        if block == cfg.frame_entries[inline.0 as usize]
+                            && let Some(call_site) = call_sites[inline.0 as usize].as_ref()
+                        {
+                            for (parameter, &argument) in
+                                call_site.argument_registers.iter().enumerate()
+                            {
+                                let parameter = u16::try_from(parameter).map_err(|_| {
+                                    FrameStateError::HeadRegisterOutOfRange {
+                                        block,
+                                        register: u16::MAX,
+                                        register_count: frame_registers,
+                                    }
+                                })?;
+                                let value = stacks
+                                    [variable(ssa, call_site.parent, argument)]
+                                .last()
+                                .copied();
+                                if let Some(value) = value {
+                                    let slot = variable(ssa, inline, parameter);
+                                    stacks[slot].push(value);
+                                    pushed.push(slot);
+                                }
+                            }
+                        }
                         for &value in &ssa.blocks[block_index].phis {
                             let data = ssa
                                 .values
                                 .get(value.0 as usize)
                                 .ok_or(FrameStateError::HeadValueOutOfRange { block, value })?;
-                            let register = head_register(&data.def)
-                                .ok_or(FrameStateError::InvalidHeadDefinition { block, value })?;
-                            if register >= ssa.register_count {
+                            let Some(register) = head_register(&data.def) else {
+                                // A frame-entry constant names no register and
+                                // so occupies no frame slot.
+                                continue;
+                            };
+                            if register >= frame_registers {
                                 return Err(FrameStateError::HeadRegisterOutOfRange {
                                     block,
                                     register,
-                                    register_count: ssa.register_count,
+                                    register_count: frame_registers,
                                 });
                             }
-                            stacks[usize::from(register)].push(value);
-                            pushed.push(register);
+                            let slot = variable(ssa, inline, register);
+                            stacks[slot].push(value);
+                            pushed.push(slot);
                         }
 
                         for instruction in &ssa.blocks[block_index].instrs {
+                            let base = usize::from(register_base(ssa, inline));
                             states.push(AbstractFrameState {
+                                inline,
                                 pc: instruction.pc,
                                 block,
                                 registers: stacks
+                                    [base..base + usize::from(frame_registers)]
                                     .iter()
                                     .map(|stack| stack.last().copied())
                                     .collect::<Vec<_>>()
                                     .into_boxed_slice(),
+                                caller: None,
                             });
 
                             match (instruction.result, instruction.result_register) {
@@ -286,15 +350,16 @@ impl FrameStateTable {
                                             value,
                                         });
                                     }
-                                    if register >= ssa.register_count {
+                                    if register >= frame_registers {
                                         return Err(FrameStateError::ResultRegisterOutOfRange {
                                             pc: instruction.pc,
                                             register,
-                                            register_count: ssa.register_count,
+                                            register_count: frame_registers,
                                         });
                                     }
-                                    stacks[usize::from(register)].push(value);
-                                    pushed.push(register);
+                                    let slot = variable(ssa, inline, register);
+                                    stacks[slot].push(value);
+                                    pushed.push(slot);
                                 }
                                 (None, None) => {}
                                 _ => {
@@ -315,7 +380,29 @@ impl FrameStateTable {
             debug_assert!(stacks.iter().all(Vec::is_empty));
         }
 
-        states.sort_by_key(|state| state.pc);
+        // States are keyed by (frame, PC): a PC alone is ambiguous once a body
+        // is spliced in.
+        states.sort_by_key(|state| (state.inline, state.pc));
+        // Link every spliced frame's states to its caller's state at the call,
+        // so a deopt inside the frame can rebuild the whole chain.
+        for (index, call_site) in call_sites.iter().enumerate() {
+            let Some(call_site) = call_site.as_ref() else {
+                continue;
+            };
+            let caller = states
+                .iter()
+                .position(|state| {
+                    state.inline == call_site.parent && state.pc == call_site.call_pc
+                })
+                .ok_or(FrameStateError::ResultRegisterMismatch {
+                    pc: call_site.call_pc,
+                })?;
+            for state in &mut states {
+                if state.inline == InlineId(index as u32) {
+                    state.caller = Some(caller);
+                }
+            }
+        }
         let table = Self {
             states: states.into_boxed_slice(),
         };
@@ -398,10 +485,19 @@ impl FrameStateTable {
                         actual: state.block,
                     });
                 }
-                if state.registers.len() != usize::from(ssa.register_count) {
+                if state.inline != cfg_block.inline {
+                    return Err(FrameStateError::StateBlockMismatch {
+                        pc: state.pc,
+                        expected: cfg_block.id,
+                        actual: state.block,
+                    });
+                }
+                // A state describes its own frame's window, not the unit's.
+                let frame_registers = ssa.frame_registers(cfg_block.inline);
+                if state.registers.len() != usize::from(frame_registers) {
                     return Err(FrameStateError::RegisterCountMismatch {
                         pc: state.pc,
-                        expected: usize::from(ssa.register_count),
+                        expected: usize::from(frame_registers),
                         actual: state.registers.len(),
                     });
                 }
@@ -468,6 +564,19 @@ impl FrameStateTable {
     }
 }
 
+/// First dense stack slot of `inline`'s register window.
+fn register_base(ssa: &SsaFunction, inline: InlineId) -> u16 {
+    ssa.frames[..inline.0 as usize]
+        .iter()
+        .map(|frame| frame.register_count)
+        .sum()
+}
+
+/// Dense stack slot of one frame's register.
+fn variable(ssa: &SsaFunction, inline: InlineId, register: u16) -> usize {
+    usize::from(register_base(ssa, inline)) + usize::from(register)
+}
+
 fn head_register(definition: &ValueDef) -> Option<u16> {
     match definition {
         ValueDef::Param { register, .. }
@@ -499,6 +608,91 @@ mod tests {
             })
             .collect();
         JitCompileSnapshot::without_feedback(0, param_count, register_count, instructions)
+    }
+
+    #[test]
+    fn a_spliced_frame_state_chains_to_its_caller_at_the_call() {
+        use crate::ir::inline::InlineTree;
+
+        // Caller: `r0 = r1(r2); return r0`. Callee (fid 9, one param):
+        // `return r0`.
+        let mut view = snapshot(
+            1,
+            8,
+            vec![
+                (
+                    Op::Call,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        let callee_view = JitCompileSnapshot::without_feedback(
+            9,
+            1,
+            4,
+            vec![JitTestInstruction::new(
+                Op::ReturnValue,
+                0,
+                0,
+                vec![Operand::Register(0)],
+            )],
+        );
+        let call_byte_pc = view.instructions[0].byte_pc;
+        view.inline_callees.insert(
+            call_byte_pc,
+            otter_vm::JitInlineCallee {
+                code_block: std::sync::Arc::clone(&callee_view.code_block),
+                function_id: 9,
+                param_count: 1,
+                register_count: callee_view.code_block.register_count,
+                instructions: callee_view.instructions,
+            },
+        );
+        let tree = InlineTree::build(&view);
+        assert_eq!(tree.frames.len(), 2, "the fixture must splice");
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
+        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("a spliced SSA builds");
+        let call_sites: Vec<_> = tree
+            .frames
+            .iter()
+            .map(|frame| frame.call_site.clone())
+            .collect();
+        let table = FrameStateTable::build_inlined(&call_sites, &ssa, &cfg)
+            .expect("spliced frame states build");
+
+        let root_states: Vec<_> = table
+            .states()
+            .iter()
+            .filter(|state| state.inline == InlineId::ROOT)
+            .collect();
+        let callee_states: Vec<_> = table
+            .states()
+            .iter()
+            .filter(|state| state.inline == InlineId(1))
+            .collect();
+
+        // The root's own states have no caller; the callee's chain to the
+        // caller's state at the call PC.
+        assert!(root_states.iter().all(|state| state.caller.is_none()));
+        assert_eq!(callee_states.len(), 1);
+        let caller = callee_states[0].caller.expect("a spliced state has a caller");
+        let caller = &table.states()[caller];
+        assert_eq!(caller.inline, InlineId::ROOT);
+        assert_eq!(caller.pc, 0, "the caller is paused at its call");
+
+        // Each state describes its own frame's window, not the unit's.
+        assert_eq!(caller.registers.len(), 8);
+        assert_eq!(callee_states[0].registers.len(), 4);
+
+        // The callee's parameter slot holds the caller's argument value.
+        let argument = caller.registers[2].expect("r2 reaches the call");
+        assert_eq!(callee_states[0].registers[0], Some(argument));
     }
 
     fn analyses(

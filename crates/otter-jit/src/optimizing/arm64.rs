@@ -232,7 +232,12 @@ pub(super) fn compile_with_transitions(
     allocation
         .verify(&ssa, &cfg, &liveness, &reprs)
         .map_err(|_| Unsupported::OperandShape("optimizing allocation verification"))?;
-    let frame_states = FrameStateTable::build(&ssa, &cfg)
+    let call_sites: Vec<_> = tree
+        .frames
+        .iter()
+        .map(|frame| frame.call_site.clone())
+        .collect();
+    let frame_states = FrameStateTable::build_inlined(&call_sites, &ssa, &cfg)
         .map_err(|_| Unsupported::OperandShape("optimizing frame-state construction"))?;
     frame_states
         .verify(&ssa, &cfg, &dom)

@@ -61,3 +61,39 @@ for (let k = 0; k < 800; k++) {
   thisSum += p.mix();
 }
 globalThis.thisSum = thisSum;
+
+// Regression distilled from RayTrace's Vector.initialize: float parameters
+// flow through truthy branches into tagged phis and then StoreProperty. The
+// method must stay optimized across all three stores under every GC stride.
+function TruthyVector() {}
+TruthyVector.prototype.reset = function (x, y, z) {
+  this.x = x ? x : 0;
+  this.y = y ? y : 0;
+  this.z = z ? z : 0;
+  return 0;
+};
+
+globalThis.truthyVector = new TruthyVector();
+let warmTruthyVector = "";
+for (let i = 0; i < 4010; i++) {
+  warmTruthyVector += "new TruthyVector().reset(1.5, 2.5, 3.5);";
+}
+eval(warmTruthyVector);
+
+let truthyVectorSum = 0;
+for (let i = 0; i < 800; i++) {
+  truthyVector.reset(
+    (i & 1) ? 1.25 : 0,
+    (i & 2) ? 2.5 : 0,
+    (i & 4) ? 3.75 : 0
+  );
+  truthyVectorSum += truthyVector.x + truthyVector.y + truthyVector.z;
+}
+
+console.log(JSON.stringify({
+  propSum,
+  floatSum,
+  propThrow,
+  thisSum,
+  truthyVectorSum
+}));

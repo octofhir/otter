@@ -52,7 +52,7 @@ mod structural;
 mod super_access;
 mod transitions;
 mod value_load;
-mod values;
+pub(crate) mod values;
 mod variadic;
 
 use std::collections::BTreeMap;

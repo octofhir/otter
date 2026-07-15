@@ -74,7 +74,14 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
-        let snapshot = context.jit_compile_snapshot(fid)?;
+        let mut snapshot = context.jit_compile_snapshot(fid)?;
+        // The optimizing tier consumes the same baked compile inputs as the
+        // template tier: without the cage base and body offsets no inline access
+        // can be emitted at all, and without monomorphic call-site candidates
+        // there is nothing to inline.
+        Self::bake_typed_array_layout(&mut snapshot);
+        Self::bake_string_layout(&mut snapshot);
+        self.bake_inline_callees(&mut snapshot, context, fid);
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_optimized_function(jit::JitCompileRequest {

@@ -62,8 +62,8 @@ use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL,
-    STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ, STUB_JIT_STORE_ELEMENT,
+    FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_LOAD_ELEMENT,
+    STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ, STUB_JIT_STORE_ELEMENT,
     STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
 
@@ -73,8 +73,9 @@ use crate::{
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
-        THREAD_OFFSET,
+        MAX_METHOD_ARGS, THREAD_OFFSET,
         TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
+        pack_method_arg_regs,
         VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     ir::{
@@ -172,6 +173,7 @@ struct EmissionPlan<'a> {
     store_property_entry: u64,
     load_global_entry: u64,
     loose_eq_entry: u64,
+    call_method_entry: u64,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -258,6 +260,7 @@ pub(super) fn compile_with_transitions(
             store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROP_WINDOW),
             load_global_entry: transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
             loose_eq_entry: transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
+            call_method_entry: transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -565,6 +568,35 @@ fn check_eligibility(
                         || instruction.result_register.is_none()
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || reprs.representation(instruction.inputs[1]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::CallMethodValue => {
+                    // `dst, receiver, name-const, argc-const, arg-regs...`. The
+                    // receiver plus up to `MAX_METHOD_ARGS` tagged arguments are
+                    // register inputs; resolution runs the full method walk and
+                    // may reenter arbitrary (possibly compiled) callee code, so it
+                    // is a precise reentrant transition. An exotic-receiver report
+                    // side-exits with a full deopt to this pc.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("method-call result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.result_register.is_none()
+                        || instruction.input_registers.is_empty()
+                        || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
+                        || instruction.inputs.len() != instruction.input_registers.len()
+                        || instruction
+                            .inputs
+                            .iter()
+                            .any(|&input| reprs.representation(input) != Representation::Tagged)
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
@@ -1143,6 +1175,7 @@ fn emit(
         store_property_entry,
         load_global_entry,
         loose_eq_entry,
+        call_method_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -1616,6 +1649,78 @@ fn emit(
                             ),
                         )),
                     )?;
+                }
+                Op::CallMethodValue => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked method-call destination");
+                    let receiver = instruction.input_registers[0];
+                    let arg_regs = &instruction.input_registers[1..];
+                    let argc = arg_regs.len() as u32;
+                    let packed = pack_method_arg_regs(arg_regs);
+                    let name = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("method-call name constant"))?;
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing method call missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, receiver as u32
+                    );
+                    emit_load_u64(&mut ops, 3, u64::from(name));
+                    // The optimizing tier keeps no per-site call IC: a site index
+                    // past the IC table runs the full method resolution walk.
+                    emit_load_u64(&mut ops, 4, u64::MAX);
+                    dynasm!(ops ; .arch aarch64 ; movz x5, argc);
+                    emit_load_u64(&mut ops, 6, packed);
+                    emit_load_u64(&mut ops, 16, call_method_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    let bail = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>bail
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked method-call result"),
+                            ),
+                        )),
+                    )?;
+                    // An exotic-receiver report (`2`) side-exits before the opcode
+                    // takes effect: a full deopt re-runs it in the interpreter.
+                    deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
                 }
                 Op::Increment => {
                     let result = instruction.result.expect("eligibility checked increment result");

@@ -62,6 +62,20 @@ for (let k = 0; k < 800; k++) {
 }
 globalThis.thisSum = thisSum;
 
+function constructWith(C, x, y) {
+  return new C(x, y);
+}
+let warmConstruct = "";
+for (let i = 0; i < 4010; i++) {
+  warmConstruct += "constructWith(Point, 1, 2);";
+}
+eval(warmConstruct);
+let constructSum = 0;
+for (let i = 0; i < 800; i++) {
+  const p = constructWith(Point, i & 7, (i + 1) & 7);
+  constructSum += p.a + p.b;
+}
+
 // Regression distilled from RayTrace's Vector.initialize: float parameters
 // flow through truthy branches into tagged phis and then StoreProperty. The
 // method must stay optimized across all three stores under every GC stride.
@@ -95,5 +109,6 @@ console.log(JSON.stringify({
   floatSum,
   propThrow,
   thisSum,
+  constructSum,
   truthyVectorSum
 }));

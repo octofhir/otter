@@ -65,9 +65,9 @@ use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_LOAD_ELEMENT,
-    STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ, STUB_JIT_STORE_ELEMENT,
-    STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
+    FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
+    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
+    STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
 
 use super::{OptimizedCode, OptimizedMetadata};
@@ -178,6 +178,7 @@ struct EmissionPlan<'a> {
     load_global_entry: u64,
     loose_eq_entry: u64,
     call_method_entry: u64,
+    construct_entry: u64,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -265,6 +266,7 @@ pub(super) fn compile_with_transitions(
             load_global_entry: transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
             loose_eq_entry: transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
             call_method_entry: transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
+            construct_entry: transitions.variadic_entry(STUB_JIT_CONSTRUCT),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -597,6 +599,36 @@ fn check_eligibility(
                         || instruction.input_registers.is_empty()
                         || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
                         || instruction.inputs.len() != instruction.input_registers.len()
+                        || instruction
+                            .inputs
+                            .iter()
+                            .any(|&input| reprs.representation(input) != Representation::Tagged)
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::New => {
+                    // `dst, callee, argc-const, arg-regs...`. Construction may
+                    // execute arbitrary JS, allocate, or throw, so every tagged
+                    // operand is materialized in the precise frame window.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("construct result"))?;
+                    let argc = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("construct argument count"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.result_register.is_none()
+                        || instruction.input_registers.is_empty()
+                        || instruction.input_registers.len() > 1 + MAX_METHOD_ARGS
+                        || instruction.inputs.len() != instruction.input_registers.len()
+                        || argc as usize != instruction.input_registers.len() - 1
                         || instruction
                             .inputs
                             .iter()
@@ -1239,6 +1271,7 @@ fn emit(
         load_global_entry,
         loose_eq_entry,
         call_method_entry,
+        construct_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -1784,6 +1817,71 @@ fn emit(
                     )?;
                     // An exotic-receiver report (`2`) side-exits before the opcode
                     // takes effect: a full deopt re-runs it in the interpreter.
+                    deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                }
+                Op::New => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked construct destination");
+                    let callee = instruction.input_registers[0];
+                    let arg_regs = &instruction.input_registers[1..];
+                    let argc = arg_regs.len() as u32;
+                    let packed = pack_method_arg_regs(arg_regs);
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing construct missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, callee as u32
+                        ; movz x3, argc
+                    );
+                    emit_load_u64(&mut ops, 4, packed);
+                    emit_load_u64(&mut ops, 16, construct_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    let bail = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cmp x0, #1
+                        ; b.eq =>threw
+                        ; cmp x0, #2
+                        ; b.eq =>bail
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked construct result"),
+                            ),
+                        )),
+                    )?;
+                    // A non-constructor report (`2`) has no committed effects;
+                    // deopt re-runs the opcode to create the canonical TypeError.
                     deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
                 }
                 Op::Increment => {
@@ -3567,6 +3665,26 @@ mod tests {
         1
     }
 
+    extern "C" fn successful_construct(
+        ctx: *mut JitCtx,
+        dst: u64,
+        callee: u64,
+        argc: u64,
+        packed_args: u64,
+    ) -> u64 {
+        // SAFETY: the fixture supplies a three-slot frame window for the
+        // duration of this transition and the emitted ABI passes slot ids.
+        let regs = unsafe { (*ctx).regs };
+        unsafe {
+            assert_eq!(*regs.add(callee as usize), box_i32(99));
+            assert_eq!(argc, 1);
+            assert_eq!(packed_args & 0xffff, 1);
+            assert_eq!(*regs.add(1), box_i32(7));
+            *regs.add(dst as usize) = box_i32(37);
+        }
+        0
+    }
+
     fn element_load_transitions(entry: usize) -> TransitionTable {
         let mut transitions = TransitionTable::resolve();
         transitions.replace_variadic_entry_for_test(STUB_JIT_LOAD_ELEMENT, entry);
@@ -3576,6 +3694,12 @@ mod tests {
     fn element_store_transitions(entry: usize) -> TransitionTable {
         let mut transitions = TransitionTable::resolve();
         transitions.replace_variadic_entry_for_test(STUB_JIT_STORE_ELEMENT, entry);
+        transitions
+    }
+
+    fn construct_transitions(entry: usize) -> TransitionTable {
+        let mut transitions = TransitionTable::resolve();
+        transitions.replace_variadic_entry_for_test(STUB_JIT_CONSTRUCT, entry);
         transitions
     }
 
@@ -3854,6 +3978,37 @@ mod tests {
             ]
         );
         assert_eq!(code.frame_map_bitmap_words(), &[0b11]);
+    }
+
+    #[test]
+    fn construct_transition_materializes_args_and_reloads_result() {
+        let view = view(
+            2,
+            3,
+            vec![
+                (
+                    Op::New,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(0),
+                        Operand::ConstIndex(1),
+                        Operand::Register(1),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let transitions = construct_transitions(successful_construct as *const () as usize);
+        let code = compile_with_transitions(&view, 117, &transitions)
+            .expect("construct is optimizing-eligible");
+
+        let result = execute(&code, &[box_i32(99), box_i32(7)]);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(result.value, box_i32(37));
+
+        let record = code.safepoint_record(0).expect("construct safepoint");
+        assert_eq!(code.frame_map_bitmap_words(), &[0b11]);
+        assert_eq!(record.tagged_locations.len(), 2);
     }
 
     #[test]

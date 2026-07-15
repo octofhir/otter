@@ -5,6 +5,7 @@
 //! - [`dom`] — dominator tree and dominance-frontier analyses.
 //! - [`deopt_lower`] — concrete exact-PC interpreter-frame reconstruction.
 //! - [`frame_state`] — abstract exact-PC interpreter-frame reconstruction.
+//! - [`inline`] — verified splice decision over monomorphic call sites.
 //! - [`liveness`] — backward SSA-value liveness over normal control edges.
 //! - [`regalloc`] — backend-independent linear-scan SSA register allocation.
 //! - [`repr`] — feedback-guided SSA representation selection and conversions.
@@ -23,6 +24,7 @@ pub mod cfg;
 pub mod deopt_lower;
 pub mod dom;
 pub mod frame_state;
+pub mod inline;
 pub mod liveness;
 pub mod regalloc;
 pub mod repr;

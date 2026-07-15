@@ -389,7 +389,15 @@ pub(super) fn compile(
                 receiver,
                 index,
             } => {
-                transitions::emit_load_element(&mut ops, transitions, dst, receiver, index, threw);
+                transitions::emit_load_element(
+                    &mut ops,
+                    transitions,
+                    view,
+                    dst,
+                    receiver,
+                    index,
+                    threw,
+                )?;
             }
             TemplateOp::StoreElement {
                 receiver,
@@ -400,12 +408,13 @@ pub(super) fn compile(
                 transitions::emit_store_element(
                     &mut ops,
                     transitions,
+                    view,
                     receiver,
                     index,
                     value,
                     scratch,
                     threw,
-                );
+                )?;
             }
             TemplateOp::LoadUpvalue { dst, index } => {
                 transitions::emit_load_upvalue(&mut ops, transitions, dst, index, threw);

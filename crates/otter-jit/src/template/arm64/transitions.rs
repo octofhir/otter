@@ -24,12 +24,14 @@ use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::values::{emit_load_reg, emit_load_u64, emit_store_reg};
 pub(super) use crate::entry::TransitionTable;
+use otter_vm::JitCompileSnapshot;
+
 use crate::entry::{
     ALLOC_CTX_CODE_OBJECT_ID_OFFSET, ALLOC_CTX_FRAME_OFFSET, ALLOC_CTX_RESERVED0_OFFSET,
     ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
     ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-    NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, THREAD_OFFSET, Unsupported,
-    VALUE_UNDEFINED,
+    NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET,
+    Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
 };
 
 /// `blr` to a resolved transition entry and branch to `threw` on a nonzero
@@ -254,14 +256,84 @@ pub(super) fn emit_define_own_property(
     );
 }
 
+/// Emit the ordinary-dense-array fast-path guards for one element access:
+/// heap cell → `ArrayBody` tag → no exotic sidecar → int32 index inside the
+/// dense bounds. On the hit path the element address is left in `x16` and the
+/// code falls through; any failed guard branches to `miss`. Addresses go
+/// through the VM-maintained `(elements_ptr, dense_len)` body cache, so `Vec`
+/// layout stays unobserved. Nothing here allocates, so no safepoint is owed.
+///
+/// Clobbers `x9`, `x11`-`x16`.
+fn emit_dense_element_guards(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u16,
+    index: u16,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    let layout = view.array_layout;
+    emit_load_reg(ops, 9, receiver)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x11, NUMBER_TAG_HI16, lsl #48
+        ; orr x11, x11, #0x2       // NOT_CELL_MASK
+        ; tst x9, x11
+        ; b.ne =>miss
+        ; mov w12, w9              // low-32 Gc offset
+    );
+    emit_load_u64(ops, 13, view.cage_base as u64);
+    dynasm!(ops
+        ; .arch aarch64
+        ; add x13, x13, x12        // x13 = GcHeader ptr
+        ; ldrb w14, [x13]
+        ; cmp w14, layout.type_tag as u32
+        ; b.ne =>miss
+        ; ldr x14, [x13, layout.exotic_byte]
+        ; cbnz x14, =>miss         // exotic sidecar: the stub owns semantics
+    );
+    emit_load_reg(ops, 15, index)?;
+    dynasm!(ops
+        ; .arch aarch64
+        ; lsr x11, x15, #48
+        ; movz x12, NUMBER_TAG_HI16
+        ; cmp x11, x12
+        ; b.ne =>miss              // index is not an int32 payload
+        ; ldr w16, [x13, layout.dense_len_byte]
+        ; cmp w15, w16
+        ; b.hs =>miss              // unsigned: negative indices miss too
+        ; ldr x16, [x13, layout.elements_ptr_byte]
+        ; add x16, x16, w15, uxtw #3
+    );
+    Ok(())
+}
+
 pub(super) fn emit_load_element(
     ops: &mut Assembler,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     dst: u16,
     receiver: u16,
     index: u16,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // Dense fast path: read the element straight from the buffer. A hole is an
+    // absent property — the prototype chain answers — so it misses like every
+    // other failed guard.
+    if view.cage_base != 0 {
+        emit_dense_element_guards(ops, view, receiver, index, miss)?;
+        emit_load_u64(ops, 11, VALUE_HOLE);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x16]
+            ; cmp x9, x11
+            ; b.eq =>miss
+        );
+        emit_store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    }
+    dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_ctx_arg(ops);
     dynasm!(ops
         ; .arch aarch64
@@ -270,18 +342,48 @@ pub(super) fn emit_load_element(
         ; movz x3, index as u32
     );
     emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_ELEMENT), threw);
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_store_element(
     ops: &mut Assembler,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     receiver: u16,
     index: u16,
     value: u16,
     scratch: u16,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // Dense fast path for a primitive value: an in-bounds overwrite of a
+    // non-hole element with a non-cell value owes no generational write
+    // barrier and cannot allocate. A cell value takes the stub (barrier), a
+    // hole takes the stub (a prototype setter may observe the store).
+    if view.cage_base != 0 {
+        emit_dense_element_guards(ops, view, receiver, index, miss)?;
+        emit_load_u64(ops, 11, VALUE_HOLE);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x16]
+            ; cmp x9, x11
+            ; b.eq =>miss
+        );
+        emit_load_reg(ops, 9, value)?;
+        dynasm!(ops
+            ; .arch aarch64
+            ; movz x11, NUMBER_TAG_HI16, lsl #48
+            ; orr x11, x11, #0x2       // NOT_CELL_MASK
+            ; tst x9, x11
+            ; b.eq =>miss              // heap cell: the stub owns the barrier
+            ; str x9, [x16]
+            ; b =>done
+        );
+    }
+    dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_ctx_arg(ops);
     dynasm!(ops
         ; .arch aarch64
@@ -295,6 +397,8 @@ pub(super) fn emit_store_element(
         table.variadic_entry(abi::STUB_JIT_STORE_ELEMENT),
         threw,
     );
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 pub(super) fn emit_load_upvalue(

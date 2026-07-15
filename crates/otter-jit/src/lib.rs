@@ -12,7 +12,8 @@
 //! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
 //! - [`ir`] — backend-independent analysis structures for optimizing compilers.
-//! - [`optimizing`] — the production-wired single-block int32 optimizing tier.
+//! - [`optimizing`] — the production-wired reducible numeric/element tier with
+//!   function and loop-header OSR entries.
 //!
 //! # Invariants
 //! - **`unsafe` is contained here.** This crate lifts the workspace

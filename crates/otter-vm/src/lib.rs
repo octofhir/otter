@@ -414,8 +414,10 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 /// Aggregate native-tier runtime counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitRuntimeStats {
-    /// Optimizing-tier leaf entries.
+    /// Optimizing-tier function and OSR entries.
     pub optimized_entries: u64,
+    /// Optimizing-tier entries materialized at a hot loop header.
+    pub optimized_osr_entries: u64,
     /// Optimizing-tier exits that reconstructed and resumed an interpreter frame.
     pub optimized_deopts: u64,
     /// Compiled `Op::Call` bridge invocations.
@@ -993,12 +995,17 @@ pub struct Interpreter {
     /// installed baseline body; `None` records a function the emitter could not
     /// compile (outside the supported subset), so it is never retried.
     jit_code: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
-    /// Separately installed optimizing-tier leaves keyed by function id.
+    /// Separately installed optimizing-tier bodies keyed by function id.
     /// `None` records a hot function outside the deliberately narrow subset.
     jit_optimized_code:
         rustc_hash::FxHashMap<u32, Option<std::sync::Arc<dyn jit::JitFunctionCode>>>,
     /// Single-entry cache over [`Self::jit_optimized_code`] for hot leaf calls.
     jit_optimized_code_cache: Option<(u32, std::sync::Arc<dyn jit::JitFunctionCode>)>,
+    /// Feedback epoch at which a hot function last failed optimizing compilation.
+    /// A back-edge only re-attempts the whole-body optimizer when the epoch has
+    /// advanced, so a structurally-ineligible body is not recompiled on every hot
+    /// loop iteration.
+    jit_optimized_declined_epoch: rustc_hash::FxHashMap<u32, Option<u32>>,
     /// OSR-target compiled-code cache keyed by `(function_id, loop_header_pc)`.
     /// A target compile is not interchangeable with another header in the same
     /// function: its synthetic entry edge and captured OSR reload set are rooted

@@ -765,8 +765,10 @@ pub struct RuntimeExecutionStats {
     pub jit_direct_calls: u64,
     /// Compiled calls that fell back to the Rust callable path.
     pub jit_rust_call_fallbacks: u64,
-    /// Optimizing-tier leaf entries.
+    /// Optimizing-tier function and OSR entries.
     pub jit_optimized_entries: u64,
+    /// Optimizing-tier entries materialized at a hot loop header.
+    pub jit_optimized_osr_entries: u64,
     /// Optimizing-tier deopts resumed on reconstructed interpreter frames.
     pub jit_optimized_deopts: u64,
     /// Function-entry compile attempts across native tiers.
@@ -3163,6 +3165,7 @@ impl Runtime {
             jit_direct_calls: jit.direct_calls,
             jit_rust_call_fallbacks: jit.rust_call_fallbacks,
             jit_optimized_entries: jit.optimized_entries,
+            jit_optimized_osr_entries: jit.optimized_osr_entries,
             jit_optimized_deopts: jit.optimized_deopts,
             jit_compile_attempts: jit.compile_attempts,
             jit_osr_attempts: jit.osr_attempts,

@@ -968,6 +968,19 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// Enter optimizing code at one loop header from an interpreter frame.
+    ///
+    /// The default identifies baseline/template objects. Optimized code uses
+    /// the current interpreter register window to materialize its allocated
+    /// machine state before branching to the requested header.
+    fn run_optimized_osr_entry(
+        &self,
+        _activation: VmRuntimeActivation,
+        _logical_pc: u32,
+    ) -> Option<JitExecOutcome> {
+        None
+    }
+
     /// Enter compiled code mid-function at the loop header whose logical PC is
     /// `logical_pc` (on-stack replacement). Returns `None` when this code has no
     /// OSR entry for that PC (the VM keeps interpreting).

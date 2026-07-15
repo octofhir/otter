@@ -3,6 +3,8 @@
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
 //! - Reducible loop checks, numeric comparisons, and per-edge phi copies.
+//! - Loop-header OSR trampolines materializing allocated state from the
+//!   interpreter register window.
 //! - Cooperative back-edge polling with loop-header bail writeback.
 //! - Precise live-tagged GC safepoints around element load/store transitions.
 //! - Guarded numeric fast paths for source-lowered coercion scaffolding.
@@ -31,6 +33,10 @@
 //! - Every backwards bytecode edge targets a dominating loop header. Its phi moves
 //!   execute before the interrupt/fuel poll so a poll exit reconstructs the
 //!   loop-header frame, and no optimized loop can bypass cooperative polling.
+//! - Every OSR trampoline loads exactly the live loop-header frame-state
+//!   values, unboxes them into their allocated locations, and only then
+//!   branches to the header body. A representation mismatch bails with the
+//!   untouched interpreter window.
 //! - Conditional inputs are optimizer-produced tagged booleans and branch by
 //!   exact comparison with the VM's `true` immediate.
 //! - Every element transition boxes its operands plus tagged SSA values live
@@ -108,8 +114,22 @@ struct Eligibility {
     guarded_uses: Vec<GuardedUse>,
     /// `(deopt-table byte PC, native-frame logical resume PC)` per back-edge.
     back_edges: BTreeMap<(BlockId, BlockId), (u32, u32)>,
+    /// Verified loop-header entry state keyed by target block.
+    osr_entries: BTreeMap<BlockId, OsrEntrySite>,
     /// Precise transition protocol per element load/store logical PC.
     element_transitions: ElementTransitionSafepoints,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OsrLiveValue {
+    value: ValueId,
+    register: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OsrEntrySite {
+    logical_pc: u32,
+    live_values: Box<[OsrLiveValue]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +166,11 @@ struct EmissionPlan<'a> {
     deopt_table: &'a DeoptTable,
     load_element_entry: u64,
     store_element_entry: u64,
+}
+
+struct OptimizedEmission {
+    code: CompiledCode,
+    osr_entries: BTreeMap<u32, usize>,
 }
 
 #[cfg(test)]
@@ -208,7 +233,7 @@ pub(super) fn compile_with_transitions(
             frame_states: &frame_states,
         },
     )?;
-    let code = emit(
+    let emission = emit(
         view,
         &cfg,
         dom.reverse_postorder(),
@@ -245,11 +270,12 @@ pub(super) fn compile_with_transitions(
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
     Ok(OptimizedCode::new(
-        code,
+        emission.code,
         deopt.table().clone(),
         safepoint_records,
         frame_maps,
         eligibility.element_transitions.bitmap_words,
+        emission.osr_entries,
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -596,11 +622,60 @@ fn check_eligibility(
         frame_states,
         element_transition_instructions,
     )?;
+    let osr_entries = build_osr_entry_sites(cfg, ssa, liveness, frame_states)?;
     Ok(Eligibility {
         guarded_uses: guarded_numeric_uses,
         back_edges,
+        osr_entries,
         element_transitions,
     })
+}
+
+fn build_osr_entry_sites(
+    cfg: &ControlFlowGraph,
+    ssa: &SsaFunction,
+    liveness: &Liveness,
+    frame_states: &FrameStateTable,
+) -> Result<BTreeMap<BlockId, OsrEntrySite>, Unsupported> {
+    let mut sites = BTreeMap::new();
+    for block in cfg.blocks.iter().filter(|block| block.is_loop_header) {
+        let frame_state = frame_states
+            .at(block.start_pc)
+            .ok_or(Unsupported::OperandShape(
+                "optimizing OSR header frame state",
+            ))?;
+        let live_in = liveness.live_in(block.id);
+        let mut register_by_value = BTreeMap::<ValueId, u16>::new();
+        for (register, value) in frame_state.registers.iter().copied().enumerate() {
+            let Some(value) = value.filter(|value| live_in.contains(value)) else {
+                continue;
+            };
+            let register = u16::try_from(register)
+                .map_err(|_| Unsupported::OperandShape("optimizing OSR register overflow"))?;
+            register_by_value.entry(value).or_insert(register);
+        }
+        if live_in
+            .iter()
+            .any(|value| has_non_dead_use(ssa, *value) && !register_by_value.contains_key(value))
+        {
+            return Err(Unsupported::OperandShape(
+                "optimizing OSR live value is absent from header frame state",
+            ));
+        }
+        let live_values = register_by_value
+            .into_iter()
+            .map(|(value, register)| OsrLiveValue { value, register })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        sites.insert(
+            block.id,
+            OsrEntrySite {
+                logical_pc: block.start_pc,
+                live_values,
+            },
+        );
+    }
+    Ok(sites)
 }
 
 fn build_element_transition_sites(
@@ -904,7 +979,7 @@ fn emit(
     rpo: &[BlockId],
     ssa: &SsaFunction,
     plan: EmissionPlan<'_>,
-) -> Result<CompiledCode, Unsupported> {
+) -> Result<OptimizedEmission, Unsupported> {
     let EmissionPlan {
         reprs,
         allocation,
@@ -1417,10 +1492,38 @@ fn emit(
         emit_epilogue(&mut ops, spill_frame_bytes);
     }
 
+    let mut osr_entries = BTreeMap::new();
+    for (&block, site) in &eligibility.osr_entries {
+        let target = block_labels[block.0 as usize];
+        let offset = ops.offset().0;
+        let representation_bail = ops.new_dynamic_label();
+        emit_prologue(&mut ops, spill_frame_bytes);
+        dynasm!(ops
+            ; .arch aarch64
+            ; mov x20, x0
+            ; ldr x19, [x20]
+        );
+        emit_osr_materialization(&mut ops, reprs, allocation, site, representation_bail)?;
+        dynasm!(ops ; .arch aarch64 ; b =>target ; =>representation_bail);
+        emit_load_u32(&mut ops, 9, site.logical_pc);
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+            ; mov x0, xzr
+            ; movz x1, STATUS_BAILED as u32
+        );
+        emit_epilogue(&mut ops, spill_frame_bytes);
+        osr_entries.insert(site.logical_pc, offset);
+    }
+
     let buffer = ops
         .finalize()
         .expect("arm64 optimizing assembler finalization");
-    Ok(CompiledCode::new(buffer, entry))
+    Ok(OptimizedEmission {
+        code: CompiledCode::new(buffer, entry),
+        osr_entries,
+    })
 }
 
 /// Emit one normal edge. Loop-carried phi destinations are populated before
@@ -1667,6 +1770,45 @@ fn emit_load_parameter(ops: &mut Assembler, index: u32, scratch: u8) {
         emit_load_u32(ops, 12, offset);
         dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [x19, x12]);
     }
+}
+
+/// Inverse of [`emit_deopt_writeback`] for a loop-header live set.
+///
+/// The interpreter window is still the canonical rooted state on entry. Each
+/// live frame-state value is loaded from its bytecode register, checked and
+/// unboxed according to the representation analysis, then written to the same
+/// allocated location that deopt later reads. Until every value has been
+/// materialized, a representation failure returns through `bail` without
+/// writing any machine location back over the window.
+fn emit_osr_materialization(
+    ops: &mut Assembler,
+    reprs: &ReprMap,
+    allocation: &Allocation,
+    site: &OsrEntrySite,
+    bail: DynamicLabel,
+) -> Result<(), Unsupported> {
+    for live in &site.live_values {
+        emit_load_frame_register(ops, u32::from(live.register), 9)?;
+        match reprs.representation(live.value) {
+            Representation::Tagged => {
+                emit_store_tagged_location(ops, allocation.location(live.value), 9)?;
+            }
+            Representation::Int32 => {
+                emit_guard_int32(ops, 9, bail);
+                emit_store_location(ops, allocation.location(live.value), 9)?;
+            }
+            Representation::Float64 => {
+                emit_num_to_double(ops, 9, FP_SCRATCH, bail);
+                emit_store_fp_location(
+                    ops,
+                    allocation,
+                    allocation.location(live.value),
+                    FP_SCRATCH,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn emit_deopt_writeback(
@@ -2413,10 +2555,40 @@ mod tests {
         // SAFETY: the compiler emitted `JitEntry`, `code` owns the mapping
         // through the call, and the context plus poll cells remain valid until
         // the entry returns.
-        let entry: JitEntry = unsafe { std::mem::transmute(code.compiled_code().entry_ptr()) };
+        let entry = unsafe { code.compiled_code().entry_ptr() };
         let mut frame =
             vec![otter_vm::Value::undefined().to_bits(); code.metadata().register_count as usize];
         frame[..args.len()].copy_from_slice(args);
+        execute_at(code, entry, frame, interrupt, fuel)
+    }
+
+    fn execute_osr_with_frame(
+        code: &OptimizedCode,
+        logical_pc: u32,
+        frame: Vec<u64>,
+    ) -> (JitRet, Vec<u64>, u32) {
+        let interrupt = 0_u8;
+        let mut fuel = i64::MAX as u64;
+        // SAFETY: the code object owns the recorded trampoline while this call
+        // executes.
+        let entry = unsafe {
+            code.osr_entry_ptr_for_test(logical_pc)
+                .expect("optimized OSR entry")
+        };
+        execute_at(code, entry, frame, std::ptr::addr_of!(interrupt), &mut fuel)
+    }
+
+    fn execute_at(
+        code: &OptimizedCode,
+        entry: *const u8,
+        mut frame: Vec<u64>,
+        interrupt: *const u8,
+        fuel: &mut u64,
+    ) -> (JitRet, Vec<u64>, u32) {
+        assert_eq!(frame.len(), code.metadata().register_count as usize);
+        // SAFETY: `entry` is a main entry or OSR trampoline in `code`, whose
+        // executable mapping outlives this call.
+        let entry: JitEntry = unsafe { std::mem::transmute(entry) };
         let metadata = code.metadata();
         let mut native_frame = NativeFrame {
             header: VmFrameHeader {
@@ -3727,6 +3899,31 @@ mod tests {
     }
 
     #[test]
+    fn osr_materializes_live_header_phis_from_interpreter_window() {
+        let code = compile(&summation_view(), 120).expect("summation loop is eligible");
+        let frame = vec![box_i32(10), box_i32(4), box_i32(6), box_i32(1), VALUE_TRUE];
+        let (result, _frame, _resume_pc) = execute_osr_with_frame(&code, 3, frame);
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(unbox_i32(result.value), 45);
+    }
+
+    #[test]
+    fn osr_representation_mismatch_bails_with_window_untouched() {
+        let code = compile(&summation_view(), 121).expect("summation loop is eligible");
+        let frame = vec![
+            box_i32(10),
+            box_f64(4.5),
+            box_i32(6),
+            box_i32(1),
+            VALUE_TRUE,
+        ];
+        let (result, after, resume_pc) = execute_osr_with_frame(&code, 3, frame.clone());
+        assert_eq!(result.status, STATUS_BAILED);
+        assert_eq!(resume_pc, 3);
+        assert_eq!(after, frame);
+    }
+
+    #[test]
     fn loop_overflow_deopts_with_reconstructed_mid_loop_frame() {
         let view = view(
             1,
@@ -3774,6 +3971,68 @@ mod tests {
         let (result, frame, resume_pc) = execute_with_frame(&code, &[box_i32(5)]);
         assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(result.value, 0);
+        assert_eq!(resume_pc, 5);
+        assert_eq!(frame[0], box_i32(5));
+        assert_eq!(frame[1], box_i32(2));
+        assert_eq!(frame[2], box_i32(i32::MAX));
+        assert_eq!(frame[3], box_i32(1));
+        assert_eq!(frame[4], VALUE_TRUE);
+    }
+
+    #[test]
+    fn overflow_after_osr_reconstructs_current_loop_frame() {
+        let view = view(
+            1,
+            5,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(0)]),
+                (
+                    Op::LoadInt32,
+                    vec![Operand::Register(2), Operand::Imm32(i32::MAX - 2)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(3), Operand::Imm32(1)]),
+                (
+                    Op::LessThan,
+                    vec![
+                        Operand::Register(4),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(3), Operand::Register(4)],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(2),
+                        Operand::Register(3),
+                    ],
+                ),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(1),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::Jump, vec![Operand::Imm32(-5)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let code = compile(&view, 122).expect("overflowing loop is eligible");
+        let frame = vec![
+            box_i32(5),
+            box_i32(1),
+            box_i32(i32::MAX - 1),
+            box_i32(1),
+            VALUE_TRUE,
+        ];
+        let (result, frame, resume_pc) = execute_osr_with_frame(&code, 3, frame);
+        assert_eq!(result.status, STATUS_BAILED);
         assert_eq!(resume_pc, 5);
         assert_eq!(frame[0], box_i32(5));
         assert_eq!(frame[1], box_i32(2));

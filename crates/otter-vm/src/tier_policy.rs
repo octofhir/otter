@@ -4,7 +4,8 @@
 //! - [`OptimizingDecision`] classifies one function's current promotion state.
 //! - [`Interpreter::optimizing_tier_decision`] derives the function's hotness
 //!   from the existing baseline call counter, samples its feedback epoch, and
-//!   returns the current classification.
+//!   returns the current classification. Loop OSR uses independent back-edge
+//!   hotness and may install the same optimizing body first.
 //! - [`TierPolicy`] owns per-function feedback-stability history only.
 //!
 //! # Invariants
@@ -16,7 +17,7 @@
 //! - Promotion requires both sustained hotness and an unchanged feedback epoch
 //!   across [`STABLE_SAMPLES`] consecutive checks.
 //! - A decision itself never compiles or installs code. The function-entry path
-//!   owns compilation after a `Promote` result; loop OSR remains unchanged.
+//!   owns compilation after `Promote`; loop OSR owns back-edge compilation.
 //!
 //! # See also
 //! - [`crate::executable::CodeBlock::feedback_epoch`]

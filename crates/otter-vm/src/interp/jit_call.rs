@@ -194,8 +194,8 @@ impl Interpreter {
 
     /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
     /// the threshold crossing (the top frame's `pc` is the loop header just
-    /// branched to). Compiles the function (if needed) and enters compiled code
-    /// at the header so the rest of the loop runs natively.
+    /// branched to). It prefers whole-body optimizing OSR, then preserves the
+    /// template OSR fallback for functions outside the optimizing subset.
     ///
     /// Returns `Ok(None)` to keep interpreting (ineligible, no OSR entry for
     /// this header, or the compiled body bailed); `Ok(Some(popped))` when
@@ -225,43 +225,59 @@ impl Interpreter {
         if self.jit_osr_disabled.contains(&(fid, osr_pc)) {
             return Ok(None);
         }
-        // Resolve compiled code, compiling once and caching the result (shared
-        // with the function-entry path; `None` records an uncompilable body).
-        let osr_key = (fid, osr_pc);
-        let code = match self.jit_osr_code.get(&osr_key) {
-            Some(slot) => slot.clone(),
-            None => {
-                let compiled = self.compile_jit_function(context, fid, Some(osr_pc));
-                self.jit_osr_code.insert(osr_key, compiled.clone());
-                compiled
-            }
-        };
-        let Some(code) = code else {
-            // This header's OSR region is uncompilable (its slice holds an
-            // unsupported opcode — e.g. an object-valued `StoreElement`). The
-            // region is built from `osr_pc`, so a different hot loop in the same
-            // function can still compile; disable only this header, not the body.
-            self.jit_osr_disabled.insert((fid, osr_pc));
-            return Ok(None);
-        };
-        if !self
-            .jit_code_registry
-            .dependencies_are_current_for_entry(code.as_ref())
-        {
-            return Ok(None);
-        }
         // See `run_compiled_frame`: the activation must name the chunk owning
         // the OSR-entered frame, not the caller tick's chunk.
         let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
         let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
-        match code.osr_entry(activation, osr_pc) {
-            // No trampoline for this header — it's not an OSR target. Disable
-            // just this header and re-arm so another header can still tier up.
-            None => {
-                self.jit_osr_disabled.insert((fid, osr_pc));
-                Ok(None)
+        let optimized_outcome = self
+            .resolve_optimized_osr_code(context, fid)
+            .filter(|code| {
+                self.jit_code_registry
+                    .dependencies_are_current_for_entry(code.as_ref())
+            })
+            .and_then(|code| code.run_optimized_osr_entry(activation, osr_pc));
+        let (outcome, optimized) = if let Some(outcome) = optimized_outcome {
+            self.jit_runtime_stats.optimized_entries =
+                self.jit_runtime_stats.optimized_entries.saturating_add(1);
+            self.jit_runtime_stats.optimized_osr_entries = self
+                .jit_runtime_stats
+                .optimized_osr_entries
+                .saturating_add(1);
+            if matches!(outcome, jit::JitExecOutcome::Bailed(_)) {
+                self.jit_runtime_stats.optimized_deopts =
+                    self.jit_runtime_stats.optimized_deopts.saturating_add(1);
             }
-            Some(jit::JitExecOutcome::Bailed(pc)) => {
+            (outcome, true)
+        } else {
+            // The whole-body optimizer declined this function/header. Resolve
+            // the existing template OSR object exactly as before.
+            let osr_key = (fid, osr_pc);
+            let code = match self.jit_osr_code.get(&osr_key) {
+                Some(slot) => slot.clone(),
+                None => {
+                    let compiled = self.compile_jit_function(context, fid, Some(osr_pc));
+                    self.jit_osr_code.insert(osr_key, compiled.clone());
+                    compiled
+                }
+            };
+            let Some(code) = code else {
+                self.jit_osr_disabled.insert((fid, osr_pc));
+                return Ok(None);
+            };
+            if !self
+                .jit_code_registry
+                .dependencies_are_current_for_entry(code.as_ref())
+            {
+                return Ok(None);
+            }
+            let Some(outcome) = code.osr_entry(activation, osr_pc) else {
+                self.jit_osr_disabled.insert((fid, osr_pc));
+                return Ok(None);
+            };
+            (outcome, false)
+        };
+        match outcome {
+            jit::JitExecOutcome::Bailed(pc) => {
                 // Compiled body hit a guard or unsupported opcode. Resume the
                 // interpreter at the exact bail PC (committed side effects are
                 // preserved). Disable this loop header only when the miss was in
@@ -269,7 +285,8 @@ impl Interpreter {
                 // loop, continue through cold epilogue/outer-loop code, and bail
                 // there; that should not permanently suppress the header on the
                 // next hot iteration.
-                Self::trace_jit_bail(context, fid, "osr", Some(osr_pc), pc);
+                let tier = if optimized { "optimized-osr" } else { "osr" };
+                Self::trace_jit_bail(context, fid, tier, Some(osr_pc), pc);
                 stack[top_idx].pc = pc;
                 if self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     return Ok(None);
@@ -279,11 +296,11 @@ impl Interpreter {
                 }
                 Ok(None)
             }
-            Some(jit::JitExecOutcome::Returned(value)) => {
+            jit::JitExecOutcome::Returned(value) => {
                 let popped = self.return_running_finally(stack, value)?;
                 Ok(Some(popped))
             }
-            Some(jit::JitExecOutcome::Threw(err)) => Err(err),
+            jit::JitExecOutcome::Threw(err) => Err(err),
         }
     }
 

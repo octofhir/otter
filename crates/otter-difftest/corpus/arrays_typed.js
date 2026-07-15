@@ -17,11 +17,64 @@ const hotSum = hotElement(hotValues, 0) + hotElement(hotValues, 1)
 let loadThrow = "";
 try { hotElement(null, 0); } catch (error) { loadThrow = error.name; }
 
+globalThis.hotFloatValues = [1.25, 2.5, 3.75, 5];
+function hotFloatArray(values, limit) {
+  let total = 0.25;
+  let index = 0;
+  while (index < limit) {
+    total = total + values[index];
+    index = index + 1;
+  }
+  return total;
+}
+
+globalThis.hotManyA = [1, 2, 3, 4];
+globalThis.hotManyB = [10, 20, 30, 40];
+globalThis.hotManyC = [2, 4, 6, 8];
+globalThis.hotManyD = [1, 2, 3, 4];
+function hotManyArrays(a, b, c, d, limit) {
+  let total = 0;
+  let index = 0;
+  while (index < limit) {
+    total = total + a[index];
+    total = total + b[index];
+    total = total + c[index];
+    total = total + d[index];
+    index = index + 1;
+  }
+  return total;
+}
+
+globalThis.hotChainA = [0];
+globalThis.hotChainB = [0];
+globalThis.hotChainC = [0];
+globalThis.hotChainD = [42.5];
+function hotTaggedChain(a, b, c, d, index) {
+  const first = a[index];
+  const second = b[first];
+  const third = c[second];
+  return d[third];
+}
+
+let warmPreciseRoots = "";
+for (let i = 0; i < 4010; i++) {
+  warmPreciseRoots += "hotFloatArray(hotFloatValues, 4);";
+  warmPreciseRoots += "hotManyArrays(hotManyA, hotManyB, hotManyC, hotManyD, 4);";
+  warmPreciseRoots += "hotTaggedChain(hotChainA, hotChainB, hotChainC, hotChainD, 0);";
+}
+eval(warmPreciseRoots);
+const hotFloatSum = hotFloatArray(hotFloatValues, 4);
+const hotManySum = hotManyArrays(hotManyA, hotManyB, hotManyC, hotManyD, 4);
+const hotChain = hotTaggedChain(hotChainA, hotChainB, hotChainC, hotChainD, 0);
+
 JSON.stringify({
   dense: dense.length,
   hole: 1 in holey,
   typed: Array.from(typed),
   hotSum,
+  hotFloatSum,
+  hotManySum,
+  hotChain,
   hotFirst: hotElement(hotValues, 0),
   loadThrow
 });

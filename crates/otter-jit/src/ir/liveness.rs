@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`Liveness`] — block-indexed live-in and live-out value sets.
 //! - [`Liveness::compute`] — normal-edge fixpoint construction.
+//! - [`Liveness::live_after_instruction`] — exact instruction-boundary live-out.
 //! - [`Liveness::verify`] — independent structural and dataflow checks.
 //! - [`LivenessError`] — precise verification failures.
 //!
@@ -173,6 +174,34 @@ impl Liveness {
     #[must_use]
     pub fn live_out(&self, block: BlockId) -> &BTreeSet<ValueId> {
         &self.live_out[block.0 as usize]
+    }
+
+    /// Return the values live immediately after one instruction.
+    ///
+    /// The block fixpoint is walked backwards from its live-out boundary. A
+    /// result is killed at its definition and inputs become live before their
+    /// use, matching the equations used by register allocation. `None` means
+    /// the block or instruction index is outside the verified SSA layout.
+    #[must_use]
+    pub fn live_after_instruction(
+        &self,
+        ssa: &SsaFunction,
+        block: BlockId,
+        instruction_index: usize,
+    ) -> Option<BTreeSet<ValueId>> {
+        let block_index = block.0 as usize;
+        let instructions = &ssa.blocks.get(block_index)?.instrs;
+        if instruction_index >= instructions.len() {
+            return None;
+        }
+        let mut live = self.live_out.get(block_index)?.clone();
+        for instruction in instructions[instruction_index + 1..].iter().rev() {
+            if let Some(result) = instruction.result {
+                live.remove(&result);
+            }
+            live.extend(instruction.inputs.iter().copied());
+        }
+        Some(live)
     }
 
     /// Verify range, fixpoint, dominance, boundary, and use invariants.
@@ -524,6 +553,43 @@ mod tests {
         assert!(!liveness.live_in(after).contains(&value));
         assert!(liveness.live_in.iter().all(|set| !set.contains(&unused)));
         assert!(liveness.live_out.iter().all(|set| !set.contains(&unused)));
+    }
+
+    #[test]
+    fn instruction_boundary_live_out_keeps_only_later_uses() {
+        let (cfg, ssa, _dom, liveness) = analyses(
+            1,
+            3,
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(1), Operand::Imm32(7)]),
+                (
+                    Op::Add,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(1),
+                        Operand::Register(0),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let block = block_at(&cfg, 0);
+        let loaded = op_value_at(&ssa, 0);
+        let sum = op_value_at(&ssa, 1);
+        let parameter = ssa.blocks[block.0 as usize].instrs[1].inputs[1];
+
+        assert_eq!(
+            liveness.live_after_instruction(&ssa, block, 0),
+            Some(BTreeSet::from([loaded, parameter]))
+        );
+        assert_eq!(
+            liveness.live_after_instruction(&ssa, block, 1),
+            Some(BTreeSet::from([sum]))
+        );
+        assert_eq!(
+            liveness.live_after_instruction(&ssa, block, 2),
+            Some(BTreeSet::new())
+        );
     }
 
     #[test]

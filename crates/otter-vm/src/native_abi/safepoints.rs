@@ -193,6 +193,38 @@ impl SafepointRecord {
         }
     }
 
+    /// Expand one compact frame bitmap into the collector-facing root record.
+    ///
+    /// `bitmap_words` is the owning code object's complete immutable bitmap
+    /// table. `None` rejects a descriptor whose range or width does not cover
+    /// exactly `slot_count` frame slots.
+    #[must_use]
+    pub fn from_frame_map(
+        frame_map: FrameMap,
+        frame_state: FrameStateId,
+        bitmap_words: &[u64],
+    ) -> Option<Self> {
+        let required_words = usize::from(frame_map.slot_count).div_ceil(u64::BITS as usize);
+        if usize::from(frame_map.bitmap_word_count) != required_words {
+            return None;
+        }
+        let start = usize::try_from(frame_map.bitmap_offset).ok()?;
+        let end = start.checked_add(required_words)?;
+        let words = bitmap_words.get(start..end)?;
+        let tagged_locations = (0..frame_map.slot_count)
+            .filter(|slot| {
+                let slot = usize::from(*slot);
+                words[slot / u64::BITS as usize] & (1_u64 << (slot % u64::BITS as usize)) != 0
+            })
+            .map(TaggedLocation::frame_slot)
+            .collect();
+        Some(Self {
+            id: frame_map.id,
+            frame_state,
+            tagged_locations,
+        })
+    }
+
     /// Whether this map can reconstruct interpreter-visible state.
     #[must_use]
     pub fn has_deopt_state(&self) -> bool {
@@ -220,5 +252,25 @@ mod tests {
         assert_eq!(record.tagged_locations.len(), 4);
         assert_eq!(record.tagged_locations[3], TaggedLocation::frame_slot(3));
         assert!(!record.has_deopt_state());
+    }
+
+    #[test]
+    fn precise_frame_map_expands_only_set_slots() {
+        let map = FrameMap {
+            id: 7,
+            bitmap_offset: 1,
+            bitmap_word_count: 2,
+            slot_count: 65,
+        };
+        let record = SafepointRecord::from_frame_map(map, NO_FRAME_STATE, &[u64::MAX, 0b101, 1])
+            .expect("valid precise frame map");
+        assert_eq!(
+            record.tagged_locations,
+            vec![
+                TaggedLocation::frame_slot(0),
+                TaggedLocation::frame_slot(2),
+                TaggedLocation::frame_slot(64),
+            ]
+        );
     }
 }

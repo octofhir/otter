@@ -8,17 +8,17 @@
 //! carry sequentialized phi moves, while every back-edge polls the VM thread's
 //! interrupt and fuel cells before returning to its dominating header.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
-//! reconstructs the interpreter register window in place before every bail or
-//! allocating element-load transition.
+//! reconstructs the interpreter register window in place before every bail and
+//! publishes only precise tagged roots around allocating element-load transitions.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
 //!
 //! # Invariants
-//! - Every `LoadElement` materializes the complete interpreter window, publishes
-//!   a code-object-owned safepoint, calls the shared runtime transition, and
-//!   reloads every tagged machine location before optimized execution resumes.
+//! - Every `LoadElement` materializes its operands plus tagged SSA values live
+//!   across the call, publishes a code-object-owned precise frame bitmap, and
+//!   reloads only locations that moving GC can rewrite.
 //! - Every backwards bytecode edge targets a header that dominates its predecessor;
 //!   irreducible loops and exception edges are rejected.
 //! - The sole ABI argument is a dynamically valid `JitCtx`; parameters and
@@ -41,7 +41,7 @@ use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
     deopt::DeoptTable,
     native_abi::{
-        BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, SafepointRecord,
+        BuildVersionRecord, CodeObjectMetadata, FrameMap, LayoutVersionRecord, SafepointRecord,
         VM_BUILD_VERSION,
     },
 };
@@ -78,6 +78,8 @@ pub struct OptimizedCode {
     code: CompiledCode,
     deopt_table: DeoptTable,
     safepoint_records: Box<[SafepointRecord]>,
+    frame_maps: Box<[FrameMap]>,
+    frame_map_bitmap_words: Box<[u64]>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
@@ -87,6 +89,8 @@ impl OptimizedCode {
         code: CompiledCode,
         deopt_table: DeoptTable,
         safepoint_records: Box<[SafepointRecord]>,
+        frame_maps: Box<[FrameMap]>,
+        frame_map_bitmap_words: Box<[u64]>,
         metadata: OptimizedMetadata,
     ) -> Self {
         const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0005;
@@ -96,7 +100,7 @@ impl OptimizedCode {
             entry_offset: 0,
             code_size: code.len() as u32,
             safepoint_count: safepoint_records.len() as u32,
-            frame_map_count: safepoint_records.len() as u32,
+            frame_map_count: frame_maps.len() as u32,
             spill_map_count: 0,
             dependency_count: 0,
             reserved: 0,
@@ -110,6 +114,8 @@ impl OptimizedCode {
             code,
             deopt_table,
             safepoint_records,
+            frame_maps,
+            frame_map_bitmap_words,
             metadata,
             code_metadata,
         }
@@ -132,6 +138,19 @@ impl OptimizedCode {
     pub const fn metadata(&self) -> OptimizedMetadata {
         self.metadata
     }
+
+    #[cfg(test)]
+    fn frame_map(&self, id: u32) -> Option<&FrameMap> {
+        self.frame_maps
+            .binary_search_by_key(&id, |frame_map| frame_map.id)
+            .ok()
+            .map(|index| &self.frame_maps[index])
+    }
+
+    #[cfg(test)]
+    fn frame_map_bitmap_words(&self) -> &[u64] {
+        &self.frame_map_bitmap_words
+    }
 }
 
 impl std::fmt::Debug for OptimizedCode {
@@ -140,6 +159,8 @@ impl std::fmt::Debug for OptimizedCode {
             .field("code_len", &self.code.len())
             .field("deopt_points", &self.deopt_table.len())
             .field("safepoints", &self.safepoint_records.len())
+            .field("frame_maps", &self.frame_maps.len())
+            .field("frame_map_bitmap_words", &self.frame_map_bitmap_words.len())
             .field("metadata", &self.metadata)
             .finish()
     }

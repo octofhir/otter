@@ -301,12 +301,21 @@ pub(super) fn compile_with_transitions(
         .count();
     let mut load_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); load_property_sites].into_boxed_slice();
+    let store_property_sites = dom
+        .reverse_postorder()
+        .iter()
+        .flat_map(|block| ssa.blocks[block.0 as usize].instrs.iter())
+        .filter(|instruction| instruction.op == Op::StoreProperty)
+        .count();
+    let mut store_ic_cells =
+        vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
     let emission = emit(
         view,
         &cfg,
         dom.reverse_postorder(),
         &ssa,
         &mut load_ic_cells,
+        &mut store_ic_cells,
         EmissionPlan {
             reprs: &reprs,
             allocation: &allocation,
@@ -364,6 +373,7 @@ pub(super) fn compile_with_transitions(
         emission.osr_entries,
         eligibility.math_call_arguments,
         load_ic_cells,
+        store_ic_cells,
         OptimizedMetadata {
             code_object_id,
             function_id: view.code_block.id,
@@ -1223,11 +1233,10 @@ fn build_element_transition_sites(
             "optimizing element-transition result",
         ))?;
         let is_store_transition = matches!(instruction.op, Op::StoreElement | Op::StoreProperty);
-        if is_store_transition && live_after.contains(&result) && has_non_dead_use(ssa, result) {
-            return Err(Unsupported::OperandShape(
-                "optimizing store-transition scratch is live after the transition",
-            ));
-        }
+        // The scratch register receives a setter's ignored return value, so a
+        // live-after scratch is fine: the emitter reloads its window slot into
+        // the value's machine location after the transition, exactly like a
+        // load result.
         let mut tagged_live_across = Vec::new();
         for value in live_after {
             if value == result || reprs.representation(value) != Representation::Tagged {
@@ -1552,6 +1561,7 @@ fn emit(
     rpo: &[BlockId],
     ssa: &SsaFunction,
     load_ic_cells: &mut [WhiskerIcCell],
+    store_ic_cells: &mut [WhiskerIcCell],
     plan: EmissionPlan<'_>,
 ) -> Result<OptimizedEmission, Unsupported> {
     let EmissionPlan {
@@ -1580,6 +1590,7 @@ fn emit(
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut next_load_ic = 0usize;
+    let mut next_store_ic = 0usize;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
     let mut deopt_exits = Vec::<(DynamicLabel, DeoptExitId, u32)>::new();
     let threw = ops.new_dynamic_label();
@@ -1903,12 +1914,17 @@ fn emit(
                             }
                             Representation::Tagged => unreachable!("store_fast is numeric"),
                         }
-                        dynasm!(ops
-                            ; .arch aarch64
-                            ; str x9, [x16]
-                            ; b =>done
-                            ; =>miss
-                        );
+                        dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
+                        emit_store_tagged_location(
+                            &mut ops,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked element-store scratch"),
+                            ),
+                            9,
+                        )?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                     }
                     emit_materialize_element_transition(
                         &mut ops,
@@ -1937,7 +1953,19 @@ fn emit(
                         ; b =>threw
                         ; =>succeeded
                     );
-                    emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            scratch,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked element-store scratch"),
+                            ),
+                        )),
+                    )?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LoadProperty => {
@@ -2081,6 +2109,14 @@ fn emit(
                     let name = view.instructions[instruction.pc as usize]
                         .const_index(view.code_block.as_ref(), 1)
                         .ok_or(Unsupported::OperandShape("property-store name constant"))?;
+                    let ic_site = view.instructions[instruction.pc as usize]
+                        .property_ic_site(view.code_block.as_ref())
+                        .unwrap_or(usize::MAX) as u64;
+                    let cell = store_ic_cells
+                        .get_mut(next_store_ic)
+                        .ok_or(Unsupported::OperandShape("optimizing store IC cell"))?;
+                    let cell_addr = std::ptr::from_mut::<WhiskerIcCell>(cell) as usize;
+                    next_store_ic += 1;
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -2089,6 +2125,139 @@ fn emit(
                             "optimizing property store missing site",
                         ))?;
                     debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+
+                    // Inline existing-own-data store through the self-patching
+                    // cell: guard cell tag, body tag, and shape, walk the ways,
+                    // then write the slab slot. A primitive compresses inline;
+                    // a heap cell stores its low word and runs the generational
+                    // write barrier through the window (receiver and value are
+                    // staged into their slots first). Wide primitives and every
+                    // failed guard take the window transition.
+                    if view.cage_base != 0 {
+                        let shape_byte = view.object_shape_byte;
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[0]),
+                            9,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; movz x11, NUMBER_TAG_HI16, lsl #48
+                            ; orr x11, x11, #0x2       // NOT_CELL_MASK
+                            ; tst x9, x11
+                            ; b.ne =>miss
+                            ; mov w12, w9              // low-32 Gc offset
+                        );
+                        emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x12
+                            ; ldrb w14, [x13]
+                            ; cmp w14, OBJECT_BODY_TYPE_TAG
+                            ; b.ne =>miss
+                            ; ldr w14, [x13, shape_byte]
+                            ; cbz w14, =>miss
+                        );
+                        emit_load_u64(&mut ops, 15, cell_addr as u64);
+                        let do_store = ops.new_dynamic_label();
+                        for way in 0..IC_WAYS as u32 {
+                            let shape_off = way * 8;
+                            let value_byte_off = shape_off + 4;
+                            let next = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; .arch aarch64
+                                ; ldr w16, [x15, shape_off]
+                                ; cmp w14, w16
+                                ; b.ne =>next
+                                ; ldr w17, [x15, value_byte_off]
+                                ; b =>do_store
+                                ; =>next
+                            );
+                        }
+                        dynasm!(ops ; .arch aarch64 ; b =>miss ; =>do_store);
+                        crate::template::arm64::values::emit_slab_base(&mut ops, view, 13, 14);
+                        dynasm!(ops ; .arch aarch64 ; cbz x13, =>miss);
+                        // Boxed value bits into x9, whatever its representation.
+                        match reprs.representation(instruction.inputs[1]) {
+                            Representation::Tagged => {
+                                emit_load_tagged_location(
+                                    &mut ops,
+                                    allocation.location(instruction.inputs[1]),
+                                    9,
+                                )?;
+                            }
+                            Representation::Int32 => {
+                                emit_load_location(
+                                    &mut ops,
+                                    allocation.location(instruction.inputs[1]),
+                                    9,
+                                )?;
+                                emit_box_int32(&mut ops, 9, 11);
+                            }
+                            Representation::Float64 => {
+                                emit_load_fp_location(
+                                    &mut ops,
+                                    allocation,
+                                    allocation.location(instruction.inputs[1]),
+                                    FP_SCRATCH,
+                                )?;
+                                emit_box_double(&mut ops, FP_SCRATCH, 9);
+                            }
+                        }
+                        let store_prim = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; movz x11, NUMBER_TAG_HI16, lsl #48
+                            ; orr x11, x11, #0x2
+                            ; tst x9, x11
+                            ; b.ne =>store_prim        // primitive: no barrier
+                            ; str w9, [x13, x17]
+                        );
+                        // Cell store: stage receiver and value into their window
+                        // slots and run the barrier through the window stub.
+                        emit_materialize_frame_value(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction.inputs[0],
+                            object,
+                        )?;
+                        emit_materialize_frame_value(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction.inputs[1],
+                            value,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; mov x0, x20
+                            ; movz x1, object as u32
+                            ; movz x2, value as u32
+                        );
+                        emit_load_u64(
+                            &mut ops,
+                            16,
+                            transitions.entry(otter_vm::native_abi::STUB_JIT_WRITE_BARRIER),
+                        );
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; blr x16
+                            ; cbnz x0, =>threw
+                            ; b =>done
+                            ; =>store_prim
+                        );
+                        crate::template::arm64::values::emit_compress_slot_or_bail(
+                            &mut ops, miss,
+                        );
+                        dynasm!(ops ; .arch aarch64 ; str w10, [x13, x17] ; b =>done);
+                    }
+
+                    // Miss: the window transition resolves the store and
+                    // self-patches this site's cell.
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     emit_materialize_element_transition(
                         &mut ops,
                         reprs,
@@ -2106,8 +2275,8 @@ fn emit(
                     );
                     emit_load_u64(&mut ops, 2, u64::from(name));
                     dynasm!(ops ; .arch aarch64 ; movz x3, value as u32);
-                    emit_load_u64(&mut ops, 4, u64::MAX);
-                    emit_load_u64(&mut ops, 5, 0);
+                    emit_load_u64(&mut ops, 4, ic_site);
+                    emit_load_u64(&mut ops, 5, cell_addr as u64);
                     emit_load_u64(&mut ops, 6, function_id);
                     emit_load_u64(&mut ops, 16, store_property_entry);
                     let succeeded = ops.new_dynamic_label();
@@ -2119,6 +2288,7 @@ fn emit(
                         ; =>succeeded
                     );
                     emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LoadGlobalOrThrow => {
                     let dst = instruction

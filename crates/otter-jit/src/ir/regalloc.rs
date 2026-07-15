@@ -925,7 +925,9 @@ fn extend_phi_and_live_out_intervals(
         let predecessors = normal_predecessors(cfg, block_id);
         for &head in &block.phis {
             let head_index = value_index(head, value_count)?;
-            if let ValueDef::Phi { inputs, .. } = &ssa.values[head_index].def {
+            if let ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. } =
+                &ssa.values[head_index].def
+            {
                 if inputs.len() != predecessors.len() {
                     return Err(RegallocError::PhiInputCountMismatch {
                         phi: head,
@@ -1007,7 +1009,9 @@ fn verify_intervals(
         let predecessors = normal_predecessors(cfg, block_id);
         for &head in &block.phis {
             let head_index = value_index(head, value_count)?;
-            if let ValueDef::Phi { inputs, .. } = &ssa.values[head_index].def {
+            if let ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. } =
+                &ssa.values[head_index].def
+            {
                 if inputs.len() != predecessors.len() {
                     return Err(RegallocError::PhiInputCountMismatch {
                         phi: head,
@@ -1244,7 +1248,9 @@ fn phi_move_requirements(
             continue;
         }
         let phi_index = value_index(phi, ssa.values.len())?;
-        let ValueDef::Phi { inputs, .. } = &ssa.values[phi_index].def else {
+        let (ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }) =
+            &ssa.values[phi_index].def
+        else {
             continue;
         };
         if inputs.len() != predecessors.len() {
@@ -1295,13 +1301,14 @@ fn phi_move_requirements(
     Ok(requirements)
 }
 
-/// Return whether `value` is a phi with no SSA instruction or phi-input use.
-/// Such a value can only name compiler scratch state retained for complete
-/// frame reconstruction; it cannot affect JavaScript execution.
+/// Return whether `value` is a block-head merge — an ordinary phi or a spliced
+/// call's result — with no SSA instruction or merge-input use. Such a value can
+/// only name compiler scratch state retained for complete frame reconstruction,
+/// or a call result the caller ignores; it cannot affect JavaScript execution.
 pub(crate) fn is_dead_phi(ssa: &SsaFunction, value: ValueId) -> bool {
     if !matches!(
         ssa.values.get(value.0 as usize).map(|data| &data.def),
-        Some(ValueDef::Phi { .. })
+        Some(ValueDef::Phi { .. } | ValueDef::InlineResult { .. })
     ) {
         return false;
     }
@@ -1313,7 +1320,8 @@ pub(crate) fn is_dead_phi(ssa: &SsaFunction, value: ValueId) -> bool {
             || block.phis.iter().copied().any(|phi| {
                 matches!(
                     &ssa.values[phi.0 as usize].def,
-                    ValueDef::Phi { inputs, .. } if inputs.contains(&value)
+                    ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }
+                        if inputs.contains(&value)
                 )
             })
     })
@@ -1332,7 +1340,8 @@ pub(crate) fn has_non_dead_use(ssa: &SsaFunction, value: ValueId) -> bool {
                 !is_dead_phi(ssa, phi)
                     && matches!(
                         &ssa.values[phi.0 as usize].def,
-                        ValueDef::Phi { inputs, .. } if inputs.contains(&value)
+                        ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. }
+                            if inputs.contains(&value)
                     )
             })
     })

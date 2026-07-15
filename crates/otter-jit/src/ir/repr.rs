@@ -625,6 +625,20 @@ fn conversion_kind(from: Representation, to: Representation) -> Option<(Conversi
     }
 }
 
+/// Lossless widening required when a phi input enters the phi's least-upper-
+/// bound representation. Checked narrowing is never valid on a CFG edge.
+pub(crate) fn lossless_phi_conversion(
+    from: Representation,
+    to: Representation,
+) -> Option<ConversionKind> {
+    match (from, to) {
+        (Representation::Int32, Representation::Float64) => Some(ConversionKind::Int32ToFloat64),
+        (Representation::Int32, Representation::Tagged) => Some(ConversionKind::BoxInt32),
+        (Representation::Float64, Representation::Tagged) => Some(ConversionKind::BoxFloat64),
+        _ => None,
+    }
+}
+
 fn verified_conversion_kind(
     from: Representation,
     to: Representation,

@@ -1,4 +1,4 @@
-//! Arm64 emission for the reducible numeric and element-access optimizing subset.
+//! Arm64 emission for the reducible numeric and reentrant-transition optimizing subset.
 //!
 //! # Contents
 //! - Whole-pipeline construction and eligibility validation.
@@ -6,7 +6,8 @@
 //! - Loop-header OSR trampolines materializing allocated state from the
 //!   interpreter register window.
 //! - Cooperative back-edge polling with loop-header bail writeback.
-//! - Precise live-tagged GC safepoints around element load/store transitions.
+//! - Precise live-tagged GC safepoints around element, property, global,
+//!   comparison, and method-call transitions.
 //! - Guarded numeric fast paths for source-lowered coercion scaffolding.
 //! - Tagged-number guards, mixed-representation arithmetic, spills, boxing,
 //!   and bail exits backed by exact deopt frame states.
@@ -37,13 +38,15 @@
 //!   values, unboxes them into their allocated locations, and only then
 //!   branches to the header body. A representation mismatch bails with the
 //!   untouched interpreter window.
-//! - Conditional inputs are optimizer-produced tagged booleans and branch by
-//!   exact comparison with the VM's `true` immediate.
-//! - Every element transition boxes its operands plus tagged SSA values live
+//! - Conditional inputs are tagged values. Proven booleans branch by exact
+//!   comparison with the VM's `true` immediate; all other values run the full
+//!   inline `ToBoolean` reduction before selecting an edge.
+//! - Every reentrant transition boxes its operands plus tagged SSA values live
 //!   across the call into their interpreter-window slots. Its precise frame
-//!   bitmap names only tagged materialized slots; moving-GC reloads restore
-//!   those values and a load result while numeric machine locations remain
-//!   untouched. Store scratch slots are non-roots that the runtime may clobber.
+//!   bitmap names every tagged input and live-across value; moving-GC reloads
+//!   restore live values and load results while numeric machine locations
+//!   remain untouched. Store scratch slots are non-roots that the runtime may
+//!   clobber.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
@@ -74,9 +77,10 @@ use crate::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
         MAX_METHOD_ARGS, THREAD_OFFSET,
-        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
-        pack_method_arg_regs,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_NULL, VALUE_TRUE,
+        VALUE_UNDEFINED, pack_method_arg_regs,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -724,10 +728,11 @@ fn check_eligibility(
                     if instruction.result.is_some() || instruction.inputs.len() != 1 {
                         return Err(Unsupported::OperandShape("optimizing branch shape"));
                     }
-                    let condition = instruction.inputs[0];
-                    if reprs.representation(condition) != Representation::Tagged
-                        || !is_boolean_value(ssa, condition)
-                    {
+                    // A provably-boolean condition compares directly; any other
+                    // tagged value reduces through the total `ToBoolean` sequence
+                    // (numbers/bool/null/undefined inline, heap cells via the leaf
+                    // probe) at emit time.
+                    if reprs.representation(instruction.inputs[0]) != Representation::Tagged {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
                 }
@@ -895,12 +900,10 @@ fn build_element_transition_sites(
         let result = instruction.result.ok_or(Unsupported::OperandShape(
             "optimizing element-transition result",
         ))?;
-        if instruction.op == Op::StoreElement
-            && live_after.contains(&result)
-            && has_non_dead_use(ssa, result)
-        {
+        let is_store_transition = matches!(instruction.op, Op::StoreElement | Op::StoreProperty);
+        if is_store_transition && live_after.contains(&result) && has_non_dead_use(ssa, result) {
             return Err(Unsupported::OperandShape(
-                "optimizing element-store scratch is live after the transition",
+                "optimizing store-transition scratch is live after the transition",
             ));
         }
         let mut tagged_live_across = Vec::new();
@@ -921,26 +924,20 @@ fn build_element_transition_sites(
             .iter()
             .map(|live| live.register)
             .collect::<BTreeSet<_>>();
-        root_registers.insert(instruction.input_registers[0]);
-        if instruction.op == Op::LoadElement
-            && reprs.representation(instruction.inputs[1]) == Representation::Tagged
-        {
-            root_registers.insert(instruction.input_registers[1]);
+        for (&value, &register) in instruction.inputs.iter().zip(&instruction.input_registers) {
+            if reprs.representation(value) == Representation::Tagged {
+                root_registers.insert(register);
+            }
         }
-        if instruction.op == Op::StoreElement
-            && reprs.representation(instruction.inputs[2]) == Representation::Tagged
-        {
-            root_registers.insert(instruction.input_registers[2]);
-        }
-        if instruction.op == Op::StoreElement
+        if is_store_transition
             && root_registers.contains(
                 &instruction
                     .result_register
-                    .expect("eligibility checked element-store scratch"),
+                    .expect("eligibility checked store-transition scratch"),
             )
         {
             return Err(Unsupported::OperandShape(
-                "optimizing element-store scratch aliases a tagged root",
+                "optimizing store-transition scratch aliases a tagged root",
             ));
         }
 
@@ -1080,6 +1077,72 @@ fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
             ..
         }
     )
+}
+
+/// Reduce the tagged `Value` in `x9` to `VALUE_TRUE` / `VALUE_FALSE` in `x9`
+/// per §7.1.2 `ToBoolean`. Int32 and boxed doubles (including `±0`/NaN),
+/// booleans, `null`, and `undefined` decide inline; every heap cell resolves
+/// through the total leaf `ToBoolean` probe, whose only miss is an isolate-less
+/// null heap (never on a live VM) and side-exits at `bail`. Clobbers
+/// `x14`/`x15` and the leaf-call argument registers.
+fn emit_truthiness_reduce(ops: &mut Assembler, bail: DynamicLabel) {
+    let int_case = ops.new_dynamic_label();
+    let double_case = ops.new_dynamic_label();
+    let truthy = ops.new_dynamic_label();
+    let falsy = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; movz x15, NUMBER_TAG_HI16, lsl #48
+        ; and x14, x9, x15
+        ; cmp x14, x15
+        ; b.eq =>int_case                       // all tag bits → int32
+        ; cbnz x14, =>double_case               // some tag bits → boxed double
+        ; cmp x9, VALUE_TRUE as u32
+        ; b.eq =>truthy
+        ; cmp x9, VALUE_FALSE as u32
+        ; b.eq =>falsy
+        ; cmp x9, VALUE_NULL as u32
+        ; b.eq =>falsy
+        ; cmp x9, VALUE_UNDEFINED as u32
+        ; b.eq =>falsy
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        ; mov x1, x9
+        ; movz x2, #0
+    );
+    emit_load_u64(
+        ops,
+        16,
+        otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; and x1, x1, #0xff
+        ; cbnz x1, =>bail
+        ; mov x9, x0                            // boolean Value from the probe
+        ; b =>done
+        ; =>int_case
+        ; cbz w9, =>falsy
+        ; b =>truthy
+        ; =>double_case
+        ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
+        ; sub x14, x9, x14                      // raw f64 bit pattern
+        ; cbz x14, =>falsy                      // +0.0
+        ; movz x15, #0x8000, lsl #48
+        ; cmp x14, x15
+        ; b.eq =>falsy                          // -0.0
+        ; movz x15, CANONICAL_NAN_HI16, lsl #48
+        ; cmp x14, x15
+        ; b.eq =>falsy                          // canonical NaN
+        ; =>truthy
+        ; movz x9, VALUE_TRUE as u32
+        ; b =>done
+        ; =>falsy
+        ; movz x9, VALUE_FALSE as u32
+        ; =>done
+    );
 }
 
 fn check_constant_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), Unsupported> {
@@ -1318,6 +1381,7 @@ fn emit(
                             dst: allocation.location(
                                 instruction.result.expect("eligibility checked local move"),
                             ),
+                            conversion: None,
                         },
                     )?;
                 }
@@ -1946,6 +2010,13 @@ fn emit(
                         allocation.location(instruction.inputs[0]),
                         9,
                     )?;
+                    // A provably-boolean condition compares directly; any other
+                    // tagged value is reduced to `VALUE_TRUE`/`VALUE_FALSE` first.
+                    if !is_boolean_value(ssa, instruction.inputs[0]) {
+                        let bail = ops.new_dynamic_label();
+                        emit_truthiness_reduce(&mut ops, bail);
+                        deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                    }
                     emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
                     let taken_edge = ops.new_dynamic_label();
                     if instruction.op == Op::JumpIfTrue {
@@ -2209,7 +2280,36 @@ fn emit_move(
     allocation: &Allocation,
     movement: Move,
 ) -> Result<(), Unsupported> {
-    match (movement.src, movement.dst) {
+    match movement.conversion {
+        None => emit_raw_move(ops, allocation, movement.src, movement.dst),
+        Some(ConversionKind::BoxInt32) => {
+            emit_load_move_gpr(ops, movement.src, 9)?;
+            emit_box_int32(ops, 9, 10);
+            emit_store_move_gpr(ops, movement.dst, 9)
+        }
+        Some(ConversionKind::Int32ToFloat64) => {
+            emit_load_move_gpr(ops, movement.src, 9)?;
+            dynasm!(ops ; .arch aarch64 ; scvtf d17, w9);
+            emit_store_move_fp(ops, allocation, movement.dst, FP_SCRATCH_2)
+        }
+        Some(ConversionKind::BoxFloat64) => {
+            emit_load_move_fp(ops, allocation, movement.src, FP_SCRATCH_2)?;
+            emit_box_double(ops, FP_SCRATCH_2, 9);
+            emit_store_move_gpr(ops, movement.dst, 9)
+        }
+        Some(ConversionKind::CheckedTaggedToInt32 | ConversionKind::CheckedTaggedToFloat64) => Err(
+            Unsupported::OperandShape("optimizing checked phi conversion"),
+        ),
+    }
+}
+
+fn emit_raw_move(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    src: Location,
+    dst: Location,
+) -> Result<(), Unsupported> {
+    match (src, dst) {
         (Location::Register(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
             let src = gpr_move_register(src)?;
             let dst = gpr_move_register(dst)?;
@@ -2254,11 +2354,101 @@ fn emit_move(
             let dst_offset = fp_spill_offset(allocation, dst)?;
             dynasm!(ops
                 ; .arch aarch64
-                ; ldr D(FP_SCRATCH), [sp, src_offset]
-                ; str D(FP_SCRATCH), [sp, dst_offset]
+                ; ldr D(FP_SCRATCH_2), [sp, src_offset]
+                ; str D(FP_SCRATCH_2), [sp, dst_offset]
             );
         }
         _ => return Err(Unsupported::OperandShape("optimizing cross-class phi move")),
+    }
+    Ok(())
+}
+
+fn emit_load_move_gpr(
+    ops: &mut Assembler,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(RegClass::Gpr, register) => {
+            let physical = gpr_move_register(register)?;
+            dynasm!(ops ; .arch aarch64 ; mov X(scratch), X(physical));
+        }
+        Location::Spill(RegClass::Gpr, slot) => {
+            let offset = spill_offset(slot)?;
+            dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            return Err(Unsupported::OperandShape("optimizing non-GPR phi source"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_move_gpr(
+    ops: &mut Assembler,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(RegClass::Gpr, register) => {
+            let physical = gpr_move_register(register)?;
+            dynasm!(ops ; .arch aarch64 ; mov X(physical), X(scratch));
+        }
+        Location::Spill(RegClass::Gpr, slot) => {
+            let offset = spill_offset(slot)?;
+            dynasm!(ops ; .arch aarch64 ; str X(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
+            return Err(Unsupported::OperandShape(
+                "optimizing non-GPR phi destination",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn emit_load_move_fp(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(RegClass::Fp, register) => {
+            let physical = fp_move_register(register)?;
+            dynasm!(ops ; .arch aarch64 ; fmov D(scratch), D(physical));
+        }
+        Location::Spill(RegClass::Fp, slot) => {
+            let offset = fp_spill_offset(allocation, slot)?;
+            dynasm!(ops ; .arch aarch64 ; ldr D(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
+            return Err(Unsupported::OperandShape("optimizing non-FP phi source"));
+        }
+    }
+    Ok(())
+}
+
+fn emit_store_move_fp(
+    ops: &mut Assembler,
+    allocation: &Allocation,
+    location: Location,
+    scratch: u8,
+) -> Result<(), Unsupported> {
+    match location {
+        Location::Register(RegClass::Fp, register) => {
+            let physical = fp_move_register(register)?;
+            dynasm!(ops ; .arch aarch64 ; fmov D(physical), D(scratch));
+        }
+        Location::Spill(RegClass::Fp, slot) => {
+            let offset = fp_spill_offset(allocation, slot)?;
+            dynasm!(ops ; .arch aarch64 ; str D(scratch), [sp, offset]);
+        }
+        Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
+            return Err(Unsupported::OperandShape(
+                "optimizing non-FP phi destination",
+            ));
+        }
     }
     Ok(())
 }
@@ -3605,6 +3795,37 @@ mod tests {
     }
 
     #[test]
+    fn property_store_roots_tagged_value_dead_after_transition() {
+        let view = view(
+            2,
+            3,
+            vec![
+                (
+                    Op::StoreProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnUndefined, vec![]),
+            ],
+        );
+        let code = compile(&view, 114).expect("property store is optimizing-eligible");
+
+        let record = code.safepoint_record(0).expect("property-store safepoint");
+        assert_eq!(
+            record.tagged_locations,
+            vec![
+                otter_vm::native_abi::TaggedLocation::frame_slot(0),
+                otter_vm::native_abi::TaggedLocation::frame_slot(1),
+            ]
+        );
+        assert_eq!(code.frame_map_bitmap_words(), &[0b11]);
+    }
+
+    #[test]
     fn executes_add() {
         let view = view(
             2,
@@ -4014,6 +4235,36 @@ mod tests {
         let fallthrough = execute(&code, &[box_i32(9), box_i32(4)]);
         assert_eq!(fallthrough.status, STATUS_RETURNED);
         assert_eq!(unbox_i32(fallthrough.value), 22);
+    }
+
+    #[test]
+    fn executes_tagged_phi_with_boxed_int32_edge() {
+        let view = view(
+            2,
+            3,
+            vec![
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(1), Operand::Imm32(2)],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(0)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::Jump, vec![Operand::Imm32(0)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let code = compile(&view, 115).expect("tagged phi is eligible");
+
+        let truthy = execute(&code, &[VALUE_TRUE, box_f64(1.5)]);
+        assert_eq!(truthy.status, STATUS_RETURNED);
+        assert_eq!(truthy.value, box_i32(0));
+
+        let falsy = execute(&code, &[VALUE_FALSE, box_f64(1.5)]);
+        assert_eq!(falsy.status, STATUS_RETURNED);
+        assert_eq!(falsy.value, box_f64(1.5));
     }
 
     #[test]

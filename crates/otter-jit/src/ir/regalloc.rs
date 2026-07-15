@@ -16,8 +16,9 @@
 //!   phi destinations are simultaneous even when individual phis are dead.
 //! - Overlapping closed intervals never share a register within their class.
 //! - GPR and FP values have independent register files and spill namespaces.
-//! - Phi edge moves preserve parallel-copy semantics; each class reserves its
-//!   register-budget count as a move-only scratch never assigned to a value.
+//! - Phi edge moves preserve parallel-copy semantics and perform only lossless
+//!   representation widening. Each class reserves its register-budget count as
+//!   a move-only scratch never assigned to a value.
 //! - Structurally dead phis emit no edge copy. Backends initialize their homes
 //!   to a representation-valid value at block entry for safe deopt writeback.
 //! - Allocation reads immutable SSA, CFG, and liveness data and has no runtime
@@ -33,7 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{
     cfg::{BlockId, ControlFlowGraph},
     liveness::Liveness,
-    repr::{ReprMap, Representation},
+    repr::{ConversionKind, ReprMap, Representation, lossless_phi_conversion},
     ssa::{SsaFunction, ValueDef, ValueId},
 };
 
@@ -139,6 +140,8 @@ pub struct Move {
     pub src: Location,
     /// Location overwritten by this move.
     pub dst: Location,
+    /// Lossless representation widening performed while copying, if any.
+    pub conversion: Option<ConversionKind>,
 }
 
 /// Sequentialized phi copies on one normal CFG edge.
@@ -331,16 +334,16 @@ pub enum RegallocError {
         /// Stored spill-slot count.
         actual: u32,
     },
-    /// A phi input belongs to a different register class than its result.
-    PhiClassMismatch {
-        /// Phi whose parallel copy crosses register classes.
+    /// A phi input cannot be widened losslessly to its result representation.
+    PhiConversionUnsupported {
+        /// Phi requiring an unsupported edge conversion.
         phi: ValueId,
         /// Input value on the affected predecessor edge.
         input: ValueId,
-        /// Register class required by the phi result.
-        expected: RegClass,
-        /// Register class required by the input.
-        actual: RegClass,
+        /// Representation produced by the input.
+        from: Representation,
+        /// Representation required by the phi.
+        to: Representation,
     },
     /// A stored edge move crosses register classes.
     MoveClassMismatch {
@@ -348,6 +351,19 @@ pub enum RegallocError {
         predecessor: BlockId,
         /// Successor block containing the phis.
         block: BlockId,
+        /// Source location's class.
+        source: RegClass,
+        /// Destination location's class.
+        destination: RegClass,
+    },
+    /// A stored edge move has an invalid representation-conversion shape.
+    MoveConversionMismatch {
+        /// Edge containing the invalid move.
+        predecessor: BlockId,
+        /// Successor block containing the phis.
+        block: BlockId,
+        /// Conversion attached to the move.
+        conversion: ConversionKind,
         /// Source location's class.
         source: RegClass,
         /// Destination location's class.
@@ -687,14 +703,7 @@ impl Allocation {
                 edge.block,
             )?;
             for movement in &edge.moves {
-                if movement.src.class() != movement.dst.class() {
-                    return Err(RegallocError::MoveClassMismatch {
-                        predecessor: edge.predecessor,
-                        block: edge.block,
-                        source: movement.src.class(),
-                        destination: movement.dst.class(),
-                    });
-                }
+                validate_move_shape(*movement, edge.predecessor, edge.block)?;
                 for location in [movement.src, movement.dst] {
                     if !self.valid_move_location(location) {
                         return Err(RegallocError::InvalidMoveLocation {
@@ -740,7 +749,7 @@ impl Allocation {
                 }
             }
 
-            let expected = sequentialize_class_moves(
+            let expected = sequentialize_parallel_moves(
                 parallel,
                 self.register_budget,
                 edge.predecessor,
@@ -1177,7 +1186,8 @@ fn build_edge_moves(
         .into_iter()
         .map(|(predecessor, block)| {
             let parallel = parallel_phi_moves(ssa, cfg, reprs, locations, predecessor, block)?;
-            let moves = sequentialize_class_moves(parallel, register_budget, predecessor, block)?;
+            let moves =
+                sequentialize_parallel_moves(parallel, register_budget, predecessor, block)?;
             Ok(EdgeMoves {
                 predecessor,
                 block,
@@ -1210,7 +1220,7 @@ fn parallel_phi_moves(
         phi_move_requirements(ssa, cfg, reprs, locations, predecessor, block)?
             .into_iter()
             .map(|(_, movement)| movement)
-            .filter(|movement| movement.src != movement.dst)
+            .filter(|movement| movement.src != movement.dst || movement.conversion.is_some())
             .collect(),
     )
 }
@@ -1246,21 +1256,29 @@ fn phi_move_requirements(
         }
         let input = inputs[predecessor_index];
         let input_index = value_index(input, ssa.values.len())?;
-        let phi_class = RegClass::from_representation(reprs.representation(phi));
-        let input_class = RegClass::from_representation(reprs.representation(input));
-        if input_class != phi_class {
-            return Err(RegallocError::PhiClassMismatch {
-                phi,
-                input,
-                expected: phi_class,
-                actual: input_class,
-            });
-        }
-        for (value, location) in [(input, locations[input_index]), (phi, locations[phi_index])] {
-            if location.class() != phi_class {
+        let phi_repr = reprs.representation(phi);
+        let input_repr = reprs.representation(input);
+        let conversion = if input_repr == phi_repr {
+            None
+        } else {
+            Some(lossless_phi_conversion(input_repr, phi_repr).ok_or(
+                RegallocError::PhiConversionUnsupported {
+                    phi,
+                    input,
+                    from: input_repr,
+                    to: phi_repr,
+                },
+            )?)
+        };
+        for (value, representation, location) in [
+            (input, input_repr, locations[input_index]),
+            (phi, phi_repr, locations[phi_index]),
+        ] {
+            let expected = RegClass::from_representation(representation);
+            if location.class() != expected {
                 return Err(RegallocError::LocationClassMismatch {
                     value,
-                    expected: phi_class,
+                    expected,
                     actual: location.class(),
                 });
             }
@@ -1270,6 +1288,7 @@ fn phi_move_requirements(
             Move {
                 src: locations[input_index],
                 dst: locations[phi_index],
+                conversion,
             },
         ));
     }
@@ -1319,54 +1338,24 @@ pub(crate) fn has_non_dead_use(ssa: &SsaFunction, value: ValueId) -> bool {
     })
 }
 
-fn sequentialize_class_moves(
+fn sequentialize_parallel_moves(
     parallel: Vec<Move>,
     register_budget: RegisterBudget,
     predecessor: BlockId,
     block: BlockId,
 ) -> Result<Vec<Move>, RegallocError> {
     for movement in &parallel {
-        if movement.src.class() != movement.dst.class() {
-            return Err(RegallocError::MoveClassMismatch {
-                predecessor,
-                block,
-                source: movement.src.class(),
-                destination: movement.dst.class(),
-            });
-        }
+        validate_move_shape(*movement, predecessor, block)?;
     }
-
-    let mut result = Vec::new();
-    for class in RegClass::ALL {
-        let class_moves = parallel
-            .iter()
-            .copied()
-            .filter(|movement| movement.src.class() == class)
-            .collect();
-        result.extend(sequentialize_parallel_moves(
-            class_moves,
-            Location::Register(class, register_budget.count(class)),
-            predecessor,
-            block,
-        )?);
-    }
-    Ok(result)
-}
-
-fn sequentialize_parallel_moves(
-    parallel: Vec<Move>,
-    scratch: Location,
-    predecessor: BlockId,
-    block: BlockId,
-) -> Result<Vec<Move>, RegallocError> {
     let mut destinations = BTreeMap::new();
     let mut pending = Vec::new();
     for movement in parallel {
-        if movement.src == movement.dst {
+        if movement.src == movement.dst && movement.conversion.is_none() {
             continue;
         }
-        if let Some(previous) = destinations.insert(movement.dst, movement.src) {
-            if previous != movement.src {
+        let source = (movement.src, movement.conversion);
+        if let Some(previous) = destinations.insert(movement.dst, source) {
+            if previous != source {
                 return Err(RegallocError::ParallelDestinationConflict {
                     predecessor,
                     block,
@@ -1389,9 +1378,11 @@ fn sequentialize_parallel_moves(
         }
 
         let saved = pending[0].dst;
+        let scratch = Location::Register(saved.class(), register_budget.count(saved.class()));
         result.push(Move {
             src: saved,
             dst: scratch,
+            conversion: None,
         });
         for movement in &mut pending {
             if movement.src == saved {
@@ -1400,6 +1391,53 @@ fn sequentialize_parallel_moves(
         }
     }
     Ok(result)
+}
+
+fn validate_move_shape(
+    movement: Move,
+    predecessor: BlockId,
+    block: BlockId,
+) -> Result<(), RegallocError> {
+    let source = movement.src.class();
+    let destination = movement.dst.class();
+    let valid = match movement.conversion {
+        None => source == destination,
+        Some(ConversionKind::Int32ToFloat64) => {
+            source == RegClass::Gpr && destination == RegClass::Fp
+        }
+        Some(ConversionKind::BoxInt32) => source == RegClass::Gpr && destination == RegClass::Gpr,
+        Some(ConversionKind::BoxFloat64) => source == RegClass::Fp && destination == RegClass::Gpr,
+        Some(
+            conversion @ (ConversionKind::CheckedTaggedToInt32
+            | ConversionKind::CheckedTaggedToFloat64),
+        ) => {
+            return Err(RegallocError::MoveConversionMismatch {
+                predecessor,
+                block,
+                conversion,
+                source,
+                destination,
+            });
+        }
+    };
+    if valid {
+        return Ok(());
+    }
+    match movement.conversion {
+        None => Err(RegallocError::MoveClassMismatch {
+            predecessor,
+            block,
+            source,
+            destination,
+        }),
+        Some(conversion) => Err(RegallocError::MoveConversionMismatch {
+            predecessor,
+            block,
+            conversion,
+            source,
+            destination,
+        }),
+    }
 }
 
 fn normal_predecessors(cfg: &ControlFlowGraph, block: BlockId) -> Vec<BlockId> {
@@ -1939,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_float64_phi_with_gpr_input() {
+    fn widens_int32_phi_input_to_float64_on_edge() {
         let (cfg, ssa, liveness, reprs) = analyses_with_feedback(
             1,
             3,
@@ -1968,15 +2006,57 @@ mod tests {
         let phi = phi_for(&ssa, join, 1);
         assert_eq!(reprs.representation(phi), Representation::Float64);
 
-        assert!(matches!(
-            Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(3, 3)),
-            Err(RegallocError::PhiClassMismatch {
-                phi: actual_phi,
-                expected: RegClass::Fp,
-                actual: RegClass::Gpr,
-                ..
-            }) if actual_phi == phi
-        ));
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(3, 3))
+            .expect("allocate widening phi");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify widening phi");
+        assert!(
+            allocation
+                .edge_moves
+                .iter()
+                .flat_map(|edge| &edge.moves)
+                .any(|movement| movement.dst == allocation.location(phi)
+                    && movement.conversion == Some(ConversionKind::Int32ToFloat64))
+        );
+    }
+
+    #[test]
+    fn boxes_int32_phi_input_when_other_edge_is_tagged() {
+        let (cfg, ssa, liveness, reprs) = analyses(
+            2,
+            3,
+            vec![
+                (
+                    Op::StoreLocal,
+                    vec![Operand::Register(1), Operand::Imm32(2)],
+                ),
+                (
+                    Op::JumpIfFalse,
+                    vec![Operand::Imm32(2), Operand::Register(0)],
+                ),
+                (Op::LoadInt32, vec![Operand::Register(2), Operand::Imm32(0)]),
+                (Op::Jump, vec![Operand::Imm32(0)]),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+        );
+        let join = block_at(&cfg, 4);
+        let phi = phi_for(&ssa, join, 2);
+        assert_eq!(reprs.representation(phi), Representation::Tagged);
+
+        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, budget(3, 3))
+            .expect("allocate tagged phi");
+        allocation
+            .verify(&ssa, &cfg, &liveness, &reprs)
+            .expect("verify tagged phi");
+        assert!(
+            allocation
+                .edge_moves
+                .iter()
+                .flat_map(|edge| &edge.moves)
+                .any(|movement| movement.dst == allocation.location(phi)
+                    && movement.conversion == Some(ConversionKind::BoxInt32))
+        );
     }
 
     #[test]

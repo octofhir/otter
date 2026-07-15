@@ -74,10 +74,9 @@ use crate::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
         MAX_METHOD_ARGS, THREAD_OFFSET,
-        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_NULL, VALUE_TRUE,
-        VALUE_UNDEFINED, pack_method_arg_regs,
-        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-        VM_THREAD_INTERRUPT_CELL_OFFSET,
+        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_TRUE,
+        pack_method_arg_regs,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
@@ -725,11 +724,10 @@ fn check_eligibility(
                     if instruction.result.is_some() || instruction.inputs.len() != 1 {
                         return Err(Unsupported::OperandShape("optimizing branch shape"));
                     }
-                    // A provably-boolean condition compares directly; any other
-                    // tagged value reduces through the total `ToBoolean` sequence
-                    // (numbers/bool/null/undefined inline, heap cells via the leaf
-                    // probe) at emit time.
-                    if reprs.representation(instruction.inputs[0]) != Representation::Tagged {
+                    let condition = instruction.inputs[0];
+                    if reprs.representation(condition) != Representation::Tagged
+                        || !is_boolean_value(ssa, condition)
+                    {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
                 }
@@ -1082,72 +1080,6 @@ fn is_boolean_value(ssa: &SsaFunction, value: ValueId) -> bool {
             ..
         }
     )
-}
-
-/// Reduce the tagged `Value` in `x9` to `VALUE_TRUE` / `VALUE_FALSE` in `x9`
-/// per §7.1.2 `ToBoolean`. Int32 and boxed doubles (including `±0`/NaN),
-/// booleans, `null`, and `undefined` decide inline; every heap cell resolves
-/// through the total leaf `ToBoolean` probe, whose only miss is an isolate-less
-/// null heap (never on a live VM) and side-exits at `bail`. Clobbers
-/// `x14`/`x15` and the leaf-call argument registers.
-fn emit_truthiness_reduce(ops: &mut Assembler, bail: DynamicLabel) {
-    let int_case = ops.new_dynamic_label();
-    let double_case = ops.new_dynamic_label();
-    let truthy = ops.new_dynamic_label();
-    let falsy = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; movz x15, NUMBER_TAG_HI16, lsl #48
-        ; and x14, x9, x15
-        ; cmp x14, x15
-        ; b.eq =>int_case                       // all tag bits → int32
-        ; cbnz x14, =>double_case               // some tag bits → boxed double
-        ; cmp x9, VALUE_TRUE as u32
-        ; b.eq =>truthy
-        ; cmp x9, VALUE_FALSE as u32
-        ; b.eq =>falsy
-        ; cmp x9, VALUE_NULL as u32
-        ; b.eq =>falsy
-        ; cmp x9, VALUE_UNDEFINED as u32
-        ; b.eq =>falsy
-        ; ldr x0, [x20, THREAD_OFFSET]
-        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-        ; mov x1, x9
-        ; movz x2, #0
-    );
-    emit_load_u64(
-        ops,
-        16,
-        otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; and x1, x1, #0xff
-        ; cbnz x1, =>bail
-        ; mov x9, x0                            // boolean Value from the probe
-        ; b =>done
-        ; =>int_case
-        ; cbz w9, =>falsy
-        ; b =>truthy
-        ; =>double_case
-        ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
-        ; sub x14, x9, x14                      // raw f64 bit pattern
-        ; cbz x14, =>falsy                      // +0.0
-        ; movz x15, #0x8000, lsl #48
-        ; cmp x14, x15
-        ; b.eq =>falsy                          // -0.0
-        ; movz x15, CANONICAL_NAN_HI16, lsl #48
-        ; cmp x14, x15
-        ; b.eq =>falsy                          // canonical NaN
-        ; =>truthy
-        ; movz x9, VALUE_TRUE as u32
-        ; b =>done
-        ; =>falsy
-        ; movz x9, VALUE_FALSE as u32
-        ; =>done
-    );
 }
 
 fn check_constant_result(instruction: &SsaInstr, reprs: &ReprMap) -> Result<(), Unsupported> {
@@ -2014,13 +1946,6 @@ fn emit(
                         allocation.location(instruction.inputs[0]),
                         9,
                     )?;
-                    // A provably-boolean condition compares directly; any other
-                    // tagged value is reduced to `VALUE_TRUE`/`VALUE_FALSE` first.
-                    if !is_boolean_value(ssa, instruction.inputs[0]) {
-                        let bail = ops.new_dynamic_label();
-                        emit_truthiness_reduce(&mut ops, bail);
-                        deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
-                    }
                     emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
                     let taken_edge = ops.new_dynamic_label();
                     if instruction.op == Op::JumpIfTrue {

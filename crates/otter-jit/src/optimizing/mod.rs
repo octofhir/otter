@@ -1,4 +1,4 @@
-//! Feedback-guided optimizing tier for reducible numeric arithmetic functions.
+//! Feedback-guided optimizing tier for reducible numeric and element-load functions.
 //!
 //! This module compiles multi-block int32 and float64 arithmetic functions,
 //! including reducible loops entered only at function entry. It runs
@@ -8,16 +8,17 @@
 //! carry sequentialized phi moves, while every back-edge polls the VM thread's
 //! interrupt and fuel cells before returning to its dominating header.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
-//! reconstructs the interpreter register window in place before every bail.
+//! reconstructs the interpreter register window in place before every bail or
+//! allocating element-load transition.
 //!
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
 //!
 //! # Invariants
-//! - Current entries emit no allocating/reentrant operation or safepoint, but
-//!   use the same runtime-capable `JitCtx` and published frame as the template
-//!   tier so later operations can cross that boundary safely.
+//! - Every `LoadElement` materializes the complete interpreter window, publishes
+//!   a code-object-owned safepoint, calls the shared runtime transition, and
+//!   reloads every tagged machine location before optimized execution resumes.
 //! - Every backwards bytecode edge targets a header that dominates its predecessor;
 //!   irreducible loops and exception edges are rejected.
 //! - The sole ABI argument is a dynamically valid `JitCtx`; parameters and
@@ -39,10 +40,16 @@
 use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
     deopt::DeoptTable,
-    native_abi::{BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION},
+    native_abi::{
+        BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, SafepointRecord,
+        VM_BUILD_VERSION,
+    },
 };
 
-use crate::{CompiledCode, Unsupported, entry::enter_compiled};
+use crate::{
+    CompiledCode, Unsupported,
+    entry::{TransitionTable, enter_compiled},
+};
 
 #[cfg(target_arch = "aarch64")]
 mod arm64;
@@ -70,6 +77,7 @@ pub struct OptimizedMetadata {
 pub struct OptimizedCode {
     code: CompiledCode,
     deopt_table: DeoptTable,
+    safepoint_records: Box<[SafepointRecord]>,
     metadata: OptimizedMetadata,
     code_metadata: CodeObjectMetadata,
 }
@@ -78,16 +86,17 @@ impl OptimizedCode {
     pub(super) fn new(
         code: CompiledCode,
         deopt_table: DeoptTable,
+        safepoint_records: Box<[SafepointRecord]>,
         metadata: OptimizedMetadata,
     ) -> Self {
-        const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0004;
+        const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0005;
         let code_metadata = CodeObjectMetadata {
             id: metadata.code_object_id,
             code_block_id: metadata.function_id,
             entry_offset: 0,
             code_size: code.len() as u32,
-            safepoint_count: 0,
-            frame_map_count: 0,
+            safepoint_count: safepoint_records.len() as u32,
+            frame_map_count: safepoint_records.len() as u32,
             spill_map_count: 0,
             dependency_count: 0,
             reserved: 0,
@@ -100,6 +109,7 @@ impl OptimizedCode {
         Self {
             code,
             deopt_table,
+            safepoint_records,
             metadata,
             code_metadata,
         }
@@ -129,6 +139,7 @@ impl std::fmt::Debug for OptimizedCode {
         f.debug_struct("OptimizedCode")
             .field("code_len", &self.code.len())
             .field("deopt_points", &self.deopt_table.len())
+            .field("safepoints", &self.safepoint_records.len())
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -141,6 +152,17 @@ impl JitFunctionCode for OptimizedCode {
 
     fn code_len(&self) -> usize {
         self.code.len()
+    }
+
+    fn safepoint_count(&self) -> u32 {
+        self.safepoint_records.len() as u32
+    }
+
+    fn safepoint_record(&self, safepoint_id: u32) -> Option<&SafepointRecord> {
+        self.safepoint_records
+            .binary_search_by_key(&safepoint_id, |record| record.id)
+            .ok()
+            .map(|index| &self.safepoint_records[index])
     }
 
     fn run_entry(&self, _activation: otter_vm::VmRuntimeActivation) -> JitExecOutcome {
@@ -162,7 +184,7 @@ impl JitFunctionCode for OptimizedCode {
                 self.metadata.code_object_id,
                 self.metadata.function_id,
                 self.metadata.register_count,
-                false,
+                !self.safepoint_records.is_empty(),
             )
         })
     }
@@ -175,7 +197,17 @@ pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
 ) -> Result<OptimizedCode, Unsupported> {
-    arm64::compile(view, code_object_id)
+    let transitions = TransitionTable::resolve();
+    arm64::compile_with_transitions(view, code_object_id, &transitions)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn compile_optimized_with_transitions(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+) -> Result<OptimizedCode, Unsupported> {
+    arm64::compile_with_transitions(view, code_object_id, transitions)
 }
 
 /// Non-arm64 stub: the first optimizing backend is arm64-only.
@@ -188,6 +220,16 @@ pub fn compile_optimized(
     Err(Unsupported::OperandShape(
         "optimizing compiler is arm64-only",
     ))
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) fn compile_optimized_with_transitions(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+) -> Result<OptimizedCode, Unsupported> {
+    let _ = transitions;
+    compile_optimized(view, code_object_id)
 }
 
 #[cfg(test)]

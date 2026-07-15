@@ -82,6 +82,8 @@ pub enum ConversionKind {
 /// One conversion or guard required by an instruction operand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conversion {
+    /// Frame owning the use; [`Self::at_pc`] is canonical within it.
+    pub inline: InlineId,
     /// Canonical instruction PC owning the use.
     pub at_pc: u32,
     /// Index in the instruction's SSA input list.
@@ -200,7 +202,11 @@ impl ReprMap {
             .values
             .iter()
             .map(|value| match value.def {
+                // Both block-head merges start at the lattice bottom and widen
+                // to meet their inputs: an ordinary phi, and a spliced call's
+                // result, which merges what the callee returned.
                 ValueDef::Phi { .. }
+                | ValueDef::InlineResult { .. }
                 | ValueDef::Op {
                     op: Op::LoadLocal | Op::StoreLocal,
                     ..
@@ -213,7 +219,7 @@ impl ReprMap {
             let mut changed = false;
             for value in &ssa.values {
                 let widened = match &value.def {
-                    ValueDef::Phi { inputs, .. } => {
+                    ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. } => {
                         inputs.iter().fold(Representation::Int32, |acc, input| {
                             meet(acc, reprs[input.0 as usize])
                         })
@@ -251,6 +257,7 @@ impl ReprMap {
                     let from = reprs[value.0 as usize];
                     if let Some((kind, may_deopt)) = conversion_kind(from, required) {
                         conversions.push(Conversion {
+                            inline: instruction.inline,
                             at_pc: instruction.pc,
                             operand_index,
                             value,
@@ -263,7 +270,10 @@ impl ReprMap {
                 }
             }
         }
-        conversions.sort_by_key(|conversion| (conversion.at_pc, conversion.operand_index));
+        // A PC is canonical only within its frame, so a use is named by both.
+        conversions.sort_by_key(|conversion| {
+            (conversion.inline, conversion.at_pc, conversion.operand_index)
+        });
 
         Self {
             reprs: reprs.into_boxed_slice(),
@@ -294,7 +304,7 @@ impl ReprMap {
 
         for value in &ssa.values {
             match &value.def {
-                ValueDef::Phi { inputs, .. } => {
+                ValueDef::Phi { inputs, .. } | ValueDef::InlineResult { inputs, .. } => {
                     let expected = inputs.iter().fold(Representation::Int32, |acc, input| {
                         meet(acc, self.representation(*input))
                     });
@@ -334,14 +344,17 @@ impl ReprMap {
             }
         }
 
-        let mut stored = BTreeMap::<(u32, usize), Vec<Conversion>>::new();
+        // Keyed by frame as well as PC: a PC is canonical only within its own
+        // frame, so a caller and a spliced callee both converting at their PC 1
+        // are two distinct uses, not a duplicate.
+        let mut stored = BTreeMap::<(InlineId, u32, usize), Vec<Conversion>>::new();
         for &conversion in &self.conversions {
             stored
                 .entry(conversion_key(&conversion))
                 .or_default()
                 .push(conversion);
         }
-        if let Some((&(at_pc, operand_index), _)) =
+        if let Some((&(_, at_pc, operand_index), _)) =
             stored.iter().find(|(_, conversions)| conversions.len() > 1)
         {
             return Err(ReprError::DuplicateConversion {
@@ -360,7 +373,7 @@ impl ReprMap {
                     verified_input_representation(instruction.op, feedback_at(tree, instruction.inline, instruction.pc))
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
-                    let key = (instruction.pc, operand_index);
+                    let key = (instruction.inline, instruction.pc, operand_index);
                     let from = self.representation(value);
                     let matches = stored.remove(&key).unwrap_or_default();
                     if from == required {
@@ -381,6 +394,7 @@ impl ReprMap {
                         });
                     };
                     let expected = Conversion {
+                        inline: instruction.inline,
                         at_pc: instruction.pc,
                         operand_index,
                         value,
@@ -415,7 +429,7 @@ impl ReprMap {
                 }
             }
         }
-        if let Some((&(at_pc, operand_index), _)) = stored.first_key_value() {
+        if let Some((&(_, at_pc, operand_index), _)) = stored.first_key_value() {
             return Err(ReprError::UnexpectedConversion {
                 at_pc,
                 operand_index,
@@ -685,8 +699,8 @@ fn verified_conversion_kind(
     }
 }
 
-fn conversion_key(conversion: &Conversion) -> (u32, usize) {
-    (conversion.at_pc, conversion.operand_index)
+fn conversion_key(conversion: &Conversion) -> (InlineId, u32, usize) {
+    (conversion.inline, conversion.at_pc, conversion.operand_index)
 }
 
 #[cfg(test)]
@@ -748,6 +762,68 @@ mod tests {
                 _ => None,
             })
             .expect("register has a phi")
+    }
+
+    #[test]
+    fn a_spliced_call_result_widens_to_meet_what_the_callee_returns() {
+        use crate::ir::inline::InlineTree;
+        use otter_vm::jit::JitTestInstruction;
+
+        // Caller: `r0 = r1(r2); return r0`. Callee returns its int32 parameter.
+        let mut view = JitCompileSnapshot::without_feedback(
+            7,
+            1,
+            8,
+            vec![
+                JitTestInstruction::new(
+                    Op::Call,
+                    0,
+                    0,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(0)]),
+            ],
+        );
+        let callee = JitCompileSnapshot::without_feedback(
+            9,
+            1,
+            4,
+            vec![
+                JitTestInstruction::new(Op::LoadInt32, 0, 0, vec![Operand::Register(1), Operand::Imm32(7)]),
+                JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(1)]),
+            ],
+        );
+        let call_byte_pc = view.instructions[0].byte_pc;
+        view.inline_callees.insert(
+            call_byte_pc,
+            otter_vm::JitInlineCallee {
+                code_block: std::sync::Arc::clone(&callee.code_block),
+                function_id: 9,
+                param_count: 1,
+                register_count: callee.code_block.register_count,
+                instructions: callee.instructions,
+            },
+        );
+        let tree = InlineTree::build(&view);
+        assert_eq!(tree.frames.len(), 2, "the fixture must splice");
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
+        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("a spliced SSA builds");
+        let reprs = ReprMap::compute(&tree, &ssa);
+        reprs.verify(&tree, &ssa).expect("representations verify");
+
+        // The merge is a lattice merge like a phi, not a Tagged default that
+        // missed the fixpoint: it meets the single int32 the callee returns.
+        let merge = ssa
+            .values
+            .iter()
+            .find(|value| matches!(value.def, ValueDef::InlineResult { .. }))
+            .expect("the continuation merges the call result");
+        assert_eq!(reprs.representation(merge.id), Representation::Int32);
     }
 
     #[test]

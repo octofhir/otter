@@ -65,10 +65,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
-use otter_vm::JitCompileSnapshot;
+use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
+    STUB_JIT_DEOPT_REIFY_FRAME,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
     STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
@@ -179,6 +180,9 @@ struct EmissionPlan<'a> {
     /// Abstract states, so an emitted exit can be named by its dense id rather
     /// than by a PC, which a body may guard more than once.
     frame_states: &'a FrameStateTable,
+    /// This unit's frames; a spliced call guards its callee against the body
+    /// the tree chose, and chain exits resolve per-frame logical PCs here.
+    tree: &'a InlineTree,
     load_element_entry: u64,
     store_element_entry: u64,
     load_property_entry: u64,
@@ -187,6 +191,8 @@ struct EmissionPlan<'a> {
     loose_eq_entry: u64,
     call_method_entry: u64,
     construct_entry: u64,
+    /// Rebuilds a spliced callee's interpreter frame at a deopt exit.
+    reify_frame_entry: u64,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -208,10 +214,9 @@ pub(super) fn compile_with_transitions(
     code_object_id: u64,
     transitions: &TransitionTable,
 ) -> Result<OptimizedCode, Unsupported> {
-    // The unit is the root function alone until the backend can emit and
-    // deoptimize a spliced frame; the tree is built so the pipeline is the same
-    // shape either way.
-    let tree = InlineTree::trivial(view);
+    // The unit is the root function plus every callee body the inline tree
+    // splices into it, from the VM-baked monomorphic candidates.
+    let tree = InlineTree::build(view);
     let cfg = ControlFlowGraph::build_inlined(&tree)
         .map_err(|_| Unsupported::OperandShape("optimizing CFG construction"))?;
     cfg.verify()
@@ -277,6 +282,7 @@ pub(super) fn compile_with_transitions(
             eligibility: &eligibility,
             deopt_table: deopt.table(),
             frame_states: &frame_states,
+            tree: &tree,
             load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
             store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
             load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
@@ -285,6 +291,7 @@ pub(super) fn compile_with_transitions(
             loose_eq_entry: transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
             call_method_entry: transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
             construct_entry: transitions.variadic_entry(STUB_JIT_CONSTRUCT),
+            reify_frame_entry: transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -370,6 +377,28 @@ fn legalize_deopt_locations(
     Ok(legalized)
 }
 
+/// Canonical instruction index of `byte_pc` within `function_id`'s body.
+fn logical_pc(tree: &InlineTree, function_id: u32, byte_pc: u32) -> Result<u32, Unsupported> {
+    let frame = tree
+        .frames
+        .iter()
+        .find(|frame| frame.function_id == function_id)
+        .ok_or(Unsupported::OperandShape("optimizing chain frame body"))?;
+    frame
+        .instructions
+        .iter()
+        .position(|instruction| instruction.byte_pc == byte_pc)
+        .map(|position| position as u32)
+        .ok_or(Unsupported::OperandShape("optimizing chain frame byte PC"))
+}
+
+/// `true` when this instruction is the call a spliced frame replaces.
+fn is_spliced_call(cfg: &ControlFlowGraph, block: BlockId, instruction: &SsaInstr) -> bool {
+    let block = &cfg.blocks[block.0 as usize];
+    matches!(block.terminator, Terminator::InlineCall { .. })
+        && block.instr_pcs.last() == Some(&instruction.pc)
+}
+
 fn check_eligibility(
     view: &JitCompileSnapshot,
     cfg: &ControlFlowGraph,
@@ -425,6 +454,11 @@ fn check_eligibility(
             Terminator::FallThrough | Terminator::Jump if block.normal_succs.len() == 1 => {}
             Terminator::Branch { .. } if !block.normal_succs.is_empty() => {}
             Terminator::Return if block.normal_succs.is_empty() => {}
+            // A spliced call reaches its callee's entry; the callee's returns
+            // reach the call's continuation. The graph already verified both as
+            // single-successor frame-crossing edges.
+            Terminator::InlineCall { .. } | Terminator::InlineReturn { .. }
+                if block.normal_succs.len() == 1 => {}
             _ => {
                 return Err(Unsupported::OperandShape(
                     "optimizing subset has an unsupported terminator",
@@ -810,6 +844,45 @@ fn check_eligibility(
                         &mut allowed_conversions,
                     )?;
                 }
+                // A spliced call is not lowered as a call: control enters the
+                // callee's body. Its operands stay inputs so the emitter can
+                // guard the callee's identity, and the continuation's merge —
+                // not the call — defines its result.
+                Op::Call if is_spliced_call(cfg, block, instruction) => {
+                    if instruction.result.is_some()
+                        || instruction.result_register.is_some()
+                        || instruction.inputs.is_empty()
+                        || instruction.inputs.len() != instruction.input_registers.len()
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                }
+                // A spliced return hands its value to the continuation's merge
+                // through the edge at the merge's representation, so it needs
+                // no boxing of its own and never leaves the unit.
+                Op::Return | Op::ReturnValue
+                    if matches!(
+                        cfg.blocks[block.0 as usize].terminator,
+                        Terminator::InlineReturn { .. }
+                    ) =>
+                {
+                    if instruction.result.is_some() || instruction.inputs.len() != 1 {
+                        return Err(Unsupported::OperandShape("optimizing return shape"));
+                    }
+                }
+                Op::ReturnUndefined
+                    if matches!(
+                        cfg.blocks[block.0 as usize].terminator,
+                        Terminator::InlineReturn { .. }
+                    ) =>
+                {
+                    if instruction.result.is_some() || !instruction.inputs.is_empty() {
+                        return Err(Unsupported::OperandShape(
+                            "optimizing return-undefined shape",
+                        ));
+                    }
+                }
                 Op::Jump => {
                     if instruction.result.is_some() || !instruction.inputs.is_empty() {
                         return Err(Unsupported::OperandShape("optimizing jump shape"));
@@ -927,9 +1000,17 @@ fn build_osr_entry_sites(
     frame_states: &FrameStateTable,
 ) -> Result<BTreeMap<BlockId, OsrEntrySite>, Unsupported> {
     let mut sites = BTreeMap::new();
-    for block in cfg.blocks.iter().filter(|block| block.is_loop_header) {
+    // Only the root frame's headers are OSR targets: the interpreter requests
+    // OSR by the root function's PC, and a PC inside a spliced callee is not in
+    // that namespace. A hot loop inside a spliced body runs compiled from the
+    // unit's entry instead.
+    for block in cfg
+        .blocks
+        .iter()
+        .filter(|block| block.is_loop_header && block.inline == InlineId::ROOT)
+    {
         let frame_state = frame_states
-            .at(block.start_pc)
+            .at(InlineId::ROOT, block.start_pc)
             .ok_or(Unsupported::OperandShape(
                 "optimizing OSR header frame state",
             ))?;
@@ -989,9 +1070,13 @@ fn build_element_transition_sites(
             .ok_or(Unsupported::OperandShape(
                 "optimizing element-transition instruction boundary",
             ))?;
-        let frame_state = frame_states.at(pc).ok_or(Unsupported::OperandShape(
-            "optimizing element-transition abstract frame state",
-        ))?;
+        // Eligibility confines reentrant transitions to the root frame — a
+        // spliced callee has no interpreter window for the stub to address.
+        let frame_state = frame_states
+            .at(InlineId::ROOT, pc)
+            .ok_or(Unsupported::OperandShape(
+                "optimizing element-transition abstract frame state",
+            ))?;
         let live_after = liveness
             .live_after_instruction(ssa, block, instruction_index)
             .ok_or(Unsupported::OperandShape(
@@ -1337,6 +1422,7 @@ fn emit(
         eligibility,
         deopt_table,
         frame_states,
+        tree,
         load_element_entry,
         store_element_entry,
         load_property_entry,
@@ -1345,6 +1431,7 @@ fn emit(
         loose_eq_entry,
         call_method_entry,
         construct_entry,
+        reify_frame_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -2338,6 +2425,59 @@ fn emit(
                         taken,
                     )?;
                 }
+                // A spliced call: guard that the callee is still the body that
+                // was spliced, then fall into it. A different callee deopts and
+                // the interpreter re-runs the call generically.
+                Op::Call if is_spliced_call(cfg, block_id, instruction) => {
+                    let Terminator::InlineCall { callee_entry, .. } =
+                        cfg.blocks[block_id.0 as usize].terminator
+                    else {
+                        unreachable!("a spliced call block ends in a splice");
+                    };
+                    let callee =
+                        &tree.frames[cfg.blocks[callee_entry.0 as usize].inline.0 as usize];
+                    let deopt = ops.new_dynamic_label();
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    emit_load_tagged_location(
+                        &mut ops,
+                        allocation.location(instruction.inputs[0]),
+                        9,
+                    )?;
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; movz x11, NUMBER_TAG_HI16, lsl #48
+                        ; orr x11, x11, #0x2       // NOT_CELL_MASK
+                        ; tst x9, x11
+                        ; b.ne =>deopt
+                        ; mov w12, w9              // low-32 Gc offset
+                    );
+                    emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; add x13, x13, x12        // x13 = GcHeader ptr
+                        ; ldrb w14, [x13]
+                        ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG as u32
+                        ; b.ne =>deopt
+                        ; ldr w14, [x13, view.closure_fid_byte]
+                    );
+                    emit_load_u32(&mut ops, 15, callee.function_id);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; cmp w14, w15
+                        ; b.ne =>deopt
+                    );
+                }
+                // A spliced return hands its value to the continuation's merge
+                // through the edge; the block's terminator emits that edge.
+                Op::Return | Op::ReturnValue | Op::ReturnUndefined
+                    if matches!(
+                        cfg.blocks[block_id.0 as usize].terminator,
+                        Terminator::InlineReturn { .. }
+                    ) => {}
                 Op::Return | Op::ReturnValue => {
                     let returned = instruction.inputs[0];
                     match reprs.representation(returned) {
@@ -2374,7 +2514,12 @@ fn emit(
             }
         }
 
-        if block.terminator == Terminator::FallThrough {
+        if matches!(
+            block.terminator,
+            Terminator::FallThrough
+                | Terminator::InlineCall { .. }
+                | Terminator::InlineReturn { .. }
+        ) {
             let target = block.normal_succs[0];
             emit_cfg_edge(
                 &mut ops,
@@ -2401,19 +2546,51 @@ fn emit(
         let frame_state = deopt_table.lookup(exit).ok_or(Unsupported::OperandShape(
             "optimizing deopt exit missing frame state",
         ))?;
-        // Eligibility rejects spliced frames, so an exit owes the interpreter
-        // this function's frame and nothing else.
-        if !frame_state.is_single_frame() {
-            return Err(Unsupported::OperandShape(
-                "optimizing deopt exit owes an inlined frame chain",
-            ));
+        // The compiled function's own frame is always rebuilt first, in the
+        // window it already runs on.
+        emit_deopt_writeback(&mut ops, allocation, frame_state.outermost(), 19)?;
+        if frame_state.is_single_frame() {
+            emit_load_u32(&mut ops, 9, resume_pc);
+            dynasm!(ops
+                ; .arch aarch64
+                ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                ; mov x0, xzr
+                ; movz x1, STATUS_BAILED as u32
+            );
+            emit_epilogue(&mut ops, spill_frame_bytes);
+            continue;
         }
-        emit_deopt_writeback(&mut ops, allocation, frame_state.outermost())?;
-        emit_load_u32(&mut ops, 9, resume_pc);
+
+        // The exit was inside a spliced callee, so the interpreter is owed that
+        // callee's frame too. Reify rewinds the just-restored caller to its call
+        // and lets the interpreter's own call path build the frame — which also
+        // leaves the caller advanced past the call, so no PC is stamped here.
+        for (depth, frame) in frame_state.frames.iter().enumerate().skip(1) {
+            // The reify stub speaks logical PCs — a frame's `pc` is a canonical
+            // instruction index — while the chain records byte PCs. The caller
+            // resumes one past its call, so the call itself is `resume - 1`.
+            let caller = &frame_state.frames[depth - 1];
+            let call_pc = logical_pc(tree, caller.function_id, caller.byte_pc)?
+                .checked_sub(1)
+                .ok_or(Unsupported::OperandShape(
+                    "optimizing chain caller resumes at its entry",
+                ))?;
+            let callee_pc = logical_pc(tree, frame.function_id, frame.byte_pc)?;
+            dynasm!(ops ; .arch aarch64 ; mov x0, x20);
+            emit_load_u64(&mut ops, 1, u64::from(call_pc));
+            emit_load_u64(&mut ops, 2, u64::from(callee_pc));
+            emit_load_u64(&mut ops, 16, reify_frame_entry);
+            dynasm!(ops
+                ; .arch aarch64
+                ; blr x16
+                ; cbz x0, =>threw
+                ; mov x13, x0
+            );
+            emit_deopt_writeback(&mut ops, allocation, frame, 13)?;
+        }
         dynasm!(ops
             ; .arch aarch64
-            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-            ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
             ; mov x0, xzr
             ; movz x1, STATUS_BAILED as u32
         );
@@ -2858,10 +3035,15 @@ fn emit_osr_materialization(
     Ok(())
 }
 
+/// Restore one interpreter frame's registers from an exit's slots.
+///
+/// `window` addresses the frame being rebuilt: `x19` for the compiled function's
+/// own frame, or the window a reify handed back for an inlined callee's.
 fn emit_deopt_writeback(
     ops: &mut Assembler,
     allocation: &Allocation,
     frame: &DeoptFrame,
+    window: u8,
 ) -> Result<(), Unsupported> {
     for (register, slot) in frame.slots.iter().enumerate() {
         match slot.location {
@@ -2920,7 +3102,7 @@ fn emit_deopt_writeback(
             ),
             DeoptRepr::Float64 => emit_box_double(ops, FP_SCRATCH, 9),
         }
-        emit_store_frame_register(ops, register as u32, 9)?;
+        emit_store_frame_register_in(ops, window, register as u32, 9)?;
     }
     Ok(())
 }
@@ -3045,16 +3227,30 @@ fn emit_store_frame_register(
     register: u32,
     scratch: u8,
 ) -> Result<(), Unsupported> {
+    emit_store_frame_register_in(ops, 19, register, scratch)
+}
+
+/// Store into an interpreter register window addressed by `window`.
+///
+/// The compiled frame's own window is `x19`; a frame reified for an inlined
+/// callee lives in the window its reify handed back, and the callee's registers
+/// belong there and not in its caller's.
+fn emit_store_frame_register_in(
+    ops: &mut Assembler,
+    window: u8,
+    register: u32,
+    scratch: u8,
+) -> Result<(), Unsupported> {
     let offset = register
         .checked_mul(STACK_SLOT_BYTES)
         .ok_or(Unsupported::OperandShape(
             "optimizing frame register offset",
         ))?;
     if offset <= MAX_PARAMETER_OFFSET {
-        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x19, offset]);
+        dynasm!(ops ; .arch aarch64 ; str X(scratch), [X(window), offset]);
     } else {
         emit_load_u32(ops, 12, offset);
-        dynasm!(ops ; .arch aarch64 ; str X(scratch), [x19, x12]);
+        dynasm!(ops ; .arch aarch64 ; str X(scratch), [X(window), x12]);
     }
     Ok(())
 }
@@ -3368,7 +3564,18 @@ fn emit_store_location(
         }
         Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
-            dynasm!(ops ; .arch aarch64 ; str W(scratch), [sp, offset]);
+            // An int32 spill slot is 8 bytes and other emitters read it with
+            // 64-bit loads (raw moves, boxing edge moves), so the store must
+            // cover the whole slot. A 32-bit store would leave the upper half
+            // as stack garbage that a later 64-bit read folds into the boxed
+            // value. The `mov` zero-extends in case the caller's register
+            // carries tag bits above the payload (OSR reloads pass the boxed
+            // form).
+            dynasm!(ops
+                ; .arch aarch64
+                ; mov W(scratch), W(scratch)
+                ; str X(scratch), [sp, offset]
+            );
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape("optimizing FP location"));
@@ -3542,15 +3749,20 @@ mod tests {
 
     const STRIDE: u32 = 8;
 
-    /// A spliced unit is refused by the specific piece the backend still lacks,
-    /// not by a blanket rule — so each landing piece narrows the refusal.
+    /// A spliced unit compiles, and its callee-identity guard deoptimizes when
+    /// the runtime callee is not the body the tree spliced. Wrong-callee is the
+    /// one splice path executable without a VM: the guard fails before any
+    /// callee code runs, so the exit owes only the caller's own frame, and the
+    /// interpreter re-runs the call generically from the call PC.
     #[test]
-    fn a_spliced_unit_is_still_refused() {
+    fn a_spliced_unit_compiles_and_guards_the_callee_identity() {
         use crate::ir::inline::InlineTree;
 
+        // Three params so the harness-supplied callee and argument values are
+        // real inputs rather than compiler-seeded undefined.
         let mut view = JitCompileSnapshot::without_feedback(
             7,
-            1,
+            3,
             8,
             vec![
                 JitTestInstruction::new(
@@ -3592,50 +3804,16 @@ mod tests {
 
         let tree = InlineTree::build(&view);
         assert_eq!(tree.frames.len(), 2, "the fixture must splice");
-        let cfg = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
-        let dom = DominatorTree::compute(&cfg);
-        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("a spliced SSA builds");
-        let liveness = Liveness::compute(&ssa, &cfg);
-        let reprs = ReprMap::compute(&tree, &ssa);
-        let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
-            .expect("allocation computes");
-        let frame_states = FrameStateTable::build_inlined(
-            &tree
-                .frames
-                .iter()
-                .map(|frame| frame.call_site.clone())
-                .collect::<Vec<_>>(),
-            &ssa,
-            &cfg,
-        )
-        .expect("frame states build");
+        let code = compile(&view, 91).expect("a spliced unit compiles");
 
-        let refusal = check_eligibility(
-            &view,
-            &cfg,
-            &dom,
-            &ssa,
-            EligibilityAnalyses {
-                liveness: &liveness,
-                reprs: &reprs,
-                allocation: &allocation,
-                frame_states: &frame_states,
-            },
-        );
-        // The splice terminator, not a blanket "no spliced frames" rule.
-        // The splice terminator the backend cannot emit yet — not a blanket
-        // "no spliced frames" rule, and not a back edge: a callee entering at
-        // PC 0 from a call block at PC 0 leaves the frame, so it is a splice
-        // edge and never a loop.
-        let Err(refusal) = refusal else {
-            panic!("a spliced unit must still be refused");
-        };
-        assert_eq!(
-            refusal,
-            Unsupported::OperandShape("optimizing subset has an unsupported terminator"),
-        );
+        // A non-cell callee value fails the guard's very first check.
+        let (ret, frame, pc) = execute_with_frame(&code, &[box_i32(1), box_i32(5), box_i32(3)]);
+        assert_eq!(ret.status, STATUS_BAILED);
+        assert_eq!(pc, 0, "the interpreter re-runs the call itself");
+        // The caller's registers were written back intact for that re-run.
+        assert_eq!(frame[1], box_i32(5));
+        assert_eq!(frame[2], box_i32(3));
     }
-
 
     fn box_i32(value: i32) -> u64 {
         (0xfffe_u64 << 48) | u64::from(value as u32)

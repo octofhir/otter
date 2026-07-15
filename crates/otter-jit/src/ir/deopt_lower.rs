@@ -21,7 +21,6 @@
 //! - [`super::repr`] for selected SSA value representations.
 //! - [`otter_vm::deopt`] for the concrete VM deoptimization schema.
 
-use std::collections::BTreeSet;
 
 use otter_bytecode::Op;
 use otter_vm::{
@@ -242,7 +241,7 @@ impl DeoptLowering {
         allocation: &Allocation,
         reprs: &ReprMap,
     ) -> Result<Self, DeoptLoweringError> {
-        let table = lower_table(view, tree, ssa, frame_states, allocation, reprs)?;
+        let table = lower_table(tree, ssa, frame_states, allocation, reprs)?;
         let lowering = Self { table };
         lowering.verify(view, tree, ssa, frame_states, allocation, reprs)?;
         Ok(lowering)
@@ -282,7 +281,7 @@ impl DeoptLowering {
         allocation: &Allocation,
         reprs: &ReprMap,
     ) -> Result<(), DeoptLoweringError> {
-        validate_inputs(view, tree, ssa, frame_states, allocation, reprs)?;
+        validate_inputs(tree, ssa, frame_states, allocation, reprs)?;
         self.table
             .verify(verify_limits(ssa, allocation)?)
             .map_err(DeoptLoweringError::InvalidDeoptTable)?;
@@ -387,8 +386,8 @@ impl DeoptLowering {
             }
         }
 
-        let first = lower_table(view, tree, ssa, frame_states, allocation, reprs)?;
-        let second = lower_table(view, tree, ssa, frame_states, allocation, reprs)?;
+        let first = lower_table(tree, ssa, frame_states, allocation, reprs)?;
+        let second = lower_table(tree, ssa, frame_states, allocation, reprs)?;
         if first != second || self.table != first {
             return Err(DeoptLoweringError::NonDeterministic);
         }
@@ -397,7 +396,6 @@ impl DeoptLowering {
 }
 
 fn validate_inputs(
-    view: &JitCompileSnapshot,
     tree: &InlineTree,
     ssa: &SsaFunction,
     frame_states: &FrameStateTable,
@@ -413,42 +411,49 @@ fn validate_inputs(
             actual: allocation.locations.len(),
         });
     }
-    if frame_states.states().len() != view.instructions.len() {
+    // The unit covers every frame's body, not just the root's.
+    let unit_instructions: usize = tree
+        .frames
+        .iter()
+        .map(|frame| frame.instructions.len())
+        .sum();
+    if frame_states.states().len() != unit_instructions {
         return Err(DeoptLoweringError::AbstractStateCountMismatch {
-            expected: view.instructions.len(),
+            expected: unit_instructions,
             actual: frame_states.states().len(),
         });
     }
     let ssa_instruction_count = ssa.blocks.iter().map(|block| block.instrs.len()).sum();
-    if ssa_instruction_count != view.instructions.len() {
+    if ssa_instruction_count != unit_instructions {
         return Err(DeoptLoweringError::SsaInstructionCountMismatch {
-            expected: view.instructions.len(),
+            expected: unit_instructions,
             actual: ssa_instruction_count,
         });
     }
 
-    let expected_width = usize::from(ssa.register_count);
-    let mut byte_pcs = BTreeSet::new();
-    for (index, state) in frame_states.states().iter().enumerate() {
-        let expected_pc =
-            u32::try_from(index).map_err(|_| DeoptLoweringError::AbstractStateOrderMismatch {
-                expected: u32::MAX,
-                actual: state.pc,
-            })?;
-        if state.pc != expected_pc {
+    // States are ordered by (frame, PC) and cover each frame's body densely.
+    // A PC and a byte PC are canonical only within one frame, so density and
+    // byte-PC uniqueness are per-frame invariants, never unit-wide ones.
+    let mut expected_pc_by_frame = vec![0_u32; tree.frames.len()];
+    for state in frame_states.states() {
+        let frame = &tree.frames[state.inline.0 as usize];
+        let expected_pc = &mut expected_pc_by_frame[state.inline.0 as usize];
+        if state.pc != *expected_pc {
             return Err(DeoptLoweringError::AbstractStateOrderMismatch {
-                expected: expected_pc,
+                expected: *expected_pc,
                 actual: state.pc,
             });
         }
-        let instruction = &view.instructions[index];
-        let actual_pc = instruction.instruction_pc(&view.code_block);
-        if actual_pc != expected_pc {
+        *expected_pc += 1;
+        let instruction = &frame.instructions[state.pc as usize];
+        let actual_pc = instruction.instruction_pc(frame.code_block.as_ref());
+        if actual_pc != state.pc {
             return Err(DeoptLoweringError::InstructionPcMismatch {
-                expected: expected_pc,
+                expected: state.pc,
                 actual: actual_pc,
             });
         }
+        let expected_width = usize::from(ssa.frame_registers(state.inline));
         if state.registers.len() != expected_width {
             return Err(DeoptLoweringError::AbstractSlotCountMismatch {
                 pc: state.pc,
@@ -456,27 +461,29 @@ fn validate_inputs(
                 actual: state.registers.len(),
             });
         }
-        if !byte_pcs.insert(instruction.byte_pc) {
-            return Err(DeoptLoweringError::DuplicateBytePc {
-                byte_pc: instruction.byte_pc,
-            });
-        }
         for (register, &value) in state.registers.iter().enumerate() {
             lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)?;
+        }
+    }
+    for (index, frame) in tree.frames.iter().enumerate() {
+        if expected_pc_by_frame[index] as usize != frame.instructions.len() {
+            return Err(DeoptLoweringError::AbstractStateCountMismatch {
+                expected: frame.instructions.len(),
+                actual: expected_pc_by_frame[index] as usize,
+            });
         }
     }
     Ok(())
 }
 
 fn lower_table(
-    view: &JitCompileSnapshot,
     tree: &InlineTree,
     ssa: &SsaFunction,
     frame_states: &FrameStateTable,
     allocation: &Allocation,
     reprs: &ReprMap,
 ) -> Result<DeoptTable, DeoptLoweringError> {
-    validate_inputs(view, tree, ssa, frame_states, allocation, reprs)?;
+    validate_inputs(tree, ssa, frame_states, allocation, reprs)?;
     let mut states = Vec::with_capacity(frame_states.states().len());
     for state in frame_states.states() {
         // Rebuild the whole chain this exit owes the interpreter: the outermost

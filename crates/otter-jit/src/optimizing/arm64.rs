@@ -62,8 +62,9 @@ use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_PROP_WINDOW,
-    STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
+    FrameMap, NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL,
+    STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId,
+    SafepointRecord,
 };
 
 use super::{OptimizedCode, OptimizedMetadata};
@@ -169,8 +170,9 @@ struct EmissionPlan<'a> {
     store_element_entry: u64,
     load_property_entry: u64,
     store_property_entry: u64,
-    /// Owning function id, baked into property transitions so the stub resolves
-    /// the name constant against this function's constant pool.
+    load_global_entry: u64,
+    /// Owning function id, baked into property/global transitions so the stub
+    /// resolves the name constant against this function's constant pool.
     function_id: u64,
 }
 
@@ -253,6 +255,7 @@ pub(super) fn compile_with_transitions(
             store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
             load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
             store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROP_WINDOW),
+            load_global_entry: transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -520,6 +523,26 @@ fn check_eligibility(
                         return Err(Unsupported::Opcode(instruction.op));
                     }
                     check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::LoadGlobalOrThrow => {
+                    // `WRITE_CONST`: the name is a constant immediate and there are
+                    // no register inputs; the global value is tagged. The reentrant
+                    // stub can allocate/throw, so it is a precise-rooted transition.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("global-load result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || !instruction.inputs.is_empty()
+                        || !instruction.input_registers.is_empty()
+                        || instruction.result_register.is_none()
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
                     element_transition_instructions.push((
                         instruction.pc,
                         block,
@@ -1071,6 +1094,7 @@ fn emit(
         store_element_entry,
         load_property_entry,
         store_property_entry,
+        load_global_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -1433,6 +1457,61 @@ fn emit(
                         ; =>succeeded
                     );
                     emit_reload_element_transition(&mut ops, allocation, site, None)?;
+                }
+                Op::LoadGlobalOrThrow => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked global-load destination");
+                    let name = view.instructions[instruction.pc as usize]
+                        .const_index(view.code_block.as_ref(), 1)
+                        .ok_or(Unsupported::OperandShape("global-load name constant"))?;
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing global load missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(name));
+                    emit_load_u64(&mut ops, 3, function_id);
+                    emit_load_u64(&mut ops, 16, load_global_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked global-load result"),
+                            ),
+                        )),
+                    )?;
                 }
                 Op::Increment => {
                     let result = instruction.result.expect("eligibility checked increment result");

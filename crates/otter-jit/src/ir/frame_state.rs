@@ -418,10 +418,10 @@ impl FrameStateTable {
 
     /// Return the frame state at exactly `pc`.
     #[must_use]
-    pub fn at(&self, pc: u32) -> Option<&AbstractFrameState> {
+    pub fn at(&self, inline: InlineId, pc: u32) -> Option<&AbstractFrameState> {
         let index = self
             .states
-            .binary_search_by_key(&pc, |state| state.pc)
+            .binary_search_by_key(&(inline, pc), |state| (state.inline, state.pc))
             .ok()?;
         Some(&self.states[index])
     }
@@ -761,15 +761,15 @@ mod tests {
         );
 
         assert_eq!(
-            states.at(1).unwrap().registers[1],
+            states.at(InlineId::ROOT, 1).unwrap().registers[1],
             Some(op_value_at(&ssa, 0))
         );
         assert_eq!(
-            states.at(2).unwrap().registers[1],
+            states.at(InlineId::ROOT, 2).unwrap().registers[1],
             Some(op_value_at(&ssa, 1))
         );
         assert_eq!(
-            states.at(3).unwrap().registers[2],
+            states.at(InlineId::ROOT, 3).unwrap().registers[2],
             Some(op_value_at(&ssa, 2))
         );
         assert_eq!(states, FrameStateTable::build(&ssa, &cfg).unwrap());
@@ -801,7 +801,7 @@ mod tests {
         let join = cfg.blocks.iter().find(|block| block.start_pc == 5).unwrap();
 
         assert_eq!(
-            states.at(5).unwrap().registers[1],
+            states.at(InlineId::ROOT, 5).unwrap().registers[1],
             Some(phi_for(&ssa, join.id, 1))
         );
     }
@@ -834,7 +834,7 @@ mod tests {
         let header = cfg.blocks.iter().find(|block| block.start_pc == 2).unwrap();
 
         assert_eq!(
-            states.at(3).unwrap().registers[1],
+            states.at(InlineId::ROOT, 3).unwrap().registers[1],
             Some(phi_for(&ssa, header.id, 1))
         );
     }
@@ -874,7 +874,7 @@ mod tests {
             ],
         );
         let handler = cfg.blocks.iter().find(|block| block.start_pc == 6).unwrap();
-        let state = states.at(6).unwrap();
+        let state = states.at(InlineId::ROOT, 6).unwrap();
 
         for (register, &value) in state.registers.iter().enumerate() {
             assert!(matches!(
@@ -904,7 +904,7 @@ mod tests {
             ],
         );
         let expected = op_value_at(&ssa, 0);
-        let replacement = states.at(1).unwrap().registers[0].unwrap();
+        let replacement = states.at(InlineId::ROOT, 1).unwrap().registers[0].unwrap();
         states.states[1].registers[1] = Some(replacement);
 
         assert_eq!(

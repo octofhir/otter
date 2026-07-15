@@ -606,6 +606,27 @@ fn check_eligibility(
                         &mut allowed_conversions,
                     )?;
                 }
+                Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                    // Bitwise and shift results are int32 in JS; only the
+                    // int32-feedback form (both operands already int32) is
+                    // eligible. The op cannot overflow the int32 range.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("bitwise result"))?;
+                    if reprs.representation(result) != Representation::Int32
+                        || instruction.inputs.len() != 2
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_numeric_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        Representation::Int32,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
                 Op::LessThan
                 | Op::LessEq
                 | Op::GreaterThan
@@ -1634,6 +1655,33 @@ fn emit(
                         }
                         Representation::Tagged => unreachable!("eligibility checked arithmetic"),
                     }
+                }
+                Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
+                    let result = instruction.result.expect("eligibility checked result");
+                    emit_load_int_operand(
+                        &mut ops, reprs, allocation, instruction, 0, 9, guard_deopt,
+                    )?;
+                    emit_load_int_operand(
+                        &mut ops, reprs, allocation, instruction, 1, 10, guard_deopt,
+                    )?;
+                    match instruction.op {
+                        Op::BitwiseAnd => dynasm!(ops ; .arch aarch64 ; and w11, w9, w10),
+                        Op::BitwiseOr => dynasm!(ops ; .arch aarch64 ; orr w11, w9, w10),
+                        Op::BitwiseXor => dynasm!(ops ; .arch aarch64 ; eor w11, w9, w10),
+                        // JS masks the shift count to the low 5 bits.
+                        Op::Shl => dynasm!(ops
+                            ; .arch aarch64
+                            ; and w10, w10, #31
+                            ; lsl w11, w9, w10
+                        ),
+                        Op::Shr => dynasm!(ops
+                            ; .arch aarch64
+                            ; and w10, w10, #31
+                            ; asr w11, w9, w10
+                        ),
+                        _ => unreachable!("eligibility checked bitwise op"),
+                    }
+                    emit_store_location(&mut ops, allocation.location(result), 11)?;
                 }
                 Op::LessThan
                 | Op::LessEq

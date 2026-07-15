@@ -69,3 +69,22 @@ JSON.stringify({
   nanCompare,
   floatDeopt,
 });
+
+// Optimizing-tier int32 loop with an `i++` counter (Op::Increment) plus a
+// ReturnUndefined path — wholly eligible, warmed so it runs through the optimizing
+// tier and must match the interpreter.
+function incSum(n) {
+  let s = 0;
+  for (let i = 0; i < n; i++) { s = s + i; }
+  return s;
+}
+function incVoid(n) {
+  let s = 0;
+  for (let i = 0; i < n; i++) { s = s + i; }
+}
+let incWarm = "";
+for (let i = 0; i < 4010; i++) { incWarm += "incSum(4);incVoid(4);"; }
+eval(incWarm);
+let incTotal = 0;
+for (let k = 0; k < 2000; k++) { incTotal += incSum(k & 31); incVoid(k & 15); }
+globalThis.incTotal = incTotal;

@@ -26,14 +26,14 @@ use std::collections::BTreeSet;
 use otter_vm::{
     JitCompileSnapshot,
     deopt::{
-        DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable, DeoptVerifyError, DeoptVerifyLimits,
-        FrameState,
+        DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable, DeoptVerifyError,
+        DeoptVerifyLimits, FrameState,
     },
 };
 
 use super::{
-    frame_state::FrameStateTable,
-    inline::InlineTree,
+    frame_state::{AbstractFrameState, FrameStateTable},
+    inline::{InlineFrame, InlineTree},
     regalloc::{Allocation, Location, RegClass},
     repr::{ReprError, ReprMap, Representation},
     ssa::{SsaFunction, ValueId},
@@ -260,7 +260,8 @@ impl DeoptLowering {
                         pc: state.pc,
                         byte_pc,
                     })?;
-            let expected_width = usize::from(ssa.register_count);
+            let concrete = concrete.innermost();
+            let expected_width = usize::from(ssa.frame_registers(state.inline));
             if concrete.slots.len() != expected_width {
                 return Err(DeoptLoweringError::ConcreteSlotCountMismatch {
                     byte_pc,
@@ -383,20 +384,49 @@ fn lower_table(
     validate_inputs(view, tree, ssa, frame_states, allocation, reprs)?;
     let mut states = Vec::with_capacity(frame_states.states().len());
     for state in frame_states.states() {
-        let slots = state
-            .registers
-            .iter()
-            .enumerate()
-            .map(|(register, &value)| {
-                lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // Rebuild the whole chain this exit owes the interpreter: the outermost
+        // function first, then each inlined caller down to the frame the code
+        // was executing.
+        let mut chain = Vec::new();
+        let mut current = Some(state);
+        while let Some(state) = current {
+            chain.push(lower_frame(tree, state, ssa, allocation, reprs)?);
+            current = state.caller.map(|index| &frame_states.states()[index]);
+        }
+        chain.reverse();
         states.push(FrameState {
-            byte_pc: byte_pc(view, state.pc)?,
-            slots: slots.into_boxed_slice(),
+            byte_pc: chain
+                .first()
+                .expect("a chain always contains the outermost frame")
+                .byte_pc,
+            frames: chain.into_boxed_slice(),
         });
     }
     Ok(DeoptTable::from_states(states))
+}
+
+/// Lower one abstract frame state into its concrete interpreter frame.
+fn lower_frame(
+    tree: &InlineTree,
+    state: &AbstractFrameState,
+    ssa: &SsaFunction,
+    allocation: &Allocation,
+    reprs: &ReprMap,
+) -> Result<DeoptFrame, DeoptLoweringError> {
+    let frame = &tree.frames[state.inline.0 as usize];
+    let slots = state
+        .registers
+        .iter()
+        .enumerate()
+        .map(|(register, &value)| {
+            lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DeoptFrame {
+        function_id: frame.function_id,
+        byte_pc: frame_byte_pc(frame, state.pc)?,
+        slots: slots.into_boxed_slice(),
+    })
 }
 
 fn lower_slot(
@@ -492,6 +522,25 @@ fn spill_offset(slot: u32) -> Result<i32, DeoptLoweringError> {
         .and_then(|offset| i32::try_from(offset).ok())
         .ok_or(DeoptLoweringError::SpillSlotOffsetOverflow { slot })?;
     Ok(bytes)
+}
+
+/// Byte PC of one instruction of one frame.
+///
+/// A logical PC is canonical only within its own frame, so a spliced callee's
+/// byte PC must come from that callee's own overlay.
+fn frame_byte_pc(frame: &InlineFrame, pc: u32) -> Result<u32, DeoptLoweringError> {
+    let index = usize::try_from(pc).map_err(|_| DeoptLoweringError::InstructionPcMismatch {
+        expected: u32::MAX,
+        actual: pc,
+    })?;
+    frame
+        .instructions
+        .get(index)
+        .map(|instruction| instruction.byte_pc)
+        .ok_or(DeoptLoweringError::InstructionPcMismatch {
+            expected: frame.instructions.len().try_into().unwrap_or(u32::MAX),
+            actual: pc,
+        })
 }
 
 fn byte_pc(view: &JitCompileSnapshot, pc: u32) -> Result<u32, DeoptLoweringError> {
@@ -659,7 +708,7 @@ mod tests {
         );
         let lowering = lower(&pipeline);
         let value = op_value_at(&pipeline.ssa, 0);
-        let slot = concrete_at(&lowering, &pipeline, 1).slots[0];
+        let slot = concrete_at(&lowering, &pipeline, 1).innermost().slots[0];
 
         assert_eq!(slot.repr, DeoptRepr::Int32);
         assert_eq!(
@@ -710,7 +759,7 @@ mod tests {
         );
 
         let lowering = lower(&pipeline);
-        let slot = concrete_at(&lowering, &pipeline, 1).slots[0];
+        let slot = concrete_at(&lowering, &pipeline, 1).innermost().slots[0];
         assert_eq!(slot.repr, DeoptRepr::Float64);
         assert_eq!(slot.location, DeoptLocation::Register(3));
         assert_eq!(
@@ -768,7 +817,7 @@ mod tests {
                     .map(|register| (state.pc, register))
             })
             .expect("spilled value appears in a frame state");
-        let slot = concrete_at(&lowering, &pipeline, pc).slots[register];
+        let slot = concrete_at(&lowering, &pipeline, pc).innermost().slots[register];
 
         assert_eq!(
             slot.location,
@@ -801,7 +850,7 @@ mod tests {
             &[],
         );
         let lowering = lower(&pipeline);
-        let slot = concrete_at(&lowering, &pipeline, 1).slots[0];
+        let slot = concrete_at(&lowering, &pipeline, 1).innermost().slots[0];
 
         assert_eq!(slot.repr, DeoptRepr::Tagged);
         assert!(matches!(slot.location, DeoptLocation::Register(_)));
@@ -879,8 +928,8 @@ mod tests {
         let second = op_value_at(&pipeline.ssa, 2);
         assert_ne!(first, second);
         let lowering = lower(&pipeline);
-        let first_slot = concrete_at(&lowering, &pipeline, 1).slots[0];
-        let second_slot = concrete_at(&lowering, &pipeline, 3).slots[0];
+        let first_slot = concrete_at(&lowering, &pipeline, 1).innermost().slots[0];
+        let second_slot = concrete_at(&lowering, &pipeline, 3).innermost().slots[0];
 
         assert_eq!(
             first_slot,
@@ -942,7 +991,7 @@ mod tests {
             .iter()
             .map(|state| concrete_at(&lowering, &pipeline, state.pc).clone())
             .collect();
-        states[1].slots[0].repr = DeoptRepr::Tagged;
+        states[1].frames[0].slots[0].repr = DeoptRepr::Tagged;
         let corrupted = DeoptLowering {
             table: DeoptTable::from_states(states),
         };
@@ -963,16 +1012,16 @@ mod tests {
             })
         );
 
-        let out_of_order = DeoptTable::from_unverified_states(vec![
-            FrameState {
-                byte_pc: 20,
+        let empty_frame = |byte_pc| FrameState {
+            byte_pc,
+            frames: Box::new([DeoptFrame {
+                function_id: 0,
+                byte_pc,
                 slots: Box::new([]),
-            },
-            FrameState {
-                byte_pc: 8,
-                slots: Box::new([]),
-            },
-        ]);
+            }]),
+        };
+        let out_of_order =
+            DeoptTable::from_unverified_states(vec![empty_frame(20), empty_frame(8)]);
         assert_eq!(
             out_of_order.verify(DeoptVerifyLimits {
                 max_frame_slots: 0,

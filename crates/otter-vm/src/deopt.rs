@@ -210,18 +210,60 @@ pub struct DeoptSlot {
     pub repr: DeoptRepr,
 }
 
-/// The interpreter-frame reconstruction record for one deopt point.
+/// One interpreter frame to rebuild at a deopt point.
 ///
-/// Reconstructing the frame means materializing each [`DeoptSlot`] (read the
-/// raw bits at its location, [`DeoptRepr::reconstitute`]) into the interpreter
-/// register of the same index, then resuming the interpreter at `byte_pc`.
+/// Rebuilding it means materializing each [`DeoptSlot`] (read the raw bits at
+/// its location, [`DeoptRepr::reconstitute`]) into the interpreter register of
+/// the same index, and resuming that frame at `byte_pc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrameState {
-    /// Interpreter byte-PC to resume at after the exit.
+pub struct DeoptFrame {
+    /// VM function id whose body this frame runs.
+    pub function_id: u32,
+    /// Interpreter byte-PC this frame resumes at.
     pub byte_pc: u32,
     /// One slot per interpreter virtual register the frame defines, in
     /// register-index order.
     pub slots: Box<[DeoptSlot]>,
+}
+
+/// The interpreter-state reconstruction record for one deopt point.
+///
+/// Optimized code may inline callee bodies, so one exit can owe the interpreter
+/// a whole chain of frames: the outermost function first, then each inlined
+/// callee it was executing, innermost last. Every frame after the first resumes
+/// a call its caller had already started, so the caller's `byte_pc` names that
+/// call instruction, not the instruction after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameState {
+    /// Interpreter byte-PC of the outermost frame; the table's key.
+    pub byte_pc: u32,
+    /// Frames to rebuild, outermost first and innermost last. Never empty.
+    pub frames: Box<[DeoptFrame]>,
+}
+
+impl FrameState {
+    /// The outermost frame — the compiled function's own.
+    #[must_use]
+    pub fn outermost(&self) -> &DeoptFrame {
+        self.frames
+            .first()
+            .expect("a frame state always rebuilds at least its own frame")
+    }
+
+    /// The frame optimized code was executing when it exited.
+    #[must_use]
+    pub fn innermost(&self) -> &DeoptFrame {
+        self.frames
+            .last()
+            .expect("a frame state always rebuilds at least its own frame")
+    }
+
+    /// `true` when the exit owes the interpreter only the compiled function's
+    /// own frame.
+    #[must_use]
+    pub fn is_single_frame(&self) -> bool {
+        self.frames.len() == 1
+    }
 }
 
 impl FrameState {
@@ -236,6 +278,30 @@ impl FrameState {
                 max: limits.max_stack_slot_offset,
             });
         }
+        if self.frames.is_empty() || self.outermost().byte_pc != self.byte_pc {
+            return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
+                byte_pc: self.byte_pc,
+                max: limits.max_frame_slots,
+                actual: 0,
+            });
+        }
+        for frame in &self.frames {
+            frame.verify(limits)?;
+        }
+        Ok(())
+    }
+}
+
+impl DeoptFrame {
+    /// Verify slot count, concrete-location uniqueness, and location bounds.
+    ///
+    /// Locations are unique within a frame but deliberately not across the
+    /// chain: an inlined callee's parameter is the caller's argument value, so
+    /// both frames read it from the same place.
+    ///
+    /// [`DeoptRepr`] is a closed Rust enum, so every safely constructed value
+    /// is intrinsically one of the three supported representations.
+    pub fn verify(&self, limits: DeoptVerifyLimits) -> Result<(), DeoptVerifyError> {
         if self.slots.len() > limits.max_frame_slots {
             return Err(DeoptVerifyError::FrameSlotCountOutOfRange {
                 byte_pc: self.byte_pc,
@@ -558,6 +624,64 @@ mod tests {
         );
     }
 
+    /// A single-frame state, the shape an exit from a function with nothing
+    /// inlined into it produces.
+    fn single_frame(byte_pc: u32, slots: Vec<DeoptSlot>) -> FrameState {
+        FrameState {
+            byte_pc,
+            frames: Box::new([DeoptFrame {
+                function_id: 7,
+                byte_pc,
+                slots: slots.into(),
+            }]),
+        }
+    }
+
+    #[test]
+    fn an_inlined_chain_shares_locations_across_frames() {
+        // A callee's parameter is the caller's argument value, so both frames
+        // read it from the same place. That is unique per frame, not per state.
+        let shared = DeoptSlot {
+            location: DeoptLocation::Register(3),
+            repr: DeoptRepr::Tagged,
+        };
+        let chained = FrameState {
+            byte_pc: 12,
+            frames: Box::new([
+                DeoptFrame {
+                    function_id: 7,
+                    byte_pc: 12,
+                    slots: vec![shared].into(),
+                },
+                DeoptFrame {
+                    function_id: 9,
+                    byte_pc: 0,
+                    slots: vec![shared].into(),
+                },
+            ]),
+        };
+
+        assert_eq!(chained.verify(verify_limits()), Ok(()));
+        assert!(!chained.is_single_frame());
+        assert_eq!(chained.outermost().function_id, 7);
+        assert_eq!(chained.innermost().function_id, 9);
+        // The table is keyed by the outermost frame's resume PC.
+        assert_eq!(chained.byte_pc, chained.outermost().byte_pc);
+    }
+
+    #[test]
+    fn a_frame_state_key_must_match_its_outermost_frame() {
+        let mismatched = FrameState {
+            byte_pc: 12,
+            frames: Box::new([DeoptFrame {
+                function_id: 7,
+                byte_pc: 16,
+                slots: Box::new([]),
+            }]),
+        };
+        assert!(mismatched.verify(verify_limits()).is_err());
+    }
+
     #[test]
     fn deopt_table_is_exact_pc() {
         let slot = DeoptSlot {
@@ -565,28 +689,23 @@ mod tests {
             repr: DeoptRepr::Int32,
         };
         let table = DeoptTable::from_states(vec![
-            FrameState {
-                byte_pc: 40,
-                slots: vec![slot].into(),
-            },
-            FrameState {
-                byte_pc: 8,
-                slots: vec![slot].into(),
-            },
+            single_frame(40, vec![slot]),
+            single_frame(8, vec![slot]),
         ]);
         table.verify(verify_limits()).unwrap();
         assert_eq!(table.len(), 2);
         assert!(table.lookup(8).is_some());
-        assert_eq!(table.lookup(40).unwrap().slots[0].location, slot.location);
+        assert_eq!(
+            table.lookup(40).unwrap().innermost().slots[0].location,
+            slot.location
+        );
         // A non-deopt PC has no entry — exact match, no nearest-PC fallback.
         assert!(table.lookup(20).is_none());
     }
 
     #[test]
     fn frame_state_verifier_accepts_well_formed_slots() {
-        let state = FrameState {
-            byte_pc: 12,
-            slots: vec![
+        let state = single_frame(12, vec![
                 DeoptSlot {
                     location: DeoptLocation::Register(3),
                     repr: DeoptRepr::Tagged,
@@ -599,18 +718,14 @@ mod tests {
                     location: DeoptLocation::Constant(2),
                     repr: DeoptRepr::Int32,
                 },
-            ]
-            .into(),
-        };
+            ]);
 
         assert_eq!(state.verify(verify_limits()), Ok(()));
     }
 
     #[test]
     fn frame_state_verifier_rejects_duplicate_and_out_of_range_locations() {
-        let duplicate = FrameState {
-            byte_pc: 12,
-            slots: vec![
+        let duplicate = single_frame(12, vec![
                 DeoptSlot {
                     location: DeoptLocation::Register(3),
                     repr: DeoptRepr::Tagged,
@@ -619,9 +734,7 @@ mod tests {
                     location: DeoptLocation::Register(3),
                     repr: DeoptRepr::Int32,
                 },
-            ]
-            .into(),
-        };
+            ]);
         assert_eq!(
             duplicate.verify(verify_limits()),
             Err(DeoptVerifyError::DuplicateLocation {
@@ -632,14 +745,10 @@ mod tests {
             })
         );
 
-        let out_of_range = FrameState {
-            byte_pc: 20,
-            slots: vec![DeoptSlot {
+        let out_of_range = single_frame(20, vec![DeoptSlot {
                 location: DeoptLocation::Constant(4),
                 repr: DeoptRepr::Tagged,
-            }]
-            .into(),
-        };
+            }]);
         assert_eq!(
             out_of_range.verify(verify_limits()),
             Err(DeoptVerifyError::ConstantOutOfRange {
@@ -653,14 +762,10 @@ mod tests {
 
     #[test]
     fn frame_state_verifier_checks_all_declared_bounds() {
-        let state_with = |location| FrameState {
-            byte_pc: 24,
-            slots: vec![DeoptSlot {
+        let state_with = |location| single_frame(24, vec![DeoptSlot {
                 location,
                 repr: DeoptRepr::Tagged,
-            }]
-            .into(),
-        };
+            }]);
 
         let mut limits = verify_limits();
         limits.max_frame_slots = 0;
@@ -692,10 +797,7 @@ mod tests {
 
     #[test]
     fn deopt_table_verifier_rejects_unsorted_and_duplicate_pcs() {
-        let empty = |byte_pc| FrameState {
-            byte_pc,
-            slots: Box::new([]),
-        };
+        let empty = |byte_pc| single_frame(byte_pc, Vec::new());
         let unsorted = DeoptTable {
             entries: vec![empty(20), empty(8)],
         };

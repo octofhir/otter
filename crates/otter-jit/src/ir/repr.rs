@@ -463,6 +463,7 @@ fn selected_result_representation(op: Op, feedback: ArithFeedback) -> Representa
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
         | Op::BitwiseXor
@@ -476,6 +477,7 @@ fn selected_result_representation(op: Op, feedback: ArithFeedback) -> Representa
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
         | Op::BitwiseXor
@@ -497,6 +499,7 @@ fn verified_result_representation(op: Op, feedback: ArithFeedback) -> Representa
             | Op::Sub
             | Op::Mul
             | Op::Increment
+            | Op::Neg
             | Op::BitwiseOr
             | Op::BitwiseAnd
             | Op::BitwiseXor
@@ -523,6 +526,7 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
         | Op::BitwiseXor
@@ -541,6 +545,7 @@ fn selected_input_representation(op: Op, feedback: ArithFeedback) -> Representat
         | Op::Sub
         | Op::Mul
         | Op::Increment
+        | Op::Neg
         | Op::BitwiseOr
         | Op::BitwiseAnd
         | Op::BitwiseXor
@@ -570,6 +575,7 @@ fn verified_input_representation(op: Op, feedback: ArithFeedback) -> Representat
             | Op::Sub
             | Op::Mul
             | Op::Increment
+            | Op::Neg
             | Op::BitwiseOr
             | Op::BitwiseAnd
             | Op::BitwiseXor

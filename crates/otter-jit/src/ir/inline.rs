@@ -197,13 +197,7 @@ impl InlineTree {
     /// else keeps its ordinary call.
     #[must_use]
     pub fn build(view: &JitCompileSnapshot) -> Self {
-        let mut frames = vec![InlineFrame {
-            id: InlineId::ROOT,
-            call_site: None,
-            function_id: view.code_block.id,
-            code_block: Arc::clone(&view.code_block),
-            instructions: view.instructions.clone(),
-        }];
+        let mut frames = Self::trivial(view).frames;
         // Breadth-first over the frames already accepted, so `MAX_INLINE_DEPTH`
         // is enforced by construction and every parent precedes its callees.
         let mut next = 0usize;
@@ -228,6 +222,20 @@ impl InlineTree {
             next += 1;
         }
         Self { frames }
+    }
+
+    /// Build the one-frame tree for `view`: nothing is spliced.
+    #[must_use]
+    pub fn trivial(view: &JitCompileSnapshot) -> Self {
+        Self {
+            frames: vec![InlineFrame {
+                id: InlineId::ROOT,
+                call_site: None,
+                function_id: view.code_block.id,
+                code_block: Arc::clone(&view.code_block),
+                instructions: view.instructions.clone(),
+            }],
+        }
     }
 
     /// Collect the acceptable call sites of one already-accepted frame.

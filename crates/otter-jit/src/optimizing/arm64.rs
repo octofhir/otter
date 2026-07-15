@@ -215,8 +215,12 @@ pub(super) fn compile_with_transitions(
     transitions: &TransitionTable,
 ) -> Result<OptimizedCode, Unsupported> {
     // The unit is the root function plus every callee body the inline tree
-    // splices into it, from the VM-baked monomorphic candidates.
-    let tree = InlineTree::build(view);
+    // splices into it, from the VM-baked monomorphic candidates. Only bodies
+    // this backend lowers entirely into machine registers are spliced: a
+    // reentrant transition inside a callee would need an interpreter window the
+    // spliced frame does not have, and one unsuitable callee would otherwise
+    // cost the whole unit its compilation.
+    let tree = InlineTree::build_where(view, splice_lowerable);
     let cfg = ControlFlowGraph::build_inlined(&tree)
         .map_err(|_| Unsupported::OperandShape("optimizing CFG construction"))?;
     cfg.verify()
@@ -375,6 +379,53 @@ fn legalize_deopt_locations(
         }
     }
     Ok(legalized)
+}
+
+/// `true` when every instruction of `callee` lowers into machine registers.
+///
+/// This is the backend's own splice test, mirrored ahead of tree construction:
+/// arithmetic, compares, branches, moves, constants, and returns qualify;
+/// anything that calls, allocates, or reaches the heap through a reentrant
+/// window transition does not.
+fn splice_lowerable(callee: &otter_vm::JitInlineCallee) -> bool {
+    callee.instructions.iter().all(|instruction| {
+        matches!(
+            instruction.op(callee.code_block.as_ref()),
+            Op::LoadInt32
+                | Op::LoadNumber
+                | Op::LoadUndefined
+                | Op::LoadNull
+                | Op::LoadTrue
+                | Op::LoadFalse
+                | Op::LoadLocal
+                | Op::StoreLocal
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Rem
+                | Op::Neg
+                | Op::Increment
+                | Op::LogicalNot
+                | Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+                | Op::Shl
+                | Op::Shr
+                | Op::Equal
+                | Op::NotEqual
+                | Op::LessThan
+                | Op::LessEq
+                | Op::GreaterThan
+                | Op::GreaterEq
+                | Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::Return
+                | Op::ReturnValue
+                | Op::ReturnUndefined
+        )
+    })
 }
 
 /// Canonical instruction index of `byte_pc` within `function_id`'s body.

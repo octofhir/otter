@@ -197,7 +197,21 @@ impl InlineTree {
     /// else keeps its ordinary call.
     #[must_use]
     pub fn build(view: &JitCompileSnapshot) -> Self {
+        Self::build_where(view, |_| true)
+    }
+
+    /// Decide the inline tree, splicing only callees `accept` approves.
+    ///
+    /// The backend passes its own lowering test here so a body it cannot splice
+    /// never enters the unit: an unsuitable callee would otherwise make the
+    /// whole unit ineligible and cost a previously-compiled function its code.
+    #[must_use]
+    pub fn build_where(
+        view: &JitCompileSnapshot,
+        accept: impl Fn(&otter_vm::JitInlineCallee) -> bool,
+    ) -> Self {
         let mut frames = Self::trivial(view).frames;
+        let accept = &accept;
         // Breadth-first over the frames already accepted, so `MAX_INLINE_DEPTH`
         // is enforced by construction and every parent precedes its callees.
         let mut next = 0usize;
@@ -208,7 +222,7 @@ impl InlineTree {
                 next += 1;
                 continue;
             }
-            let candidates = Self::candidates_in(view, &frames, parent_id);
+            let candidates = Self::candidates_in(view, &frames, parent_id, accept);
             for (call_site, callee) in candidates {
                 let id = InlineId(frames.len() as u32);
                 frames.push(InlineFrame {
@@ -249,6 +263,7 @@ impl InlineTree {
         view: &JitCompileSnapshot,
         frames: &[InlineFrame],
         parent_id: InlineId,
+        accept: impl Fn(&otter_vm::JitInlineCallee) -> bool,
     ) -> Vec<(InlineCallSite, otter_vm::JitInlineCallee)> {
         if parent_id != InlineId::ROOT {
             return Vec::new();
@@ -263,7 +278,7 @@ impl InlineTree {
             let Some(callee) = view.inline_callees.get(&instruction.byte_pc) else {
                 continue;
             };
-            if callee.instructions.len() > MAX_INLINE_INSTRUCTIONS {
+            if callee.instructions.len() > MAX_INLINE_INSTRUCTIONS || !accept(callee) {
                 continue;
             }
             // A function id already on this path would splice a recursive body

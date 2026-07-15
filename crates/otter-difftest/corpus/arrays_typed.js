@@ -28,6 +28,15 @@ function hotFloatArray(values, limit) {
   return total;
 }
 
+globalThis.hotFloatRmwA = [1.25, 2.5, 3.75, 5];
+globalThis.hotFloatRmwB = [0.5, 1, 1.5, 2];
+function hotFloatRmw(a, b, c, limit) {
+  for (let index = 0; index < limit; index = index + 1) {
+    a[index] = a[index] * c + b[index];
+  }
+  return a[0] + a[1] + a[2] + a[3];
+}
+
 globalThis.hotManyA = [1, 2, 3, 4];
 globalThis.hotManyB = [10, 20, 30, 40];
 globalThis.hotManyC = [2, 4, 6, 8];
@@ -59,11 +68,13 @@ function hotTaggedChain(a, b, c, d, index) {
 let warmPreciseRoots = "";
 for (let i = 0; i < 4010; i++) {
   warmPreciseRoots += "hotFloatArray(hotFloatValues, 4);";
+  warmPreciseRoots += "hotFloatRmw(hotFloatRmwA, hotFloatRmwB, 0.5, 4);";
   warmPreciseRoots += "hotManyArrays(hotManyA, hotManyB, hotManyC, hotManyD, 4);";
   warmPreciseRoots += "hotTaggedChain(hotChainA, hotChainB, hotChainC, hotChainD, 0);";
 }
 eval(warmPreciseRoots);
 const hotFloatSum = hotFloatArray(hotFloatValues, 4);
+const hotFloatRmwSum = hotFloatRmw(hotFloatRmwA, hotFloatRmwB, 0.5, 4);
 const hotManySum = hotManyArrays(hotManyA, hotManyB, hotManyC, hotManyD, 4);
 const hotChain = hotTaggedChain(hotChainA, hotChainB, hotChainC, hotChainD, 0);
 
@@ -73,6 +84,8 @@ JSON.stringify({
   typed: Array.from(typed),
   hotSum,
   hotFloatSum,
+  hotFloatRmwSum,
+  hotFloatRmw: hotFloatRmwA,
   hotManySum,
   hotChain,
   hotFirst: hotElement(hotValues, 0),

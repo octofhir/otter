@@ -127,6 +127,17 @@ impl TransitionTable {
         self.entry(descriptor)
     }
 
+    /// Swap any stub entry for a test double, whatever its signature family.
+    #[cfg(test)]
+    pub(crate) fn replace_entry_for_test(
+        &mut self,
+        descriptor: otter_vm::native_abi::RuntimeStubDescriptor,
+        entry_addr: usize,
+    ) {
+        let slot = &mut self.entries[descriptor.id as usize - 1];
+        *slot = (entry_addr as u64, Some(descriptor.signature));
+    }
+
     /// Replace one variadic entry in backend execution fixtures.
     #[cfg(test)]
     pub(crate) fn replace_variadic_entry_for_test(

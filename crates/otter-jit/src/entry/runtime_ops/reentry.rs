@@ -69,6 +69,32 @@ fn try_materialize_compiled_error(ctx: &mut JitCtx, err: VmError) -> Result<bool
     Ok(true)
 }
 
+/// Rebuild an inlined callee's interpreter frame at a deopt exit.
+///
+/// The optimized code has already restored the caller's registers into its
+/// window; this hands the caller back to the interpreter's own `Op::Call` path
+/// at `call_pc`, so the frame the interpreter gets is exactly the one a real
+/// call would have built. The emitted code then fast-forwards that frame's
+/// registers and PC to where the optimized code was.
+///
+/// Returns the new frame's register-window base, or `0` when the call path
+/// raised — a stack overflow the interpreter would have raised at this same
+/// call — with the error parked for the throw epilogue.
+pub(crate) extern "C" fn jit_deopt_reify_frame_stub(ctx: *mut JitCtx, call_pc: u64) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
+    let context = unsafe { &*ctx.activation().context_ptr() };
+    match unsafe { vm.jit_deopt_reify_inlined_frame(context, stack, call_pc as u32) } {
+        Ok(registers) => registers as u64,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            0
+        }
+    }
+}
+
 /// Shared throw-epilogue resolver.
 ///
 /// A value transition (property/element/global/loose-equality/coercion resolves

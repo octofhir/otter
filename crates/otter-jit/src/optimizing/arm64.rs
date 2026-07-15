@@ -63,8 +63,8 @@ use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptLocation, DeoptRepr, DeoptTable, FrameState};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL,
-    STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId,
-    SafepointRecord,
+    STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ, STUB_JIT_STORE_ELEMENT,
+    STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
 
 use super::{OptimizedCode, OptimizedMetadata};
@@ -171,6 +171,7 @@ struct EmissionPlan<'a> {
     load_property_entry: u64,
     store_property_entry: u64,
     load_global_entry: u64,
+    loose_eq_entry: u64,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -256,6 +257,7 @@ pub(super) fn compile_with_transitions(
             load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
             store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROP_WINDOW),
             load_global_entry: transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
+            loose_eq_entry: transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -543,6 +545,30 @@ fn check_eligibility(
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
+                    element_transition_instructions.push((
+                        instruction.pc,
+                        block,
+                        instruction_index,
+                    ));
+                }
+                Op::LooseEqual | Op::LooseNotEqual => {
+                    // `WRITE_READ_READ`: two tagged register operands compared
+                    // under §7.2.14 abstract equality, which may run `ToPrimitive`
+                    // (user `valueOf`/`toString`), allocate, and throw — a precise
+                    // reentrant transition. The boolean result is tagged.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("loose-eq result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.inputs.len() != 2
+                        || instruction.input_registers.len() != 2
+                        || instruction.result_register.is_none()
+                        || reprs.representation(instruction.inputs[0]) != Representation::Tagged
+                        || reprs.representation(instruction.inputs[1]) != Representation::Tagged
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     element_transition_instructions.push((
                         instruction.pc,
                         block,
@@ -1116,6 +1142,7 @@ fn emit(
         load_property_entry,
         store_property_entry,
         load_global_entry,
+        loose_eq_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -1530,6 +1557,62 @@ fn emit(
                                 instruction
                                     .result
                                     .expect("eligibility checked global-load result"),
+                            ),
+                        )),
+                    )?;
+                }
+                Op::LooseEqual | Op::LooseNotEqual => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked loose-eq destination");
+                    let lhs = instruction.input_registers[0];
+                    let rhs = instruction.input_registers[1];
+                    let negate = u64::from(instruction.op == Op::LooseNotEqual);
+                    let site = eligibility
+                        .element_transitions
+                        .sites
+                        .get(&instruction.pc)
+                        .ok_or(Unsupported::OperandShape(
+                            "optimizing loose-eq missing site",
+                        ))?;
+                    debug_assert_eq!(site.safepoint_id, site.frame_map.id);
+                    emit_materialize_element_transition(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        site,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                        ; movz x2, lhs as u32
+                        ; movz x3, rhs as u32
+                    );
+                    emit_load_u64(&mut ops, 4, negate);
+                    emit_load_u64(&mut ops, 16, loose_eq_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_reload_element_transition(
+                        &mut ops,
+                        allocation,
+                        site,
+                        Some((
+                            dst,
+                            allocation.location(
+                                instruction
+                                    .result
+                                    .expect("eligibility checked loose-eq result"),
                             ),
                         )),
                     )?;

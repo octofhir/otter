@@ -28,12 +28,13 @@ const optimizedFloatLoop = (n) => {
 };
 const optimizedMixedFloat = (n) => n * 1.5 + 0.25;
 const optimizedFloatDivision = (a, b) => a / b;
+const optimizedFloatRemainder = (a, b) => a % b;
 const optimizedFloatInfinity = (x) => x / 0;
 const optimizedNanCompare = (x) => x < 0 / 0 ? 1.5 : 2.5;
 const deoptimizedFloat = (x) => x + 1.5;
 
 eval(
-  "optimizedLeaf(); deoptimizedLeaf(); optimizedIfElse(); optimizedMaxPhi(); optimizedAbsPhi(); deoptimizedBranch(); optimizedLoop(16); deoptimizedLoop(1); optimizedFloatLoop(16); optimizedMixedFloat(7); optimizedFloatDivision(7.5, 2); optimizedFloatInfinity(1); optimizedNanCompare(1); deoptimizedFloat(2.5);\n".repeat(4010),
+  "optimizedLeaf(); deoptimizedLeaf(); optimizedIfElse(); optimizedMaxPhi(); optimizedAbsPhi(); deoptimizedBranch(); optimizedLoop(16); deoptimizedLoop(1); optimizedFloatLoop(16); optimizedMixedFloat(7); optimizedFloatDivision(7.5, 2); optimizedFloatRemainder(7.5, 2); optimizedFloatInfinity(1); optimizedNanCompare(1); deoptimizedFloat(2.5);\n".repeat(4010),
 );
 const optimized = optimizedLeaf();
 const deoptimized = deoptimizedLeaf();
@@ -46,6 +47,9 @@ const loopDeopt = deoptimizedLoop(5);
 const floatLoopSum = optimizedFloatLoop(100);
 const mixedFloat = optimizedMixedFloat(7);
 const floatDivision = optimizedFloatDivision(7.5, 2);
+const floatRemainder = optimizedFloatRemainder(7.5, 2);
+const remNegativeZero = Object.is(optimizedFloatRemainder(-6, 3), -0);
+const remNan = Number.isNaN(optimizedFloatRemainder(7.5, 0));
 const floatInfinity = optimizedFloatInfinity(-1);
 const nanCompare = optimizedNanCompare(1);
 const floatDeopt = deoptimizedFloat("otter");
@@ -65,6 +69,9 @@ JSON.stringify({
   floatLoopSum,
   mixedFloat,
   floatDivision,
+  floatRemainder,
+  remNegativeZero,
+  remNan,
   floatInfinity,
   nanCompare,
   floatDeopt,
@@ -87,4 +94,4 @@ for (let i = 0; i < 4010; i++) { incWarm += "incSum(4);incVoid(4);"; }
 eval(incWarm);
 let incTotal = 0;
 for (let k = 0; k < 2000; k++) { incTotal += incSum(k & 31); incVoid(k & 15); }
-globalThis.incTotal = incTotal;
+JSON.stringify({ incTotal, floatRemainder, remNegativeZero, remNan });

@@ -480,6 +480,13 @@ pub struct JitArrayLayout {
     /// prototype/accessor/descriptor/source-text state may make dense stores
     /// observable, so inline stores must miss to the runtime path.
     pub exotic_byte: u32,
+    /// Offset to the VM-maintained dense-element base pointer. The buffer is
+    /// a plain host allocation, so it survives a moving collection of the
+    /// body; every dense mutation refreshes it.
+    pub elements_ptr_byte: u32,
+    /// Offset to the VM-maintained mirror of `elements.len()`, read by the
+    /// inline bounds check as one 32-bit load.
+    pub dense_len_byte: u32,
 }
 
 /// Ready-to-use byte offsets and tags for inline primitive string fast paths.

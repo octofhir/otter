@@ -32,12 +32,13 @@ use otter_bytecode::{
         OperandKind, OperandShape, OperandSpec, RegisterAccess, RegisterSource, opcode_schema,
     },
 };
-use otter_vm::JitCompileSnapshot;
+use otter_vm::{CodeBlock, JitCompileSnapshot, JitInstructionMetadata};
 use smallvec::SmallVec;
 
 use super::{
-    cfg::{BlockId, ControlFlowGraph},
+    cfg::{BlockId, ControlFlowGraph, Terminator},
     dom::{DomError, DominanceFrontier, DominatorTree},
+    inline::{InlineId, InlineTree},
 };
 
 /// Dense SSA value identity; every value is defined exactly once.
@@ -59,12 +60,30 @@ pub enum ValueDef {
         /// Seeded bytecode register.
         register: u16,
     },
+    /// The `undefined` a spliced callee returns when its return carries no
+    /// value operand. Defined at the callee frame's entry so it dominates every
+    /// return in that frame.
+    InlineUndefinedReturn {
+        /// Callee frame entry defining it.
+        block: BlockId,
+    },
     /// Register frame reload at an exception-handler entry.
     ExceptionInput {
         /// Handler block performing the reload.
         block: BlockId,
         /// Reloaded bytecode register.
         register: u16,
+    },
+    /// The value a spliced call produces: a merge of the callee's returned
+    /// values, defined at the call's continuation block and bound to the
+    /// caller's result register.
+    InlineResult {
+        /// Continuation block containing the merge.
+        block: BlockId,
+        /// Caller register the call writes.
+        register: u16,
+        /// One value per callee-return predecessor, in predecessor order.
+        inputs: Box<[ValueId]>,
     },
     /// Normal-edge phi definition.
     Phi {
@@ -100,6 +119,8 @@ pub struct ValueData {
 /// One bytecode instruction with register reads renamed to SSA values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsaInstr {
+    /// Frame owning this instruction; [`Self::pc`] is canonical within it.
+    pub inline: InlineId,
     /// Original canonical bytecode PC.
     pub pc: u32,
     /// Original bytecode opcode.
@@ -132,10 +153,21 @@ pub struct SsaFunction {
     pub blocks: Vec<SsaBlock>,
     /// Dense values indexed by [`ValueId`].
     pub values: Vec<ValueData>,
-    /// Function entry block.
+    /// Unit entry block.
     pub entry: BlockId,
-    /// Number of bytecode virtual registers represented by the SSA graph.
+    /// Number of bytecode virtual registers in the root frame.
     pub register_count: u16,
+    /// Per-frame register-window shape, indexed by [`InlineId`].
+    pub frames: Vec<SsaFrame>,
+}
+
+/// Register-window shape of one frame in the compiled unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsaFrame {
+    /// Register-window length of this frame's body.
+    pub register_count: u16,
+    /// Formal parameter count of this frame's body.
+    pub param_count: u16,
 }
 
 /// Failure to construct or verify SSA form.
@@ -406,6 +438,68 @@ impl std::fmt::Display for SsaError {
 
 impl std::error::Error for SsaError {}
 
+/// Dense index spaces over a compiled unit's frames.
+///
+/// A frame's registers and PCs are canonical only within that frame, so every
+/// per-register and per-instruction table is keyed by `(frame, index)` flattened
+/// into one dense range per frame.
+struct UnitLayout {
+    register_base: Vec<u32>,
+    register_count: Vec<u16>,
+    instruction_base: Vec<u32>,
+    total_variables: usize,
+    total_instructions: usize,
+}
+
+impl UnitLayout {
+    fn new(tree: &InlineTree) -> Self {
+        let mut register_base = Vec::with_capacity(tree.frames.len());
+        let mut register_count = Vec::with_capacity(tree.frames.len());
+        let mut instruction_base = Vec::with_capacity(tree.frames.len());
+        let mut variables = 0u32;
+        let mut instructions = 0u32;
+        for frame in &tree.frames {
+            register_base.push(variables);
+            register_count.push(frame.code_block.register_count);
+            instruction_base.push(instructions);
+            variables += u32::from(frame.code_block.register_count);
+            instructions += frame.instructions.len() as u32;
+        }
+        Self {
+            register_base,
+            register_count,
+            instruction_base,
+            total_variables: variables as usize,
+            total_instructions: instructions as usize,
+        }
+    }
+
+    fn register_count(&self, inline: InlineId) -> u16 {
+        self.register_count[inline.0 as usize]
+    }
+
+    fn variable(&self, inline: InlineId, register: u16) -> usize {
+        self.register_base[inline.0 as usize] as usize + usize::from(register)
+    }
+
+    fn instruction(&self, inline: InlineId, pc: u32) -> usize {
+        self.instruction_base[inline.0 as usize] as usize + pc as usize
+    }
+}
+
+/// `true` when any block of `frame` returns without a value operand.
+fn frame_has_valueless_return(cfg: &ControlFlowGraph, frame: &crate::ir::inline::InlineFrame) -> bool {
+    cfg.blocks.iter().any(|block| {
+        block.inline == frame.id
+            && matches!(block.terminator, Terminator::InlineReturn { .. })
+            && block
+                .instr_pcs
+                .last()
+                .is_some_and(|&pc| frame.instructions[pc as usize].op(frame.code_block.as_ref())
+                    != Op::ReturnValue)
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 struct RegisterFlow {
     uses: SmallVec<[u16; 4]>,
@@ -420,35 +514,86 @@ enum DefinitionPosition {
 
 impl SsaFunction {
     /// Build deterministic Cytron SSA for a verified snapshot and CFG.
+    /// Build SSA for one function with nothing spliced into it.
     pub fn build(view: &JitCompileSnapshot, cfg: &ControlFlowGraph) -> Result<Self, SsaError> {
+        Self::build_inlined(&InlineTree::trivial(view), cfg)
+    }
+
+    /// Build SSA for a whole compiled unit.
+    ///
+    /// Each frame owns a private register space, so the renamed variable is
+    /// `(frame, register)` rather than `register`. A spliced callee's
+    /// parameters are not fresh definitions: they alias the caller's argument
+    /// values, which is sound because the call block dominates the callee's
+    /// entry. The call's result is defined at the continuation as a merge of
+    /// the callee's returned values.
+    pub fn build_inlined(tree: &InlineTree, cfg: &ControlFlowGraph) -> Result<Self, SsaError> {
+        let layout = UnitLayout::new(tree);
         let instruction_count: usize = cfg.blocks.iter().map(|block| block.instr_pcs.len()).sum();
-        if view.instructions.len() != instruction_count {
+        if layout.total_instructions != instruction_count {
             return Err(SsaError::SnapshotInstructionCountMismatch {
-                snapshot: view.instructions.len(),
+                snapshot: layout.total_instructions,
                 cfg: instruction_count,
             });
         }
 
-        let code_block = view.code_block.as_ref();
-        let register_count = code_block.register_count;
-        let mut flows = vec![RegisterFlow::default(); instruction_count];
-        let mut def_blocks = vec![BTreeSet::new(); usize::from(register_count)];
-        for register_defs in &mut def_blocks {
-            register_defs.insert(cfg.entry);
+        let mut flows = vec![RegisterFlow::default(); layout.total_instructions];
+        let mut def_blocks = vec![BTreeSet::new(); layout.total_variables];
+        for (index, frame) in tree.frames.iter().enumerate() {
+            let entry = cfg.frame_entries[index];
+            for register in 0..frame.code_block.register_count {
+                def_blocks[layout.variable(frame.id, register)].insert(entry);
+            }
         }
 
         let handlers = exception_handlers(cfg);
         for (index, is_handler) in handlers.iter().copied().enumerate() {
-            if is_handler {
-                for register_defs in &mut def_blocks {
-                    register_defs.insert(BlockId(index as u32));
-                }
+            if !is_handler {
+                continue;
+            }
+            let block = &cfg.blocks[index];
+            for register in 0..layout.register_count(block.inline) {
+                def_blocks[layout.variable(block.inline, register)].insert(block.id);
             }
         }
 
+        // A spliced call stops defining its result register: the continuation's
+        // merge owns that definition instead.
+        let mut spliced_calls = BTreeSet::new();
+        let mut continuations = Vec::new();
+        for frame in &tree.frames {
+            let Some(call_site) = frame.call_site.as_ref() else {
+                continue;
+            };
+            spliced_calls.insert((call_site.parent, call_site.call_pc));
+            let Terminator::InlineCall { continuation, .. } = cfg
+                .blocks
+                .iter()
+                .find(|block| {
+                    block.inline == call_site.parent
+                        && block.instr_pcs.last() == Some(&call_site.call_pc)
+                })
+                .map(|block| block.terminator)
+                .ok_or(SsaError::MissingNormalPredecessor {
+                    block: cfg.frame_entries[frame.id.0 as usize],
+                    predecessor: cfg.entry,
+                })?
+            else {
+                return Err(SsaError::MissingNormalPredecessor {
+                    block: cfg.frame_entries[frame.id.0 as usize],
+                    predecessor: cfg.entry,
+                });
+            };
+            def_blocks[layout.variable(call_site.parent, call_site.result_register)]
+                .insert(continuation);
+            continuations.push((continuation, frame.id, call_site.clone()));
+        }
+
         for block in &cfg.blocks {
+            let frame = &tree.frames[block.inline.0 as usize];
+            let code_block = frame.code_block.as_ref();
             for &pc in &block.instr_pcs {
-                let instruction = &view.instructions[pc as usize];
+                let instruction = &frame.instructions[pc as usize];
                 let actual_pc = instruction.instruction_pc(code_block);
                 if actual_pc != pc {
                     return Err(SsaError::InstructionPcMismatch {
@@ -456,30 +601,47 @@ impl SsaFunction {
                         actual: actual_pc,
                     });
                 }
-                let flow = register_flow(view, pc, register_count)?;
-                if let Some(register) = flow.def {
-                    def_blocks[usize::from(register)].insert(block.id);
+                let mut flow = register_flow(
+                    code_block,
+                    &frame.instructions,
+                    pc,
+                    code_block.register_count,
+                )?;
+                if spliced_calls.contains(&(block.inline, pc)) {
+                    flow.def = None;
                 }
-                flows[pc as usize] = flow;
+                if let Some(register) = flow.def {
+                    def_blocks[layout.variable(block.inline, register)].insert(block.id);
+                }
+                flows[layout.instruction(block.inline, pc)] = flow;
             }
         }
 
         let normal_dom = DominatorTree::compute_normal(cfg);
         let frontier = DominanceFrontier::compute(cfg, &normal_dom);
         let mut phi_registers = vec![BTreeSet::new(); cfg.blocks.len()];
-        for register in 0..register_count {
-            let definitions = &def_blocks[usize::from(register)];
-            let mut worklist: VecDeque<_> = definitions.iter().copied().collect();
-            while let Some(definition) = worklist.pop_front() {
-                for &target in frontier.frontier(definition) {
-                    let target_index = target.0 as usize;
-                    if handlers[target_index] || normal_predecessors(cfg, target).len() < 2 {
-                        continue;
-                    }
-                    if phi_registers[target_index].insert(register)
-                        && !definitions.contains(&target)
-                    {
-                        worklist.push_back(target);
+        for frame in &tree.frames {
+            for register in 0..layout.register_count(frame.id) {
+                let variable = layout.variable(frame.id, register);
+                let definitions = &def_blocks[variable];
+                let mut worklist: VecDeque<_> = definitions.iter().copied().collect();
+                while let Some(definition) = worklist.pop_front() {
+                    for &target in frontier.frontier(definition) {
+                        let target_index = target.0 as usize;
+                        // A frame's registers die with its frame: a phi for them
+                        // in another frame's block would merge values that no
+                        // longer name anything.
+                        if cfg.blocks[target_index].inline != frame.id {
+                            continue;
+                        }
+                        if handlers[target_index] || normal_predecessors(cfg, target).len() < 2 {
+                            continue;
+                        }
+                        if phi_registers[target_index].insert(register)
+                            && !definitions.contains(&target)
+                        {
+                            worklist.push_back(target);
+                        }
                     }
                 }
             }
@@ -495,8 +657,12 @@ impl SsaFunction {
             })
             .collect();
         let mut values = Vec::new();
+        let mut undefined_return = vec![None; tree.frames.len()];
         for &block_id in normal_dom.reverse_postorder() {
             let block_index = block_id.0 as usize;
+            let inline = cfg.blocks[block_index].inline;
+            let frame = &tree.frames[inline.0 as usize];
+            let register_count = layout.register_count(inline);
             if handlers[block_index] {
                 for register in 0..register_count {
                     let id = append_value(
@@ -509,9 +675,27 @@ impl SsaFunction {
                     )?;
                     blocks[block_index].phis.push(id);
                 }
-            } else if block_id == cfg.entry {
+            } else if block_id == cfg.frame_entries[inline.0 as usize] {
+                // The frame's `undefined` return constant sorts ahead of every
+                // register-keyed head value.
+                if inline != InlineId::ROOT && frame_has_valueless_return(cfg, frame) {
+                    let id = append_value(
+                        &mut values,
+                        ValueDef::InlineUndefinedReturn { block: block_id },
+                        block_id,
+                    )?;
+                    undefined_return[inline.0 as usize] = Some(id);
+                    blocks[block_index].phis.push(id);
+                }
                 for register in 0..register_count {
-                    let def = if register < code_block.param_count {
+                    // A spliced frame's parameters alias the caller's argument
+                    // values at rename time and get no definition of their own.
+                    if inline != InlineId::ROOT && register < frame.code_block.param_count {
+                        continue;
+                    }
+                    let def = if inline == InlineId::ROOT
+                        && register < frame.code_block.param_count
+                    {
                         ValueDef::Param {
                             register,
                             index: u32::from(register),
@@ -522,6 +706,23 @@ impl SsaFunction {
                     let id = append_value(&mut values, def, block_id)?;
                     blocks[block_index].phis.push(id);
                 }
+            }
+
+            if let Some((_, _, call_site)) = continuations
+                .iter()
+                .find(|(continuation, _, _)| *continuation == block_id)
+            {
+                let predecessor_count = normal_predecessors(cfg, block_id).len();
+                let id = append_value(
+                    &mut values,
+                    ValueDef::InlineResult {
+                        block: block_id,
+                        register: call_site.result_register,
+                        inputs: vec![ValueId(u32::MAX); predecessor_count].into_boxed_slice(),
+                    },
+                    block_id,
+                )?;
+                blocks[block_index].phis.push(id);
             }
 
             if !handlers[block_index] {
@@ -541,9 +742,10 @@ impl SsaFunction {
             }
 
             for &pc in &cfg.blocks[block_index].instr_pcs {
-                let instruction = &view.instructions[pc as usize];
-                let op = instruction.op(code_block);
-                let result = if flows[pc as usize].def.is_some() {
+                let instruction = &frame.instructions[pc as usize];
+                let op = instruction.op(frame.code_block.as_ref());
+                let flow = &flows[layout.instruction(inline, pc)];
+                let result = if flow.def.is_some() {
                     Some(append_value(
                         &mut values,
                         ValueDef::Op {
@@ -557,12 +759,13 @@ impl SsaFunction {
                     None
                 };
                 blocks[block_index].instrs.push(SsaInstr {
+                    inline,
                     pc,
                     op,
                     inputs: SmallVec::new(),
-                    input_registers: flows[pc as usize].uses.clone(),
+                    input_registers: flow.uses.clone(),
                     result,
-                    result_register: flows[pc as usize].def,
+                    result_register: flow.def,
                 });
             }
         }
@@ -571,9 +774,17 @@ impl SsaFunction {
             blocks,
             values,
             entry: cfg.entry,
-            register_count,
+            register_count: layout.register_count(InlineId::ROOT),
+            frames: tree
+                .frames
+                .iter()
+                .map(|frame| SsaFrame {
+                    register_count: frame.code_block.register_count,
+                    param_count: frame.code_block.param_count,
+                })
+                .collect(),
         };
-        function.rename(cfg, &normal_dom, &flows)?;
+        function.rename(tree, cfg, &normal_dom, &flows, &layout, &undefined_return)?;
         let full_dom = DominatorTree::compute(cfg);
         function.verify(cfg, &full_dom)?;
         Ok(function)
@@ -581,13 +792,16 @@ impl SsaFunction {
 
     fn rename(
         &mut self,
+        tree: &InlineTree,
         cfg: &ControlFlowGraph,
         normal_dom: &DominatorTree,
         flows: &[RegisterFlow],
+        layout: &UnitLayout,
+        undefined_return: &[Option<ValueId>],
     ) -> Result<(), SsaError> {
         enum Event {
             Enter(BlockId),
-            Exit(Vec<u16>),
+            Exit(Vec<usize>),
         }
 
         let mut children = vec![Vec::new(); cfg.blocks.len()];
@@ -602,41 +816,81 @@ impl SsaFunction {
             .copied()
             .filter(|&block| normal_dom.immediate_dominator(block).is_none())
             .collect();
-        let mut stacks = vec![Vec::new(); usize::from(self.register_count)];
+        let mut stacks = vec![Vec::new(); layout.total_variables];
 
         for root in roots {
             let mut events = vec![Event::Enter(root)];
             while let Some(event) = events.pop() {
                 match event {
                     Event::Exit(pushed) => {
-                        for register in pushed.into_iter().rev() {
-                            stacks[usize::from(register)]
+                        for variable in pushed.into_iter().rev() {
+                            stacks[variable]
                                 .pop()
                                 .expect("rename pops exactly the values it pushed");
                         }
                     }
                     Event::Enter(block_id) => {
                         let block_index = block_id.0 as usize;
+                        let inline = cfg.blocks[block_index].inline;
                         let mut pushed = Vec::new();
+
+                        // Entering a spliced frame binds its parameters to the
+                        // caller's argument values. The call block dominates
+                        // this entry, so those values are in scope and no copy
+                        // is needed.
+                        if block_id == cfg.frame_entries[inline.0 as usize]
+                            && let Some(call_site) =
+                                tree.frames[inline.0 as usize].call_site.as_ref()
+                        {
+                            for (parameter, &argument) in
+                                call_site.argument_registers.iter().enumerate()
+                            {
+                                let parameter = u16::try_from(parameter).map_err(|_| {
+                                    SsaError::RegisterOutOfRange {
+                                        pc: None,
+                                        register: u16::MAX,
+                                        register_count: layout.register_count(inline),
+                                    }
+                                })?;
+                                let value = stacks
+                                    [layout.variable(call_site.parent, argument)]
+                                .last()
+                                .copied()
+                                .ok_or(SsaError::MissingReachingDefinition {
+                                    block: block_id,
+                                    pc: None,
+                                    register: argument,
+                                })?;
+                                let variable = layout.variable(inline, parameter);
+                                stacks[variable].push(value);
+                                pushed.push(variable);
+                            }
+                        }
+
                         for &value in &self.blocks[block_index].phis {
-                            let register = head_register(&self.values[value.0 as usize].def)
-                                .expect("construction puts only head values in SsaBlock::phis");
-                            stacks[usize::from(register)].push(value);
-                            pushed.push(register);
+                            let Some(register) = head_register(&self.values[value.0 as usize].def)
+                            else {
+                                // A block-head constant names no register.
+                                continue;
+                            };
+                            let variable = layout.variable(inline, register);
+                            stacks[variable].push(value);
+                            pushed.push(variable);
                         }
 
                         for instruction_index in 0..self.blocks[block_index].instrs.len() {
                             let pc = self.blocks[block_index].instrs[instruction_index].pc;
-                            let flow = &flows[pc as usize];
+                            let flow = &flows[layout.instruction(inline, pc)];
                             let mut inputs = SmallVec::<[ValueId; 4]>::new();
                             for &register in &flow.uses {
-                                let value = stacks[usize::from(register)].last().copied().ok_or(
-                                    SsaError::MissingReachingDefinition {
+                                let value = stacks[layout.variable(inline, register)]
+                                    .last()
+                                    .copied()
+                                    .ok_or(SsaError::MissingReachingDefinition {
                                         block: block_id,
                                         pc: Some(pc),
                                         register,
-                                    },
-                                )?;
+                                    })?;
                                 inputs.push(value);
                             }
                             let result = self.blocks[block_index].instrs[instruction_index].result;
@@ -656,8 +910,9 @@ impl SsaFunction {
                                 let register = flow.def.expect(
                                     "construction creates results exactly for register defs",
                                 );
-                                stacks[usize::from(register)].push(value);
-                                pushed.push(register);
+                                let variable = layout.variable(inline, register);
+                                stacks[variable].push(value);
+                                pushed.push(variable);
                             }
                         }
 
@@ -670,25 +925,39 @@ impl SsaFunction {
                                     block: successor,
                                     predecessor: block_id,
                                 })?;
+                            let successor_inline = cfg.blocks[successor.0 as usize].inline;
                             let successor_heads = self.blocks[successor.0 as usize].phis.clone();
                             for phi in successor_heads {
-                                let register = match self.values[phi.0 as usize].def {
-                                    ValueDef::Phi { register, .. } => register,
+                                let input = match &self.values[phi.0 as usize].def {
+                                    ValueDef::Phi { register, .. } => {
+                                        let variable = layout.variable(successor_inline, *register);
+                                        stacks[variable].last().copied().ok_or(
+                                            SsaError::MissingReachingDefinition {
+                                                block: successor,
+                                                pc: None,
+                                                register: *register,
+                                            },
+                                        )?
+                                    }
+                                    // The merged value is what this predecessor
+                                    // returns, not what the caller's result
+                                    // register held before the call.
+                                    ValueDef::InlineResult { register, .. } => self
+                                        .returned_value(cfg, block_id, undefined_return)
+                                        .ok_or(SsaError::MissingReachingDefinition {
+                                            block: successor,
+                                            pc: None,
+                                            register: *register,
+                                        })?,
                                     _ => continue,
                                 };
-                                let input = stacks[usize::from(register)].last().copied().ok_or(
-                                    SsaError::MissingReachingDefinition {
-                                        block: successor,
-                                        pc: None,
-                                        register,
-                                    },
-                                )?;
-                                let ValueDef::Phi { inputs, .. } =
-                                    &mut self.values[phi.0 as usize].def
-                                else {
-                                    unreachable!();
-                                };
-                                inputs[predecessor_index] = input;
+                                match &mut self.values[phi.0 as usize].def {
+                                    ValueDef::Phi { inputs, .. }
+                                    | ValueDef::InlineResult { inputs, .. } => {
+                                        inputs[predecessor_index] = input;
+                                    }
+                                    _ => unreachable!(),
+                                }
                             }
                         }
 
@@ -702,6 +971,32 @@ impl SsaFunction {
             debug_assert!(stacks.iter().all(Vec::is_empty));
         }
         Ok(())
+    }
+
+    /// The value a spliced frame's return block hands back to its caller.
+    fn returned_value(
+        &self,
+        cfg: &ControlFlowGraph,
+        block: BlockId,
+        undefined_return: &[Option<ValueId>],
+    ) -> Option<ValueId> {
+        if !matches!(
+            cfg.blocks[block.0 as usize].terminator,
+            Terminator::InlineReturn { .. }
+        ) {
+            return None;
+        }
+        let last = self.blocks[block.0 as usize].instrs.last()?;
+        if last.op == Op::ReturnValue {
+            return last.inputs.first().copied();
+        }
+        undefined_return[cfg.blocks[block.0 as usize].inline.0 as usize]
+    }
+
+    /// Register-window length of one frame in the unit.
+    #[must_use]
+    pub fn frame_registers(&self, inline: InlineId) -> u16 {
+        self.frames[inline.0 as usize].register_count
     }
 
     /// Verify SSA structure, dominance, exception inputs, and deterministic order.
@@ -745,12 +1040,24 @@ impl SsaFunction {
 
         let handlers = exception_handlers(cfg);
         let mut placements = vec![None; self.values.len()];
-        let mut entry_inputs = vec![false; usize::from(self.register_count)];
-        let mut handler_inputs =
-            vec![vec![false; usize::from(self.register_count)]; cfg.blocks.len()];
+        // Frame entries and handlers seed their own frame's registers, so every
+        // per-register table is sized by the frame that owns the block.
+        let mut entry_inputs: Vec<Vec<bool>> = self
+            .frames
+            .iter()
+            .map(|frame| vec![false; usize::from(frame.register_count)])
+            .collect();
+        let mut handler_inputs: Vec<Vec<bool>> = cfg
+            .blocks
+            .iter()
+            .map(|block| vec![false; usize::from(self.frame_registers(block.inline))])
+            .collect();
 
         for (block_index, block) in self.blocks.iter().enumerate() {
             let block_id = block.id;
+            let inline = cfg.blocks[block_index].inline;
+            let frame_registers = self.frame_registers(inline);
+            let frame_entry = cfg.frame_entries[inline.0 as usize];
             let normal_predecessors = normal_predecessors(cfg, block_id);
             let mut previous_head_key = None;
             for &value_id in &block.phis {
@@ -772,12 +1079,31 @@ impl SsaFunction {
                                 index: *index,
                             });
                         }
-                        mark_entry_input(&mut entry_inputs, *register, self.register_count)?;
-                        (0_u8, *register)
+                        mark_entry_input(
+                            &mut entry_inputs[inline.0 as usize],
+                            *register,
+                            frame_registers,
+                        )?;
+                        (1_u8, *register)
                     }
-                    ValueDef::Uninitialized { register } if block_id == self.entry => {
-                        mark_entry_input(&mut entry_inputs, *register, self.register_count)?;
-                        (0, *register)
+                    // Every frame seeds the registers its call ABI does not
+                    // fill, not just the unit's outermost entry.
+                    ValueDef::Uninitialized { register } if block_id == frame_entry => {
+                        mark_entry_input(
+                            &mut entry_inputs[inline.0 as usize],
+                            *register,
+                            frame_registers,
+                        )?;
+                        (1, *register)
+                    }
+                    ValueDef::InlineUndefinedReturn { block: owner }
+                        if *owner == block_id
+                            && block_id == frame_entry
+                            && inline != InlineId::ROOT =>
+                    {
+                        // A frame-entry constant that no register names; it
+                        // sorts ahead of every register-keyed head value.
+                        (0, 0)
                     }
                     ValueDef::ExceptionInput {
                         block: owner,
@@ -787,9 +1113,9 @@ impl SsaFunction {
                             &mut handler_inputs[block_index],
                             block_id,
                             *register,
-                            self.register_count,
+                            frame_registers,
                         )?;
-                        (0, *register)
+                        (1, *register)
                     }
                     ValueDef::ExceptionInput { .. } => {
                         return Err(SsaError::UnexpectedExceptionInput {
@@ -821,6 +1147,33 @@ impl SsaFunction {
                                 actual: inputs.len(),
                             });
                         }
+                        (2, *register)
+                    }
+                    // A spliced call's result merges the callee's returned
+                    // values; its predecessors are the callee's return blocks.
+                    ValueDef::InlineResult {
+                        block: owner,
+                        register,
+                        inputs,
+                    } if *owner == block_id => {
+                        if inputs.len() != normal_predecessors.len() {
+                            return Err(SsaError::PhiInputCountMismatch {
+                                value: value_id,
+                                expected: normal_predecessors.len(),
+                                actual: inputs.len(),
+                            });
+                        }
+                        if !normal_predecessors.iter().all(|&predecessor| {
+                            matches!(
+                                cfg.blocks[predecessor.0 as usize].terminator,
+                                Terminator::InlineReturn { .. }
+                            )
+                        }) {
+                            return Err(SsaError::InvalidHeadDefinition {
+                                value: value_id,
+                                block: block_id,
+                            });
+                        }
                         (1, *register)
                     }
                     _ => {
@@ -830,7 +1183,7 @@ impl SsaFunction {
                         });
                     }
                 };
-                check_register(None, register, self.register_count)?;
+                check_register(None, register, frame_registers)?;
                 let key = (category, register);
                 if previous_head_key.is_some_and(|previous| previous >= key) {
                     return Err(SsaError::NonCanonicalHeadOrder { block: block_id });
@@ -901,14 +1254,29 @@ impl SsaFunction {
                 });
             }
         }
-        for register in 0..self.register_count {
-            if !entry_inputs[usize::from(register)] && !handlers[self.entry.0 as usize] {
-                return Err(SsaError::MissingEntryInput { register });
+        // Every frame seeds each of its registers at its entry, except the
+        // parameters of a spliced frame, which alias the caller's arguments.
+        for (index, frame) in self.frames.iter().enumerate() {
+            let inline = InlineId(index as u32);
+            let entry = cfg.frame_entries[index];
+            if handlers[entry.0 as usize] {
+                continue;
+            }
+            let aliased_parameters = if inline == InlineId::ROOT {
+                0
+            } else {
+                frame.param_count
+            };
+            for register in aliased_parameters..frame.register_count {
+                if !entry_inputs[index][usize::from(register)] {
+                    return Err(SsaError::MissingEntryInput { register });
+                }
             }
         }
         for (block_index, is_handler) in handlers.iter().copied().enumerate() {
             if is_handler {
-                for register in 0..self.register_count {
+                let inline = cfg.blocks[block_index].inline;
+                for register in 0..self.frame_registers(inline) {
                     if !handler_inputs[block_index][usize::from(register)] {
                         return Err(SsaError::MissingExceptionInput {
                             block: BlockId(block_index as u32),
@@ -1004,12 +1372,12 @@ impl SsaFunction {
 }
 
 fn register_flow(
-    view: &JitCompileSnapshot,
+    code_block: &CodeBlock,
+    instructions: &[JitInstructionMetadata],
     pc: u32,
     register_count: u16,
 ) -> Result<RegisterFlow, SsaError> {
-    let code_block = view.code_block.as_ref();
-    let instruction = &view.instructions[pc as usize];
+    let instruction = &instructions[pc as usize];
     let op = instruction.op(code_block);
     let operands = instruction.operand_view(code_block);
     let shape = opcode_schema(op).operand_shape;
@@ -1108,8 +1476,11 @@ fn head_register(def: &ValueDef) -> Option<u16> {
         ValueDef::Param { register, .. }
         | ValueDef::Uninitialized { register }
         | ValueDef::ExceptionInput { register, .. }
+        | ValueDef::InlineResult { register, .. }
         | ValueDef::Phi { register, .. } => Some(*register),
-        ValueDef::Op { .. } => None,
+        // A spliced callee's `undefined` return value is a block-head constant
+        // that no register names.
+        ValueDef::InlineUndefinedReturn { .. } | ValueDef::Op { .. } => None,
     }
 }
 
@@ -1179,6 +1550,185 @@ mod tests {
             })
             .collect();
         JitCompileSnapshot::without_feedback(0, param_count, register_count, instructions)
+    }
+
+    /// Splice a one-parameter callee into `r0 = r1(r2); return r0`.
+    fn spliced(callee_body: Vec<(Op, Vec<Operand>)>) -> (ControlFlowGraph, SsaFunction, InlineTree) {
+        let mut view = snapshot(
+            1,
+            8,
+            vec![
+                (
+                    Op::Call,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::ConstIndex(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(0)]),
+            ],
+        );
+        let callee_instructions: Vec<JitTestInstruction> = callee_body
+            .into_iter()
+            .enumerate()
+            .map(|(pc, (op, operands))| {
+                JitTestInstruction::new(op, pc as u32, pc as u32 * 4, operands)
+            })
+            .collect();
+        let callee_view = JitCompileSnapshot::without_feedback(9, 1, 4, callee_instructions);
+        let call_byte_pc = view.instructions[0].byte_pc;
+        view.inline_callees.insert(
+            call_byte_pc,
+            otter_vm::JitInlineCallee {
+                code_block: std::sync::Arc::clone(&callee_view.code_block),
+                function_id: 9,
+                param_count: 1,
+                register_count: callee_view.code_block.register_count,
+                instructions: callee_view.instructions,
+            },
+        );
+        let tree = InlineTree::build(&view);
+        assert_eq!(tree.frames.len(), 2, "the fixture must splice");
+        let cfg = ControlFlowGraph::build_inlined(&tree).expect("a spliced CFG builds");
+        let ssa = SsaFunction::build_inlined(&tree, &cfg).expect("a spliced SSA builds");
+        ssa.verify(&cfg, &DominatorTree::compute(&cfg))
+            .expect("a spliced SSA verifies");
+        (cfg, ssa, tree)
+    }
+
+    #[test]
+    fn a_spliced_parameter_aliases_the_caller_argument_value() {
+        // The callee body is `return r0`.
+        let (cfg, ssa, _) = spliced(vec![(Op::ReturnValue, vec![Operand::Register(0)])]);
+
+        // The caller's argument register r2 is an entry seed of the root frame.
+        let argument = ssa.blocks[0]
+            .phis
+            .iter()
+            .copied()
+            .find(|&value| {
+                matches!(ssa.values[value.0 as usize].def, ValueDef::Uninitialized { register } if register == 2)
+            })
+            .expect("r2 is seeded at the root entry");
+
+        // The callee's `return r0` reads exactly that value: no copy, no fresh
+        // parameter definition.
+        let callee_entry = cfg.frame_entries[1];
+        let callee_block = &ssa.blocks[callee_entry.0 as usize];
+        assert!(
+            callee_block.phis.iter().all(|&value| !matches!(
+                ssa.values[value.0 as usize].def,
+                ValueDef::Param { .. }
+            )),
+            "a spliced frame defines no parameters of its own",
+        );
+        let ret = callee_block.instrs.last().expect("the callee returns");
+        assert_eq!(ret.op, Op::ReturnValue);
+        assert_eq!(ret.inline, InlineId(1));
+        assert_eq!(ret.inputs.as_slice(), [argument]);
+    }
+
+    #[test]
+    fn the_call_result_merges_the_callee_returned_value() {
+        let (cfg, ssa, _) = spliced(vec![(Op::ReturnValue, vec![Operand::Register(0)])]);
+
+        // The spliced call defines nothing; the continuation's merge does.
+        let call = ssa.blocks[0].instrs.last().expect("the call is emitted");
+        assert_eq!(call.op, Op::Call);
+        assert_eq!(call.result, None);
+        assert_eq!(call.result_register, None);
+
+        let Terminator::InlineCall { continuation, .. } = cfg.blocks[0].terminator else {
+            panic!("the call block ends in a splice");
+        };
+        let merge = ssa.blocks[continuation.0 as usize]
+            .phis
+            .iter()
+            .copied()
+            .find(|&value| matches!(ssa.values[value.0 as usize].def, ValueDef::InlineResult { .. }))
+            .expect("the continuation merges the call result");
+        let ValueDef::InlineResult {
+            register, inputs, ..
+        } = &ssa.values[merge.0 as usize].def
+        else {
+            unreachable!()
+        };
+        assert_eq!(*register, 0, "the merge binds the caller's result register");
+
+        // Its only input is what the callee returned.
+        let callee_return = &ssa.blocks[cfg.frame_entries[1].0 as usize];
+        let returned = callee_return.instrs.last().expect("the callee returns").inputs[0];
+        assert_eq!(inputs.as_ref(), [returned]);
+
+        // The caller's own `return r0` then reads the merge, not its stale r0.
+        let caller_return = ssa.blocks[continuation.0 as usize]
+            .instrs
+            .last()
+            .expect("the caller returns");
+        assert_eq!(caller_return.inputs.as_slice(), [merge]);
+    }
+
+    #[test]
+    fn a_valueless_callee_return_merges_undefined() {
+        // The callee body is a bare `return`.
+        let (cfg, ssa, _) = spliced(vec![(Op::ReturnUndefined, Vec::new())]);
+
+        let undefined = ssa.blocks[cfg.frame_entries[1].0 as usize]
+            .phis
+            .iter()
+            .copied()
+            .find(|&value| {
+                matches!(
+                    ssa.values[value.0 as usize].def,
+                    ValueDef::InlineUndefinedReturn { .. }
+                )
+            })
+            .expect("a valueless return needs an undefined to merge");
+
+        let Terminator::InlineCall { continuation, .. } = cfg.blocks[0].terminator else {
+            panic!("the call block ends in a splice");
+        };
+        let merge = ssa.blocks[continuation.0 as usize]
+            .phis
+            .iter()
+            .copied()
+            .find(|&value| matches!(ssa.values[value.0 as usize].def, ValueDef::InlineResult { .. }))
+            .expect("the continuation merges the call result");
+        let ValueDef::InlineResult { inputs, .. } = &ssa.values[merge.0 as usize].def else {
+            unreachable!()
+        };
+        assert_eq!(inputs.as_ref(), [undefined]);
+    }
+
+    #[test]
+    fn each_frame_keeps_a_private_register_space() {
+        // Both frames use register 0 for different things: the caller's result
+        // and the callee's parameter. They must never be the same variable.
+        let (cfg, ssa, _) = spliced(vec![(Op::ReturnValue, vec![Operand::Register(0)])]);
+
+        assert_eq!(ssa.frames.len(), 2);
+        assert_eq!(ssa.frame_registers(InlineId::ROOT), 8);
+        assert_eq!(ssa.frame_registers(InlineId(1)), 4);
+
+        let callee_r0 = ssa.blocks[cfg.frame_entries[1].0 as usize]
+            .instrs
+            .last()
+            .expect("the callee returns")
+            .inputs[0];
+        let root_r0 = ssa.blocks[0]
+            .phis
+            .iter()
+            .copied()
+            .find(|&value| {
+                matches!(ssa.values[value.0 as usize].def, ValueDef::Param { register: 0, .. })
+            })
+            .expect("the root's r0 is its parameter");
+        assert_ne!(
+            callee_r0, root_r0,
+            "the callee's r0 is the caller's argument, not the caller's r0",
+        );
     }
 
     fn build(

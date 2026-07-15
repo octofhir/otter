@@ -87,6 +87,7 @@ use crate::{
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
+        inline::InlineId,
         deopt_lower::DeoptLowering,
         dom::DominatorTree,
         frame_state::{AbstractFrameState, FrameStateTable},
@@ -371,6 +372,14 @@ fn check_eligibility(
     if cfg.entry.0 != 0 || dom.reverse_postorder().len() != cfg.blocks.len() {
         return Err(Unsupported::OperandShape(
             "optimizing subset requires one reachable entry graph",
+        ));
+    }
+    // The backend resolves every instruction against the root snapshot and
+    // reconstructs one interpreter frame on deopt, so it cannot yet emit a unit
+    // whose graph spans more than one frame.
+    if cfg.blocks.iter().any(|block| block.inline != InlineId::ROOT) {
+        return Err(Unsupported::OperandShape(
+            "optimizing subset rejects spliced frames",
         ));
     }
     let mut back_edges = BTreeMap::new();
@@ -1333,7 +1342,14 @@ fn emit(
                 emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
                 emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
             }
-            ValueDef::ExceptionInput { .. } | ValueDef::Phi { .. } | ValueDef::Op { .. } => {}
+            ValueDef::InlineUndefinedReturn { .. } => {
+                emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
+                emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
+            }
+            ValueDef::ExceptionInput { .. }
+            | ValueDef::InlineResult { .. }
+            | ValueDef::Phi { .. }
+            | ValueDef::Op { .. } => {}
         }
     }
 

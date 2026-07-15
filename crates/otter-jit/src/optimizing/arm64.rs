@@ -412,6 +412,7 @@ fn check_eligibility(
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
                 Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
                 Op::LoadUndefined => check_tagged_constant_result(instruction, reprs)?,
+                Op::LoadNull => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadThis => check_tagged_constant_result(instruction, reprs)?,
                 Op::LoadTrue | Op::LoadFalse => check_boolean_result(instruction, reprs)?,
                 Op::LoadLocal | Op::StoreLocal => {
@@ -544,6 +545,26 @@ fn check_eligibility(
                         &mut allowed_conversions,
                     )?;
                 }
+                Op::Increment => {
+                    // `dst = src + delta` over int32 (the common loop-counter form);
+                    // float increments stay ineligible and complete elsewhere.
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("increment result"))?;
+                    if reprs.representation(result) != Representation::Int32
+                        || instruction.inputs.len() != 1
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_numeric_inputs(
+                        instruction,
+                        ssa,
+                        reprs,
+                        Representation::Int32,
+                        &mut guarded_uses,
+                        &mut allowed_conversions,
+                    )?;
+                }
                 Op::Div => {
                     let result = instruction
                         .result
@@ -634,6 +655,13 @@ fn check_eligibility(
                         ));
                     }
                     allowed_conversions.insert((instruction.pc, 0));
+                }
+                Op::ReturnUndefined => {
+                    if instruction.result.is_some() || !instruction.inputs.is_empty() {
+                        return Err(Unsupported::OperandShape(
+                            "optimizing return-undefined shape",
+                        ));
+                    }
                 }
                 other => return Err(Unsupported::Opcode(other)),
             }
@@ -1166,6 +1194,16 @@ fn emit(
                         9,
                     )?;
                 }
+                Op::LoadNull => {
+                    emit_load_u32(&mut ops, 9, otter_vm::Value::null().to_bits() as u32);
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation.location(
+                            instruction.result.expect("eligibility checked null result"),
+                        ),
+                        9,
+                    )?;
+                }
                 Op::LoadLocal | Op::StoreLocal => {
                     emit_move(
                         &mut ops,
@@ -1396,6 +1434,30 @@ fn emit(
                     );
                     emit_reload_element_transition(&mut ops, allocation, site, None)?;
                 }
+                Op::Increment => {
+                    let result = instruction.result.expect("eligibility checked increment result");
+                    let delta = view.instructions[instruction.pc as usize]
+                        .imm32(view.code_block.as_ref(), 2)
+                        .ok_or(Unsupported::OperandShape("increment delta operand"))?;
+                    emit_load_int_operand(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction,
+                        0,
+                        9,
+                        guard_deopt,
+                    )?;
+                    emit_load_u32(&mut ops, 10, delta as u32);
+                    let deopt = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; adds w11, w9, w10
+                        ; b.vs =>deopt
+                    );
+                    emit_store_location(&mut ops, allocation.location(result), 11)?;
+                    deopt_exits.push((deopt, byte_pc(view, instruction.pc)?, instruction.pc));
+                }
                 Op::Add | Op::Sub | Op::Mul | Op::Div => {
                     let result = instruction.result.expect("eligibility checked result");
                     match reprs.representation(result) {
@@ -1623,6 +1685,11 @@ fn emit(
                         ; mov x0, x9
                         ; movz x1, STATUS_RETURNED as u32
                     );
+                    emit_epilogue(&mut ops, spill_frame_bytes);
+                }
+                Op::ReturnUndefined => {
+                    emit_load_u32(&mut ops, 0, otter_vm::Value::undefined().to_bits() as u32);
+                    dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
                     emit_epilogue(&mut ops, spill_frame_bytes);
                 }
                 _ => unreachable!("eligibility rejected unsupported opcode"),

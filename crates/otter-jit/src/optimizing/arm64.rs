@@ -69,7 +69,7 @@ use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
-    STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
+    STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
     STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
@@ -200,6 +200,8 @@ struct EmissionPlan<'a> {
     reify_frame_entry: u64,
     /// Dispatches a `Math.<method>` intrinsic through the window transition.
     math_call_entry: u64,
+    /// Refills the back-edge budget and reports raised interrupts.
+    poll_entry: u64,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
     function_id: u64,
@@ -313,6 +315,7 @@ pub(super) fn compile_with_transitions(
             construct_entry: transitions.variadic_entry(STUB_JIT_CONSTRUCT),
             reify_frame_entry: transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
             math_call_entry: transitions.variadic_entry(STUB_JIT_MATH_CALL),
+            poll_entry: transitions.entry(STUB_JIT_BACKEDGE_POLL),
             function_id: u64::from(view.code_block.id),
         },
     )?;
@@ -617,7 +620,7 @@ fn check_eligibility(
                         || instruction.inputs.len() != 3
                         || instruction.input_registers.len() != 3
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
-                        || reprs.representation(instruction.inputs[1]) != Representation::Int32
+                        || reprs.representation(instruction.inputs[1]) == Representation::Float64
                         || instruction.input_registers.contains(&scratch)
                     {
                         return Err(Unsupported::Opcode(instruction.op));
@@ -1531,6 +1534,7 @@ fn emit(
         construct_entry,
         reify_frame_entry,
         math_call_entry,
+        poll_entry,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
@@ -2702,7 +2706,8 @@ fn emit(
                         &mut ops,
                         allocation,
                         eligibility,
-                        &mut deopt_exits,
+                        poll_entry,
+                        threw,
                         &block_labels,
                         block_id,
                         target,
@@ -2736,7 +2741,8 @@ fn emit(
                         &mut ops,
                         allocation,
                         eligibility,
-                        &mut deopt_exits,
+                        poll_entry,
+                        threw,
                         &block_labels,
                         block_id,
                         fallthrough,
@@ -2747,7 +2753,8 @@ fn emit(
                         &mut ops,
                         allocation,
                         eligibility,
-                        &mut deopt_exits,
+                        poll_entry,
+                        threw,
                         &block_labels,
                         block_id,
                         taken,
@@ -2853,7 +2860,8 @@ fn emit(
                 &mut ops,
                 allocation,
                 eligibility,
-                &mut deopt_exits,
+                poll_entry,
+                threw,
                 &block_labels,
                 block_id,
                 target,
@@ -2961,11 +2969,13 @@ fn emit(
 
 /// Emit one normal edge. Loop-carried phi destinations are populated before
 /// the poll because the poll's deopt state is the target header's entry state.
+#[allow(clippy::too_many_arguments)]
 fn emit_cfg_edge(
     ops: &mut Assembler,
     allocation: &Allocation,
     eligibility: &Eligibility,
-    deopt_exits: &mut Vec<(DynamicLabel, DeoptExitId, u32)>,
+    poll_entry: u64,
+    threw: DynamicLabel,
     block_labels: &[DynamicLabel],
     predecessor: BlockId,
     target: BlockId,
@@ -2975,10 +2985,8 @@ fn emit_cfg_edge(
         allocation,
         edge_moves(allocation, predecessor, target)?,
     )?;
-    if let Some(&(exit, header_pc)) = eligibility.back_edges.get(&(predecessor, target)) {
-        let deopt = ops.new_dynamic_label();
-        emit_backedge_poll(ops, deopt);
-        deopt_exits.push((deopt, exit, header_pc));
+    if eligibility.back_edges.contains_key(&(predecessor, target)) {
+        emit_backedge_poll(ops, poll_entry, threw);
     }
     let target_label = block_labels[target.0 as usize];
     dynasm!(ops ; .arch aarch64 ; b =>target_label);
@@ -2995,20 +3003,38 @@ fn emit_cfg_edge(
 /// interrupt/budget checkpoint on its next back-edge. Thus optimized code
 /// bails at least as often as the interpreter/baseline poll cadence, never
 /// less often, while keeping all refill and error policy inside the VM.
-fn emit_backedge_poll(ops: &mut Assembler, deopt: DynamicLabel) {
+/// Cooperative back-edge poll, matching the template tier: the fast path
+/// decrements the fuel cell inline; an exhausted budget or a raised interrupt
+/// calls the leaf poll stub, which refills the budget and returns to the
+/// compiled loop, or raises (interrupt, timeout) through the throw epilogue.
+/// Deoptimizing here would abandon the compiled loop once per budget window.
+fn emit_backedge_poll(
+    ops: &mut Assembler,
+    poll_entry: u64,
+    threw: DynamicLabel,
+) {
+    let slow = ops.new_dynamic_label();
+    let cont = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; ldr x9, [x9, VM_THREAD_INTERRUPT_CELL_OFFSET]
-        ; ldrb w10, [x9]
-        ; cbnz w10, =>deopt
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; ldr x9, [x9, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
+        ; ldr x17, [x20, THREAD_OFFSET]
+        ; ldr x9, [x17, VM_THREAD_INTERRUPT_CELL_OFFSET]
+        ; ldrb w9, [x9]
+        ; cbnz w9, =>slow
+        ; ldr x9, [x17, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET]
         ; ldr x10, [x9]
         ; subs x10, x10, #1
-        ; csel x10, x10, xzr, gt
         ; str x10, [x9]
-        ; b.le =>deopt
+        ; b.gt =>cont
+        ; =>slow
+        ; mov x0, x20
+    );
+    emit_load_u64(ops, 16, poll_entry);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cbnz x0, =>threw
+        ; =>cont
     );
 }
 
@@ -4129,13 +4155,7 @@ fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        time::Duration,
-    };
+    use std::sync::Arc;
 
     use otter_vm::{
         JitFunctionCode,
@@ -6113,7 +6133,12 @@ mod tests {
     }
 
     #[test]
-    fn backedge_interrupt_deopts_near_infinite_loop_at_header() {
+    fn backedge_interrupt_raises_through_the_poll_stub() {
+        // The poll matches the template tier: an interrupt reaches the leaf
+        // poll stub, which raises; the loop never deoptimizes for it.
+        extern "C" fn raising_poll(_ctx: *mut JitCtx) -> u64 {
+            1
+        }
         let view = view(
             0,
             2,
@@ -6131,43 +6156,52 @@ mod tests {
                 (Op::Jump, vec![Operand::Imm32(-2)]),
             ],
         );
-        let code = compile(&view, 15).expect("reducible infinite loop is eligible");
-        let interrupt = Arc::new(AtomicBool::new(false));
-        let setter = Arc::clone(&interrupt);
-        let interrupter = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            setter.store(true, Ordering::Release);
-        });
+        let mut transitions = TransitionTable::resolve();
+        transitions.replace_entry_for_test(
+            otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL,
+            raising_poll as *const () as usize,
+        );
+        let code = compile_with_transitions(&view, 15, &transitions)
+            .expect("reducible infinite loop is eligible");
+        let interrupt = 1_u8;
         let mut fuel = i64::MAX as u64;
-        let (result, frame, resume_pc) =
-            execute_with_poll_cells(&code, &[], Arc::as_ptr(&interrupt).cast::<u8>(), &mut fuel);
-        interrupter.join().expect("interrupt setter");
-
-        assert_eq!(result.status, STATUS_BAILED);
-        assert_eq!(result.value, 0);
-        assert_eq!(resume_pc, 2);
-        assert_eq!(frame, vec![box_i32(0), box_i32(0)]);
+        let (result, _, _) =
+            execute_with_poll_cells(&code, &[], std::ptr::addr_of!(interrupt), &mut fuel);
+        assert_eq!(result.status, STATUS_THREW);
     }
 
     #[test]
-    fn exhausted_backedge_fuel_deopts_at_header_after_phi_moves() {
+    fn exhausted_backedge_fuel_refills_through_the_poll_stub() {
+        // An exhausted budget refills through the stub and the compiled loop
+        // keeps running to its own return — no deopt, no interpreter resume.
+        extern "C" fn refilling_poll(ctx: *mut JitCtx) -> u64 {
+            // SAFETY: the fixture's thread cell outlives the call.
+            unsafe {
+                let thread = &*(*ctx).thread;
+                let fuel = thread.backedge_fuel_cell as *mut u64;
+                *fuel = 1_000_000;
+            }
+            0
+        }
         let view = summation_view();
-        let code = compile(&view, 16).expect("summation loop is eligible");
+        let mut transitions = TransitionTable::resolve();
+        transitions.replace_entry_for_test(
+            otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL,
+            refilling_poll as *const () as usize,
+        );
+        let code = compile_with_transitions(&view, 16, &transitions)
+            .expect("summation loop is eligible");
         let interrupt = 0_u8;
         let mut fuel = 1_u64;
-        let (result, frame, resume_pc) = execute_with_poll_cells(
+        let (result, _, _) = execute_with_poll_cells(
             &code,
             &[box_i32(5)],
             std::ptr::addr_of!(interrupt),
             &mut fuel,
         );
 
-        assert_eq!(result.status, STATUS_BAILED);
-        assert_eq!(result.value, 0);
-        assert_eq!(resume_pc, 3);
-        assert_eq!(fuel, 0);
-        assert_eq!(frame[1], box_i32(1));
-        assert_eq!(frame[2], box_i32(0));
+        assert_eq!(result.status, STATUS_RETURNED);
+        assert_eq!(unbox_i32(result.value), 10);
     }
 
     #[test]

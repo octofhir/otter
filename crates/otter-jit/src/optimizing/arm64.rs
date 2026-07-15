@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
 use otter_vm::JitCompileSnapshot;
-use otter_vm::deopt::{DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
+use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
@@ -117,14 +117,15 @@ const MAX_PARAMETER_OFFSET: u32 = 32_760;
 #[derive(Debug, Clone, Copy)]
 struct GuardedUse {
     use_pc: u32,
-    deopt_byte_pc: u32,
 }
 
 #[derive(Debug)]
 struct Eligibility {
     guarded_uses: Vec<GuardedUse>,
     /// `(deopt-table byte PC, native-frame logical resume PC)` per back-edge.
-    back_edges: BTreeMap<(BlockId, BlockId), (u32, u32)>,
+    /// Back edge -> the exit its poll deoptimizes through, and the header's
+    /// logical PC. A poll's deopt state is the target header's entry state.
+    back_edges: BTreeMap<(BlockId, BlockId), (DeoptExitId, u32)>,
     /// Verified loop-header entry state keyed by target block.
     osr_entries: BTreeMap<BlockId, OsrEntrySite>,
     /// Precise transition protocol per element load/store logical PC.
@@ -175,6 +176,9 @@ struct EmissionPlan<'a> {
     allocation: &'a Allocation,
     eligibility: &'a Eligibility,
     deopt_table: &'a DeoptTable,
+    /// Abstract states, so an emitted exit can be named by its dense id rather
+    /// than by a PC, which a body may guard more than once.
+    frame_states: &'a FrameStateTable,
     load_element_entry: u64,
     store_element_entry: u64,
     load_property_entry: u64,
@@ -272,6 +276,7 @@ pub(super) fn compile_with_transitions(
             allocation: &allocation,
             eligibility: &eligibility,
             deopt_table: deopt.table(),
+            frame_states: &frame_states,
             load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
             store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
             load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
@@ -405,11 +410,15 @@ fn check_eligibility(
                         "optimizing subset rejects irreducible back-edges",
                     ));
                 }
+                let header = &cfg.blocks[successor.0 as usize];
                 back_edges.insert(
                     (block.id, successor),
                     (
-                        byte_pc(view, cfg.blocks[successor.0 as usize].start_pc)?,
-                        cfg.blocks[successor.0 as usize].start_pc,
+                        DeoptLowering::exit_at(frame_states, header.inline, header.start_pc)
+                            .ok_or(Unsupported::OperandShape(
+                                "optimizing back edge header has no frame state",
+                            ))?,
+                        header.start_pc,
                     ),
                 );
             }
@@ -879,10 +888,7 @@ fn check_eligibility(
                 ));
             }
         }
-        guarded_numeric_uses.push(GuardedUse {
-            use_pc,
-            deopt_byte_pc: byte_pc(view, use_pc)?,
-        });
+        guarded_numeric_uses.push(GuardedUse { use_pc });
     }
     guarded_numeric_uses.sort_by_key(|guarded| guarded.use_pc);
     guarded_numeric_uses.dedup_by_key(|guarded| guarded.use_pc);
@@ -1297,11 +1303,15 @@ fn is_exact_i32(number: f64) -> bool {
         && number == f64::from(number as i32)
 }
 
-fn byte_pc(view: &JitCompileSnapshot, pc: u32) -> Result<u32, Unsupported> {
-    view.instructions
-        .get(pc as usize)
-        .map(|instruction| instruction.byte_pc)
-        .ok_or(Unsupported::OperandShape("optimizing instruction byte PC"))
+
+/// Name the exit an instruction deoptimizes through.
+fn deopt_exit_at(
+    frame_states: &FrameStateTable,
+    instruction: &SsaInstr,
+) -> Result<DeoptExitId, Unsupported> {
+    DeoptLowering::exit_at(frame_states, instruction.inline, instruction.pc).ok_or(
+        Unsupported::OperandShape("optimizing deopt exit has no frame state"),
+    )
 }
 
 fn emit(
@@ -1316,6 +1326,7 @@ fn emit(
         allocation,
         eligibility,
         deopt_table,
+        frame_states,
         load_element_entry,
         store_element_entry,
         load_property_entry,
@@ -1328,7 +1339,7 @@ fn emit(
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
-    let mut deopt_exits = Vec::<(DynamicLabel, u32, u32)>::new();
+    let mut deopt_exits = Vec::<(DynamicLabel, DeoptExitId, u32)>::new();
     let threw = ops.new_dynamic_label();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
         .map(|_| ops.new_dynamic_label())
@@ -1374,15 +1385,22 @@ fn emit(
             &ssa.blocks[block_id.0 as usize].phis,
         )?;
         for instruction in &ssa.blocks[block_id.0 as usize].instrs {
-            let guard_deopt = eligibility
+            let guard_deopt = match eligibility
                 .guarded_uses
                 .iter()
-                .find(|param| param.use_pc == instruction.pc)
-                .map(|param| {
+                .find(|guarded| guarded.use_pc == instruction.pc)
+            {
+                Some(_) => {
                     let label = ops.new_dynamic_label();
-                    deopt_exits.push((label, param.deopt_byte_pc, instruction.pc));
-                    label
-                });
+                    deopt_exits.push((
+                        label,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
+                    Some(label)
+                }
+                None => None,
+            };
             match instruction.op {
                 Op::LoadInt32 => {
                     let value = load_int32(view, instruction.pc)?;
@@ -1876,7 +1894,7 @@ fn emit(
                     )?;
                     // An exotic-receiver report (`2`) side-exits before the opcode
                     // takes effect: a full deopt re-runs it in the interpreter.
-                    deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                    deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
                 }
                 Op::New => {
                     let dst = instruction
@@ -1941,7 +1959,7 @@ fn emit(
                     )?;
                     // A non-constructor report (`2`) has no committed effects;
                     // deopt re-runs the opcode to create the canonical TypeError.
-                    deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                    deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
                 }
                 Op::LogicalNot => {
                     let result = instruction
@@ -1969,7 +1987,7 @@ fn emit(
                         allocation.location(result),
                         11,
                     )?;
-                    deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                    deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
                 }
                 Op::Neg => {
                     let result = instruction.result.expect("eligibility checked negate result");
@@ -1994,7 +2012,7 @@ fn emit(
                             emit_store_location(&mut ops, allocation.location(result), 11)?;
                             deopt_exits.push((
                                 deopt,
-                                byte_pc(view, instruction.pc)?,
+                                deopt_exit_at(frame_states, instruction)?,
                                 instruction.pc,
                             ));
                         }
@@ -2041,7 +2059,7 @@ fn emit(
                         ; b.vs =>deopt
                     );
                     emit_store_location(&mut ops, allocation.location(result), 11)?;
-                    deopt_exits.push((deopt, byte_pc(view, instruction.pc)?, instruction.pc));
+                    deopt_exits.push((deopt, deopt_exit_at(frame_states, instruction)?, instruction.pc));
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let result = instruction.result.expect("eligibility checked result");
@@ -2089,7 +2107,7 @@ fn emit(
                             emit_store_location(&mut ops, allocation.location(result), 11)?;
                             deopt_exits.push((
                                 deopt,
-                                byte_pc(view, instruction.pc)?,
+                                deopt_exit_at(frame_states, instruction)?,
                                 instruction.pc,
                             ));
                         }
@@ -2156,7 +2174,7 @@ fn emit(
                                     emit_num_to_double(&mut ops, 0, FP_SCRATCH, deopt);
                                     deopt_exits.push((
                                         deopt,
-                                        byte_pc(view, instruction.pc)?,
+                                        deopt_exit_at(frame_states, instruction)?,
                                         instruction.pc,
                                     ));
                                 }
@@ -2279,7 +2297,7 @@ fn emit(
                     if !is_boolean_value(ssa, instruction.inputs[0]) {
                         let bail = ops.new_dynamic_label();
                         emit_truthiness_reduce(&mut ops, bail);
-                        deopt_exits.push((bail, byte_pc(view, instruction.pc)?, instruction.pc));
+                        deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
                     }
                     emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
                     let taken_edge = ops.new_dynamic_label();
@@ -2368,13 +2386,11 @@ fn emit(
     );
     emit_epilogue(&mut ops, spill_frame_bytes);
 
-    for (label, deopt_byte_pc, resume_pc) in deopt_exits {
+    for (label, exit, resume_pc) in deopt_exits {
         dynasm!(ops ; .arch aarch64 ; =>label);
-        let frame_state = deopt_table
-            .lookup(deopt_byte_pc)
-            .ok_or(Unsupported::OperandShape(
-                "optimizing deopt exit missing frame state",
-            ))?;
+        let frame_state = deopt_table.lookup(exit).ok_or(Unsupported::OperandShape(
+            "optimizing deopt exit missing frame state",
+        ))?;
         // Eligibility rejects spliced frames, so an exit owes the interpreter
         // this function's frame and nothing else.
         if !frame_state.is_single_frame() {
@@ -2434,7 +2450,7 @@ fn emit_cfg_edge(
     ops: &mut Assembler,
     allocation: &Allocation,
     eligibility: &Eligibility,
-    deopt_exits: &mut Vec<(DynamicLabel, u32, u32)>,
+    deopt_exits: &mut Vec<(DynamicLabel, DeoptExitId, u32)>,
     block_labels: &[DynamicLabel],
     predecessor: BlockId,
     target: BlockId,
@@ -2444,10 +2460,10 @@ fn emit_cfg_edge(
         allocation,
         edge_moves(allocation, predecessor, target)?,
     )?;
-    if let Some(&(header_byte_pc, header_pc)) = eligibility.back_edges.get(&(predecessor, target)) {
+    if let Some(&(exit, header_pc)) = eligibility.back_edges.get(&(predecessor, target)) {
         let deopt = ops.new_dynamic_label();
         emit_backedge_poll(ops, deopt);
-        deopt_exits.push((deopt, header_byte_pc, header_pc));
+        deopt_exits.push((deopt, exit, header_pc));
     }
     let target_label = block_labels[target.0 as usize];
     dynasm!(ops ; .arch aarch64 ; b =>target_label);

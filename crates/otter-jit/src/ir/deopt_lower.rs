@@ -26,14 +26,14 @@ use std::collections::BTreeSet;
 use otter_vm::{
     JitCompileSnapshot,
     deopt::{
-        DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable, DeoptVerifyError,
-        DeoptVerifyLimits, FrameState,
+        DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
+        DeoptVerifyError, DeoptVerifyLimits, FrameState,
     },
 };
 
 use super::{
     frame_state::{AbstractFrameState, FrameStateTable},
-    inline::{InlineFrame, InlineTree},
+    inline::{InlineFrame, InlineId, InlineTree},
     regalloc::{Allocation, Location, RegClass},
     repr::{ReprError, ReprMap, Representation},
     ssa::{SsaFunction, ValueId},
@@ -223,6 +223,24 @@ impl DeoptLowering {
         Ok(lowering)
     }
 
+    /// The exit an emitter must name to deoptimize at one instruction.
+    ///
+    /// Exits are lowered in abstract-state order, so a state's index is its id.
+    /// The emitter cannot name an exit by PC: a body may guard the same
+    /// instruction more than once, and a spliced callee's PCs are its own.
+    #[must_use]
+    pub fn exit_at(
+        frame_states: &FrameStateTable,
+        inline: InlineId,
+        pc: u32,
+    ) -> Option<DeoptExitId> {
+        frame_states
+            .states()
+            .iter()
+            .position(|state| state.inline == inline && state.pc == pc)
+            .map(|index| DeoptExitId(index as u32))
+    }
+
     /// Borrow the verified concrete exact-byte-PC deopt table.
     #[must_use]
     pub fn table(&self) -> &DeoptTable {
@@ -251,15 +269,15 @@ impl DeoptLowering {
             });
         }
 
-        for state in frame_states.states() {
+        for (exit, state) in frame_states.states().iter().enumerate() {
             let byte_pc = byte_pc(view, state.pc)?;
-            let concrete =
-                self.table
-                    .lookup(byte_pc)
-                    .ok_or(DeoptLoweringError::MissingConcreteState {
-                        pc: state.pc,
-                        byte_pc,
-                    })?;
+            let concrete = self
+                .table
+                .lookup(DeoptExitId(exit as u32))
+                .ok_or(DeoptLoweringError::MissingConcreteState {
+                    pc: state.pc,
+                    byte_pc,
+                })?;
             let concrete = concrete.innermost();
             let expected_width = usize::from(ssa.frame_registers(state.inline));
             if concrete.slots.len() != expected_width {
@@ -386,23 +404,35 @@ fn lower_table(
     for state in frame_states.states() {
         // Rebuild the whole chain this exit owes the interpreter: the outermost
         // function first, then each inlined caller down to the frame the code
-        // was executing.
+        // was executing. Only the innermost frame resumes at the instruction
+        // that exited; every caller resumes after the call it had already
+        // advanced past.
         let mut chain = Vec::new();
         let mut current = Some(state);
+        let mut resume = ResumeAt::Instruction;
         while let Some(state) = current {
-            chain.push(lower_frame(tree, state, ssa, allocation, reprs)?);
+            chain.push(lower_frame(tree, state, ssa, allocation, reprs, resume)?);
             current = state.caller.map(|index| &frame_states.states()[index]);
+            resume = ResumeAt::AfterCall;
         }
         chain.reverse();
         states.push(FrameState {
-            byte_pc: chain
-                .first()
-                .expect("a chain always contains the outermost frame")
-                .byte_pc,
             frames: chain.into_boxed_slice(),
         });
     }
     Ok(DeoptTable::from_states(states))
+}
+
+/// Where one frame of a chain picks execution back up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeAt {
+    /// The frame the optimized code was executing: it re-runs the instruction
+    /// that exited, which has committed nothing.
+    Instruction,
+    /// A caller: the interpreter advances past a call before pushing its
+    /// callee's frame, so a rebuilt caller must resume after the call, and the
+    /// register the call writes arrives through the ordinary return protocol.
+    AfterCall,
 }
 
 /// Lower one abstract frame state into its concrete interpreter frame.
@@ -412,6 +442,7 @@ fn lower_frame(
     ssa: &SsaFunction,
     allocation: &Allocation,
     reprs: &ReprMap,
+    resume: ResumeAt,
 ) -> Result<DeoptFrame, DeoptLoweringError> {
     let frame = &tree.frames[state.inline.0 as usize];
     let slots = state
@@ -422,9 +453,13 @@ fn lower_frame(
             lower_slot(register as u16, value, ssa, allocation, reprs, state.pc)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let pc = match resume {
+        ResumeAt::Instruction => state.pc,
+        ResumeAt::AfterCall => state.pc + 1,
+    };
     Ok(DeoptFrame {
         function_id: frame.function_id,
-        byte_pc: frame_byte_pc(frame, state.pc)?,
+        byte_pc: frame_byte_pc(frame, pc)?,
         slots: slots.into_boxed_slice(),
     })
 }
@@ -586,7 +621,6 @@ fn verify_limits(
 mod tests {
     use otter_bytecode::{Op, Operand};
     use otter_vm::{
-        deopt::{DeoptVerifyError, DeoptVerifyLimits},
         jit::JitTestInstruction,
         jit_feedback::{ARITH_FLOAT64, ARITH_INT32, ArithFeedback},
     };
@@ -687,10 +721,9 @@ mod tests {
         pipeline: &Pipeline,
         pc: u32,
     ) -> &'a FrameState {
-        lowering
-            .table()
-            .lookup(pipeline.view.instructions[pc as usize].byte_pc)
-            .expect("exact byte PC is lowered")
+        let exit = DeoptLowering::exit_at(&pipeline.frame_states, InlineId::ROOT, pc)
+            .expect("every instruction has a frame state");
+        lowering.table().lookup(exit).expect("the exit is lowered")
     }
 
     #[test]
@@ -1012,28 +1045,36 @@ mod tests {
             })
         );
 
-        let empty_frame = |byte_pc| FrameState {
-            byte_pc,
-            frames: Box::new([DeoptFrame {
-                function_id: 0,
-                byte_pc,
-                slots: Box::new([]),
-            }]),
-        };
-        let out_of_order =
-            DeoptTable::from_unverified_states(vec![empty_frame(20), empty_frame(8)]);
-        assert_eq!(
-            out_of_order.verify(DeoptVerifyLimits {
-                max_frame_slots: 0,
-                machine_register_count: 0,
-                min_stack_slot_offset: 0,
-                max_stack_slot_offset: 0,
-                constant_count: 0,
-            }),
-            Err(DeoptVerifyError::EntriesNotSorted {
-                previous: 20,
-                current: 8
-            })
+    }
+
+    #[test]
+    fn exits_are_named_by_dense_id_not_by_pc() {
+        let pipeline = pipeline(
+            0,
+            1,
+            budget(8, 8),
+            vec![
+                (Op::LoadInt32, vec![Operand::Register(0), Operand::Imm32(9)]),
+                (Op::Nop, vec![]),
+                (Op::ReturnUndefined, vec![]),
+            ],
+            &[],
+        );
+        let lowering = lower(&pipeline);
+
+        // Every abstract state gets its own exit, in state order.
+        assert_eq!(lowering.table().entries().len(), pipeline.frame_states.states().len());
+        for (index, state) in pipeline.frame_states.states().iter().enumerate() {
+            assert_eq!(
+                DeoptLowering::exit_at(&pipeline.frame_states, state.inline, state.pc),
+                Some(DeoptExitId(index as u32)),
+            );
+        }
+        assert!(
+            lowering
+                .table()
+                .lookup(DeoptExitId(lowering.table().entries().len() as u32))
+                .is_none()
         );
     }
 }

@@ -517,9 +517,35 @@ pub(crate) struct TemplatePlan {
     pub(crate) osr_only: bool,
 }
 
+/// Pack a call's argument registers inline (up to [`MAX_METHOD_ARGS`] u16
+/// lanes) or spill a longer list into the plan's decoded register buffer,
+/// returning the spill start index. `argc` discriminates the two encodings
+/// end-to-end: the emitter rewrites a spilled index into the frozen buffer's
+/// baked address, and runtime stubs decode by the same rule.
+fn pack_or_spill_arg_regs(arguments: &[u16], register_operands: &mut Vec<u16>) -> u64 {
+    if arguments.len() <= MAX_METHOD_ARGS {
+        pack_method_arg_regs(arguments)
+    } else {
+        let start = register_operands.len() as u64;
+        register_operands.extend_from_slice(arguments);
+        start
+    }
+}
+
 impl TemplatePlan {
     pub(crate) fn register_tail(&self, tail: TemplateTail) -> &[u16] {
         &self.register_operands[tail.start..tail.start + tail.len]
+    }
+
+    /// Resolve a call's packed-argument word for emission: a spilled list
+    /// (`argc > MAX_METHOD_ARGS`) becomes the baked address of its table in
+    /// the frozen decoded-operand buffer; an inline pack passes through.
+    pub(crate) fn resolve_packed_args(&self, argc: u16, packed_args: u64) -> u64 {
+        if usize::from(argc) > MAX_METHOD_ARGS {
+            self.register_operands[packed_args as usize..].as_ptr() as u64
+        } else {
+            packed_args
+        }
     }
 
     pub(crate) fn index_tail(&self, tail: TemplateTail) -> &[u32] {
@@ -838,19 +864,11 @@ impl TemplatePlan {
                 Op::Call => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
-                        osr_only = true;
-                        instructions.push(TemplateInstr {
-                            pc,
-                            op: TemplateOp::UnsupportedBail,
-                        });
-                        continue;
-                    }
                     TemplateOp::Call {
                         dst: operands.dst,
                         callee: operands.callee,
                         argc: arguments.len() as u16,
-                        packed_args: pack_method_arg_regs(arguments),
+                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                     }
                 }
                 Op::CallWithThis => {
@@ -904,27 +922,16 @@ impl TemplatePlan {
                 Op::New => {
                     let operands = lowered.call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
-                        osr_only = true;
-                        instructions.push(TemplateInstr {
-                            pc,
-                            op: TemplateOp::UnsupportedBail,
-                        });
-                        continue;
-                    }
                     TemplateOp::Construct {
                         dst: operands.dst,
                         callee: operands.callee,
                         argc: arguments.len() as u16,
-                        packed_args: pack_method_arg_regs(arguments),
+                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                     }
                 }
                 Op::CallMethodValue => {
                     let operands = lowered.method_call_operands()?;
                     let arguments = lowering.register_tail(operands.arguments)?;
-                    if arguments.len() > MAX_METHOD_ARGS {
-                        return Err(Unsupported::ArgCount(arguments.len()));
-                    }
                     let site = meta
                         .property_ic_site(view.code_block.as_ref())
                         .unwrap_or(usize::MAX) as u64;
@@ -934,7 +941,7 @@ impl TemplatePlan {
                         name: operands.name,
                         site,
                         argc: arguments.len() as u16,
-                        packed_args: pack_method_arg_regs(arguments),
+                        packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
                         byte_pc: lowered.byte_pc,
                         arg0: arguments.first().copied(),
                         arg1: arguments.get(1).copied(),

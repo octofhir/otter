@@ -14,7 +14,7 @@
 
 use otter_vm::Value;
 
-use super::super::{JitCtx, unpack_method_arg_regs};
+use super::super::JitCtx;
 use super::park_jit_error;
 
 /// Number of shapes a WhiskerIC site caches inline before it is megamorphic and
@@ -345,15 +345,15 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
+    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
+    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_runtime_try_collection_method_ic(
         stack,
         ctx.frame_index,
         dst as u16,
         recv as u16,
         site as usize,
-        &all[..argc],
+        args,
     ) {
         Ok(true) => 0,
         Ok(false) => 2,

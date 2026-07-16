@@ -993,22 +993,28 @@ fn check_eligibility(
                     )?;
                 }
                 Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
-                    // Bitwise and shift results are int32 in JS; only the
-                    // int32-feedback form (both operands already int32) is
-                    // eligible. The op cannot overflow the int32 range.
+                    // Bitwise and shift results are int32 in JS. Int32-only
+                    // feedback computes directly; mixed numeric feedback takes
+                    // float64 operands through the exact JS ToInt32 conversion
+                    // (fjcvtzs) and returns the int32 result as an exact double.
                     let result = instruction
                         .result
                         .ok_or(Unsupported::OperandShape("bitwise result"))?;
-                    if reprs.representation(result) != Representation::Int32
-                        || instruction.inputs.len() != 2
-                    {
+                    if instruction.inputs.len() != 2 {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
+                    let required = match reprs.representation(result) {
+                        Representation::Int32 => Representation::Int32,
+                        Representation::Float64 => Representation::Float64,
+                        Representation::Tagged => {
+                            return Err(Unsupported::Opcode(instruction.op));
+                        }
+                    };
                     check_numeric_inputs(
                         instruction,
                         ssa,
                         reprs,
-                        Representation::Int32,
+                        required,
                         &mut guarded_uses,
                         &mut allowed_conversions,
                     )?;
@@ -3128,12 +3134,43 @@ fn emit(
                 }
                 Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
                     let result = instruction.result.expect("eligibility checked result");
-                    emit_load_int_operand(
-                        &mut ops, reprs, allocation, instruction, 0, 9, guard_deopt,
-                    )?;
-                    emit_load_int_operand(
-                        &mut ops, reprs, allocation, instruction, 1, 10, guard_deopt,
-                    )?;
+                    let float_form =
+                        reprs.representation(result) == Representation::Float64;
+                    if float_form {
+                        // Mixed numeric operands: exact JS ToInt32 per operand
+                        // (fjcvtzs truncates and wraps modulo 2^32), integer
+                        // op, and the int32 result back as an exact double.
+                        emit_load_float_operand(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            0,
+                            FP_SCRATCH,
+                            guard_deopt,
+                        )?;
+                        emit_load_float_operand(
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            1,
+                            FP_SCRATCH_2,
+                            guard_deopt,
+                        )?;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; fjcvtzs w9, D(FP_SCRATCH)
+                            ; fjcvtzs w10, D(FP_SCRATCH_2)
+                        );
+                    } else {
+                        emit_load_int_operand(
+                            &mut ops, reprs, allocation, instruction, 0, 9, guard_deopt,
+                        )?;
+                        emit_load_int_operand(
+                            &mut ops, reprs, allocation, instruction, 1, 10, guard_deopt,
+                        )?;
+                    }
                     match instruction.op {
                         Op::BitwiseAnd => dynasm!(ops ; .arch aarch64 ; and w11, w9, w10),
                         Op::BitwiseOr => dynasm!(ops ; .arch aarch64 ; orr w11, w9, w10),
@@ -3151,7 +3188,17 @@ fn emit(
                         ),
                         _ => unreachable!("eligibility checked bitwise op"),
                     }
-                    emit_store_location(&mut ops, allocation.location(result), 11)?;
+                    if float_form {
+                        dynasm!(ops ; .arch aarch64 ; scvtf D(FP_SCRATCH), w11);
+                        emit_store_fp_location(
+                            &mut ops,
+                            allocation,
+                            allocation.location(result),
+                            FP_SCRATCH,
+                        )?;
+                    } else {
+                        emit_store_location(&mut ops, allocation.location(result), 11)?;
+                    }
                 }
                 Op::LessThan
                 | Op::LessEq

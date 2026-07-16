@@ -2,14 +2,14 @@
 //!
 //! # Contents
 //! - Hot returned/aborted completion by compact owner id.
-//! - Cold adoption of one native activation into an independent interpreter
-//!   stack after a bailout has actually fired.
+//! - Cold adoption of one native activation above the caller's activation
+//!   floor after a bailout has actually fired.
 //!
 //! # Invariants
 //! - Every successful prepare removes exactly its youngest
 //!   [`crate::native_call_owners::NativeCallOwner`] and releases exactly one
 //!   synchronous re-entry guard.
-//! - Normal return and abort never construct or inspect a [`HoltStack`]. The
+//! - Normal return and abort never construct or inspect a [`ActivationStack`]. The
 //!   compiled caller writes the returned value through its live ActiveFrame.
 //! - Bailout moves the owner's register window into one [`Frame`] without
 //!   copying registers. Owned upvalues move with it; a borrowed closure spine
@@ -88,7 +88,7 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Adopt a bailed compiled callee into one independent interpreter stack.
+    /// Adopt a bailed compiled callee above the caller's activation floor.
     ///
     /// `native.header.pc` is the exact logical resume PC published by the
     /// compiled side exit. The descriptor must be copied while its native
@@ -96,6 +96,7 @@ impl Interpreter {
     pub fn jit_finish_direct_call_bailed(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         owner_id: u32,
         native: NativeFrame,
     ) -> Result<Value, VmError> {
@@ -119,11 +120,10 @@ impl Interpreter {
             self.jit_runtime_stats.optimized_deopts =
                 self.jit_runtime_stats.optimized_deopts.saturating_add(1);
         }
-        let mut stack = self.draw_stack();
-        debug_assert!(stack.is_empty(), "pooled HoltStack must be drained");
+        let floor = stack.floor();
         stack.push(frame);
-        let result = self.dispatch_loop(context, &mut stack);
-        self.return_stack(stack);
+        let result = self.dispatch_loop_above(context, stack, floor);
+        self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
     }
@@ -164,16 +164,16 @@ mod tests {
     }
 
     #[test]
-    fn hot_return_releases_owner_without_holt_stack() {
+    fn hot_return_releases_owner_without_materializing_an_activation() {
         let mut vm = Interpreter::new();
-        let pooled_before = vm.holt_pool.len();
+        let pooled_before = vm.reentry_stack_cache.len();
         let (owner_id, _) = publish_test_owner(&mut vm, 17);
 
         vm.jit_finish_direct_call_returned(owner_id).unwrap();
 
         assert_eq!(vm.native_call_owners.len(), 0);
         assert_eq!(vm.register_stack.checkpoint(), 0);
-        assert_eq!(vm.holt_pool.len(), pooled_before);
+        assert_eq!(vm.reentry_stack_cache.len(), pooled_before);
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use smallvec::SmallVec;
 
 use super::MethodCallIc;
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use crate::native_abi::RuntimeStubId;
 use crate::{Interpreter, Value, VmError, read_register, write_register};
 
@@ -24,7 +24,7 @@ impl Interpreter {
     /// semantics.
     pub fn jit_runtime_try_string_char_code_at(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         recv: Value,
@@ -74,7 +74,7 @@ impl Interpreter {
     /// semantics by falling back to the generic bridge.
     pub fn jit_runtime_try_number_to_string(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         recv: Value,
@@ -103,7 +103,7 @@ impl Interpreter {
     /// performs method resolution or calls user code.
     pub fn jit_runtime_try_collection_leaf_method(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         recv_reg: u16,
@@ -142,7 +142,7 @@ impl Interpreter {
     /// back to [`Self::jit_runtime_call_method`] on `Ok(false)`.
     pub fn jit_runtime_try_collection_method_ic(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         recv_reg: u16,
@@ -170,7 +170,7 @@ impl Interpreter {
     /// VM-native leaf ABI entry against raw register-window values.
     pub fn jit_runtime_resolve_collection_leaf_method_stub(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         frame_index: usize,
         recv_reg: u16,
         site: usize,

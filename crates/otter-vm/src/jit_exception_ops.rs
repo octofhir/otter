@@ -12,11 +12,11 @@
 //! # Invariants
 //! - A transition that mutates cold-frame state never asks the interpreter to
 //!   replay the originating opcode.
-//! - The machine activation owns the live HoltStack frame until compiled code
+//! - The machine activation owns the live ActivationStack frame until compiled code
 //!   returns; helpers may select a continuation or return value, but never pop
 //!   that frame underneath native code.
 //! - Thrown values remain rooted in the published register/cold-frame graph,
-//!   and reentry uses the existing HoltStack/VmThread activation ABI.
+//!   and reentry uses the existing ActivationStack/VmThread activation ABI.
 //!
 //! # See also
 //! - [`crate::Interpreter::unwind_throw`]
@@ -26,9 +26,9 @@ use otter_bytecode::Op;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, TryHandler, Value, VmError,
+    activation_stack::ActivationStack,
     cold_frame::{AbruptFrameOutcome, AbruptKind, ParkedFinally},
     error_ops::snapshot_frames,
-    holt_stack::HoltStack,
     read_register,
 };
 
@@ -55,7 +55,7 @@ impl Interpreter {
     pub fn jit_materialize_error_from_compiled(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         err: VmError,
     ) -> Result<Option<u32>, VmError> {
@@ -81,7 +81,7 @@ impl Interpreter {
     pub fn jit_resume_caller_throw(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
     ) -> Result<Option<u32>, VmError> {
         let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
@@ -117,7 +117,7 @@ impl Interpreter {
     pub fn jit_runtime_exception_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,
@@ -207,7 +207,7 @@ impl Interpreter {
     fn jit_throw_from_compiled(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         value: Value,
     ) -> Result<JitExceptionOutcome, VmError> {

@@ -237,7 +237,7 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
             jit_next_code_object_id: 1,
-            holt_pool: Vec::new(),
+            reentry_stack_cache: Vec::new(),
             register_stack: register_stack::RegisterStack::new(),
             native_call_owners: native_call_owners::NativeCallOwnerStack::new(),
             jit_native_activations: vec![
@@ -266,7 +266,7 @@ impl Interpreter {
             rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
             pending_uncaught_frames: None,
             module_sources: source_registry::SourceRegistry::default(),
-            active_frame_stack: std::ptr::null(),
+            active_frame_stack: None,
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),

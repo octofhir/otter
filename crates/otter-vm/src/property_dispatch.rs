@@ -19,7 +19,7 @@
 //! - [`crate::executable`]
 //! - [`crate::object`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use otter_gc::raw::RawGc;
@@ -82,7 +82,7 @@ impl Interpreter {
 
     fn capture_store_property_transition_with_stack_roots(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         mut obj: JsObject,
         key: AtomizedPropertyKey<'_>,
         value: &Value,
@@ -206,7 +206,7 @@ impl Interpreter {
 
     fn function_user_bag_with_stack_roots(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
@@ -684,7 +684,7 @@ impl Interpreter {
     pub(crate) fn run_load_super_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         home: Value,
@@ -738,7 +738,7 @@ impl Interpreter {
     pub(crate) fn run_store_super_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         home: Value,
         key: SuperReadKey<'_>,
@@ -931,7 +931,7 @@ impl Interpreter {
     pub(crate) fn run_load_property_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         obj_reg: u16,
@@ -955,7 +955,7 @@ impl Interpreter {
     pub(crate) fn load_property_value(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         receiver: Value,
         name: &str,
     ) -> Result<Value, VmError> {
@@ -1461,7 +1461,7 @@ impl Interpreter {
     pub(crate) fn store_property_value(
         &mut self,
         context: &ExecutionContext,
-        _stack: &mut HoltStack,
+        _stack: &mut ActivationStack,
         receiver: Value,
         name: &str,
         value: Value,
@@ -1560,7 +1560,7 @@ impl Interpreter {
     pub(crate) fn run_store_property_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         obj_reg: u16,
         key: AtomizedPropertyKey<'_>,
@@ -2754,7 +2754,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         frame: &mut crate::ActiveFrameMut<'_>,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         function_id: u32,
         dst: u16,
         obj_reg: u16,
@@ -2771,7 +2771,7 @@ impl Interpreter {
         // only serve cache-representable ordinary-object loads.
         let full_get = |vm: &mut Self,
                         frame: &mut crate::ActiveFrameMut<'_>,
-                        stack: &mut HoltStack|
+                        stack: &mut ActivationStack|
          -> Result<u64, VmError> {
             // Re-read the receiver from the traced activation: the IC probes
             // above may have allocated (cache-stub install) and moved the
@@ -2843,7 +2843,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         frame: &mut crate::ActiveFrameMut<'_>,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         function_id: u32,
         obj_reg: u16,
         name_idx: u32,
@@ -2858,7 +2858,7 @@ impl Interpreter {
         let value = frame.read(src)?;
         let full_set = |vm: &mut Self,
                         frame: &mut crate::ActiveFrameMut<'_>,
-                        stack: &mut HoltStack|
+                        stack: &mut ActivationStack|
          -> Result<u64, VmError> {
             // Re-read both values from the published, traced window. IC setup
             // and property-key materialisation may allocate and move either
@@ -3016,7 +3016,7 @@ impl Interpreter {
     pub(crate) fn run_define_data_property_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         obj_reg: u16,
         key_reg: u16,
@@ -3244,7 +3244,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinaryget>
     pub(crate) fn drive_load_property(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -3550,7 +3550,7 @@ impl Interpreter {
     /// fast path's prototype-walk fallback.
     pub(crate) fn drive_instanceof(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -3570,7 +3570,7 @@ impl Interpreter {
     /// object/proxy reads whose resolved descriptor is an accessor.
     pub(crate) fn drive_load_element(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -3742,7 +3742,7 @@ impl Interpreter {
         context.function_is_strict(function_id)
     }
 
-    fn current_frame_is_strict(stack: &HoltStack, context: &ExecutionContext) -> bool {
+    fn current_frame_is_strict(stack: &ActivationStack, context: &ExecutionContext) -> bool {
         stack
             .last()
             .is_some_and(|frame| Self::function_is_strict(context, frame.function_id))
@@ -3787,7 +3787,7 @@ impl Interpreter {
 
     fn finish_failed_set(
         &self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         message: impl Into<Box<str>>,
     ) -> Result<bool, VmError> {
@@ -3822,7 +3822,7 @@ impl Interpreter {
 
     fn store_to_primitive_base(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         key: VmPropertyKey,
@@ -4031,7 +4031,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
     pub(crate) fn drive_store_property(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -4483,7 +4483,7 @@ impl Interpreter {
     /// the trap-aware walk instead of delegating to `object::lookup`.
     pub(crate) fn drive_has_property_proxy(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -4580,7 +4580,7 @@ impl Interpreter {
     /// trap when the receiver of `delete obj.x` is a Proxy.
     pub(crate) fn drive_delete_property_proxy(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -4616,7 +4616,7 @@ impl Interpreter {
     /// same trap-aware path as `delete obj.x`.
     pub(crate) fn drive_delete_element_proxy(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -4644,7 +4644,7 @@ impl Interpreter {
     /// `getPrototypeOf` trap when the source is a Proxy.
     pub(crate) fn drive_get_prototype_proxy(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -4665,7 +4665,7 @@ impl Interpreter {
     /// `setPrototypeOf` trap when the receiver is a Proxy.
     pub(crate) fn drive_set_prototype_proxy(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {

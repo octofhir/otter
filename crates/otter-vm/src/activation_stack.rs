@@ -6,7 +6,9 @@
 //! windows, never `Frame` addresses, across a push.
 //!
 //! # Contents
-//! - [`HoltStack`] — the frame stack and its stack-discipline API.
+//! - [`ActivationStack`] — the frame stack and its stack-discipline API.
+//! - [`ActivationFloor`] — a lexical lower bound for nested VM execution.
+//! - Direct GC tracing of the live activation range and cold side records.
 //!
 //! # Invariants
 //! - No reference or pointer to a `Frame` survives an operation that can push.
@@ -19,6 +21,7 @@
 //!   state.
 
 use crate::frame_state::Frame;
+use otter_gc::raw::RawGc;
 
 /// Growable stack of materialized interpreter call [`Frame`]s.
 ///
@@ -26,24 +29,66 @@ use crate::frame_state::Frame;
 /// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `clear` /
 /// `iter` / `iter_mut`) plus `Index` / `IndexMut`.
 #[derive(Debug)]
-pub struct HoltStack {
+pub struct ActivationStack {
     frames: Vec<Frame>,
 }
 
-impl Default for HoltStack {
+/// Immutable lower bound of one nested execution region.
+///
+/// Frames below this depth belong to the caller and must remain visible to GC,
+/// diagnostics, and stack traces while the nested region runs. The token is a
+/// scalar snapshot; opening a region performs no allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationFloor {
+    depth: usize,
+}
+
+impl ActivationFloor {
+    /// Root execution region; no caller-owned materialized frames exist below it.
+    pub const ROOT: Self = Self { depth: 0 };
+
+    /// Absolute number of caller-owned frames below this region.
+    #[must_use]
+    pub const fn depth(self) -> usize {
+        self.depth
+    }
+}
+
+impl Default for ActivationStack {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HoltStack {
+impl ActivationStack {
     /// A new empty stack. Capacity grows only with observed call depth.
     #[must_use]
     pub fn new() -> Self {
         Self { frames: Vec::new() }
     }
 
-    /// Drop all frames but retain observed capacity for pooled reuse.
+    /// Mark the current absolute depth as the lower bound of nested execution.
+    #[inline]
+    #[must_use]
+    pub fn floor(&self) -> ActivationFloor {
+        ActivationFloor { depth: self.len() }
+    }
+
+    /// Number of frames owned by the region above `floor`.
+    #[inline]
+    #[must_use]
+    pub fn len_above(&self, floor: ActivationFloor) -> usize {
+        self.len().saturating_sub(floor.depth)
+    }
+
+    /// Whether no frame owned by the region above `floor` remains.
+    #[inline]
+    #[must_use]
+    pub fn is_at_floor(&self, floor: ActivationFloor) -> bool {
+        self.len() <= floor.depth
+    }
+
+    /// Drop all frames but retain capacity for the next execution turn.
     #[inline]
     pub fn clear(&mut self) {
         self.frames.clear();
@@ -155,9 +200,26 @@ impl HoltStack {
     pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Frame> {
         self.frames.iter_mut()
     }
+
+    /// Trace every non-register root owned by live materialized activations and
+    /// every cold side record. Register windows are traced once by the separate
+    /// [`crate::register_stack::RegisterStack`] live-prefix walk.
+    ///
+    /// The complete cold pool is intentional: frame construction can populate a
+    /// cold record before publishing the corresponding activation.
+    pub(crate) fn trace_roots(
+        &self,
+        cold_frames: &crate::cold_frame::ColdFramePool,
+        visitor: &mut dyn FnMut(*mut RawGc),
+    ) {
+        for frame in self.iter() {
+            frame.trace_frame_slots(visitor);
+        }
+        cold_frames.trace_all(visitor);
+    }
 }
 
-impl std::ops::Index<usize> for HoltStack {
+impl std::ops::Index<usize> for ActivationStack {
     type Output = Frame;
 
     #[inline]
@@ -166,7 +228,7 @@ impl std::ops::Index<usize> for HoltStack {
     }
 }
 
-impl std::ops::IndexMut<usize> for HoltStack {
+impl std::ops::IndexMut<usize> for ActivationStack {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut Frame {
         &mut self.frames[i]
@@ -186,7 +248,7 @@ mod tests {
     /// identity tag.
     fn one_register_module() -> BytecodeModule {
         BytecodeModule {
-            module: "holt-stack-test.ts".to_string(),
+            module: "activation-stack-test.ts".to_string(),
             template_sites: Vec::new(),
             source_kind: BcSourceKind::TypeScript,
             functions: vec![Function {
@@ -241,7 +303,7 @@ mod tests {
     fn push_pop_len_and_order() {
         let module = one_register_module();
         let f = &module.functions[0];
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let mut registers = crate::register_stack::RegisterStack::new();
         assert!(stack.is_empty());
 
@@ -262,10 +324,38 @@ mod tests {
     }
 
     #[test]
+    fn floor_is_a_zero_allocation_nested_execution_boundary() {
+        let module = one_register_module();
+        let f = &module.functions[0];
+        let mut stack = ActivationStack::new();
+        let mut registers = crate::register_stack::RegisterStack::new();
+
+        stack.push(tagged_frame(f, 10, &mut registers));
+        stack.push(tagged_frame(f, 11, &mut registers));
+        let capacity = stack.frames.capacity();
+        let floor = stack.floor();
+
+        assert_eq!(floor.depth(), 2);
+        assert!(stack.is_at_floor(floor));
+        assert_eq!(stack.len_above(floor), 0);
+        assert_eq!(stack.frames.capacity(), capacity);
+
+        stack.push(tagged_frame(f, 20, &mut registers));
+        assert!(!stack.is_at_floor(floor));
+        assert_eq!(stack.len_above(floor), 1);
+        assert_eq!(stack[0].registers[0], Value::number_i32(10));
+        assert_eq!(stack[1].registers[0], Value::number_i32(11));
+
+        stack.pop();
+        assert!(stack.is_at_floor(floor));
+        assert_eq!(stack.len(), floor.depth());
+    }
+
+    #[test]
     fn capacity_grows_with_observed_depth_without_moving_register_windows() {
         let module = one_register_module();
         let f = &module.functions[0];
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let mut registers = crate::register_stack::RegisterStack::new();
         assert_eq!(stack.frames.capacity(), 0);
         let n = 32;
@@ -284,7 +374,7 @@ mod tests {
     fn truncate_drops_to_target() {
         let module = one_register_module();
         let f = &module.functions[0];
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let mut registers = crate::register_stack::RegisterStack::new();
         for tag in 0..100 {
             stack.push(tagged_frame(f, tag, &mut registers));
@@ -306,7 +396,7 @@ mod tests {
     fn get_and_get_mut_bounds() {
         let module = one_register_module();
         let f = &module.functions[0];
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let mut registers = crate::register_stack::RegisterStack::new();
         for tag in 0..3 {
             stack.push(tagged_frame(f, tag, &mut registers));
@@ -321,14 +411,14 @@ mod tests {
     fn iter_traces_every_live_frame() {
         let module = one_register_module();
         let f = &module.functions[0];
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let mut registers = crate::register_stack::RegisterStack::new();
         let n = 200;
         for tag in 0..n as i32 {
             stack.push(tagged_frame(f, tag, &mut registers));
         }
 
-        // Mirrors how `trace_active_frame_roots` walks the live stack for GC:
+        // Mirrors how `ActivationStack::trace_roots` walks the live stack for GC:
         // iterate every frame and trace its slots. number_i32 registers carry
         // no GC pointer, so a correct walk visits zero raw-GC slots and reaches
         // every live frame without panicking. The closure is scoped so its

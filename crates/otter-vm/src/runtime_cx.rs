@@ -1486,6 +1486,19 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::array"))
     }
 
+    /// Allocate an `ArrayBuffer` owning `bytes` and root it in this scope.
+    pub fn array_buffer_from_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<Local<'scope>, NativeError> {
+        let result = self
+            .ctx
+            .cx
+            .interp
+            .scoped_array_buffer_from_bytes(self.token, bytes);
+        result.map_err(|error| self.vm_error(error, "NativeScope::array_buffer_from_bytes"))
+    }
+
     /// Allocate a JavaScript string from UTF-8.
     pub fn string(&mut self, text: &str) -> Result<Local<'scope>, NativeError> {
         let result = self.ctx.cx.interp.scoped_string(self.token, text);
@@ -1538,6 +1551,94 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     ) -> Result<Local<'scope>, NativeError> {
         let object = self.ctx.alloc_host_object(data)?;
         Ok(self.value(Value::object(object)))
+    }
+
+    /// Borrow host data behind a rooted object, including an ancestor view of
+    /// a declared host-class instance.
+    ///
+    /// The callback runs while the object's GC payload is borrowed. It must
+    /// only inspect Rust data: allocating a JavaScript value or re-entering the
+    /// VM during the callback is forbidden. The callback deliberately receives
+    /// no VM context, and this method keeps the scope borrowed for its entire
+    /// duration so safe Rust cannot allocate through the same scope.
+    ///
+    /// ```compile_fail
+    /// # use otter_vm::{Local, NativeScope};
+    /// # fn allocating_during_borrow(
+    /// #     scope: &mut NativeScope<'_, '_>,
+    /// #     host: Local<'_>,
+    /// # ) {
+    /// let _ = scope.with_host_data::<String, _>(host, |_| {
+    ///     scope.string("forbidden")
+    /// });
+    /// # }
+    /// ```
+    pub fn with_host_data<T: std::any::Any, R>(
+        &self,
+        value: Local<'_>,
+        f: impl FnOnce(&T) -> R,
+    ) -> Result<R, NativeError> {
+        crate::marshal::host_data_view_raw(self.raw(value), self.ctx.heap(), f).map_err(|reason| {
+            NativeError::TypeError {
+                name: "NativeScope::with_host_data",
+                reason,
+            }
+        })
+    }
+
+    /// Mutable counterpart of [`Self::with_host_data`]. The callback owns the
+    /// sole mutable payload borrow and has the same no-allocation/no-re-entry
+    /// contract.
+    pub fn with_host_data_mut<T: std::any::Any, R>(
+        &mut self,
+        value: Local<'_>,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, NativeError> {
+        let raw = self.raw(value);
+        crate::marshal::host_data_view_raw_mut(raw, self.ctx.heap_mut(), f).map_err(|reason| {
+            NativeError::TypeError {
+                name: "NativeScope::with_host_data_mut",
+                reason,
+            }
+        })
+    }
+
+    /// Borrow the live byte range of an `ArrayBuffer` or typed-array view for
+    /// one non-allocating callback. A detached or internally out-of-bounds
+    /// buffer source presents an empty slice; non-buffer values yield `None`.
+    ///
+    /// The callback runs while the buffer payload (and, for shared buffers, its
+    /// backing-store lock) is borrowed. It must not allocate JavaScript values
+    /// or re-enter the VM. The callback's result cannot borrow the input slice,
+    /// and this method keeps the scope borrowed, so safe Rust enforces both
+    /// boundaries.
+    ///
+    /// ```compile_fail
+    /// # use otter_vm::{Local, NativeScope};
+    /// # fn allocating_during_buffer_borrow(
+    /// #     scope: &mut NativeScope<'_, '_>,
+    /// #     buffer: Local<'_>,
+    /// # ) {
+    /// let _ = scope.with_buffer_source_bytes(buffer, |_| {
+    ///     scope.string("forbidden")
+    /// });
+    /// # }
+    /// ```
+    pub fn with_buffer_source_bytes<R>(
+        &self,
+        value: Local<'_>,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        with_buffer_source_bytes(self.raw(value), self.ctx.heap(), f)
+    }
+
+    /// Copy the live byte range out of an `ArrayBuffer` or typed-array view.
+    /// The owned result remains valid across later VM allocations and
+    /// collections. Prefer [`Self::with_buffer_source_bytes`] when the caller
+    /// can consume the bytes synchronously without copying.
+    #[must_use]
+    pub fn buffer_source_bytes(&self, value: Local<'_>) -> Option<Vec<u8>> {
+        self.with_buffer_source_bytes(value, <[u8]>::to_vec)
     }
 
     /// Root a number immediate.
@@ -1825,6 +1926,13 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         Some(self.value(value))
     }
 
+    /// Root the active realm's `globalThis` object itself.
+    #[must_use]
+    pub fn global_this(&mut self) -> Local<'scope> {
+        let global = *self.ctx.cx.interp.global_this();
+        self.value(Value::object(global))
+    }
+
     /// Queue an isolate-local microtask from rooted inputs.
     pub fn queue_microtask(
         &mut self,
@@ -1879,6 +1987,35 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     pub(crate) fn into_parts(self) -> (&'scope mut NativeCtx<'rt>, &'scope HandleScope) {
         (self.ctx, self.token)
     }
+}
+
+/// Borrow a buffer source while holding only a non-allocating heap read. The
+/// result type is independent of the slice lifetime, so the borrowed bytes
+/// cannot escape the callback.
+pub(crate) fn with_buffer_source_bytes<R>(
+    value: Value,
+    heap: &otter_gc::GcHeap,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Option<R> {
+    if let Some(view) = value.as_typed_array(heap) {
+        let offset = view.byte_offset(heap);
+        let length = view.byte_length(heap);
+        return Some(view.buffer(heap).with_bytes(heap, |bytes| {
+            let range = offset
+                .checked_add(length)
+                .and_then(|end| bytes.get(offset..end))
+                .unwrap_or_default();
+            f(range)
+        }));
+    }
+    value
+        .as_array_buffer()
+        .map(|buffer| buffer.with_bytes(heap, f))
+}
+
+/// Owned-copy convenience over [`with_buffer_source_bytes`].
+pub(crate) fn copy_buffer_source_bytes(value: Value, heap: &otter_gc::GcHeap) -> Option<Vec<u8>> {
+    with_buffer_source_bytes(value, heap, <[u8]>::to_vec)
 }
 
 pub(crate) fn visit_native_roots(
@@ -2060,6 +2197,77 @@ mod tests {
             after > before,
             "Native AggregateError should allocate the error and errors array through root-aware young allocation"
         );
+    }
+
+    #[test]
+    fn native_scope_host_data_borrow_returns_owned_state_before_allocation() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct HostState {
+            label: String,
+            count: usize,
+        }
+
+        let mut interp = Interpreter::new();
+        let mut ctx = NativeCtx::new(&mut interp);
+        ctx.scope(|mut scope| {
+            let host = scope
+                .host_object(HostState {
+                    label: "otter".to_string(),
+                    count: 1,
+                })
+                .expect("host object");
+
+            let before = scope
+                .with_host_data::<HostState, _>(host, Clone::clone)
+                .expect("host data read");
+            scope
+                .with_host_data_mut::<HostState, _>(host, |state| state.count += 1)
+                .expect("host data mutation");
+            let after = scope
+                .with_host_data::<HostState, _>(host, Clone::clone)
+                .expect("host data read after mutation");
+
+            // The callbacks have ended before this allocation. Their owned
+            // snapshots do not retain a GC-payload borrow.
+            let _allocation_after_borrow = scope.string("allocation is now safe").unwrap();
+            assert_eq!(before.count, 1);
+            assert_eq!(after.count, 2);
+            assert_eq!(after.label, "otter");
+        });
+    }
+
+    #[test]
+    fn native_scope_buffer_source_returns_owned_copy() {
+        use crate::binary::typed_array::{JsTypedArray, TypedArrayKind};
+
+        let mut interp = Interpreter::new();
+        let mut ctx = NativeCtx::new(&mut interp);
+        let buffer = ctx
+            .array_buffer_from_bytes(vec![1, 2, 3, 4])
+            .expect("array buffer");
+        let view = JsTypedArray::new(ctx.heap_mut(), buffer, TypedArrayKind::Uint8, 1, 2)
+            .expect("typed array view");
+        ctx.scope(|mut scope| {
+            let view = scope.value(Value::typed_array(view));
+            let observed = scope
+                .with_buffer_source_bytes(view, |bytes| {
+                    (bytes.len(), bytes.first().copied(), bytes.last().copied())
+                })
+                .expect("buffer source byte borrow");
+            assert_eq!(observed, (2, Some(2), Some(3)));
+
+            let copied = scope
+                .buffer_source_bytes(view)
+                .expect("buffer source bytes");
+
+            // A later VM allocation cannot invalidate the returned Rust-owned
+            // copy because no slice into the GC payload escaped the read.
+            let _allocation_after_copy = scope.string("later allocation").unwrap();
+            assert_eq!(copied, [2, 3]);
+
+            let number = scope.number(1.0);
+            assert!(scope.buffer_source_bytes(number).is_none());
+        });
     }
 
     /// Build a nested value (`{ name, count, items: [1, "two"] }`) through

@@ -20,7 +20,8 @@ use super::{
     jit_push_native_activation_stub,
 };
 use otter_vm::{
-    ActiveFrameMut, HoltStack, Interpreter, JitExecOutcome, Value, VmError, VmRuntimeActivation,
+    ActivationStack, ActiveFrameMut, Interpreter, JitExecOutcome, Value, VmError,
+    VmRuntimeActivation,
     native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
 };
 
@@ -47,7 +48,7 @@ pub(crate) unsafe fn enter_compiled(
     has_safepoints: bool,
 ) -> JitExecOutcome {
     {
-        let stack = activation.stack_ptr().cast::<HoltStack>();
+        let stack = activation.stack_ptr().cast::<ActivationStack>();
         let vm = activation.vm_ptr().cast::<Interpreter>();
         // This is the remaining interpreter-to-native entry adapter. It reads
         // the materialized activation once through the tier-neutral API; the

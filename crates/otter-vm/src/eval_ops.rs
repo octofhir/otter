@@ -17,12 +17,14 @@
 //!   slot (frame register / native argument storage) because user
 //!   `toString` can move the heap.
 //! - Strict-mode eval inherits the caller function strictness.
+//! - Direct eval re-enters above an activation floor on the caller's stack;
+//!   caller frames remain traced and cannot be consumed by nested dispatch.
 //!
 //! # See also
 //! - [`crate::code_space`]
 //! - [`crate::ExecutionContext`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use otter_bytecode::{BytecodeModule, Operand};
 
 use crate::promise::JsPromise;
@@ -75,7 +77,7 @@ impl Interpreter {
     pub(crate) fn run_eval_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -218,7 +220,7 @@ impl Interpreter {
         options: EvalCompileOptions,
         cell_sources: &[CallerCellSource],
         new_target_suppressed: bool,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
     ) -> Result<Value, VmError> {
         let Some(s) = value.as_string(&self.gc_heap) else {
             // §19.2.1.1 step 2 — non-string operands are returned
@@ -331,15 +333,26 @@ impl Interpreter {
         if caller_new_target.is_some() {
             self.frame_ensure_cold(&mut entry).new_target = caller_new_target;
         }
-        let mut sub_stack: HoltStack = HoltStack::new();
-        sub_stack.push(entry);
-        self.dispatch_loop(&context, &mut sub_stack)
+        // Direct eval is synchronous re-entry in the caller's logical
+        // activation chain. Keep the caller frames published for GC, stack
+        // traces, and exception diagnostics, while the floor prevents the
+        // nested dispatch from executing or consuming them.
+        let floor = stack.floor();
+        stack.push(entry);
+        let result = self.dispatch_loop_above(&context, stack, floor);
+
+        // Successful return and throw-unwind normally consume the complete
+        // nested region themselves. Non-language VM failures may leave one or
+        // more materialized eval frames behind; release their cold records and
+        // register windows in strict LIFO order before returning to the caller.
+        self.release_frames_above(stack, floor);
+        result
     }
 
     pub(crate) fn run_new_function_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -411,7 +424,7 @@ impl Interpreter {
         // eval stay callable from any later frame.
         let context = self.link_module(module);
         let main = context.exec_main();
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
         // §19.2.1.3 — eval code evaluated at global scope (direct at
@@ -540,7 +553,7 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
         // completion).
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         let main = context.main();
         let total = main
             .param_count
@@ -581,7 +594,7 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion).
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         let main = context.main();
         let total = main
             .param_count
@@ -656,4 +669,142 @@ fn is_v8_native_eval_hint(source: &str) -> bool {
     (trimmed.starts_with("%PrepareFunctionForOptimization(")
         || trimmed.starts_with("%OptimizeFunctionOnNextCall("))
         && trimmed.ends_with(')')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_bytecode::{Function, Instruction, Op, SourceKind, SpanEntry};
+
+    fn eval_module(source: &str) -> BytecodeModule {
+        let code = match source {
+            "ok" => vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(42)],
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Return,
+                    operands: vec![Operand::Register(0)],
+                },
+            ],
+            "throw" => vec![
+                Instruction {
+                    pc: 0,
+                    op: Op::LoadInt32,
+                    operands: vec![Operand::Register(0), Operand::Imm32(91)],
+                },
+                Instruction {
+                    pc: 1,
+                    op: Op::Throw,
+                    operands: vec![Operand::Register(0)],
+                },
+            ],
+            "invalid" => vec![Instruction {
+                pc: 0,
+                op: Op::LoadString,
+                operands: vec![Operand::Register(0), Operand::ConstIndex(0)],
+            }],
+            other => panic!("unexpected eval test source: {other}"),
+        };
+        let spans = code
+            .iter()
+            .map(|instruction| SpanEntry {
+                pc: instruction.pc,
+                span: (0, 0),
+            })
+            .collect();
+        BytecodeModule {
+            module: "direct-eval-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: vec![Function {
+                name: "<main>".to_string(),
+                scratch: 1,
+                code: code.into(),
+                spans,
+                ..Function::default()
+            }],
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        }
+    }
+
+    fn source_value(interp: &mut Interpreter, source: &str) -> Value {
+        Value::string(
+            crate::string::JsString::from_str(source, interp.gc_heap_mut())
+                .expect("short eval test source fits"),
+        )
+    }
+
+    fn direct_options() -> EvalCompileOptions {
+        EvalCompileOptions {
+            caller_scope: Some(Vec::new()),
+            ..EvalCompileOptions::default()
+        }
+    }
+
+    #[test]
+    fn direct_eval_shared_stack_reclaims_every_nested_completion_path() {
+        let mut interp = Interpreter::new();
+        interp.set_eval_hook(Some(std::sync::Arc::new(|source, _| {
+            Ok(eval_module(source))
+        })));
+
+        let caller_function = Function {
+            id: 777,
+            locals: 1,
+            ..Function::default()
+        };
+        let mut caller = interp
+            .test_frame_for_function(&caller_function)
+            .expect("caller register window");
+        caller.pc = 19;
+        caller.registers[0] = Value::number_i32(7);
+        let mut stack = ActivationStack::new();
+        stack.push(caller);
+
+        let ok = source_value(&mut interp, "ok");
+        assert_eq!(
+            interp
+                .run_direct_eval(&ok, direct_options(), &[], false, &mut stack)
+                .expect("direct eval succeeds"),
+            Value::number_i32(42)
+        );
+        assert_caller_only(&interp, &stack);
+
+        let thrown_source = source_value(&mut interp, "throw");
+        let thrown = interp
+            .run_direct_eval(&thrown_source, direct_options(), &[], false, &mut stack)
+            .expect_err("eval throw escapes its activation floor");
+        assert!(matches!(thrown, VmError::Uncaught));
+        assert_eq!(
+            interp.take_pending_uncaught_throw(),
+            Some(Value::number_i32(91))
+        );
+        assert_caller_only(&interp, &stack);
+
+        let invalid = source_value(&mut interp, "invalid");
+        let error = interp
+            .run_direct_eval(&invalid, direct_options(), &[], false, &mut stack)
+            .expect_err("invalid bytecode leaves cleanup to the eval boundary");
+        assert!(matches!(error, VmError::InvalidOperand));
+        assert_caller_only(&interp, &stack);
+
+        let mut caller = stack.pop().expect("caller retained");
+        interp.reclaim_registers(&mut caller);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+    }
+
+    fn assert_caller_only(interp: &Interpreter, stack: &ActivationStack) {
+        assert_eq!(stack.len(), 1);
+        let caller = stack.last().expect("caller retained");
+        assert_eq!(caller.function_id, 777);
+        assert_eq!(caller.pc, 19);
+        assert_eq!(caller.registers[0], Value::number_i32(7));
+        assert_eq!(interp.register_stack.checkpoint(), 1);
+    }
 }

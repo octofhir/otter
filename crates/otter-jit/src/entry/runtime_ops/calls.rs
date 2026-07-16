@@ -323,8 +323,9 @@ pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
         return 1;
     };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
+    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_finish_direct_call_bailed(context, owner_id as u32, callee_frame) {
+    match vm.jit_finish_direct_call_bailed(context, stack, owner_id as u32, callee_frame) {
         Ok(value) => match ctx
             .active_frame_mut()
             .and_then(|mut frame| frame.write(dst as u16, value))

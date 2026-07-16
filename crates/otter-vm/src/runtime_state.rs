@@ -224,7 +224,7 @@ impl<'a> RuntimeState<'a> {
         interp.rejection_tracker_for_trace().trace(visitor);
         // 9) Active call frames are NOT enumerated here. The
         //    frame stack lives on the call stack of
-        //    `Interpreter::run_inner` (`HoltStack`),
+        //    `Interpreter::run_inner` (`ActivationStack`),
         //    not on the [`Interpreter`] struct itself, so an
         //    out-of-band GC triggered through `RuntimeState`
         //    has no frame stack to walk. When the interpreter
@@ -232,7 +232,7 @@ impl<'a> RuntimeState<'a> {
         //    (task 76+), it will pass an additional
         //    `external_visit` closure to
         //    `GcHeap::collect_full` that walks the live
-        //    `&mut HoltStack` directly. This
+        //    `&mut ActivationStack` directly. This
         //    `RuntimeState` walker stays as-is.
         // 9b) The flat JIT register stack DOES live on the `Interpreter`
         //    struct, so its in-flight callee windows are traced here.

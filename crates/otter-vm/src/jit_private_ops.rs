@@ -9,7 +9,7 @@
 //! # Invariants
 //! - No private-element semantics are duplicated in JIT code; each opcode calls
 //!   the same VM register helper the interpreter dispatches.
-//! - Accessor getter/setter reentry runs through the shared HoltStack/VmThread
+//! - Accessor getter/setter reentry runs through the shared ActivationStack/VmThread
 //!   path; a committed private effect is never replayed by an exact side exit.
 //!
 //! # See also
@@ -19,8 +19,8 @@ use otter_bytecode::Op;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Interpreter, Value, VmError, VmPropertyKey, holt_stack::HoltStack, object,
-    read_register, write_register,
+    ExecutionContext, Interpreter, Value, VmError, VmPropertyKey,
+    activation_stack::ActivationStack, object, read_register, write_register,
 };
 
 impl Interpreter {
@@ -28,7 +28,7 @@ impl Interpreter {
     pub(crate) fn run_private_get_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         obj_reg: u16,
@@ -76,7 +76,7 @@ impl Interpreter {
     pub(crate) fn run_private_set_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         obj_reg: u16,
         key_reg: u16,
@@ -136,7 +136,7 @@ impl Interpreter {
     pub(crate) fn run_private_brand_check_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         obj_reg: u16,
         brand_reg: u16,
@@ -179,7 +179,7 @@ impl Interpreter {
     pub fn jit_runtime_private_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

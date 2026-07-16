@@ -20,7 +20,7 @@
 //! - [`crate::microtask`]
 //! - [`crate::promise_dispatch`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::{ActivationFloor, ActivationStack};
 use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
@@ -39,7 +39,7 @@ impl Interpreter {
     fn await_promise_resolve(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value: Value,
     ) -> Result<crate::promise::JsPromiseHandle, VmError> {
         if let Some(p) = value.as_promise() {
@@ -97,7 +97,7 @@ impl Interpreter {
     ///   frame.
     pub(crate) fn do_await(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
         awaited: Value,
@@ -151,7 +151,7 @@ impl Interpreter {
     /// subsequent `Op::Yield`, completion, or further `Op::Await`.
     fn do_await_async_gen(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
         awaited: Value,
@@ -215,7 +215,7 @@ impl Interpreter {
                 });
             }
         }
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(frame);
         owner.set_async_state(
             &mut self.gc_heap,
@@ -229,9 +229,9 @@ impl Interpreter {
         let anchor_depth = self.push_iteration_anchor(value);
         self.push_iteration_anchor(Value::generator(owner));
         let frame_roots = otter_gc::RawFrameRoots::new(
-            &stack as *const HoltStack,
+            &stack as *const ActivationStack,
             &self.cold_frames as *const crate::cold_frame::ColdFramePool,
-            crate::trace_active_frame_roots,
+            crate::ActivationStack::trace_roots,
         );
         let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
         let frame_roots_guard = self
@@ -370,7 +370,7 @@ impl Interpreter {
                 });
             }
         }
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(frame);
         // The resumed frame and the settlement value must be GC
         // roots *before* `dispatch_loop` registers its own provider:
@@ -379,9 +379,9 @@ impl Interpreter {
         // lives on this local stack.
         let anchor_depth = self.push_iteration_anchor(value);
         let frame_roots = otter_gc::RawFrameRoots::new(
-            &stack as *const HoltStack,
+            &stack as *const ActivationStack,
             &self.cold_frames as *const crate::cold_frame::ColdFramePool,
-            crate::trace_active_frame_roots,
+            crate::ActivationStack::trace_roots,
         );
         let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
         let frame_roots_guard = self
@@ -447,34 +447,54 @@ impl Interpreter {
     ///    - **Otherwise** — pop the frame and continue.
     ///
     /// # Errors
-    /// - [`VmError::Uncaught`] when the frame stack empties without
+    /// - [`VmError::Uncaught`] when the root execution region empties without
     ///   a handler and no async-frame absorbed the throw.
     pub(crate) fn unwind_throw(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         value: Value,
     ) -> Result<(), VmError> {
-        self.unwind_throw_with_uncaught(context, stack, value, None)
+        self.unwind_throw_above(context, stack, ActivationFloor::ROOT, value)
     }
 
-    /// Same as [`Self::unwind_throw`], but returns
-    /// `uncaught_error` if the frame stack empties without a
-    /// handler. Heap-cap failures use this path so script code can
-    /// catch a real `RangeError`, while embedders still receive
-    /// structured [`VmError::OutOfMemory`] when the error is
-    /// unhandled.
-    pub(crate) fn unwind_throw_with_uncaught(
+    /// Unwind only frames owned by the execution region above `floor`.
+    ///
+    /// The caller-owned frame at `floor` is never inspected or popped. If no
+    /// handler or async frame absorbs the throw before that boundary, the
+    /// original thrown [`Value`] is retained for the caller and
+    /// [`VmError::Uncaught`] is returned.
+    pub(crate) fn unwind_throw_above(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+        value: Value,
+    ) -> Result<(), VmError> {
+        self.unwind_throw_with_uncaught_above(context, stack, floor, value, None)
+    }
+
+    /// Structured-error variant of [`Self::unwind_throw_above`].
+    ///
+    /// `uncaught_error` replaces [`VmError::Uncaught`] only after every frame
+    /// above `floor` has been unwound. As on the root path, a structured error
+    /// does not publish `value` through `pending_uncaught_throw`.
+    pub(crate) fn unwind_throw_with_uncaught_above(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
         value: Value,
         mut uncaught_error: Option<VmError>,
     ) -> Result<(), VmError> {
+        if floor.depth() > stack.len() {
+            return Err(VmError::InvalidOperand);
+        }
+
         let display = self.render_thrown(&value);
         let payload = value;
         loop {
-            if stack.last().is_none() {
+            if stack.is_at_floor(floor) {
                 if uncaught_error.is_none() {
                     self.pending_uncaught_throw = Some(payload);
                 }
@@ -522,7 +542,7 @@ impl Interpreter {
             // floor). An iterator opened *outside* the matched handler —
             // e.g. a `try`/`catch` nested inside the loop body — stays
             // open so iteration can resume.
-            let floor = self
+            let handler_floor = self
                 .frame_cold(stack.last().expect("frame"))
                 .map_or(0, |c| c.handlers.len() as i64);
             // §14.15.3 — completions parked by `finally` blocks this
@@ -530,9 +550,10 @@ impl Interpreter {
             // landing handler) are replaced by the new throw.
             if let Some(cold) = self.frame_cold_mut(stack.last_mut().expect("frame")) {
                 cold.parked_finally
-                    .retain(|(_, depth)| i64::from(*depth) <= floor);
+                    .retain(|(_, depth)| i64::from(*depth) <= handler_floor);
             }
-            let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), floor);
+            let closers =
+                self.take_frame_closers_above(stack.last_mut().expect("frame"), handler_floor);
             self.close_unwind_iterators(context, closers);
             let frame = stack.last_mut().expect("frame still present");
             if let Some(catch_pc) = handler.catch_pc {
@@ -622,5 +643,68 @@ impl Interpreter {
         {
             cold.active_iterator_closers.push((iterator, depth));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_bytecode::{BytecodeModule, Function, SourceKind};
+
+    fn empty_context() -> ExecutionContext {
+        ExecutionContext::from_module(BytecodeModule {
+            module: "async-ops-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: SourceKind::JavaScript,
+            functions: Vec::new(),
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    fn function(registers: u16) -> Function {
+        Function {
+            locals: registers,
+            ..Function::default()
+        }
+    }
+
+    #[test]
+    fn floor_unwind_preserves_caller_frame_window_and_thrown_identity() {
+        let mut interp = Interpreter::new();
+        let context = empty_context();
+        let mut stack = ActivationStack::new();
+
+        let mut caller = interp.test_frame_for_function(&function(1)).unwrap();
+        caller.pc = 19;
+        caller.registers[0] = Value::number_i32(7);
+        stack.push(caller);
+        let floor = stack.floor();
+
+        let mut nested = interp.test_frame_for_function(&function(2)).unwrap();
+        nested.registers[0] = Value::number_i32(11);
+        nested.registers[1] = Value::number_i32(13);
+        stack.push(nested);
+        assert_eq!(interp.register_stack.checkpoint(), 3);
+
+        let thrown = Value::number_i32(41);
+        let error = interp
+            .unwind_throw_above(&context, &mut stack, floor, thrown)
+            .unwrap_err();
+
+        assert!(matches!(error, VmError::Uncaught));
+        assert_eq!(stack.len(), floor.depth());
+        assert_eq!(stack.last().expect("caller retained").pc, 19);
+        assert_eq!(
+            stack.last().expect("caller retained").registers[0],
+            Value::number_i32(7)
+        );
+        assert_eq!(interp.register_stack.checkpoint(), 1);
+        assert_eq!(interp.take_pending_uncaught_throw(), Some(thrown));
+
+        let mut caller = stack.pop().expect("caller retained");
+        interp.reclaim_registers(&mut caller);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
     }
 }

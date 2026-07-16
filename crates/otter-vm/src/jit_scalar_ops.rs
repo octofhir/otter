@@ -22,7 +22,7 @@ use otter_bytecode::Op;
 
 use crate::{
     ActiveFrameMut, ExecutionContext, Frame, Interpreter, JsString, Value, VmError, abstract_ops,
-    holt_stack::HoltStack, number::NumberValue, read_register, write_register,
+    activation_stack::ActivationStack, number::NumberValue, read_register, write_register,
 };
 
 impl Interpreter {
@@ -30,7 +30,7 @@ impl Interpreter {
     /// pass through; `null`/`undefined` throw.
     pub(crate) fn run_to_object_reg(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -50,7 +50,7 @@ impl Interpreter {
     pub(crate) fn run_to_property_key_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -131,7 +131,7 @@ impl Interpreter {
     pub fn jit_runtime_scalar_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

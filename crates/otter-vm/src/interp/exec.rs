@@ -13,6 +13,36 @@
 #![allow(unused_imports)]
 use crate::*;
 
+/// Panic-safe publication of the local activation stack used by diagnostics.
+///
+/// The slot remains a temporary compatibility bridge until activations become
+/// interpreter-owned. It is allocation-free and restores a nested parent's
+/// pointer even when dispatch unwinds through a panic.
+struct ActiveFrameStackPublication {
+    slot: *mut Option<std::ptr::NonNull<ActivationStack>>,
+    previous: Option<std::ptr::NonNull<ActivationStack>>,
+}
+
+impl ActiveFrameStackPublication {
+    fn publish(
+        slot: &mut Option<std::ptr::NonNull<ActivationStack>>,
+        stack: &mut ActivationStack,
+    ) -> Self {
+        let previous = *slot;
+        *slot = Some(std::ptr::NonNull::from(&mut *stack));
+        Self { slot, previous }
+    }
+}
+
+impl Drop for ActiveFrameStackPublication {
+    fn drop(&mut self) {
+        // SAFETY: `publish` receives the Interpreter-owned slot, and this guard
+        // never escapes `dispatch_loop`; the owning interpreter remains live
+        // and stationary for the complete call.
+        unsafe { *self.slot = self.previous };
+    }
+}
+
 impl Interpreter {
     /// Borrow the per-isolate GC heap (read-only).
     #[must_use]
@@ -545,7 +575,7 @@ impl Interpreter {
                 frames: Vec::new(),
                 detail: self.take_error_detail(),
             })?;
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(new_frame);
         // An `async` handler invoked as a reaction is a top-level call with no
         // caller frame, so — exactly like the async entry frame in `run_inner`
@@ -666,7 +696,7 @@ impl Interpreter {
     ) -> Result<Value, (VmError, Vec<StackFrameSnapshot>)> {
         let _window_rollback = self.register_window_rollback();
         let main = context.exec_main();
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
@@ -763,10 +793,29 @@ impl Interpreter {
     pub(crate) fn dispatch_loop(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
     ) -> Result<Value, VmError> {
-        let previous = self.active_frame_stack;
-        self.active_frame_stack = stack as *const HoltStack;
+        self.dispatch_loop_above(context, stack, ActivationFloor::ROOT)
+    }
+
+    /// Drive only the activation region above `floor`.
+    ///
+    /// This is the shared-stack re-entry boundary: caller frames below the
+    /// floor remain visible to GC and diagnostics, but terminal completion,
+    /// suspension, and uncaught throws cannot consume or execute them.
+    pub(crate) fn dispatch_loop_above(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+    ) -> Result<Value, VmError> {
+        if floor.depth() > stack.len() {
+            return Err(VmError::InvalidOperand);
+        }
+        let stack_ptr = std::ptr::NonNull::from(&mut *stack);
+        let roots_already_published = self.active_frame_stack == Some(stack_ptr);
+        let active_stack =
+            ActiveFrameStackPublication::publish(&mut self.active_frame_stack, stack);
         // A nested dispatch allocates its frames' register windows above the
         // caller's flat-stack cursor; on exit clamp the cursor down to release
         // any window a non-locally-exited sub-frame left behind. Only ever
@@ -775,9 +824,10 @@ impl Interpreter {
         // that frame returned here), the cursor is already below `saved` and
         // raising it back would re-leak that window on every `run_callable_sync`.
         let register_checkpoint = self.register_stack.checkpoint();
-        let result = self.dispatch_loop_tracked(context, stack);
+        let result =
+            self.dispatch_loop_tracked(context, stack, floor, roots_already_published);
         self.register_stack.restore(register_checkpoint);
-        self.active_frame_stack = previous;
+        drop(active_stack);
         result
     }
 
@@ -797,19 +847,26 @@ impl Interpreter {
     pub(crate) fn dispatch_loop_tracked(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+        roots_already_published: bool,
     ) -> Result<Value, VmError> {
         self.ensure_property_ic_capacity(context);
         self.begin_runtime_budget_turn();
         let frame_roots = otter_gc::RawFrameRoots::new(
-            stack as *const HoltStack,
+            stack as *const ActivationStack,
             &self.cold_frames as *const cold_frame::ColdFramePool,
-            trace_active_frame_roots,
+            ActivationStack::trace_roots,
         );
-        let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-        let frame_roots_guard = self
-            .gc_heap
-            .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
+        let frame_roots_guard = if roots_already_published {
+            None
+        } else {
+            let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
+            Some(
+                self.gc_heap
+                    .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots),
+            )
+        };
         // Catch-all runtime-roots registration: every bytecode tick
         // can allocate, and some dispatch entries (generator
         // prologues spawned from host-driven drains, future embedder
@@ -817,18 +874,19 @@ impl Interpreter {
         // The heap dedupes same-source stack entries, so re-pushing
         // under `run` / `run_callable_sync` costs one Vec slot.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
+        let extra_roots_guard = (!roots_already_published)
+            .then(|| self.gc_heap.register_extra_roots(extra_roots));
         let result = (|| -> Result<Value, VmError> {
             loop {
-                match self.dispatch_loop_inner(context, stack) {
+                match self.dispatch_loop_inner(context, stack, floor) {
                     Ok(value) => break Ok(value),
                     Err(err) => {
                         if matches!(err, VmError::Uncaught)
-                            && !stack.is_empty()
+                            && !stack.is_at_floor(floor)
                             && let Some(thrown) = self.pending_uncaught_throw.take()
                         {
                             self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                            let unwind = self.unwind_throw(context, stack, thrown);
+                            let unwind = self.unwind_throw_above(context, stack, floor, thrown);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
                             } else {
@@ -841,7 +899,7 @@ impl Interpreter {
                                 self.pending_uncaught_throw = Some(thrown);
                             }
                             unwind?;
-                            if stack.is_empty() {
+                            if stack.is_at_floor(floor) {
                                 break Ok(Value::undefined());
                             }
                             continue;
@@ -858,13 +916,14 @@ impl Interpreter {
                                 None
                             };
                             self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                            let unwind =
-                                self.unwind_throw_with_uncaught(context, stack, thrown, uncaught);
+                            let unwind = self.unwind_throw_with_uncaught_above(
+                                context, stack, floor, thrown, uncaught,
+                            );
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
                             }
                             unwind?;
-                            if stack.is_empty() {
+                            if stack.is_at_floor(floor) {
                                 break Ok(Value::undefined());
                             }
                             continue;

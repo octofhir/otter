@@ -17,7 +17,7 @@
 
 use otter_bytecode::Op;
 
-use crate::{ExecutionContext, Interpreter, VmError, holt_stack::HoltStack};
+use crate::{ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack};
 
 impl Interpreter {
     /// Complete one allocating-construction opcode for a published compiled
@@ -26,7 +26,7 @@ impl Interpreter {
     pub fn jit_runtime_construct_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

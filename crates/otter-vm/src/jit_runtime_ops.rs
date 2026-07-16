@@ -11,7 +11,7 @@
 //! - Every operand is decoded by the compiler and passed explicitly. These
 //!   functions never receive a byte PC or decode a `CodeBlockInstruction`.
 //! - Arithmetic and unary-coercion semantics consume typed values through a
-//!   representation-neutral [`ActiveFrameMut`]; no HoltStack identity or raw
+//!   representation-neutral [`ActiveFrameMut`]; no ActivationStack identity or raw
 //!   register pointer enters those paths.
 //! - Published active-frame slots remain the canonical moving-GC roots across
 //!   allocating or throwing operations.
@@ -24,7 +24,7 @@
 
 use crate::{
     ActiveFrameMut, ExecutionContext, Interpreter, Value, VmError, abstract_ops,
-    arithmetic_dispatch::NumericRuntimeOp, holt_stack::HoltStack, write_register,
+    activation_stack::ActivationStack, arithmetic_dispatch::NumericRuntimeOp, write_register,
 };
 
 /// Fully decoded `ToPrimitive` hint used by unary-coercion semantics.
@@ -188,7 +188,7 @@ impl Interpreter {
     pub fn jit_runtime_load_string(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         function_id: u32,
         dst: u16,
@@ -205,7 +205,7 @@ impl Interpreter {
     pub fn jit_runtime_define_data_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         object: u16,
         key: u16,
@@ -227,7 +227,7 @@ impl Interpreter {
     pub fn jit_runtime_load_builtin_error(
         &self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         kind_index: u32,
@@ -263,7 +263,7 @@ impl Interpreter {
     pub fn jit_runtime_define_own_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         target: u16,
         key: u16,
@@ -280,7 +280,7 @@ impl Interpreter {
     pub fn jit_runtime_make_closure(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         function_id: u32,
         dst: u16,
@@ -307,7 +307,7 @@ impl Interpreter {
     pub fn jit_runtime_math_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         method_id: u32,

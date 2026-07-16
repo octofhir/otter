@@ -31,7 +31,7 @@
 //! - [`crate::module_records`]
 //! - [`crate::execution_context`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, JsString, Value, VmError, module_records::ModuleStatus,
     operand_decode::register_operand, promise_dispatch, read_register, resolve_relative_url,
@@ -50,7 +50,7 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         spec_idx: u32,
@@ -79,7 +79,7 @@ impl Interpreter {
     pub(crate) fn run_module_namespace_object_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         spec_idx: u32,
@@ -113,7 +113,7 @@ impl Interpreter {
     pub(crate) fn run_load_import_binding_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         url_idx: u32,
@@ -148,7 +148,7 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_deferred_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         spec_idx: u32,
@@ -184,7 +184,7 @@ impl Interpreter {
     pub(crate) fn run_evaluate_module_const(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         url_idx: u32,
@@ -207,7 +207,7 @@ impl Interpreter {
     pub(crate) fn run_mark_module_evaluated_const(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         url_idx: u32,
     ) -> Result<(), VmError> {
@@ -806,7 +806,7 @@ impl Interpreter {
                 if let Err(err) = self.execute_async_module(context, &module) {
                     let message = format!("module evaluation failed: {err}");
                     let reason = self
-                        .make_type_error_with_stack_roots(&HoltStack::new(), &message)
+                        .make_type_error_with_stack_roots(&ActivationStack::new(), &message)
                         .unwrap_or_else(|_| Value::undefined());
                     self.async_module_execution_rejected(&module, reason);
                 }
@@ -829,7 +829,7 @@ impl Interpreter {
                     Err(err) => {
                         let message = format!("module evaluation failed: {err}");
                         let reason = self
-                            .make_type_error_with_stack_roots(&HoltStack::new(), &message)
+                            .make_type_error_with_stack_roots(&ActivationStack::new(), &message)
                             .unwrap_or_else(|_| Value::undefined());
                         self.async_module_execution_rejected(&module, reason);
                     }
@@ -1213,7 +1213,7 @@ impl Interpreter {
     pub(crate) fn run_import_meta_resolve_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         spec_reg: u16,
@@ -1239,7 +1239,7 @@ impl Interpreter {
     pub(crate) fn run_import_namespace_dynamic_operands(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {

@@ -21,7 +21,7 @@
 //! - [`crate::object`]
 //! - [`crate::executable`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
     NativeFunction, Value, VmError,
@@ -33,7 +33,7 @@ use crate::{
 use otter_gc::raw::RawGc;
 
 impl Interpreter {
-    pub(crate) fn collect_allocation_roots(&self, stack: &HoltStack) -> Vec<*mut RawGc> {
+    pub(crate) fn collect_allocation_roots(&self, stack: &ActivationStack) -> Vec<*mut RawGc> {
         // Fast path: when the dispatch loop has registered its frame-roots
         // and extra-roots providers, an allocation-triggered collection walks
         // both of them *internally* — see `GcHeap::collect_minor_internal`
@@ -518,7 +518,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_extra_roots(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         extra_roots: &[&Value],
     ) -> Result<crate::object::JsObject, VmError> {
         self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &[])
@@ -526,7 +526,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_value_roots(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value_roots: &[&Value],
         slice_roots: &[Value],
     ) -> Result<crate::object::JsObject, VmError> {
@@ -539,7 +539,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_value_roots_and_slices(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
@@ -568,7 +568,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_object_with_proto(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         proto: crate::object::JsObject,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -612,7 +612,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_array(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::array::JsArray, VmError> {
@@ -636,7 +636,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_array_from_values<I>(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         elements: I,
         value_roots: &[&Value],
         slice_roots: &[Value],
@@ -654,7 +654,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_array_from_values_with_root_slices<I>(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         elements: I,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -690,7 +690,7 @@ impl Interpreter {
 
     pub(crate) fn alloc_stack_rooted_iterator_state(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         state: IteratorState,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -726,7 +726,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_object_reg(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
@@ -768,7 +768,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_array_operands(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
@@ -783,7 +783,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_array_regs(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         source_regs: &[u16],
@@ -872,7 +872,7 @@ impl Interpreter {
 
     pub(crate) fn run_array_push_regs(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         arr_reg: u16,
         value_reg: u16,
@@ -896,7 +896,7 @@ impl Interpreter {
 
     pub(crate) fn run_new_weak_ref_regs(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         target_reg: u16,
@@ -923,7 +923,7 @@ impl Interpreter {
     pub(crate) fn run_new_finalization_registry_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         callback_reg: u16,

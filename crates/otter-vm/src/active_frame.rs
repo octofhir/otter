@@ -49,7 +49,7 @@ use crate::{
 /// Physical representation backing an active frame view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveFrameStorage {
-    /// Full interpreter [`Frame`] published on a `HoltStack`.
+    /// Full interpreter [`Frame`] published on a `ActivationStack`.
     Materialized,
     /// Machine-visible [`NativeFrame`] plus its published register window.
     Native,

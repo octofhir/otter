@@ -16,8 +16,8 @@
 use otter_bytecode::Op;
 
 use crate::{
-    ExecutionContext, Interpreter, JsString, Value, VmError, abstract_ops, holt_stack::HoltStack,
-    object, read_register,
+    ExecutionContext, Interpreter, JsString, Value, VmError, abstract_ops,
+    activation_stack::ActivationStack, object, read_register,
 };
 
 impl Interpreter {
@@ -25,7 +25,7 @@ impl Interpreter {
     /// derived-constructor `this`, rejecting a double binding.
     pub(crate) fn run_bind_this_value_reg(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         src: u16,
     ) -> Result<(), VmError> {
@@ -77,7 +77,7 @@ impl Interpreter {
     pub(crate) fn run_class_check_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         kind: u32,
         reg: u16,
@@ -112,7 +112,7 @@ impl Interpreter {
     pub(crate) fn run_set_function_name_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         fn_reg: u16,
         key_reg: u16,
@@ -169,7 +169,7 @@ impl Interpreter {
     pub fn jit_runtime_class_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

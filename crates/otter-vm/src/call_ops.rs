@@ -23,7 +23,7 @@
 
 use std::cell::UnsafeCell;
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
@@ -349,7 +349,7 @@ impl LeanCallbackRoot {
 }
 
 pub(crate) struct LeanCallbackState {
-    stack: HoltStack,
+    stack: ActivationStack,
     root_index: usize,
     function_id: u32,
     /// Callee register-window length, read once from the executable function.
@@ -771,7 +771,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn push_bytecode_call_frame(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee_closure: Option<crate::closure::JsClosure>,
         function_id: u32,
@@ -873,9 +873,11 @@ impl Interpreter {
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
-            let mut prologue_stack: HoltStack = HoltStack::new();
-            prologue_stack.push(frame);
-            self.dispatch_loop(context, &mut prologue_stack)?;
+            let prologue_floor = stack.floor();
+            stack.push(frame);
+            let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
+            self.release_frames_above(stack, prologue_floor);
+            prologue?;
             self.resolve_generator_prototype_stack_rooted(
                 context,
                 stack,
@@ -896,7 +898,7 @@ impl Interpreter {
     fn prepare_bytecode_call_frame_from_window(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         function_id: u32,
         parent_upvalues: UpvalueSpine,
         this_for_callee: Value,
@@ -959,7 +961,7 @@ impl Interpreter {
     fn resolve_generator_prototype_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         gen_handle: &crate::generator::JsGenerator,
@@ -984,7 +986,7 @@ impl Interpreter {
 
     fn push_prepared_bytecode_call_frame(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
         prepared: PreparedBytecodeFrame,
@@ -1015,9 +1017,11 @@ impl Interpreter {
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
-            let mut prologue_stack: HoltStack = HoltStack::new();
-            prologue_stack.push(frame);
-            self.dispatch_loop(context, &mut prologue_stack)?;
+            let prologue_floor = stack.floor();
+            stack.push(frame);
+            let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
+            self.release_frames_above(stack, prologue_floor);
+            prologue?;
             self.resolve_generator_prototype_stack_rooted(
                 context,
                 stack,
@@ -1035,7 +1039,7 @@ impl Interpreter {
 
     fn try_push_bytecode_call_frame_from_window(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
@@ -1114,7 +1118,7 @@ impl Interpreter {
 
     fn try_invoke_native_call_from_window(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
@@ -1184,7 +1188,7 @@ impl Interpreter {
     /// to `Value::undefined()` (foundation strict default).
     pub(crate) fn do_call<'a>(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
@@ -1242,7 +1246,7 @@ impl Interpreter {
     /// [`Self::do_call`], preserving behaviour at a small depth cost.
     pub(crate) fn do_tail_call(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
@@ -1308,7 +1312,7 @@ impl Interpreter {
     /// dispatch resumes after the originating instruction.
     pub(crate) fn invoke(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
@@ -1485,7 +1489,7 @@ impl Interpreter {
     /// that swap so the unwind path is uniform across call shapes.
     pub(crate) fn do_construct<'a>(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
@@ -1520,7 +1524,7 @@ impl Interpreter {
 
     fn try_dispatch_construct_from_window(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
         operands: OperandView<'_>,
@@ -1623,7 +1627,7 @@ impl Interpreter {
 
     fn try_finish_simple_constructor_init(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         function_id: u32,
         init: Option<crate::constructor_fast_path::SimpleConstructorInit>,
         receiver: JsObject,
@@ -1673,7 +1677,7 @@ impl Interpreter {
     fn simple_constructor_shape(
         &mut self,
         function_id: u32,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         receiver: &crate::object::JsObject,
         proto: Value,
         values: &[Value],
@@ -1728,7 +1732,7 @@ impl Interpreter {
 
     pub(crate) fn do_construct_spread(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
@@ -1754,7 +1758,7 @@ impl Interpreter {
 
     pub(crate) fn do_super_construct_spread(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
@@ -1784,7 +1788,7 @@ impl Interpreter {
 
     pub(crate) fn dispatch_construct(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
         args: SmallVec<[Value; 8]>,
@@ -1795,7 +1799,7 @@ impl Interpreter {
 
     fn dispatch_construct_with_new_target(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: Value,
         new_target: Value,
@@ -1989,7 +1993,7 @@ impl Interpreter {
     pub(crate) fn construct_prototype_for_callee_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         let function_id = callee.as_function().or_else(|| {
@@ -2139,7 +2143,7 @@ impl Interpreter {
     /// calls with `this = undefined`).
     pub(crate) fn do_call_spread(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
@@ -2167,7 +2171,7 @@ impl Interpreter {
     /// path of `Function.prototype.apply`.
     pub(crate) fn do_call_with_this(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: OperandView<'_>,
     ) -> Result<(), VmError> {
@@ -2411,13 +2415,13 @@ impl Interpreter {
                 args.as_slice(),
             );
         }
-        let mut inner = self.draw_stack();
+        let mut inner = self.take_reentry_stack();
         let current = roots.current.get();
         let receiver = roots.receiver.get();
         let args = roots.take_args();
         let result =
             self.run_bytecode_callable_committed(&mut inner, context, current, receiver, args);
-        self.return_stack(inner);
+        self.recycle_reentry_stack(inner);
         result
     }
 
@@ -2468,7 +2472,7 @@ impl Interpreter {
             && root.bound_derived_this.is_none()
             && root.eval_env.is_none();
         if self.enter_sync_reentry().is_ok() {
-            let stack = self.draw_stack();
+            let stack = self.take_reentry_stack();
             let root_index = self.lean_callback_roots.len();
             let function_id = root.function_id;
             self.lean_callback_roots.push(root);
@@ -2500,7 +2504,7 @@ impl Interpreter {
                 self.frame_release_cold(&mut frame);
                 self.reclaim_registers(&mut frame);
             }
-            self.return_stack(state.stack);
+            self.recycle_reentry_stack(state.stack);
             let root = self
                 .lean_callback_roots
                 .pop()
@@ -2515,7 +2519,7 @@ impl Interpreter {
 
     pub(crate) fn run_bytecode_callable_committed(
         &mut self,
-        inner: &mut HoltStack,
+        inner: &mut ActivationStack,
         context: &ExecutionContext,
         current: Value,
         effective_this: Value,
@@ -2536,7 +2540,7 @@ impl Interpreter {
 
     fn run_bytecode_callable_committed_rooted(
         &mut self,
-        inner: &mut HoltStack,
+        inner: &mut ActivationStack,
         context: &ExecutionContext,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
@@ -2654,9 +2658,11 @@ impl Interpreter {
             if let Some(cold) = cold {
                 self.frame_attach_cold(&mut frame, cold);
             }
-            let mut prologue_stack: HoltStack = HoltStack::new();
-            prologue_stack.push(frame);
-            self.dispatch_loop(context, &mut prologue_stack)?;
+            let prologue_floor = inner.floor();
+            inner.push(frame);
+            let prologue = self.dispatch_loop_above(context, inner, prologue_floor);
+            self.release_frames_above(inner, prologue_floor);
+            prologue?;
             // §27.5.1 step 3 — resolve [[Prototype]] after the
             // prologue (FunctionDeclarationInstantiation) ran, through
             // the invoked closure's bag so the generator's prototype is
@@ -3298,7 +3304,7 @@ impl Interpreter {
             effective_args,
             None,
         )?;
-        let mut inner: HoltStack = HoltStack::new();
+        let mut inner: ActivationStack = ActivationStack::new();
         inner.push(new_frame);
         self.dispatch_loop(context, &mut inner)
     }

@@ -10,7 +10,7 @@
 //!   `getPrototypeOf`, and `setPrototypeOf` traps through `run_callable_sync`)
 //!   and otherwise the same `run_*_regs` fast path; no protocol semantics are
 //!   copied into JIT code.
-//! - Trap reentry runs through the shared HoltStack/VmThread path; a committed
+//! - Trap reentry runs through the shared ActivationStack/VmThread path; a committed
 //!   protocol effect is never replayed by an exact side exit.
 //!
 //! # See also
@@ -19,7 +19,7 @@
 
 use otter_bytecode::{Op, Operand};
 
-use crate::{ExecutionContext, Interpreter, VmError, holt_stack::HoltStack};
+use crate::{ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack};
 
 impl Interpreter {
     /// Complete one object property-protocol opcode for a published compiled
@@ -28,7 +28,7 @@ impl Interpreter {
     pub fn jit_runtime_object_protocol_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

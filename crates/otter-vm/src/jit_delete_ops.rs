@@ -19,7 +19,9 @@
 
 use otter_bytecode::{Op, Operand};
 
-use crate::{ExecutionContext, Interpreter, VmError, holt_stack::HoltStack, read_register};
+use crate::{
+    ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack, read_register,
+};
 
 impl Interpreter {
     /// Complete one `delete` opcode for a published compiled frame. For
@@ -29,7 +31,7 @@ impl Interpreter {
     pub fn jit_runtime_delete_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

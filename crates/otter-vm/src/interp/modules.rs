@@ -138,7 +138,7 @@ impl Interpreter {
         let args: SmallVec<[Value; 8]> =
             smallvec::smallvec![env, import_meta, Value::boolean(hoist_phase)];
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(frame);
         let init_promise = if function.is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())

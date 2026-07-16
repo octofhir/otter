@@ -20,7 +20,7 @@
 //! - [`crate::error_classes`]
 //! - [`crate::executable`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use crate::{
@@ -32,7 +32,7 @@ impl Interpreter {
     pub(crate) fn run_new_error_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         msg_reg: u16,
@@ -56,7 +56,7 @@ impl Interpreter {
     pub(crate) fn run_new_builtin_error_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         kind_idx: u32,
@@ -87,7 +87,7 @@ impl Interpreter {
     fn capture_error_stack_frames(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         obj: object::JsObject,
     ) {
         let limit = self.current_stack_trace_limit();
@@ -121,7 +121,7 @@ impl Interpreter {
 
     fn make_error_instance_with_stack_roots(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         kind: ErrorKind,
         message: Option<String>,
         message_value: &Value,
@@ -183,7 +183,7 @@ impl Interpreter {
     /// but skips the `VmError` wrapping.
     pub(crate) fn make_type_error_with_stack_roots(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         message: &str,
     ) -> Result<Value, VmError> {
         let message_root = Value::undefined();
@@ -201,7 +201,7 @@ impl Interpreter {
     pub(crate) fn vm_error_to_throwable_with_stack_roots(
         &mut self,
         context: Option<&ExecutionContext>,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         err: &VmError,
     ) -> Option<Value> {
         let error_realm_id = stack
@@ -465,7 +465,7 @@ fn system_error_code(message: &str) -> &str {
 /// (`<entry>`).
 pub(crate) fn snapshot_frames(
     context: &ExecutionContext,
-    stack: &HoltStack,
+    stack: &ActivationStack,
 ) -> Vec<StackFrameSnapshot> {
     stack
         .iter()
@@ -534,7 +534,7 @@ pub(crate) fn native_to_vm_error(interp: &mut crate::Interpreter, err: NativeErr
         message: String,
     ) -> VmError {
         match interp.make_error_instance_with_stack_roots(
-            &HoltStack::new(),
+            &ActivationStack::new(),
             kind,
             Some(message.clone()),
             &Value::undefined(),

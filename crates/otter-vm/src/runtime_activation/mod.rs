@@ -34,7 +34,7 @@ mod value_ops;
 use std::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
-    ActiveFrameMut, ActiveFrameRef, ExecutionContext, HoltStack, Interpreter, Value, VmError,
+    ActivationStack, ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError,
     jit::VmRuntimeActivation,
     native_abi::{NativeFrame, NativeFrameFlags},
 };
@@ -56,7 +56,7 @@ pub(crate) enum RuntimeFrameIdentity {
 /// or materialized-stack reference aliases the GC's active-frame root walk.
 pub struct RuntimeCall<'a> {
     pub(super) vm: NonNull<Interpreter>,
-    pub(super) stack: NonNull<HoltStack>,
+    pub(super) stack: NonNull<ActivationStack>,
     pub(super) context: NonNull<ExecutionContext>,
     pub(super) frame: NonNull<NativeFrame>,
     identity: RuntimeFrameIdentity,
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn identity_is_decoded_once_and_slot_access_is_checked() {
         let mut vm = Interpreter::new();
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let context = ExecutionContext::from_module(crate::BytecodeModule {
             module: "runtime-call-test.js".to_string(),
             template_sites: Vec::new(),
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn materialized_identity_must_resolve_the_published_stack_slot() {
         let mut vm = Interpreter::new();
-        let mut stack = HoltStack::new();
+        let mut stack = ActivationStack::new();
         let context = ExecutionContext::from_module(crate::BytecodeModule {
             module: "runtime-call-materialized-test.js".to_string(),
             template_sites: Vec::new(),

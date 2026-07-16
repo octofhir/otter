@@ -151,12 +151,10 @@ fn make_tag(engine: &Engine, store: &SharedStore, params: &[ValType]) -> Result<
 /// Resolve the cached per-realm engine + shared store + well-known JSTag,
 /// creating and caching them on first use. All handles are cheap to clone.
 fn realm_handle(cx: &mut MarshalCx<'_, '_, '_>) -> Result<WasmRealm, JsError> {
-    let global = *cx.ctx().interp_mut().global_this();
-    if let Some(existing) = object::get(global, cx.heap(), REALM_KEY) {
-        let handle = cx.park(existing);
-        if let Ok(realm) = cx.with_host_data::<WasmRealm, WasmRealm>(handle, Clone::clone) {
-            return Ok(realm);
-        }
+    let global = cx.global_this();
+    let existing = cx.get(global, REALM_KEY)?;
+    if let Ok(realm) = cx.with_host_data::<WasmRealm, WasmRealm>(existing, Clone::clone) {
+        return Ok(realm);
     }
     let engine = Engine::new(&realm_config())
         .map_err(|err| JsError::Type(format!("WebAssembly engine init failed: {err}")))?;
@@ -168,15 +166,14 @@ fn realm_handle(cx: &mut MarshalCx<'_, '_, '_>) -> Result<WasmRealm, JsError> {
         js_tag,
     };
     let value = realm.clone().into_js(cx)?;
-    let raw = cx.escape(value);
     // Cache as a non-writable, non-enumerable, non-configurable own property so
     // user code cannot observe or replace the realm carrier.
-    object::define_own_property(
+    cx.define(
         global,
-        cx.heap_mut(),
         REALM_KEY,
-        object::PropertyDescriptor::data(raw, false, false, false),
-    );
+        value,
+        object::PropertyFlags::new(false, false, false),
+    )?;
     Ok(realm)
 }
 

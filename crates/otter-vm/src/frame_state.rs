@@ -95,7 +95,7 @@ impl OwnedRegisterSnapshot {
 
 /// Materialized compatibility/cold-sidecar frame.
 ///
-/// Existing HoltStack dispatch paths still own this compact record. New
+/// Existing ActivationStack dispatch paths still own this compact record. New
 /// tier-neutral execution uses [`crate::ActiveFrameMut`] over the canonical
 /// [`crate::NativeFrame`] and its register window, so interpreter/baseline/
 /// optimizer switches do not require constructing this Rust-owned adapter.

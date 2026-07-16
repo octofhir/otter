@@ -18,14 +18,14 @@
 //! - [`crate::collections`]
 //! - [`crate::executable`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use crate::{ExecutionContext, Interpreter, Value, VmError, read_register, write_register};
 
 impl Interpreter {
     pub(crate) fn run_new_collection_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         kind_idx: u32,
@@ -47,7 +47,7 @@ impl Interpreter {
         &mut self,
         kind: &str,
         seed: &Value,
-        stack: &HoltStack,
+        stack: &ActivationStack,
     ) -> Result<Value, VmError> {
         let roots = self.collect_allocation_roots(stack);
         let seed_entries = if seed_is_present(seed) {

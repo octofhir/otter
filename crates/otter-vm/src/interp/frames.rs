@@ -1,7 +1,7 @@
 //! Register-window and frame-stack management.
 //!
 //! # Contents
-//! Register allocation/reclaim on the contiguous register stack, HoltStack
+//! Register allocation/reclaim on the contiguous register stack, ActivationStack
 //! draw/return, cold-frame attach/detach, frame pop/unwind
 //! (`pop_frame`, `unwind_abrupt`, `return_running_finally`), and the
 //! raw pointers compiled code uses to address the reg window.
@@ -155,7 +155,7 @@ impl Interpreter {
     pub(crate) fn free_reg_window(&mut self, base: u32) {
         // Release this window: truncate the cursor to `base`. Only ever LOWER
         // `reg_top` — never raise it. A window can be freed more than once (a
-        // frame returns normally, lowering `reg_top`, then `return_stack` drains
+        // frame returns normally, lowering `reg_top`, then re-entry cleanup drains
         // the finished re-entry stack and reclaims the same frame); a second
         // free then arrives with `base > reg_top`. Setting `reg_top = base`
         // unconditionally would raise the cursor back over slots that were
@@ -266,26 +266,26 @@ impl Interpreter {
     /// Draw a materialized frame stack for synchronous re-entry, reusing its
     /// observed capacity when a pooled stack is available.
     #[inline]
-    pub(crate) fn draw_stack(&mut self) -> HoltStack {
-        self.holt_pool.pop().unwrap_or_default()
+    pub(crate) fn take_reentry_stack(&mut self) -> ActivationStack {
+        self.reentry_stack_cache.pop().unwrap_or_default()
     }
 
     /// Return a drained re-entry stack to the pool for reuse. The stack is
     /// cleared (it holds no live frames, so the pool is never GC-traced); a full
     /// pool drops the stack instead.
     #[inline]
-    pub(crate) fn return_stack(&mut self, mut stack: HoltStack) {
+    pub(crate) fn recycle_reentry_stack(&mut self, mut stack: ActivationStack) {
         while let Some(mut frame) = stack.pop() {
             self.frame_release_cold(&mut frame);
             self.reclaim_registers(&mut frame);
         }
-        if self.holt_pool.len() < Self::HOLT_POOL_CAP {
-            self.holt_pool.push(stack);
+        if self.reentry_stack_cache.len() < Self::REENTRY_STACK_CACHE_CAP {
+            self.reentry_stack_cache.push(stack);
         }
     }
 
     /// Maximum pooled re-entry stacks retained at once.
-    const HOLT_POOL_CAP: usize = 64;
+    const REENTRY_STACK_CACHE_CAP: usize = 64;
 
     /// Acquire (or lazily create) this frame's cold side record and
     /// then return a mutable borrow.
@@ -352,6 +352,26 @@ impl Interpreter {
 }
 
 impl Interpreter {
+    /// Release every activation owned by the nested region above `floor`.
+    ///
+    /// This is the single abnormal-exit cleanup path for shared-stack VM
+    /// re-entry.  Cold side records and register windows are reclaimed in LIFO
+    /// order; caller-owned frames below the floor are never inspected.
+    pub(crate) fn release_frames_above(
+        &mut self,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+    ) {
+        debug_assert!(floor.depth() <= stack.len());
+        while !stack.is_at_floor(floor) {
+            let mut frame = stack
+                .pop()
+                .expect("activation depth above floor was just observed");
+            self.frame_release_cold(&mut frame);
+            self.reclaim_registers(&mut frame);
+        }
+    }
+
     /// Pop the top frame and route its completion value.
     ///
     /// # Algorithm
@@ -376,11 +396,21 @@ impl Interpreter {
     /// # Errors
     /// - [`VmError::InvalidOperand`] when the stack is empty or
     ///   the caller's return register is out of bounds.
-    pub(crate) fn pop_frame(
+    /// Pop one frame without crossing the caller-owned activation `floor`.
+    ///
+    /// Nested VM execution shares the same physical stack as its caller.  A
+    /// terminal async completion therefore means "back at the region floor",
+    /// not necessarily an empty stack.  A frame carrying a return register is
+    /// malformed when its caller would sit below the floor.
+    pub(crate) fn pop_frame_above(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
         value: Value,
     ) -> Result<Option<Value>, VmError> {
+        if stack.is_at_floor(floor) {
+            return Err(VmError::InvalidOperand);
+        }
         let mut popped = stack.pop().ok_or_else(|| VmError::InvalidOperand)?;
         let construct_target = self.frame_cold(&popped).and_then(|c| c.construct_target);
         let is_derived_ctor = self
@@ -431,7 +461,7 @@ impl Interpreter {
                 resolved,
                 None,
             )?;
-            if stack.is_empty() {
+            if stack.is_at_floor(floor) {
                 return Ok(Some(Value::undefined()));
             }
             return Ok(None);
@@ -439,6 +469,9 @@ impl Interpreter {
         let Some(return_reg) = popped.return_register else {
             return Ok(Some(resolved));
         };
+        if stack.is_at_floor(floor) {
+            return Err(VmError::InvalidOperand);
+        }
         let caller = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
         write_register(caller, return_reg, resolved)?;
         // Caller's pc was set to the next instruction at call time;
@@ -453,21 +486,28 @@ impl Interpreter {
     /// completion (`pending_abrupt`) and jumps to the finally body —
     /// `Op::EndFinally` resumes this walk. With no remaining `finally`,
     /// a `Jump` sets the target pc and a `Return` pops the frame.
-    pub(crate) fn unwind_abrupt(
+    /// Advance an abrupt completion without crossing `activation_floor`.
+    pub(crate) fn unwind_abrupt_above(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
+        activation_floor: ActivationFloor,
         completion: crate::cold_frame::AbruptKind,
-        floor: u32,
+        handler_floor: u32,
     ) -> Result<Option<Value>, VmError> {
+        if stack.is_at_floor(activation_floor) {
+            return Err(VmError::InvalidOperand);
+        }
         let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
-        match self.advance_abrupt_frame(&mut stack[top_idx], completion, floor)? {
+        match self.advance_abrupt_frame(&mut stack[top_idx], completion, handler_floor)? {
             crate::cold_frame::AbruptFrameOutcome::Resume => Ok(None),
-            crate::cold_frame::AbruptFrameOutcome::Return(value) => self.pop_frame(stack, value),
+            crate::cold_frame::AbruptFrameOutcome::Return(value) => {
+                self.pop_frame_above(stack, activation_floor, value)
+            }
         }
     }
 
     /// Advance one abrupt completion inside a live frame without changing the
-    /// HoltStack shape. Compiled code uses the same handler walk, then returns
+    /// ActivationStack shape. Compiled code uses the same handler walk, then returns
     /// a normal completion to the VM-owned frame-pop boundary when necessary.
     pub(crate) fn advance_abrupt_frame(
         &mut self,
@@ -527,21 +567,38 @@ impl Interpreter {
     }
 
     /// Return `value` from the top frame, first running any enclosing
-    /// `finally` blocks (§14.15.3). Equivalent to [`Self::pop_frame`]
-    /// when no `finally` handler is active.
+    /// `finally` blocks (§14.15.3).
     pub(crate) fn return_running_finally(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         value: Value,
     ) -> Result<Option<Value>, VmError> {
+        self.return_running_finally_above(stack, ActivationFloor::ROOT, value)
+    }
+
+    /// Floor-aware counterpart to [`Self::return_running_finally`].
+    pub(crate) fn return_running_finally_above(
+        &mut self,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+        value: Value,
+    ) -> Result<Option<Value>, VmError> {
+        if stack.is_at_floor(floor) {
+            return Err(VmError::InvalidOperand);
+        }
         let top_idx = stack.len() - 1;
         let has_finally = self
             .frame_cold(&stack[top_idx])
             .is_some_and(|c| c.handlers.iter().any(|h| h.finally_pc.is_some()));
         if has_finally {
-            self.unwind_abrupt(stack, crate::cold_frame::AbruptKind::Return(value), 0)
+            self.unwind_abrupt_above(
+                stack,
+                floor,
+                crate::cold_frame::AbruptKind::Return(value),
+                0,
+            )
         } else {
-            self.pop_frame(stack, value)
+            self.pop_frame_above(stack, floor, value)
         }
     }
 }
@@ -594,6 +651,31 @@ mod tests {
         interp.reclaim_registers(&mut outer);
         assert_eq!(interp.register_stack.checkpoint(), 0);
         interp.reclaim_registers(&mut inner);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+    }
+
+    #[test]
+    fn region_completion_preserves_caller_frames_and_registers() {
+        let mut interp = Interpreter::new();
+        let parent_function = function(2);
+        let child_function = function(3);
+        let parent = interp.test_frame_for_function(&parent_function).unwrap();
+        let mut stack = ActivationStack::new();
+        stack.push(parent);
+        let floor = stack.floor();
+        stack.push(interp.test_frame_for_function(&child_function).unwrap());
+        assert_eq!(interp.register_stack.checkpoint(), 5);
+
+        let result = interp
+            .pop_frame_above(&mut stack, floor, Value::number_i32(42))
+            .unwrap();
+
+        assert_eq!(result, Some(Value::number_i32(42)));
+        assert_eq!(stack.len(), floor.depth());
+        assert_eq!(interp.register_stack.checkpoint(), 2);
+
+        let mut parent = stack.pop().unwrap();
+        interp.reclaim_registers(&mut parent);
         assert_eq!(interp.register_stack.checkpoint(), 0);
     }
 }

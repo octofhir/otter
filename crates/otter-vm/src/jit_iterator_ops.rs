@@ -12,7 +12,7 @@
 //! - Reentrant `next` calls temporarily disarm an already-active closer, so a
 //!   throwing `next` observes IteratorStep's no-close rule; a live iterator is
 //!   re-armed exactly once on success.
-//! - All user callbacks run through the existing HoltStack/VmThread reentry
+//! - All user callbacks run through the existing ActivationStack/VmThread reentry
 //!   path and values remain rooted by the published frame.
 //!
 //! # See also
@@ -23,7 +23,8 @@
 use otter_bytecode::Op;
 
 use crate::{
-    ExecutionContext, Interpreter, VmError, holt_stack::HoltStack, read_register, write_register,
+    ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack, read_register,
+    write_register,
 };
 
 impl Interpreter {
@@ -37,7 +38,7 @@ impl Interpreter {
     pub fn jit_runtime_iterator_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

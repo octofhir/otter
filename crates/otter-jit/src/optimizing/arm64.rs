@@ -1027,21 +1027,32 @@ fn check_eligibility(
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
-                    let input_repr = if view.feedback_at(instruction.pc).is_int32_only() {
-                        Representation::Int32
-                    } else if view.feedback_at(instruction.pc).is_numeric_only() {
-                        Representation::Float64
+                    let feedback = frame_feedback(tree, instruction);
+                    if feedback.is_int32_only() {
+                        check_numeric_inputs(
+                            instruction,
+                            ssa,
+                            reprs,
+                            Representation::Int32,
+                            &mut guarded_uses,
+                            &mut allowed_conversions,
+                        )?;
+                    } else if feedback.is_numeric_only() {
+                        check_numeric_inputs(
+                            instruction,
+                            ssa,
+                            reprs,
+                            Representation::Float64,
+                            &mut guarded_uses,
+                            &mut allowed_conversions,
+                        )?;
+                    } else if matches!(instruction.op, Op::Equal | Op::NotEqual) {
+                        // Mixed operands: strict equality is total over tagged
+                        // values, so it lowers inline whatever the feedback.
+                        check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
                     } else {
                         return Err(Unsupported::Opcode(instruction.op));
-                    };
-                    check_numeric_inputs(
-                        instruction,
-                        ssa,
-                        reprs,
-                        input_repr,
-                        &mut guarded_uses,
-                        &mut allowed_conversions,
-                    )?;
+                    }
                 }
                 // A plain call resolves through the direct-call prepare stub
                 // and runs compiled-to-compiled; an ineligible callee completes
@@ -3148,7 +3159,8 @@ fn emit(
                 | Op::GreaterEq
                 | Op::Equal
                 | Op::NotEqual => {
-                    if view.feedback_at(instruction.pc).is_int32_only() {
+                    let feedback = frame_feedback(tree, instruction);
+                    if feedback.is_int32_only() {
                         emit_load_int_operand(
                             &mut ops,
                             reprs,
@@ -3168,7 +3180,7 @@ fn emit(
                             guard_deopt,
                         )?;
                         emit_int_comparison(&mut ops, instruction.op);
-                    } else {
+                    } else if feedback.is_numeric_only() {
                         emit_load_float_operand(
                             &mut ops,
                             reprs,
@@ -3188,6 +3200,33 @@ fn emit(
                             guard_deopt,
                         )?;
                         emit_float_comparison(&mut ops, instruction.op);
+                    } else {
+                        // Mixed operands: total strict (in)equality over the
+                        // tagged values, shared with the template tier. The
+                        // probe's only miss is a null heap.
+                        let deopt = ops.new_dynamic_label();
+                        deopt_exits.push((
+                            deopt,
+                            deopt_exit_at(frame_states, instruction)?,
+                            instruction.pc,
+                        ));
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[0]),
+                            9,
+                        )?;
+                        emit_load_tagged_location(
+                            &mut ops,
+                            allocation.location(instruction.inputs[1]),
+                            10,
+                        )?;
+                        crate::template::arm64::arith::emit_strict_eq_tagged(
+                            &mut ops,
+                            instruction.op == Op::NotEqual,
+                            deopt,
+                        );
+                        crate::template::arm64::values::emit_box_bool(&mut ops, 13, 12);
+                        dynasm!(ops ; .arch aarch64 ; mov x11, x13);
                     }
                     emit_store_tagged_location(
                         &mut ops,

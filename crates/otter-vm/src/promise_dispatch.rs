@@ -315,7 +315,7 @@ impl PromiseSlots {
     }
 
     fn fill(&self, heap: &mut otter_gc::GcHeap, index: usize, value: Value) -> bool {
-        let did_fill = crate::array::with_elements_mut(self.values_array(), heap, |elements| {
+        let did_fill = crate::array::with_elements_rewrite(self.values_array(), heap, |elements| {
             let Some(slot) = elements.get_mut(index) else {
                 return false;
             };

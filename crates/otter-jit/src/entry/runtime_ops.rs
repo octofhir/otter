@@ -96,18 +96,8 @@ pub(super) extern "C" fn jit_load_string_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        let frame_index = ctx.materialized_frame_index()?;
-        let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-        let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-        let context = unsafe { &*ctx.activation().context_ptr() };
-        vm.jit_runtime_load_string(
-            context,
-            stack,
-            frame_index,
-            function_id as u32,
-            dst as u16,
-            constant_index as u32,
-        )
+        ctx.runtime_call()?
+            .load_string(function_id as u32, dst as u16, constant_index as u32)
     })();
     park_result(ctx, result)
 }
@@ -121,18 +111,8 @@ pub(super) extern "C" fn jit_define_data_property_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        let frame_index = ctx.materialized_frame_index()?;
-        let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-        let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-        let context = unsafe { &*ctx.activation().context_ptr() };
-        vm.jit_runtime_define_data_property(
-            context,
-            stack,
-            frame_index,
-            object as u16,
-            key as u16,
-            value as u16,
-        )
+        ctx.runtime_call()?
+            .define_data_property(object as u16, key as u16, value as u16)
     })();
     park_result(ctx, result)
 }
@@ -155,17 +135,8 @@ pub(super) extern "C" fn jit_load_builtin_error_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        let frame_index = ctx.materialized_frame_index()?;
-        let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-        let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-        let context = unsafe { &*ctx.activation().context_ptr() };
-        vm.jit_runtime_load_builtin_error(
-            context,
-            stack,
-            frame_index,
-            dst as u16,
-            kind_index as u32,
-        )
+        ctx.runtime_call()?
+            .load_builtin_error(dst as u16, kind_index as u32)
     })();
     park_result(ctx, result)
 }
@@ -186,18 +157,8 @@ pub(super) extern "C" fn jit_define_own_property_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        let frame_index = ctx.materialized_frame_index()?;
-        let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-        let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-        let context = unsafe { &*ctx.activation().context_ptr() };
-        vm.jit_runtime_define_own_property(
-            context,
-            stack,
-            frame_index,
-            target as u16,
-            key as u16,
-            descriptor as u16,
-        )
+        ctx.runtime_call()?
+            .define_own_property(target as u16, key as u16, descriptor as u16)
     })();
     park_result(ctx, result)
 }
@@ -215,14 +176,7 @@ pub(super) extern "C" fn jit_make_closure_stub(
     let parent_indices =
         unsafe { std::slice::from_raw_parts(parent_indices, parent_count as usize) };
     let result = (|| {
-        let frame_index = ctx.materialized_frame_index()?;
-        let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-        let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-        let context = unsafe { &*ctx.activation().context_ptr() };
-        vm.jit_runtime_make_closure(
-            context,
-            stack,
-            frame_index,
+        ctx.runtime_call()?.make_closure(
             function_id as u32,
             dst as u16,
             function_index as u32,
@@ -244,18 +198,8 @@ pub(super) extern "C" fn jit_math_call_stub(
     let argument_regs =
         unsafe { std::slice::from_raw_parts(argument_regs, argument_count as usize) };
     let result = (|| {
-        let frame_index = ctx.materialized_frame_index()?;
-        let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-        let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-        let context = unsafe { &*ctx.activation().context_ptr() };
-        vm.jit_runtime_math_call(
-            context,
-            stack,
-            frame_index,
-            dst as u16,
-            method_id as u32,
-            argument_regs,
-        )
+        ctx.runtime_call()?
+            .math_call(dst as u16, method_id as u32, argument_regs)
     })();
     park_result(ctx, result)
 }

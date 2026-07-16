@@ -168,8 +168,23 @@ pub(crate) extern "C" fn jit_exception_op_stub(
     let frame_index = match ctx.materialized_frame_index() {
         Ok(index) => index,
         Err(_) => {
+            // This is an exact pre-effect side exit. Preserve the stamped
+            // opcode PC: the exception emitter treats `value` as a dynamic
+            // resume PC and republishes it before the shared bail epilogue.
+            // Returning zero would materialize a direct callee at function
+            // entry and replay every side effect preceding this opcode.
+            let pc = match ctx.active_frame() {
+                Ok(frame) => frame.pc(),
+                Err(err) => {
+                    park_jit_error(ctx, err);
+                    return JitRet {
+                        value: 0,
+                        status: STATUS_THREW,
+                    };
+                }
+            };
             return JitRet {
-                value: 0,
+                value: u64::from(pc),
                 status: STATUS_BAILED,
             };
         }
@@ -1033,17 +1048,11 @@ pub(crate) extern "C" fn jit_numeric_op_stub(
 pub(crate) extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let frame_index = match ctx.materialized_frame_index() {
-        Ok(index) => index,
-        Err(err) => {
-            park_jit_error(ctx, err);
-            return 1;
-        }
-    };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_make_function(context, stack, frame_index, dst as u16, idx as u32) {
+    let result = ctx.runtime_call().and_then(|mut runtime| {
+        let function_id = runtime.function_id();
+        runtime.make_function(function_id, dst as u16, idx as u32)
+    });
+    match result {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1123,6 +1132,20 @@ mod tests {
             assert_eq!(status, STATUS_BAILED);
             assert!(error.is_none());
             assert_eq!(ctx.native_owner_id(), Ok(41));
+        });
+    }
+
+    #[test]
+    fn frameless_exception_bail_preserves_the_stamped_opcode_pc() {
+        with_frameless_ctx(|ctx, error| {
+            // SAFETY: the fixture owns the live native frame for this call.
+            unsafe {
+                (*ctx.native_frame).header.pc = 37;
+            }
+            let result = jit_exception_op_stub(ctx, 0, 0, 0, 0);
+            assert_eq!(result.status, STATUS_BAILED);
+            assert_eq!(result.value, 37);
+            assert!(error.is_none());
         });
     }
 

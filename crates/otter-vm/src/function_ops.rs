@@ -47,6 +47,25 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
+        let eval_env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
+        let mut active = ActiveFrameMut::materialized(frame);
+        self.run_make_function_active_reg(context, &mut active, dst, idx, eval_env)
+    }
+
+    /// Representation-neutral capture-free function construction.
+    ///
+    /// Materialized frames supply their optional direct-eval environment.
+    /// Frameless direct-call owners are ineligible when that cold state exists,
+    /// so their published SELF and register window are the complete source of
+    /// truth and no interpreter [`Frame`] needs to be synthesized.
+    pub(crate) fn run_make_function_active_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        idx: u32,
+        eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    ) -> Result<(), VmError> {
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -55,8 +74,8 @@ impl Interpreter {
         // free identifiers resolve dynamically), so it materializes as a
         // closure with no upvalues. Otherwise a capture-free function keeps
         // the canonical interned value.
-        if function_id != frame.function_id
-            && let Some(env) = self.frame_cold(frame).and_then(|cold| cold.eval_env)
+        if function_id != frame.function_id()
+            && let Some(env) = eval_env
         {
             let closure = crate::closure::alloc_closure(
                 &mut self.gc_heap,
@@ -68,7 +87,7 @@ impl Interpreter {
                 Some(env),
             )
             .map_err(crate::oom_to_vm)?;
-            write_register(frame, dst, Value::closure(closure))?;
+            frame.write(dst, Value::closure(closure))?;
             frame.advance_pc()?;
             return Ok(());
         }
@@ -78,10 +97,9 @@ impl Interpreter {
         // `this instanceof Self` / `Self.prototype` inside the body would
         // observe a different per-instance `.prototype` than the one the
         // constructor installed on `this`.
-        if function_id == frame.function_id {
-            let mut active = ActiveFrameMut::materialized(frame);
-            self.frame_load_self(&mut active, dst)?;
-            active.advance_pc()?;
+        if function_id == frame.function_id() {
+            self.frame_load_self(frame, dst)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         // §10.2 OrdinaryFunctionCreate — every evaluation of a function
@@ -102,7 +120,7 @@ impl Interpreter {
             None,
         )
         .map_err(crate::oom_to_vm)?;
-        write_register(frame, dst, Value::closure(closure))?;
+        frame.write(dst, Value::closure(closure))?;
         frame.advance_pc()?;
         Ok(())
     }
@@ -137,6 +155,45 @@ impl Interpreter {
         function_index: u32,
         parent_indices: &[u32],
     ) -> Result<(), VmError> {
+        let (new_target, bound_derived_this, eval_env) =
+            self.frame_cold(frame).map_or((None, None, None), |cold| {
+                (cold.new_target, cold.derived_this_cell, cold.eval_env)
+            });
+        let mut active = ActiveFrameMut::materialized_with_new_target(
+            frame,
+            new_target.unwrap_or_else(Value::undefined),
+        );
+        self.run_make_closure_active_regs(
+            context,
+            &mut active,
+            dst,
+            function_index,
+            parent_indices,
+            new_target,
+            bound_derived_this,
+            eval_env,
+        )
+    }
+
+    /// Representation-neutral closure construction for a published activation.
+    ///
+    /// Native direct callees use this path without materializing an interpreter
+    /// [`Frame`]. Materialized callers pass their cold lexical sidecar fields;
+    /// direct-call eligibility guarantees those fields are absent for a native
+    /// owner, while SELF, `this`, and the upvalue window remain available through
+    /// [`ActiveFrameMut`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_make_closure_active_regs(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        function_index: u32,
+        parent_indices: &[u32],
+        lexical_new_target: Option<Value>,
+        bound_derived_this: Option<UpvalueCell>,
+        eval_env: Option<crate::eval_env::EvalEnvHandle>,
+    ) -> Result<(), VmError> {
         let function_id = context
             .function_id_constant(function_index)
             .ok_or(VmError::InvalidOperand)?;
@@ -146,43 +203,35 @@ impl Interpreter {
         // a fresh instance owns a distinct per-instance `.prototype`, so
         // `this instanceof Self` / `Self.prototype` would diverge from the
         // prototype the constructor installed on `this`.
-        if function_id == frame.function_id {
-            let mut active = ActiveFrameMut::materialized(frame);
-            self.frame_load_self(&mut active, dst)?;
-            active.advance_pc()?;
+        if function_id == frame.function_id() {
+            self.frame_load_self(frame, dst)?;
+            frame.advance_pc()?;
             return Ok(());
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(parent_indices.len());
         for &parent_idx in parent_indices {
-            let cell = *frame
-                .upvalues
-                .get(parent_idx as usize)
-                .ok_or(VmError::InvalidOperand)?;
-            cells.push(cell);
+            cells.push(frame.upvalue(parent_idx)?);
         }
         let upvalues = cells;
         // Arrow-closure receivers are bound lexically: every later invocation
         // ignores the call site and uses the enclosing frame's `this`.
         let bound_this = if context.function_is_arrow(function_id) {
-            Some(frame.this_value)
+            Some(frame.this_value())
         } else {
             None
         };
         let bound_new_target = if context.function_is_arrow(function_id) {
-            self.frame_cold(frame).and_then(|cold| cold.new_target)
+            lexical_new_target
         } else {
             None
         };
-        let bound_derived_this = if context.function_is_arrow(function_id) {
-            self.frame_cold(frame)
-                .and_then(|cold| cold.derived_this_cell)
-        } else {
-            None
-        };
+        let bound_derived_this = context
+            .function_is_arrow(function_id)
+            .then_some(bound_derived_this)
+            .flatten();
         // §9.1 — closures made in a frame whose function chain
         // contains a direct eval capture the frame's eval variable
         // environment so eval-introduced vars stay reachable.
-        let eval_env = self.frame_cold(frame).and_then(|cold| cold.eval_env);
         let closure = crate::closure::alloc_closure(
             &mut self.gc_heap,
             function_id,
@@ -193,7 +242,7 @@ impl Interpreter {
             eval_env,
         )
         .map_err(crate::oom_to_vm)?;
-        write_register(frame, dst, Value::closure(closure))?;
+        frame.write(dst, Value::closure(closure))?;
         frame.advance_pc()?;
         Ok(())
     }

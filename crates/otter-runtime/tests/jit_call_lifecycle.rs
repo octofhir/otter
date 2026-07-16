@@ -7,6 +7,7 @@
 //!   method-call site.
 //! - Direct callees that allocate their own captured cells while retaining the
 //!   current receiver across moving-GC safepoints.
+//! - Frameless direct callees that mint distinct capture-free function values.
 //! - Recursive compiled calls that catch or propagate throws before the same
 //!   runtime successfully enters another compiled call.
 //!
@@ -17,6 +18,8 @@
 //!   neither method identity nor `this` leaks between polymorphic calls.
 //! - Upvalue-spine construction roots inherited cells and dynamic call state
 //!   until the new frame is published.
+//! - Capture-free function construction uses the published SELF/register
+//!   window and never requires a materialized interpreter frame.
 //! - Return, caught-throw, and escaping-throw completion release every nested
 //!   call lifecycle resource so later compiled entries remain reusable.
 //! - Loop OSR is disabled, so observed direct calls cross whole-function
@@ -229,6 +232,54 @@ fn direct_frame_build_roots_receiver_and_new_upvalue_cells() {
         compiled.completion,
         "[72768,[10,1001,12,1003,14,1005,16,1007]]"
     );
+    assert_whole_function_direct_calls(&compiled);
+}
+
+const FRAMELESS_MAKE_FUNCTION: &str = r#"
+function mint() {
+  return function leaf(value) {
+    return value + 1;
+  };
+}
+
+function mintThroughCompiledCaller() {
+  return mint();
+}
+
+// Compile both endpoints, then keep allocating distinct capture-free closure
+// bodies through a compiled-to-compiled call. The volume is intentional: it
+// exercises relocation while MakeFunction's destination stays in the native
+// owner's published register window.
+let warmChecksum = 0;
+for (let i = 0; i < 512; i++) {
+  warmChecksum += mintThroughCompiledCaller()(i);
+}
+
+const first = mintThroughCompiledCaller();
+const second = mintThroughCompiledCaller();
+JSON.stringify([
+  first !== second,
+  first(40),
+  second(41),
+  warmChecksum
+]);
+"#;
+
+#[test]
+fn frameless_make_function_mints_distinct_values_across_gc() {
+    let oracle = run(
+        FRAMELESS_MAKE_FUNCTION,
+        "jit-call-frameless-make-function.js",
+        JitSelection::InterpreterOnly,
+    );
+    let compiled = run(
+        FRAMELESS_MAKE_FUNCTION,
+        "jit-call-frameless-make-function.js",
+        JitSelection::Template,
+    );
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[true,41,42,131328]");
     assert_whole_function_direct_calls(&compiled);
 }
 

@@ -5,12 +5,14 @@
 //!   functions matching the optimizer's deliberately narrow production subset.
 //! - Hot optimized return and non-int32 guard-bail comparisons against
 //!   [`JitSelection::InterpreterOnly`].
-//! - Cooperative cancellation after a hot loop has entered optimized code.
+//! - Allocation-free cooperative cancellation after a hot loop has entered
+//!   optimized code.
 //!
 //! # Invariants
 //! - Both tier selections execute the identical linked bytecode module.
-//! - The tiered run must prove machine-code entry and reconstructed bail via
-//!   isolate-owned execution statistics.
+//! - Guard failures reconstruct at an exact bytecode boundary, while an inline
+//!   interrupt poll exits its compiled activation directly and leaves it
+//!   reusable without materializing an interpreter frame.
 
 use std::{sync::Arc, time::Duration};
 
@@ -365,7 +367,7 @@ fn optimized_float_function_matches_interpreter_bits() {
 }
 
 #[test]
-fn optimized_long_loop_terminates_through_interrupt_path() {
+fn optimized_long_loop_interrupts_without_materializing_a_frame() {
     let mut interp = Interpreter::new();
     interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
     let context = interp.link_module(fixture_module());
@@ -377,16 +379,18 @@ fn optimized_long_loop_terminates_through_interrupt_path() {
             Some(10)
         );
     }
-    let entries_before = interp.jit_runtime_stats().optimized_entries;
+    let before = interp.jit_runtime_stats();
+    let entries_before = before.optimized_entries;
     assert!(
         entries_before > 0,
         "count loop must be optimized after warmup"
     );
 
     let interrupt = interp.interrupt_handle();
+    let interrupt_setter = interrupt.clone();
     let interrupter = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(10));
-        interrupt.interrupt();
+        interrupt_setter.interrupt();
     });
     let result = call_int(&mut interp, &context, 4, i32::MAX);
     interrupter.join().expect("interrupt setter");
@@ -395,7 +399,19 @@ fn optimized_long_loop_terminates_through_interrupt_path() {
     let stats = interp.jit_runtime_stats();
     assert!(stats.optimized_entries > entries_before, "{stats:?}");
     assert!(
-        stats.optimized_deopts > 0,
-        "poll must reconstruct the loop: {stats:?}"
+        stats.leaf_stub_transitions > before.leaf_stub_transitions,
+        "interrupt poll must exit through the allocation-free leaf path: {stats:?}"
+    );
+    assert_eq!(
+        stats.optimized_deopts, before.optimized_deopts,
+        "interrupt poll must not materialize an interpreter frame: {stats:?}"
+    );
+
+    interrupt.reset();
+    assert_eq!(
+        call_int(&mut interp, &context, 4, 10)
+            .expect("compiled state remains reusable after interrupt")
+            .as_i32(),
+        Some(10)
     );
 }

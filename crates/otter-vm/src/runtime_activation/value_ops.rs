@@ -6,9 +6,161 @@
 
 use crate::{NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, Value, VmError};
 
-use super::RuntimeCall;
+use super::{RuntimeCall, RuntimeFrameIdentity};
 
 impl RuntimeCall<'_> {
+    /// Load one realm builtin error constructor.
+    pub fn load_builtin_error(&mut self, dst: u16, kind_index: u32) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall exclusively owns this validated descriptor.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_load_builtin_error(context, &mut frame, dst, kind_index)
+    }
+
+    /// Define one object-literal data property through the current activation.
+    pub fn define_data_property(
+        &mut self,
+        object: u16,
+        key: u16,
+        value: u16,
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall owns the canonical published descriptor.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_define_data_property(context, &mut frame, object, key, value)
+    }
+
+    /// Apply an accessor-aware property descriptor through the current
+    /// canonical activation.
+    pub fn define_own_property(
+        &mut self,
+        target: u16,
+        key: u16,
+        descriptor: u16,
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall exclusively owns this validated descriptor.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_define_own_property(context, &mut frame, target, key, descriptor)
+    }
+
+    /// Complete a guarded Math call through the current activation.
+    pub fn math_call(
+        &mut self,
+        dst: u16,
+        method_id: u32,
+        argument_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall exclusively owns this validated descriptor.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_math_call(context, &mut frame, dst, method_id, argument_regs)
+    }
+
+    /// Materialize a string constant into the current activation.
+    pub fn load_string(
+        &mut self,
+        function_id: u32,
+        dst: u16,
+        constant_index: u32,
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        let frame = self.frame.as_ptr();
+        // SAFETY: RuntimeCall owns the published descriptor for this operation.
+        let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
+        vm.jit_runtime_load_string(context, &mut frame, function_id, dst, constant_index)
+    }
+
+    /// Allocate a closure from the current activation's captured-cell window.
+    ///
+    /// Materialized entries retain their cold lexical sidecar. Frameless direct
+    /// callees use the canonical native window and never synthesize a [`crate::Frame`].
+    pub fn make_closure(
+        &mut self,
+        function_id: u32,
+        dst: u16,
+        function_index: u32,
+        parent_indices: &[u32],
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        match self.identity {
+            RuntimeFrameIdentity::Materialized(index) => vm.jit_runtime_make_closure(
+                context,
+                unsafe { &mut *self.stack.as_ptr() },
+                index as usize,
+                function_id,
+                dst,
+                function_index,
+                parent_indices,
+            ),
+            RuntimeFrameIdentity::NativeOwner(_) => {
+                let frame = self.frame.as_ptr();
+                // SAFETY: RuntimeCall validated and exclusively owns this
+                // descriptor for the duration of the semantic operation.
+                let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+                    .map_err(|_| VmError::InvalidOperand)?;
+                vm.jit_runtime_make_closure_native(
+                    context,
+                    &mut frame,
+                    function_id,
+                    dst,
+                    function_index,
+                    parent_indices,
+                )
+            }
+        }
+    }
+
+    /// Allocate one capture-free function value through the current
+    /// activation without requiring a materialized interpreter frame.
+    pub fn make_function(
+        &mut self,
+        function_id: u32,
+        dst: u16,
+        function_index: u32,
+    ) -> Result<(), VmError> {
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        let context = unsafe { self.context.as_ref() };
+        match self.identity {
+            RuntimeFrameIdentity::Materialized(index) => vm.jit_runtime_make_function(
+                context,
+                unsafe { &mut *self.stack.as_ptr() },
+                index as usize,
+                dst,
+                function_index,
+            ),
+            RuntimeFrameIdentity::NativeOwner(_) => {
+                let frame = self.frame.as_ptr();
+                // SAFETY: RuntimeCall exclusively owns the validated published
+                // descriptor for this semantic operation.
+                let mut frame = unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+                    .map_err(|_| VmError::InvalidOperand)?;
+                vm.jit_runtime_make_function_native(
+                    context,
+                    &mut frame,
+                    function_id,
+                    dst,
+                    function_index,
+                )
+            }
+        }
+    }
+
     /// Complete generic ECMAScript addition.
     pub fn add(&mut self, dst: u16, lhs: u16, rhs: u16) -> Result<(), VmError> {
         // SAFETY: RuntimeCall brands exclusive mutator access for this exact

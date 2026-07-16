@@ -1,19 +1,19 @@
-//! Script-driven OOM surfaces as [`OtterError::OutOfMemory`].
+//! Script-driven heap-cap failures surface as catchable JavaScript
+//! `RangeError` instances.
 //!
-//! `Runtime::max_heap_bytes` is load-bearing as of task 73:
-//! a script that allocates strings past the configured cap is
-//! refused by the string heap, the resulting `VmError::OutOfMemory`
-//! is mapped through [`OtterError::OutOfMemory`], and the embedder
-//! sees the structured error variant directly.
+//! `Runtime::max_heap_bytes` is a mutator boundary: recoverable allocation
+//! refusal is converted once into the realm's `RangeError` and follows normal
+//! throw/catch semantics. Unrecoverable VM allocation failures may still cross
+//! the embedder boundary as structured host errors.
 //!
 //! # See also
 //!
 //! - GC architecture plan §1.2 NF3, §7.5.
 
-use otter_runtime::{OtterError, Runtime, SourceInput};
+use otter_runtime::{Runtime, SourceInput};
 
 #[test]
-fn runtime_string_alloc_past_cap_surfaces_out_of_memory() {
+fn runtime_string_cap_is_catchable_as_range_error() {
     // Tight cap so a tiny accumulation of string concatenations
     // overshoots — keeps the test fast and deterministic.
     let mut runtime = Runtime::builder()
@@ -26,27 +26,24 @@ fn runtime_string_alloc_past_cap_surfaces_out_of_memory() {
     // second on every supported platform.
     let source = SourceInput::from_javascript(
         r#"
-            let s = "";
-            let chunk = "";
-            for (let i = 0; i < 1024; i++) chunk += "x";
-            for (let i = 0; i < 100000; i++) {
-                s += chunk;
+            let caught = false;
+            try {
+                let s = "";
+                let chunk = "";
+                for (let i = 0; i < 1024; i++) chunk += "x";
+                for (let i = 0; i < 100000; i++) {
+                    s += chunk;
+                }
+            } catch (e) {
+                caught = e instanceof RangeError;
             }
-            s;
+            caught;
         "#,
     );
-    let err = runtime
+    let result = runtime
         .run_script(source, "<script>")
-        .expect_err("script must hit the heap cap");
-    match err {
-        OtterError::OutOfMemory {
-            requested_bytes: _,
-            heap_limit_bytes,
-        } => {
-            assert_eq!(heap_limit_bytes, 2 * 1024 * 1024);
-        }
-        other => panic!("expected OtterError::OutOfMemory, got {other:?}"),
-    }
+        .expect("script should catch string heap cap as RangeError");
+    assert_eq!(result.completion_string(), "true");
 }
 
 #[test]

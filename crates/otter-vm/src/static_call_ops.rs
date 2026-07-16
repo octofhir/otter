@@ -23,8 +23,8 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Local, Value, VmError, VmPropertyKey, array, bigint,
-    binary, object,
+    ActiveFrameMut, ExecutionContext, Frame, Interpreter, Local, Value, VmError, VmPropertyKey,
+    array, bigint, binary, object,
     operand_decode::{const_operand, register_operand},
     read_register, write_register,
 };
@@ -330,28 +330,75 @@ impl Interpreter {
         key_reg: u16,
         descriptor_reg: u16,
     ) -> Result<(), VmError> {
-        let (target, key_value, desc_value) = {
-            let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
-            (
-                *read_register(frame, target_reg)?,
-                *read_register(frame, key_reg)?,
-                *read_register(frame, descriptor_reg)?,
-            )
-        };
+        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
+        let mut frame = ActiveFrameMut::materialized(frame);
+        self.run_define_own_property_active(
+            context,
+            &mut frame,
+            target_reg,
+            key_reg,
+            descriptor_reg,
+        )?;
+        frame.advance_pc()
+    }
+
+    /// Apply a property descriptor through the canonical activation.
+    ///
+    /// The source values and a symbol key stay in the handle arena while key
+    /// coercion and descriptor getters can allocate or re-enter JavaScript.
+    /// String keys are converted to owned text so no moving heap handle spans
+    /// the descriptor conversion.
+    pub(crate) fn run_define_own_property_active(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        target_reg: u16,
+        key_reg: u16,
+        descriptor_reg: u16,
+    ) -> Result<(), VmError> {
+        let target = frame.read(target_reg)?;
+        let key_value = frame.read(key_reg)?;
+        let desc_value = frame.read(descriptor_reg)?;
         if !target.is_object_type() {
             return Err(
                 self.err_type(("DefineOwnProperty target must be an object".to_string()).into())
             );
         }
-        let key = self.evaluate_to_property_key(context, &key_value)?;
-        let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-        let ok = self.define_own_property_value(context, &target, &key, descriptor)?;
-        if !ok {
-            return Err(self.err_type(("Cannot define property".to_string()).into()));
-        }
-        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
-        frame.advance_pc()?;
-        Ok(())
+        self.with_handle_scope(|interp, scope| {
+            enum RootedKey<'scope> {
+                String(String),
+                Symbol(Local<'scope>),
+            }
+
+            let target = interp.scoped_value(scope, target);
+            let key_value = interp.scoped_value(scope, key_value);
+            let desc_value = interp.scoped_value(scope, desc_value);
+            let key = interp.evaluate_to_property_key(context, &interp.escape_scoped(key_value))?;
+            let key = match key {
+                VmPropertyKey::Symbol(symbol) => {
+                    RootedKey::Symbol(interp.scoped_value(scope, Value::symbol(symbol)))
+                }
+                VmPropertyKey::Atom(atom) => RootedKey::String(atom.name().to_string()),
+                VmPropertyKey::String(name) => RootedKey::String(name.to_string()),
+                VmPropertyKey::OwnedString(name) => RootedKey::String(name),
+            };
+            let descriptor = interp
+                .evaluate_to_property_descriptor(context, &interp.escape_scoped(desc_value))?;
+            let key = match key {
+                RootedKey::String(name) => VmPropertyKey::OwnedString(name),
+                RootedKey::Symbol(symbol) => VmPropertyKey::Symbol(
+                    interp
+                        .escape_scoped(symbol)
+                        .as_symbol(&interp.gc_heap)
+                        .ok_or(VmError::InvalidOperand)?,
+                ),
+            };
+            let target = interp.escape_scoped(target);
+            if !interp.define_own_property_value(context, &target, &key, descriptor)? {
+                return Err(interp.err_type(("Cannot define property".to_string()).into()));
+            }
+            Ok(())
+        })
     }
 
     /// §20.1.2.2 Object.create(O, Properties).

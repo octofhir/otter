@@ -72,7 +72,7 @@ pub(super) fn emit_box_int32(ops: &mut Assembler, t: u8, scratch: u8) {
 /// Box a boolean: a preceding `cset` wrote `0`/`1` into `W(t)`; adding
 /// `VALUE_FALSE` yields the full `false`/`true` immediate word. Clobbers
 /// `W(scratch)`.
-pub(super) fn emit_box_bool(ops: &mut Assembler, t: u8, scratch: u8) {
+pub(crate) fn emit_box_bool(ops: &mut Assembler, t: u8, scratch: u8) {
     dynasm!(ops
         ; .arch aarch64
         ; movz W(scratch), VALUE_FALSE_LOW
@@ -97,7 +97,7 @@ pub(super) fn emit_guard_int32(ops: &mut Assembler, r: u8, bail: DynamicLabel) {
 /// `int32` payloads sign-convert (`scvtf`); a boxed double has the encode
 /// offset subtracted before `fmov`; a cell or non-number immediate (no
 /// number-tag bit) branches to `bail`. Uses scratch GPRs x14/x15.
-pub(super) fn emit_num_to_double(ops: &mut Assembler, src_x: u8, dst_d: u8, bail: DynamicLabel) {
+pub(crate) fn emit_num_to_double(ops: &mut Assembler, src_x: u8, dst_d: u8, bail: DynamicLabel) {
     let is_non_int = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops

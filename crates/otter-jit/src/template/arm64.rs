@@ -29,7 +29,7 @@
 // intentionally redundant and outside the source-level emitter's control.
 #![allow(clippy::useless_conversion)]
 
-mod arith;
+pub(crate) mod arith;
 pub(crate) mod calls;
 mod class_ops;
 mod class_value;

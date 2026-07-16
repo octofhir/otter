@@ -1185,14 +1185,15 @@ impl Interpreter {
         // Install the call-site IC so subsequent calls skip name resolution and
         // the slot hash. The cached slot offset is only sound while the
         // prototype keeps the recorded shape (guarded on the fast path).
-        if let Some(hit) = hit
-            && site < self.method_call_ics.len()
-        {
-            self.method_call_ics[site] = Some(MethodCallIc::Array(ArrayMethodCallIc {
-                proto_shape: hit.shape_id,
-                proto_slot: hit.slot,
-                tag,
-            }));
+        if let Some(hit) = hit {
+            self.feedback_directory.install_method_ic(
+                site,
+                MethodCallIc::Array(ArrayMethodCallIc {
+                    proto_shape: hit.shape_id,
+                    proto_slot: hit.slot,
+                    tag,
+                }),
+            );
         }
         Some(self.dispatch_array_builtin_rooted(context, tag, recv, args))
     }
@@ -1213,7 +1214,7 @@ impl Interpreter {
         recv: Value,
         args: &[Value],
     ) -> Option<Result<Value, VmError>> {
-        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+        let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
         };
@@ -1221,7 +1222,7 @@ impl Interpreter {
             // The receiver is no longer an array: drop the cache so the direct
             // compiled-call path (skipped while the IC was live) resumes for
             // whatever this site now sees.
-            self.method_call_ics[site] = None;
+            self.feedback_directory.clear_method_ic(site);
             return None;
         };
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
@@ -1259,13 +1260,13 @@ impl Interpreter {
         site: usize,
         recv: Value,
     ) -> Option<CollectionFastTarget> {
-        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+        let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
         };
         let proto = if let Some(map) = recv.as_map() {
             if !ic.op.is_map() {
-                self.method_call_ics[site] = None;
+                self.feedback_directory.clear_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.map_prototype?;
@@ -1279,7 +1280,7 @@ impl Interpreter {
             proto
         } else if let Some(set) = recv.as_set() {
             if !ic.op.is_set() {
-                self.method_call_ics[site] = None;
+                self.feedback_directory.clear_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.set_prototype?;
@@ -1292,7 +1293,7 @@ impl Interpreter {
             }
             proto
         } else {
-            self.method_call_ics[site] = None;
+            self.feedback_directory.clear_method_ic(site);
             return None;
         };
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
@@ -1374,9 +1375,7 @@ impl Interpreter {
         } else {
             return None;
         };
-        if let Some(hit) = hit
-            && site < self.method_call_ics.len()
-        {
+        if let Some(hit) = hit {
             let ic = CollectionMethodCallIc {
                 proto_shape: hit.shape_id,
                 proto_slot: hit.slot,
@@ -1384,7 +1383,8 @@ impl Interpreter {
                 leaf_stub_id: op.leaf_stub_id(),
                 alloc_stub_id: op.alloc_stub_id(),
             };
-            self.method_call_ics[site] = Some(MethodCallIc::Collection(ic));
+            self.feedback_directory
+                .install_method_ic(site, MethodCallIc::Collection(ic));
         }
         Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))
     }
@@ -1655,35 +1655,41 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
         site: usize,
     ) -> Option<Value> {
-        if site >= self.load_property_ics.len() || self.load_property_ics[site].is_megamorphic() {
+        if self
+            .feedback_directory
+            .property_is_megamorphic(site, PropertyIcKind::Load)
+            != Some(false)
+        {
             return None;
         }
-        let mut hit_value: Option<Value> = None;
-        for ic in self.load_property_ics[site].entries() {
-            if let Some(value) = ic.run_load(obj, &self.gc_heap, key) {
-                hit_value = Some(value);
-                break;
-            }
-        }
-        if let Some(value) = hit_value {
-            self.property_ic_stats.record_hit(PropertyIcKind::Load);
+        if let Some(value) = self
+            .feedback_directory
+            .probe_load(site, obj, &self.gc_heap, key)
+        {
+            self.feedback_directory
+                .record_property_hit(PropertyIcKind::Load);
             return Some(value);
         }
-        if self.load_property_ics[site].entry_count() > 0 {
-            self.load_property_ics[site]
-                .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+        if self
+            .feedback_directory
+            .property_entry_count(site, PropertyIcKind::Load)
+            .unwrap_or_default()
+            > 0
+        {
+            self.feedback_directory
+                .record_property_guard_miss(site, PropertyIcKind::Load);
         } else {
-            self.load_property_ics[site]
-                .record_uncached_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+            self.feedback_directory
+                .record_property_uncached_miss(site, PropertyIcKind::Load);
         }
-        if !self.load_property_ics[site].is_megamorphic()
+        if self
+            .feedback_directory
+            .property_is_megamorphic(site, PropertyIcKind::Load)
+            == Some(false)
             && let Some((ic, value)) = cache_ir::CacheStub::install_load(obj, &self.gc_heap, key)
         {
-            self.load_property_ics[site].install_with_stats(
-                &mut self.property_ic_stats,
-                PropertyIcKind::Load,
-                ic,
-            );
+            self.feedback_directory
+                .install_property_stub(site, PropertyIcKind::Load, ic);
             return Some(value);
         }
         None

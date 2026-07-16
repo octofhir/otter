@@ -355,33 +355,7 @@ impl Interpreter {
     /// borrow.
     #[must_use]
     pub fn ic_snapshot(&self) -> Vec<inspect::IcSiteSnapshot> {
-        let mut out = Vec::with_capacity(
-            self.load_property_ics.len()
-                + self.store_property_ics.len()
-                + self.has_property_ics.len(),
-        );
-        for (index, entry) in self.load_property_ics.iter().enumerate() {
-            out.push(inspect::IcSiteSnapshot {
-                site_index: index as u32,
-                kind: inspect::IcSiteKind::Load,
-                state: inspect::snapshot_load_state(entry),
-            });
-        }
-        for (index, entry) in self.store_property_ics.iter().enumerate() {
-            out.push(inspect::IcSiteSnapshot {
-                site_index: index as u32,
-                kind: inspect::IcSiteKind::Store,
-                state: inspect::snapshot_store_state(entry),
-            });
-        }
-        for (index, entry) in self.has_property_ics.iter().enumerate() {
-            out.push(inspect::IcSiteSnapshot {
-                site_index: index as u32,
-                kind: inspect::IcSiteKind::Has,
-                state: inspect::snapshot_has_state(entry),
-            });
-        }
-        out
+        self.feedback_directory.ic_snapshot()
     }
 
     /// Snapshot the active hidden-class transition tree. Nodes

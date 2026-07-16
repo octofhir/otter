@@ -21,15 +21,17 @@
 //!
 //! # Contents
 //!
-//! - [`CodeSpace`] — append-only chunk registry with monotonic
-//!   function-id and IC-site bases.
+//! - [`CodeSpace`] — append-only chunk chain with monotonic function-id and
+//!   IC-site bases.
 //! - [`ChunkTables`] — one linked chunk's shared tables.
 //! - [`ResolvedCtx`] — borrowed-or-owned context for one function id.
 //!
 //! # Invariants
 //!
-//! - Chunks are appended with strictly increasing `function_base`, so
-//!   id→chunk resolution is a partition-point search.
+//! - Each chunk is immutable after construction. Its `next` link is published
+//!   exactly once, so reads never lock and old contexts immediately see chunks
+//!   linked later in the same code space.
+//! - Chunks are appended with monotonically increasing `function_base` values.
 //! - A linked module's `Function::id`, `Constant::FunctionId`, and
 //!   `ModuleInit::function_id` are all rebased before the executable
 //!   view is built, so chunk bytecode only ever materialises global
@@ -47,7 +49,7 @@
 //! - [`crate::execution_context`]
 //! - [`crate::executable`]
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use otter_bytecode::{BytecodeModule, Constant};
 
@@ -65,62 +67,93 @@ pub(crate) struct ChunkTables {
     pub(crate) atoms: Arc<AtomTable>,
 }
 
-/// Append-only registry of every code chunk linked into one
-/// interpreter, with the monotonic bases that keep function ids and
-/// property-IC sites globally unique.
+/// Append-only registry of every code chunk linked into one interpreter.
+///
+/// The registry is an immutable-node chain rather than a locked `Vec`. Linking
+/// claims the first empty one-shot link; resolution only follows already
+/// published links. This preserves late visibility for escaped functions while
+/// keeping the execution path lock-free.
 #[derive(Debug, Default)]
 pub(crate) struct CodeSpace {
-    inner: RwLock<CodeSpaceInner>,
+    first: OnceLock<Arc<CodeChunk>>,
 }
 
-#[derive(Debug, Default)]
-struct CodeSpaceInner {
-    /// Linked chunks ordered by ascending `function_base`.
-    chunks: Vec<ChunkTables>,
-    /// First function id handed to the next linked chunk.
-    next_function_id: u32,
-    /// First property-IC site id handed to the next linked chunk.
-    next_property_ic_site: u32,
+/// One immutable registry node. `next` is the sole publication point for a
+/// later chunk; installed nodes and their tables are never replaced or evicted.
+#[derive(Debug)]
+struct CodeChunk {
+    tables: ChunkTables,
+    next: OnceLock<Arc<CodeChunk>>,
 }
 
 impl CodeSpace {
-    /// Rebase `module` onto this registry's id space and append it as
-    /// a new chunk. Returns the chunk's [`ExecutionContext`] bound to
-    /// `space`.
-    pub(crate) fn link(space: &Arc<Self>, mut module: BytecodeModule) -> ExecutionContext {
-        let mut inner = space.inner.write().expect("code space lock poisoned");
-        let function_base = inner.next_function_id;
-        rebase_module(&mut module, function_base);
-        let function_count =
-            u32::try_from(module.functions.len()).expect("chunk function table exceeds u32 range");
-        let tables = ChunkTables {
-            function_base,
-            function_count,
-            executable: Arc::new(ExecutableModule::from_bytecode_with_ic_base(
-                &module,
-                inner.next_property_ic_site,
-            )),
-            atoms: Arc::new(AtomTable::from_constants(&module.constants)),
-            module: Arc::new(module),
-        };
-        inner.next_function_id = function_base
-            .checked_add(function_count)
-            .expect("code space exhausted the u32 function-id range");
-        inner.next_property_ic_site = tables.executable.property_ic_site_end();
-        inner.chunks.push(tables.clone());
-        drop(inner);
-        ExecutionContext::from_chunk_tables(tables, Arc::clone(space))
+    /// Rebase `module` onto this registry's id space and append it as a new
+    /// immutable chunk. Returns the chunk's [`ExecutionContext`] bound to this
+    /// code space.
+    ///
+    /// `Interpreter::link_module` is the normal single-writer entry point. The
+    /// one-shot chain also makes adopting the same standalone context into two
+    /// interpreters sound: concurrent linkers advance through already claimed
+    /// links until one publishes its own module, with no duplicated id range.
+    pub(crate) fn link_module(self: &Arc<Self>, module: BytecodeModule) -> ExecutionContext {
+        let mut pending = Some(module);
+        let mut next = &self.first;
+        let mut function_base = 0;
+        let mut property_ic_base = 0;
+
+        loop {
+            let chunk = next.get_or_init(|| {
+                let mut module = pending
+                    .take()
+                    .expect("a code-space link publishes its module exactly once");
+                rebase_module(&mut module, function_base);
+                let function_count = u32::try_from(module.functions.len())
+                    .expect("chunk function table exceeds u32 range");
+                let tables = ChunkTables {
+                    function_base,
+                    function_count,
+                    executable: Arc::new(ExecutableModule::from_bytecode_with_ic_base(
+                        &module,
+                        property_ic_base,
+                    )),
+                    atoms: Arc::new(AtomTable::from_constants(&module.constants)),
+                    module: Arc::new(module),
+                };
+                Arc::new(CodeChunk {
+                    tables,
+                    next: OnceLock::new(),
+                })
+            });
+
+            if pending.is_none() {
+                return ExecutionContext::from_chunk_tables(chunk.tables.clone(), Arc::clone(self));
+            }
+
+            function_base = chunk
+                .tables
+                .function_base
+                .checked_add(chunk.tables.function_count)
+                .expect("code space exhausted the u32 function-id range");
+            property_ic_base = chunk.tables.executable.property_ic_site_end();
+            next = &chunk.next;
+        }
     }
 
     /// Resolve the chunk owning `function_id`, if any chunk was linked
     /// over that id.
-    pub(crate) fn chunk_for(&self, function_id: u32) -> Option<ChunkTables> {
-        let inner = self.inner.read().expect("code space lock poisoned");
-        let idx = inner
-            .chunks
-            .partition_point(|chunk| chunk.function_base <= function_id);
-        let chunk = inner.chunks.get(idx.checked_sub(1)?)?;
-        (function_id - chunk.function_base < chunk.function_count).then(|| chunk.clone())
+    pub(crate) fn chunk_for(&self, function_id: u32) -> Option<&ChunkTables> {
+        let mut chunk = self.first.get();
+        while let Some(current) = chunk {
+            let tables = &current.tables;
+            if function_id < tables.function_base {
+                return None;
+            }
+            if function_id - tables.function_base < tables.function_count {
+                return Some(tables);
+            }
+            chunk = current.next.get();
+        }
+        None
     }
 
     /// Read one function's material-feedback epoch without requiring an
@@ -223,7 +256,7 @@ mod tests {
     #[test]
     fn first_chunk_links_at_base_zero_unrebased() {
         let space = Arc::new(CodeSpace::default());
-        let context = CodeSpace::link(&space, module_with_functions(3));
+        let context = space.link_module(module_with_functions(3));
         assert_eq!(context.function_base(), 0);
         assert_eq!(context.function_id_constant(0), Some(1));
         assert!(context.exec_function(0).is_some());
@@ -234,8 +267,8 @@ mod tests {
     #[test]
     fn second_chunk_rebases_ids_constants_and_inits() {
         let space = Arc::new(CodeSpace::default());
-        let _first = CodeSpace::link(&space, module_with_functions(3));
-        let second = CodeSpace::link(&space, module_with_functions(2));
+        let _first = space.link_module(module_with_functions(3));
+        let second = space.link_module(module_with_functions(2));
         assert_eq!(second.function_base(), 3);
         assert_eq!(second.function_id_constant(0), Some(4));
         assert_eq!(second.module_init_function_id("test:mod"), Some(4));
@@ -251,8 +284,8 @@ mod tests {
     #[test]
     fn foreign_ids_resolve_through_any_linked_context() {
         let space = Arc::new(CodeSpace::default());
-        let first = CodeSpace::link(&space, module_with_functions(3));
-        let second = CodeSpace::link(&space, module_with_functions(2));
+        let first = space.link_module(module_with_functions(3));
+        let second = space.link_module(module_with_functions(2));
         let foreign = first.for_function(4).expect("second chunk's id resolves");
         assert_eq!(foreign.function_base(), 3);
         assert!(foreign.exec_function(4).is_some());
@@ -292,11 +325,41 @@ mod tests {
         }];
         module.module_inits.clear();
         let second_module = module.clone();
-        let first = CodeSpace::link(&space, module);
-        let second = CodeSpace::link(&space, second_module);
+        let first = space.link_module(module);
+        let second = space.link_module(second_module);
         assert_eq!(first.property_ic_site_end(), 1);
         assert_eq!(second.property_ic_site_end(), 2);
         assert_eq!(first.property_ic_site(0, 0), Some(0));
         assert_eq!(second.property_ic_site(1, 0), Some(1));
+    }
+
+    #[test]
+    fn concurrent_linkers_claim_disjoint_function_ranges() {
+        let space = Arc::new(CodeSpace::default());
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let space = Arc::clone(&space);
+            joins.push(std::thread::spawn(move || {
+                space.link_module(module_with_functions(2)).function_base()
+            }));
+        }
+
+        let mut bases: Vec<_> = joins
+            .into_iter()
+            .map(|join| join.join().expect("code-space linker completes"))
+            .collect();
+        bases.sort_unstable();
+        assert_eq!(bases, [0, 2, 4, 6]);
+        for function_id in 0..8 {
+            assert!(space.chunk_for(function_id).is_some());
+        }
+    }
+
+    #[test]
+    fn immutable_published_nodes_keep_code_space_and_context_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<CodeSpace>();
+        assert_send_sync::<crate::ExecutionContext>();
     }
 }

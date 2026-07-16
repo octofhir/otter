@@ -200,7 +200,7 @@ impl Interpreter {
         &self,
         site: usize,
     ) -> Option<crate::jit::JitArrayMethod> {
-        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+        let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
         };
@@ -270,7 +270,7 @@ impl Interpreter {
         &self,
         site: usize,
     ) -> Option<crate::jit::JitCollectionLeafMethod> {
-        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+        let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
         };
@@ -318,7 +318,7 @@ impl Interpreter {
         site: usize,
         safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<crate::jit::JitCollectionAllocMethod> {
-        let ic = match (*self.method_call_ics.get(site)?).as_ref().copied()? {
+        let ic = match self.feedback_directory.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
         };

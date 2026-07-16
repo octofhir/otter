@@ -23,6 +23,10 @@ Downloaded checkouts and generated bundles live under
 `benchmarks/results/` and are also ignored. Curated current results belong in
 [`RESULTS.md`](RESULTS.md).
 
+The current cross-runtime snapshot and in-progress vertical-slice measurements
+are recorded in [`PERF_DASHBOARD.json`](PERF_DASHBOARD.json). Invalid, timed-out,
+and unavailable workloads remain explicit and are excluded from aggregates.
+
 Phase 0 VM/JIT refactor evidence, correctness blockers, and reproduction
 commands are tracked in [`PHASE0_BASELINE.md`](PHASE0_BASELINE.md).
 

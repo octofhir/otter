@@ -1,4 +1,4 @@
-//! Dense instruction feedback shared by the interpreter and baseline JIT.
+//! Dense tier-neutral instruction feedback owned by executable code.
 //!
 //! The interpreter records observed operand/value representations at numeric
 //! bytecode sites while a hot function is still warming up. Cells live in the
@@ -8,9 +8,12 @@
 //!
 //! # Contents
 //! - [`ArithFeedback`] — decoded arithmetic representation bits.
+//! - [`FeedbackVector`] — cells and their single monotonic transition epoch.
 //! - [`InstructionFeedback`] — one dense atomic cell per CodeBlock instruction.
-//! - [`InstructionFeedbackRecorder`] — a CodeBlock-bound recording view that
-//!   advances the owning feedback epoch on material transitions.
+//! - [`InstructionFeedbackRecorder`] — a vector-bound recording view that
+//!   advances the owning vector epoch on material transitions.
+//! - Fixed-layout call and property-summary slots selected by opcode at
+//!   CodeBlock construction; method sites carry only a directory marker.
 //!
 //! # Invariants
 //! - **Monotonic.** Bits are only ever set, never cleared. A site that has ever
@@ -23,20 +26,29 @@
 //!   only less fast.
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
-//! - The owning CodeBlock's feedback epoch advances once per material state
-//!   transition, never for an already-recorded observation.
-//! - The isolate's VM thread is the sole writer. Arithmetic/element bits use
-//!   relaxed atomics because they are advisory and monotonic; call state uses a
-//!   release/acquire publication edge because its function id is a separate
-//!   payload. Older feedback remains sound through guards and deoptimization.
+//! - The vector's feedback epoch advances once per material state transition,
+//!   never for an already-recorded observation.
+//! - The isolate's VM thread is the sole writer. Arithmetic/element bits are
+//!   advisory monotonic atomics. Multiword property and bounded-call records
+//!   publish coherent reader snapshots with a per-slot sequence counter.
+//! - Fixed slots contain atomics and stable numeric ids only; no `Value`, GC
+//!   handle, upvalue, closure, or `this` crosses the CodeBlock Send/Sync
+//!   boundary. Method distributions remain isolate-owned behind
+//!   [`crate::interp::FeedbackDirectory`].
 //!
 //! # See also
-//! - [`crate::CodeBlock`] — owner of the live feedback vector.
+//! - [`crate::CodeBlock`] — owner of the live [`FeedbackVector`].
 
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::hint::spin_loop;
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering, fence};
 
+use otter_bytecode::Op;
+use smallvec::SmallVec;
+
+use crate::cache_ir::CacheStub;
 use crate::jit::JitElementLoadKind;
-use crate::{CallTargetFeedback, CodeBlock, Value};
+use crate::property_ic::{PropertyIcEntry, PropertyIcKind};
+use crate::{CallTargetFeedback, Value};
 
 /// At least one operand was an `int32` fast-path number.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -98,6 +110,381 @@ impl CallTargetTransition {
     #[must_use]
     pub(crate) const fn evict_for_reopt(self) -> bool {
         matches!(self, Self::BecameMonomorphic)
+    }
+}
+
+/// Maximum distinct bytecode callees retained at one ordinary-call site.
+pub(crate) const MAX_CALL_TARGETS: usize = 8;
+
+/// One observed bytecode callee and its saturating execution count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallTargetCount {
+    pub(crate) fid: u32,
+    pub(crate) hits: u32,
+}
+
+/// Immutable snapshot of the bounded target population for one `Op::Call`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallSiteDistribution {
+    Mono(CallTargetCount),
+    Poly(Box<SmallVec<[CallTargetCount; MAX_CALL_TARGETS]>>),
+    Megamorphic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DistributionTransition {
+    Unchanged,
+    /// The dense unseen/mono/poly state already accounts for this transition.
+    MirroredByDenseCell,
+    /// The bounded target set gained information beyond dense mono/poly state.
+    Extended,
+}
+
+/// Stable tier-facing summary of an isolate-owned property IC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PropertyFeedbackState {
+    #[default]
+    Empty,
+    MonomorphicOwnData {
+        shape_id: crate::object::ShapeId,
+        slot: u16,
+    },
+    Polymorphic,
+    Megamorphic,
+}
+
+const PROPERTY_EMPTY: u8 = 0;
+const PROPERTY_MONOMORPHIC_OWN_DATA: u8 = 1;
+const PROPERTY_POLYMORPHIC: u8 = 2;
+const PROPERTY_MEGAMORPHIC: u8 = 3;
+
+/// Fixed-size atomic property summary. The isolate VM thread is the sole
+/// writer; readers take a coherent snapshot with `sequence` as a seqlock.
+#[derive(Debug)]
+struct AtomicPropertyFeedback {
+    sequence: AtomicU32,
+    kind: PropertyIcKind,
+    state: AtomicU8,
+    shape_id: AtomicU64,
+    slot: AtomicU16,
+}
+
+impl AtomicPropertyFeedback {
+    fn new(kind: PropertyIcKind) -> Self {
+        Self {
+            sequence: AtomicU32::new(0),
+            kind,
+            state: AtomicU8::new(PROPERTY_EMPTY),
+            shape_id: AtomicU64::new(0),
+            slot: AtomicU16::new(0),
+        }
+    }
+
+    fn publish(&self, state: PropertyFeedbackState) {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(sequence & 1, 0, "property feedback has one writer");
+
+        let (tag, shape_id, slot) = match state {
+            PropertyFeedbackState::Empty => (PROPERTY_EMPTY, 0, 0),
+            PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } => {
+                (PROPERTY_MONOMORPHIC_OWN_DATA, shape_id.raw(), slot)
+            }
+            PropertyFeedbackState::Polymorphic => (PROPERTY_POLYMORPHIC, 0, 0),
+            PropertyFeedbackState::Megamorphic => (PROPERTY_MEGAMORPHIC, 0, 0),
+        };
+        self.shape_id.store(shape_id, Ordering::Relaxed);
+        self.slot.store(slot, Ordering::Relaxed);
+        self.state.store(tag, Ordering::Relaxed);
+        let sequence = self.sequence.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(sequence & 1, 1, "property feedback publication must close");
+    }
+
+    fn snapshot(&self) -> PropertyFeedbackState {
+        loop {
+            let start = self.sequence.load(Ordering::Acquire);
+            if start & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            let state = self.state.load(Ordering::Relaxed);
+            let shape_id = self.shape_id.load(Ordering::Relaxed);
+            let slot = self.slot.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            let end = self.sequence.load(Ordering::Relaxed);
+            if start != end {
+                spin_loop();
+                continue;
+            }
+            return match state {
+                PROPERTY_EMPTY => PropertyFeedbackState::Empty,
+                PROPERTY_MONOMORPHIC_OWN_DATA => PropertyFeedbackState::MonomorphicOwnData {
+                    shape_id: crate::object::ShapeId::from_raw(shape_id),
+                    slot,
+                },
+                PROPERTY_POLYMORPHIC => PropertyFeedbackState::Polymorphic,
+                PROPERTY_MEGAMORPHIC => PropertyFeedbackState::Megamorphic,
+                _ => unreachable!("invalid atomic property feedback state"),
+            };
+        }
+    }
+}
+
+impl Clone for AtomicPropertyFeedback {
+    fn clone(&self) -> Self {
+        let cloned = Self::new(self.kind);
+        cloned.publish(self.snapshot());
+        cloned
+    }
+}
+
+const CALL_DISTRIBUTION_EMPTY: u8 = 0;
+const CALL_DISTRIBUTION_MONO: u8 = 1;
+const CALL_DISTRIBUTION_POLY: u8 = 2;
+const CALL_DISTRIBUTION_MEGAMORPHIC: u8 = 3;
+
+const fn pack_call_target(target: CallTargetCount) -> u64 {
+    (target.fid as u64) << 32 | target.hits as u64
+}
+
+const fn unpack_call_target(packed: u64) -> CallTargetCount {
+    CallTargetCount {
+        fid: (packed >> 32) as u32,
+        hits: packed as u32,
+    }
+}
+
+/// Fixed-capacity ordinary-call distribution. Target records are packed as
+/// `(function id, hits)` in one atomic word and never allocate after slot
+/// construction.
+#[derive(Debug)]
+struct AtomicCallFeedback {
+    sequence: AtomicU32,
+    state: AtomicU8,
+    count: AtomicU8,
+    targets: [AtomicU64; MAX_CALL_TARGETS],
+}
+
+impl Default for AtomicCallFeedback {
+    fn default() -> Self {
+        Self {
+            sequence: AtomicU32::new(0),
+            state: AtomicU8::new(CALL_DISTRIBUTION_EMPTY),
+            count: AtomicU8::new(0),
+            targets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl AtomicCallFeedback {
+    fn record(&self, callee_fid: u32) -> DistributionTransition {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(sequence & 1, 0, "call feedback has one writer");
+
+        let state = self.state.load(Ordering::Relaxed);
+        let count = usize::from(self.count.load(Ordering::Relaxed));
+        let mut transition = DistributionTransition::Unchanged;
+        match state {
+            CALL_DISTRIBUTION_EMPTY => {
+                self.targets[0].store(
+                    pack_call_target(CallTargetCount {
+                        fid: callee_fid,
+                        hits: 1,
+                    }),
+                    Ordering::Relaxed,
+                );
+                self.count.store(1, Ordering::Relaxed);
+                self.state.store(CALL_DISTRIBUTION_MONO, Ordering::Relaxed);
+                transition = DistributionTransition::MirroredByDenseCell;
+            }
+            CALL_DISTRIBUTION_MONO | CALL_DISTRIBUTION_POLY => {
+                let existing = self.targets[..count].iter().position(|target| {
+                    unpack_call_target(target.load(Ordering::Relaxed)).fid == callee_fid
+                });
+                if let Some(index) = existing {
+                    let target = unpack_call_target(self.targets[index].load(Ordering::Relaxed));
+                    self.targets[index].store(
+                        pack_call_target(CallTargetCount {
+                            hits: target.hits.saturating_add(1),
+                            ..target
+                        }),
+                        Ordering::Relaxed,
+                    );
+                } else if count < MAX_CALL_TARGETS {
+                    self.targets[count].store(
+                        pack_call_target(CallTargetCount {
+                            fid: callee_fid,
+                            hits: 1,
+                        }),
+                        Ordering::Relaxed,
+                    );
+                    self.count.store((count + 1) as u8, Ordering::Relaxed);
+                    self.state.store(CALL_DISTRIBUTION_POLY, Ordering::Relaxed);
+                    transition = if count == 1 {
+                        DistributionTransition::MirroredByDenseCell
+                    } else {
+                        DistributionTransition::Extended
+                    };
+                } else {
+                    self.state
+                        .store(CALL_DISTRIBUTION_MEGAMORPHIC, Ordering::Relaxed);
+                    transition = DistributionTransition::Extended;
+                }
+            }
+            CALL_DISTRIBUTION_MEGAMORPHIC => {}
+            _ => unreachable!("invalid atomic call feedback state"),
+        }
+
+        let sequence = self.sequence.fetch_add(1, Ordering::Release);
+        debug_assert_eq!(sequence & 1, 1, "call feedback publication must close");
+        transition
+    }
+
+    fn snapshot(&self) -> Option<CallSiteDistribution> {
+        loop {
+            let start = self.sequence.load(Ordering::Acquire);
+            if start & 1 != 0 {
+                spin_loop();
+                continue;
+            }
+            let state = self.state.load(Ordering::Relaxed);
+            let count = usize::from(self.count.load(Ordering::Relaxed));
+            let mut targets: SmallVec<[CallTargetCount; MAX_CALL_TARGETS]> = SmallVec::new();
+            for target in self.targets.iter().take(count.min(MAX_CALL_TARGETS)) {
+                targets.push(unpack_call_target(target.load(Ordering::Relaxed)));
+            }
+            fence(Ordering::Acquire);
+            let end = self.sequence.load(Ordering::Relaxed);
+            if start != end {
+                spin_loop();
+                continue;
+            }
+            return match state {
+                CALL_DISTRIBUTION_EMPTY => None,
+                CALL_DISTRIBUTION_MONO => targets.first().copied().map(CallSiteDistribution::Mono),
+                CALL_DISTRIBUTION_POLY => Some(CallSiteDistribution::Poly(Box::new(targets))),
+                CALL_DISTRIBUTION_MEGAMORPHIC => Some(CallSiteDistribution::Megamorphic),
+                _ => unreachable!("invalid atomic call feedback state"),
+            };
+        }
+    }
+}
+
+impl Clone for AtomicCallFeedback {
+    fn clone(&self) -> Self {
+        let cloned = Self::default();
+        let Some(snapshot) = self.snapshot() else {
+            return cloned;
+        };
+        match snapshot {
+            CallSiteDistribution::Mono(target) => {
+                cloned.targets[0].store(pack_call_target(target), Ordering::Relaxed);
+                cloned.count.store(1, Ordering::Relaxed);
+                cloned
+                    .state
+                    .store(CALL_DISTRIBUTION_MONO, Ordering::Relaxed);
+            }
+            CallSiteDistribution::Poly(targets) => {
+                for (index, target) in targets.iter().copied().enumerate() {
+                    cloned.targets[index].store(pack_call_target(target), Ordering::Relaxed);
+                }
+                cloned.count.store(targets.len() as u8, Ordering::Relaxed);
+                cloned
+                    .state
+                    .store(CALL_DISTRIBUTION_POLY, Ordering::Relaxed);
+            }
+            CallSiteDistribution::Megamorphic => {
+                cloned
+                    .state
+                    .store(CALL_DISTRIBUTION_MEGAMORPHIC, Ordering::Relaxed);
+            }
+        }
+        cloned
+    }
+}
+
+/// Opcode-selected fixed-layout feedback storage. Boxes are allocated once
+/// while the CodeBlock is built; their atomic payloads never resize or retain
+/// GC-managed values.
+#[derive(Debug, Clone)]
+enum TypedFeedbackSlot {
+    None,
+    Property(Box<AtomicPropertyFeedback>),
+    Method,
+    Call(Box<AtomicCallFeedback>),
+}
+
+impl TypedFeedbackSlot {
+    fn for_op(op: Op) -> Self {
+        match op {
+            Op::LoadProperty => {
+                Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Load)))
+            }
+            Op::StoreProperty => {
+                Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Store)))
+            }
+            Op::HasProperty => {
+                Self::Property(Box::new(AtomicPropertyFeedback::new(PropertyIcKind::Has)))
+            }
+            Op::CallMethodValue => Self::Method,
+            Op::Call => Self::Call(Box::default()),
+            _ => Self::None,
+        }
+    }
+}
+
+/// Typed view over one `LoadProperty` / `StoreProperty` / `HasProperty` cache.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PropertyFeedbackSlot<'a> {
+    feedback: &'a AtomicPropertyFeedback,
+}
+
+impl PropertyFeedbackSlot<'_> {
+    #[must_use]
+    pub(crate) fn state(self) -> PropertyFeedbackState {
+        self.feedback.snapshot()
+    }
+
+    /// Publish a stable snapshot of the isolate-owned runtime IC state.
+    pub(crate) fn publish(self, entry: &PropertyIcEntry<CacheStub>) {
+        let state = match entry {
+            PropertyIcEntry::Empty => PropertyFeedbackState::Empty,
+            PropertyIcEntry::Megamorphic => PropertyFeedbackState::Megamorphic,
+            PropertyIcEntry::Polymorphic { entries, .. } => match entries.as_slice() {
+                [stub] => {
+                    let hit = match self.feedback.kind {
+                        PropertyIcKind::Load => stub.own_data_hit(),
+                        PropertyIcKind::Store => stub.store_own_data_hit(),
+                        PropertyIcKind::Has => None,
+                    };
+                    hit.map_or(PropertyFeedbackState::Polymorphic, |hit| {
+                        PropertyFeedbackState::MonomorphicOwnData {
+                            shape_id: hit.shape_id,
+                            slot: hit.slot,
+                        }
+                    })
+                }
+                _ => PropertyFeedbackState::Polymorphic,
+            },
+        };
+        self.feedback.publish(state);
+    }
+}
+
+/// Typed view over the bounded target distribution for one ordinary call.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CallFeedbackSlot<'a> {
+    feedback: &'a AtomicCallFeedback,
+}
+
+impl CallFeedbackSlot<'_> {
+    fn record(self, callee_fid: u32) -> DistributionTransition {
+        self.feedback.record(callee_fid)
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn distribution(self) -> Option<CallSiteDistribution> {
+        self.feedback.snapshot()
     }
 }
 
@@ -359,25 +746,161 @@ impl InstructionFeedback {
     }
 }
 
-/// One instruction cell paired with its owning CodeBlock epoch.
+/// Dense feedback cells and their single material-transition epoch.
+///
+/// Keeping versioning beside the cells makes feedback one owned runtime
+/// artifact instead of a `CodeBlock` field plus a separately coordinated epoch.
+/// Property, call, and arithmetic feedback can migrate behind this boundary
+/// without teaching executable code how each slot family publishes changes.
+#[derive(Debug)]
+pub struct FeedbackVector {
+    cells: Box<[InstructionFeedback]>,
+    typed_slots: Box<[TypedFeedbackSlot]>,
+    epoch: AtomicU32,
+}
+
+impl Clone for FeedbackVector {
+    fn clone(&self) -> Self {
+        Self {
+            cells: self.cells.clone(),
+            typed_slots: self.typed_slots.clone(),
+            epoch: AtomicU32::new(self.epoch()),
+        }
+    }
+}
+
+impl FeedbackVector {
+    /// Allocate one zeroed feedback cell per canonical instruction.
+    #[must_use]
+    pub fn with_instruction_count(instruction_count: usize) -> Self {
+        Self {
+            cells: (0..instruction_count)
+                .map(|_| InstructionFeedback::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            typed_slots: (0..instruction_count)
+                .map(|_| TypedFeedbackSlot::None)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            epoch: AtomicU32::new(0),
+        }
+    }
+
+    /// Allocate dense cells plus bytecode-kind-selected out-of-line payloads.
+    #[must_use]
+    pub(crate) fn for_instruction_ops(ops: impl IntoIterator<Item = Op>) -> Self {
+        let typed_slots: Box<[_]> = ops
+            .into_iter()
+            .map(TypedFeedbackSlot::for_op)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            cells: (0..typed_slots.len())
+                .map(|_| InstructionFeedback::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            typed_slots,
+            epoch: AtomicU32::new(0),
+        }
+    }
+
+    /// Read one canonical instruction cell.
+    #[must_use]
+    pub(crate) fn cell(&self, index: usize) -> Option<&InstructionFeedback> {
+        self.cells.get(index)
+    }
+
+    /// Pair one canonical cell with this vector's transition epoch.
+    #[must_use]
+    pub(crate) fn recorder(&self, index: usize) -> Option<InstructionFeedbackRecorder<'_>> {
+        self.cell(index)
+            .map(|cell| InstructionFeedbackRecorder::new(self, cell))
+    }
+
+    /// Property/cache payload for one schema-compatible instruction.
+    #[must_use]
+    pub(crate) fn property_slot(
+        &self,
+        index: usize,
+        kind: PropertyIcKind,
+    ) -> Option<PropertyFeedbackSlot<'_>> {
+        let TypedFeedbackSlot::Property(feedback) = self.typed_slots.get(index)? else {
+            return None;
+        };
+        (feedback.kind == kind).then_some(PropertyFeedbackSlot { feedback })
+    }
+
+    /// Whether this instruction owns isolate-local method feedback in the
+    /// [`crate::interp::FeedbackDirectory`].
+    #[must_use]
+    pub(crate) fn is_method_slot(&self, index: usize) -> bool {
+        matches!(self.typed_slots.get(index), Some(TypedFeedbackSlot::Method))
+    }
+
+    /// Ordinary-call payload for one `Call` instruction.
+    #[must_use]
+    pub(crate) fn call_slot(&self, index: usize) -> Option<CallFeedbackSlot<'_>> {
+        let TypedFeedbackSlot::Call(feedback) = self.typed_slots.get(index)? else {
+            return None;
+        };
+        Some(CallFeedbackSlot { feedback })
+    }
+
+    /// Record compact and bounded ordinary-call state through one intent-level
+    /// operation. Call sites never coordinate the dense cell, payload, or epoch.
+    pub(crate) fn record_call(&self, index: usize, callee_fid: u32) -> CallTargetTransition {
+        let Some(cell) = self.cell(index) else {
+            return CallTargetTransition::Unchanged;
+        };
+        let transition = cell.record_call_target(callee_fid);
+        if transition.state_changed() {
+            self.bump_epoch();
+        }
+        if self
+            .call_slot(index)
+            .is_some_and(|slot| slot.record(callee_fid) == DistributionTransition::Extended)
+        {
+            self.bump_epoch();
+        }
+        transition
+    }
+
+    /// Current monotonic version of material feedback transitions.
+    #[must_use]
+    pub fn epoch(&self) -> u32 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Advance the feedback epoch without permitting wraparound.
+    #[inline]
+    pub(crate) fn bump_epoch(&self) {
+        let _ = self
+            .epoch
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |epoch| {
+                epoch.checked_add(1)
+            });
+    }
+}
+
+/// One instruction cell paired with its owning feedback-vector epoch.
 ///
 /// Recording through this view preserves the compact eight-byte cell while
 /// making the rare transition path advance the single function-wide epoch.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InstructionFeedbackRecorder<'a> {
-    code_block: &'a CodeBlock,
+    vector: &'a FeedbackVector,
     cell: &'a InstructionFeedback,
 }
 
 impl<'a> InstructionFeedbackRecorder<'a> {
-    pub(crate) const fn new(code_block: &'a CodeBlock, cell: &'a InstructionFeedback) -> Self {
-        Self { code_block, cell }
+    const fn new(vector: &'a FeedbackVector, cell: &'a InstructionFeedback) -> Self {
+        Self { vector, cell }
     }
 
     #[inline]
     fn note_transition(self, changed: bool) -> bool {
         if changed {
-            self.code_block.bump_feedback_epoch();
+            self.vector.bump_epoch();
         }
         changed
     }
@@ -396,13 +919,6 @@ impl<'a> InstructionFeedbackRecorder<'a> {
     /// Record a branch sample and advance the epoch on a newly seen direction.
     pub(crate) fn record_branch(self, taken: bool) -> bool {
         self.note_transition(self.cell.record_branch(taken))
-    }
-
-    /// Record a dense ordinary-call state transition and advance the epoch.
-    pub(crate) fn record_call_target(self, callee_fid: u32) -> CallTargetTransition {
-        let transition = self.cell.record_call_target(callee_fid);
-        self.note_transition(transition.state_changed());
-        transition
     }
 
     /// Mark arithmetic widening and advance the epoch only on its first bail.
@@ -524,64 +1040,160 @@ mod tests {
     }
 
     #[test]
-    fn code_block_epoch_advances_once_per_material_transition() {
-        let code_block = CodeBlock::jit_test_stub(
-            1,
-            0,
-            0,
-            &[crate::jit::JitTestInstruction::new(
-                otter_bytecode::Op::Nop,
-                0,
-                0,
-                Vec::new(),
-            )],
-        );
-        let feedback = code_block.feedback_recorder_at(0).unwrap();
-        assert_eq!(code_block.feedback_epoch(), 0);
+    fn vector_epoch_advances_once_per_material_transition() {
+        let vector = FeedbackVector::with_instruction_count(1);
+        let feedback = vector.recorder(0).unwrap();
+        assert_eq!(vector.epoch(), 0);
 
         assert!(feedback.record_arith(Value::number_i32(1), Value::number_i32(2)));
-        assert_eq!(code_block.feedback_epoch(), 1);
+        assert_eq!(vector.epoch(), 1);
         assert!(!feedback.record_arith(Value::number_i32(3), Value::number_i32(4)));
-        assert_eq!(code_block.feedback_epoch(), 1);
+        assert_eq!(vector.epoch(), 1);
         assert!(feedback.record_arith(Value::number_f64(1.5), Value::number_i32(4)));
-        assert_eq!(code_block.feedback_epoch(), 2);
+        assert_eq!(vector.epoch(), 2);
 
         assert!(feedback.record_element_load(Some(JitElementLoadKind::Float64)));
-        assert_eq!(code_block.feedback_epoch(), 3);
+        assert_eq!(vector.epoch(), 3);
         assert!(!feedback.record_element_load(Some(JitElementLoadKind::Float64)));
-        assert_eq!(code_block.feedback_epoch(), 3);
+        assert_eq!(vector.epoch(), 3);
         assert!(feedback.record_element_load(Some(JitElementLoadKind::Int32)));
-        assert_eq!(code_block.feedback_epoch(), 4);
+        assert_eq!(vector.epoch(), 4);
         assert!(!feedback.record_element_load(None));
-        assert_eq!(code_block.feedback_epoch(), 4);
+        assert_eq!(vector.epoch(), 4);
 
         assert!(feedback.record_branch(true));
-        assert_eq!(code_block.feedback_epoch(), 5);
+        assert_eq!(vector.epoch(), 5);
         assert!(!feedback.record_branch(true));
-        assert_eq!(code_block.feedback_epoch(), 5);
+        assert_eq!(vector.epoch(), 5);
         assert!(feedback.record_branch(false));
-        assert_eq!(code_block.feedback_epoch(), 6);
+        assert_eq!(vector.epoch(), 6);
 
         assert_eq!(
-            feedback.record_call_target(7),
+            vector.record_call(0, 7),
             CallTargetTransition::BecameMonomorphic
         );
-        assert_eq!(code_block.feedback_epoch(), 7);
+        assert_eq!(vector.epoch(), 7);
+        assert_eq!(vector.record_call(0, 7), CallTargetTransition::Unchanged);
+        assert_eq!(vector.epoch(), 7);
         assert_eq!(
-            feedback.record_call_target(7),
-            CallTargetTransition::Unchanged
-        );
-        assert_eq!(code_block.feedback_epoch(), 7);
-        assert_eq!(
-            feedback.record_call_target(8),
+            vector.record_call(0, 8),
             CallTargetTransition::BecamePolymorphic
         );
-        assert_eq!(code_block.feedback_epoch(), 8);
+        assert_eq!(vector.epoch(), 8);
 
         assert!(feedback.widen_arith_to_float());
-        assert_eq!(code_block.feedback_epoch(), 9);
+        assert_eq!(vector.epoch(), 9);
         assert!(!feedback.widen_arith_to_float());
-        assert_eq!(code_block.feedback_epoch(), 9);
+        assert_eq!(vector.epoch(), 9);
         assert_eq!(std::mem::size_of::<InstructionFeedback>(), 8);
+    }
+
+    #[test]
+    fn cloning_vector_snapshots_cells_and_epoch_without_sharing_mutation() {
+        let vector = FeedbackVector::with_instruction_count(2);
+        vector
+            .recorder(1)
+            .unwrap()
+            .record_arith(Value::number_i32(1), Value::number_i32(2));
+
+        let cloned = vector.clone();
+        assert_eq!(cloned.epoch(), 1);
+        assert_eq!(cloned.cell(1).unwrap().arith_bits(), ARITH_INT32);
+
+        cloned.recorder(0).unwrap().record_branch(true);
+        assert_eq!(cloned.epoch(), 2);
+        assert_eq!(vector.epoch(), 1);
+        assert_eq!(vector.cell(0).unwrap().branch_counts(), (0, 0));
+    }
+
+    #[test]
+    fn typed_atomic_slots_keep_code_blocks_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FeedbackVector>();
+    }
+
+    #[test]
+    fn property_slot_publishes_stable_own_data_summary() {
+        use crate::object;
+        use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
+
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let mut obj = object::alloc_object_old_for_fixture(&mut heap).expect("object");
+        object::set(&mut obj, &mut heap, "x", Value::number_i32(1));
+        let key = AtomizedPropertyKey::new(PropertyAtom::new(AtomId::from_constant_index(1)), "x");
+        let (stub, _) = CacheStub::install_load(obj, &heap, key).expect("load stub");
+        let mut entry = PropertyIcEntry::Empty;
+        entry.install(stub);
+
+        let vector = FeedbackVector::for_instruction_ops([Op::LoadProperty]);
+        let slot = vector
+            .property_slot(0, PropertyIcKind::Load)
+            .expect("typed property slot");
+        slot.publish(&entry);
+        assert!(matches!(
+            slot.state(),
+            PropertyFeedbackState::MonomorphicOwnData { slot: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn property_seqlock_snapshot_preserves_record_coherence() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let feedback = Arc::new(AtomicPropertyFeedback::new(PropertyIcKind::Load));
+        let first = PropertyFeedbackState::MonomorphicOwnData {
+            shape_id: crate::object::ShapeId::for_test(11),
+            slot: 101,
+        };
+        let second = PropertyFeedbackState::MonomorphicOwnData {
+            shape_id: crate::object::ShapeId::for_test(22),
+            slot: 202,
+        };
+        feedback.publish(first);
+        assert_eq!(feedback.snapshot(), first);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_feedback = Arc::clone(&feedback);
+        let writer_done = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            for iteration in 0..20_000 {
+                writer_feedback.publish(if iteration & 1 == 0 { second } else { first });
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            assert!(matches!(feedback.snapshot(), state if state == first || state == second));
+        }
+        writer.join().expect("single feedback writer");
+        assert_eq!(feedback.snapshot(), first);
+    }
+
+    #[test]
+    fn atomic_call_hits_saturate_and_snapshot_without_heap_mutation() {
+        let feedback = AtomicCallFeedback::default();
+        feedback.targets[0].store(
+            pack_call_target(CallTargetCount {
+                fid: u32::MAX,
+                hits: u32::MAX,
+            }),
+            Ordering::Relaxed,
+        );
+        feedback.count.store(1, Ordering::Relaxed);
+        feedback
+            .state
+            .store(CALL_DISTRIBUTION_MONO, Ordering::Relaxed);
+
+        assert_eq!(feedback.record(u32::MAX), DistributionTransition::Unchanged);
+        assert_eq!(
+            feedback.snapshot(),
+            Some(CallSiteDistribution::Mono(CallTargetCount {
+                fid: u32::MAX,
+                hits: u32::MAX,
+            }))
+        );
     }
 }

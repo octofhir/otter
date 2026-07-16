@@ -18,6 +18,8 @@
 //!   status contract.
 
 use crate::CompiledCode;
+#[cfg(target_arch = "aarch64")]
+use crate::arm64::CallTrampoline;
 use crate::entry::enter_compiled;
 use otter_vm::native_abi::{
     BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION,
@@ -27,6 +29,11 @@ use otter_vm::{JitExecOutcome, JitFunctionCode, SafepointRecord, VmRuntimeActiva
 /// Finalized template machine code for one function.
 pub struct TemplateCode {
     code: CompiledCode,
+    /// Shared executable call lifecycle whose entry address is baked into this
+    /// mapping. Installed code can outlive the compiler hook, so ownership is
+    /// retained here as well as by [`crate::BaselineJitCompiler`].
+    #[cfg(target_arch = "aarch64")]
+    _call_trampoline: std::sync::Arc<CallTrampoline>,
     /// Frozen VM-owned metadata validated before every entry selection.
     metadata: CodeObjectMetadata,
     /// Installed code-object identity published in native frames.
@@ -64,6 +71,7 @@ impl TemplateCode {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_emission(
         code: CompiledCode,
+        #[cfg(target_arch = "aarch64")] call_trampoline: std::sync::Arc<CallTrampoline>,
         code_object_id: u64,
         function_id: u32,
         register_count: u16,
@@ -94,6 +102,8 @@ impl TemplateCode {
         };
         Self {
             code,
+            #[cfg(target_arch = "aarch64")]
+            _call_trampoline: call_trampoline,
             metadata,
             code_object_id,
             function_id,

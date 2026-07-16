@@ -15,6 +15,8 @@
 //! - Every active frame owns one attached [`RegisterWindow`].
 //! - Parked states own copied register snapshots and no arena pointers.
 //! - GC-bearing frame and parked-state fields are visited by their tracers.
+//! - Upvalue-spine construction traces both inherited and newly allocated cells
+//!   until the completed spine is attached to a published frame.
 //!
 //! # Frame ABI (frozen)
 //!
@@ -472,10 +474,22 @@ impl Frame {
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
         for _ in 0..own {
+            // Neither collection is attached to a traced frame yet. A later
+            // allocation can move an inherited or just-created cell, so expose
+            // both live prefixes together with the caller's dynamic values.
+            let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external_visit(visitor);
+                for cell in &cells {
+                    visitor(cell as *const UpvalueCell as *mut RawGc);
+                }
+                for cell in parent_upvalues.iter() {
+                    visitor(cell as *const UpvalueCell as *mut RawGc);
+                }
+            };
             cells.push(crate::alloc_upvalue_with_roots(
                 heap,
                 Value::undefined(),
-                external_visit,
+                &mut build_roots,
             )?);
         }
         cells.extend(parent_upvalues.iter().copied());
@@ -538,31 +552,6 @@ impl Frame {
             header: VmFrameHeader::interpreter(function.id, function.register_count),
             registers: window,
             return_register,
-            upvalues,
-            this_value,
-            async_state: None,
-            cold: None,
-            generator_owner: None,
-        }
-    }
-
-    /// Build a compiled direct-call callee frame from a cached entry plan,
-    /// without touching the exec `CodeBlock`. The caller guarantees `window`
-    /// spans exactly `register_count` slots and `upvalues` already includes
-    /// the callee's own cells (the cached plan defers nonzero
-    /// `own_upvalue_count` callees to the exec-backed constructor).
-    pub(crate) fn for_jit_direct_call(
-        function_id: u32,
-        register_count: u16,
-        upvalues: UpvalueSpine,
-        this_value: Value,
-        window: RegisterWindow,
-    ) -> Self {
-        debug_assert_eq!(window.len(), register_count as usize);
-        Self {
-            header: VmFrameHeader::interpreter(function_id, register_count),
-            registers: window,
-            return_register: None,
             upvalues,
             this_value,
             async_state: None,

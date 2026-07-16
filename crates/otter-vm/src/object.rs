@@ -421,6 +421,17 @@ impl ShapeId {
     pub(crate) const fn raw(self) -> u64 {
         self.0
     }
+
+    /// Rebuild a stable VM-local identity read from an atomic feedback slot.
+    #[must_use]
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(raw: u64) -> Self {
+        Self::from_raw(raw)
+    }
 }
 
 /// Atom-aware own-property hit metadata.

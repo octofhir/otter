@@ -40,7 +40,7 @@ use otter_bytecode::{Op, Operand};
 
 use crate::{
     CodeBlock, CodeBlockInstruction,
-    jit_feedback::ArithFeedback,
+    feedback::ArithFeedback,
     native_abi::{SafepointId, SafepointRecord},
 };
 
@@ -385,14 +385,16 @@ pub struct JitInlineMethod {
 /// VM-resolved direct-call target for one eligible compiled callee.
 ///
 /// This is metadata only: frame reservation/rooting stays VM-owned, while the
-/// backend consumes `entry_addr` once it can emit the matching frame build and
+/// backend consumes `entry_cell` once it can emit the matching frame build and
 /// call/return sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JitDirectCallPlan {
     /// Callee function id in the executable module.
     pub function_id: u32,
-    /// Raw compiled entry address.
-    pub entry_addr: usize,
+    /// Stable address of the exact generation's
+    /// [`crate::native_abi::CodeEntryCell`]. The cell is registry-owned and is
+    /// never reused, even after its executable mapping retires.
+    pub entry_cell: u64,
     /// Number of formal parameter registers.
     pub param_count: u16,
     /// Total callee register-window length.
@@ -432,22 +434,27 @@ impl JitNativeActivation {
 unsafe impl Send for JitNativeActivation {}
 unsafe impl Sync for JitNativeActivation {}
 
-/// Prepared direct-call entry state returned by the VM to emitted code.
-///
-/// The frame has already been published onto the active [`HoltStack`], so
-/// its value slots are visible to precise GC tracing. Emitted code uses this to
 /// Receiver shapes cached per direct-method call site, and the number of flat
 /// inline-link ways the optimizing tier walks. Shared with the VM so the flat
 /// table stride and the emitted walk agree.
 pub const JIT_DIRECT_METHOD_WAYS: usize = 4;
 
-/// construct the callee `JitCtx` and branch to `entry_addr` without the generic
-/// call bridge.
+/// Prepared direct-call entry state returned by the VM to emitted code.
+///
+/// The frame has already been published onto the active [`HoltStack`], so its
+/// value slots are visible to precise GC tracing. Emitted code uses this to
+/// construct the callee `JitCtx` and branch through the entry cell without the
+/// generic call bridge. It acquires `entry_cell` before native entry, so an
+/// invalidated generation rejects the call without branching through a stale
+/// raw address. The record is staged as a single C-layout unit; generated code
+/// reads it only after the prepare transition reports success.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct JitPreparedDirectCall {
-    /// Raw compiled entry address.
-    pub entry_addr: usize,
+    /// Address-stable [`crate::native_abi::CodeEntryCell`] for this exact code
+    /// generation. Native linkage must acquire/recheck it before entry and
+    /// release its active count after the compiled callee returns.
+    pub entry_cell: u64,
     /// Callee register-window base.
     pub regs: *mut u64,
     /// Boxed SELF closure bits for the callee context.

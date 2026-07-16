@@ -6,6 +6,7 @@
 mod dispatch;
 mod errors;
 mod exec;
+mod feedback;
 mod frames;
 pub(crate) mod helpers;
 mod host;
@@ -19,3 +20,6 @@ mod stats;
 #[cfg(test)]
 mod tests;
 mod trace_roots;
+
+pub(crate) use feedback::{FeedbackDirectory, MethodLoadHit};
+pub(crate) use jit_call::cache::JitDirectMethodCache;

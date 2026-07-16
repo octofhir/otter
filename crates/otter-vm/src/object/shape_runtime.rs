@@ -58,6 +58,7 @@ struct TransitionKey {
 /// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
     root: Cell<ShapeHandle>,
+    handles_by_id: FxHashMap<ShapeId, Cell<ShapeHandle>>,
     next_string_id: u32,
     interned_keys: FxHashMap<String, Cell<JsStringHandle>>,
     transitions: FxHashMap<TransitionKey, Cell<ShapeHandle>>,
@@ -83,8 +84,12 @@ impl ShapeRuntime {
     pub(crate) fn new(heap: &mut GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let root = alloc_root_shape_body_with_roots(heap, &mut roots)?;
+        let root_id = heap.read_payload(root, ShapeBody::id);
+        let mut handles_by_id = FxHashMap::default();
+        handles_by_id.insert(root_id, Cell::new(root));
         Ok(Self {
             root: Cell::new(root),
+            handles_by_id,
             next_string_id: 1,
             interned_keys: FxHashMap::default(),
             transitions: FxHashMap::default(),
@@ -124,6 +129,7 @@ impl ShapeRuntime {
         self.interned_keys.clear();
         self.transitions.clear();
         self.offset_cache.clear();
+        self.handles_by_id.clear();
         self.root.set(ShapeHandle::null());
     }
 
@@ -141,6 +147,16 @@ impl ShapeRuntime {
             let p = shape.as_ptr() as *mut RawGc;
             visitor(p);
         }
+        for shape in self.handles_by_id.values() {
+            let p = shape.as_ptr() as *mut RawGc;
+            visitor(p);
+        }
+    }
+
+    /// Resolve stable feedback identity back to the isolate-local GC handle.
+    #[must_use]
+    pub(crate) fn handle_for_id(&self, id: ShapeId) -> Option<ShapeHandle> {
+        self.handles_by_id.get(&id).map(Cell::get)
     }
 
     /// Intern a property key as a GC-managed string body.
@@ -240,6 +256,8 @@ impl ShapeRuntime {
             is_accessor,
             &mut visit_child_roots,
         )?;
+        let child_id = heap.read_payload(child, ShapeBody::id);
+        self.handles_by_id.insert(child_id, Cell::new(child));
         self.transitions.insert(transition_key, Cell::new(child));
         self.notify_observer(heap, parent_id, child, key, false);
         Ok(child)
@@ -328,12 +346,15 @@ mod tests {
         let mut interp = crate::Interpreter::new();
         let root = interp.shape_root();
         let first = interp.shape_child(root, "x").expect("child");
+        let first_id = interp.gc_heap.read_payload(first, ShapeBody::id);
+        assert_eq!(interp.shape_runtime.handle_for_id(first_id), Some(first));
         assert_eq!(interp.shape_offset_of(first, "x"), Some(0));
 
         interp.force_gc().expect("force GC");
 
         let root = interp.shape_root();
         let second = interp.shape_child(root, "x").expect("child after gc");
+        assert_eq!(interp.shape_runtime.handle_for_id(first_id), Some(second));
         assert_eq!(interp.shape_offset_of(second, "x"), Some(0));
     }
 }

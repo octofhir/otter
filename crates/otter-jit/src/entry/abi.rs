@@ -15,7 +15,8 @@
 
 use otter_vm::{
     RuntimeStubAllocContext, VmError, VmRuntimeActivation,
-    native_abi::{NativeFrame, VmThread},
+    jit::JitPreparedDirectCall,
+    native_abi::{CodeEntryCell, NativeFrame, VmThread},
 };
 /// Machine-visible context shared by every compiled tier.
 ///
@@ -48,28 +49,14 @@ pub(crate) struct JitCtx {
     /// operation throws. Pointer form keeps `JitCtx` constructible by emitted
     /// code; assembly never initializes a Rust enum in place.
     pub(crate) error: *mut Option<VmError>,
-    /// Prepared direct-call callee entry address.
-    pub(crate) direct_entry_addr: usize,
-    /// Prepared direct-call callee register base.
-    pub(crate) direct_regs: *mut u64,
-    /// Prepared direct-call callee SELF bits.
-    pub(crate) direct_self_closure: u64,
-    /// Prepared direct-call callee `this` bits.
-    pub(crate) direct_this_value: u64,
-    /// Prepared direct-call callee frame index.
-    pub(crate) direct_frame_index: usize,
-    /// Prepared direct-call callee upvalue-spine base (staged from
-    /// [`otter_vm::JitPreparedDirectCall::upvalues_ptr`]); the dispatch tail
-    /// copies it into the callee `JitCtx.upvalues_ptr`.
-    pub(crate) direct_upvalues_ptr: usize,
-    /// Prepared callee native-frame identity word (`function_id |
-    /// code_block_id << 32`).
-    pub(crate) direct_frame_ids: u64,
-    /// Prepared callee native-frame header word at byte 8 with `pc = 0`
-    /// (`register_count << 32 | kind << 48 | flags << 56`).
-    pub(crate) direct_frame_meta: u64,
-    /// Prepared callee installed code-object identity.
-    pub(crate) direct_code_object_id: u64,
+    /// VM-published direct-callee state.
+    ///
+    /// Plain and method prepare transitions replace this whole record on
+    /// success. Keeping the VM/JIT boundary as one C-layout value prevents the
+    /// two adapters and native tiers from growing parallel staging contracts.
+    /// Machine-built nested contexts intentionally leave the slot uninitialized
+    /// until a successful prepare; generated code reads it only after status 0.
+    pub(crate) direct_call: std::mem::MaybeUninit<JitPreparedDirectCall>,
     /// Base of the interpreter's flat JIT register stack
     /// (`reg_stack[0]`). Compiled code builds a self-recursive callee window at
     /// `reg_stack_base + reg_top*8` without a Rust frame-build bridge.
@@ -192,23 +179,32 @@ pub(crate) const ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, spill_slot_count) as u32;
 pub(crate) const ALLOC_CTX_STACK_SIZE: u32 =
     ((std::mem::size_of::<RuntimeStubAllocContext>() + 15) & !15) as u32;
-pub(crate) const DIRECT_ENTRY_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_entry_addr) as u32;
-pub(crate) const DIRECT_REGS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_regs) as u32;
-pub(crate) const DIRECT_SELF_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_self_closure) as u32;
-pub(crate) const DIRECT_THIS_OFFSET: u32 = std::mem::offset_of!(JitCtx, direct_this_value) as u32;
+const DIRECT_CALL_OFFSET: usize = std::mem::offset_of!(JitCtx, direct_call);
+pub(crate) const DIRECT_ENTRY_CELL_OFFSET: u32 =
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, entry_cell)) as u32;
+pub(crate) const DIRECT_REGS_OFFSET: u32 =
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, regs)) as u32;
+pub(crate) const DIRECT_SELF_OFFSET: u32 =
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, self_closure)) as u32;
+pub(crate) const DIRECT_THIS_OFFSET: u32 =
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, this_value)) as u32;
 /// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
 /// `LoadThis` in baseline entries.
 pub(crate) const THIS_VALUE_OFFSET: u32 = std::mem::offset_of!(JitCtx, this_value) as u32;
 pub(crate) const DIRECT_FRAME_INDEX_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_frame_index) as u32;
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, frame_index)) as u32;
 pub(crate) const DIRECT_UPVALUES_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_upvalues_ptr) as u32;
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, upvalues_ptr)) as u32;
 pub(crate) const DIRECT_FRAME_IDS_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_frame_ids) as u32;
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, frame_ids)) as u32;
 pub(crate) const DIRECT_FRAME_META_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_frame_meta) as u32;
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, frame_meta)) as u32;
 pub(crate) const DIRECT_CODE_OBJECT_ID_OFFSET: u32 =
-    std::mem::offset_of!(JitCtx, direct_code_object_id) as u32;
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, code_object_id)) as u32;
+/// Fixed-layout fields consumed by native call linkage. Entry cells are boxed
+/// by the isolate registry and never reused for another code generation.
+pub(crate) const CODE_ENTRY_ACTIVE_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, active_count) as u32;
 pub(crate) const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
 /// 16-aligned machine-stack reservation for a nested callee's own published
 /// [`NativeFrame`], placed immediately above its `JitCtx`.
@@ -234,6 +230,16 @@ pub(crate) const NATIVE_FRAME_RETURN_REGISTER_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, return_register) as u32;
 pub(crate) const NATIVE_FRAME_TAIL_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, argument_count) as u32;
+
+// The native entry ABI currently targets 64-bit engines. Embedding the VM's
+// prepared-call record must remain layout-identical to the former contiguous
+// scalar staging fields: generated code loads these offsets directly.
+#[cfg(target_pointer_width = "64")]
+const _: [(); 64] = [(); std::mem::offset_of!(JitCtx, direct_call)];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 72] = [(); std::mem::size_of::<JitPreparedDirectCall>()];
+#[cfg(target_pointer_width = "64")]
+const _: [(); 176] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

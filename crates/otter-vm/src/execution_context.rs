@@ -52,11 +52,6 @@ pub struct ExecutionContext {
     /// interpreter. Foreign function ids (closures escaped from
     /// `eval` / `new Function` / other scripts) resolve through it.
     space: Arc<CodeSpace>,
-    /// Append-only memo of sibling chunks already resolved through
-    /// `space`, so fid-keyed reads (`function`, `exec_function`, …)
-    /// can hand out references without re-locking the registry.
-    /// Per-context; clones start empty.
-    siblings: elsa::sync::FrozenVec<Box<ChunkTables>>,
 }
 
 impl std::fmt::Debug for ExecutionContext {
@@ -76,7 +71,6 @@ impl Clone for ExecutionContext {
             atoms: Arc::clone(&self.atoms),
             function_base: self.function_base,
             space: Arc::clone(&self.space),
-            siblings: elsa::sync::FrozenVec::new(),
         }
     }
 }
@@ -89,10 +83,10 @@ impl ExecutionContext {
     /// one function-id space.
     #[must_use]
     pub fn from_module(module: BytecodeModule) -> Self {
-        CodeSpace::link(&Arc::new(CodeSpace::default()), module)
+        Arc::new(CodeSpace::default()).link_module(module)
     }
 
-    /// Wrap one linked chunk's tables. Only [`CodeSpace::link`] and
+    /// Wrap one linked chunk's tables. Only [`CodeSpace::link_module`] and
     /// [`Self::for_function`] construct contexts this way.
     #[must_use]
     pub(crate) fn from_chunk_tables(tables: ChunkTables, space: Arc<CodeSpace>) -> Self {
@@ -102,24 +96,14 @@ impl ExecutionContext {
             atoms: tables.atoms,
             function_base: tables.function_base,
             space,
-            siblings: elsa::sync::FrozenVec::new(),
         }
     }
 
-    /// Resolve the sibling chunk owning a foreign `function_id`,
-    /// memoising the registry hit so returned references stay
-    /// borrowable from `self`.
+    /// Resolve the immutable sibling chunk owning a foreign `function_id`.
+    /// Registry nodes never move or disappear, so their tables borrow directly
+    /// from the shared code-space chain without a per-context cache.
     fn sibling_tables(&self, function_id: u32) -> Option<&ChunkTables> {
-        let covers = |t: &ChunkTables| {
-            function_id
-                .checked_sub(t.function_base)
-                .is_some_and(|local| local < t.function_count)
-        };
-        if let Some(tables) = self.siblings.iter().find(|t| covers(t)) {
-            return Some(tables);
-        }
-        let tables = self.space.chunk_for(function_id)?;
-        Some(self.siblings.push_get(Box::new(tables)))
+        self.space.chunk_for(function_id)
     }
 
     /// First global function id owned by this chunk.
@@ -159,7 +143,7 @@ impl ExecutionContext {
         if self.covers_function(function_id) {
             return Some(ResolvedCtx::Ambient(self));
         }
-        let tables = self.space.chunk_for(function_id)?;
+        let tables = self.space.chunk_for(function_id)?.clone();
         Some(ResolvedCtx::Owned(Self::from_chunk_tables(
             tables,
             Arc::clone(&self.space),
@@ -398,6 +382,14 @@ impl ExecutionContext {
     #[must_use]
     pub(crate) fn property_ic_site_end(&self) -> usize {
         self.executable.property_ic_site_end() as usize
+    }
+
+    /// Directory entries mapping this chunk's globally dense property site ids
+    /// to typed payloads in their owning CodeBlock feedback vectors.
+    pub(crate) fn feedback_slot_addresses(
+        &self,
+    ) -> Vec<(usize, crate::executable::FeedbackSlotAddress)> {
+        self.executable.feedback_slot_addresses()
     }
 
     /// Dense property IC site for a named property instruction at the

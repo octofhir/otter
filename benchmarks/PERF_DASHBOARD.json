@@ -1,0 +1,510 @@
+{
+  "schema_version": 1,
+  "status": "architecture_slice_correctness_validated_performance_deferred",
+  "as_of": "2026-07-16",
+  "repository": {
+    "commit": "699885803d6ce10f30598fe516efd848d360e187"
+  },
+  "environment": {
+    "host": {
+      "os": "macOS 26.5",
+      "kernel": "Darwin 25.5",
+      "architecture": "arm64",
+      "cpu": "Apple M1",
+      "cores": 8,
+      "memory": "16 GB"
+    },
+    "toolchain": {
+      "rustc": "1.96",
+      "cargo": "1.96",
+      "llvm": "22.1.2"
+    },
+    "runtimes": {
+      "node": {
+        "version": "24.16.0",
+        "available": true
+      },
+      "bun": {
+        "version": "1.4.0",
+        "available": true
+      },
+      "jsc": {
+        "version": null,
+        "available": false
+      }
+    }
+  },
+  "otter_modes": [
+    {
+      "id": "interpreter",
+      "selector": {
+        "OTTER_JIT": "0"
+      },
+      "available": true
+    },
+    {
+      "id": "production_tiered",
+      "selector": {
+        "OTTER_JIT": "1"
+      },
+      "available": true
+    },
+    {
+      "id": "baseline_only",
+      "selector": null,
+      "available": false,
+      "reason": "JitSelection::Baseline and JitSelection::Template are equivalent and both select the production tiered policy"
+    },
+    {
+      "id": "optimizer_only",
+      "selector": null,
+      "available": false,
+      "reason": "no independent optimizer-only selector exists; JitSelection::Baseline and JitSelection::Template are equivalent"
+    }
+  ],
+  "correctness": {
+    "test262_frozen_baseline": {
+      "commit": "56bc0e56",
+      "passed": 51480,
+      "failed": 498,
+      "skipped": 1185,
+      "timeouts": 10,
+      "crashes": 0,
+      "total": 53173,
+      "pass_rate_excluding_skipped_percent": 99.02
+    }
+  },
+  "architecture_refactor": {
+    "scope": "call linkage, executable lifetime, code-space ownership, feedback ownership, and optimizer pipeline boundaries",
+    "status": "implemented_correctness_validated",
+    "performance_validation": {
+      "status": "deferred",
+      "reason": "architecture-first migration requested; tune and re-profile only after the call/IC/frame boundaries are complete"
+    },
+    "changes": [
+      {
+        "boundary": "VM call lifecycle",
+        "result": "jit_call.rs reduced from 2116 to 1324 lines; resolve, cache, frame, and finish/abort now have focused modules"
+      },
+      {
+        "boundary": "call target identity",
+        "result": "plain and method calls share callable decoding and ResolvedCallTarget; every plan travels with the exact owning code Arc"
+      },
+      {
+        "boundary": "method call-site cache",
+        "result": "cache retains shape/slot/fid/plan/code only; it reloads the callable every invocation and never retains movable closure, capture, this, or argument Values"
+      },
+      {
+        "boundary": "native tier emission",
+        "result": "template and optimizing tiers use one tier-neutral AArch64 compiled-to-compiled call tail"
+      },
+      {
+        "boundary": "prepared-call ABI",
+        "result": "nine parallel direct-call staging fields replaced by one repr(C) record in a MaybeUninit slot with frozen 64-bit layout assertions"
+      },
+      {
+        "boundary": "failure lifecycle",
+        "result": "activation-publish failure restores caller SP/native frame and aborts the prepared VM frame exactly once without activation underflow"
+      },
+      {
+        "boundary": "moving-GC frame construction",
+        "result": "inherited/new upvalue cells and dynamic this remain traced until the callee frame is published"
+      },
+      {
+        "boundary": "shared native call linkage",
+        "result": "template and optimizing call sites dispatch through one retained CallTrampoline mapping that owns nested JitCtx/NativeFrame construction and the return, exact-PC bail, throw, and activation-overflow lifecycle"
+      },
+      {
+        "boundary": "stable executable entry",
+        "result": "each production code generation installs an address-stable CodeEntryCell with unlink-before-retire state and active-entry accounting; registry tombstones are never repurposed"
+      },
+      {
+        "boundary": "linked code ownership",
+        "result": "CodeSpace RwLock<Vec<_>> and the per-ExecutionContext synchronized sibling cache were replaced by an append-only chain of immutable chunks with one-shot publication; ordinary reads borrow stable tables without locking"
+      },
+      {
+        "boundary": "feedback ownership",
+        "result": "CodeBlock now owns one FeedbackVector containing dense instruction cells, fixed typed atomic slots, and its epoch instead of parallel feedback maps; property and call snapshots use coherent sequence publication without locks"
+      },
+      {
+        "boundary": "isolate IC ownership",
+        "result": "four parallel Interpreter vectors for load/store/has/method ICs and the separate stats field were removed; FeedbackDirectory now owns executable banks, accounting, tracing views, snapshots, and method target distributions behind intent-level operations"
+      },
+      {
+        "boundary": "optimizer orchestration",
+        "result": "backend-neutral OptimizationPipeline produces a verified OptimizedUnit before target eligibility and AArch64 emission"
+      },
+      {
+        "boundary": "backend failure contract",
+        "result": "assembler allocation, finalization, representation, opcode, and terminator failures return typed Unsupported fallbacks instead of panicking"
+      },
+      {
+        "boundary": "high-level authoring API",
+        "result": "runtime contributors operate through FeedbackDirectory operations such as probe_load/probe_store/probe_has, record_property_guard_miss, install_method_ic, and method_load_hit, plus JitCodeRegistry::direct_call_plan, OptimizationPipeline, and the shared call lifecycle; raw CacheStub banks, offsets, entry-cell atomics, and payload publication remain backend-private"
+      }
+    ],
+    "correctness_gates": [
+      {
+        "command": "cargo test -p otter-runtime --test jit_call_lifecycle",
+        "result": "4 passed"
+      },
+      {
+        "command": "OTTER_GC_STRESS=1..16 target/debug/deps/jit_call_lifecycle-* --quiet",
+        "result": "4 tests passed at every stride"
+      },
+      {
+        "command": "cargo test -p otter-jit failed_activation_push_restores_caller_and_aborts_prepared_frame",
+        "result": "1 passed"
+      },
+      {
+        "command": "cargo check -p otter-vm && cargo check -p otter-jit",
+        "result": "passed"
+      },
+      {
+        "command": "cargo test -p otter-jit",
+        "result": "177 passed"
+      },
+      {
+        "command": "cargo test -p otter-vm feedback::tests --no-fail-fast && cargo test -p otter-vm property_ic_stats_record --no-fail-fast",
+        "result": "18 lock-free feedback tests and 5 executable property-IC integration tests passed"
+      },
+      {
+        "command": "cargo test -p otter-vm code_space::tests && cargo test -p otter-vm new_function_links_eval_chunk_into_shared_code_space",
+        "result": "6 append-only code-space ownership/concurrency tests and the escaped new-Function visibility test passed"
+      },
+      {
+        "command": "cargo test -p otter-vm native_abi::code_entry::tests && cargo test -p otter-vm jit_registry::tests",
+        "result": "3 code-entry lifecycle tests and 7 registry lifetime/dependency tests passed"
+      },
+      {
+        "command": "broad runtime/conformance suites",
+        "result": "deferred until the architecture migration is coherent; no additional baseline or profiling loop was run in this pass"
+      }
+    ]
+  },
+  "architecture_roadmap": {
+    "goal": "close the systematic Node/V8 gap by removing mandatory runtime re-entry from common JS execution before local tuning",
+    "design_direction": "interpreter plus template baseline plus one CFG/SSA optimizer, exposed through intent-level APIs and sharing one logical call ABI, append-only immutable code ownership, fixed-layout lock-free feedback substrate, typed IC recipes, and reconstructible VM state; no thread-local state or mutex/rwlock coordination in call, feedback, or linked-code lookup",
+    "phases": [
+      {
+        "order": 1,
+        "name": "call_frame_lifetime_contract",
+        "status": "in_progress",
+        "deliverables": [
+          "tier-neutral logical JS call ABI",
+          "native JS-to-JS trampoline for eligible fixed-arity plain and method calls",
+          "activation descriptor, stack maps, and safe code-entry lifetime/retirement"
+        ],
+        "exit_gate": "eligible compiled-call hits perform zero Rust prepare/finish transitions and preserve call/return/throw/GC-stress parity"
+      },
+      {
+        "order": 2,
+        "name": "unified_feedback_and_typed_ic_ir",
+        "status": "in_progress",
+        "deliverables": [
+          "immutable feedback metadata plus executable-instance feedback vectors",
+          "fixed property/call atomic payloads with coherent sequence snapshots and no mutex/rwlock/thread-local coordination",
+          "one isolate FeedbackDirectory owning executable IC banks, counters, snapshots, tracing views, and method distributions",
+          "typed data-only IC recipes shared by interpreter, template JIT, and optimizer snapshots",
+          "bounded per-kind mono/poly/mega policies without movable Value payloads"
+        ],
+        "exit_gate": "all supported dynamic bytecodes use deterministic typed slots and the optimizer no longer reads bespoke feedback maps"
+      },
+      {
+        "order": 3,
+        "name": "optimizer_pipeline_boundary",
+        "status": "in_progress",
+        "deliverables": [
+          "backend-neutral OptimizationPipeline producing immutable OptimizedUnit",
+          "AArch64 lowering plan separated from emission",
+          "typed compilation errors that fall back instead of panic"
+        ],
+        "exit_gate": "neutral optimizer analyses are independently testable and the emitter consumes PlannedOp rather than revalidating raw bytecode"
+      },
+      {
+        "order": 4,
+        "name": "targeted_dependencies_deopt_and_osr",
+        "status": "planned",
+        "deliverables": [
+          "shape/prototype/global/code-entry version dependencies",
+          "complete FrameState and exact side-exit recovery",
+          "loop-header OSR with deopt-loop backoff"
+        ],
+        "exit_gate": "only relevant mutations invalidate code and OSR-to-optimized-to-deopt restores the exact bytecode continuation"
+      },
+      {
+        "order": 5,
+        "name": "optimizer_depth",
+        "status": "planned",
+        "deliverables": [
+          "SCCP and branch folding",
+          "side-effect-aware DCE, GVN, LICM, range and bounds-check elimination",
+          "bounded call inlining, representation selection, and escape/scalar replacement"
+        ],
+        "exit_gate": "each pass has verifier coverage, deterministic output, dependency validation, and measurable suite-level benefit"
+      }
+    ],
+    "explicit_non_goals": [
+      "copying V8's four-tier ladder or tier thresholds",
+      "introducing Sea-of-Nodes or another parallel engine stack",
+      "forcing identical physical frame layouts across template and optimizing tiers",
+      "caching closure environments, this, arguments, or raw movable GC values",
+      "adding broad speculation before complete deopt state exists",
+      "exposing raw entry addresses, atomics, locks, or ABI offsets to ordinary VM/runtime contributors"
+    ]
+  },
+  "benchmarks": {
+    "v8_v7_selected_4_workloads": {
+      "captured_at": "2026-07-16T17:05:37Z",
+      "source_log": "benchmarks/results/v8-v7-20260716T170537Z.log",
+      "metric": "score",
+      "direction": "higher_is_better",
+      "aggregation": {
+        "method": "equal_weight_geometric_mean",
+        "weights": {
+          "Richards": 1,
+          "DeltaBlue": 1,
+          "Crypto": 1,
+          "Splay": 1
+        },
+        "failed_workloads_excluded": true
+      },
+      "runs": [
+        {
+          "runtime": "node",
+          "mode": "v8",
+          "status": "scoreable",
+          "workloads": {
+            "Richards": 45628,
+            "DeltaBlue": 122874,
+            "Crypto": 59018,
+            "Splay": 43492
+          },
+          "composite": 61591
+        },
+        {
+          "runtime": "otter",
+          "mode": "production_tiered",
+          "status": "scoreable",
+          "workloads": {
+            "Richards": 537,
+            "DeltaBlue": 215,
+            "Crypto": 1917,
+            "Splay": 1361
+          },
+          "composite": 740
+        },
+        {
+          "runtime": "bun",
+          "mode": "jsc",
+          "status": "invalid",
+          "failure": {
+            "kind": "ReferenceError",
+            "message": "setupEngine"
+          },
+          "workloads": null,
+          "composite": null
+        },
+        {
+          "runtime": "jsc",
+          "mode": "standalone",
+          "status": "unavailable",
+          "failure": null,
+          "workloads": null,
+          "composite": null
+        },
+        {
+          "runtime": "otter",
+          "mode": "interpreter",
+          "status": "invalid",
+          "failure": {
+            "kind": "timeout",
+            "timeout_seconds": 60,
+            "after_workload": "DeltaBlue"
+          },
+          "workloads": {
+            "Richards": 82.8,
+            "DeltaBlue": 113,
+            "Crypto": null,
+            "Splay": null
+          },
+          "composite": null
+        }
+      ],
+      "relative_performance": {
+        "numerator": "otter/production_tiered",
+        "denominator": "node/v8",
+        "basis": "displayed composite scores",
+        "formula": "740 / 61591",
+        "ratio": 0.012014742413664334,
+        "node_over_otter_gap_x": 83.23108108108109,
+        "failed_workloads_excluded": true
+      }
+    },
+    "richards_profile": {
+      "runtime": "otter",
+      "mode": "production_tiered",
+      "status": "scoreable",
+      "score": 496,
+      "duration_ms": 2004.73,
+      "counters": {
+        "jit_stub_transitions": 25886246,
+        "reentrant": 14558020,
+        "allocating": 11327431,
+        "leaf": 795,
+        "runtime_property_stubs": 11564868,
+        "runtime_calls": 11327431,
+        "direct_calls": 11326976,
+        "compile_attempts": 25,
+        "osr_attempts": 1,
+        "optimized_entries": 280,
+        "optimized_osr_entries": 1,
+        "optimized_deopts": 0
+      },
+      "profile": {
+        "samples": 7394,
+        "sample_attribution_percent": [
+          {
+            "label": "Mach-O",
+            "percent": 65.96
+          },
+          {
+            "label": "unmapped/JIT",
+            "percent": 29.55
+          },
+          {
+            "label": "libsystem_platform",
+            "percent": 3.77
+          },
+          {
+            "label": "malloc",
+            "percent": 0.54
+          }
+        ],
+        "top_self_percent": [
+          {
+            "symbol": "jit_prepare_direct_method_call",
+            "percent": 14.97
+          },
+          {
+            "symbol": "object::body_offset_of",
+            "percent": 6.69
+          },
+          {
+            "symbol": "jit_finish_direct_call_returned",
+            "percent": 3.19
+          },
+          {
+            "symbol": "ordinary_get_value",
+            "percent": 3.16
+          },
+          {
+            "symbol": "run_load_global_or_throw_reg_for_function",
+            "percent": 3.15
+          },
+          {
+            "symbol": "ordinary_has_property_value",
+            "percent": 3.11
+          },
+          {
+            "symbol": "jit_runtime_try_collection_method_ic",
+            "percent": 2.37
+          },
+          {
+            "symbol": "ensure_deferred_namespace_ready",
+            "percent": 2.27
+          },
+          {
+            "symbol": "object::lookup_own",
+            "percent": 2.2
+          },
+          {
+            "symbol": "jit_load_global_stub",
+            "percent": 1.83
+          },
+          {
+            "symbol": "bytecode_call_target_parts",
+            "percent": 1.81
+          },
+          {
+            "symbol": "CacheStub::run_guards",
+            "percent": 1.74
+          },
+          {
+            "symbol": "jit_prepare_direct_method_call_stub",
+            "percent": 1.54
+          },
+          {
+            "symbol": "prepare_jit_direct_call_frame",
+            "percent": 1.5
+          }
+        ]
+      }
+    },
+    "boxed_property_micro": {
+      "status": "implemented_validated",
+      "hypothesis_scope": "load_only",
+      "validation": "passed",
+      "execution": "serial",
+      "runs": 10,
+      "before": {
+        "int": {
+          "mean_ms": 87.6,
+          "standard_deviation_ms": 1.8,
+          "range_ms": [
+            85.3,
+            90.4
+          ]
+        },
+        "double": {
+          "mean_ms": 296.4,
+          "standard_deviation_ms": 26.5,
+          "range_ms": [
+            266.5,
+            343.7
+          ]
+        },
+        "double_over_int_ratio": {
+          "mean": 3.38,
+          "standard_deviation": 0.31
+        }
+      },
+      "after": {
+        "int": {
+          "mean_ms": 84.5,
+          "standard_deviation_ms": 5.4,
+          "mean_user_ms": 76.1,
+          "mean_system_ms": 6.1,
+          "range_ms": [
+            79.1,
+            97.6
+          ]
+        },
+        "double": {
+          "mean_ms": 201.7,
+          "standard_deviation_ms": 3.3,
+          "mean_user_ms": 190.2,
+          "mean_system_ms": 10.0,
+          "range_ms": [
+            198.5,
+            209.4
+          ]
+        },
+        "double_over_int_ratio": {
+          "mean": 2.39,
+          "standard_deviation": 0.16
+        }
+      },
+      "change": {
+        "int": {
+          "wall_time_percent": -3.54,
+          "interpretation": "within_noise"
+        },
+        "double": {
+          "wall_time_percent": -31.95,
+          "throughput_percent": 46.95
+        }
+      }
+    }
+  }
+}

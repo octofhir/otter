@@ -6,6 +6,7 @@
 //! re-exports, and compile-time glue.
 //!
 //! # Contents
+//! - [`code_entry`] — stable per-generation native entry cells.
 //! - [`frame`] — VM thread and activation layouts.
 //! - [`dispatch`] — tier and runtime-stub result/status layouts.
 //! - [`runtime_stubs`] — classified descriptor inventory and table header.
@@ -22,12 +23,14 @@
 //! - [`crate::jit`] for the compiler service boundary.
 //! - `JIT_REFACTOR_PLAN.md` for phase gates.
 
+mod code_entry;
 mod dispatch;
 mod frame;
 mod metadata;
 mod runtime_stubs;
 mod safepoints;
 
+pub use code_entry::*;
 pub use dispatch::*;
 pub use frame::*;
 pub use metadata::*;

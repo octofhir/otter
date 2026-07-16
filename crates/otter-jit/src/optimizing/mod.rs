@@ -15,6 +15,8 @@
 //! # Contents
 //! - [`compile_optimized`] — whole-pipeline compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and allocation metadata.
+//! - `pipeline` / `unit` — backend-neutral orchestration and its owned,
+//!   verified analysis product.
 //!
 //! # Invariants
 //! - Every `LoadElement` / `StoreElement` materializes its operands plus tagged
@@ -50,6 +52,8 @@ use otter_vm::{
     },
 };
 
+#[cfg(target_arch = "aarch64")]
+use crate::arm64::CallTrampoline;
 use crate::{
     CompiledCode, Unsupported,
     entry::{TransitionTable, enter_compiled},
@@ -57,6 +61,8 @@ use crate::{
 
 #[cfg(target_arch = "aarch64")]
 mod arm64;
+pub(crate) mod pipeline;
+pub(crate) mod unit;
 
 /// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +86,10 @@ pub struct OptimizedMetadata {
 /// Finalized optimizing code and its exact-PC deoptimization metadata.
 pub struct OptimizedCode {
     code: CompiledCode,
+    /// Shared executable call lifecycle whose address is baked into this code.
+    /// Installed optimized code can outlive the compiler hook.
+    #[cfg(target_arch = "aarch64")]
+    _call_trampoline: std::sync::Arc<CallTrampoline>,
     deopt_table: DeoptTable,
     safepoint_records: Box<[SafepointRecord]>,
     frame_maps: Box<[FrameMap]>,
@@ -104,6 +114,7 @@ impl OptimizedCode {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         code: CompiledCode,
+        #[cfg(target_arch = "aarch64")] call_trampoline: std::sync::Arc<CallTrampoline>,
         deopt_table: DeoptTable,
         safepoint_records: Box<[SafepointRecord]>,
         frame_maps: Box<[FrameMap]>,
@@ -133,6 +144,8 @@ impl OptimizedCode {
         };
         Self {
             code,
+            #[cfg(target_arch = "aarch64")]
+            _call_trampoline: call_trampoline,
             deopt_table,
             safepoint_records,
             frame_maps,
@@ -284,8 +297,9 @@ pub(crate) fn compile_optimized_with_transitions(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    call_trampoline: std::sync::Arc<CallTrampoline>,
 ) -> Result<OptimizedCode, Unsupported> {
-    arm64::compile_with_transitions(view, code_object_id, transitions)
+    arm64::compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
 }
 
 /// Non-arm64 stub: the first optimizing backend is arm64-only.

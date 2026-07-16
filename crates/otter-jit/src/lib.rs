@@ -38,6 +38,8 @@
 //! - `otter-gc` — the moving collector, `FrameRoots`, and the W^X/rooting
 //!   contract this tier must honor.
 
+#[cfg(target_arch = "aarch64")]
+mod arm64;
 mod code;
 mod entry;
 pub mod ir;
@@ -45,7 +47,7 @@ pub mod optimizing;
 mod template;
 
 pub use code::CompiledCode;
-pub use entry::{TransitionTable, Unsupported};
+pub use entry::{BackendFailure, TransitionTable, Unsupported};
 pub use optimizing::{OptimizedCode, compile_optimized};
 pub use template::{TemplateCode, compile};
 
@@ -55,11 +57,21 @@ pub use template::{TemplateCode, compile};
 /// Drives the optimizing leaf tier before the [`template`] compiler. There is no
 /// environment or runtime toggle for compiler selection; hosts opt out of
 /// native execution by not installing the hook at all.
-#[derive(Default)]
 pub struct BaselineJitCompiler {
     /// Hook-lifetime resolution of the transition inventory; every compile
     /// bakes entry addresses through this table.
     transitions: TransitionTable,
+    /// One fallibly assembled call lifecycle shared by every produced code
+    /// object. The code objects retain their own `Arc`, so installed code can
+    /// safely outlive this compiler hook.
+    #[cfg(target_arch = "aarch64")]
+    call_trampoline: Result<std::sync::Arc<arm64::CallTrampoline>, Unsupported>,
+}
+
+impl Default for BaselineJitCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl std::fmt::Debug for BaselineJitCompiler {
@@ -72,8 +84,13 @@ impl BaselineJitCompiler {
     /// Construct the production baseline JIT compiler hook.
     #[must_use]
     pub fn new() -> Self {
+        let transitions = TransitionTable::resolve();
+        #[cfg(target_arch = "aarch64")]
+        let call_trampoline = arm64::CallTrampoline::compile(&transitions).map(std::sync::Arc::new);
         Self {
-            transitions: TransitionTable::resolve(),
+            transitions,
+            #[cfg(target_arch = "aarch64")]
+            call_trampoline,
         }
     }
 }
@@ -92,7 +109,23 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
-        match template::compile(&request.snapshot, request.code_object_id, &self.transitions) {
+        #[cfg(target_arch = "aarch64")]
+        let compiled = self
+            .call_trampoline
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|call_trampoline| {
+                template::compile_with_trampoline(
+                    &request.snapshot,
+                    request.code_object_id,
+                    &self.transitions,
+                    std::sync::Arc::clone(call_trampoline),
+                )
+            });
+        #[cfg(not(target_arch = "aarch64"))]
+        let compiled =
+            template::compile(&request.snapshot, request.code_object_id, &self.transitions);
+        match compiled {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),
@@ -107,11 +140,26 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
-        match optimizing::compile_optimized_with_transitions(
+        #[cfg(target_arch = "aarch64")]
+        let compiled = self
+            .call_trampoline
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|call_trampoline| {
+                optimizing::compile_optimized_with_transitions(
+                    &request.snapshot,
+                    request.code_object_id,
+                    &self.transitions,
+                    std::sync::Arc::clone(call_trampoline),
+                )
+            });
+        #[cfg(not(target_arch = "aarch64"))]
+        let compiled = optimizing::compile_optimized_with_transitions(
             &request.snapshot,
             request.code_object_id,
             &self.transitions,
-        ) {
+        );
+        match compiled {
             Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(code),
             }),

@@ -1,9 +1,9 @@
 //! AArch64 call emitters for the template compiler.
 //!
 //! # Contents
-//! - Plain-call and method-call lowering through the prepare transitions.
-//! - The shared direct-call dispatch tail building the callee's `JitCtx`
-//!   and publishing its own `NativeFrame`.
+//! - Plain-call, method-call, and construct lowering through prepare and
+//!   generic transitions.
+//! - Guarded collection-method dispatch before ordinary method resolution.
 //!
 //! # Invariants
 //! - The caller's canonical PC is stamped before the prepare transition; a
@@ -11,15 +11,15 @@
 //!   caller's published frame survives untouched.
 //! - A callee throw caught by the compiled caller publishes the selected
 //!   catch/finally PC and exits through the shared bailout epilogue.
-//! - The callee frame lives exactly as long as its machine-stack
-//!   reservation; the caller's frame is republished before any exit path.
+//! - Prepared callees enter through the common owned AArch64 call trampoline,
+//!   which owns frame publication and cleanup for every native tier.
 //! - Ineligible call resolutions complete through the descriptor-classified
 //!   generic in-place transitions; only receivers whose opcode semantics the
 //!   interpreter dispatches through bespoke branches take an exact side exit.
 //!
 //! # See also
+//! - [`crate::arm64::calls`] — shared compiled-to-compiled call emission.
 //! - [`super::transitions`] — descriptor-resolved entries used here.
-//! - `crates/otter-vm/src/native_abi/frame.rs` — the published activation.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::JitCompileSnapshot;
@@ -30,19 +30,7 @@ use super::collections::{
 };
 use super::transitions::TransitionTable;
 use super::values::emit_load_u64;
-use crate::entry::{
-    ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
-    CTX_PLUS_FRAME_STACK_SIZE, DIRECT_CODE_OBJECT_ID_OFFSET, DIRECT_ENTRY_OFFSET,
-    DIRECT_FRAME_IDS_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_FRAME_META_OFFSET,
-    DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET,
-    ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE, NATIVE_FRAME_ARGUMENT_BASE_OFFSET,
-    NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_FEEDBACK_BASE_OFFSET,
-    NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-    NATIVE_FRAME_PREVIOUS_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-    NATIVE_FRAME_RETURN_REGISTER_OFFSET, NATIVE_FRAME_TAIL_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-    REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET,
-    UPVALUES_PTR_OFFSET, VALUE_UNDEFINED,
-};
+use crate::arm64::{CallTrampoline, emit_prepared_call};
 
 /// Emit `dst = callee(args…)` (plain `Op::Call`).
 ///
@@ -56,6 +44,7 @@ use crate::entry::{
 pub(super) fn emit_call(
     ops: &mut Assembler,
     table: &TransitionTable,
+    call_trampoline: &CallTrampoline,
     dst: u16,
     callee: u16,
     argc: u16,
@@ -81,7 +70,7 @@ pub(super) fn emit_call(
         ; cmp x0, #2
         ; b.eq =>generic
     );
-    emit_direct_call_tail(ops, table, dst, bail, threw, done);
+    emit_prepared_call(ops, call_trampoline, dst, bail, threw, done);
 
     // Ineligible callee: complete the whole opcode through the generic
     // in-place call transition; only its non-callable report (`2`)
@@ -160,6 +149,7 @@ pub(super) fn emit_construct(
 pub(super) fn emit_method_call(
     ops: &mut Assembler,
     table: &TransitionTable,
+    call_trampoline: &CallTrampoline,
     view: &JitCompileSnapshot,
     dst: u16,
     receiver: u16,
@@ -236,7 +226,7 @@ pub(super) fn emit_method_call(
         ; cmp x0, #2
         ; b.eq =>generic
     );
-    emit_direct_call_tail(ops, table, dst, bail, threw, done);
+    emit_prepared_call(ops, call_trampoline, dst, bail, threw, done);
 
     // Ineligible direct resolution: complete the whole opcode through the
     // generic in-place method transition; only its exotic-receiver report
@@ -263,197 +253,4 @@ pub(super) fn emit_method_call(
         ; =>done
     );
     Ok(())
-}
-
-/// Shared direct-call dispatch tail used after a prepare transition returned
-/// status 0 (callee staged in the entry context's `direct_*` fields).
-///
-/// Builds the callee `JitCtx` on the machine stack with the callee's own
-/// published `NativeFrame` above it (prepared identity/meta words, the
-/// caller's frame as `previous_frame`, the callee window as `register_base`,
-/// and the callee code-object id, so the isolate registry resolves the
-/// callee's safepoints while the caller frame keeps its exact PC). Branches
-/// to the compiled entry and dispatches the returned / bailed / threw finish
-/// helpers, landing at `done`.
-pub(crate) fn emit_direct_call_tail(
-    ops: &mut Assembler,
-    table: &TransitionTable,
-    dst: u16,
-    bail: DynamicLabel,
-    threw: DynamicLabel,
-    done: DynamicLabel,
-) {
-    let direct_returned = ops.new_dynamic_label();
-    let direct_bailed = ops.new_dynamic_label();
-    let direct_threw = ops.new_dynamic_label();
-    let push_slow = ops.new_dynamic_label();
-    let push_done = ops.new_dynamic_label();
-    let push_activation = table.entry(abi::STUB_JIT_PUSH_NATIVE_ACTIVATION);
-    dynasm!(ops
-        ; .arch aarch64
-        ; sub sp, sp, CTX_PLUS_FRAME_STACK_SIZE
-        ; ldr x9, [x20, DIRECT_REGS_OFFSET]
-        ; str x9, [sp]
-        ; ldr x9, [x20, DIRECT_SELF_OFFSET]
-        ; str x9, [sp, #8]
-        ; ldr x9, [x20, DIRECT_THIS_OFFSET]
-        ; str x9, [sp, #16]
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x9, [sp, THREAD_OFFSET]
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; add x15, sp, JIT_CTX_STACK_SIZE
-        ; ldr x9, [x20, DIRECT_FRAME_IDS_OFFSET]
-        ; str x9, [x15]
-        ; ldr x9, [x20, DIRECT_FRAME_META_OFFSET]
-        ; str x9, [x15, #8]
-        ; str x10, [x15, NATIVE_FRAME_PREVIOUS_OFFSET]
-        ; ldr x9, [x20, DIRECT_REGS_OFFSET]
-        ; str x9, [x15, NATIVE_FRAME_REGISTER_BASE_OFFSET]
-        ; str xzr, [x15, NATIVE_FRAME_ARGUMENT_BASE_OFFSET]
-        ; str xzr, [x15, NATIVE_FRAME_FEEDBACK_BASE_OFFSET]
-        ; ldr x9, [x20, DIRECT_CODE_OBJECT_ID_OFFSET]
-        ; str x9, [x15, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
-        ; ldr x9, [x20, DIRECT_THIS_OFFSET]
-        ; str x9, [x15, NATIVE_FRAME_THIS_OFFSET]
-    );
-    emit_load_u64(ops, 9, VALUE_UNDEFINED);
-    dynasm!(ops
-        ; .arch aarch64
-        ; str x9, [x15, NATIVE_FRAME_NEW_TARGET_OFFSET]
-        ; movn x9, #0
-        ; str x9, [x15, NATIVE_FRAME_RETURN_REGISTER_OFFSET]
-        ; str xzr, [x15, NATIVE_FRAME_TAIL_OFFSET]
-        ; str x15, [sp, NATIVE_FRAME_OFFSET]
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x15, [x9]
-        ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; str x9, [sp, FRAME_INDEX_OFFSET]
-        ; ldr x9, [x20, ERROR_SLOT_OFFSET]
-        ; str x9, [sp, ERROR_SLOT_OFFSET]
-        ; ldr x9, [x20, DIRECT_UPVALUES_OFFSET]
-        ; str x9, [sp, UPVALUES_PTR_OFFSET]
-        ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
-        ; str x9, [sp, REG_STACK_BASE_OFFSET]
-        ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
-        ; str x9, [sp, REG_TOP_PTR_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_BASE_OFFSET]
-        ; str x9, [sp, ACTIVATION_BASE_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
-        ; str x9, [sp, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_LIMIT_OFFSET]
-        ; str x9, [sp, ACTIVATION_LIMIT_OFFSET]
-        // Publish the callee's SELF/`this` GC slots inline: bump the
-        // activation cursor and record the two slot addresses. Overflow takes
-        // the stub slow path, which parks the stack-overflow error.
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_LIMIT_OFFSET]
-        ; cmp x10, x11
-        ; b.hs =>push_slow
-        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
-        ; add x13, sp, #8
-        ; str x13, [x12]
-        ; add x13, sp, #16
-        ; str x13, [x12, #8]
-        ; add x10, x10, #1
-        ; str x10, [x9]
-        ; =>push_done
-        ; mov x0, sp
-        ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
-        ; blr x16
-        // The callee frame dies with this reservation: republish the caller's
-        // frame before any exit path runs.
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x10, [x9]
-        ; cmp x1, STATUS_RETURNED as u32
-        ; b.eq =>direct_returned
-        ; cmp x1, STATUS_BAILED as u32
-        ; b.eq =>direct_bailed
-        ; b =>direct_threw
-        ; =>direct_returned
-        ; mov x3, x0
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, #1
-        ; str x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
-        ; str xzr, [x12]
-        ; str xzr, [x12, #8]
-        ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
-        ; mov x0, x20
-        ; movz x1, dst as u32
-    );
-    emit_load_u64(
-        ops,
-        16,
-        table.entry(abi::STUB_JIT_FINISH_DIRECT_CALL_RETURNED),
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbnz x0, =>threw
-        ; b =>done
-        ; =>direct_bailed
-        // The callee stamped its exact bail PC into its own published frame.
-        ; add x9, sp, JIT_CTX_STACK_SIZE
-        ; ldr w3, [x9, NATIVE_FRAME_PC_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, #1
-        ; str x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
-        ; str xzr, [x12]
-        ; str xzr, [x12, #8]
-        ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
-        ; mov x0, x20
-        ; movz x1, dst as u32
-    );
-    emit_load_u64(
-        ops,
-        16,
-        table.entry(abi::STUB_JIT_FINISH_DIRECT_CALL_BAILED),
-    );
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbnz x0, =>threw
-        ; b =>done
-        ; =>direct_threw
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x10, [x9]
-        ; sub x10, x10, #1
-        ; str x10, [x9]
-        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
-        ; str xzr, [x12]
-        ; str xzr, [x12, #8]
-        ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
-        ; mov x0, x20
-    );
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_ABORT_DIRECT_CALL));
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cmp x0, #2
-        ; b.eq =>bail
-        ; b =>threw
-        // Out-of-line activation-publish overflow: the stub re-checks, parks
-        // the stack-overflow error, and reports it.
-        ; =>push_slow
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 16, push_activation);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbnz x0, =>threw
-        ; b =>push_done
-    );
 }

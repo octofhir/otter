@@ -30,7 +30,8 @@ use otter_vm::native_abi as abi;
 
 use super::transitions::TransitionTable;
 use super::values::{
-    emit_box_int32, emit_compress_slot_or_bail, emit_decompress_slot, emit_load_u64, emit_slab_base,
+    BoxedSlotSlowPath, emit_box_int32, emit_compress_slot_or_bail, emit_decompress_slot,
+    emit_load_u64, emit_slab_base,
 };
 use crate::entry::{IC_WAYS, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
 
@@ -46,6 +47,7 @@ pub(super) fn emit_load_property(
     site: u64,
     array_length: bool,
     cell_addr: usize,
+    boxed_slot_slow_paths: &mut Vec<BoxedSlotSlowPath>,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let cage_base = view.cage_base;
@@ -141,9 +143,17 @@ pub(super) fn emit_load_property(
             ; cbz x13, =>miss
             ; ldr w9, [x13, x17]       // 4-byte compressed slot
         );
-        emit_decompress_slot(ops, cage_base as u64, miss);
+        let boxed_entry = ops.new_dynamic_label();
+        let continuation = ops.new_dynamic_label();
+        boxed_slot_slow_paths.push(BoxedSlotSlowPath {
+            entry: boxed_entry,
+            continuation,
+            miss,
+        });
+        emit_decompress_slot(ops, cage_base as u64, boxed_entry);
         dynasm!(ops
             ; .arch aarch64
+            ; =>continuation
             ; str x9, [x19, dst_off]
             ; b =>done
         );

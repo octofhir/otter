@@ -79,7 +79,7 @@ impl Interpreter {
     pub fn link_module(&mut self, module: otter_bytecode::BytecodeModule) -> ExecutionContext {
         let function_count = u32::try_from(module.functions.len())
             .expect("linked module function table exceeds u32 range");
-        let context = code_space::CodeSpace::link(&self.code_space, module);
+        let context = self.code_space.link_module(module);
         if self.active_realm_id != 0 {
             let base = context.function_base();
             for function_id in base..base + function_count {

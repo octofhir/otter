@@ -193,7 +193,7 @@ impl Interpreter {
     pub(crate) fn store_property_ics_for_trace(
         &self,
     ) -> &[property_ic::PropertyIcEntry<cache_ir::CacheStub>] {
-        &self.store_property_ics
+        self.feedback_directory.store_ics_for_trace()
     }
 }
 

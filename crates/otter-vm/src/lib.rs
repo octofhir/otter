@@ -33,6 +33,7 @@
 extern crate self as otter_vm;
 
 pub(crate) mod abstract_ops;
+pub mod active_frame;
 mod allocation_ops;
 mod argument_window;
 pub mod arguments_object;
@@ -141,6 +142,7 @@ pub mod microtask;
 mod module_ops;
 mod module_records;
 pub mod native_abi;
+mod native_call_owners;
 pub mod native_function;
 pub mod number;
 pub mod object;
@@ -190,6 +192,8 @@ mod gc_invariants;
 #[cfg(test)]
 mod test_support;
 
+pub use active_frame::{ActiveFrameError, ActiveFrameMut, ActiveFrameRef, ActiveFrameStorage};
+pub use arithmetic_dispatch::NumericRuntimeOp;
 pub use cpu_profile::CpuProfile;
 pub use execution_context::ExecutionContext;
 pub use frame_state::{
@@ -197,13 +201,13 @@ pub use frame_state::{
     PendingIteratorNext, PendingToPrimitive, ToPrimitiveStage, TryHandler,
 };
 pub use jit_exception_ops::JitExceptionOutcome;
+pub use jit_runtime_ops::{UnaryCoercionOp, UnaryPrimitiveHint};
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
 
-use crate::holt_stack::HoltCallReservation;
 #[cfg(test)]
 use otter_bytecode::ArgumentsObjectKind;
 use otter_bytecode::{BytecodeModule, Op};
@@ -231,11 +235,11 @@ pub use handles::{HandleArena, HandleScope, Scoped};
 pub use holt_stack::HoltStack;
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
-    JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitCodeResidency, JitCollectionAllocMethod,
-    JitCollectionLayout, JitCollectionLeafMethod, JitCompileError, JitCompileRequest,
-    JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome, JitFunctionCode,
-    JitInlineCallee, JitInlineMethod, JitInstructionMetadata, JitPrimitiveMethodGuard,
-    JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
+    JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitClosureCallLayout, JitCodeResidency,
+    JitCollectionAllocMethod, JitCollectionLayout, JitCollectionLeafMethod, JitCompileError,
+    JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
+    JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
+    JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -244,7 +248,7 @@ pub use js_surface::{
 };
 pub use microtask::{Microtask, MicrotaskError, MicrotaskKind, MicrotaskQueue};
 pub use native_abi::{
-    FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrameFlags, NativeFrameKind,
+    FrameStateId, NO_FRAME_STATE, NO_SAFEPOINT, NativeFrame, NativeFrameFlags, NativeFrameKind,
     RuntimeStubAllocContext, RuntimeStubClass, RuntimeStubDescriptor, RuntimeStubId,
     RuntimeStubResult, RuntimeStubResultPair, RuntimeStubStatus, STUB_COLLECTION_MAP_DELETE_ALLOC,
     STUB_COLLECTION_MAP_GET_ALLOC, STUB_COLLECTION_MAP_GET_LEAF, STUB_COLLECTION_MAP_HAS_ALLOC,
@@ -982,23 +986,9 @@ pub struct Interpreter {
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
     /// Next unique code-object identity handed to a compile request.
     jit_next_code_object_id: u64,
-    /// Stable isolate-owned descriptor-indexed runtime entries, typed per
-    /// signature family. VM-owned entries are installed at construction;
-    /// JIT-owned transitions at [`Interpreter::set_jit_compiler`].
-    jit_runtime_stub_entries: Box<[runtime_stubs::RuntimeStubEntry]>,
-    /// Machine-visible address column derived from the typed entries.
-    jit_runtime_stub_machine_entries: Box<[u64]>,
-    /// Published C-layout header over the machine entry column.
-    jit_runtime_stub_table: native_abi::RuntimeStubTable,
-    /// Pool of reservation-stable [`HoltStack`]s reused for synchronous callable
-    /// re-entry (Array / collection callbacks, comparators, sync `@@iterator`
-    /// drives). Every re-entry needs a stack whose frames never move, so a
-    /// compiled callee can append its frame directly onto it and re-enter without
-    /// dangling the caller's in-register frame pointer. Each stack reserves
-    /// `DEFAULT_MAX_STACK_DEPTH` frames, which would `malloc` that reservation per
-    /// re-entry; recycling cleared stacks here makes the hot callback path
-    /// allocation-free. Drawn by [`Self::draw_stack`], returned by
-    /// [`Self::return_stack`].
+    /// Pool of materialized frame vectors reused for synchronous callable
+    /// re-entry. Reuse retains only capacity actually reached by prior calls;
+    /// no stack pre-reserves the maximum call depth.
     holt_pool: Vec<HoltStack>,
     /// Flat register stack for JIT-built callee windows. Compiled code sets up a
     /// direct call by bumping `reg_top`, writing the callee's window into
@@ -1006,6 +996,10 @@ pub struct Interpreter {
     /// VM-owned native register arena. Its published prefix is a precise GC
     /// root set for in-flight compiled call windows.
     register_stack: register_stack::RegisterStack,
+    /// LIFO ownership of frameless compiled callees. A hot direct call retains
+    /// only its register window and upvalue spine here; no interpreter frame or
+    /// parent `HoltStack` entry is constructed unless that callee bails.
+    native_call_owners: native_call_owners::NativeCallOwnerStack,
     /// Fixed VM-owned descriptors for native JIT contexts whose scalar binding
     /// slots must stay visible to a moving collection across safepoints.
     jit_native_activations: Vec<jit::JitNativeActivation>,

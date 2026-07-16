@@ -6,6 +6,9 @@
 //! to shrink without changing VM behavior.
 //!
 //! # Contents
+//! - [`NumericRuntimeOp`] — fully decoded numeric slow-path requests shared by
+//!   native tiers.
+//! - Value-in/value-out arithmetic kernels independent of frame storage.
 //! - Register-based binary numeric dispatch.
 //! - `+` string-or-numeric dispatch.
 //! - Relational comparison dispatch.
@@ -14,6 +17,10 @@
 //! # Invariants
 //! - Inputs are already compiler-lowered through the required ToPrimitive
 //!   opcodes before reaching these helpers.
+//! - Raw opcode integers are decoded into [`NumericRuntimeOp`] at the native
+//!   ABI boundary; semantic kernels never inspect an untyped opcode.
+//! - Generic `+` roots both operands and allocated string intermediates in a
+//!   handle scope before any moving-GC allocation.
 //! - Mixed Number/BigInt arithmetic is rejected with `TypeMismatch`.
 //! - BigInt ops here operate on owned [`num_bigint::BigInt`] values
 //!   (already cloned out of the GC body by
@@ -43,6 +50,154 @@ pub(crate) type BigIntBinop = fn(
     &num_bigint::BigInt,
 ) -> Result<num_bigint::BigInt, bigint::ops::OpError>;
 
+/// Fully decoded numeric-family operation requested by native code.
+///
+/// Binary variants carry a checked register identity and update-expression
+/// variants carry the signed delta. This prevents raw opcode or overloaded
+/// integer operands from crossing the native ABI into VM semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericRuntimeOp {
+    /// Numeric or BigInt subtraction.
+    Sub {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt multiplication.
+    Mul {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt division.
+    Div {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt remainder.
+    Rem {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt exponentiation.
+    Pow {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt bitwise AND.
+    BitwiseAnd {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt bitwise OR.
+    BitwiseOr {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Numeric or BigInt bitwise XOR.
+    BitwiseXor {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Arithmetic left shift.
+    Shl {
+        /// Shift-count register.
+        rhs: u16,
+    },
+    /// Arithmetic right shift.
+    Shr {
+        /// Shift-count register.
+        rhs: u16,
+    },
+    /// Logical unsigned right shift.
+    Ushr {
+        /// Shift-count register.
+        rhs: u16,
+    },
+    /// Abstract less-than comparison.
+    LessThan {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Abstract less-than-or-equal comparison.
+    LessEq {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Abstract greater-than comparison.
+    GreaterThan {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Abstract greater-than-or-equal comparison.
+    GreaterEq {
+        /// Right-operand register.
+        rhs: u16,
+    },
+    /// Unary numeric negation.
+    Neg,
+    /// Unary numeric bitwise complement.
+    BitwiseNot,
+    /// Update-expression numeric step.
+    Increment {
+        /// Signed step applied after numeric coercion.
+        delta: i32,
+    },
+}
+
+impl NumericRuntimeOp {
+    /// Decode the two overloaded machine words used by the numeric runtime
+    /// descriptor. This is intentionally the only raw-opcode decoder.
+    pub fn decode_abi(opcode: u64, rhs_or_delta: u64) -> Result<Self, VmError> {
+        let opcode = u8::try_from(opcode).map_err(|_| VmError::InvalidOperand)?;
+        let rhs = || u16::try_from(rhs_or_delta).map_err(|_| VmError::InvalidOperand);
+        match opcode {
+            x if x == Op::Sub as u8 => Ok(Self::Sub { rhs: rhs()? }),
+            x if x == Op::Mul as u8 => Ok(Self::Mul { rhs: rhs()? }),
+            x if x == Op::Div as u8 => Ok(Self::Div { rhs: rhs()? }),
+            x if x == Op::Rem as u8 => Ok(Self::Rem { rhs: rhs()? }),
+            x if x == Op::Pow as u8 => Ok(Self::Pow { rhs: rhs()? }),
+            x if x == Op::BitwiseAnd as u8 => Ok(Self::BitwiseAnd { rhs: rhs()? }),
+            x if x == Op::BitwiseOr as u8 => Ok(Self::BitwiseOr { rhs: rhs()? }),
+            x if x == Op::BitwiseXor as u8 => Ok(Self::BitwiseXor { rhs: rhs()? }),
+            x if x == Op::Shl as u8 => Ok(Self::Shl { rhs: rhs()? }),
+            x if x == Op::Shr as u8 => Ok(Self::Shr { rhs: rhs()? }),
+            x if x == Op::Ushr as u8 => Ok(Self::Ushr { rhs: rhs()? }),
+            x if x == Op::LessThan as u8 => Ok(Self::LessThan { rhs: rhs()? }),
+            x if x == Op::LessEq as u8 => Ok(Self::LessEq { rhs: rhs()? }),
+            x if x == Op::GreaterThan as u8 => Ok(Self::GreaterThan { rhs: rhs()? }),
+            x if x == Op::GreaterEq as u8 => Ok(Self::GreaterEq { rhs: rhs()? }),
+            x if x == Op::Neg as u8 => Ok(Self::Neg),
+            x if x == Op::BitwiseNot as u8 => Ok(Self::BitwiseNot),
+            x if x == Op::Increment as u8 => Ok(Self::Increment {
+                delta: rhs_or_delta as u32 as i32,
+            }),
+            _ => Err(VmError::InvalidOperand),
+        }
+    }
+
+    /// Register read as the right operand, absent for unary/update operations.
+    #[must_use]
+    pub const fn rhs_register(self) -> Option<u16> {
+        match self {
+            Self::Sub { rhs }
+            | Self::Mul { rhs }
+            | Self::Div { rhs }
+            | Self::Rem { rhs }
+            | Self::Pow { rhs }
+            | Self::BitwiseAnd { rhs }
+            | Self::BitwiseOr { rhs }
+            | Self::BitwiseXor { rhs }
+            | Self::Shl { rhs }
+            | Self::Shr { rhs }
+            | Self::Ushr { rhs }
+            | Self::LessThan { rhs }
+            | Self::LessEq { rhs }
+            | Self::GreaterThan { rhs }
+            | Self::GreaterEq { rhs } => Some(rhs),
+            Self::Neg | Self::BitwiseNot | Self::Increment { .. } => None,
+        }
+    }
+}
+
 impl Interpreter {
     pub(crate) fn run_numeric_regs(
         &mut self,
@@ -58,7 +213,8 @@ impl Interpreter {
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        run_numeric_values(self, frame, dst, lhs, rhs, op, bigint_op)
+        let result = numeric_binary_value(self, lhs, rhs, op, bigint_op)?;
+        commit_frame_result(frame, dst, result)
     }
 
     pub(crate) fn run_add_regs(
@@ -73,56 +229,70 @@ impl Interpreter {
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        self.run_add_values(frame, dst, lhs, rhs)
+        let result = self.add_value(lhs, rhs)?;
+        commit_frame_result(frame, dst, result)
     }
 
-    fn run_add_values(
-        &mut self,
-        frame: &mut Frame,
-        dst: u16,
-        lhs: Value,
-        rhs: Value,
-    ) -> Result<(), VmError> {
-        // §13.15.4 ApplyStringOrNumericBinaryOperator for `+`:
-        // already-primitive operands enter here (the compiler emits
-        // `Op::ToPrimitive(default)` ahead of `Op::Add`). If either
-        // primitive is a String, concatenate; otherwise apply ToNumeric
-        // to each primitive and fold via the numeric / BigInt rules.
-        let result = if lhs.is_string() || rhs.is_string() {
-            if let Some(fast) = self.try_concat_string_int32(lhs, rhs) {
-                fast?
+    /// Evaluate `+` without coupling its observable semantics to frame storage.
+    pub(crate) fn add_value(&mut self, lhs: Value, rhs: Value) -> Result<Value, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let lhs = interp.scoped_value(scope, lhs);
+            let rhs = interp.scoped_value(scope, rhs);
+            let lhs_value = interp.escape_scoped(lhs);
+            let rhs_value = interp.escape_scoped(rhs);
+
+            // §13.15.4 ApplyStringOrNumericBinaryOperator for `+`:
+            // already-primitive operands enter here (the compiler emits
+            // `Op::ToPrimitive(default)` ahead of `Op::Add`). If either
+            // primitive is a String, concatenate; otherwise apply ToNumeric
+            // to each primitive and fold via the numeric / BigInt rules.
+            if lhs_value.is_string() || rhs_value.is_string() {
+                if let Some(fast) = interp.try_concat_string_int32(lhs_value, rhs_value) {
+                    return fast.map_err(oom_to_vm);
+                }
+
+                let lhs_string = interp.js_string_for_concat(lhs_value)?;
+                let lhs_string = interp.scoped_value(scope, Value::string(lhs_string));
+                let rhs_value = interp.escape_scoped(rhs);
+                let rhs_string = interp.js_string_for_concat(rhs_value)?;
+                let rhs_string = interp.scoped_value(scope, Value::string(rhs_string));
+                let lhs_string = interp
+                    .escape_scoped(lhs_string)
+                    .as_string(&interp.gc_heap)
+                    .ok_or(VmError::TypeMismatch)?;
+                let rhs_string = interp
+                    .escape_scoped(rhs_string)
+                    .as_string(&interp.gc_heap)
+                    .ok_or(VmError::TypeMismatch)?;
+                Ok(Value::string(JsString::concat(
+                    lhs_string,
+                    rhs_string,
+                    interp.gc_heap_mut(),
+                )?))
             } else {
-                let l_str = self.js_string_for_concat(lhs)?;
-                let r_str = self.js_string_for_concat(rhs)?;
-                Value::string(JsString::concat(l_str, r_str, self.gc_heap_mut())?)
-            }
-        } else {
-            let lk =
-                abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
-            let rk =
-                abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
-            match (lk, rk) {
-                (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-                    Value::number(number::add(a, b))
-                }
-                (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-                    let sum = bigint::ops::add(&a, &b);
-                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
-                        .map_err(oom_to_vm)?;
-                    Value::big_int(handle)
-                }
-                // §6.1.6.2 Numeric Type Conversion forbids mixing
-                // Number and BigInt operands without an explicit
-                // coercion — raise a TypeError per §13.15.4 step 1.b.
-                (abstract_ops::NumericKind::Num(_), abstract_ops::NumericKind::Big(_))
-                | (abstract_ops::NumericKind::Big(_), abstract_ops::NumericKind::Num(_)) => {
-                    return Err(VmError::TypeMismatch);
+                let lhs_numeric = abstract_ops::to_numeric_kind(&lhs_value, &interp.gc_heap)
+                    .ok_or(VmError::TypeMismatch)?;
+                let rhs_numeric = abstract_ops::to_numeric_kind(&rhs_value, &interp.gc_heap)
+                    .ok_or(VmError::TypeMismatch)?;
+                match (lhs_numeric, rhs_numeric) {
+                    (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
+                        Ok(Value::number(number::add(a, b)))
+                    }
+                    (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
+                        let sum = bigint::ops::add(&a, &b);
+                        let handle = bigint::BigIntValue::from_inner(&mut interp.gc_heap, sum)
+                            .map_err(oom_to_vm)?;
+                        Ok(Value::big_int(handle))
+                    }
+                    // §6.1.6.2 Numeric Type Conversion forbids mixing
+                    // Number and BigInt operands without an explicit coercion.
+                    (abstract_ops::NumericKind::Num(_), abstract_ops::NumericKind::Big(_))
+                    | (abstract_ops::NumericKind::Big(_), abstract_ops::NumericKind::Num(_)) => {
+                        Err(VmError::TypeMismatch)
+                    }
                 }
             }
-        };
-        write_register(frame, dst, result)?;
-        frame.advance_pc()?;
-        Ok(())
+        })
     }
 
     pub(crate) fn run_compare_regs(
@@ -138,7 +308,8 @@ impl Interpreter {
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        run_compare_values(&self.gc_heap, frame, dst, lhs, rhs, op)
+        let result = compare_value(&self.gc_heap, lhs, rhs, op)?;
+        commit_frame_result(frame, dst, result)
     }
 
     pub(crate) fn run_ushr_regs(
@@ -153,17 +324,8 @@ impl Interpreter {
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
-        let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
-        let result = match (lk, rk) {
-            (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-                Value::number(number::shr_logical(a, b))
-            }
-            _ => return Err(VmError::TypeMismatch),
-        };
-        write_register(frame, dst, result)?;
-        frame.advance_pc()?;
-        Ok(())
+        let result = ushr_value(&self.gc_heap, lhs, rhs)?;
+        commit_frame_result(frame, dst, result)
     }
 
     pub(crate) fn run_neg_regs(
@@ -172,20 +334,9 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let v = *read_register(frame, src)?;
-        let value =
-            match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
-                abstract_ops::NumericKind::Num(n) => Value::number(number::neg(n)),
-                abstract_ops::NumericKind::Big(b) => {
-                    let neg = bigint::ops::neg(&b);
-                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, neg)
-                        .map_err(oom_to_vm)?;
-                    Value::big_int(handle)
-                }
-            };
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        let value = *read_register(frame, src)?;
+        let result = self.neg_value(value)?;
+        commit_frame_result(frame, dst, result)
     }
 
     pub(crate) fn run_bitwise_not_regs(
@@ -194,20 +345,9 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let v = *read_register(frame, src)?;
-        let value =
-            match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
-                abstract_ops::NumericKind::Num(n) => Value::number(number::bitwise_not(n)),
-                abstract_ops::NumericKind::Big(b) => {
-                    let notted = bigint::ops::bitwise_not(&b);
-                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, notted)
-                        .map_err(oom_to_vm)?;
-                    Value::big_int(handle)
-                }
-            };
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        let value = *read_register(frame, src)?;
+        let result = self.bitwise_not_value(value)?;
+        commit_frame_result(frame, dst, result)
     }
 
     /// Execute one update-expression numeric step through the same semantic
@@ -226,25 +366,127 @@ impl Interpreter {
         if let Some(feedback) = feedback {
             feedback.record_arith(value, Value::number_i32(delta));
         }
+        let result = self.increment_value(context, value, delta)?;
+        commit_frame_result(frame, dst, result)
+    }
+
+    /// Evaluate one decoded native numeric request from already-read values.
+    ///
+    /// `rhs` is required exactly for variants carrying a right-hand register.
+    /// The operation returns its value without advancing or otherwise mutating
+    /// frame state, so materialized and native register windows share it.
+    pub(crate) fn numeric_runtime_value(
+        &mut self,
+        context: &crate::execution_context::ExecutionContext,
+        operation: NumericRuntimeOp,
+        lhs: Value,
+        rhs: Option<Value>,
+    ) -> Result<Value, VmError> {
+        let binary_rhs = || rhs.ok_or(VmError::InvalidOperand);
+        match operation {
+            NumericRuntimeOp::Sub { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::sub, bigint_sub_op)
+            }
+            NumericRuntimeOp::Mul { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::mul, bigint_mul_op)
+            }
+            NumericRuntimeOp::Div { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::div, bigint::ops::div)
+            }
+            NumericRuntimeOp::Rem { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::rem, bigint::ops::rem)
+            }
+            NumericRuntimeOp::Pow { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::pow, bigint::ops::pow)
+            }
+            NumericRuntimeOp::BitwiseAnd { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::bitwise_and, bigint_and_op)
+            }
+            NumericRuntimeOp::BitwiseOr { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::bitwise_or, bigint_or_op)
+            }
+            NumericRuntimeOp::BitwiseXor { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::bitwise_xor, bigint_xor_op)
+            }
+            NumericRuntimeOp::Shl { .. } => {
+                numeric_binary_value(self, lhs, binary_rhs()?, number::shl, bigint::ops::shl)
+            }
+            NumericRuntimeOp::Shr { .. } => numeric_binary_value(
+                self,
+                lhs,
+                binary_rhs()?,
+                number::shr_arith,
+                bigint::ops::shr,
+            ),
+            NumericRuntimeOp::Ushr { .. } => ushr_value(&self.gc_heap, lhs, binary_rhs()?),
+            NumericRuntimeOp::LessThan { .. } => {
+                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::LessThan)
+            }
+            NumericRuntimeOp::LessEq { .. } => {
+                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::LessEq)
+            }
+            NumericRuntimeOp::GreaterThan { .. } => {
+                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::GreaterThan)
+            }
+            NumericRuntimeOp::GreaterEq { .. } => {
+                compare_value(&self.gc_heap, lhs, binary_rhs()?, Op::GreaterEq)
+            }
+            NumericRuntimeOp::Neg => self.neg_value(lhs),
+            NumericRuntimeOp::BitwiseNot => self.bitwise_not_value(lhs),
+            NumericRuntimeOp::Increment { delta } => self.increment_value(context, lhs, delta),
+        }
+    }
+
+    pub(crate) fn neg_value(&mut self, value: Value) -> Result<Value, VmError> {
+        match abstract_ops::to_numeric_kind(&value, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+            abstract_ops::NumericKind::Num(number_value) => {
+                Ok(Value::number(number::neg(number_value)))
+            }
+            abstract_ops::NumericKind::Big(big) => {
+                let negated = bigint::ops::neg(&big);
+                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, negated)
+                    .map_err(oom_to_vm)?;
+                Ok(Value::big_int(handle))
+            }
+        }
+    }
+
+    fn bitwise_not_value(&mut self, value: Value) -> Result<Value, VmError> {
+        match abstract_ops::to_numeric_kind(&value, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+            abstract_ops::NumericKind::Num(number_value) => {
+                Ok(Value::number(number::bitwise_not(number_value)))
+            }
+            abstract_ops::NumericKind::Big(big) => {
+                let inverted = bigint::ops::bitwise_not(&big);
+                let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, inverted)
+                    .map_err(oom_to_vm)?;
+                Ok(Value::big_int(handle))
+            }
+        }
+    }
+
+    fn increment_value(
+        &mut self,
+        context: &crate::execution_context::ExecutionContext,
+        value: Value,
+        delta: i32,
+    ) -> Result<Value, VmError> {
         let primitive =
             self.evaluate_to_primitive(context, &value, abstract_ops::ToPrimitiveHint::Number)?;
         let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
             .ok_or(VmError::TypeMismatch)?;
-        let next = match kind {
-            abstract_ops::NumericKind::Num(n) => {
-                Value::number(NumberValue::from_f64(n.as_f64() + f64::from(delta)))
-            }
-            abstract_ops::NumericKind::Big(b) => {
+        match kind {
+            abstract_ops::NumericKind::Num(number_value) => Ok(Value::number(
+                NumberValue::from_f64(number_value.as_f64() + f64::from(delta)),
+            )),
+            abstract_ops::NumericKind::Big(big) => {
                 let delta_big = num_bigint::BigInt::from(delta);
-                let sum = bigint::ops::add(&b, &delta_big);
+                let sum = bigint::ops::add(&big, &delta_big);
                 let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
                     .map_err(|_| VmError::TypeMismatch)?;
-                Value::big_int(handle)
+                Ok(Value::big_int(handle))
             }
-        };
-        write_register(frame, dst, next)?;
-        frame.advance_pc()?;
-        Ok(())
+        }
     }
 
     pub(crate) fn run_equal_regs(
@@ -372,44 +614,48 @@ fn binop_values(
     Ok((dst, l, r))
 }
 
-fn run_numeric_values(
+fn numeric_binary_value(
     interp: &mut Interpreter,
-    frame: &mut Frame,
-    dst: u16,
     lhs: Value,
     rhs: Value,
     op: fn(NumberValue, NumberValue) -> NumberValue,
     bigint_op: BigIntBinop,
-) -> Result<(), VmError> {
+) -> Result<Value, VmError> {
     let lnum =
         abstract_ops::to_numeric_kind(&lhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
     let rnum =
         abstract_ops::to_numeric_kind(&rhs, interp.gc_heap()).ok_or(VmError::TypeMismatch)?;
-    let result = match (lnum, rnum) {
+    match (lnum, rnum) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-            Value::number(op(a, b))
+            Ok(Value::number(op(a, b)))
         }
         (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
             let folded = bigint_op(&a, &b).map_err(|err| bigint_to_vm_error(interp, err))?;
             let handle =
                 bigint::BigIntValue::from_inner(interp.gc_heap_mut(), folded).map_err(oom_to_vm)?;
-            Value::big_int(handle)
+            Ok(Value::big_int(handle))
         }
-        _ => return Err(VmError::TypeMismatch),
-    };
-    write_register(frame, dst, result)?;
-    frame.advance_pc()?;
-    Ok(())
+        _ => Err(VmError::TypeMismatch),
+    }
 }
 
-fn run_compare_values(
+fn ushr_value(heap: &otter_gc::GcHeap, lhs: Value, rhs: Value) -> Result<Value, VmError> {
+    let lhs = abstract_ops::to_numeric_kind(&lhs, heap).ok_or(VmError::TypeMismatch)?;
+    let rhs = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
+    match (lhs, rhs) {
+        (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
+            Ok(Value::number(number::shr_logical(a, b)))
+        }
+        _ => Err(VmError::TypeMismatch),
+    }
+}
+
+fn compare_value(
     heap: &otter_gc::GcHeap,
-    frame: &mut Frame,
-    dst: u16,
     lhs: Value,
     rhs: Value,
     op: Op,
-) -> Result<(), VmError> {
+) -> Result<Value, VmError> {
     // §7.2.14 step 3.b — relational comparison applies ToNumeric
     // after ToPrimitive(number). Symbols cannot be converted to a
     // numeric value, so all four relational operators throw.
@@ -435,7 +681,11 @@ fn run_compare_values(
         ),
         _ => unreachable!("run_compare_values called with non-relational op"),
     };
-    write_register(frame, dst, Value::boolean(truthy))?;
+    Ok(Value::boolean(truthy))
+}
+
+fn commit_frame_result(frame: &mut Frame, dst: u16, result: Value) -> Result<(), VmError> {
+    write_register(frame, dst, result)?;
     frame.advance_pc()?;
     Ok(())
 }
@@ -485,4 +735,103 @@ fn bigint_to_vm_error(interp: &Interpreter, err: bigint::ops::OpError) -> VmErro
         bigint::ops::OpError::ShiftOutOfRange => "Maximum BigInt size exceeded",
     };
     interp.err_range((message.to_string()).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_context() -> crate::ExecutionContext {
+        crate::ExecutionContext::from_module(crate::BytecodeModule {
+            module: "numeric-runtime-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: otter_bytecode::SourceKind::TypeScript,
+            functions: Vec::new(),
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn numeric_runtime_op_decodes_binary_and_signed_update_operands() {
+        assert_eq!(
+            NumericRuntimeOp::decode_abi(Op::Sub as u64, 41).expect("binary opcode"),
+            NumericRuntimeOp::Sub { rhs: 41 }
+        );
+        assert_eq!(
+            NumericRuntimeOp::decode_abi(Op::Increment as u64, u32::MAX.into())
+                .expect("signed update opcode"),
+            NumericRuntimeOp::Increment { delta: -1 }
+        );
+    }
+
+    #[test]
+    fn numeric_runtime_op_rejects_non_numeric_and_unrepresentable_operands() {
+        assert!(matches!(
+            NumericRuntimeOp::decode_abi(Op::Add as u64, 0),
+            Err(VmError::InvalidOperand)
+        ));
+        assert!(matches!(
+            NumericRuntimeOp::decode_abi(Op::Sub as u64, u64::from(u16::MAX) + 1),
+            Err(VmError::InvalidOperand)
+        ));
+        assert!(matches!(
+            NumericRuntimeOp::decode_abi(u64::from(u8::MAX) + 1, 0),
+            Err(VmError::InvalidOperand)
+        ));
+    }
+
+    #[test]
+    fn typed_numeric_runtime_dispatch_returns_values_without_frame_state() {
+        let context = empty_context();
+        let mut interp = Interpreter::new();
+
+        let difference = interp
+            .numeric_runtime_value(
+                &context,
+                NumericRuntimeOp::Sub { rhs: 1 },
+                Value::number_i32(9),
+                Some(Value::number_i32(4)),
+            )
+            .expect("number subtraction");
+        assert_eq!(difference, Value::number_i32(5));
+
+        let comparison = interp
+            .numeric_runtime_value(
+                &context,
+                NumericRuntimeOp::LessThan { rhs: 1 },
+                Value::number_i32(4),
+                Some(Value::number_i32(9)),
+            )
+            .expect("number comparison");
+        assert_eq!(comparison, Value::boolean(true));
+
+        assert!(matches!(
+            interp.numeric_runtime_value(
+                &context,
+                NumericRuntimeOp::Mul { rhs: 1 },
+                Value::number_i32(3),
+                None,
+            ),
+            Err(VmError::InvalidOperand)
+        ));
+    }
+
+    #[test]
+    fn add_kernel_roots_string_operands_without_frame_storage() {
+        let mut interp = Interpreter::new();
+        let lhs_text = "rooted-string-value-that-is-longer-than-inline-";
+        let lhs = Value::string(
+            JsString::from_str(lhs_text, interp.gc_heap_mut()).expect("left string allocation"),
+        );
+        let result = interp
+            .add_value(lhs, Value::number_i32(7))
+            .expect("string addition");
+        let text = result
+            .as_string(interp.gc_heap())
+            .expect("string result")
+            .to_lossy_string(interp.gc_heap());
+        assert_eq!(text, format!("{lhs_text}7"));
+    }
 }

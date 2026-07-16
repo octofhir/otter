@@ -3,27 +3,32 @@
 //! # Contents
 //! - Propagated-throw resumption in live compiled callers.
 //! - Reentrant construction and closure/function creation.
-//! - Reentrant equality, numeric-family, and unary-coercion completion.
+//! - Reentrant equality, typed numeric-family, and unary-coercion completion.
 //! - Cooperative backedge polling.
 //!
 //! # Invariants
-//! Every entry receives a live JIT context whose frame/register roots are
-//! published for the entire call. Errors are parked in the shared context slot.
+//! Every entry receives a live JIT context whose canonical
+//! [`NativeFrame`](otter_vm::native_abi::NativeFrame) publishes frame/register
+//! roots for the entire call. Raw numeric opcodes and unary-coercion modes are
+//! decoded exactly once at this ABI edge; coercion hint constants are resolved
+//! through the canonical frame owner before VM semantics receive typed
+//! requests. Errors are parked in the shared context slot.
 //!
 //! # See also
 //! - `super::super::abi` — machine-visible entry context.
 //! - `super::calls` — plain/method-call adapters and direct-call lifecycle.
 
-use otter_vm::{JitExceptionOutcome, VmError};
-
-use super::super::{
-    JitCtx, JitRet, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED, STATUS_THREW,
+use otter_vm::{
+    JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, VmError,
 };
+
+use super::super::{JitCtx, JitRet, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED, STATUS_THREW};
+use super::decode_register;
 
 pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
     // SAFETY: every `JitCtx` is built with an initialized error slot that lives
-    // for the compiled entry's dynamic extent; nested direct-call contexts copy
-    // the same pointer.
+    // for the compiled entry's dynamic extent; nested direct calls reuse the
+    // same context and slot.
     unsafe {
         *ctx.error = Some(err);
     }
@@ -39,11 +44,17 @@ pub(super) fn try_resume_caller_throw(
     if !is_uncaught {
         return Ok(false);
     }
+    let Ok(frame_index) = ctx.materialized_frame_index() else {
+        // A frameless caller has no interpreter handler stack yet. Preserve
+        // the original throw so the enclosing native-call edge can propagate
+        // or materialize it without replacing it with InvalidOperand.
+        return Ok(false);
+    };
     let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
     let vm = unsafe { &mut *activation.vm_ptr() };
     let context = unsafe { &*activation.context_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
-    let Some(pc) = vm.jit_resume_caller_throw(context, stack, ctx.frame_index)? else {
+    let Some(pc) = vm.jit_resume_caller_throw(context, stack, frame_index)? else {
         return Ok(false);
     };
     // SAFETY: runtime-capable JIT contexts always publish the current native
@@ -56,12 +67,14 @@ pub(super) fn try_resume_caller_throw(
 /// Convert an interpreter-style catchable VM error into its JavaScript error
 /// object and publish the selected catch/finally continuation when present.
 fn try_materialize_compiled_error(ctx: &mut JitCtx, err: VmError) -> Result<bool, VmError> {
+    let Ok(frame_index) = ctx.materialized_frame_index() else {
+        return Ok(false);
+    };
     let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
     let vm = unsafe { &mut *activation.vm_ptr() };
     let context = unsafe { &*activation.context_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
-    let Some(pc) = vm.jit_materialize_error_from_compiled(context, stack, ctx.frame_index, err)?
-    else {
+    let Some(pc) = vm.jit_materialize_error_from_compiled(context, stack, frame_index, err)? else {
         return Ok(false);
     };
     // SAFETY: runtime-capable JIT contexts publish this native frame for the
@@ -154,18 +167,19 @@ pub(crate) extern "C" fn jit_exception_op_stub(
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => {
+            return JitRet {
+                value: 0,
+                status: STATUS_BAILED,
+            };
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_exception_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_exception_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(JitExceptionOutcome::Continue) => JitRet {
             value: 0,
             status: STATUS_CONTINUE,
@@ -201,21 +215,17 @@ pub(crate) extern "C" fn jit_iterator_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_iterator_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_iterator_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -237,6 +247,10 @@ pub(crate) extern "C" fn jit_static_call_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
@@ -246,7 +260,7 @@ pub(crate) extern "C" fn jit_static_call_op_stub(
     match vm.jit_runtime_static_call_op(
         context,
         stack,
-        ctx.frame_index,
+        frame_index,
         opcode as u8,
         packed_head,
         method,
@@ -273,21 +287,17 @@ pub(crate) extern "C" fn jit_control_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_control_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_control_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -309,21 +319,18 @@ pub(crate) extern "C" fn jit_spread_call_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_spread_call_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_spread_call_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
+    {
         Ok(()) => 0,
         Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
             Ok(true) => STATUS_BAILED,
@@ -351,21 +358,18 @@ pub(crate) extern "C" fn jit_class_value_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_class_value_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_class_value_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
+    {
         Ok(()) => 0,
         Err(err) => {
             let materialized = if matches!(err, VmError::Uncaught) {
@@ -399,21 +403,17 @@ pub(crate) extern "C" fn jit_module_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_module_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_module_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             let materialized = if matches!(err, VmError::Uncaught) {
@@ -449,6 +449,10 @@ pub(crate) extern "C" fn jit_variadic_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
@@ -458,7 +462,7 @@ pub(crate) extern "C" fn jit_variadic_op_stub(
     match vm.jit_runtime_variadic_op(
         context,
         stack,
-        ctx.frame_index,
+        frame_index,
         opcode as u8,
         prefix,
         count,
@@ -485,21 +489,17 @@ pub(crate) extern "C" fn jit_class_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_class_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_class_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -521,13 +521,17 @@ pub(crate) extern "C" fn jit_structural_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_structural_op(context, stack, ctx.frame_index, opcode as u8, arg0, arg1) {
+    match vm.jit_runtime_structural_op(context, stack, frame_index, opcode as u8, arg0, arg1) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -549,21 +553,17 @@ pub(crate) extern "C" fn jit_construct_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_construct_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_construct_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -585,21 +585,18 @@ pub(crate) extern "C" fn jit_value_load_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_value_load_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_value_load_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2)
+    {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -621,21 +618,17 @@ pub(crate) extern "C" fn jit_private_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_private_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_private_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -657,21 +650,17 @@ pub(crate) extern "C" fn jit_super_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_super_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_super_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -694,21 +683,17 @@ pub(crate) extern "C" fn jit_scalar_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_scalar_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_scalar_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -730,21 +715,17 @@ pub(crate) extern "C" fn jit_delete_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_delete_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_delete_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -766,6 +747,10 @@ pub(crate) extern "C" fn jit_object_protocol_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
@@ -775,7 +760,7 @@ pub(crate) extern "C" fn jit_object_protocol_op_stub(
     match vm.jit_runtime_object_protocol_op(
         context,
         stack,
-        ctx.frame_index,
+        frame_index,
         opcode as u8,
         arg0,
         arg1,
@@ -803,21 +788,17 @@ pub(crate) extern "C" fn jit_global_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_global_op(
-        context,
-        stack,
-        ctx.frame_index,
-        opcode as u8,
-        arg0,
-        arg1,
-        arg2,
-    ) {
+    match vm.jit_runtime_global_op(context, stack, frame_index, opcode as u8, arg0, arg1, arg2) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -840,13 +821,17 @@ pub(crate) extern "C" fn jit_bind_function_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return STATUS_BAILED,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return STATUS_BAILED;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_bind_function(context, stack, ctx.frame_index, packed_meta, packed_args) {
+    match vm.jit_runtime_bind_function(context, stack, frame_index, packed_meta, packed_args) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -868,6 +853,13 @@ pub(crate) extern "C" fn jit_construct_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let regs = match ctx.register_base() {
+        Ok(regs) => regs,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let Some(activation) = ctx.checked_activation() else {
         return 2;
     };
@@ -875,13 +867,7 @@ pub(crate) extern "C" fn jit_construct_stub(
     let context = unsafe { &*activation.context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    match vm.jit_runtime_construct_in_place(
-        context,
-        dst as u16,
-        callee as u16,
-        args,
-        ctx.regs.cast::<otter_vm::Value>(),
-    ) {
+    match vm.jit_runtime_construct_in_place(context, dst as u16, callee as u16, args, regs) {
         Ok(true) => 0,
         Ok(false) => 2,
         Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
@@ -910,6 +896,13 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let regs = match ctx.register_base() {
+        Ok(regs) => regs,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let Some(activation) = ctx.checked_activation() else {
         return 2;
     };
@@ -921,7 +914,7 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
         lhs as u16,
         rhs as u16,
         negate != 0,
-        ctx.regs.cast::<otter_vm::Value>(),
+        regs,
     ) {
         Ok(()) => 0,
         Err(err) => {
@@ -931,33 +924,70 @@ pub(crate) extern "C" fn jit_loose_eq_stub(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbiUnaryCoercion {
+    ToPrimitive { hint_index: u32 },
+    ToNumeric,
+}
+
+fn decode_unary_coercion(numeric: u64, hint_index: u64) -> Result<AbiUnaryCoercion, VmError> {
+    match numeric {
+        0 => Ok(AbiUnaryCoercion::ToPrimitive {
+            hint_index: u32::try_from(hint_index).map_err(|_| VmError::InvalidOperand)?,
+        }),
+        1 => Ok(AbiUnaryCoercion::ToNumeric),
+        _ => Err(VmError::InvalidOperand),
+    }
+}
+
+fn complete_unary_coercion(
+    ctx: &mut JitCtx,
+    dst: u16,
+    src: u16,
+    request: AbiUnaryCoercion,
+) -> Result<(), VmError> {
+    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
+    let vm_ptr = activation.vm_ptr();
+    let context_ptr = activation.context_ptr();
+    let mut frame = ctx.active_frame_mut()?;
+    let context = unsafe { &*context_ptr };
+    let operation = match request {
+        AbiUnaryCoercion::ToNumeric => UnaryCoercionOp::ToNumeric,
+        AbiUnaryCoercion::ToPrimitive { hint_index } => {
+            let token = context
+                .string_constant_str_for_function(frame.function_id(), hint_index)
+                .ok_or(VmError::InvalidOperand)?;
+            let hint = UnaryPrimitiveHint::from_token(token).ok_or(VmError::InvalidOperand)?;
+            UnaryCoercionOp::ToPrimitive { hint }
+        }
+    };
+    // SAFETY: the published activation retains both pointers for this compiled
+    // entry's dynamic extent. ActiveFrame performs copied reads and a final
+    // single-slot commit, with no exclusive register slice spanning coercion.
+    unsafe { &mut *vm_ptr }.jit_runtime_coerce_unary(context, &mut frame, dst, src, operation)
+}
+
 /// Complete one `ToPrimitive`/`ToNumeric` opcode in the VM. `0` means the
-/// destination was written, `1` means a coercion hook threw, and `2` is
-/// reserved for an isolate-less probe context with no published activation.
+/// destination was written and `1` means ABI decoding or coercion threw. A
+/// published canonical activation is part of the operation contract.
 pub(crate) extern "C" fn jit_coerce_unary_stub(
     ctx: *mut JitCtx,
     dst: u64,
     src: u64,
     numeric: u64,
     hint_index: u64,
-    function_id: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let Some(activation) = ctx.checked_activation() else {
-        return 2;
-    };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_coerce_unary_in_place(
-        context,
-        dst as u16,
-        src as u16,
-        numeric != 0,
-        hint_index as u32,
-        function_id as u32,
-        ctx.regs.cast::<otter_vm::Value>(),
-    ) {
+    let result = (|| {
+        complete_unary_coercion(
+            ctx,
+            decode_register(dst)?,
+            decode_register(src)?,
+            decode_unary_coercion(numeric, hint_index)?,
+        )
+    })();
+    match result {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -966,9 +996,33 @@ pub(crate) extern "C" fn jit_coerce_unary_stub(
     }
 }
 
+fn complete_numeric_op(
+    ctx: &mut JitCtx,
+    dst: u16,
+    lhs: u16,
+    operation: NumericRuntimeOp,
+) -> Result<(), VmError> {
+    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
+    let vm_ptr = activation.vm_ptr();
+    let context_ptr = activation.context_ptr();
+    let mut frame = ctx.active_frame_mut()?;
+    // SAFETY: the published activation retains both pointers for this compiled
+    // entry's dynamic extent. ActiveFrame retains raw validated windows and
+    // performs no long-lived register borrow across numeric execution.
+    unsafe { &mut *vm_ptr }.jit_runtime_numeric_op(
+        unsafe { &*context_ptr },
+        &mut frame,
+        dst,
+        lhs,
+        operation,
+    )
+}
+
 /// Complete one numeric-family opcode in the VM. `0` means the destination
-/// was committed, `1` means the operation threw, and `2` is reserved for an
-/// isolate-less compiled-entry probe where no VM activation exists.
+/// was committed and `1` means decoding or execution threw. Unlike the former
+/// adapter, this path has no isolate-less/HoltStack bailout mode: a published
+/// [`NativeFrame`](otter_vm::native_abi::NativeFrame) and VM activation are
+/// part of the runtime-op contract.
 pub(crate) extern "C" fn jit_numeric_op_stub(
     ctx: *mut JitCtx,
     dst: u64,
@@ -978,21 +1032,21 @@ pub(crate) extern "C" fn jit_numeric_op_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let Some(activation) = ctx.checked_activation() else {
-        return 2;
+    let decoded = (|| {
+        Ok((
+            decode_register(dst)?,
+            decode_register(lhs)?,
+            NumericRuntimeOp::decode_abi(opcode, rhs_or_delta)?,
+        ))
+    })();
+    let (dst, lhs, operation) = match decoded {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
     };
-    let vm = unsafe { &mut *activation.vm_ptr() };
-    let stack = unsafe { &mut *activation.stack_ptr() };
-    let context = unsafe { &*activation.context_ptr() };
-    match vm.jit_runtime_numeric_op(
-        context,
-        stack,
-        ctx.frame_index,
-        dst as u16,
-        lhs as u16,
-        rhs_or_delta,
-        opcode as u8,
-    ) {
+    match complete_numeric_op(ctx, dst, lhs, operation) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1006,10 +1060,17 @@ pub(crate) extern "C" fn jit_numeric_op_stub(
 pub(crate) extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_make_function(context, stack, ctx.frame_index, dst as u16, idx as u32) {
+    match vm.jit_runtime_make_function(context, stack, frame_index, dst as u16, idx as u32) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -1038,5 +1099,93 @@ pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
             park_jit_error(ctx, err);
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use otter_vm::{
+        Value,
+        native_abi::{NativeFrame, NativeFrameKind, VmFrameHeader, VmThread},
+    };
+
+    fn with_frameless_ctx(test: impl FnOnce(&mut JitCtx, &mut Option<VmError>)) {
+        let mut registers = [Value::undefined()];
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
+                function_id: 7,
+                code_block_id: 7,
+                pc: 0,
+                register_count: 1,
+                kind: NativeFrameKind::Baseline,
+                flags: Default::default(),
+            },
+            registers.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        frame.set_native_owner(41);
+        let mut thread = VmThread::empty();
+        thread.current_frame = std::ptr::addr_of_mut!(frame) as u64;
+        let mut error = None;
+        let mut ctx = JitCtx {
+            thread: std::ptr::addr_of_mut!(thread),
+            native_frame: std::ptr::addr_of_mut!(frame),
+            error: std::ptr::addr_of_mut!(error),
+            direct_call: std::mem::MaybeUninit::uninit(),
+            activation_base: std::ptr::null_mut(),
+            activation_top_ptr: std::ptr::null_mut(),
+            activation_limit: 0,
+        };
+        test(&mut ctx, &mut error);
+    }
+
+    #[test]
+    fn frameless_complex_transition_is_an_exact_pre_effect_bail() {
+        with_frameless_ctx(|ctx, error| {
+            let status = jit_iterator_op_stub(ctx, 0, 0, 0, 0);
+            assert_eq!(status, STATUS_BAILED);
+            assert!(error.is_none());
+            assert_eq!(ctx.native_owner_id(), Ok(41));
+        });
+    }
+
+    #[test]
+    fn frameless_throw_resolution_preserves_the_original_error() {
+        with_frameless_ctx(|ctx, error| {
+            *error = Some(VmError::InvalidOperand);
+            let status = jit_resolve_threw_stub(ctx);
+            assert_eq!(status, STATUS_THREW);
+            assert!(matches!(error, Some(VmError::InvalidOperand)));
+        });
+    }
+
+    #[test]
+    fn unary_coercion_mode_is_decoded_once_at_the_abi_edge() {
+        assert_eq!(
+            decode_unary_coercion(1, u64::MAX).expect("ToNumeric mode"),
+            AbiUnaryCoercion::ToNumeric
+        );
+        assert_eq!(
+            decode_unary_coercion(0, 12).expect("ToPrimitive mode"),
+            AbiUnaryCoercion::ToPrimitive { hint_index: 12 }
+        );
+    }
+
+    #[test]
+    fn unary_coercion_decoder_rejects_invalid_words() {
+        assert!(matches!(
+            decode_unary_coercion(2, 0),
+            Err(VmError::InvalidOperand)
+        ));
+        assert!(matches!(
+            decode_unary_coercion(0, u64::from(u32::MAX) + 1),
+            Err(VmError::InvalidOperand)
+        ));
+        assert!(matches!(
+            decode_register(u64::from(u16::MAX) + 1),
+            Err(VmError::InvalidOperand)
+        ));
     }
 }

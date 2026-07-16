@@ -77,8 +77,6 @@ pub enum TaggedLocationKind {
 pub struct TaggedLocation {
     /// Storage class.
     pub kind: TaggedLocationKind,
-    /// Reserved; zero in version 1.
-    pub reserved: u8,
     /// Register, frame-slot, or spill-slot index.
     pub index: u16,
 }
@@ -89,7 +87,6 @@ impl TaggedLocation {
     pub const fn frame_slot(index: u16) -> Self {
         Self {
             kind: TaggedLocationKind::FrameSlot,
-            reserved: 0,
             index,
         }
     }
@@ -99,7 +96,6 @@ impl TaggedLocation {
     pub const fn machine_register(index: u16) -> Self {
         Self {
             kind: TaggedLocationKind::MachineRegister,
-            reserved: 0,
             index,
         }
     }
@@ -109,7 +105,6 @@ impl TaggedLocation {
     pub const fn spill_slot(index: u16) -> Self {
         Self {
             kind: TaggedLocationKind::SpillSlot,
-            reserved: 0,
             index,
         }
     }
@@ -139,8 +134,6 @@ pub struct SpillMap {
     pub location_offset: u32,
     /// Number of tagged spill locations.
     pub location_count: u16,
-    /// Reserved; zero in version 1.
-    pub reserved: u16,
 }
 
 /// Machine-code return-PC safepoint entry.
@@ -161,8 +154,6 @@ pub struct SafepointEntry {
     pub frame_state_id: FrameStateId,
     /// Runtime stub invoked at this return PC.
     pub stub_id: RuntimeStubId,
-    /// Reserved; zero in version 1.
-    pub reserved: u32,
 }
 
 /// VM-owned expanded root map used by the current collector integration.
@@ -237,7 +228,7 @@ const _: [(); 16] = [(); std::mem::size_of::<CodeRegistryView>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeRegistryView>()];
 const _: [(); 12] = [(); std::mem::size_of::<FrameMap>()];
 const _: [(); 12] = [(); std::mem::size_of::<SpillMap>()];
-const _: [(); 32] = [(); std::mem::size_of::<SafepointEntry>()];
+const _: [(); 28] = [(); std::mem::size_of::<SafepointEntry>()];
 const _: [(); 4] = [(); std::mem::align_of::<SafepointEntry>()];
 const _: [(); 8] = [(); std::mem::offset_of!(SafepointEntry, logical_pc)];
 const _: [(); 24] = [(); std::mem::offset_of!(SafepointEntry, stub_id)];

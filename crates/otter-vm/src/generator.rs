@@ -178,20 +178,21 @@ impl JsGenerator {
         heap: &mut otter_gc::GcHeap,
         frame: ParkedFrameState,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        Self::new_with_prototype(heap, frame, None)
+        Self::new_with_prototype(heap, frame, None, None)
     }
 
-    /// Allocate a fresh generator over `frame` with the call-time
-    /// generator prototype.
+    /// Allocate a fresh generator over `frame` and its detached cold ownership
+    /// record, with the call-time generator prototype.
     pub fn new_with_prototype(
         heap: &mut otter_gc::GcHeap,
         frame: ParkedFrameState,
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
         prototype_override: Option<crate::Value>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(GeneratorBody {
                 frame: Some(Box::new(frame)),
-                cold: None,
+                cold,
                 resume_dst: 0,
                 done: false,
                 yielded: None,
@@ -439,12 +440,16 @@ impl JsGenerator {
         heap.with_payload(self.inner, |body| {
             body.done = true;
             body.frame = None;
+            body.cold = None;
         });
     }
 
     /// Clear the saved frame without marking done.
     pub fn clear_frame(&self, heap: &mut otter_gc::GcHeap) {
-        heap.with_payload(self.inner, |body| body.frame = None);
+        heap.with_payload(self.inner, |body| {
+            body.frame = None;
+            body.cold = None;
+        });
     }
 
     /// Read async-generator scheduling state.
@@ -505,13 +510,17 @@ impl JsGenerator {
         heap.read_payload(self.inner, |body| !body.async_requests.is_empty())
     }
 
-    /// Install the generator self-reference into the saved frame.
+    /// Install the generator self-reference into the saved frame's cold record.
+    /// Every generator needs the record, while ordinary sync frames never pay
+    /// for the backlink in their hot layout.
     pub fn install_owner_on_frame(&self, heap: &mut otter_gc::GcHeap) {
         heap.with_payload(self.inner, |body| {
-            if let Some(frame) = body.frame.as_mut() {
-                frame.generator_owner = Some(*self);
-            }
+            debug_assert!(body.frame.is_some(), "new generator must own a frame");
+            body.cold
+                .get_or_insert_with(|| Box::new(crate::cold_frame::ColdFrame::default()))
+                .generator_owner = Some(*self);
         });
+        heap.record_write(self.inner, &crate::Value::generator(*self));
     }
 }
 

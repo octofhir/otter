@@ -1,8 +1,8 @@
 //! Call-frame and pending-dispatch state for the VM interpreter.
 //!
 //! This module owns the data carried between dispatch-loop ticks: register
-//! windows, active try handlers, async/generator side state, and resumable
-//! protocol ladders such as ToPrimitive, bind metadata, and iterator stepping.
+//! windows and resumable dispatch state. Async/generator ownership, active try
+//! handlers, and protocol ladders live in the lazily attached cold record.
 //!
 //! # Contents
 //! - Active register windows and owned parked-frame snapshots.
@@ -18,12 +18,11 @@
 //! - Upvalue-spine construction traces both inherited and newly allocated cells
 //!   until the completed spine is attached to a published frame.
 //!
-//! # Frame ABI (frozen)
+//! # Frame execution layout
 //!
 //! The optimizing tier bakes constant displacements against a frame's register
-//! window and references the frame header by field, and the deopt frame-state
-//! record is keyed by these slots, so the following layout is a stable contract
-//! — change a literal only in lockstep with the codegen and the deopt record.
+//! window and references the frame header by field. VM and JIT consume the same
+//! current layout; there is no compatibility/versioned frame representation.
 //!
 //! - **Register window.** A frame's registers are a contiguous run of [`Value`]
 //!   slots. Register `r` lives at `window_base + r * size_of::<Value>()`; the
@@ -34,10 +33,10 @@
 //!   the callee window starting at register 0 before transferring control. The
 //!   prologue binds each into its local storage. Locals and scratch temporaries
 //!   occupy registers above the arguments.
-//! - **`this` / new.target are header fields, not window registers.** They live
-//!   in [`Frame::this_value`] (and the cold record) and are materialized into a
-//!   register on demand by the load opcodes, so a callee never reserves a window
-//!   slot for them.
+//! - **SELF / `this` are frame fields, not window registers.** They live in
+//!   [`Frame::self_value`] / [`Frame::this_value`] and are materialized into a
+//!   register on demand by the load opcodes, so a callee never reserves a
+//!   window slot for them. `new.target` remains optional cold call state.
 //! - **Header.** [`Frame::function_id`] + [`Frame::pc`] identify the resume
 //!   point; [`Frame::return_register`] names the caller register that receives
 //!   the completion value (`None` for `<main>`); [`Frame::upvalues`] is the
@@ -66,14 +65,10 @@ pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
 pub(crate) const REGISTER_SLOT_BYTES: usize = std::mem::size_of::<Value>();
 const _: () = assert!(REGISTER_SLOT_BYTES == 8);
 
-// Hot frame fits in two 64 B cache lines. Cold protocol state (try
-// handlers, async parking, pending ToPrimitive/bind/iterator ladders,
-// rest/incoming args, …) lives in `cold_frame::ColdFramePool` and is
+// One current 72-byte materialized activation. Async/generator ownership and
+// all other uncommon protocol state live in `cold_frame::ColdFramePool` and are
 // reached lazily through `frame.cold`.
-const _: () = assert!(
-    std::mem::size_of::<Frame>() <= 144,
-    "hot Frame must stay within ~2 cache lines; cold-state fields belong in ColdFrame",
-);
+const _: [(); 72] = [(); std::mem::size_of::<Frame>()];
 
 /// Owned register values of a suspended frame. This type deliberately cannot
 /// expose a [`RegisterWindow`]: parked state is independent of the active arena.
@@ -98,10 +93,12 @@ impl OwnedRegisterSnapshot {
     }
 }
 
-/// One call frame. Compact and cache-conscious per foundation
-/// plan §M7. Slice 13 promotes the interpreter to a real frame
-/// stack (`HoltStack` inside the dispatcher) so
-/// function calls push and pop without per-call `Vec` allocation.
+/// Materialized compatibility/cold-sidecar frame.
+///
+/// Existing HoltStack dispatch paths still own this compact record. New
+/// tier-neutral execution uses [`crate::ActiveFrameMut`] over the canonical
+/// [`crate::NativeFrame`] and its register window, so interpreter/baseline/
+/// optimizer switches do not require constructing this Rust-owned adapter.
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct Frame {
@@ -113,6 +110,12 @@ pub struct Frame {
     /// frames. Indexed by `Op::LoadUpvalue` / `Op::StoreUpvalue`
     /// operands.
     pub upvalues: UpvalueSpine,
+    /// Exact function object executing this frame. Named-function SELF and
+    /// `arguments.callee` read this hot field so materialized and native frames
+    /// share one representation-neutral binding. Bare functions use the
+    /// canonical interned function value; closure calls store that exact
+    /// closure instance.
+    pub self_value: Value,
     /// `this` value visible inside the body. `<main>` and free
     /// `Op::Call` invocations both bind `Value::Undefined`
     /// (foundation strict default). Method calls set the receiver,
@@ -120,25 +123,6 @@ pub struct Frame {
     /// provided value, and arrow closures override with their
     /// lexically-captured `this` regardless of the call site.
     pub this_value: Value,
-    /// Async-call state: `Some` when this frame belongs to an
-    /// `async` function. The result promise was created at call
-    /// entry and written into the caller's destination register
-    /// **then**; on return / unhandled throw, the dispatcher
-    /// settles this promise instead of writing a value to the
-    /// caller. `Op::Await` parks the frame off the stack and
-    /// re-pushes it from a microtask once the awaited promise
-    /// settles. `None` for ordinary (non-async) frames.
-    pub async_state: Option<AsyncFrameState>,
-    /// `Some(gen)` when this frame is the suspended body of an
-    /// active generator object. [`otter_bytecode::Op::Yield`]
-    /// inspects this slot: if set, the running frame is unspooled
-    /// onto the generator's saved-state slot and the dispatcher
-    /// returns to the calling `.next()` resume site. `None` for
-    /// every other call shape.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-generator-objects>
-    pub generator_owner: Option<crate::generator::JsGenerator>,
     /// When `Some(reg)`, returning from this frame writes the
     /// completion value into the **caller's** register `reg` and
     /// resumes at the caller's next pc. `<main>` carries `None`
@@ -160,9 +144,8 @@ pub struct ParkedFrameState {
     pub header: VmFrameHeader,
     registers: OwnedRegisterSnapshot,
     pub upvalues: UpvalueSpine,
+    pub self_value: Value,
     pub this_value: Value,
-    pub async_state: Option<AsyncFrameState>,
-    pub generator_owner: Option<crate::generator::JsGenerator>,
     pub return_register: Option<u16>,
 }
 
@@ -339,8 +322,7 @@ impl Frame {
     /// Advance the canonical instruction-index program counter by one.
     /// Surfaces [`VmError::InvalidOperand`] on overflow.
     pub(crate) fn advance_pc(&mut self) -> Result<(), VmError> {
-        self.pc = self.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        Ok(())
+        crate::ActiveFrameMut::materialized(self).advance_pc()
     }
 
     /// Shared empty upvalue slice for plain functions without captured
@@ -524,10 +506,9 @@ impl Frame {
             registers: window,
             return_register,
             upvalues,
+            self_value: Value::function(function.id),
             this_value,
-            async_state: None,
             cold: None,
-            generator_owner: None,
         }
     }
 
@@ -553,15 +534,15 @@ impl Frame {
             registers: window,
             return_register,
             upvalues,
+            self_value: Value::function(function.id),
             this_value,
-            async_state: None,
             cold: None,
-            generator_owner: None,
         }
     }
 
-    /// Trace locals, register window, receiver, parked side-channel
-    /// values, and nested generator / async state held by this frame.
+    /// Trace hot upvalues, SELF, and receiver state. Active register windows are
+    /// traced once by RegisterStack; async/generator ownership is traced through
+    /// the attached cold record.
     pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {
         // Active register windows are traced once through RegisterStack's
         // precisely published prefix. The frame walker owns scalar/header state.
@@ -569,17 +550,12 @@ impl Frame {
             let p = slot as *const UpvalueCell as *mut RawGc;
             visitor(p);
         }
+        self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
-        if let Some(async_state) = &self.async_state {
-            async_state.result_promise.trace_value_slots(visitor);
-        }
         // Cold-record GC slots (pending_to_primitive / pending_bind_function /
         // pending_iterator_next) are traced separately by the caller through
         // [`crate::cold_frame::ColdFrame::trace_cold_slots`] when
         // `self.cold` is `Some`.
-        if let Some(owner) = &self.generator_owner {
-            owner.trace_value_slots(visitor);
-        }
     }
 }
 
@@ -595,9 +571,8 @@ impl ParkedFrameState {
                 header: frame.header,
                 registers,
                 upvalues: frame.upvalues,
+                self_value: frame.self_value,
                 this_value: frame.this_value,
-                async_state: frame.async_state,
-                generator_owner: frame.generator_owner,
                 return_register: frame.return_register,
             },
             window,
@@ -613,18 +588,16 @@ impl ParkedFrameState {
             header,
             registers: _,
             upvalues,
+            self_value,
             this_value,
-            async_state,
-            generator_owner,
             return_register,
         } = self;
         Frame {
             header,
             registers: window,
             upvalues,
+            self_value,
             this_value,
-            async_state,
-            generator_owner,
             return_register,
             cold: None,
         }
@@ -641,13 +614,8 @@ impl ParkedFrameState {
             let p = slot as *const UpvalueCell as *mut RawGc;
             visitor(p);
         }
+        self.self_value.trace_value_slots(visitor);
         self.this_value.trace_value_slots(visitor);
-        if let Some(async_state) = &self.async_state {
-            async_state.result_promise.trace_value_slots(visitor);
-        }
-        if let Some(owner) = &self.generator_owner {
-            owner.trace_value_slots(visitor);
-        }
     }
 
     #[cfg(test)]

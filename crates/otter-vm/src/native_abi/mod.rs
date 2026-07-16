@@ -1,17 +1,17 @@
 //! Authoritative native VM/JIT ABI crate map.
 //!
 //! The focused modules below are the single source of machine-observed frame,
-//! dispatch, runtime-stub, safepoint, code metadata, dependency, and version
-//! layouts. This module intentionally contains only shared ids, sentinels,
-//! re-exports, and compile-time glue.
+//! dispatch, runtime-stub, safepoint, code metadata, and dependency layouts.
+//! This module intentionally contains only shared ids, sentinels, re-exports,
+//! and compile-time glue.
 //!
 //! # Contents
 //! - [`code_entry`] — stable per-generation native entry cells.
 //! - [`frame`] — VM thread and activation layouts.
 //! - [`dispatch`] — tier and runtime-stub result/status layouts.
-//! - [`runtime_stubs`] — classified descriptor inventory and table header.
+//! - [`runtime_stubs`] — classified descriptor inventory and call packets.
 //! - [`safepoints`] — frame/spill maps and safepoint entries.
-//! - [`metadata`] — code-object metadata, dependencies, and versions.
+//! - [`metadata`] — code-object metadata and dependencies.
 //!
 //! # Invariants
 //! - There is one native ABI. No tier owns a private frame, status, or
@@ -20,6 +20,7 @@
 //! - Addresses are fixed-width `u64` values and are never Rust layout handles.
 //!
 //! # See also
+//! - [`crate::active_frame`] for tier-neutral semantic frame access.
 //! - [`crate::jit`] for the compiler service boundary.
 //! - `JIT_REFACTOR_PLAN.md` for phase gates.
 

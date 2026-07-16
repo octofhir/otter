@@ -1,16 +1,20 @@
 //! Typed runtime operations used by baseline JIT slow paths.
 //!
 //! # Contents
-//! Narrow entry points for fixed-operand operations whose full ECMAScript
-//! semantics still belong to the VM: the complete numeric family, coercing
-//! arithmetic, captured-binding checks, constant materialization, descriptor
-//! writes, and loose equality.
+//! - [`UnaryCoercionOp`] / [`UnaryPrimitiveHint`] — fully decoded coercion
+//!   intent with no constant-pool metadata in the semantic kernel.
+//! - Fixed-operand operations whose full ECMAScript semantics still belong to
+//!   the VM: arithmetic, coercion, captured-binding checks, constant
+//!   materialization, descriptor writes, and loose equality.
 //!
 //! # Invariants
 //! - Every operand is decoded by the compiler and passed explicitly. These
 //!   functions never receive a byte PC or decode a `CodeBlockInstruction`.
-//! - Frame slots remain the canonical moving-GC roots across allocating or
-//!   throwing operations.
+//! - Arithmetic and unary-coercion semantics consume typed values through a
+//!   representation-neutral [`ActiveFrameMut`]; no HoltStack identity or raw
+//!   register pointer enters those paths.
+//! - Published active-frame slots remain the canonical moving-GC roots across
+//!   allocating or throwing operations.
 //! - The compiled frame's instruction PC is preserved; advancing dispatch is
 //!   the interpreter caller's responsibility, not the JIT ABI's.
 //!
@@ -18,185 +22,166 @@
 //! - `crate::property_dispatch` for typed property and element slow paths.
 //! - `otter-jit::template` for the machine-code stubs calling these operations.
 
-use crate::{ExecutionContext, Interpreter, VmError, holt_stack::HoltStack, write_register};
-use otter_bytecode::Op;
+use crate::{
+    ActiveFrameMut, ExecutionContext, Interpreter, Value, VmError, abstract_ops,
+    arithmetic_dispatch::NumericRuntimeOp, holt_stack::HoltStack, write_register,
+};
+
+/// Fully decoded `ToPrimitive` hint used by unary-coercion semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryPrimitiveHint {
+    /// ECMAScript `default` hint.
+    Default,
+    /// ECMAScript `number` hint.
+    Number,
+    /// ECMAScript `string` hint.
+    String,
+}
+
+impl UnaryPrimitiveHint {
+    /// Decode a compiler-owned hint token after the ABI adapter resolves it
+    /// through the canonical frame's function identity.
+    #[must_use]
+    pub fn from_token(token: &str) -> Option<Self> {
+        match token {
+            "default" => Some(Self::Default),
+            "number" => Some(Self::Number),
+            "string" => Some(Self::String),
+            _ => None,
+        }
+    }
+
+    fn abstract_hint(self) -> abstract_ops::ToPrimitiveHint {
+        match self {
+            Self::Default => abstract_ops::ToPrimitiveHint::Default,
+            Self::Number => abstract_ops::ToPrimitiveHint::Number,
+            Self::String => abstract_ops::ToPrimitiveHint::String,
+        }
+    }
+}
+
+/// Fully decoded coercive unary operation requested by native code.
+///
+/// Raw ABI mode words, function ownership, and hint constant identities are
+/// consumed by the JIT entry before this value crosses into VM semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryCoercionOp {
+    /// ECMAScript `ToPrimitive` with a resolved semantic hint.
+    ToPrimitive {
+        /// Already-resolved `preferredType` semantic hint.
+        hint: UnaryPrimitiveHint,
+    },
+    /// ECMAScript `ToNumeric` (`ToPrimitive(number)` plus numeric conversion).
+    ToNumeric,
+}
 
 impl Interpreter {
-    /// Complete a numeric, bitwise, update, or relational opcode from decoded
-    /// operands. This is the single compiled slow transition for the numeric
-    /// family; it calls the same register helpers as interpreter dispatch and
-    /// restores the interpreter PC because the native frame owns canonical
-    /// compiled progress.
-    #[allow(clippy::too_many_arguments)]
+    /// Complete one decoded numeric request against the published active frame.
+    ///
+    /// Semantics return a value before the destination is committed. Native
+    /// progress is intentionally unchanged: generated code, not this runtime
+    /// operation, owns the compiled instruction PC.
     pub fn jit_runtime_numeric_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         lhs: u16,
-        rhs_or_delta: u64,
-        opcode: u8,
+        operation: NumericRuntimeOp,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
-        let saved_pc = stack[frame_index].pc;
-        let result = {
-            let frame = &mut stack[frame_index];
-            match opcode {
-                x if x == Op::Sub as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::sub,
-                    crate::arithmetic_dispatch::bigint_sub_op,
-                    None,
-                ),
-                x if x == Op::Mul as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::mul,
-                    crate::arithmetic_dispatch::bigint_mul_op,
-                    None,
-                ),
-                x if x == Op::Div as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::div,
-                    crate::bigint::ops::div,
-                    None,
-                ),
-                x if x == Op::Rem as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::rem,
-                    crate::bigint::ops::rem,
-                    None,
-                ),
-                x if x == Op::Pow as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::pow,
-                    crate::bigint::ops::pow,
-                    None,
-                ),
-                x if x == Op::BitwiseAnd as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::bitwise_and,
-                    crate::arithmetic_dispatch::bigint_and_op,
-                    None,
-                ),
-                x if x == Op::BitwiseOr as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::bitwise_or,
-                    crate::arithmetic_dispatch::bigint_or_op,
-                    None,
-                ),
-                x if x == Op::BitwiseXor as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::bitwise_xor,
-                    crate::arithmetic_dispatch::bigint_xor_op,
-                    None,
-                ),
-                x if x == Op::Shl as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::shl,
-                    crate::bigint::ops::shl,
-                    None,
-                ),
-                x if x == Op::Shr as u8 => self.run_numeric_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    crate::number::shr_arith,
-                    crate::bigint::ops::shr,
-                    None,
-                ),
-                x if x == Op::Ushr as u8 => {
-                    self.run_ushr_regs(frame, dst, lhs, rhs_or_delta as u16, None)
-                }
-                x if x == Op::LessThan as u8 => {
-                    self.run_compare_regs(frame, dst, lhs, rhs_or_delta as u16, Op::LessThan, None)
-                }
-                x if x == Op::LessEq as u8 => {
-                    self.run_compare_regs(frame, dst, lhs, rhs_or_delta as u16, Op::LessEq, None)
-                }
-                x if x == Op::GreaterThan as u8 => self.run_compare_regs(
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u16,
-                    Op::GreaterThan,
-                    None,
-                ),
-                x if x == Op::GreaterEq as u8 => {
-                    self.run_compare_regs(frame, dst, lhs, rhs_or_delta as u16, Op::GreaterEq, None)
-                }
-                x if x == Op::Neg as u8 => self.run_neg_regs(frame, dst, lhs),
-                x if x == Op::BitwiseNot as u8 => self.run_bitwise_not_regs(frame, dst, lhs),
-                x if x == Op::Increment as u8 => self.run_increment_regs(
-                    context,
-                    frame,
-                    dst,
-                    lhs,
-                    rhs_or_delta as u32 as i32,
-                    None,
-                ),
-                _ => Err(VmError::InvalidOperand),
-            }
-        };
-        stack[frame_index].pc = saved_pc;
-        result
+        let lhs = frame.read(lhs)?;
+        let rhs = operation
+            .rhs_register()
+            .map(|register| frame.read(register))
+            .transpose()?;
+        let result = self.numeric_runtime_value(context, operation, lhs, rhs)?;
+        frame.write(dst, result)
     }
 
-    /// Execute generic ECMAScript addition from decoded register operands.
+    /// Execute generic ECMAScript addition against the canonical activation.
     pub fn jit_runtime_add(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         lhs: u16,
         rhs: u16,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_add_regs(&mut stack[frame_index], dst, lhs, rhs, None);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        let lhs = frame.read(lhs)?;
+        let rhs = frame.read(rhs)?;
+        let result = self.add_value(lhs, rhs)?;
+        frame.write(dst, result)
+    }
+
+    /// Complete a coercive unary operation against the canonical activation.
+    ///
+    /// The source is rooted in the handle arena before any user conversion
+    /// hook can re-enter JavaScript. The destination is committed only after
+    /// the complete abstract operation succeeds; compiled PC ownership stays
+    /// with generated code. `ToPrimitive` arrives with a resolved semantic
+    /// hint; constant-pool lookup is confined to the native ABI adapter.
+    pub fn jit_runtime_coerce_unary(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        src: u16,
+        operation: UnaryCoercionOp,
+    ) -> Result<(), VmError> {
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        let input = frame.read(src)?;
+        let result = self.coerce_unary_value(context, input, operation)?;
+        frame.write(dst, result)
+    }
+
+    /// Evaluate one typed coercive unary operation independently of frame
+    /// storage. The returned value is ready for an immediate destination
+    /// commit and no source/destination register aliasing assumptions leak in.
+    pub(crate) fn coerce_unary_value(
+        &mut self,
+        context: &ExecutionContext,
+        input: Value,
+        operation: UnaryCoercionOp,
+    ) -> Result<Value, VmError> {
+        self.with_handle_scope(|interp, scope| {
+            let input = interp.scoped_value(scope, input);
+            let (numeric, hint) = match operation {
+                UnaryCoercionOp::ToNumeric => (true, abstract_ops::ToPrimitiveHint::Number),
+                UnaryCoercionOp::ToPrimitive { hint } => (false, hint.abstract_hint()),
+            };
+            let current = interp.escape_scoped(input);
+            let primitive = if abstract_ops::is_primitive(&current) {
+                current
+            } else {
+                interp.evaluate_to_primitive(context, &current, hint)?
+            };
+            let primitive = interp.scoped_value(scope, primitive);
+            let primitive_value = interp.escape_scoped(primitive);
+            let result = if !numeric || primitive_value.is_number() || primitive_value.is_big_int()
+            {
+                primitive_value
+            } else if primitive_value.is_symbol() {
+                return Err(interp
+                    .err_type(("Cannot convert a Symbol value to a number".to_string()).into()));
+            } else {
+                Value::number(crate::number::NumberValue::from_f64(
+                    crate::number::parse::to_number_value(&primitive_value, &interp.gc_heap),
+                ))
+            };
+            let result = interp.scoped_value(scope, result);
+            Ok(interp.escape_scoped(result))
+        })
     }
 
     /// Store a captured binding after enforcing its TDZ check.
     pub fn jit_runtime_store_upvalue_checked(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         src: u16,
         idx: i32,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_store_upvalue_checked_reg(&mut stack[frame_index], src, idx);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.frame_store_upvalue_checked(frame, src, idx)
     }
 
     /// Materialize a string constant from the owning function's constant pool.
@@ -232,14 +217,10 @@ impl Interpreter {
     /// Replace one loop-captured upvalue cell with a fresh TDZ cell.
     pub fn jit_runtime_fresh_upvalue(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         idx: i32,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_fresh_upvalue_reg(&mut stack[frame_index], idx);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.frame_fresh_upvalue(frame, idx)
     }
 
     /// Load one realm builtin error constructor from a decoded constant index.
@@ -265,18 +246,17 @@ impl Interpreter {
         result
     }
 
-    /// Execute generic ECMAScript unary negation from decoded registers.
+    /// Execute generic ECMAScript unary negation against the canonical frame.
     pub fn jit_runtime_neg(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_neg_regs(&mut stack[frame_index], dst, src);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        let value = frame.read(src)?;
+        let result = self.neg_value(value)?;
+        frame.write(dst, result)
     }
 
     /// Apply a descriptor object through `OrdinaryDefineOwnProperty`.
@@ -345,5 +325,112 @@ impl Interpreter {
         );
         stack[frame_index].pc = saved_pc;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader};
+
+    fn empty_context() -> ExecutionContext {
+        ExecutionContext::from_module(crate::BytecodeModule {
+            module: "jit-numeric-native-frame-test.js".to_string(),
+            template_sites: Vec::new(),
+            source_kind: otter_bytecode::SourceKind::TypeScript,
+            functions: Vec::new(),
+            constants: Vec::new(),
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn primitive_hint_tokens_are_resolved_before_vm_semantics() {
+        assert_eq!(
+            UnaryPrimitiveHint::from_token("default"),
+            Some(UnaryPrimitiveHint::Default)
+        );
+        assert_eq!(
+            UnaryPrimitiveHint::from_token("number"),
+            Some(UnaryPrimitiveHint::Number)
+        );
+        assert_eq!(
+            UnaryPrimitiveHint::from_token("string"),
+            Some(UnaryPrimitiveHint::String)
+        );
+        assert_eq!(UnaryPrimitiveHint::from_token("invalid"), None);
+
+        let mut interp = Interpreter::new();
+        let primitive = interp
+            .coerce_unary_value(
+                &empty_context(),
+                crate::Value::boolean(true),
+                UnaryCoercionOp::ToPrimitive {
+                    hint: UnaryPrimitiveHint::Default,
+                },
+            )
+            .expect("primitive identity coercion");
+        assert_eq!(primitive, crate::Value::boolean(true));
+    }
+
+    #[test]
+    fn arithmetic_and_coercion_ops_commit_to_native_window_without_advancing_pc() {
+        let mut registers = [
+            crate::Value::number_i32(9),
+            crate::Value::number_i32(4),
+            crate::Value::undefined(),
+            crate::Value::undefined(),
+            crate::Value::undefined(),
+            crate::Value::boolean(true),
+            crate::Value::undefined(),
+        ];
+        let header = VmFrameHeader {
+            function_id: 7,
+            code_block_id: 7,
+            pc: 19,
+            register_count: registers.len() as u16,
+            kind: NativeFrameKind::Baseline,
+            flags: NativeFrameFlags::empty(),
+        };
+        let mut native = NativeFrame::new(
+            header,
+            registers.as_mut_ptr() as u64,
+            crate::Value::undefined(),
+            crate::Value::undefined(),
+        );
+        {
+            // SAFETY: `native` and its initialized register array remain live
+            // and unmoved for the active view's scoped lifetime.
+            let mut frame = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
+                .expect("valid native activation");
+            let mut interp = Interpreter::new();
+            let context = empty_context();
+
+            interp
+                .jit_runtime_numeric_op(
+                    &context,
+                    &mut frame,
+                    2,
+                    0,
+                    NumericRuntimeOp::Sub { rhs: 1 },
+                )
+                .expect("native numeric runtime op");
+            interp
+                .jit_runtime_add(&mut frame, 3, 0, 1)
+                .expect("native add runtime op");
+            interp
+                .jit_runtime_neg(&mut frame, 4, 1)
+                .expect("native negate runtime op");
+            interp
+                .jit_runtime_coerce_unary(&context, &mut frame, 6, 5, UnaryCoercionOp::ToNumeric)
+                .expect("native ToNumeric runtime op");
+        }
+
+        assert_eq!(registers[2].as_f64(), Some(5.0));
+        assert_eq!(registers[3].as_f64(), Some(13.0));
+        assert_eq!(registers[4].as_f64(), Some(-4.0));
+        assert_eq!(registers[6].as_f64(), Some(1.0));
+        assert_eq!(native.header.pc, 19);
     }
 }

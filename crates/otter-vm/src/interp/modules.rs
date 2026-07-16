@@ -143,12 +143,13 @@ impl Interpreter {
         let init_promise = if function.is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, &stack, &[&env, &import_meta], &[])?;
-            stack
-                .last_mut()
-                .expect("init frame was just pushed")
-                .async_state = Some(AsyncFrameState {
-                result_promise: result,
-            });
+            let frame = stack.last_mut().expect("init frame was just pushed");
+            self.frame_set_async_state(
+                frame,
+                AsyncFrameState {
+                    result_promise: result,
+                },
+            );
             Some(result)
         } else {
             None

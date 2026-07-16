@@ -538,6 +538,7 @@ impl Interpreter {
             this_for_callee,
             window,
         );
+        new_frame.self_value = *current;
         self.bind_bytecode_call_arguments(function, &mut new_frame, std::mem::take(effective_args))
             .map_err(|error| RunError {
                 error,
@@ -565,12 +566,13 @@ impl Interpreter {
                     });
                 }
             };
-            stack
-                .last_mut()
-                .expect("reaction frame was just pushed")
-                .async_state = Some(AsyncFrameState {
-                result_promise: result,
-            });
+            let frame = stack.last_mut().expect("reaction frame was just pushed");
+            self.frame_set_async_state(
+                frame,
+                AsyncFrameState {
+                    result_promise: result,
+                },
+            );
             Some(result)
         } else {
             None
@@ -689,12 +691,13 @@ impl Interpreter {
             let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, &stack, &[], &[])
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
-            stack
-                .last_mut()
-                .expect("entry frame was just pushed")
-                .async_state = Some(AsyncFrameState {
-                result_promise: result,
-            });
+            let frame = stack.last_mut().expect("entry frame was just pushed");
+            self.frame_set_async_state(
+                frame,
+                AsyncFrameState {
+                    result_promise: result,
+                },
+            );
             Some(result)
         } else {
             None

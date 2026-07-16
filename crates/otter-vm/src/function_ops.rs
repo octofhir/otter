@@ -24,10 +24,10 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    BoundFunction, ClassConstructor, ExecutionContext, Frame, Interpreter, JsObject, JsString,
-    PendingBindFunction, PendingBindStage, UpvalueCell, Value, VmError, VmGetOutcome,
-    VmIntrinsicFunction, VmPropertyKey, abstract_ops, array, function_metadata, object,
-    object_statics,
+    ActiveFrameMut, BoundFunction, ClassConstructor, ExecutionContext, Frame, Interpreter,
+    JsObject, JsString, PendingBindFunction, PendingBindStage, UpvalueCell, Value, VmError,
+    VmGetOutcome, VmIntrinsicFunction, VmPropertyKey, abstract_ops, array, function_metadata,
+    object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register, symbol, to_length, write_register,
 };
@@ -78,11 +78,10 @@ impl Interpreter {
         // `this instanceof Self` / `Self.prototype` inside the body would
         // observe a different per-instance `.prototype` than the one the
         // constructor installed on `this`.
-        if function_id == frame.function_id
-            && let Some(closure) = self.frame_cold(frame).and_then(|cold| cold.callee_closure)
-        {
-            write_register(frame, dst, Value::closure(closure))?;
-            frame.advance_pc()?;
+        if function_id == frame.function_id {
+            let mut active = ActiveFrameMut::materialized(frame);
+            self.frame_load_self(&mut active, dst)?;
+            active.advance_pc()?;
             return Ok(());
         }
         // §10.2 OrdinaryFunctionCreate — every evaluation of a function
@@ -147,11 +146,10 @@ impl Interpreter {
         // a fresh instance owns a distinct per-instance `.prototype`, so
         // `this instanceof Self` / `Self.prototype` would diverge from the
         // prototype the constructor installed on `this`.
-        if function_id == frame.function_id
-            && let Some(closure) = self.frame_cold(frame).and_then(|cold| cold.callee_closure)
-        {
-            write_register(frame, dst, Value::closure(closure))?;
-            frame.advance_pc()?;
+        if function_id == frame.function_id {
+            let mut active = ActiveFrameMut::materialized(frame);
+            self.frame_load_self(&mut active, dst)?;
+            active.advance_pc()?;
             return Ok(());
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(parent_indices.len());

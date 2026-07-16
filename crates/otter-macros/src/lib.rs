@@ -6,7 +6,7 @@
 //! plus a `BuiltinIntrinsic`-shaped installer that bootstrap walks
 //! at startup. No new runtime path, no dynamic registration — the
 //! macros are pure code generation over the spec types in
-//! [`otter_vm`] and the native ABI v1 documented at
+//! [`otter_vm`] and the current native ABI documented at
 //! [`docs/book/src/engine/native-call-abi.md`](../../../docs/book/src/engine/native-call-abi.md).
 //!
 //! # Naming theme

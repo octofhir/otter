@@ -46,10 +46,7 @@ use std::collections::BTreeMap;
 use otter_vm::{
     JitCompileSnapshot, JitExecOutcome, JitFunctionCode, VmRuntimeActivation,
     deopt::DeoptTable,
-    native_abi::{
-        BuildVersionRecord, CodeObjectMetadata, FrameMap, LayoutVersionRecord, SafepointRecord,
-        VM_BUILD_VERSION,
-    },
+    native_abi::{CodeObjectMetadata, FrameMap, SafepointRecord},
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -125,7 +122,6 @@ impl OptimizedCode {
         store_ic_cells: Box<[crate::entry::WhiskerIcCell]>,
         metadata: OptimizedMetadata,
     ) -> Self {
-        const AARCH64_OPTIMIZED_JIT_CTX_ABI: u64 = 0x4136_344f_5054_0005;
         let code_metadata = CodeObjectMetadata {
             id: metadata.code_object_id,
             code_block_id: metadata.function_id,
@@ -135,12 +131,6 @@ impl OptimizedCode {
             frame_map_count: frame_maps.len() as u32,
             spill_map_count: 0,
             dependency_count: 0,
-            reserved: 0,
-            layout: LayoutVersionRecord::CURRENT,
-            build: BuildVersionRecord {
-                vm_build: VM_BUILD_VERSION,
-                target_abi: AARCH64_OPTIMIZED_JIT_CTX_ABI,
-            },
         };
         Self {
             code,
@@ -217,6 +207,10 @@ impl JitFunctionCode for OptimizedCode {
         self.code_metadata
     }
 
+    fn native_frame_kind(&self) -> otter_vm::native_abi::NativeFrameKind {
+        otter_vm::native_abi::NativeFrameKind::Optimizing
+    }
+
     fn code_len(&self) -> usize {
         self.code.len()
     }
@@ -237,9 +231,6 @@ impl JitFunctionCode for OptimizedCode {
     }
 
     fn run_optimized_entry(&self, activation: VmRuntimeActivation) -> Option<JitExecOutcome> {
-        if !self.code_metadata.is_compatible_with_current_vm() {
-            return None;
-        }
         // SAFETY: this object owns the live executable mapping, whose entry was
         // emitted with the shared `JitCtx` ABI. `activation` carries the VM's
         // frozen-borrow contract for the dynamic call.
@@ -251,6 +242,7 @@ impl JitFunctionCode for OptimizedCode {
                 self.metadata.code_object_id,
                 self.metadata.function_id,
                 self.metadata.register_count,
+                otter_vm::native_abi::NativeFrameKind::Optimizing,
                 !self.safepoint_records.is_empty(),
             )
         })
@@ -261,9 +253,6 @@ impl JitFunctionCode for OptimizedCode {
         activation: VmRuntimeActivation,
         logical_pc: u32,
     ) -> Option<JitExecOutcome> {
-        if !self.code_metadata.is_compatible_with_current_vm() {
-            return None;
-        }
         let offset = *self.osr_entries.get(&logical_pc)?;
         // SAFETY: the recorded offset belongs to this live executable mapping
         // and names a trampoline emitted with the shared `JitCtx` ABI.
@@ -275,6 +264,7 @@ impl JitFunctionCode for OptimizedCode {
                 self.metadata.code_object_id,
                 self.metadata.function_id,
                 self.metadata.register_count,
+                otter_vm::native_abi::NativeFrameKind::Optimizing,
                 !self.safepoint_records.is_empty(),
             )
         })

@@ -13,7 +13,8 @@
 //!   and bail exits backed by exact deopt frame states.
 //!
 //! # Invariants
-//! - `x20` retains the sole `JitCtx` argument and `x19` retains `ctx.regs`.
+//! - `x20` retains the sole `JitCtx` argument and `x19` retains the canonical
+//!   `NativeFrame.register_base`.
 //!   GPR linear-scan registers `0..4` map to `x21..x24`, disjoint from both
 //!   fixed ABI registers; FP registers `0..8` map to the AAPCS64 callee-saved
 //!   `d8..d15`. `x8..x15` and `d16..d17` are caller-saved scratch registers.
@@ -70,9 +71,9 @@ use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTa
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_GENERIC,
     STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT, STUB_JIT_DEOPT_REIFY_FRAME,
-    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOAD_UPVALUE,
+    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROPERTY, STUB_JIT_LOAD_UPVALUE,
     STUB_JIT_LOOSE_EQ, STUB_JIT_MATH_CALL, STUB_JIT_PREPARE_DIRECT_CALL,
-    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW,
+    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROPERTY,
     STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, SafepointId, SafepointRecord,
 };
 use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
@@ -88,10 +89,11 @@ use crate::{
     arm64::CallTrampoline,
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, IC_WAYS, MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET,
-        NATIVE_FRAME_PC_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, STATUS_BAILED,
-        STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, THREAD_OFFSET, TransitionTable,
-        UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
-        VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+        NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, TransitionTable, Unsupported, VALUE_FALSE,
+        VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+        VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
         VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell, pack_method_arg_regs,
     },
     ir::{
@@ -318,8 +320,8 @@ pub(super) fn compile_with_trampoline(
             tree: &unit.tree,
             load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
             store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
-            load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
-            store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROP_WINDOW),
+            load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROPERTY),
+            store_property_entry: transitions.variadic_entry(STUB_JIT_STORE_PROPERTY),
             load_global_entry: transitions.variadic_entry(STUB_JIT_LOAD_GLOBAL),
             loose_eq_entry: transitions.variadic_entry(STUB_JIT_LOOSE_EQ),
             call_method_entry: transitions.variadic_entry(STUB_JIT_CALL_METHOD_GENERIC),
@@ -1671,7 +1673,8 @@ fn emit(
     dynasm!(ops
         ; .arch aarch64
         ; mov x20, x0
-        ; ldr x19, [x20]
+        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
     // Entry seeds initialize at their own defining block, not at the unit
     // entry: a spliced frame's seeds come alive only when control reaches that
@@ -1815,8 +1818,12 @@ fn emit(
                     )?;
                 }
                 Op::LoadThis => {
-                    // `this` is a tagged value published in the JitCtx.
-                    dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
+                    // `this` is canonical tagged state in the active NativeFrame.
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; ldr x9, [x10, NATIVE_FRAME_THIS_OFFSET]
+                    );
                     emit_store_tagged_location(
                         &mut ops,
                         allocation.location(
@@ -2421,11 +2428,12 @@ fn emit(
                     if view.cage_base != 0 && index >= 0 {
                         let spine_offset = (index as u32) * 4;
                         dynasm!(ops
-                            ; .arch aarch64
-                            ; ldr x9, [x20, UPVALUES_PTR_OFFSET]
-                            ; cbz x9, =>miss
-                            ; ldr w9, [x9, spine_offset]
-                        );
+                                    ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+                                    ; cbz x9, =>miss
+                                    ; ldr w9, [x9, spine_offset]
+                                );
                         emit_load_u64(&mut ops, 13, view.cage_base as u64);
                         dynasm!(ops
                             ; .arch aarch64
@@ -3461,7 +3469,7 @@ fn emit(
                         ; ldrb w14, [x13]
                         ; cmp w14, JS_CLOSURE_BODY_TYPE_TAG as u32
                         ; b.ne =>deopt
-                        ; ldr w14, [x13, view.closure_fid_byte]
+                        ; ldr w14, [x13, view.closure_call_layout.function_id_byte]
                     );
                     emit_load_u32(&mut ops, 15, callee.function_id);
                     dynasm!(ops
@@ -3612,7 +3620,8 @@ fn emit(
         dynasm!(ops
             ; .arch aarch64
             ; mov x20, x0
-            ; ldr x19, [x20]
+            ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
+            ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
         );
         emit_osr_materialization(&mut ops, reprs, allocation, site, representation_bail)?;
         dynasm!(ops ; .arch aarch64 ; b =>target ; =>representation_bail);
@@ -5074,8 +5083,8 @@ mod tests {
         // executable mapping outlives this call.
         let entry: JitEntry = unsafe { std::mem::transmute(entry) };
         let metadata = code.metadata();
-        let mut native_frame = NativeFrame {
-            header: VmFrameHeader {
+        let mut native_frame = NativeFrame::new(
+            VmFrameHeader {
                 function_id: metadata.function_id,
                 code_block_id: metadata.function_id,
                 pc: 0,
@@ -5083,36 +5092,22 @@ mod tests {
                 kind: NativeFrameKind::Baseline,
                 flags: NativeFrameFlags::empty(),
             },
-            previous_frame: 0,
-            register_base: frame.as_mut_ptr() as u64,
-            argument_base: 0,
-            feedback_base: 0,
-            code_object_id: metadata.code_object_id,
-            this_value_bits: otter_vm::Value::undefined().to_bits(),
-            new_target_bits: otter_vm::Value::undefined().to_bits(),
-            return_register: u32::MAX,
-            cold_state_index: u32::MAX,
-            argument_count: 0,
-            reserved0: 0,
-            feedback_id: 0,
-        };
+            frame.as_mut_ptr() as u64,
+            otter_vm::Value::undefined(),
+            otter_vm::Value::undefined(),
+        );
+        native_frame.set_materialized_activation(0);
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
+        thread.current_code_object_id = metadata.code_object_id;
         thread.interrupt_cell = interrupt as u64;
         thread.backedge_fuel_cell = std::ptr::from_mut(fuel) as u64;
         let mut error = None;
         let mut ctx = JitCtx {
-            regs: frame.as_mut_ptr(),
-            self_closure: otter_vm::Value::undefined().to_bits(),
-            this_value: otter_vm::Value::undefined().to_bits(),
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
-            frame_index: 0,
-            upvalues_ptr: 0,
             error: &mut error,
             direct_call: std::mem::MaybeUninit::uninit(),
-            reg_stack_base: std::ptr::null_mut(),
-            reg_top_ptr: std::ptr::null_mut(),
             activation_base: std::ptr::null_mut(),
             activation_top_ptr: std::ptr::null_mut(),
             activation_limit: 0,
@@ -5163,6 +5158,12 @@ mod tests {
         )
     }
 
+    unsafe fn fixture_registers(ctx: *mut JitCtx) -> *mut u64 {
+        // SAFETY: every execution fixture publishes a live canonical frame and
+        // register window for the complete transition call.
+        unsafe { (*(*ctx).native_frame).register_base as *mut u64 }
+    }
+
     extern "C" fn relocating_element_load(
         ctx: *mut JitCtx,
         dst: u64,
@@ -5171,7 +5172,7 @@ mod tests {
     ) -> u64 {
         // SAFETY: the execution fixture supplies a live three-or-more-slot
         // register window for the duration of this transition call.
-        let regs = unsafe { (*ctx).regs };
+        let regs = unsafe { fixture_registers(ctx) };
         unsafe {
             *regs.add(receiver as usize) = box_i32(5);
             *regs.add(dst as usize) = box_i32(37);
@@ -5188,7 +5189,7 @@ mod tests {
         // SAFETY: this fixture compiles a twelve-slot frame and keeps it live
         // for the transition. Tagged slots model moving-GC rewrites; numeric
         // slots are deliberately poisoned to prove they are never reloaded.
-        let regs = unsafe { (*ctx).regs };
+        let regs = unsafe { fixture_registers(ctx) };
         unsafe {
             assert_eq!(*regs.add(receiver as usize), box_i32(99));
             assert_eq!(*regs.add(index as usize), box_i32(0));
@@ -5232,7 +5233,7 @@ mod tests {
         // transition. Slots 0..=2 model moving-GC rewrites; the numeric index
         // and non-root scratch are poisoned to prove optimized code ignores
         // their window contents after the call.
-        let regs = unsafe { (*ctx).regs };
+        let regs = unsafe { fixture_registers(ctx) };
         unsafe {
             assert_eq!(*regs.add(receiver as usize), box_i32(99));
             assert_eq!(*regs.add(index as usize), box_i32(0));
@@ -5274,7 +5275,7 @@ mod tests {
     ) -> u64 {
         // SAFETY: the fixture supplies a three-slot frame window for the
         // duration of this transition and the emitted ABI passes slot ids.
-        let regs = unsafe { (*ctx).regs };
+        let regs = unsafe { fixture_registers(ctx) };
         unsafe {
             assert_eq!(*regs.add(callee as usize), box_i32(99));
             assert_eq!(argc, 1);
@@ -5307,7 +5308,7 @@ mod tests {
         // SAFETY: the fixture supplies the frame window for the duration of
         // this transition; the emitted ABI passes window slot ids and an
         // interior pointer into the code-owned argument arena.
-        let regs = unsafe { (*ctx).regs };
+        let regs = unsafe { fixture_registers(ctx) };
         unsafe {
             assert_eq!(method, 15, "Math.floor's method id");
             assert_eq!(argument_count, 1);

@@ -3629,7 +3629,7 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
-    frame.async_state = Some(AsyncFrameState { result_promise });
+    interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
     let mut stack: HoltStack = HoltStack::new();
     stack.push(frame);
     let context = ExecutionContext::from_module(module);

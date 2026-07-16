@@ -173,16 +173,6 @@ impl Interpreter {
         drop(global_scope);
         drop(error_scope);
         drop(well_known_scope);
-        // VM-owned phase of the isolate runtime-stub table. JIT-owned slots
-        // stay vacant until explicit compiler-hook installation.
-        let jit_runtime_stub_entries = crate::runtime_stubs::vm_runtime_stub_entries();
-        let jit_runtime_stub_machine_entries =
-            crate::runtime_stubs::machine_stub_entries(&jit_runtime_stub_entries);
-        let jit_runtime_stub_table = crate::native_abi::RuntimeStubTable::new(
-            jit_runtime_stub_machine_entries.as_ptr() as u64,
-            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.as_ptr() as u64,
-            jit_runtime_stub_machine_entries.len() as u32,
-        );
         let mut interp = Self {
             template_objects: rustc_hash::FxHashMap::default(),
             string_constant_cache: rustc_hash::FxHashMap::default(),
@@ -247,11 +237,9 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
             jit_next_code_object_id: 1,
-            jit_runtime_stub_entries,
-            jit_runtime_stub_machine_entries,
-            jit_runtime_stub_table,
             holt_pool: Vec::new(),
             register_stack: register_stack::RegisterStack::new(),
+            native_call_owners: native_call_owners::NativeCallOwnerStack::new(),
             jit_native_activations: vec![
                 jit::JitNativeActivation::EMPTY;
                 DEFAULT_MAX_STACK_DEPTH as usize
@@ -972,68 +960,16 @@ impl Interpreter {
     /// [`JitCompileStatus::Unavailable`] or [`JitCompileStatus::Unsupported`]
     /// must also leave execution on the interpreter fallback path.
     ///
-    /// Installation is the second phase of the isolate runtime-stub table:
-    /// VM-owned entries are rebuilt, then every JIT-owned transition binding is
-    /// validated against the descriptor inventory (dense id, matching signature
-    /// family, nonzero entry, vacant slot) and installed. With a hook present
-    /// no slot may stay vacant; a bad binding fails here, never at a call.
+    /// Every compiler-owned transition binding is validated against the static
+    /// descriptor inventory (dense id, matching signature family, nonzero
+    /// entry, unique compiler-owned slot). With a hook present every JIT-owned
+    /// descriptor must be covered; a bad binding fails here, never at a call.
     pub fn set_jit_compiler(&mut self, hook: Option<std::sync::Arc<dyn jit::JitCompilerHook>>) {
-        let mut entries = crate::runtime_stubs::vm_runtime_stub_entries();
         if let Some(compiler) = &hook {
-            for binding in compiler.runtime_stub_bindings() {
-                let index = binding
-                    .id
-                    .checked_sub(1)
-                    .map(|index| index as usize)
-                    .expect("JIT runtime-stub id is 1-based");
-                let descriptor = crate::native_abi::RUNTIME_STUB_DESCRIPTORS
-                    .get(index)
-                    .expect("JIT runtime-stub id names a VM descriptor");
-                assert_eq!(descriptor.id, binding.id);
-                assert_eq!(
-                    descriptor.signature, binding.signature,
-                    "JIT runtime-stub binding {} declares the descriptor signature family",
-                    binding.id
-                );
-                assert_ne!(binding.entry_addr, 0);
-                assert!(
-                    matches!(
-                        entries[index],
-                        crate::runtime_stubs::RuntimeStubEntry::Vacant
-                    ),
-                    "JIT runtime-stub binding {} may only fill a JIT-owned slot",
-                    binding.id
-                );
-                entries[index] = crate::runtime_stubs::RuntimeStubEntry::JitOwned {
-                    signature: binding.signature,
-                    entry_addr: binding.entry_addr,
-                };
-            }
-            for (index, entry) in entries.iter().enumerate() {
-                assert!(
-                    !matches!(entry, crate::runtime_stubs::RuntimeStubEntry::Vacant),
-                    "runtime stub {} left vacant after JIT installation",
-                    index + 1
-                );
-            }
+            let bindings = compiler.runtime_stub_bindings();
+            crate::runtime_stubs::validate_jit_runtime_stub_bindings(&bindings);
         }
-        self.jit_runtime_stub_entries = entries;
-        self.jit_runtime_stub_machine_entries =
-            crate::runtime_stubs::machine_stub_entries(&self.jit_runtime_stub_entries);
-        self.jit_runtime_stub_table = crate::native_abi::RuntimeStubTable::new(
-            self.jit_runtime_stub_machine_entries.as_ptr() as u64,
-            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.as_ptr() as u64,
-            self.jit_runtime_stub_machine_entries.len() as u32,
-        );
         self.jit_hook = hook;
-    }
-
-    /// Address of the published C-layout header over the isolate-owned
-    /// machine entry column. The header and both columns live as long as the
-    /// interpreter and are replaced only by [`Self::set_jit_compiler`].
-    #[must_use]
-    pub fn jit_runtime_stub_table_addr(&self) -> u64 {
-        std::ptr::from_ref(&self.jit_runtime_stub_table) as u64
     }
 
     /// Address of the published isolate code-registry view. The boxed registry

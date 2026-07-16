@@ -27,11 +27,10 @@ pub(super) use crate::entry::TransitionTable;
 use otter_vm::JitCompileSnapshot;
 
 use crate::entry::{
-    ALLOC_CTX_CODE_OBJECT_ID_OFFSET, ALLOC_CTX_FRAME_OFFSET, ALLOC_CTX_RESERVED0_OFFSET,
-    ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
-    ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-    NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET,
-    UPVALUES_PTR_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+    ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, NATIVE_FRAME_OFFSET,
+    NATIVE_FRAME_UPVALUE_BASE_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_HOLE,
+    VALUE_UNDEFINED,
 };
 
 /// `blr` to a resolved transition entry and branch to `threw` on a nonzero
@@ -419,7 +418,8 @@ pub(super) fn emit_load_upvalue(
         let spine_offset = (index as u32) * 4;
         dynasm!(ops
             ; .arch aarch64
-            ; ldr x9, [x20, UPVALUES_PTR_OFFSET]
+            ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+            ; ldr x9, [x10, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
             ; cbz x9, =>miss
             ; ldr w9, [x9, spine_offset]
         );
@@ -508,16 +508,9 @@ pub(super) fn emit_string_concat_alloc_call(
         ; sub sp, sp, ALLOC_CTX_STACK_SIZE
         ; ldr x9, [x20, THREAD_OFFSET]
         ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; str x10, [sp, ALLOC_CTX_FRAME_OFFSET]
-        ; ldr x9, [x10, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
-        ; str x9, [sp, ALLOC_CTX_CODE_OBJECT_ID_OFFSET]
         ; movz w9, safepoint
         ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-        ; str wzr, [sp, ALLOC_CTX_RESERVED0_OFFSET]
-        ; movz w9, #0
-        ; strh w9, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
-        ; strh w9, [sp, ALLOC_CTX_RESERVED1_OFFSET]
+        ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
         ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
         ; mov x0, sp
     );

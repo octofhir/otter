@@ -135,7 +135,7 @@ impl Interpreter {
                     let pc = bits as u32;
                     (pc != u32::MAX).then_some(pc)
                 };
-                self.run_enter_try_handler(
+                self.materialized_enter_try_handler(
                     &mut stack[frame_index],
                     TryHandler {
                         catch_pc: decode_pc(arg0),
@@ -147,12 +147,12 @@ impl Interpreter {
                 Ok(JitExceptionOutcome::Continue)
             }
             value if value == Op::LeaveTry as u8 => {
-                self.run_leave_try(&mut stack[frame_index])?;
+                self.materialized_leave_try(&mut stack[frame_index])?;
                 stack[frame_index].pc = saved_pc;
                 Ok(JitExceptionOutcome::Continue)
             }
             value if value == Op::PopParkedFinally as u8 => {
-                self.run_pop_parked_finally(&mut stack[frame_index], arg0 as usize)?;
+                self.materialized_pop_parked_finally(&mut stack[frame_index], arg0 as usize)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(JitExceptionOutcome::Continue)
             }

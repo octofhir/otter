@@ -199,6 +199,7 @@ impl CodeBlock {
     /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.
     #[must_use]
     pub(crate) fn jit_compile_snapshot(self: &Arc<Self>) -> crate::jit::JitCompileSnapshot {
+        let gc_header_bytes = otter_gc::header::HEADER_SIZE as u32;
         crate::jit::JitCompileSnapshot {
             code_block: Arc::clone(self),
             // Baked by `Interpreter::compile_jit_function`, which holds the
@@ -233,8 +234,22 @@ impl CodeBlock {
             heap_number_type_tag: crate::heap_number::HEAP_NUMBER_TYPE_TAG,
             heap_number_bits_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::heap_number::HeapNumberBody, bits) as u32,
-            closure_fid_byte: otter_gc::header::HEADER_SIZE as u32
-                + std::mem::offset_of!(crate::closure::JsClosureBody, function_id) as u32,
+            closure_call_layout: crate::jit::JitClosureCallLayout {
+                function_id_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,
+                flags_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_CALL_FLAGS_OFFSET as u32,
+                upvalue_base_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_UPVALUE_BASE_OFFSET as u32,
+                upvalue_count_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_UPVALUE_COUNT_OFFSET as u32,
+                bound_this_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_BOUND_THIS_OFFSET as u32,
+                bound_new_target_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET as u32,
+                bound_this_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS,
+                bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
+                runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
+            },
             upvalue_value_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
             collection_layout: crate::jit::JitCollectionLayout {
@@ -991,6 +1006,34 @@ mod tests {
             module_resolutions: Vec::new(),
             module_inits: Vec::new(),
         }
+    }
+
+    #[test]
+    fn jit_snapshot_publishes_typed_closure_call_layout() {
+        let executable = ExecutableModule::from_bytecode(&module(function(Vec::new())));
+        let function = executable.function_arc(0).expect("function");
+        let snapshot = function.jit_compile_snapshot();
+        let gc_header_bytes = otter_gc::header::HEADER_SIZE as u32;
+
+        assert_eq!(
+            snapshot.closure_call_layout,
+            crate::jit::JitClosureCallLayout {
+                function_id_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET as u32,
+                flags_byte: gc_header_bytes + crate::closure::CLOSURE_BODY_CALL_FLAGS_OFFSET as u32,
+                upvalue_base_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_UPVALUE_BASE_OFFSET as u32,
+                upvalue_count_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_UPVALUE_COUNT_OFFSET as u32,
+                bound_this_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_BOUND_THIS_OFFSET as u32,
+                bound_new_target_byte: gc_header_bytes
+                    + crate::closure::CLOSURE_BODY_BOUND_NEW_TARGET_OFFSET as u32,
+                bound_this_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_THIS,
+                bound_new_target_flag: crate::closure::CLOSURE_CALL_FLAG_BOUND_NEW_TARGET,
+                runtime_setup_flags: crate::closure::CLOSURE_CALL_RUNTIME_SETUP_FLAGS,
+            }
+        );
     }
 
     #[test]

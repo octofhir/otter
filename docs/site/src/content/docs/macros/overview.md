@@ -380,10 +380,10 @@ decision in `bootstrap.rs`.
   code generation, not a new runtime path.
 - Expansion compiles under `#![forbid(unsafe_code)]`. Any macro
   that needs `unsafe` for the expansion is a design bug.
-- Every generated method call targets ABI v1 from
+- Every generated method call targets the current contract from
   [Native Call ABI](/otter/engine/native-call-abi/). The macro
   expansion fails to compile if the referenced function does
-  not match the v1 signature.
+  not match that signature.
 
 ## See Also
 

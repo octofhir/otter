@@ -3,7 +3,6 @@
 //! # Contents
 //! - [`RuntimeStubDescriptor`] declares signature, effects, safepoint,
 //!   exception, and result ABI for every dense [`RuntimeStubId`].
-//! - [`RuntimeStubTable`] is the fixed C-layout table header seen by code.
 //! - [`RuntimeStubAllocContext`] is the temporary rooted call packet used by
 //!   the current allocating entries while frame publication converges.
 //!
@@ -17,7 +16,7 @@
 //! - [`crate::runtime_stubs`] for semantic entrypoints.
 //! - [`super::safepoints`] for root maps.
 
-use super::{NO_SAFEPOINT, NativeFrame, RUNTIME_STUB_TABLE_VERSION, SafepointId, VmThread};
+use super::{NO_SAFEPOINT, NativeFrame, SafepointId, VmThread};
 
 /// Descriptor argument count for variadic call shapes.
 pub const VARIADIC_STUB_ARGUMENTS: u8 = u8::MAX;
@@ -192,12 +191,8 @@ pub struct RuntimeStubDescriptor {
     pub exception: RuntimeStubException,
     /// Result encoding.
     pub result_abi: RuntimeStubResultAbi,
-    /// Reserved; zero in version 1.
-    pub reserved: u8,
     /// Declared observable effects.
     pub effects: RuntimeStubEffects,
-    /// Reserved; zero in version 1.
-    pub reserved2: u16,
 }
 
 const fn descriptor(
@@ -221,36 +216,7 @@ const fn descriptor(
         },
         exception,
         result_abi,
-        reserved: 0,
         effects,
-        reserved2: 0,
-    }
-}
-
-/// Fixed C-layout header for one isolate-owned runtime-stub table.
-#[repr(C, align(8))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RuntimeStubTable {
-    /// Address of `count` machine entry addresses indexed by `id - 1`.
-    pub entries_address: u64,
-    /// Address of `count` [`RuntimeStubDescriptor`] records.
-    pub descriptors_address: u64,
-    /// Dense descriptor/entry count.
-    pub count: u32,
-    /// [`RUNTIME_STUB_TABLE_VERSION`].
-    pub version: u32,
-}
-
-impl RuntimeStubTable {
-    /// Construct a table header for an already-owned stable entry array.
-    #[must_use]
-    pub const fn new(entries_address: u64, descriptors_address: u64, count: u32) -> Self {
-        Self {
-            entries_address,
-            descriptors_address,
-            count,
-            version: RUNTIME_STUB_TABLE_VERSION,
-        }
     }
 }
 
@@ -260,40 +226,23 @@ impl RuntimeStubTable {
 pub struct RuntimeStubAllocContext {
     /// Active VM thread record.
     pub thread: *mut VmThread,
-    /// Published activation containing the tagged frame window.
-    pub frame: *mut NativeFrame,
-    /// Installed code-object identity.
-    pub code_object_id: u64,
-    /// Dense safepoint id within the code object.
-    pub safepoint_id: SafepointId,
-    /// Reserved; zero in version 1.
-    pub reserved0: u32,
-    /// Number of native spill slots.
-    pub spill_slot_count: u16,
-    /// Reserved; zero in version 1.
-    pub reserved1: u16,
     /// Base of tagged native spill slots.
     pub spill_slots: *mut u64,
+    /// Dense safepoint id within the code object.
+    pub safepoint_id: SafepointId,
+    /// Number of native spill slots.
+    pub spill_slot_count: u16,
 }
 
 impl RuntimeStubAllocContext {
     /// Build an allocating call packet.
     #[must_use]
-    pub const fn new(
-        thread: *mut VmThread,
-        frame: *mut NativeFrame,
-        code_object_id: u64,
-        safepoint_id: SafepointId,
-    ) -> Self {
+    pub const fn new(thread: *mut VmThread, safepoint_id: SafepointId) -> Self {
         Self {
             thread,
-            frame,
-            code_object_id,
-            safepoint_id,
-            reserved0: 0,
-            spill_slot_count: 0,
-            reserved1: 0,
             spill_slots: std::ptr::null_mut(),
+            safepoint_id,
+            spill_slot_count: 0,
         }
     }
 
@@ -308,12 +257,33 @@ impl RuntimeStubAllocContext {
     /// Whether a frame-slot window is present.
     #[must_use]
     pub const fn has_frame_slots(self) -> bool {
-        if self.frame.is_null() {
+        let frame = self.current_frame();
+        if frame.is_null() {
             return false;
         }
         // SAFETY: callers uphold the live published-frame contract.
-        let frame = unsafe { &*self.frame };
+        let frame = unsafe { &*frame };
         frame.register_base != 0 && frame.header.register_count != 0
+    }
+
+    /// Currently published activation, or null outside compiled execution.
+    #[must_use]
+    pub const fn current_frame(self) -> *mut NativeFrame {
+        if self.thread.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: callers uphold the live VM-thread contract.
+        unsafe { (*self.thread).current_frame as *mut NativeFrame }
+    }
+
+    /// Installed code generation owning the current activation.
+    #[must_use]
+    pub const fn code_object_id(self) -> u64 {
+        if self.thread.is_null() {
+            return 0;
+        }
+        // SAFETY: callers uphold the live VM-thread contract.
+        unsafe { (*self.thread).current_code_object_id }
     }
 
     /// Whether a spill-slot window is present.
@@ -325,7 +295,7 @@ impl RuntimeStubAllocContext {
     /// Whether code-object/safepoint identity is publishable.
     #[must_use]
     pub const fn has_safepoint_records(self) -> bool {
-        !self.thread.is_null() && self.code_object_id != 0 && self.safepoint_id != NO_SAFEPOINT
+        self.code_object_id() != 0 && self.safepoint_id != NO_SAFEPOINT
     }
 }
 
@@ -531,7 +501,7 @@ pub const STUB_JIT_COLLECTION_METHOD_IC: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Runs a bailed direct callee to completion in the interpreter.
+/// Copies a live bailed native frame, adopts its owner, and runs it to completion.
 pub const STUB_JIT_FINISH_DIRECT_CALL_BAILED: RuntimeStubDescriptor = descriptor(
     21,
     RuntimeStubClass::Reentrant,
@@ -541,8 +511,9 @@ pub const STUB_JIT_FINISH_DIRECT_CALL_BAILED: RuntimeStubDescriptor = descriptor
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Runs a bailed frameless self-recursive callee to completion.
-pub const STUB_JIT_SELF_CALL_BAIL: RuntimeStubDescriptor = descriptor(
+/// Cold-materializes a frameless self-recursive deopt and runs it to
+/// completion. Normal tier switches retain the canonical native activation.
+pub const STUB_JIT_DEOPT_MATERIALIZE_SELF_CALL: RuntimeStubDescriptor = descriptor(
     22,
     RuntimeStubClass::Reentrant,
     RuntimeStubSignature::Variadic,
@@ -551,8 +522,8 @@ pub const STUB_JIT_SELF_CALL_BAIL: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Status,
     RuntimeStubResultAbi::StatusPair,
 );
-/// Named-property IC miss handler over the register window.
-pub const STUB_JIT_LOAD_PROP_WINDOW: RuntimeStubDescriptor = descriptor(
+/// Named-property IC miss handler over the canonical activation.
+pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
     23,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
@@ -562,7 +533,7 @@ pub const STUB_JIT_LOAD_PROP_WINDOW: RuntimeStubDescriptor = descriptor(
     RuntimeStubResultAbi::StatusWord,
 );
 /// Named-property store miss handler; shape transitions allocate.
-pub const STUB_JIT_STORE_PROP_WINDOW: RuntimeStubDescriptor = descriptor(
+pub const STUB_JIT_STORE_PROPERTY: RuntimeStubDescriptor = descriptor(
     24,
     RuntimeStubClass::Alloc,
     RuntimeStubSignature::Variadic,
@@ -691,7 +662,7 @@ pub const STUB_JIT_POP_NATIVE_ACTIVATION: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Never,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Abandons a prepared direct-call callee frame after a throw.
+/// Releases a prepared direct-call owner after throw or rejected native entry.
 pub const STUB_JIT_ABORT_DIRECT_CALL: RuntimeStubDescriptor = descriptor(
     37,
     RuntimeStubClass::LeafNoAlloc,
@@ -701,7 +672,7 @@ pub const STUB_JIT_ABORT_DIRECT_CALL: RuntimeStubDescriptor = descriptor(
     RuntimeStubException::Never,
     RuntimeStubResultAbi::StatusWord,
 );
-/// Pops a returned direct callee and stores its value.
+/// Releases a returned direct-call owner and stores its value in the caller.
 pub const STUB_JIT_FINISH_DIRECT_CALL_RETURNED: RuntimeStubDescriptor = descriptor(
     38,
     RuntimeStubClass::LeafNoAlloc,
@@ -1285,9 +1256,9 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_DEFINE_OWN_PROPERTY,
     STUB_JIT_COLLECTION_METHOD_IC,
     STUB_JIT_FINISH_DIRECT_CALL_BAILED,
-    STUB_JIT_SELF_CALL_BAIL,
-    STUB_JIT_LOAD_PROP_WINDOW,
-    STUB_JIT_STORE_PROP_WINDOW,
+    STUB_JIT_DEOPT_MATERIALIZE_SELF_CALL,
+    STUB_JIT_LOAD_PROPERTY,
+    STUB_JIT_STORE_PROPERTY,
     STUB_JIT_DEFINE_DATA_PROPERTY,
     STUB_JIT_LOAD_STRING,
     STUB_JIT_LOAD_BUILTIN_ERROR,
@@ -1370,7 +1341,7 @@ pub const fn validate_stub_descriptor(
                 && matches!(desc.exception, RuntimeStubException::Never)
         }
     };
-    if !throwing_matches || !result_matches || desc.reserved != 0 || desc.reserved2 != 0 {
+    if !throwing_matches || !result_matches {
         return false;
     }
     match desc.class {
@@ -1399,16 +1370,13 @@ pub const fn validate_stub_descriptor(
     }
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<RuntimeStubDescriptor>()];
+const _: [(); 12] = [(); std::mem::size_of::<RuntimeStubDescriptor>()];
 const _: [(); 4] = [(); std::mem::align_of::<RuntimeStubDescriptor>()];
-const _: [(); 24] = [(); std::mem::size_of::<RuntimeStubTable>()];
-const _: [(); 8] = [(); std::mem::align_of::<RuntimeStubTable>()];
 const _: [(); 0] = [(); std::mem::offset_of!(RuntimeStubDescriptor, id)];
-const _: [(); 12] = [(); std::mem::offset_of!(RuntimeStubDescriptor, effects)];
-const _: [(); 16] = [(); std::mem::offset_of!(RuntimeStubTable, count)];
-const _: [(); 48] = [(); std::mem::size_of::<RuntimeStubAllocContext>()];
-const _: [(); 16] = [(); std::mem::offset_of!(RuntimeStubAllocContext, code_object_id)];
-const _: [(); 24] = [(); std::mem::offset_of!(RuntimeStubAllocContext, safepoint_id)];
+const _: [(); 10] = [(); std::mem::offset_of!(RuntimeStubDescriptor, effects)];
+const _: [(); 24] = [(); std::mem::size_of::<RuntimeStubAllocContext>()];
+const _: [(); 8] = [(); std::mem::offset_of!(RuntimeStubAllocContext, spill_slots)];
+const _: [(); 16] = [(); std::mem::offset_of!(RuntimeStubAllocContext, safepoint_id)];
 
 #[cfg(test)]
 mod tests {
@@ -1447,12 +1415,5 @@ mod tests {
             NO_SAFEPOINT
         ));
         assert!(validate_stub_descriptor(STUB_COLLECTION_MAP_SET_ALLOC, 7));
-    }
-
-    #[test]
-    fn table_header_carries_authoritative_version() {
-        let table = RuntimeStubTable::new(8, 16, RUNTIME_STUB_DESCRIPTORS.len() as u32);
-        assert_eq!(table.version, RUNTIME_STUB_TABLE_VERSION);
-        assert_eq!(table.count as usize, RUNTIME_STUB_DESCRIPTORS.len());
     }
 }

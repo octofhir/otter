@@ -670,7 +670,9 @@ mod tests {
 
     #[test]
     fn frame_state_verifier_accepts_well_formed_slots() {
-        let state = single_frame(12, vec![
+        let state = single_frame(
+            12,
+            vec![
                 DeoptSlot {
                     location: DeoptLocation::Register(3),
                     repr: DeoptRepr::Tagged,
@@ -683,14 +685,17 @@ mod tests {
                     location: DeoptLocation::Constant(2),
                     repr: DeoptRepr::Int32,
                 },
-            ]);
+            ],
+        );
 
         assert_eq!(state.verify(verify_limits()), Ok(()));
     }
 
     #[test]
     fn frame_state_verifier_rejects_duplicate_and_out_of_range_locations() {
-        let duplicate = single_frame(12, vec![
+        let duplicate = single_frame(
+            12,
+            vec![
                 DeoptSlot {
                     location: DeoptLocation::Register(3),
                     repr: DeoptRepr::Tagged,
@@ -699,7 +704,8 @@ mod tests {
                     location: DeoptLocation::Register(3),
                     repr: DeoptRepr::Int32,
                 },
-            ]);
+            ],
+        );
         assert_eq!(
             duplicate.verify(verify_limits()),
             Err(DeoptVerifyError::DuplicateLocation {
@@ -710,10 +716,13 @@ mod tests {
             })
         );
 
-        let out_of_range = single_frame(20, vec![DeoptSlot {
+        let out_of_range = single_frame(
+            20,
+            vec![DeoptSlot {
                 location: DeoptLocation::Constant(4),
                 repr: DeoptRepr::Tagged,
-            }]);
+            }],
+        );
         assert_eq!(
             out_of_range.verify(verify_limits()),
             Err(DeoptVerifyError::ConstantOutOfRange {
@@ -727,10 +736,15 @@ mod tests {
 
     #[test]
     fn frame_state_verifier_checks_all_declared_bounds() {
-        let state_with = |location| single_frame(24, vec![DeoptSlot {
-                location,
-                repr: DeoptRepr::Tagged,
-            }]);
+        let state_with = |location| {
+            single_frame(
+                24,
+                vec![DeoptSlot {
+                    location,
+                    repr: DeoptRepr::Tagged,
+                }],
+            )
+        };
 
         let mut limits = verify_limits();
         limits.max_frame_slots = 0;

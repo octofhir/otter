@@ -18,7 +18,7 @@
 //!
 //! # See also
 //! - [`super::resolve`] for dynamic callable decoding and eligibility policy.
-//! - [`super::frame`] for frame publication and code pinning.
+//! - [`super::frame`] for frameless owner publication and code pinning.
 
 use std::sync::Arc;
 
@@ -73,13 +73,11 @@ impl Interpreter {
     }
 
     /// Try a guarded cache way, then feed its freshly loaded callable through
-    /// the same resolver and frame transaction as an uncached method call.
+    /// the same resolver and frameless owner transaction as an uncached call.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_prepare_cached_direct_method_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
         recv: Value,
         obj: crate::object::JsObject,
         site: usize,
@@ -117,7 +115,7 @@ impl Interpreter {
         ) else {
             return Ok(None);
         };
-        self.prepare_jit_resolved_call(stack, frame_index, target, arg_regs, caller_regs)
+        self.prepare_jit_resolved_call(target, arg_regs, caller_regs)
             .map(Some)
     }
 

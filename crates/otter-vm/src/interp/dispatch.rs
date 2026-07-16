@@ -425,8 +425,10 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let yielded = *read_register(&stack[top_idx], src)?;
+                    let owner = self
+                        .frame_generator_owner(&stack[top_idx])
+                        .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
@@ -445,8 +447,10 @@ impl Interpreter {
                     let dst = register_operand(function.operand(instr, 0))?;
                     let src = register_operand(function.operand(instr, 1))?;
                     let yielded = *read_register(&stack[top_idx], src)?;
+                    let owner = self
+                        .frame_generator_owner(&stack[top_idx])
+                        .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
@@ -467,8 +471,10 @@ impl Interpreter {
                     return Ok(yielded);
                 }
                 Op::GeneratorStart => {
+                    let owner = self
+                        .frame_generator_owner(&stack[top_idx])
+                        .ok_or(VmError::TypeMismatch)?;
                     let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
-                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.advance_pc()?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
@@ -1118,28 +1124,14 @@ impl Interpreter {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let mut value = stack[top_idx].this_value;
-                    if value.is_hole() {
-                        // §13.3.7.3 — an arrow's lexical `this` in a
-                        // derived constructor: the hole snapshot
-                        // resolves through the nearest derived-ctor
-                        // frame (bound there by a super() that may
-                        // itself have run inside an arrow).
-                        for i in (0..=top_idx).rev() {
-                            if self
-                                .frame_cold(&stack[i])
-                                .is_some_and(|c| c.is_derived_constructor)
-                            {
-                                value = stack[i].this_value;
-                                break;
-                            }
-                        }
-                    }
-                    if value.is_hole() {
-                        return Err(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into()));
-                    }
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, value)?;
+                    // Legacy arrows created before a derived constructor binds
+                    // `this` carry the hole snapshot. Resolve that sidecar-only
+                    // inheritance once, then enter the same kernel native
+                    // activations use.
+                    let this_value = self.materialized_this_binding(&*stack, top_idx)?;
+                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    frame.set_this_value(this_value);
+                    self.frame_load_this(&mut frame, dst)?;
                     frame.advance_pc()?;
                     continue;
                 }
@@ -1147,8 +1139,16 @@ impl Interpreter {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_new_target_reg(frame, dst)?;
+                    let new_target = self
+                        .frame_cold(&stack[top_idx])
+                        .and_then(|cold| cold.new_target)
+                        .unwrap_or(Value::undefined());
+                    let mut frame = ActiveFrameMut::materialized_with_new_target(
+                        &mut stack[top_idx],
+                        new_target,
+                    );
+                    self.frame_load_new_target(&mut frame, dst)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::NewObject => {
@@ -1192,16 +1192,18 @@ impl Interpreter {
                     let idx = context
                         .exec_imm32(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_upvalue_reg(frame, dst, idx)?;
+                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    self.frame_load_upvalue(&mut frame, dst, idx)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::FreshUpvalue => {
                     let idx = context
                         .exec_imm32(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_fresh_upvalue_reg(frame, idx)?;
+                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    self.frame_fresh_upvalue(&mut frame, idx)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::StoreUpvalue => {
@@ -1211,8 +1213,9 @@ impl Interpreter {
                     let idx = context
                         .exec_imm32(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_upvalue_reg(frame, src, idx)?;
+                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    self.frame_store_upvalue(&mut frame, src, idx)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::StoreUpvalueChecked => {
@@ -1222,15 +1225,17 @@ impl Interpreter {
                     let idx = context
                         .exec_imm32(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_store_upvalue_checked_reg(frame, src, idx)?;
+                    let mut frame = ActiveFrameMut::materialized(&mut stack[top_idx]);
+                    self.frame_store_upvalue_checked(&mut frame, src, idx)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::CollectRest => {
                     let dst = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    self.run_collect_rest_reg(&mut *stack, top_idx, dst)?;
+                    self.materialized_collect_rest(&mut *stack, top_idx, dst)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::MakeFunction => {
@@ -1828,12 +1833,14 @@ impl Interpreter {
                         .exec_exception_region(instr)
                         .ok_or_else(|| VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_enter_try_region(frame, region)?;
+                    self.materialized_enter_try_region(frame, region)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::LeaveTry => {
                     let frame = &mut stack[top_idx];
-                    self.run_leave_try(frame)?;
+                    self.materialized_leave_try(frame)?;
+                    frame.advance_pc()?;
                     continue;
                 }
                 Op::GlobalBindingExists => {
@@ -1861,7 +1868,8 @@ impl Interpreter {
                         .exec_imm32(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?
                         .max(0) as usize;
-                    self.run_pop_parked_finally(&mut stack[top_idx], count)?;
+                    self.materialized_pop_parked_finally(&mut stack[top_idx], count)?;
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::JumpViaFinally => {

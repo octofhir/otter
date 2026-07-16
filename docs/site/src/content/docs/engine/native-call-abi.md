@@ -1,5 +1,5 @@
 ---
-title: "Otter Native Call ABI (frozen 2026-05-23, Task 2.5)"
+title: "Otter Native Call Contract"
 ---
 
 This document is the authoritative contract for every native-Rust function
@@ -23,8 +23,9 @@ pub type NativeFastFn =
 - Return: `Ok(Value)` for a normal completion, `Err(NativeError)` for
   any non-completion the dispatcher must surface.
 
-This signature is frozen. Adding parameters, switching to async, or
-changing the return shape requires a new ABI version.
+Otter keeps one current native call shape. The dispatcher, macros, builtins,
+tests, and documentation change together when the shape changes; no parallel
+compatibility ABI is retained inside the active runtime.
 
 ## Receiver and `new.target`
 
@@ -162,19 +163,11 @@ The following are compile errors (enforced by
 - Constructing a `Gc<T>` outside the GC heap allocator path.
 - Importing `otter_gc::raw::RawGc` from non-GC crate code.
 
-## Versioning
+## Changing the contract
 
-This ABI is v1. Breaking changes require:
-
-1. A new `NativeFastFn`-shaped signature with an explicit version tag
-   on the registry entry, and
-2. A migration plan that brings every existing native binding (Otter
-   modules, intrinsics, web crate) to the new signature in a single
-   cut-over.
-
-Additive changes (new high-level allocator on `NativeCtx`, new
-`NativeError` variant) are non-breaking and can land without bumping
-the version.
+Change `NativeFastFn`, every binding, the macro output, and the compile-time
+tests in one cut-over. The active runtime keeps no version tag, adapter table,
+or old call path.
 
 ## See also
 

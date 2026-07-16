@@ -233,6 +233,8 @@ pub(crate) enum TemplateOp {
         callee: u16,
         argc: u16,
         packed_args: u64,
+        /// Serialized byte PC used to resolve the immutable call-site link.
+        byte_pc: u32,
     },
     /// `r<dst> = new r<callee>(args…)` (`Op::New`) through the generic
     /// in-place construct transition; a non-constructor callee takes an exact
@@ -869,6 +871,7 @@ impl TemplatePlan {
                         callee: operands.callee,
                         argc: arguments.len() as u16,
                         packed_args: pack_or_spill_arg_regs(arguments, &mut register_operands),
+                        byte_pc: meta.byte_pc,
                     }
                 }
                 Op::CallWithThis => {
@@ -1874,6 +1877,7 @@ mod tests {
                 callee,
                 argc,
                 packed_args,
+                byte_pc: _,
             } => {
                 assert_eq!((dst, callee, argc), (0, 1, 2));
                 assert_eq!(packed_args & 0xffff, 2);

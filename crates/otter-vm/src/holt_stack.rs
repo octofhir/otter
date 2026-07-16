@@ -1,171 +1,49 @@
-//! HoltStack — contiguous, reservation-stable execution-frame stack.
+//! Materialized interpreter activation stack.
 //!
-//! Before this slice the interpreter held its call frames in a
-//! `SmallVec<[Frame; 8]>`. That works for a pure interpreter but is the wrong
-//! substrate for machine-code calls and optimizer deopt: a buffer that
-//! **reallocates and moves every live frame** when it outgrows its capacity is
-//! unusable once a compiled callee holds a raw pointer to its caller's frame —
-//! and to the register slots inside it — across a re-entrant call.
-//!
-//! `HoltStack` is that substrate. It is a single contiguous buffer, so frame
-//! access is one indirection and `stack[i]` is O(1) — exactly the cost the
-//! legacy `SmallVec` paid. Stability comes from **reservation, not
-//! segmentation**: *every* `HoltStack` reserves [`crate::DEFAULT_MAX_STACK_DEPTH`]
-//! frames up front ([`HoltStack::new`]). The VM throws a catchable stack-overflow
-//! before the live frame count could exceed that bound, so the backing buffer
-//! never reallocates and every `&Frame` it has handed out stays put for the
-//! stack's lifetime. There is one stable behavior — no inline / non-reserved
-//! mode. Short-lived re-entry stacks (Array callbacks, eval, generator
-//! prologues) are recycled through the interpreter's stack pool
-//! (`Interpreter::draw_stack` / `return_stack`) so they cost no per-call
-//! reallocation, and a compiled callee can append its frame directly onto the
-//! caller's stack and re-enter without the caller's in-register frame pointer
-//! ever moving.
-//!
-//! This **is** the interpreter execution stack: slice 1b replaced
-//! `SmallVec<[Frame; 8]>` with `HoltStack` at every call site and rewired the
-//! GC frame-roots provider (`trace_active_frame_roots`) onto it. There is no
-//! legacy fallback.
+//! The stack owns bytecode-interpreter frames while register storage lives in
+//! the separate reservation-stable [`crate::RegisterStack`]. The frame vector
+//! may therefore grow and move: consumers keep indices and register/upvalue
+//! windows, never `Frame` addresses, across a push.
 //!
 //! # Contents
 //! - [`HoltStack`] — the frame stack and its stack-discipline API.
-//! - [`HoltCallReservation`] — unpublished frame owner for two-phase call-frame
-//!   construction.
-//! - [`HoltFrameDesc`] / [`crate::RegisterWindow`] — stable frame index and
-//!   value-window metadata consumed by JIT call-entry work.
 //!
 //! # Invariants
-//! - A [`HoltStack`] never exceeds its reserved capacity (the VM's
-//!   stack-overflow guard fires first), so its buffer never reallocates and
-//!   live-frame addresses are stable.
+//! - No reference or pointer to a `Frame` survives an operation that can push.
+//! - Register windows remain stable independently of frame-vector growth.
 //! - GC tracing visits every live frame exactly once, in push order.
 //!
 //! # See also
 //! - [`crate::frame_state::Frame`] — the frame payload and `trace_frame_slots`.
-//! - [`crate::cold_frame`] — cold side records, traced separately by the
-//!   integration just as they were for the `SmallVec` stack.
+//! - [`crate::cold_frame`] — cold side records traced separately from hot frame
+//!   state.
 
-use smallvec::SmallVec;
+use crate::frame_state::Frame;
 
-use crate::{RegisterWindow, frame_state::Frame};
-
-/// Published frame descriptor for a live frame on a [`HoltStack`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HoltFrameDesc {
-    index: usize,
-    register_window: RegisterWindow,
-}
-
-impl HoltFrameDesc {
-    /// Frame index in the owning [`HoltStack`].
-    #[inline]
-    #[must_use]
-    pub fn index(self) -> usize {
-        self.index
-    }
-
-    /// Raw value-slot metadata for the frame's register window.
-    #[inline]
-    #[must_use]
-    pub fn register_window(self) -> RegisterWindow {
-        self.register_window
-    }
-}
-
-/// Unpublished call-frame reservation.
+/// Growable stack of materialized interpreter call [`Frame`]s.
 ///
-/// The frame is fully owned here and is not visible to GC frame-root tracing
-/// until [`Self::publish`] moves it onto a [`HoltStack`]. This is the substrate
-/// direct JIT calls need: Rust initializes header/cold/upvalue state first,
-/// then emitted code can fill value slots through a descriptor only after the
-/// VM publishes a fully initialized frame shape.
-#[derive(Debug)]
-pub struct HoltCallReservation {
-    frame: Frame,
-}
-
-impl HoltCallReservation {
-    /// Create a reservation around a fully allocated but unpublished frame.
-    #[inline]
-    #[must_use]
-    pub fn from_frame(frame: Frame) -> Self {
-        Self { frame }
-    }
-
-    /// Mutate the unpublished frame before it becomes GC-visible.
-    #[inline]
-    #[must_use]
-    pub fn frame_mut(&mut self) -> &mut Frame {
-        &mut self.frame
-    }
-
-    /// Raw metadata for the unpublished frame's value slots.
-    #[inline]
-    #[must_use]
-    pub fn register_window(&mut self) -> RegisterWindow {
-        self.frame.registers
-    }
-
-    /// Publish the frame onto `stack`, returning the stable descriptor for the
-    /// now-live frame.
-    #[inline]
-    pub fn publish(self, stack: &mut HoltStack) -> HoltFrameDesc {
-        stack.publish_call_reservation(self)
-    }
-}
-
-/// `SmallVec` inline threshold. Immaterial to behavior — every `HoltStack`
-/// reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] up front, so storage always lives
-/// in the heap buffer.
-const INLINE_FRAMES: usize = 8;
-
-/// Reservation-stable stack of interpreter call [`Frame`]s.
-///
-/// Frame access is one indirection and `stack[i]` is O(1) — exactly the cost the
-/// legacy `SmallVec<[Frame; 8]>` paid. Stability comes from **reservation**:
-/// every stack reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] frames in one heap
-/// buffer up front ([`Self::new`]), and the VM throws a catchable stack-overflow
-/// before the live frame count could exceed it — so that buffer never
-/// reallocates and every `&Frame` it hands out stays put. There is no inline /
-/// non-reserved mode; short-lived re-entry stacks are pooled and reused.
-///
-/// Same stack-discipline surface as the legacy stack (`push` / `pop` / `last` /
+/// Stack-discipline surface (`push` / `pop` / `last` /
 /// `last_mut` / `len` / `is_empty` / `get` / `get_mut` / `truncate` / `clear` /
 /// `iter` / `iter_mut`) plus `Index` / `IndexMut`.
 #[derive(Debug)]
 pub struct HoltStack {
-    frames: SmallVec<[Frame; INLINE_FRAMES]>,
+    frames: Vec<Frame>,
 }
 
 impl Default for HoltStack {
-    /// Reserved, like [`Self::new`] — the only behavior, so a defaulted stack is
-    /// stable too.
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl HoltStack {
-    /// A new, empty stack pre-reserved for a full dispatch run.
-    ///
-    /// Every `HoltStack` reserves [`crate::DEFAULT_MAX_STACK_DEPTH`] frames up
-    /// front, spilling storage to a single heap buffer. The VM throws a catchable
-    /// stack-overflow before the live frame count could exceed that bound, so the
-    /// buffer never reallocates and every `&Frame` it hands out keeps a stable
-    /// address — the property compiled callees rely on to append a callee frame
-    /// onto the caller's own stack and re-enter without dangling the caller's
-    /// in-register frame pointer. There is no inline / non-reserved mode: one
-    /// stable behavior, with short-lived re-entry stacks recycled through the
-    /// interpreter's stack pool rather than reallocated per call.
+    /// A new empty stack. Capacity grows only with observed call depth.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            frames: SmallVec::with_capacity(crate::DEFAULT_MAX_STACK_DEPTH as usize),
-        }
+        Self { frames: Vec::new() }
     }
 
-    /// Drop all frames but keep the reserved capacity, so the buffer can be
-    /// returned to the interpreter's stack pool and reused without reallocating.
+    /// Drop all frames but retain observed capacity for pooled reuse.
     #[inline]
     pub fn clear(&mut self) {
         self.frames.clear();
@@ -190,37 +68,10 @@ impl HoltStack {
     /// The frame is fully constructed before it is published (its register
     /// window is already `Value::undefined()`-filled by
     /// [`Frame::with_exec_return_upvalues_and_this`] and friends), so it is never visible to
-    /// GC in a partially-initialized state. Callers that need the pushed frame
-    /// read it back with [`last_mut`](Self::last_mut); that reference stays valid
-    /// until the matching [`pop`](Self::pop) / [`truncate`](Self::truncate),
-    /// because the reserved buffer never reallocates.
+    /// GC in a partially-initialized state.
     #[inline]
     pub fn push(&mut self, frame: Frame) {
         self.frames.push(frame);
-    }
-
-    /// Publish a fully initialized call-frame reservation onto the stack.
-    ///
-    /// The returned descriptor is valid until the frame is popped/truncated.
-    /// Because every `HoltStack` is pre-reserved to the VM stack-depth limit,
-    /// publishing the frame cannot reallocate and cannot move older frames.
-    #[inline]
-    pub fn publish_call_reservation(&mut self, reservation: HoltCallReservation) -> HoltFrameDesc {
-        let index = self.frames.len();
-        self.frames.push(reservation.frame);
-        self.frame_desc(index)
-            .expect("published frame descriptor must exist")
-    }
-
-    /// Descriptor for a live frame at `index`.
-    #[inline]
-    #[must_use]
-    pub fn frame_desc(&mut self, index: usize) -> Option<HoltFrameDesc> {
-        let frame = self.frames.get_mut(index)?;
-        Some(HoltFrameDesc {
-            index,
-            register_window: frame.registers,
-        })
     }
 
     /// Pop and return the top frame, or `None` when empty.
@@ -248,9 +99,8 @@ impl HoltStack {
     /// # Safety
     /// The stack must be non-empty. The dispatch loop calls this only after its
     /// `is_empty()` guard at the top of each tick, so a live top frame is
-    /// guaranteed; the reserved buffer never reallocates, so the reference stays
-    /// put until the next push/pop. Avoids the `Index`/`last` bounds check on the
-    /// hottest per-instruction read.
+    /// guaranteed. The reference must not survive a push/pop. Avoids the
+    /// `Index`/`last` bounds check on the hottest per-instruction read.
     #[inline]
     #[must_use]
     pub unsafe fn top_unchecked(&self) -> &Frame {
@@ -412,62 +262,22 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_capacity_keeps_frame_addresses_stable() {
+    fn capacity_grows_with_observed_depth_without_moving_register_windows() {
         let module = one_register_module();
         let f = &module.functions[0];
-        // A dispatch stack reserves the max call depth, so pushing up to that
-        // bound never reallocates and never moves a previously-pushed frame.
         let mut stack = HoltStack::new();
         let mut registers = crate::register_stack::RegisterStack::new();
-        let n = crate::DEFAULT_MAX_STACK_DEPTH as usize;
+        assert_eq!(stack.frames.capacity(), 0);
+        let n = 32;
 
-        let mut addrs = Vec::with_capacity(n);
         for tag in 0..n {
             stack.push(tagged_frame(f, tag as i32, &mut registers));
-            addrs.push(stack.last().unwrap() as *const Frame as usize);
         }
-        for (i, &addr) in addrs.iter().enumerate() {
-            let now = &stack[i] as *const Frame as usize;
-            assert_eq!(now, addr, "frame {i} moved within the reserved capacity");
+        assert!(stack.frames.capacity() >= n);
+        assert!(stack.frames.capacity() < crate::DEFAULT_MAX_STACK_DEPTH as usize);
+        for i in 0..n {
             assert_eq!(stack[i].registers[0], Value::number_i32(i as i32));
         }
-    }
-
-    #[test]
-    fn call_reservation_is_unpublished_until_publish() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = HoltStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-        let mut reservation = HoltCallReservation::from_frame(tagged_frame(f, 7, &mut registers));
-
-        assert_eq!(stack.len(), 0);
-        assert_eq!(reservation.register_window().len(), 1);
-        reservation.frame_mut().registers[0] = Value::number_i32(11);
-
-        let desc = reservation.publish(&mut stack);
-        assert_eq!(desc.index(), 0);
-        assert_eq!(desc.register_window().len(), 1);
-        assert_eq!(stack.len(), 1);
-        assert_eq!(stack[0].registers[0], Value::number_i32(11));
-    }
-
-    #[test]
-    fn published_frame_desc_matches_register_window() {
-        let module = one_register_module();
-        let f = &module.functions[0];
-        let mut stack = HoltStack::new();
-        let mut registers = crate::register_stack::RegisterStack::new();
-
-        let desc =
-            HoltCallReservation::from_frame(tagged_frame(f, 3, &mut registers)).publish(&mut stack);
-        let frame = stack.get_mut(desc.index()).unwrap();
-
-        assert_eq!(
-            desc.register_window().as_mut_ptr(),
-            frame.registers.as_mut_ptr()
-        );
-        assert_eq!(desc.register_window().len(), frame.registers.len());
     }
 
     #[test]

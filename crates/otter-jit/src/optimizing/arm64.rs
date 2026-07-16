@@ -71,6 +71,7 @@ use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
     STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
     STUB_JIT_CALL_GENERIC, STUB_JIT_LOAD_UPVALUE, STUB_JIT_PREPARE_DIRECT_CALL,
+    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED,
     STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
     STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
@@ -140,6 +141,11 @@ struct Eligibility {
     /// emitted call passes a pointer into the boxed slice, so the arena must
     /// live exactly as long as the code; `OptimizedCode` takes ownership.
     math_call_arguments: BTreeMap<u32, Box<[u16]>>,
+    /// Sites whose feedback cell has never recorded an execution. Emission
+    /// replaces each with an unconditional deopt: if the cold path is ever
+    /// reached, the interpreter runs it, records feedback, bumps the epoch,
+    /// and the next compile sees real types.
+    insufficient_feedback: BTreeSet<(InlineId, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +220,10 @@ struct EmissionPlan<'a> {
     call_generic_entry: u64,
     /// Reads one captured binding into a window slot; TDZ reads throw.
     load_upvalue_entry: u64,
+    /// Writes one captured binding with the generational barrier.
+    store_upvalue_entry: u64,
+    /// TDZ-checked captured-binding write.
+    store_upvalue_checked_entry: u64,
     /// Hook-lifetime transition inventory for the shared direct-call tail.
     transitions: &'a TransitionTable,
     /// Owning function id, baked into property/global transitions so the stub
@@ -288,6 +298,7 @@ pub(super) fn compile_with_transitions(
 
     let eligibility = check_eligibility(
         view,
+        &tree,
         &cfg,
         &dom,
         &ssa,
@@ -344,6 +355,9 @@ pub(super) fn compile_with_transitions(
             prepare_direct_call_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
             call_generic_entry: transitions.entry(STUB_JIT_CALL_GENERIC),
             load_upvalue_entry: transitions.variadic_entry(STUB_JIT_LOAD_UPVALUE),
+            store_upvalue_entry: transitions.variadic_entry(STUB_JIT_STORE_UPVALUE),
+            store_upvalue_checked_entry: transitions
+                .variadic_entry(STUB_JIT_STORE_UPVALUE_CHECKED),
             transitions,
             function_id: u64::from(view.code_block.id),
         },
@@ -502,8 +516,24 @@ fn is_spliced_call(cfg: &ControlFlowGraph, block: BlockId, instruction: &SsaInst
         && block.instr_pcs.last() == Some(&instruction.pc)
 }
 
+/// Arithmetic feedback for one instruction of its own frame — a spliced
+/// callee's instruction must never read the root body's cell.
+fn frame_feedback(
+    tree: &InlineTree,
+    instruction: &SsaInstr,
+) -> otter_vm::jit_feedback::ArithFeedback {
+    tree.frames[instruction.inline.0 as usize]
+        .instructions
+        .get(instruction.pc as usize)
+        .map_or_else(
+            otter_vm::jit_feedback::ArithFeedback::default,
+            otter_vm::JitInstructionMetadata::arith_feedback,
+        )
+}
+
 fn check_eligibility(
     view: &JitCompileSnapshot,
+    tree: &InlineTree,
     cfg: &ControlFlowGraph,
     dom: &DominatorTree,
     ssa: &SsaFunction,
@@ -584,10 +614,50 @@ fn check_eligibility(
     let mut allowed_conversions = BTreeSet::new();
     let mut element_transition_instructions = Vec::new();
     let mut math_call_arguments = BTreeMap::new();
+    let mut insufficient_feedback = BTreeSet::new();
     for block in dom.reverse_postorder().iter().copied() {
         for (instruction_index, instruction) in
             ssa.blocks[block.0 as usize].instrs.iter().enumerate()
         {
+            // A feedback-driven op whose cell never recorded an execution is
+            // unreachable-by-feedback: lower it as an unconditional deopt
+            // instead of refusing the whole function for a cold path.
+            if matches!(
+                instruction.op,
+                Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Rem
+                    | Op::Neg
+                    | Op::Increment
+                    | Op::LessThan
+                    | Op::LessEq
+                    | Op::GreaterThan
+                    | Op::GreaterEq
+                    | Op::Equal
+                    | Op::NotEqual
+                    | Op::BitwiseAnd
+                    | Op::BitwiseOr
+                    | Op::BitwiseXor
+                    | Op::Shl
+                    | Op::Shr
+            ) && frame_feedback(tree, instruction).is_unseen()
+            {
+                insufficient_feedback.insert((instruction.inline, instruction.pc));
+                // Whatever conversions representation selection planned at
+                // this site are moot — the op is never emitted — but they must
+                // not fail the unit-wide conversion sweep.
+                for conversion in reprs.conversions() {
+                    if conversion.inline == instruction.inline
+                        && conversion.at_pc == instruction.pc
+                    {
+                        allowed_conversions
+                            .insert((conversion.at_pc, conversion.operand_index));
+                    }
+                }
+                continue;
+            }
             match instruction.op {
                 Op::LoadInt32 => check_constant_result(instruction, reprs)?,
                 Op::LoadNumber => check_number_constant_result(view, instruction, reprs)?,
@@ -1035,6 +1105,18 @@ fn check_eligibility(
                         ));
                     }
                 }
+                // A captured-binding write is a leaf with a write barrier; the
+                // checked form throws on a TDZ write. The value materializes
+                // into its window slot for the stub.
+                Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                    if instruction.result.is_some()
+                        || instruction.inputs.len() != 1
+                        || instruction.input_registers.len() != 1
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                    check_tagged_inputs(instruction, reprs, &mut allowed_conversions)?;
+                }
                 // A captured-binding read is a leaf: it reaches the upvalue
                 // cell through pointers, never allocates or runs JS, and only
                 // a TDZ read throws. No safepoint or materialization is owed;
@@ -1158,6 +1240,7 @@ fn check_eligibility(
         osr_entries,
         element_transitions,
         math_call_arguments,
+        insufficient_feedback,
     })
 }
 
@@ -1607,6 +1690,8 @@ fn emit(
         prepare_direct_call_entry,
         call_generic_entry,
         load_upvalue_entry,
+        store_upvalue_entry,
+        store_upvalue_checked_entry,
         transitions,
         function_id,
     } = plan;
@@ -1679,6 +1764,21 @@ fn emit(
             }
         }
         for instruction in &ssa.blocks[block_id.0 as usize].instrs {
+            if eligibility
+                .insufficient_feedback
+                .contains(&(instruction.inline, instruction.pc))
+            {
+                // Never-executed site: deopt to the interpreter, which runs it,
+                // records feedback, and triggers a recompile via the epoch.
+                let deopt = ops.new_dynamic_label();
+                deopt_exits.push((
+                    deopt,
+                    deopt_exit_at(frame_states, instruction)?,
+                    instruction.pc,
+                ));
+                dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                continue;
+            }
             let guard_deopt = match eligibility
                 .guarded_uses
                 .iter()
@@ -2393,6 +2493,45 @@ fn emit(
                     emit_load_frame_register(&mut ops, u32::from(dst), 9)?;
                     emit_store_tagged_location(&mut ops, result_location, 9)?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
+                }
+                Op::StoreUpvalue | Op::StoreUpvalueChecked => {
+                    let src = instruction.input_registers[0];
+                    let index = view.instructions[instruction.pc as usize]
+                        .imm32(view.code_block.as_ref(), 1)
+                        .ok_or(Unsupported::OperandShape("upvalue-store index"))?;
+                    emit_materialize_frame_value(
+                        &mut ops,
+                        reprs,
+                        allocation,
+                        instruction.inputs[0],
+                        src,
+                    )?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, src as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(index as u32));
+                    emit_load_u64(
+                        &mut ops,
+                        16,
+                        if instruction.op == Op::StoreUpvalueChecked {
+                            store_upvalue_checked_entry
+                        } else {
+                            store_upvalue_entry
+                        },
+                    );
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
                 }
                 Op::LoadGlobalOrThrow => {
                     let dst = instruction

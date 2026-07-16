@@ -166,6 +166,15 @@ impl ArithFeedback {
     pub const fn is_int32_only(self) -> bool {
         self.0 == ARITH_INT32
     }
+
+    /// `true` when this site has never executed. Optimized code may treat it
+    /// as unreachable-by-feedback and deoptimize unconditionally if it is ever
+    /// reached: the interpreter then records real feedback and the next
+    /// compile sees it.
+    #[must_use]
+    pub const fn is_unseen(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// Dense feedback owned by one canonical CodeBlock instruction.

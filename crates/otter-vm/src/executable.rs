@@ -192,6 +192,8 @@ impl CodeBlock {
                 + std::mem::offset_of!(crate::heap_number::HeapNumberBody, bits) as u32,
             closure_fid_byte: otter_gc::header::HEADER_SIZE as u32
                 + std::mem::offset_of!(crate::closure::JsClosureBody, function_id) as u32,
+            upvalue_value_byte: otter_gc::header::HEADER_SIZE as u32
+                + std::mem::offset_of!(crate::upvalue::UpvalueCellBody, value) as u32,
             collection_layout: crate::jit::JitCollectionLayout {
                 map_type_tag: crate::collections::MAP_BODY_TYPE_TAG,
                 set_type_tag: crate::collections::SET_BODY_TYPE_TAG,

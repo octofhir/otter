@@ -23,7 +23,7 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Scoped, Value, VmError, VmPropertyKey, array, bigint,
+    ExecutionContext, Frame, Interpreter, Local, Value, VmError, VmPropertyKey, array, bigint,
     binary, object,
     operand_decode::{const_operand, register_operand},
     read_register, write_register,
@@ -777,11 +777,11 @@ impl Interpreter {
                     // would otherwise be stranded by the key-string and pair
                     // allocations below. The arena keeps each current across
                     // every collection those allocations drive.
-                    let value_handles: Vec<Scoped> = raw
+                    let value_handles: Vec<Local> = raw
                         .iter()
                         .map(|(_, value)| interp.scoped_value(scope, *value))
                         .collect();
-                    let mut pair_handles: Vec<Scoped> = Vec::with_capacity(raw.len());
+                    let mut pair_handles: Vec<Local> = Vec::with_capacity(raw.len());
                     for ((key, _), value_h) in raw.iter().zip(value_handles) {
                         let key_h = interp.scoped_string(scope, key)?;
                         // Resolve both handles through the arena immediately
@@ -1088,7 +1088,7 @@ impl Interpreter {
                         let keys = interp.own_property_keys_value(context, &target_value)?;
                         // Park every key before the first descriptor allocation:
                         // the fresh young key strings would otherwise dangle.
-                        let mut key_handles: Vec<Scoped> = Vec::with_capacity(keys.len());
+                        let mut key_handles: Vec<Local> = Vec::with_capacity(keys.len());
                         for key in &keys {
                             key_handles.push(interp.scoped_value(scope, *key));
                         }

@@ -34,13 +34,13 @@
 
 use std::marker::PhantomData;
 
-use crate::handles::Scoped;
+use crate::handles::Local;
 
 use super::cx::MarshalCx;
 use super::error::{JsError, ValueIdent};
 
 /// The identity extraction: a raw handle into the ambient scope.
-pub type JsValue<'s> = Scoped<'s>;
+pub type JsValue<'s> = Local<'s>;
 
 /// Extract `Self` from the JS value behind `v`, following WebIDL
 /// coercion semantics. `ident` names the value in error messages.
@@ -48,15 +48,15 @@ pub trait FromJs<'s>: Sized {
     /// Perform the conversion.
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError>;
 }
 
-impl<'s> FromJs<'s> for Scoped<'s> {
+impl<'s> FromJs<'s> for Local<'s> {
     fn from_js(
         _cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         _ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         Ok(v)
@@ -66,7 +66,7 @@ impl<'s> FromJs<'s> for Scoped<'s> {
 impl<'s> FromJs<'s> for f64 {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         cx.to_number_spec(v)
@@ -77,7 +77,7 @@ impl<'s> FromJs<'s> for f64 {
 impl<'s> FromJs<'s> for bool {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         _ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         Ok(cx.to_boolean(v))
@@ -87,7 +87,7 @@ impl<'s> FromJs<'s> for bool {
 impl<'s> FromJs<'s> for i32 {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         f64::from_js(cx, v, ident).map(to_int32)
@@ -97,7 +97,7 @@ impl<'s> FromJs<'s> for i32 {
 impl<'s> FromJs<'s> for u32 {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         f64::from_js(cx, v, ident).map(to_uint32)
@@ -107,7 +107,7 @@ impl<'s> FromJs<'s> for u32 {
 impl<'s> FromJs<'s> for i64 {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         f64::from_js(cx, v, ident).map(to_int64)
@@ -121,7 +121,7 @@ impl<'s> FromJs<'s> for i64 {
 impl<'s, T: FromJs<'s>> FromJs<'s> for Option<T> {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         if cx.is_nullish(v) {
@@ -219,7 +219,7 @@ impl From<String> for DOMString {
 impl<'s> FromJs<'s> for DOMString {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         cx.to_string_units(v)
@@ -272,7 +272,7 @@ impl std::ops::Deref for USVString {
 impl<'s> FromJs<'s> for String {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         cx.to_string_spec(v)
@@ -283,7 +283,7 @@ impl<'s> FromJs<'s> for String {
 impl<'s> FromJs<'s> for USVString {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         cx.to_string_spec(v)
@@ -316,7 +316,7 @@ impl<T> IntoIterator for Sequence<T> {
 impl<'s, T: FromJs<'s>> FromJs<'s> for Sequence<T> {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         let handles = cx
@@ -353,7 +353,7 @@ impl BufferSource {
 impl<'s> FromJs<'s> for BufferSource {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         cx.buffer_source_bytes(v).map(Self).ok_or_else(|| {
@@ -371,14 +371,14 @@ impl<'s> FromJs<'s> for BufferSource {
 /// reads.
 #[derive(Debug, Clone, Copy)]
 pub struct HostRef<'s, T: 'static> {
-    handle: Scoped<'s>,
+    handle: Local<'s>,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<'s, T: 'static> HostRef<'s, T> {
     /// The underlying scope handle.
     #[must_use]
-    pub fn handle(&self) -> Scoped<'s> {
+    pub fn handle(&self) -> Local<'s> {
         self.handle
     }
 
@@ -403,7 +403,7 @@ impl<'s, T: 'static> HostRef<'s, T> {
 impl<'s, T: 'static> FromJs<'s> for HostRef<'s, T> {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         cx.with_host_data::<T, ()>(v, |_| ())
@@ -419,13 +419,13 @@ impl<'s, T: 'static> FromJs<'s> for HostRef<'s, T> {
 /// re-enters the VM through the call's execution context.
 #[derive(Debug, Clone, Copy)]
 pub struct Callback<'s> {
-    handle: Scoped<'s>,
+    handle: Local<'s>,
 }
 
 impl<'s> Callback<'s> {
     /// The underlying scope handle.
     #[must_use]
-    pub fn handle(&self) -> Scoped<'s> {
+    pub fn handle(&self) -> Local<'s> {
         self.handle
     }
 
@@ -434,9 +434,9 @@ impl<'s> Callback<'s> {
     pub fn call(
         &self,
         cx: &mut MarshalCx<'_, '_, 's>,
-        this_value: Scoped<'_>,
-        args: &[Scoped<'_>],
-    ) -> Result<Scoped<'s>, JsError> {
+        this_value: Local<'_>,
+        args: &[Local<'_>],
+    ) -> Result<Local<'s>, JsError> {
         cx.call(self.handle, this_value, args)
     }
 }
@@ -444,7 +444,7 @@ impl<'s> Callback<'s> {
 impl<'s> FromJs<'s> for Callback<'s> {
     fn from_js(
         cx: &mut MarshalCx<'_, '_, 's>,
-        v: Scoped<'s>,
+        v: Local<'s>,
         ident: ValueIdent<'_>,
     ) -> Result<Self, JsError> {
         if !cx.is_callable(v) {

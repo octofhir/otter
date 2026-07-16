@@ -132,15 +132,15 @@ impl<T: Copy> NativeWindow<T> {
 }
 
 #[derive(Debug)]
-struct NativeFrameRef<'a> {
-    frame: &'a NativeFrame,
+struct NativeFrameRef {
+    frame: NonNull<NativeFrame>,
     registers: NativeWindow<Value>,
     upvalues: NativeWindow<UpvalueCell>,
 }
 
 #[derive(Debug)]
-struct NativeFrameMut<'a> {
-    frame: &'a mut NativeFrame,
+struct NativeFrameMut {
+    frame: NonNull<NativeFrame>,
     registers: NativeWindow<Value>,
     upvalues: NativeWindow<UpvalueCell>,
 }
@@ -148,7 +148,7 @@ struct NativeFrameMut<'a> {
 #[derive(Debug)]
 enum ActiveFrameRefInner<'a> {
     Materialized { frame: &'a Frame, new_target: Value },
-    Native(NativeFrameRef<'a>),
+    Native(NativeFrameRef),
 }
 
 #[derive(Debug)]
@@ -157,7 +157,7 @@ enum ActiveFrameMutInner<'a> {
         frame: &'a mut Frame,
         new_target: Value,
     },
-    Native(NativeFrameMut<'a>),
+    Native(NativeFrameMut),
 }
 
 /// Shared, representation-neutral access to one active JS frame.
@@ -196,26 +196,30 @@ impl<'a> ActiveFrameRef<'a> {
     ///
     /// # Safety
     ///
-    /// `frame` must remain valid and immutable for `'a`. Its non-empty
+    /// `frame` must remain valid for `'a`. Its non-empty
     /// register and upvalue descriptors must point to initialized storage that
-    /// remains live for `'a`; their backing allocations must not move. The
-    /// boxed value fields must contain valid [`Value`] bit patterns.
+    /// remains live for `'a`; their backing allocations must not move. No
+    /// semantic writer may race this activation. The boxed value fields must
+    /// contain valid [`Value`] bit patterns. The returned view retains only raw
+    /// descriptors, so no Rust reference spans a safepoint.
     pub unsafe fn from_native_ptr(frame: *const NativeFrame) -> Result<Self, ActiveFrameError> {
         validate_frame_pointer(frame)?;
-        // SAFETY: upheld by the caller after the null/alignment validation.
-        let frame = unsafe { &*frame };
+        // SAFETY: null and alignment were validated above. The short reference
+        // is used only to copy scalar window descriptors.
+        let frame_ref = unsafe { &*frame };
         let registers = checked_window::<Value>(
-            frame.register_base,
-            usize::from(frame.header.register_count),
+            frame_ref.register_base,
+            usize::from(frame_ref.header.register_count),
             ActiveFrameError::MissingRegisterWindow,
             ActiveFrameError::MisalignedRegisterWindow,
         )?;
         let upvalues = checked_window::<UpvalueCell>(
-            frame.upvalue_base,
-            frame.upvalue_count as usize,
+            frame_ref.upvalue_base,
+            frame_ref.upvalue_count as usize,
             ActiveFrameError::MissingUpvalueSpine,
             ActiveFrameError::MisalignedUpvalueSpine,
         )?;
+        let frame = NonNull::new(frame.cast_mut()).expect("validated native frame pointer");
         Ok(Self {
             inner: ActiveFrameRefInner::Native(NativeFrameRef {
                 frame,
@@ -236,10 +240,12 @@ impl<'a> ActiveFrameRef<'a> {
 
     /// Common frame header.
     #[must_use]
-    pub fn header(&self) -> &VmFrameHeader {
+    pub fn header(&self) -> VmFrameHeader {
         match &self.inner {
-            ActiveFrameRefInner::Materialized { frame, .. } => &frame.header,
-            ActiveFrameRefInner::Native(native) => &native.frame.header,
+            ActiveFrameRefInner::Materialized { frame, .. } => frame.header,
+            // SAFETY: the native-view contract keeps the frame live. Copying
+            // the header ends the raw access before the caller can safepoint.
+            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().header },
         }
     }
 
@@ -299,7 +305,8 @@ impl<'a> ActiveFrameRef<'a> {
     pub fn self_value(&self) -> Value {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => frame.self_value,
-            ActiveFrameRefInner::Native(native) => native.frame.self_value(),
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().self_value() },
         }
     }
 
@@ -308,7 +315,8 @@ impl<'a> ActiveFrameRef<'a> {
     pub fn this_value(&self) -> Value {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => frame.this_value,
-            ActiveFrameRefInner::Native(native) => native.frame.this_value(),
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().this_value() },
         }
     }
 
@@ -317,7 +325,8 @@ impl<'a> ActiveFrameRef<'a> {
     pub fn new_target_value(&self) -> Value {
         match &self.inner {
             ActiveFrameRefInner::Materialized { new_target, .. } => *new_target,
-            ActiveFrameRefInner::Native(native) => native.frame.new_target(),
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameRefInner::Native(native) => unsafe { native.frame.as_ref().new_target() },
         }
     }
 
@@ -367,17 +376,19 @@ impl<'a> ActiveFrameRef<'a> {
         match &self.inner {
             ActiveFrameRefInner::Materialized { frame, .. } => frame.trace_frame_slots(visitor),
             ActiveFrameRefInner::Native(native) => {
-                for bits in [
-                    &native.frame.self_value_bits,
-                    &native.frame.this_value_bits,
-                    &native.frame.new_target_bits,
-                ] {
-                    // SAFETY: Value is transparent over `u64`; native-frame
-                    // publication guarantees valid boxed bits and stop-the-
-                    // world root tracing owns in-place relocation updates.
-                    unsafe {
-                        (&*(std::ptr::from_ref(bits).cast::<Value>())).trace_value_slots(visitor)
-                    };
+                let frame = native.frame.as_ptr();
+                // SAFETY: Value is transparent over `u64`; native-frame
+                // publication guarantees valid boxed bits and stop-the-world
+                // tracing owns each short in-place relocation update. No
+                // reference to the enclosing NativeFrame is retained.
+                for bits in unsafe {
+                    [
+                        std::ptr::addr_of_mut!((*frame).self_value_bits),
+                        std::ptr::addr_of_mut!((*frame).this_value_bits),
+                        std::ptr::addr_of_mut!((*frame).new_target_bits),
+                    ]
+                } {
+                    unsafe { (&mut *bits.cast::<Value>()).trace_value_slot_mut(visitor) };
                 }
                 for index in 0..native.upvalues.len {
                     // SAFETY: the validated published spine remains live for
@@ -414,29 +425,31 @@ impl<'a> ActiveFrameMut<'a> {
     ///
     /// # Safety
     ///
-    /// `frame` must remain valid and exclusively borrowed for `'a`. Its
+    /// `frame` must remain valid for `'a`. Its
     /// register and upvalue descriptors must point to initialized, stable
-    /// storage with exclusive logical mutator ownership for `'a`. The owning
-    /// VM may inspect or relocate published slots during GC, but no independent
-    /// semantic writer may race this activation. No owner may reclaim or move
-    /// either window until the returned view is dropped. Boxed fields must
-    /// contain valid [`Value`] bit patterns.
+    /// storage with exclusive logical mutator ownership for `'a`. No owner may
+    /// reclaim or move either window until the returned view is dropped. Boxed
+    /// fields must contain valid [`Value`] bit patterns. The view retains only
+    /// raw descriptors; each method opens at most one short scalar reference so
+    /// collector root access never aliases a long-lived Rust borrow.
     pub unsafe fn from_native_ptr(frame: *mut NativeFrame) -> Result<Self, ActiveFrameError> {
         validate_frame_pointer(frame.cast_const())?;
-        // SAFETY: upheld by the caller after the null/alignment validation.
-        let frame = unsafe { &mut *frame };
+        // SAFETY: null and alignment were validated above. The short reference
+        // is used only to copy scalar window descriptors.
+        let frame_ref = unsafe { &*frame };
         let registers = checked_window::<Value>(
-            frame.register_base,
-            usize::from(frame.header.register_count),
+            frame_ref.register_base,
+            usize::from(frame_ref.header.register_count),
             ActiveFrameError::MissingRegisterWindow,
             ActiveFrameError::MisalignedRegisterWindow,
         )?;
         let upvalues = checked_window::<UpvalueCell>(
-            frame.upvalue_base,
-            frame.upvalue_count as usize,
+            frame_ref.upvalue_base,
+            frame_ref.upvalue_count as usize,
             ActiveFrameError::MissingUpvalueSpine,
             ActiveFrameError::MisalignedUpvalueSpine,
         )?;
+        let frame = NonNull::new(frame).expect("validated native frame pointer");
         Ok(Self {
             inner: ActiveFrameMutInner::Native(NativeFrameMut {
                 frame,
@@ -471,10 +484,11 @@ impl<'a> ActiveFrameMut<'a> {
 
     /// Common frame header.
     #[must_use]
-    pub fn header(&self) -> &VmFrameHeader {
+    pub fn header(&self) -> VmFrameHeader {
         match &self.inner {
-            ActiveFrameMutInner::Materialized { frame, .. } => &frame.header,
-            ActiveFrameMutInner::Native(native) => &native.frame.header,
+            ActiveFrameMutInner::Materialized { frame, .. } => frame.header,
+            // SAFETY: one copied scalar header under the native-view contract.
+            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().header },
         }
     }
 
@@ -494,7 +508,10 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn set_pc(&mut self, pc: u32) {
         match &mut self.inner {
             ActiveFrameMutInner::Materialized { frame, .. } => frame.header.pc = pc,
-            ActiveFrameMutInner::Native(native) => native.frame.header.pc = pc,
+            // SAFETY: one scalar write under exclusive logical mutator access.
+            ActiveFrameMutInner::Native(native) => unsafe {
+                native.frame.as_mut().header.pc = pc;
+            },
         }
     }
 
@@ -566,7 +583,8 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn self_value(&self) -> Value {
         match &self.inner {
             ActiveFrameMutInner::Materialized { frame, .. } => frame.self_value,
-            ActiveFrameMutInner::Native(native) => native.frame.self_value(),
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().self_value() },
         }
     }
 
@@ -574,7 +592,10 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn set_self_value(&mut self, value: Value) {
         match &mut self.inner {
             ActiveFrameMutInner::Materialized { frame, .. } => frame.self_value = value,
-            ActiveFrameMutInner::Native(native) => native.frame.set_self_value(value),
+            // SAFETY: one scalar write under exclusive logical mutator access.
+            ActiveFrameMutInner::Native(native) => unsafe {
+                native.frame.as_mut().set_self_value(value);
+            },
         }
     }
 
@@ -583,7 +604,8 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn this_value(&self) -> Value {
         match &self.inner {
             ActiveFrameMutInner::Materialized { frame, .. } => frame.this_value,
-            ActiveFrameMutInner::Native(native) => native.frame.this_value(),
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().this_value() },
         }
     }
 
@@ -591,7 +613,10 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn set_this_value(&mut self, value: Value) {
         match &mut self.inner {
             ActiveFrameMutInner::Materialized { frame, .. } => frame.this_value = value,
-            ActiveFrameMutInner::Native(native) => native.frame.set_this_value(value),
+            // SAFETY: one scalar write under exclusive logical mutator access.
+            ActiveFrameMutInner::Native(native) => unsafe {
+                native.frame.as_mut().set_this_value(value);
+            },
         }
     }
 
@@ -600,7 +625,8 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn new_target_value(&self) -> Value {
         match &self.inner {
             ActiveFrameMutInner::Materialized { new_target, .. } => *new_target,
-            ActiveFrameMutInner::Native(native) => native.frame.new_target(),
+            // SAFETY: one scalar read under the native-view contract.
+            ActiveFrameMutInner::Native(native) => unsafe { native.frame.as_ref().new_target() },
         }
     }
 
@@ -670,11 +696,15 @@ impl<'a> ActiveFrameMut<'a> {
                 frame.header.kind = NativeFrameKind::Interpreter;
                 Ok(())
             }
-            ActiveFrameMutInner::Native(native) => native
-                .frame
-                .enter_interpreter()
-                .then_some(())
-                .ok_or(VmError::InvalidOperand),
+            // SAFETY: one non-safepointing scalar state transition.
+            ActiveFrameMutInner::Native(native) => unsafe {
+                native
+                    .frame
+                    .as_mut()
+                    .enter_interpreter()
+                    .then_some(())
+                    .ok_or(VmError::InvalidOperand)
+            },
         }
     }
 
@@ -686,11 +716,15 @@ impl<'a> ActiveFrameMut<'a> {
     pub fn enter_compiled(&mut self, kind: NativeFrameKind) -> Result<(), VmError> {
         match &mut self.inner {
             ActiveFrameMutInner::Materialized { .. } => Err(VmError::InvalidOperand),
-            ActiveFrameMutInner::Native(native) => native
-                .frame
-                .enter_compiled(kind)
-                .then_some(())
-                .ok_or(VmError::InvalidOperand),
+            // SAFETY: one non-safepointing scalar state transition.
+            ActiveFrameMutInner::Native(native) => unsafe {
+                native
+                    .frame
+                    .as_mut()
+                    .enter_compiled(kind)
+                    .then_some(())
+                    .ok_or(VmError::InvalidOperand)
+            },
         }
     }
 }

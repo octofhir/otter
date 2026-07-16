@@ -124,13 +124,12 @@ pub(crate) struct ElementLoadOperands {
     pub(crate) index: u16,
 }
 
-/// Typed element-store operands including the bytecode scratch slot.
+/// Typed element-store operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ElementStoreOperands {
     pub(crate) receiver: u16,
     pub(crate) index: u16,
     pub(crate) value: u16,
-    pub(crate) scratch: u16,
 }
 
 /// Typed update-expression operands.
@@ -830,7 +829,6 @@ impl BaselinePlan {
                     receiver: reg(operands, 0)?,
                     index: reg(operands, 1)?,
                     value: reg(operands, 2)?,
-                    scratch: reg(operands, 3)?,
                 }),
                 Op::Call | Op::New => {
                     let count = const_index(operands, 2)? as usize;

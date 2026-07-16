@@ -140,15 +140,16 @@ pub use structured_clone::{
 };
 pub use surface::{
     RuntimeAccessorSpec, RuntimeAttr, RuntimeClassSpec, RuntimeConstSpec, RuntimeConstValue,
-    RuntimeConstructorSpec, RuntimeHandleScope, RuntimeHostObjectData, RuntimeHostObjectError,
-    RuntimeJsObject, RuntimeJsString, RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall,
-    RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNumberValue,
-    RuntimeObjectBuilder, RuntimePropertySpec, RuntimeScoped, RuntimeSurfaceError, RuntimeValue,
-    runtime_accessor, runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements,
-    runtime_class, runtime_constant, runtime_constructor, runtime_getter, runtime_method,
-    runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
-    runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
-    runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeConstructorSpec, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeJsObject,
+    RuntimeJsString, RuntimeLocal, RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall,
+    RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNativeScope,
+    RuntimeNumberValue, RuntimeObjectBuilder, RuntimePropertySpec, RuntimeSurfaceError,
+    RuntimeValue, runtime_accessor, runtime_alloc_object, runtime_arg_to_string,
+    runtime_array_from_elements, runtime_class, runtime_constant, runtime_constructor,
+    runtime_getter, runtime_method, runtime_method_with_attrs, runtime_namespace,
+    runtime_native_dynamic, runtime_native_static, runtime_optional_arg_to_string,
+    runtime_property, runtime_set_property, runtime_string_value, runtime_this_object,
+    runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
 };
 pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,

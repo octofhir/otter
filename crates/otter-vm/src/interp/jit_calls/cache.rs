@@ -24,8 +24,6 @@ use std::sync::Arc;
 
 use crate::*;
 
-use super::resolve::CallTargetOrigin;
-
 /// One guarded receiver-shape way in a direct-method call-site cache.
 #[derive(Clone)]
 pub(crate) struct JitDirectMethodCache {
@@ -91,30 +89,50 @@ impl Interpreter {
         };
         let current_epoch = self.jit_code_registry.invalidation_epoch();
         let mut resolved = None;
-        for cache in set {
+        for (way, cache) in set.iter().enumerate() {
             let Some(method) = self.cached_direct_method_value(obj, &cache.hit) else {
                 continue;
             };
             if cache.plan_epoch != current_epoch {
                 return Ok(None);
             }
-            resolved = Some((method, cache.function_id, cache.plan, cache.code.clone()));
+            resolved = Some((
+                way,
+                cache.cached_shape_id(),
+                method,
+                cache.function_id,
+                cache.plan,
+                cache.code.clone(),
+            ));
             break;
         }
-        let Some((method, function_id, plan, code)) = resolved else {
+        let Some((way, shape_id, method, function_id, plan, code)) = resolved else {
             return Ok(None);
         };
         let Some(target) = self.resolve_cached_jit_call_target(
             context,
             method,
             recv,
-            CallTargetOrigin::Method,
             function_id,
             plan,
-            code,
+            code.clone(),
         ) else {
             return Ok(None);
         };
+        if !Arc::ptr_eq(&code, &target.code) {
+            let promoted_code = target.code.clone();
+            if let Some(cache) = self
+                .jit_direct_method_cache
+                .get_mut(site)
+                .and_then(|set| set.get_mut(way))
+                && cache.cached_shape_id() == shape_id
+                && cache.function_id == function_id
+                && cache.plan_epoch == current_epoch
+            {
+                cache.code = promoted_code;
+                cache.plan = target.plan;
+            }
+        }
         self.prepare_jit_resolved_call(target, arg_regs, caller_regs)
             .map(Some)
     }

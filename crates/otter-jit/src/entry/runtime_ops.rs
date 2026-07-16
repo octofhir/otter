@@ -14,7 +14,7 @@
 //! - JS values remain in the published frame window across every allocating or
 //!   throwing operation, preserving precise moving-GC roots.
 //! - Arithmetic and coercion entries validate machine-word operands, then use
-//!   the canonical native activation through `JitCtx::active_frame_mut`.
+//!   the VM-owned typed runtime boundary; no VM/container pointer escapes.
 //!
 //! # See also
 //! - `crate::template::code` for metadata ownership.
@@ -47,32 +47,15 @@ pub(super) fn decode_register(raw: u64) -> Result<u16, VmError> {
 }
 
 fn complete_add(ctx: &mut JitCtx, dst: u16, lhs: u16, rhs: u16) -> Result<(), VmError> {
-    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
-    let vm_ptr = activation.vm_ptr();
-    let mut frame = ctx.active_frame_mut()?;
-    // SAFETY: the published activation retains the interpreter for this
-    // compiled entry's dynamic extent. ActiveFrame retains only raw validated
-    // window descriptors, so reconstructing the VM creates no overlapping
-    // `&mut [Value]`; its read/commit operations are slot-scoped.
-    unsafe { &mut *vm_ptr }.jit_runtime_add(&mut frame, dst, lhs, rhs)
+    ctx.runtime_call()?.add(dst, lhs, rhs)
 }
 
 fn complete_neg(ctx: &mut JitCtx, dst: u16, src: u16) -> Result<(), VmError> {
-    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
-    let vm_ptr = activation.vm_ptr();
-    let mut frame = ctx.active_frame_mut()?;
-    // SAFETY: same published-activation contract as `complete_add`.
-    unsafe { &mut *vm_ptr }.jit_runtime_neg(&mut frame, dst, src)
+    ctx.runtime_call()?.neg(dst, src)
 }
 
 fn complete_new_array(ctx: &mut JitCtx, dst: u16, source_regs: &[u16]) -> Result<(), VmError> {
-    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
-    let vm_ptr = activation.vm_ptr();
-    let mut frame = ctx.active_frame_mut()?;
-    // SAFETY: the activation and raw canonical register descriptor remain
-    // published for the complete allocating operation. No register borrow
-    // spans the VM call.
-    unsafe { &mut *vm_ptr }.jit_runtime_new_array(&mut frame, dst, source_regs)
+    ctx.runtime_call()?.new_array(dst, source_regs)
 }
 
 pub(super) extern "C" fn jit_add_stub(ctx: *mut JitCtx, dst: u64, lhs: u64, rhs: u64) -> u64 {
@@ -97,16 +80,9 @@ pub(super) extern "C" fn jit_store_upvalue_checked_stub(
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        let vm_ptr = ctx
-            .checked_activation()
-            .ok_or(VmError::InvalidOperand)?
-            .vm_ptr();
-        let mut frame = ctx.active_frame_mut()?;
         let src = decode_register(src)?;
         let idx = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)? as i32;
-        // SAFETY: the activation retains the VM; ActiveFrame accesses the live
-        // upvalue-handle window one checked slot at a time.
-        unsafe { &mut *vm_ptr }.jit_runtime_store_upvalue_checked(&mut frame, src, idx)
+        ctx.runtime_call()?.store_upvalue_checked(src, idx)
     })();
     park_result(ctx, result)
 }
@@ -165,15 +141,8 @@ pub(super) extern "C" fn jit_fresh_upvalue_stub(ctx: *mut JitCtx, idx: u64) -> u
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let result = (|| {
-        let vm_ptr = ctx
-            .checked_activation()
-            .ok_or(VmError::InvalidOperand)?
-            .vm_ptr();
-        let mut frame = ctx.active_frame_mut()?;
         let idx = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)? as i32;
-        // SAFETY: same activation-owned upvalue-window contract as the checked
-        // store stub.
-        unsafe { &mut *vm_ptr }.jit_runtime_fresh_upvalue(&mut frame, idx)
+        ctx.runtime_call()?.fresh_upvalue(idx)
     })();
     park_result(ctx, result)
 }

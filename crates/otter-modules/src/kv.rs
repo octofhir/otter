@@ -268,13 +268,13 @@ fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
     // the strings into a `Vec` first left every earlier `JsString` unrooted
     // across the later allocations; fill the array through the scope instead so
     // each element is parked the moment it is created.
-    ctx.scope(|ctx, s| {
-        let array = ctx.scoped_array(s, keys.len())?;
+    ctx.scope(|mut scope| {
+        let array = scope.array(keys.len())?;
         for (index, key) in keys.iter().enumerate() {
-            let value = ctx.scoped_string(s, key)?;
-            ctx.scoped_set_index(s, array, index, value)?;
+            let value = scope.string(key)?;
+            scope.set_index(array, index, value)?;
         }
-        Ok::<Value, NativeError>(ctx.escape(array))
+        Ok::<Value, NativeError>(scope.finish(array))
     })
 }
 

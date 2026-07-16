@@ -49,7 +49,7 @@ use crate::{ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, Value};
 use super::cx::MarshalCx;
 use super::error::JsError;
 use super::into_js::IntoJs;
-use crate::handles::Scoped;
+use crate::handles::Local;
 
 /// One-shot settle token for a pending promise created by
 /// [`MarshalCx::promise_pending`]. `Send`; carries no GC handles.
@@ -124,8 +124,8 @@ fn settle_from_root<R: IntoJs>(
         NativeCallInfo::default_call(),
         context.as_ref(),
     );
-    ctx.scope(|ctx, s| {
-        let mut cx = MarshalCx::new(ctx, s);
+    ctx.scope(|scope| {
+        let mut cx = MarshalCx::new(scope);
         // The promise handle must survive the conversion allocations.
         let promise_handle = cx.park(promise_value);
         let settled = match result {
@@ -171,7 +171,7 @@ fn settle_from_root<R: IntoJs>(
 fn reject_reason<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     error: &JsError,
-) -> Result<Scoped<'s>, JsError> {
+) -> Result<Local<'s>, JsError> {
     let (ctor_name, message) = match error {
         JsError::Type(m) => ("TypeError", m.clone()),
         JsError::Range(m) => ("RangeError", m.clone()),
@@ -196,7 +196,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Create a pending promise plus its one-shot [`PromiseCompleter`].
     /// Requires the isolate's host completion sink (installed by the
     /// runtime layer); host-less embeddings get a `TypeError`.
-    pub fn promise_pending(&mut self) -> Result<(Scoped<'s>, PromiseCompleter), JsError> {
+    pub fn promise_pending(&mut self) -> Result<(Local<'s>, PromiseCompleter), JsError> {
         let Some(sink) = self.ctx().interp_mut().host_completion_sink() else {
             return Err(JsError::Type(
                 "async host completions are not available in this embedding".to_string(),
@@ -225,7 +225,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// — an already-ready result settles through the ordinary
     /// pre-settled promise path with no executor round-trip — and
     /// otherwise spawn it on the host executor with a completer.
-    pub fn promise_from_future<R, F>(&mut self, future: F) -> Result<Scoped<'s>, JsError>
+    pub fn promise_from_future<R, F>(&mut self, future: F) -> Result<Local<'s>, JsError>
     where
         R: IntoJs + Send + 'static,
         F: Future<Output = Result<R, JsError>> + Send + 'static,

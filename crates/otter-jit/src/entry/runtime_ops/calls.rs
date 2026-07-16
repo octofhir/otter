@@ -342,7 +342,11 @@ pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
     }
 }
 
-pub(crate) extern "C" fn jit_abort_direct_call_stub(ctx: *mut JitCtx, owner_id: u64) -> u64 {
+pub(crate) extern "C" fn jit_abort_direct_call_stub(
+    ctx: *mut JitCtx,
+    owner_id: u64,
+    entered: u64,
+) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     // SAFETY: direct callees share the caller's initialized error slot.
@@ -352,7 +356,8 @@ pub(crate) extern "C" fn jit_abort_direct_call_stub(ctx: *mut JitCtx, owner_id: 
     // Drop the dead callee's resources before catch materialization can
     // allocate or trigger GC. The trampoline has already restored and
     // published the caller frame, so only caller state may remain live here.
-    let release = unsafe { &mut *ctx.activation().vm_ptr() }.jit_abort_direct_call(owner_id as u32);
+    let release = unsafe { &mut *ctx.activation().vm_ptr() }
+        .jit_abort_direct_call(owner_id as u32, entered != 0);
     if let Err(err) = release {
         park_jit_error(ctx, err);
         return 1;

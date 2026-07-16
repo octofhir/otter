@@ -411,8 +411,8 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
         glue.extend(quote! {
             #signature {
                 #silence_caps
-                ctx.scope(|ctx, __s| {
-                    let mut __cx = ::otter_runtime::marshal::MarshalCx::new(ctx, __s);
+                ctx.scope(|__scope| {
+                    let mut __cx = ::otter_runtime::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     #output
                 })

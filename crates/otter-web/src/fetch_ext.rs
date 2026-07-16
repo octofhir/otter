@@ -26,8 +26,8 @@ use std::sync::Arc;
 use otter_runtime::marshal::{IntoJs, JsError, MarshalCx};
 use otter_runtime::web_fetch_host::{FetchRequest, FetchResponseHead, ResponseBody, prepare_fetch};
 use otter_runtime::{
-    CapabilitySet, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeScoped as Scoped, RuntimeValue as Value,
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeValue as Value,
 };
 
 /// One streamed body chunk: `Some` bytes become a `Uint8Array`, end-of-stream
@@ -35,7 +35,7 @@ use otter_runtime::{
 struct ChunkResult(Option<Vec<u8>>);
 
 impl IntoJs for ChunkResult {
-    fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Scoped<'s>, JsError> {
+    fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Local<'s>, JsError> {
         match self.0 {
             Some(bytes) => cx.uint8_array_from_bytes(bytes),
             None => Ok(cx.null()),
@@ -53,7 +53,7 @@ struct StreamingHead {
 }
 
 impl IntoJs for StreamingHead {
-    fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Scoped<'s>, JsError> {
+    fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Local<'s>, JsError> {
         let StreamingHead { head, body } = self;
         let array = cx.array(5)?;
         let status = cx.number(f64::from(head.status));
@@ -80,8 +80,8 @@ impl IntoJs for StreamingHead {
                 Default::default(),
                 move |ctx, _args, _captures| {
                     let body = body.clone();
-                    ctx.scope(|ctx, scope| {
-                        let mut cx = MarshalCx::new(ctx, scope);
+                    ctx.scope(|scope| {
+                        let mut cx = MarshalCx::new(scope);
                         let future = async move {
                             body.pull().await.map(ChunkResult).map_err(JsError::Type)
                         };
@@ -114,8 +114,8 @@ pub fn native_fetch(
     let net = caps.net.clone();
     let user_agent = format!("Otter/{}", env!("CARGO_PKG_VERSION"));
 
-    ctx.scope(|ctx, scope| {
-        let mut cx = MarshalCx::new(ctx, scope);
+    ctx.scope(|scope| {
+        let mut cx = MarshalCx::new(scope);
 
         let method_handle = cx.park(arg(0));
         let method = cx.as_string_lossy(method_handle).unwrap_or_default();

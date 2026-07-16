@@ -13,8 +13,8 @@
 //!   the complete machine-code dynamic extent.
 //! - Any setup error rolls back both the register cursor and synchronous
 //!   re-entry before it escapes.
-//! - Dynamic closure state (upvalues, `this`, and SELF) belongs to this call and
-//!   is never retained in a call-site cache.
+//! - Dynamic closure state (borrowed upvalues, `this`, and exact SELF) belongs
+//!   to this call and is never retained in a call-site cache.
 //! - Successful preparation constructs no [`Frame`] and touches no
 //!   [`HoltStack`]. Generated code publishes the returned owner id in its
 //!   stack-local [`NativeFrame`] before the next possible GC boundary.
@@ -36,16 +36,16 @@ use crate::*;
 pub(crate) struct ResolvedCallTarget<'a> {
     /// Authoritative executable metadata for owner construction.
     pub(crate) function: &'a crate::executable::CodeBlock,
-    /// Captured cells derived from the current callable value.
-    pub(crate) parent_upvalues: crate::frame_state::UpvalueSpine,
+    /// Allocation-neutral captured cells derived from the current callable.
+    pub(crate) parent_upvalues: crate::upvalue_source::UpvalueSource,
+    /// Exact callable instance. It is rooted through every preparation
+    /// allocation and published as native SELF, keeping borrowed cells alive.
+    pub(crate) self_value: Value,
     /// Effective receiver after non-allocating direct-call binding. Sloppy
     /// primitive receivers are rejected to the generic path before this point.
     pub(crate) this_value: Value,
     /// Scalar compiled-entry and frame-layout metadata.
     pub(crate) plan: jit::JitDirectCallPlan,
-    /// Caller register holding the plain callee, used to re-read named SELF
-    /// after allocation. Method resolution carries its callable separately.
-    pub(crate) callee_reg: Option<u16>,
     /// Strong lifetime anchor upgraded/selected by the resolver. It remains
     /// live until prepare returns the stable entry-cell address to generated
     /// code; the registry owns the generation and native entry takes a lease.
@@ -66,13 +66,15 @@ impl Interpreter {
         arg_regs: &[u16],
         caller_regs: *const Value,
     ) -> Result<jit::JitPreparedDirectCall, VmError> {
+        let tier = target.code.native_frame_kind();
         self.enter_sync_reentry()?;
         let prepared = self.prepare_jit_direct_call_owner(
             target.function,
             target.parent_upvalues,
+            target.self_value,
             target.this_value,
             target.plan,
-            target.callee_reg,
+            tier,
             arg_regs,
             caller_regs,
         );
@@ -82,8 +84,6 @@ impl Interpreter {
                 // linkage immediately acquires its registry-owned entry cell
                 // before branching to native code.
                 drop(target.code);
-                self.jit_runtime_stats.direct_calls =
-                    self.jit_runtime_stats.direct_calls.saturating_add(1);
                 Ok(prepared)
             }
             Err(err) => {
@@ -102,13 +102,11 @@ impl Interpreter {
     fn prepare_jit_direct_call_owner(
         &mut self,
         function: &crate::executable::CodeBlock,
-        parent_upvalues: crate::frame_state::UpvalueSpine,
-        this_for_callee: Value,
+        parent_upvalues: crate::upvalue_source::UpvalueSource,
+        mut self_value: Value,
+        mut this_for_callee: Value,
         plan: jit::JitDirectCallPlan,
-        // `Some(reg)` for `Op::Call`: the callee closure lives in a caller
-        // register and is re-read post-allocation for the named SELF binding.
-        // Method resolution passes `None` and rejects `makes_function` targets.
-        callee_reg: Option<u16>,
+        tier: crate::native_abi::NativeFrameKind,
         arg_regs: &[u16],
         // Base of the caller's live register window (`JitCtx.regs`). It may be
         // a framed window or a frameless register-stack window; both are stable
@@ -120,44 +118,36 @@ impl Interpreter {
         let read_caller = |reg: u16| -> Value { unsafe { *caller_regs.add(reg as usize) } };
 
         // Resolution already applied the complete non-allocating receiver
-        // policy. A sloppy primitive receiver was rejected to the generic path,
-        // so no cloned upvalue handle crosses an untracked GC boundary here.
+        // policy. Inherited-only closures publish their stable source directly;
+        // fresh own cells create exactly one final owned spine.
         let upvalues = if function.own_upvalue_count == 0 {
-            parent_upvalues
+            crate::native_call_owners::NativeCallUpvalues::borrowed(parent_upvalues)
         } else {
-            // No owner exists yet. Keep the effective receiver rewriteable
-            // while fresh cells allocate; the builder separately roots the
-            // inherited and already-created upvalue handles.
+            // No owner exists yet. Keep the exact closure and effective
+            // receiver rewriteable while fresh cells allocate. Rooting SELF
+            // also keeps the borrowed closure vector allocation alive.
             let mut build_roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                this_for_callee.trace_value_slots(visitor);
+                self_value.trace_value_slot_mut(visitor);
+                this_for_callee.trace_value_slot_mut(visitor);
             };
-            Frame::build_upvalues_for_exec_with_roots(
+            let owned = Frame::build_upvalues_for_exec_from_source_with_roots(
                 &mut self.gc_heap,
                 function,
                 parent_upvalues,
                 &mut build_roots,
-            )?
+            )?;
+            crate::native_call_owners::NativeCallUpvalues::owned(owned)
         };
         let window_rollback = self.register_window_rollback();
         let mut window = self.alloc_reg_window(usize::from(plan.register_count))?;
         for (dst_slot, &src) in window.iter_mut().zip(arg_regs.iter()).take(bind_count) {
             *dst_slot = read_caller(src);
         }
-        // Re-read plain-call SELF after every possible GC. Method targets which
-        // could observe a dynamic SELF binding are rejected during resolution.
-        let self_value = callee_reg
-            .map(read_caller)
-            .unwrap_or_else(|| Value::function(function.id));
         let self_closure_bits = self_value.to_bits();
         let this_bits = this_for_callee.to_bits();
         let (upvalues_ptr, upvalue_count) = {
-            let count = u32::try_from(upvalues.len()).map_err(|_| VmError::InvalidOperand)?;
-            let base = if upvalues.is_empty() {
-                0
-            } else {
-                upvalues.as_ptr() as usize
-            };
-            (base, count)
+            let source = upvalues.source();
+            (source.base_ptr_or_null() as usize, source.len_u32())
         };
 
         // This is the publication point. Nothing above can leave a half-owned
@@ -167,6 +157,7 @@ impl Interpreter {
             self.native_call_owners
                 .push(crate::native_call_owners::NativeCallOwner {
                     function_id: function.id,
+                    tier,
                     registers: window,
                     upvalues,
                 })?;

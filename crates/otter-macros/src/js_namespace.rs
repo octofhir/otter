@@ -360,8 +360,8 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
                 ctx: &mut ::otter_vm::NativeCtx<'_>,
                 args: &[::otter_vm::Value],
             ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
-                ctx.scope(|ctx, __s| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                ctx.scope(|__scope| {
+                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     #output
                 })

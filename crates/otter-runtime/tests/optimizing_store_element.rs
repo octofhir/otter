@@ -12,7 +12,8 @@
 //! - Final store, read-modify-write, growth, and throw calls all enter already
 //!   optimized functions in the tiered run.
 //! - Array mutation remains owned by `STUB_JIT_STORE_ELEMENT`; optimized code
-//!   only materializes its precise interpreter-window transition protocol.
+//!   delegates through the canonical active frame without materializing an
+//!   interpreter activation.
 //!
 //! # See also
 //! - `crates/otter-difftest/corpus/arrays_typed.js` exercises the same float

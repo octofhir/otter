@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Interpreter, JsObject, JsString, Scoped, Value, VmError, VmGetOutcome,
+    ExecutionContext, Interpreter, JsObject, JsString, Local, Value, VmError, VmGetOutcome,
     VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata, object, proxy,
     regexp_prototype, string, symbol, to_length,
 };
@@ -2652,12 +2652,12 @@ impl Interpreter {
         name: &str,
     ) -> Result<(), VmError> {
         self.with_handle_scope(|interp, scope| {
-            let key_handles: Vec<Scoped> = keys
+            let key_handles: Vec<Local> = keys
                 .iter()
                 .map(|k| interp.scoped_value(scope, *k))
                 .collect();
             let target_handle = interp.scoped_value(scope, *target);
-            let symbol_handles: Vec<Scoped> = symbols
+            let symbol_handles: Vec<Local> = symbols
                 .iter()
                 .map(|s| interp.scoped_value(scope, *s))
                 .collect();
@@ -5817,6 +5817,20 @@ impl Interpreter {
             return self.ordinary_set_data_value(context, parent, key, value, receiver, hops + 1);
         }
         if let Some(obj) = target.as_object() {
+            // §7.3.28 PrivateSet — installing a new private element is a hard
+            // TypeError on a non-extensible object, independent of the
+            // caller's strict-mode assignment policy. Keep this in the
+            // value-level `[[Set]]` authority so interpreter and compiled
+            // computed stores cannot diverge.
+            if let VmPropertyKey::Symbol(sym) = key
+                && sym.is_private_name()
+                && object::get_own_symbol_descriptor(obj, &self.gc_heap, *sym).is_none()
+                && !object::is_extensible(obj, &self.gc_heap)
+            {
+                return Err(self.err_type(
+                    ("Cannot define private member on a non-extensible object".to_string()).into(),
+                ));
+            }
             if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
                 && !desc.writable()
             {

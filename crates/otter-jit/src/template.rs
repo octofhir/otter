@@ -481,7 +481,6 @@ mod tests {
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::Register(2),
-                    Operand::Register(3),
                 ],
             ),
             (Op::ReturnValue, vec![Operand::Register(0)]),

@@ -192,13 +192,11 @@ pub(crate) enum TemplateOp {
     },
     /// `r<dst> = r<receiver>[r<index>]`.
     LoadElement { dst: u16, receiver: u16, index: u16 },
-    /// `r<receiver>[r<index>] = r<value>` (`scratch` is the bytecode scratch
-    /// slot the runtime operation owns).
+    /// `r<receiver>[r<index>] = r<value>`.
     StoreElement {
         receiver: u16,
         index: u16,
         value: u16,
-        scratch: u16,
     },
     /// `r<dst> = upvalue[index]` (captured binding; TDZ raises in the VM).
     LoadUpvalue { dst: u16, index: i32 },
@@ -805,7 +803,6 @@ impl TemplatePlan {
                         receiver: operands.receiver,
                         index: operands.index,
                         value: operands.value,
-                        scratch: operands.scratch,
                     }
                 }
                 Op::LoadUpvalue => {

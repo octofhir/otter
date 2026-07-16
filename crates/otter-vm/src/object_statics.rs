@@ -35,7 +35,7 @@ use crate::object::{
 };
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
-use crate::{NativeCtx, NativeError, Scoped, Value, VmError};
+use crate::{Local, NativeCtx, NativeError, Value, VmError};
 
 enum PropertyKey {
     String(String),
@@ -2124,11 +2124,11 @@ pub fn call(
                 // by the key-string and pair allocations below. The arena keeps
                 // each current across every collection those allocations drive.
                 let target_h = interp.scoped_value(scope, Value::object(target));
-                let value_handles: Vec<Scoped> = raw
+                let value_handles: Vec<Local> = raw
                     .iter()
                     .map(|(_, v)| interp.scoped_value(scope, *v))
                     .collect();
-                let mut pair_handles: Vec<Scoped> = Vec::with_capacity(raw.len());
+                let mut pair_handles: Vec<Local> = Vec::with_capacity(raw.len());
                 for ((k, _), value_h) in raw.iter().zip(value_handles) {
                     let key_h = interp.scoped_string(scope, k)?;
                     // Resolve through the arena immediately before the pair

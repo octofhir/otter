@@ -19,8 +19,8 @@ use super::{
 fn with_cx<R>(f: impl FnOnce(&mut MarshalCx<'_, '_, '_>) -> R) -> R {
     let mut interp = Interpreter::new();
     let mut ctx = NativeCtx::new(&mut interp);
-    ctx.scope(|ctx, s| {
-        let mut cx = MarshalCx::new(ctx, s);
+    ctx.scope(|scope| {
+        let mut cx = MarshalCx::new(scope);
         f(&mut cx)
     })
 }

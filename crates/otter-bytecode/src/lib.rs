@@ -1633,8 +1633,8 @@ impl Op {
             // operands.
             Op::NewArray => 2,
             Op::LoadElement | Op::DeleteElement => 3,
-            // recv, key, src, scratch_dst for accessor setters.
-            Op::StoreElement => 4,
+            // recv, key, src.
+            Op::StoreElement => 3,
             Op::CallMethodValue => 4,    // dst, recv, name_const, argc
             Op::MathCall => 3,           // dst, method_id, argc — args follow
             Op::ForInKeys => 2,          // dst, obj

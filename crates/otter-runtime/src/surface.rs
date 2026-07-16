@@ -32,18 +32,12 @@ pub type RuntimeJsObject = otter_vm::JsObject;
 pub type RuntimeValue = otter_vm::Value;
 /// Runtime-owned native context alias.
 pub type RuntimeNativeCtx<'rt> = otter_vm::NativeCtx<'rt>;
-/// Runtime-owned handle-scope token alias.
-///
-/// Opened by [`RuntimeNativeCtx::scope`]; a [`RuntimeScoped`] minted inside the
-/// scope closure cannot escape it. See [`otter_vm::handles`] for the rooting
-/// contract these types enforce.
-pub type RuntimeHandleScope = otter_vm::HandleScope;
-/// Runtime-owned scoped handle alias.
-///
-/// A `Copy` index handle whose `'s` lifetime pins it inside the
-/// [`RuntimeHandleScope`] that created it, so a moving collection can never turn
-/// it into a stale offset.
-pub type RuntimeScoped<'s> = otter_vm::Scoped<'s>;
+/// Runtime-owned native scope. The collector token is private; contributors
+/// allocate and access values only through this mutator-bound view.
+pub type RuntimeNativeScope<'s, 'rt> = otter_vm::NativeScope<'s, 'rt>;
+/// Runtime-owned local handle. Its lifetime pins it inside the active native
+/// scope, so moving collection rewrites remain invisible to contributor code.
+pub type RuntimeLocal<'s> = otter_vm::Local<'s>;
 /// Runtime-owned native error alias.
 pub type RuntimeNativeError = otter_vm::NativeError;
 /// Runtime-owned native fast function pointer.

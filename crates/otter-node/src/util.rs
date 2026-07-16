@@ -137,34 +137,22 @@ pub fn util_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<
     {
         return Ok(Value::object(cached));
     }
+    let export = otter_runtime::run_builtin_cjs_shim(ctx, "node:util", SHIM, &[])?;
     let export = ctx
-        .scope(|ctx, scope| {
-            let export = otter_runtime::run_builtin_cjs_shim(ctx, "node:util", SHIM, &[]).map_err(
-                |reason| NativeError::TypeError {
-                    name: "node:util",
-                    reason,
-                },
-            )?;
-            let export = ctx.scoped_value(scope, export);
-            let callsites =
-                ctx.scoped_native_method(scope, "captureCallSites", 2, capture_call_sites)?;
+        .scope(|mut scope| {
+            let export = scope.value(export);
+            let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
             let typed_arrays_equal =
-                ctx.scoped_native_method(scope, "typedArraysEqual", 2, typed_arrays_equal)?;
+                scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
             let flags = Attr {
                 writable: false,
                 enumerable: false,
                 configurable: false,
             }
             .to_flags();
-            ctx.scoped_define_data(scope, export, "__otterCaptureCallSites", callsites, flags)?;
-            ctx.scoped_define_data(
-                scope,
-                export,
-                "__otterTypedArraysEqual",
-                typed_arrays_equal,
-                flags,
-            )?;
-            Ok::<Value, NativeError>(ctx.escape(export))
+            scope.define(export, "__otterCaptureCallSites", callsites, flags)?;
+            scope.define(export, "__otterTypedArraysEqual", typed_arrays_equal, flags)?;
+            Ok::<Value, NativeError>(scope.finish(export))
         })
         .map_err(|err| err.to_string())?;
     let export_object = export

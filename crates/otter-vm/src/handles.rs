@@ -7,20 +7,20 @@
 //! into every allocating call and re-read afterwards" contract with a single
 //! rooted store — the [`HandleArena`] — that the collector rewrites in place.
 //!
-//! A [`Scoped`] handle carries only an index into that store, never a cached
+//! A [`Local`] handle carries only an index into that store, never a cached
 //! payload, so every read resolves through the current slot and can never be
-//! stale. Handles are minted inside [`Interpreter::with_handle_scope`], which
-//! owns the arena range it opened and truncates back to it on return or panic,
-//! so a
-//! `Scoped` cannot outlive the scope that created it (the `'s` lifetime pins
-//! it) and can never dangle.
+//! stale. Contributor-facing handles are minted by [`crate::NativeScope`]
+//! inside [`crate::NativeCtx::scope`]. The internal scope frame owns the arena
+//! range it opened and truncates back to it on return or panic, so a `Local`
+//! cannot outlive the scope that created it (the `'s` lifetime pins it) and can
+//! never dangle.
 //!
 //! # Contents
 //!
 //! - [`HandleArena`] — contiguous, collector-traced handle storage; one per
 //!   [`Interpreter`].
 //! - [`HandleScope`] — a scope token owning an arena range `[base, len)`.
-//! - [`Scoped`] — a `Copy` index handle whose lifetime pins it to its scope.
+//! - [`Local`] — a `Copy` index handle whose lifetime pins it to its scope.
 //!
 //! # Invariants
 //!
@@ -35,7 +35,7 @@
 //!   range the scope opened, never slots an outer scope owns. Nesting is free —
 //!   an inner scope's `base` is the current arena length, and its truncate
 //!   leaves every outer slot in place.
-//! - A `Scoped` never caches a payload; it is only an arena index. Reads go
+//! - A `Local` never caches a payload; it is only an arena index. Reads go
 //!   through [`HandleArena::get`], which the collector keeps live.
 //! - A scoped write may box a wide number inside the callee (`object::set` and
 //!   its symbol/define variants), and that box allocation traces only the
@@ -95,7 +95,7 @@ impl HandleArena {
 
     /// Overwrite the value parked at `idx`. Test-only: production writes never
     /// re-park a handle, because the only way a parked object relocates is a
-    /// collection that rewrites its slot in place (see [`Interpreter::scoped_set`]).
+    /// collection that rewrites its slot in place (see [`crate::NativeScope::set`]).
     #[cfg(test)]
     pub(crate) fn set(&mut self, idx: u32, v: Value) {
         self.slots[idx as usize] = v;
@@ -116,12 +116,13 @@ impl HandleArena {
     }
 }
 
-/// Scope token. Created only by [`crate::Interpreter::with_handle_scope`]; owns
-/// the arena range `[base, len)`, which is truncated when the scope exits.
+/// Internal scope token. Created by the handle-scope frame behind
+/// [`crate::NativeCtx::scope`]; owns the arena range `[base, len)`, which is
+/// truncated when the scope exits.
 ///
 /// Kept private-constructible so user code cannot forge one and hand a
-/// [`Scoped`] a range it does not own.
-pub struct HandleScope {
+/// [`Local`] a range it does not own.
+pub(crate) struct HandleScope {
     // Read only by the test-only `base()` accessor today; the scope wrappers
     // truncate from the `base` value they captured on entry, not the field.
     #[allow(dead_code)]
@@ -190,7 +191,7 @@ impl Drop for HandleScopeFrame {
 /// lifetime pins it inside the [`HandleScope`] that created it, so it cannot
 /// escape the `with_handle_scope` closure and can never dangle.
 ///
-/// The lifetime makes escape a compile error. A `Scoped` cannot be returned out
+/// The lifetime makes escape a compile error. A `Local` cannot be returned out
 /// of the scope closure — the closure result type cannot name the scope's
 /// higher-ranked lifetime:
 ///
@@ -204,8 +205,8 @@ impl Drop for HandleScopeFrame {
 ///     None,
 /// );
 /// // Returning the handle from the closure fails to compile: `scope`'s result
-/// // type is fixed and cannot capture the `&HandleScope` token's lifetime.
-/// let escaped = ctx.scope(|ctx, s| ctx.scoped_object(s).unwrap());
+/// // type is fixed and cannot capture the scope's lifetime.
+/// let escaped = ctx.scope(|mut scope| scope.object().unwrap());
 /// let _ = escaped;
 /// ```
 ///
@@ -221,20 +222,20 @@ impl Drop for HandleScopeFrame {
 ///     None,
 /// );
 /// let mut leaked = None;
-/// ctx.scope(|ctx, s| {
+/// ctx.scope(|mut scope| {
 ///     // Storing the handle into a binding declared outside the scope would let
 ///     // it outlive the arena range it indexes — the borrow checker rejects it.
-///     leaked = Some(ctx.scoped_object(s).unwrap());
+///     leaked = Some(scope.object().unwrap());
 /// });
 /// let _ = leaked;
 /// ```
 #[derive(Debug, Clone, Copy)]
-pub struct Scoped<'s> {
+pub struct Local<'s> {
     idx: u32,
     _scope: PhantomData<&'s HandleScope>,
 }
 
-impl<'s> Scoped<'s> {
+impl<'s> Local<'s> {
     /// Wrap an arena index as a handle pinned to scope `'s`.
     pub(crate) fn new(idx: u32) -> Self {
         Self {
@@ -252,17 +253,17 @@ impl<'s> Scoped<'s> {
 /// Scope entry point and scoped allocation/access built on the arena.
 ///
 /// These are the surface VM-internal callers use to build JS values without
-/// hand-threading `value_roots`. They back the native-context surface
-/// ([`crate::NativeCtx::scope`] and its `scoped_*` methods) and
-/// interpreter-internal adoption.
+/// hand-threading `value_roots`. They are the private backend for
+/// [`crate::NativeScope`]'s `Local`-based builders and interpreter-internal
+/// adoption.
 impl Interpreter {
     /// Open a handle scope, run `f`, then truncate the arena back to the length
     /// it had on entry.
     ///
-    /// Handles minted inside `f` (via `scoped_*`) borrow the `&HandleScope`
-    /// token, not the interpreter, so allocating calls interleave freely with
-    /// live handles. The `'s` lifetime pins every [`Scoped`] to the closure, so
-    /// none can escape. An RAII frame restores both the arena and temporary
+    /// Backend handles minted inside `f` borrow the `&HandleScope` token, not
+    /// the interpreter, so allocating calls interleave freely with live
+    /// handles. The `'s` lifetime pins every [`Local`] to the closure, so none
+    /// can escape. An RAII frame restores both the arena and temporary
     /// runtime-root registration on ordinary return, early `?`, or panic.
     ///
     /// Interpreter-internal reflection paths (e.g.
@@ -309,10 +310,10 @@ impl Interpreter {
     }
 
     /// Root an incoming raw `Value` in the current scope and hand back a
-    /// [`Scoped`] handle to it.
-    pub(crate) fn scoped_value<'s>(&mut self, _scope: &'s HandleScope, value: Value) -> Scoped<'s> {
+    /// [`Local`] handle to it.
+    pub(crate) fn scoped_value<'s>(&mut self, _scope: &'s HandleScope, value: Value) -> Local<'s> {
         let idx = self.handle_arena.push(value);
-        Scoped::new(idx)
+        Local::new(idx)
     }
 
     /// Allocate a string and park it in the current scope.
@@ -324,7 +325,7 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         text: &str,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let string = JsString::from_str(text, &mut self.gc_heap)?;
         Ok(self.scoped_value(scope, Value::string(string)))
     }
@@ -362,7 +363,7 @@ impl Interpreter {
     pub(crate) fn scoped_object<'s>(
         &mut self,
         scope: &'s HandleScope,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         // Install the prototype only after the allocation: the object alloc can
         // drive a scavenge that relocates the realm prototype while it is still
@@ -381,7 +382,7 @@ impl Interpreter {
     pub(crate) fn scoped_object_bare<'s>(
         &mut self,
         scope: &'s HandleScope,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         Ok(self.scoped_value(scope, Value::object(object)))
     }
@@ -393,7 +394,7 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         len: usize,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let roots = self.collect_runtime_roots();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -421,7 +422,7 @@ impl Interpreter {
     pub(crate) fn scoped_collection_set<'s>(
         &mut self,
         scope: &'s HandleScope,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let roots = self.collect_runtime_roots();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -437,9 +438,9 @@ impl Interpreter {
     pub(crate) fn scoped_proxy<'s>(
         &mut self,
         scope: &'s HandleScope,
-        target: Scoped<'_>,
-        handler: Scoped<'_>,
-    ) -> Result<Scoped<'s>, VmError> {
+        target: Local<'_>,
+        handler: Local<'_>,
+    ) -> Result<Local<'s>, VmError> {
         let target = self.handle_arena.get(target.index());
         let handler = self.handle_arena.get(handler.index());
         if !target.is_object_type() || !handler.is_object_type() {
@@ -466,12 +467,12 @@ impl Interpreter {
     /// Park an `f64` number in the current scope. Numbers are NaN-boxed
     /// immediates, so this never allocates; it exists so number construction
     /// reads the same as every other scoped creation.
-    pub(crate) fn scoped_number<'s>(&mut self, scope: &'s HandleScope, n: f64) -> Scoped<'s> {
+    pub(crate) fn scoped_number<'s>(&mut self, scope: &'s HandleScope, n: f64) -> Local<'s> {
         self.scoped_value(scope, Value::number_f64(n))
     }
 
     /// Park a boolean immediate in the current scope.
-    pub(crate) fn scoped_boolean<'s>(&mut self, scope: &'s HandleScope, b: bool) -> Scoped<'s> {
+    pub(crate) fn scoped_boolean<'s>(&mut self, scope: &'s HandleScope, b: bool) -> Local<'s> {
         self.scoped_value(scope, Value::boolean(b))
     }
 
@@ -483,7 +484,7 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         n: i64,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         self.scoped_bigint_i128(scope, i128::from(n))
     }
 
@@ -493,18 +494,18 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         n: i128,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let bigint = crate::bigint::BigIntValue::from_i128(&mut self.gc_heap, n)?;
         Ok(self.scoped_value(scope, Value::big_int(bigint)))
     }
 
     /// Park the `undefined` immediate in the current scope.
-    pub(crate) fn scoped_undefined<'s>(&mut self, scope: &'s HandleScope) -> Scoped<'s> {
+    pub(crate) fn scoped_undefined<'s>(&mut self, scope: &'s HandleScope) -> Local<'s> {
         self.scoped_value(scope, Value::undefined())
     }
 
     /// Park the `null` immediate in the current scope.
-    pub(crate) fn scoped_null<'s>(&mut self, scope: &'s HandleScope) -> Scoped<'s> {
+    pub(crate) fn scoped_null<'s>(&mut self, scope: &'s HandleScope) -> Local<'s> {
         self.scoped_value(scope, Value::null())
     }
 
@@ -519,7 +520,7 @@ impl Interpreter {
         name: &'static str,
         length: u8,
         call: crate::native_function::NativeFastFn,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let roots = self.collect_runtime_roots();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -542,9 +543,9 @@ impl Interpreter {
     pub(crate) fn scoped_get<'s>(
         &mut self,
         scope: &'s HandleScope,
-        obj: Scoped<'_>,
+        obj: Local<'_>,
         key: &str,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let object = self
             .handle_arena
             .get(obj.index())
@@ -566,9 +567,9 @@ impl Interpreter {
     pub(crate) fn scoped_set(
         &mut self,
         _scope: &HandleScope,
-        obj: Scoped<'_>,
+        obj: Local<'_>,
         key: &str,
-        value: Scoped<'_>,
+        value: Local<'_>,
     ) -> Result<(), VmError> {
         let mut object = self
             .handle_arena
@@ -587,9 +588,9 @@ impl Interpreter {
     pub(crate) fn scoped_set_symbol(
         &mut self,
         _scope: &HandleScope,
-        obj: Scoped<'_>,
+        obj: Local<'_>,
         key: crate::symbol::JsSymbol,
-        value: Scoped<'_>,
+        value: Local<'_>,
     ) -> Result<(), VmError> {
         let object = self
             .handle_arena
@@ -613,8 +614,8 @@ impl Interpreter {
     pub(crate) fn scoped_object_with_proto<'s>(
         &mut self,
         scope: &'s HandleScope,
-        proto: Scoped<'_>,
-    ) -> Result<Scoped<'s>, VmError> {
+        proto: Local<'_>,
+    ) -> Result<Local<'s>, VmError> {
         let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
         let handle = self.scoped_value(scope, Value::object(object));
         let proto_obj = self.handle_arena.get(proto.index()).as_object();
@@ -636,9 +637,9 @@ impl Interpreter {
     pub(crate) fn scoped_define_symbol(
         &mut self,
         _scope: &HandleScope,
-        obj: Scoped<'_>,
-        key: Scoped<'_>,
-        value: Scoped<'_>,
+        obj: Local<'_>,
+        key: Local<'_>,
+        value: Local<'_>,
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
         let object = self
@@ -678,7 +679,7 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         desc: &crate::object::PropertyDescriptor,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         use crate::object::DescriptorKind;
         let (value_h, get_h, set_h) = match &desc.kind {
             DescriptorKind::Data { value } => (Some(self.scoped_value(scope, *value)), None, None),
@@ -714,9 +715,9 @@ impl Interpreter {
     pub(crate) fn scoped_define_data(
         &mut self,
         _scope: &HandleScope,
-        obj: Scoped<'_>,
+        obj: Local<'_>,
         key: &str,
-        value: Scoped<'_>,
+        value: Local<'_>,
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
@@ -744,8 +745,8 @@ impl Interpreter {
     pub(crate) fn scoped_set_call_native(
         &mut self,
         _scope: &HandleScope,
-        obj: Scoped<'_>,
-        call: Scoped<'_>,
+        obj: Local<'_>,
+        call: Local<'_>,
     ) -> Result<(), VmError> {
         let object = self
             .handle_arena
@@ -762,8 +763,8 @@ impl Interpreter {
     pub(crate) fn scoped_set_prototype(
         &mut self,
         _scope: &HandleScope,
-        obj: Scoped<'_>,
-        prototype: Option<Scoped<'_>>,
+        obj: Local<'_>,
+        prototype: Option<Local<'_>>,
     ) -> Result<(), VmError> {
         let object = self
             .handle_arena
@@ -789,9 +790,9 @@ impl Interpreter {
     pub(crate) fn scoped_set_index(
         &mut self,
         _scope: &HandleScope,
-        arr: Scoped<'_>,
+        arr: Local<'_>,
         index: usize,
-        value: Scoped<'_>,
+        value: Local<'_>,
     ) -> Result<(), VmError> {
         let array = self
             .handle_arena
@@ -814,9 +815,9 @@ impl Interpreter {
     pub(crate) fn scoped_get_index<'s>(
         &mut self,
         scope: &'s HandleScope,
-        arr: Scoped<'_>,
+        arr: Local<'_>,
         index: usize,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let array = self
             .handle_arena
             .get(arr.index())
@@ -833,7 +834,7 @@ impl Interpreter {
 
     /// Read the current logical length of the array behind `arr`, resolving
     /// the handle through the arena at call time.
-    pub(crate) fn scoped_array_length(&self, arr: Scoped<'_>) -> Result<usize, VmError> {
+    pub(crate) fn scoped_array_length(&self, arr: Local<'_>) -> Result<usize, VmError> {
         let array = self
             .handle_arena
             .get(arr.index())
@@ -845,7 +846,7 @@ impl Interpreter {
     /// Read the current raw `Value` behind a scope handle for immediate
     /// hand-off across the scope boundary (returning to the VM, or storing into
     /// an already-rooted object). Valid until the next allocation.
-    pub(crate) fn escape_scoped(&self, handle: Scoped<'_>) -> Value {
+    pub(crate) fn escape_scoped(&self, handle: Local<'_>) -> Value {
         self.handle_arena.get(handle.index())
     }
 }
@@ -880,7 +881,7 @@ impl Interpreter {
     /// through a registered extra-roots provider — the handle arena — which the
     /// host-side scope is responsible for installing. Used to prove the
     /// set-boxing hole is closed at the scope boundary.
-    pub(crate) fn collect_minor_rooting_only_receiver(&mut self, receiver: Scoped<'_>) {
+    pub(crate) fn collect_minor_rooting_only_receiver(&mut self, receiver: Local<'_>) {
         let mut raw = self
             .handle_arena
             .get(receiver.index())

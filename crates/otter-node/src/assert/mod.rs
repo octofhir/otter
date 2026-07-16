@@ -29,34 +29,55 @@ const MYERS_DIFF_JS: &str = include_str!("myers_diff.js");
 
 /// CommonJS export: the callable `assert` namespace.
 pub fn assert_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    ctx.scope(|ctx, scope| {
+    // CommonJS compilation is still an explicit raw runtime boundary in this
+    // checkpoint. Keep intermediate module values in persistent VM roots while
+    // later shims allocate; ordinary native value construction uses
+    // `NativeScope` everywhere else.
+    let mut roots = Vec::with_capacity(3);
+    let result = (|| {
         let util = crate::util::util_cjs_value(ctx, caps)?;
-        let util = ctx.scoped_value(scope, util);
+        let util_root = ctx.persistent_root_insert(util);
+        roots.push(util_root);
         let calltracker = otter_runtime::run_builtin_cjs_shim(
             ctx,
             "internal/assert/calltracker",
             CALLTRACKER_JS,
             &[],
         )?;
-        let calltracker = ctx.scoped_value(scope, calltracker);
+        let calltracker_root = ctx.persistent_root_insert(calltracker);
+        roots.push(calltracker_root);
         let myers = otter_runtime::run_builtin_cjs_shim(
             ctx,
             "internal/assert/myers_diff",
             MYERS_DIFF_JS,
             &[],
         )?;
-        let myers = ctx.scoped_value(scope, myers);
+        let myers_root = ctx.persistent_root_insert(myers);
+        roots.push(myers_root);
+        let util = ctx
+            .persistent_root_get(util_root)
+            .ok_or_else(|| "util root disappeared during assert bootstrap".to_string())?;
+        let calltracker = ctx
+            .persistent_root_get(calltracker_root)
+            .ok_or_else(|| "calltracker root disappeared during assert bootstrap".to_string())?;
+        let myers = ctx
+            .persistent_root_get(myers_root)
+            .ok_or_else(|| "myers root disappeared during assert bootstrap".to_string())?;
         otter_runtime::run_builtin_cjs_shim(
             ctx,
             "assert",
             ASSERT_JS,
             &[
-                ("util", ctx.escape(util)),
-                ("internal/assert/calltracker", ctx.escape(calltracker)),
-                ("internal/assert/myers_diff", ctx.escape(myers)),
+                ("util", util),
+                ("internal/assert/calltracker", calltracker),
+                ("internal/assert/myers_diff", myers),
             ],
         )
-    })
+    })();
+    for root in roots {
+        let _ = ctx.persistent_root_remove(root);
+    }
+    result
 }
 
 /// CommonJS export: strict assert namespace (`node:assert/strict`).

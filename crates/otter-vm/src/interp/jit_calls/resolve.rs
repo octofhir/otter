@@ -7,12 +7,11 @@
 //!
 //! # Invariants
 //! - The callable value is decoded on every invocation. Closure upvalues,
-//!   effective `this`, and the caller-held SELF value are never taken from a
-//!   call-site cache.
+//!   effective `this`, and exact SELF are never taken from a call-site cache.
+//! - Inherited closure upvalues remain an allocation-neutral stable source;
+//!   owner publication roots the exact callable instead of cloning its spine.
 //! - A [`frame::ResolvedCallTarget`] owns the exact code `Arc` whose scalar
 //!   entry plan it carries; owner publication pins that same `Arc`.
-//! - Method calls reject named-SELF callees because their callable does not
-//!   live in a caller register that owner construction can re-read after GC.
 //! - Resolution returns `None` before entering synchronous re-entry; only
 //!   [`frame::prepare_jit_resolved_call`] owns the prepare transaction.
 //!
@@ -26,37 +25,12 @@ use crate::*;
 
 use super::frame;
 
-/// Where a callable came from, including the rooting capability available to
-/// owner construction after it performs allocations.
-#[derive(Clone, Copy)]
-pub(super) enum CallTargetOrigin {
-    /// `Op::Call`: the caller register can be re-read for named SELF binding.
-    Plain { callee_reg: u16 },
-    /// `Op::CallMethodValue`: the callable was loaded from a receiver slot.
-    Method,
-}
-
-impl CallTargetOrigin {
-    #[inline]
-    fn callee_reg(self) -> Option<u16> {
-        match self {
-            Self::Plain { callee_reg } => Some(callee_reg),
-            Self::Method => None,
-        }
-    }
-
-    #[inline]
-    fn supports_named_self(self) -> bool {
-        matches!(self, Self::Plain { .. })
-    }
-}
-
 /// Dynamic callable state decoded from the current invocation.
 struct DecodedCallTarget<'a> {
     function: &'a crate::executable::CodeBlock,
-    parent_upvalues: crate::frame_state::UpvalueSpine,
+    parent_upvalues: crate::upvalue_source::UpvalueSource,
+    self_value: Value,
     this_value: Value,
-    callee_reg: Option<u16>,
 }
 
 impl Interpreter {
@@ -67,11 +41,30 @@ impl Interpreter {
         context: &'a ExecutionContext,
         callable: Value,
         effective_this: Value,
-        origin: CallTargetOrigin,
         expected_fid: Option<u32>,
     ) -> Option<DecodedCallTarget<'a>> {
         let (function_id, parent_upvalues, this_value, new_target, derived_this, eval_env) =
-            Self::bytecode_call_target_parts(callable, effective_this, &self.gc_heap).ok()?;
+            if let Some(function_id) = callable.as_function() {
+                (
+                    function_id,
+                    crate::upvalue_source::UpvalueSource::empty(),
+                    effective_this,
+                    None,
+                    None,
+                    None,
+                )
+            } else {
+                let closure = callable.as_closure(&self.gc_heap)?;
+                let state = closure.call_state(&self.gc_heap);
+                (
+                    closure.function_id(),
+                    state.upvalues,
+                    state.bound_this.unwrap_or(effective_this),
+                    state.bound_new_target,
+                    state.bound_derived_this,
+                    state.eval_env,
+                )
+            };
         if expected_fid.is_some_and(|expected| expected != function_id)
             || new_target.is_some()
             || derived_this.is_some()
@@ -88,7 +81,6 @@ impl Interpreter {
             || function.has_rest
             || function.contains_direct_eval
             || function.is_derived_constructor
-            || (function.makes_function && !origin.supports_named_self())
         {
             return None;
         }
@@ -108,32 +100,35 @@ impl Interpreter {
         Some(DecodedCallTarget {
             function,
             parent_upvalues,
+            self_value: callable,
             this_value,
-            callee_reg: origin.callee_reg(),
         })
     }
 
-    /// Resolve dynamic callable state together with the currently installed
-    /// compatible baseline body and its entry plan.
+    /// Resolve dynamic callable state together with the best currently
+    /// installed entry body and its plan. Direct calls keep advancing the
+    /// shared entry counter, so a hot baseline-to-baseline edge can promote to
+    /// optimizing code without first materializing an interpreter frame.
     pub(super) fn resolve_jit_call_target<'a>(
         &mut self,
         context: &'a ExecutionContext,
         callable: Value,
         effective_this: Value,
-        origin: CallTargetOrigin,
     ) -> Option<frame::ResolvedCallTarget<'a>> {
-        let decoded =
-            self.decode_jit_call_target(context, callable, effective_this, origin, None)?;
-        let code = self.jit_resolve_compiled_cached(decoded.function.id)?;
-        let plan = self
-            .jit_code_registry
-            .direct_call_plan(decoded.function, code.as_ref())?;
+        let decoded = self.decode_jit_call_target(context, callable, effective_this, None)?;
+        let (plan, code) =
+            if let Some(optimized) = self.installed_optimized_direct_call_code(decoded.function) {
+                optimized
+            } else {
+                let baseline = self.jit_resolve_compiled_cached(decoded.function.id)?;
+                self.promote_direct_call_code(context, decoded.function, baseline)?
+            };
         Some(frame::ResolvedCallTarget {
             function: decoded.function,
             parent_upvalues: decoded.parent_upvalues,
+            self_value: decoded.self_value,
             this_value: decoded.this_value,
             plan,
-            callee_reg: decoded.callee_reg,
             code,
         })
     }
@@ -145,22 +140,16 @@ impl Interpreter {
     /// slot load, so a replacement closure with the same function id contributes
     /// its own upvalues and `this` state without invalidating code selection.
     pub(super) fn resolve_cached_jit_call_target<'a>(
-        &self,
+        &mut self,
         context: &'a ExecutionContext,
         callable: Value,
         effective_this: Value,
-        origin: CallTargetOrigin,
         expected_fid: u32,
         plan: jit::JitDirectCallPlan,
         code: Arc<dyn jit::JitFunctionCode>,
     ) -> Option<frame::ResolvedCallTarget<'a>> {
-        let decoded = self.decode_jit_call_target(
-            context,
-            callable,
-            effective_this,
-            origin,
-            Some(expected_fid),
-        )?;
+        let decoded =
+            self.decode_jit_call_target(context, callable, effective_this, Some(expected_fid))?;
 
         // The cache installs and clones plan+owner as one record. These checks
         // document that pairing in debug builds without restoring virtual calls
@@ -175,14 +164,70 @@ impl Interpreter {
         debug_assert_eq!(plan.param_count, decoded.function.param_count);
         debug_assert_eq!(plan.register_count, decoded.function.register_count);
 
+        let (plan, code) = if code.native_frame_kind() == native_abi::NativeFrameKind::Optimizing {
+            // `cache.rs` already checked the installation epoch, and the
+            // plan/code pair was installed atomically into this cache way.
+            (plan, code)
+        } else if let Some(optimized) = self.installed_optimized_direct_call_code(decoded.function)
+        {
+            optimized
+        } else {
+            self.promote_direct_call_code(context, decoded.function, code)?
+        };
+
         Some(frame::ResolvedCallTarget {
             function: decoded.function,
             parent_upvalues: decoded.parent_upvalues,
+            self_value: decoded.self_value,
             this_value: decoded.this_value,
             plan,
-            callee_reg: decoded.callee_reg,
             code,
         })
+    }
+
+    /// Resolve an already installed optimizing body without sampling tier
+    /// policy or touching baseline state. Once promoted, direct edges stay on
+    /// this constant-time path.
+    fn installed_optimized_direct_call_code(
+        &mut self,
+        function: &crate::executable::CodeBlock,
+    ) -> Option<(jit::JitDirectCallPlan, Arc<dyn jit::JitFunctionCode>)> {
+        let fid = function.id;
+        let code = if let Some((cached_fid, code)) = &self.jit_optimized_code_cache
+            && *cached_fid == fid
+            && self.jit_code_registry.is_current_for_entry(code.as_ref())
+        {
+            code.clone()
+        } else {
+            let code = self.jit_optimized_code.get(&fid)?.as_ref()?.clone();
+            if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
+                return None;
+            }
+            self.jit_optimized_code_cache = Some((fid, code.clone()));
+            code
+        };
+        let plan = self
+            .jit_code_registry
+            .direct_call_plan(function, code.as_ref())?;
+        Some((plan, code))
+    }
+
+    /// Count one baseline entry, then select an optimizing body if that exact
+    /// sample triggers promotion; otherwise retain `baseline`.
+    fn promote_direct_call_code(
+        &mut self,
+        context: &ExecutionContext,
+        function: &crate::executable::CodeBlock,
+        baseline: Arc<dyn jit::JitFunctionCode>,
+    ) -> Option<(jit::JitDirectCallPlan, Arc<dyn jit::JitFunctionCode>)> {
+        self.note_jit_function_entry(function.id);
+        let code = self
+            .resolve_optimized_code_for_fid(context, function.id)
+            .unwrap_or(baseline);
+        let plan = self
+            .jit_code_registry
+            .direct_call_plan(function, code.as_ref())?;
+        Some((plan, code))
     }
 
     /// Resolve `fid`'s installed non-OSR baseline body through the single-entry
@@ -276,9 +321,7 @@ impl Interpreter {
         let Some(method) = self.resolve_method_ic(obj, key, site) else {
             return Ok(None);
         };
-        let Some(target) =
-            self.resolve_jit_call_target(context, method, recv, CallTargetOrigin::Method)
-        else {
+        let Some(target) = self.resolve_jit_call_target(context, method, recv) else {
             return Ok(None);
         };
         self.install_jit_direct_method_cache(
@@ -317,12 +360,7 @@ impl Interpreter {
             self.jit_runtime_stats.runtime_calls.saturating_add(1);
         // SAFETY: `callee_reg` is a compiler-emitted index into the caller window.
         let callee = unsafe { *caller_regs.add(callee_reg as usize) };
-        let Some(target) = self.resolve_jit_call_target(
-            context,
-            callee,
-            Value::undefined(),
-            CallTargetOrigin::Plain { callee_reg },
-        ) else {
+        let Some(target) = self.resolve_jit_call_target(context, callee, Value::undefined()) else {
             return Ok(None);
         };
         self.prepare_jit_resolved_call(target, arg_regs, caller_regs)

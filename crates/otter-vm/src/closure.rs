@@ -14,6 +14,7 @@
 //! # Contents
 //!
 //! - [`ClosureCallHeader`] — stable machine-facing call ABI prefix.
+//! - [`ClosureCallState`] — allocation-neutral VM call metadata.
 //! - [`JsClosureBody`] — GC body holding the ABI prefix, canonical
 //!   bound values, and the Rust-owned traced tail.
 //! - [`JsClosure`] — 8-byte handle plus cached function id.
@@ -61,7 +62,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 use otter_macros::Pelt;
 
 use crate::object::JsObject;
-use crate::{UpvalueCell, Value};
+use crate::{UpvalueCell, Value, upvalue_source::UpvalueSource};
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
@@ -101,6 +102,20 @@ pub struct ClosureCallHeader {
     pub upvalue_base: u64,
     /// Number of captured [`UpvalueCell`] entries at `upvalue_base`.
     pub upvalue_count: u32,
+}
+
+/// Allocation-neutral closure state consumed by call preparation.
+///
+/// `upvalues` borrows the closure's stable external vector allocation without
+/// constructing a `Vec`/`Box`. The exact closure value must remain rooted for
+/// every use of this record that can cross a collection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClosureCallState {
+    pub(crate) upvalues: UpvalueSource,
+    pub(crate) bound_this: Option<Value>,
+    pub(crate) bound_new_target: Option<Value>,
+    pub(crate) bound_derived_this: Option<UpvalueCell>,
+    pub(crate) eval_env: Option<crate::eval_env::EvalEnvHandle>,
 }
 
 impl ClosureCallHeader {
@@ -299,6 +314,22 @@ impl JsClosureBody {
         );
         self.eval_env
     }
+
+    /// Copy call metadata while borrowing the immutable upvalue allocation.
+    fn call_state(&self) -> ClosureCallState {
+        // SAFETY: closure upvalue vectors are built once and never resized. A
+        // consumer of ClosureCallState must root the exact closure value for
+        // the record's live extent, as documented on the record itself.
+        let upvalues = unsafe { UpvalueSource::from_stable_slice(&self.upvalues) }
+            .expect("closure upvalue spine must fit the u32 call ABI");
+        ClosureCallState {
+            upvalues,
+            bound_this: self.bound_this_option(),
+            bound_new_target: self.bound_new_target_option(),
+            bound_derived_this: self.bound_derived_this_option(),
+            eval_env: self.eval_env_option(),
+        }
+    }
 }
 
 /// 4-byte compressed `Gc<JsClosureBody>` handle to the underlying
@@ -359,6 +390,15 @@ impl JsClosure {
     #[must_use]
     pub fn call_header(self, heap: &GcHeap) -> ClosureCallHeader {
         heap.read_payload(self.handle, |body| body.call_header)
+    }
+
+    /// Copy all dynamic call metadata without cloning the captured spine.
+    ///
+    /// The returned upvalue source remains valid while this exact closure is
+    /// rooted; closure creation never resizes its external vector allocation.
+    #[must_use]
+    pub(crate) fn call_state(self, heap: &GcHeap) -> ClosureCallState {
+        heap.read_payload(self.handle, JsClosureBody::call_state)
     }
 
     /// Whether native linkage must use the call-setup runtime stub before
@@ -558,12 +598,20 @@ mod tests {
         assert_eq!(closure.upvalue_count(&heap), 2);
         assert_eq!(closure.bound_this(&heap), Some(Value::null()));
         assert_eq!(closure.bound_new_target(&heap), None);
+        let call_state = closure.call_state(&heap);
+        assert_eq!(call_state.upvalues.len(), 2);
+        assert_eq!(call_state.upvalues.read(0), Some(cell_a));
+        assert_eq!(call_state.upvalues.read(1), Some(cell_b));
         heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.call_header.function_id, 42);
             assert_eq!(body.call_header.upvalue_count, 2);
             assert_eq!(
                 body.call_header.upvalue_base,
                 body.upvalues.as_ptr() as usize as u64
+            );
+            assert_eq!(
+                call_state.upvalues.base_ptr_or_null(),
+                body.upvalues.as_ptr().cast_mut()
             );
             assert!(body.call_header.has_flag(CLOSURE_CALL_FLAG_BOUND_THIS));
             assert!(

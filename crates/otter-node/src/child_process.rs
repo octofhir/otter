@@ -117,16 +117,14 @@ fn opt_env(
     if !env.is_object_type() {
         return Ok(None);
     }
-    ctx.scope(|ctx, scope| {
-        let env = ctx.scoped_value(scope, env);
-        let keys = ctx.enumerable_own_string_keys(ctx.escape(env))?;
+    ctx.scope(|mut scope| {
+        let env = scope.value(env);
+        let keys = scope.enumerable_own_string_keys(env)?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            let value = ctx.get_value_property(ctx.escape(env), &key)?;
-            let value = ctx.scoped_value(scope, value);
-            let value = ctx.escape(value);
-            if !value.is_undefined() && !value.is_null() {
-                out.push((key, value.display_string(ctx.heap())));
+            let value = scope.get(env, &key)?;
+            if !scope.is_undefined(value) && !scope.is_null(value) {
+                out.push((key, scope.display_string(value)));
             }
         }
         Ok(Some(out))

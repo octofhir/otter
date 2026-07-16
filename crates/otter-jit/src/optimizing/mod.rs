@@ -9,7 +9,7 @@
 //! carry sequentialized phi moves, while every back-edge polls the VM thread's
 //! interrupt and fuel cells before returning to its dominating header.
 //! Installed code enters through the shared reentrant `JitCtx` ABI and
-//! reconstructs the interpreter register window in place before every bail and
+//! homes transition operands in the canonical native register window and
 //! publishes only precise tagged roots around allocating element transitions.
 //!
 //! # Contents
@@ -22,7 +22,6 @@
 //! - Every `LoadElement` / `StoreElement` materializes its operands plus tagged
 //!   SSA values live across the call, publishes a code-object-owned precise
 //!   frame bitmap, and reloads only locations that moving GC can rewrite.
-//!   Store scratch slots remain non-roots and may be clobbered by the runtime.
 //! - Every backwards bytecode edge targets a header that dominates its predecessor;
 //!   irreducible loops and exception edges are rejected.
 //! - The sole ABI argument is a dynamically valid `JitCtx`; parameters, OSR
@@ -213,6 +212,13 @@ impl JitFunctionCode for OptimizedCode {
 
     fn code_len(&self) -> usize {
         self.code.len()
+    }
+
+    fn entry_addr(&self) -> Option<usize> {
+        // SAFETY: the executable mapping is owned by `self`; the registry and
+        // active entry-cell leases retain this code object for every direct
+        // branch using the published address.
+        Some(unsafe { self.code.entry_ptr() as usize })
     }
 
     fn safepoint_count(&self) -> u32 {

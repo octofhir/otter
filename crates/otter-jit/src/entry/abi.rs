@@ -14,7 +14,8 @@
 //! - `otter_vm::native_abi` — authoritative VM frame and thread records.
 
 use otter_vm::{
-    ActiveFrameMut, ActiveFrameRef, RuntimeStubAllocContext, Value, VmError, VmRuntimeActivation,
+    ActiveFrameMut, ActiveFrameRef, RuntimeCall, RuntimeStubAllocContext, Value, VmError,
+    VmRuntimeActivation,
     jit::JitPreparedDirectCall,
     native_abi::{CodeEntryCell, NativeFrame, VmFrameHeader, VmThread},
 };
@@ -53,6 +54,36 @@ pub(crate) struct JitCtx {
 }
 
 impl JitCtx {
+    /// Bind the current machine-published frame to the VM-owned typed runtime
+    /// boundary. This is the sole unsafe reconstruction point used by semantic
+    /// stubs; [`RuntimeCall`] exposes no raw VM, stack, context, or frame handles.
+    pub(crate) fn runtime_call(&mut self) -> Result<RuntimeCall<'_>, VmError> {
+        let thread = unsafe { self.thread.as_ref() }.ok_or(VmError::InvalidOperand)?;
+        let runtime_context = thread.runtime_context;
+        if runtime_context == 0 {
+            return Err(VmError::InvalidOperand);
+        }
+        // SAFETY: enter_compiled publishes this exact activation and native
+        // frame for the dynamic extent of the shared JitCtx. `&mut self`
+        // prevents a second RuntimeCall from being bound concurrently.
+        let activation = std::ptr::NonNull::new(runtime_context as *mut VmRuntimeActivation)
+            .ok_or(VmError::InvalidOperand)?;
+        let frame = std::ptr::NonNull::new(self.native_frame).ok_or(VmError::InvalidOperand)?;
+        // SAFETY: the shared entry ABI publishes both records and their
+        // windows for the complete runtime-stub call.
+        unsafe { RuntimeCall::bind(activation, frame) }
+    }
+
+    /// Try the typed boundary for pure-code fixture entries that deliberately
+    /// publish no runtime context.
+    pub(crate) fn try_runtime_call(&mut self) -> Result<Option<RuntimeCall<'_>>, VmError> {
+        let thread = unsafe { self.thread.as_ref() }.ok_or(VmError::InvalidOperand)?;
+        if thread.runtime_context == 0 {
+            return Ok(None);
+        }
+        self.runtime_call().map(Some)
+    }
+
     /// Representation-neutral shared view of the canonical activation.
     pub(crate) fn active_frame(&self) -> Result<ActiveFrameRef<'_>, VmError> {
         // SAFETY: the JIT entry contract publishes this frame and its windows

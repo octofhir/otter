@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use otter_vm::{
-    Attr, Interpreter, JsString, NativeCall, NativeCtx, NativeError, NativeFn, NumberValue, Value,
+    Attr, Interpreter, JsString, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope,
+    NumberValue, Value,
 };
 use sysinfo::{ProcessesToUpdate, System};
 
@@ -48,22 +49,22 @@ pub(crate) fn install_global(
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
+    let process_tag_symbol = interp
+        .well_known_symbols()
+        .get(otter_vm::symbol::WellKnown::ToStringTag);
+    let global_object = *interp.global_this();
+    let function_prototype = function_prototype_object(interp);
     let mut ctx = NativeCtx::new_with_call_info_and_context(
         interp,
         otter_vm::NativeCallInfo::default_call(),
         None,
     );
-    let result: Result<(), NativeError> = ctx.scope(|ctx, scope| {
-        let process = ctx.scoped_object_bare(scope)?;
+    let result: Result<(), NativeError> = ctx.scope(|mut scope| {
+        let process = scope.bare_object()?;
 
-        let process_tag = ctx.scoped_string(scope, "process")?;
-        let tag_sym = ctx
-            .interp_mut()
-            .well_known_symbols()
-            .get(otter_vm::symbol::WellKnown::ToStringTag);
-        let tag_sym = ctx.scoped_value(scope, Value::symbol(tag_sym));
-        ctx.scoped_define_symbol(
-            scope,
+        let process_tag = scope.string("process")?;
+        let tag_sym = scope.value(Value::symbol(process_tag_symbol));
+        scope.define_symbol(
             process,
             tag_sym,
             process_tag,
@@ -75,14 +76,14 @@ pub(crate) fn install_global(
             .to_flags(),
         )?;
 
-        let argv = ctx.scoped_array(scope, process_argv.len())?;
+        let argv = scope.array(process_argv.len())?;
         for (index, arg) in process_argv.iter().enumerate() {
-            let arg = ctx.scoped_string(scope, arg)?;
-            ctx.scoped_set_index(scope, argv, index, arg)?;
+            let arg = scope.string(arg)?;
+            scope.set_index(argv, index, arg)?;
         }
-        ctx.scoped_set(scope, process, "argv", argv)?;
-        let exec_argv = ctx.scoped_array(scope, 0)?;
-        ctx.scoped_set(scope, process, "execArgv", exec_argv)?;
+        scope.set(process, "argv", argv)?;
+        let exec_argv = scope.array(0)?;
+        scope.set(process, "execArgv", exec_argv)?;
 
         for (name, value) in [
             (
@@ -94,38 +95,38 @@ pub(crate) fn install_global(
             ("arch", node_arch()),
             ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
         ] {
-            let value = ctx.scoped_string(scope, value)?;
-            ctx.scoped_set(scope, process, name, value)?;
+            let value = scope.string(value)?;
+            scope.set(process, name, value)?;
         }
 
-        let versions = ctx.scoped_object_bare(scope)?;
+        let versions = scope.bare_object()?;
         for (name, value) in [
             ("otter", env!("CARGO_PKG_VERSION")),
             ("node", env!("CARGO_PKG_VERSION")),
             ("openssl", "3.0.0"),
             ("v8", "12.0.0"),
         ] {
-            let value = ctx.scoped_string(scope, value)?;
-            ctx.scoped_set(scope, versions, name, value)?;
+            let value = scope.string(value)?;
+            scope.set(versions, name, value)?;
         }
-        ctx.scoped_set(scope, process, "versions", versions)?;
+        scope.set(process, "versions", versions)?;
 
-        let release = ctx.scoped_object_bare(scope)?;
-        let release_name = ctx.scoped_string(scope, "node")?;
-        ctx.scoped_set(scope, release, "name", release_name)?;
-        ctx.scoped_set(scope, process, "release", release)?;
+        let release = scope.bare_object()?;
+        let release_name = scope.string("node")?;
+        scope.set(release, "name", release_name)?;
+        scope.set(process, "release", release)?;
 
-        let pid = ctx.scoped_number(scope, f64::from(pid_to_i32(snapshot.pid)));
-        ctx.scoped_set(scope, process, "pid", pid)?;
-        let ppid = ctx.scoped_number(scope, f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
-        ctx.scoped_set(scope, process, "ppid", ppid)?;
-        let undefined = ctx.scoped_undefined(scope);
-        ctx.scoped_set(scope, process, "exitCode", undefined)?;
+        let pid = scope.number(f64::from(pid_to_i32(snapshot.pid)));
+        scope.set(process, "pid", pid)?;
+        let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
+        scope.set(process, "ppid", ppid)?;
+        let undefined = scope.undefined();
+        scope.set(process, "exitCode", undefined)?;
 
-        let env = crate::process_env::build(ctx, scope, capabilities, hooks)?;
-        ctx.scoped_set(scope, process, "env", env)?;
-        let allowed_flags = crate::process_flags::build(ctx, scope)?;
-        ctx.scoped_set(scope, process, "allowedNodeEnvironmentFlags", allowed_flags)?;
+        let env = crate::process_env::build(&mut scope, capabilities, hooks)?;
+        scope.set(process, "env", env)?;
+        let allowed_flags = crate::process_flags::build(&mut scope)?;
+        scope.set(process, "allowedNodeEnvironmentFlags", allowed_flags)?;
 
         for (name, length, call) in [
             (
@@ -150,28 +151,26 @@ pub(crate) fn install_global(
                 NativeCall::Static(process_constrained_memory),
             ),
         ] {
-            define_process_method(ctx, scope, process, name, length, call)?;
+            define_process_method(&mut scope, process, name, length, call)?;
         }
-        let hrtime = hrtime_value(ctx, scope, start)?;
-        ctx.scoped_set(scope, process, "hrtime", hrtime)?;
-        install_stdio_streams(ctx, scope, process)?;
+        let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
+        scope.set(process, "hrtime", hrtime)?;
+        install_stdio_streams(&mut scope, process)?;
         define_process_method(
-            ctx,
-            scope,
+            &mut scope,
             process,
             "umask",
             1,
             NativeCall::Static(process_umask),
         )?;
 
-        crate::process_events::install(ctx, scope, process)?;
+        crate::process_events::install(&mut scope, process)?;
 
-        let config = ctx.scoped_object_bare(scope)?;
-        let variables = ctx.scoped_object_bare(scope)?;
-        let disabled = ctx.scoped_boolean(scope, false);
-        ctx.scoped_set(scope, variables, "v8_enable_i18n_support", disabled)?;
-        ctx.scoped_define_data(
-            scope,
+        let config = scope.bare_object()?;
+        let variables = scope.bare_object()?;
+        let disabled = scope.boolean(false);
+        scope.set(variables, "v8_enable_i18n_support", disabled)?;
+        scope.define(
             config,
             "variables",
             variables,
@@ -182,9 +181,9 @@ pub(crate) fn install_global(
             }
             .to_flags(),
         )?;
-        ctx.scoped_set(scope, process, "config", config)?;
+        scope.set(process, "config", config)?;
 
-        let features = ctx.scoped_object_bare(scope)?;
+        let features = scope.bare_object()?;
         for (name, on) in [
             ("inspector", false),
             ("quic", false),
@@ -200,15 +199,13 @@ pub(crate) fn install_global(
             ("require_module", true),
             ("typescript", false),
         ] {
-            let value = ctx.scoped_boolean(scope, on);
-            ctx.scoped_set(scope, features, name, value)?;
+            let value = scope.boolean(on);
+            scope.set(features, name, value)?;
         }
-        ctx.scoped_set(scope, process, "features", features)?;
+        scope.set(process, "features", features)?;
 
-        let global_object = *ctx.interp_mut().global_this();
-        let global = ctx.scoped_value(scope, Value::object(global_object));
-        ctx.scoped_define_data(
-            scope,
+        let global = scope.value(Value::object(global_object));
+        scope.define(
             global,
             "process",
             process,
@@ -240,12 +237,10 @@ fn process_umask(
 /// `process.stdout.write`; the EventEmitter-style methods are no-ops that
 /// return the stream for chaining.
 fn install_stdio_streams(
-    ctx: &mut NativeCtx<'_>,
-    scope: &otter_vm::HandleScope,
-    process: otter_vm::Scoped<'_>,
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
 ) -> Result<(), NativeError> {
     install_one_stdio(
-        ctx,
         scope,
         process,
         "stdout",
@@ -254,7 +249,6 @@ fn install_stdio_streams(
         NativeCall::Static(stdout_write),
     )?;
     install_one_stdio(
-        ctx,
         scope,
         process,
         "stderr",
@@ -263,7 +257,6 @@ fn install_stdio_streams(
         NativeCall::Static(stderr_write),
     )?;
     install_one_stdio(
-        ctx,
         scope,
         process,
         "stdin",
@@ -275,27 +268,26 @@ fn install_stdio_streams(
 }
 
 fn install_one_stdio(
-    ctx: &mut NativeCtx<'_>,
-    scope: &otter_vm::HandleScope,
-    process: otter_vm::Scoped<'_>,
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
     name: &'static str,
     fd: i32,
     readable: bool,
     write_call: NativeCall,
 ) -> Result<(), NativeError> {
-    let stream = ctx.scoped_object_bare(scope)?;
+    let stream = scope.bare_object()?;
     for (key, value) in [
-        ("isTTY", ctx.scoped_boolean(scope, false)),
-        ("fd", ctx.scoped_number(scope, f64::from(fd))),
-        ("writable", ctx.scoped_boolean(scope, !readable)),
-        ("readable", ctx.scoped_boolean(scope, readable)),
-        ("columns", ctx.scoped_number(scope, 80.0)),
-        ("rows", ctx.scoped_number(scope, 24.0)),
+        ("isTTY", scope.boolean(false)),
+        ("fd", scope.number(f64::from(fd))),
+        ("writable", scope.boolean(!readable)),
+        ("readable", scope.boolean(readable)),
+        ("columns", scope.number(80.0)),
+        ("rows", scope.number(24.0)),
     ] {
-        ctx.scoped_set(scope, stream, key, value)?;
+        scope.set(stream, key, value)?;
     }
 
-    define_method_on(ctx, scope, stream, "write", 1, write_call)?;
+    define_method_on(scope, stream, "write", 1, write_call)?;
     for method in [
         "end",
         "cork",
@@ -314,7 +306,6 @@ fn install_one_stdio(
         "unref",
     ] {
         define_method_on(
-            ctx,
             scope,
             stream,
             method,
@@ -322,25 +313,18 @@ fn install_one_stdio(
             NativeCall::Static(stdio_return_this),
         )?;
     }
-    ctx.scoped_set(scope, process, name, stream)
+    scope.set(process, name, stream)
 }
 
 fn define_method_on(
-    ctx: &mut NativeCtx<'_>,
-    scope: &otter_vm::HandleScope,
-    target: otter_vm::Scoped<'_>,
+    scope: &mut NativeScope<'_, '_>,
+    target: Local<'_>,
     name: &'static str,
     length: u8,
     call: NativeCall,
 ) -> Result<(), NativeError> {
-    let value = ctx.scoped_native_call(scope, name, length, call)?;
-    ctx.scoped_define_data(
-        scope,
-        target,
-        name,
-        value,
-        Attr::builtin_function().to_flags(),
-    )
+    let value = scope.native_call(name, length, call)?;
+    scope.define(target, name, value, Attr::builtin_function().to_flags())
 }
 
 fn stdout_write(
@@ -377,14 +361,13 @@ fn stdio_return_this(
 }
 
 fn define_process_method(
-    ctx: &mut NativeCtx<'_>,
-    scope: &otter_vm::HandleScope,
-    process: otter_vm::Scoped<'_>,
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
     name: &'static str,
     length: u8,
     call: NativeCall,
 ) -> Result<(), NativeError> {
-    define_method_on(ctx, scope, process, name, length, call)
+    define_method_on(scope, process, name, length, call)
 }
 
 pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
@@ -471,8 +454,8 @@ fn process_memory_usage(
     let rss = snapshot.memory_bytes.unwrap_or(0) as f64;
     let heap_used = ctx.interp_mut().gc_heap_mut().gc_stats().live_bytes as f64;
     let heap_total = heap_used;
-    ctx.scope(|ctx, scope| {
-        let object = ctx.scoped_object_bare(scope)?;
+    ctx.scope(|mut scope| {
+        let object = scope.bare_object()?;
         for (name, value) in [
             ("rss", rss),
             ("heapTotal", heap_total),
@@ -480,10 +463,10 @@ fn process_memory_usage(
             ("external", 0.0),
             ("arrayBuffers", 0.0),
         ] {
-            let value = ctx.scoped_number(scope, value);
-            ctx.scoped_set(scope, object, name, value)?;
+            let value = scope.number(value);
+            scope.set(object, name, value)?;
         }
-        Ok(ctx.escape(object))
+        Ok(scope.finish(object))
     })
 }
 
@@ -534,13 +517,13 @@ fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         system = (system - previous_system).max(0.0);
     }
 
-    ctx.scope(|ctx, scope| {
-        let result = ctx.scoped_object_bare(scope)?;
-        let user = ctx.scoped_number(scope, user);
-        ctx.scoped_set(scope, result, "user", user)?;
-        let system = ctx.scoped_number(scope, system);
-        ctx.scoped_set(scope, result, "system", system)?;
-        Ok(ctx.escape(result))
+    ctx.scope(|mut scope| {
+        let result = scope.bare_object()?;
+        let user = scope.number(user);
+        scope.set(result, "user", user)?;
+        let system = scope.number(system);
+        scope.set(result, "system", system)?;
+        Ok(scope.finish(result))
     })
 }
 
@@ -644,15 +627,15 @@ fn function_prototype_object(interp: &mut Interpreter) -> Option<otter_vm::objec
 }
 
 fn hrtime_value<'s>(
-    ctx: &mut NativeCtx<'_>,
-    scope: &'s otter_vm::HandleScope,
+    scope: &mut NativeScope<'s, '_>,
     start: Instant,
-) -> Result<otter_vm::Scoped<'s>, NativeError> {
-    let function = ctx.scoped_native_call(scope, "hrtime", 1, hrtime_call(start))?;
-    let bigint = ctx.scoped_native_call(scope, "bigint", 0, hrtime_bigint_call(start))?;
-    let object = ctx.scoped_object_bare(scope)?;
-    ctx.scoped_set_call_native(scope, object, function)?;
-    ctx.scoped_set(scope, object, "bigint", bigint)?;
+    function_prototype: Option<otter_vm::object::JsObject>,
+) -> Result<Local<'s>, NativeError> {
+    let function = scope.native_call("hrtime", 1, hrtime_call(start))?;
+    let bigint = scope.native_call("bigint", 0, hrtime_bigint_call(start))?;
+    let object = scope.bare_object()?;
+    scope.set_callable(object, function)?;
+    scope.set(object, "bigint", bigint)?;
     // `process.hrtime` is a callable host object (so it can carry the
     // `.bigint` own property), but a host object defaults to a null
     // `[[Prototype]]`. A callable with no `%Function.prototype%` in its
@@ -660,9 +643,9 @@ fn hrtime_value<'s>(
     // (and any `ToPrimitive`) throws instead of yielding the native
     // form. Re-seat it on `%Function.prototype%` to match an ordinary
     // function object.
-    if let Some(function_prototype) = function_prototype_object(ctx.interp_mut()) {
-        let function_prototype = ctx.scoped_value(scope, Value::object(function_prototype));
-        ctx.scoped_set_prototype(scope, object, Some(function_prototype))?;
+    if let Some(function_prototype) = function_prototype {
+        let function_prototype = scope.value(Value::object(function_prototype));
+        scope.set_prototype(object, Some(function_prototype))?;
     }
     Ok(object)
 }
@@ -718,9 +701,9 @@ fn hrtime_call(start: Instant) -> NativeCall {
 fn hrtime_bigint_call(start: Instant) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
         let nanos = start.elapsed().as_nanos().min(i128::MAX as u128) as i128;
-        ctx.scope(|ctx, scope| {
-            let value = ctx.scoped_bigint_i128(scope, nanos)?;
-            Ok(ctx.escape(value))
+        ctx.scope(|mut scope| {
+            let value = scope.bigint_i128(nanos)?;
+            Ok(scope.finish(value))
         })
     });
     NativeCall::Dynamic(call)

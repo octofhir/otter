@@ -273,11 +273,17 @@ fn create_realm(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
                 name: "$262.createRealm",
                 reason: err.to_string(),
             })?;
-    ctx.scope(|ctx, scope| {
-        let global = ctx.scoped_value(scope, Value::object(global));
-        let realm_obj = ctx.scoped_object(scope)?;
-
-        let global_value = ctx.escape(global);
+    // Captured dynamic native closures remain an explicit raw host boundary for
+    // this checkpoint. Persist the capture and both generated functions while
+    // the next closure allocation runs, then switch back to `NativeScope` for
+    // all JS-visible object construction.
+    let mut persistent = Vec::with_capacity(3);
+    let result = (|| {
+        let global_root = ctx.persistent_root_insert(Value::object(global));
+        persistent.push(global_root);
+        let global_value = ctx
+            .persistent_root_get(global_root)
+            .ok_or_else(|| type_err("realm global root disappeared"))?;
         let eval_value = ctx
             .native_value(
                 "$262.createRealm.evalScript",
@@ -288,9 +294,12 @@ fn create_realm(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
                 name: "$262.createRealm",
                 reason: "evalScript allocation failed".to_string(),
             })?;
-        let eval_value = ctx.scoped_value(scope, eval_value);
+        let eval_root = ctx.persistent_root_insert(eval_value);
+        persistent.push(eval_root);
 
-        let global_value = ctx.escape(global);
+        let global_value = ctx
+            .persistent_root_get(global_root)
+            .ok_or_else(|| type_err("realm global root disappeared"))?;
         let global_eval_value = ctx
             .native_value(
                 "$262.createRealm.global.eval",
@@ -301,45 +310,48 @@ fn create_realm(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
                 name: "$262.createRealm",
                 reason: "global eval allocation failed".to_string(),
             })?;
-        let global_eval_value = ctx.scoped_value(scope, global_eval_value);
+        let global_eval_root = ctx.persistent_root_insert(global_eval_value);
+        persistent.push(global_eval_root);
 
-        let realm_object = ctx
-            .escape(realm_obj)
-            .as_object()
-            .ok_or_else(|| type_err("realm object allocation failed"))?;
-        let global_value = ctx.escape(global);
-        otter_vm::object::define_own_property(
-            realm_object,
-            ctx.heap_mut(),
-            "global",
-            otter_vm::object::PropertyDescriptor::data(global_value, true, true, true),
-        );
-
-        let realm_object = ctx
-            .escape(realm_obj)
-            .as_object()
-            .ok_or_else(|| type_err("realm object allocation failed"))?;
-        let eval_value = ctx.escape(eval_value);
-        otter_vm::object::define_own_property(
-            realm_object,
-            ctx.heap_mut(),
-            "evalScript",
-            otter_vm::object::PropertyDescriptor::data(eval_value, true, true, true),
-        );
-
-        let global_object = ctx
-            .escape(global)
-            .as_object()
-            .ok_or_else(|| type_err("realm eval lost its global"))?;
-        let global_eval_value = ctx.escape(global_eval_value);
-        otter_vm::object::define_own_property(
-            global_object,
-            ctx.heap_mut(),
-            "eval",
-            otter_vm::object::PropertyDescriptor::data(global_eval_value, true, false, true),
-        );
-        Ok(ctx.escape(realm_obj))
-    })
+        let global = ctx
+            .persistent_root_get(global_root)
+            .ok_or_else(|| type_err("realm global root disappeared"))?;
+        let eval_value = ctx
+            .persistent_root_get(eval_root)
+            .ok_or_else(|| type_err("realm eval root disappeared"))?;
+        let global_eval_value = ctx
+            .persistent_root_get(global_eval_root)
+            .ok_or_else(|| type_err("realm global eval root disappeared"))?;
+        ctx.scope(|mut scope| {
+            let global = scope.value(global);
+            let eval_value = scope.value(eval_value);
+            let global_eval_value = scope.value(global_eval_value);
+            let realm = scope.object()?;
+            scope.define(
+                realm,
+                "global",
+                global,
+                otter_vm::object::PropertyFlags::new(true, true, true),
+            )?;
+            scope.define(
+                realm,
+                "evalScript",
+                eval_value,
+                otter_vm::object::PropertyFlags::new(true, true, true),
+            )?;
+            scope.define(
+                global,
+                "eval",
+                global_eval_value,
+                otter_vm::object::PropertyFlags::new(true, false, true),
+            )?;
+            Ok(scope.finish(realm))
+        })
+    })();
+    for root in persistent {
+        let _ = ctx.persistent_root_remove(root);
+    }
+    result
 }
 
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {

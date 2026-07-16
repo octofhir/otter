@@ -540,8 +540,8 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 ctx: &mut ::otter_vm::NativeCtx<'_>,
                 args: &[::otter_vm::Value],
             ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
-                ctx.scope(|ctx, __s| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                ctx.scope(|__scope| {
+                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     let __data = #normalized;
                     let __instance =
@@ -641,8 +641,8 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 ctx: &mut ::otter_vm::NativeCtx<'_>,
                 args: &[::otter_vm::Value],
             ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
-                ctx.scope(|ctx, __s| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                ctx.scope(|__scope| {
+                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
                     #(#extractions)*
                     #output
                 })
@@ -715,9 +715,9 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                             ::otter_vm::NativeError,
                         > {
                             let __this_value = *ctx.this_value();
-                            let __recv: #self_ty = ctx.scope(|ctx, __s| {
+                            let __recv: #self_ty = ctx.scope(|__scope| {
                                 let mut __cx =
-                                    ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                                    ::otter_vm::marshal::MarshalCx::new(__scope);
                                 let __this = __cx.park(__this_value);
                                 __cx.with_host_data::<#self_ty, #self_ty>(
                                     __this,
@@ -803,8 +803,8 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                     args: &[::otter_vm::Value],
                 ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
                     let __this_value = *ctx.this_value();
-                    ctx.scope(|ctx, __s| {
-                        let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                    ctx.scope(|__scope| {
+                        let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
                         let __this = __cx.park(__this_value);
                         // Owned snapshot: nothing GC-touching crosses
                         // the .await inside the future.
@@ -907,8 +907,8 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
                 args: &[::otter_vm::Value],
             ) -> ::core::result::Result<::otter_vm::Value, ::otter_vm::NativeError> {
                 let __this_value = *ctx.this_value();
-                ctx.scope(|ctx, __s| {
-                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(ctx, __s);
+                ctx.scope(|__scope| {
+                    let mut __cx = ::otter_vm::marshal::MarshalCx::new(__scope);
                     let __this = __cx.park(__this_value);
                     #(#extractions)*
                     #output

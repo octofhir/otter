@@ -26,8 +26,8 @@ use smallvec::SmallVec;
 use crate::function_ops::BindMetadataGet;
 use crate::native_abi::RuntimeStubId;
 use crate::{
-    ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue, PendingBindFunction,
-    PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
+    ActiveFrameMut, ExecutionContext, GeneratorResumeKind, Interpreter, JsString, NumberValue,
+    PendingBindFunction, PendingBindStage, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, cache_ir, collections_prototype, date, descriptor_value,
     executable::OperandView,
@@ -281,6 +281,94 @@ impl Interpreter {
             stack[frame_index].advance_pc()?;
         }
         self.invoke(stack, context, &callee, math_value, arg_values, dst)
+    }
+
+    /// Complete a guarded `Math.<method>` call through the canonical active
+    /// frame without materializing an interpreter frame or copying its window.
+    /// Slow-path property access and user callables execute synchronously while
+    /// the receiver/callee live in the handle arena; arguments are read from
+    /// the stable published window only after any getter re-entry completes.
+    pub(crate) fn do_math_call_active(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        method_id: u32,
+        arg_regs: &[u16],
+    ) -> Result<(), VmError> {
+        let method = otter_bytecode::method_id::MathMethod::from_u32(method_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let mut fast_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+        for &register in arg_regs {
+            fast_args.push(frame.read(register)?);
+        }
+
+        let lexical_math = self.read_global_lexical("Math")?;
+        if lexical_math.is_none()
+            && math::original_method_receiver(self.global_this, &self.gc_heap, method).is_some()
+            && math::args_skip_to_primitive(&fast_args)
+        {
+            let value = math::call(method, &fast_args, &self.gc_heap).map_err(|err| match err {
+                math::MathError::UnknownMember(member) => {
+                    self.err_unknown_intrinsic(format!("Math.{member}").into())
+                }
+                math::MathError::BadArgument { reason, .. } => {
+                    self.err_type((format!("Math.{} {reason}", method.name())).into())
+                }
+            })?;
+            return frame.write(dst, value);
+        }
+
+        let result = self.with_handle_scope(|interp, scope| {
+            let math_value = if let Some(value) = lexical_math {
+                value
+            } else {
+                let receiver = Value::object(interp.global_this);
+                let key = VmPropertyKey::String("Math");
+                if !interp.ordinary_has_property_value(context, receiver, &key, 0)? {
+                    return Err(interp.err_undefined_ident(("Math".to_string()).into()));
+                }
+                match interp.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        interp.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                    }
+                }
+            };
+            let math_value = interp.scoped_value(scope, math_value);
+            let receiver = interp.escape_scoped(math_value);
+            if receiver.is_nullish() {
+                let label = if receiver.is_null() {
+                    "null"
+                } else {
+                    "undefined"
+                };
+                return Err(interp.err_type((format!("Cannot read properties of {label}")).into()));
+            }
+            let key = VmPropertyKey::String(method.name());
+            let callee = match interp.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    interp.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                }
+            };
+            let callee = interp.scoped_value(scope, callee);
+            let callee_value = interp.escape_scoped(callee);
+            if !interp.is_callable_runtime(&callee_value) {
+                return Err(VmError::NotCallable);
+            }
+            let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(arg_regs.len());
+            for &register in arg_regs {
+                args.push(frame.read(register)?);
+            }
+            interp.run_callable_sync(
+                context,
+                &callee_value,
+                interp.escape_scoped(math_value),
+                args,
+            )
+        })?;
+        frame.write(dst, result)
     }
 
     /// §22.1.3 — pre-coerce the arguments of a `String.prototype`

@@ -824,8 +824,7 @@ impl Interpreter {
         // that frame returned here), the cursor is already below `saved` and
         // raising it back would re-leak that window on every `run_callable_sync`.
         let register_checkpoint = self.register_stack.checkpoint();
-        let result =
-            self.dispatch_loop_tracked(context, stack, floor, roots_already_published);
+        let result = self.dispatch_loop_tracked(context, stack, floor, roots_already_published);
         self.register_stack.restore(register_checkpoint);
         drop(active_stack);
         result
@@ -874,8 +873,8 @@ impl Interpreter {
         // The heap dedupes same-source stack entries, so re-pushing
         // under `run` / `run_callable_sync` costs one Vec slot.
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard = (!roots_already_published)
-            .then(|| self.gc_heap.register_extra_roots(extra_roots));
+        let extra_roots_guard =
+            (!roots_already_published).then(|| self.gc_heap.register_extra_roots(extra_roots));
         let result = (|| -> Result<Value, VmError> {
             loop {
                 match self.dispatch_loop_inner(context, stack, floor) {
@@ -885,7 +884,10 @@ impl Interpreter {
                             && !stack.is_at_floor(floor)
                             && let Some(thrown) = self.pending_uncaught_throw.take()
                         {
-                            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                            if self.pending_uncaught_frames.is_none() {
+                                self.pending_uncaught_frames =
+                                    Some(snapshot_frames(context, stack));
+                            }
                             let unwind = self.unwind_throw_above(context, stack, floor, thrown);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
@@ -915,7 +917,10 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                            if self.pending_uncaught_frames.is_none() {
+                                self.pending_uncaught_frames =
+                                    Some(snapshot_frames(context, stack));
+                            }
                             let unwind = self.unwind_throw_with_uncaught_above(
                                 context, stack, floor, thrown, uncaught,
                             );

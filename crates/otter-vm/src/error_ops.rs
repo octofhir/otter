@@ -24,8 +24,9 @@ use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use crate::{
-    ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError, StackFrameSnapshot,
-    Value, VmError, error_classes, object, read_register, symbol_dispatch, write_register,
+    ActiveFrameMut, ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError,
+    StackFrameSnapshot, Value, VmError, error_classes, object, read_register, symbol_dispatch,
+    write_register,
 };
 
 impl Interpreter {
@@ -168,12 +169,25 @@ impl Interpreter {
         dst: u16,
         kind_idx: u32,
     ) -> Result<(), VmError> {
+        let mut frame = ActiveFrameMut::materialized(frame);
+        self.run_load_builtin_error_active(context, &mut frame, dst, kind_idx)
+    }
+
+    /// Load one realm error constructor through a representation-neutral
+    /// activation. No cold frame state or allocation is required.
+    pub(crate) fn run_load_builtin_error_active(
+        &self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+        kind_idx: u32,
+    ) -> Result<(), VmError> {
         let kind_name = context
             .string_constant_str(kind_idx)
             .ok_or(VmError::InvalidOperand)?;
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let ctor = self.error_classes.constructor(kind);
-        write_register(frame, dst, Value::object(ctor))?;
+        frame.write(dst, Value::object(ctor))?;
         frame.advance_pc()?;
         Ok(())
     }

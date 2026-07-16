@@ -24,7 +24,7 @@
 
 use crate::{
     ActiveFrameMut, ExecutionContext, Interpreter, Value, VmError, abstract_ops,
-    activation_stack::ActivationStack, arithmetic_dispatch::NumericRuntimeOp, write_register,
+    activation_stack::ActivationStack, arithmetic_dispatch::NumericRuntimeOp,
 };
 
 /// Fully decoded `ToPrimitive` hint used by unary-coercion semantics.
@@ -188,8 +188,7 @@ impl Interpreter {
     pub fn jit_runtime_load_string(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         function_id: u32,
         dst: u16,
         constant_index: u32,
@@ -198,20 +197,19 @@ impl Interpreter {
             .for_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
         let value = self.load_string_constant_value(&resolved, constant_index)?;
-        write_register(&mut stack[frame_index], dst, value)
+        frame.write(dst, value)
     }
 
     /// Define one object-literal data property from decoded registers.
     pub fn jit_runtime_define_data_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         object: u16,
         key: u16,
         value: u16,
     ) -> Result<(), VmError> {
-        self.run_define_data_property_regs(context, stack, frame_index, object, key, value)
+        self.run_define_data_property_active(context, frame, object, key, value)
     }
 
     /// Replace one loop-captured upvalue cell with a fresh TDZ cell.
@@ -227,22 +225,20 @@ impl Interpreter {
     pub fn jit_runtime_load_builtin_error(
         &self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         kind_index: u32,
     ) -> Result<(), VmError> {
         // `kind_index` is a constant-pool index of the COMPILED function's
         // chunk; in a multi-script runtime the ambient context may belong to
         // a different chunk, so resolve the owner before decoding.
-        let function_id = stack[frame_index].function_id;
+        let function_id = frame.function_id();
         let resolved = context
             .for_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
-        let saved_pc = stack[frame_index].pc;
-        let result =
-            self.run_load_builtin_error_reg(&resolved, &mut stack[frame_index], dst, kind_index);
-        stack[frame_index].pc = saved_pc;
+        let saved_pc = frame.pc();
+        let result = self.run_load_builtin_error_active(&resolved, frame, dst, kind_index);
+        frame.set_pc(saved_pc);
         result
     }
 
@@ -263,17 +259,12 @@ impl Interpreter {
     pub fn jit_runtime_define_own_property(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         target: u16,
         key: u16,
         descriptor: u16,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result =
-            self.run_define_own_property_regs(context, stack, frame_index, target, key, descriptor);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.run_define_own_property_active(context, frame, target, key, descriptor)
     }
 
     /// Allocate a closure from decoded function and parent-upvalue indices.
@@ -302,29 +293,78 @@ impl Interpreter {
         result
     }
 
+    /// Allocate a closure directly from a published frameless native owner.
+    ///
+    /// Direct-call eligibility excludes cold eval/constructor state, so the
+    /// canonical native SELF/`this`/upvalue windows contain the complete source
+    /// state and no interpreter [`Frame`] adapter is required.
+    pub fn jit_runtime_make_closure_native(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        function_id: u32,
+        dst: u16,
+        function_index: u32,
+        parent_indices: &[u32],
+    ) -> Result<(), VmError> {
+        if frame.function_id() != function_id {
+            return Err(VmError::InvalidOperand);
+        }
+        let resolved = context
+            .for_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = frame.pc();
+        let result = self.run_make_closure_active_regs(
+            &resolved,
+            frame,
+            dst,
+            function_index,
+            parent_indices,
+            None,
+            None,
+            None,
+        );
+        frame.set_pc(saved_pc);
+        result
+    }
+
+    /// Allocate a distinct capture-free function value directly in a
+    /// published frameless native owner.
+    ///
+    /// Direct-call eligibility excludes direct-eval cold state, while the
+    /// native descriptor publishes the exact SELF value needed by named
+    /// self-references. The compiled PC remains owned by generated code.
+    pub fn jit_runtime_make_function_native(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        function_id: u32,
+        dst: u16,
+        function_index: u32,
+    ) -> Result<(), VmError> {
+        if frame.function_id() != function_id {
+            return Err(VmError::InvalidOperand);
+        }
+        let resolved = context
+            .for_function(function_id)
+            .ok_or(VmError::InvalidOperand)?;
+        let saved_pc = frame.pc();
+        let result = self.run_make_function_active_reg(&resolved, frame, dst, function_index, None);
+        frame.set_pc(saved_pc);
+        result
+    }
+
     /// Execute a guarded `Math` call from decoded argument registers.
     #[allow(clippy::too_many_arguments)]
     pub fn jit_runtime_math_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut ActivationStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         method_id: u32,
         argument_regs: &[u16],
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.do_math_call_regs(
-            stack,
-            context,
-            frame_index,
-            dst,
-            method_id,
-            argument_regs,
-            false,
-        );
-        stack[frame_index].pc = saved_pc;
-        result
+        self.do_math_call_active(context, frame, dst, method_id, argument_regs)
     }
 }
 

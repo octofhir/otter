@@ -25,8 +25,8 @@ use smallvec::SmallVec;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ActiveFrameRef, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue,
-    SuperReadKey, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    ActiveFrameMut, ActiveFrameRef, ExecutionContext, Frame, Interpreter, JsObject, JsString,
+    NumberValue, SuperReadKey, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
     binary, cache_ir, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, object,
@@ -2797,8 +2797,13 @@ impl Interpreter {
         {
             self.feedback_directory
                 .record_property_hit(PropertyIcKind::Load);
+            // Compute feedback before committing the destination: register
+            // allocation may legally alias `dst` with `obj_reg` (common in an
+            // optimizing OSR transition). Reading the receiver after the write
+            // would then inspect the loaded property value as an object.
+            let fill = self.whisker_load_cell_fill(site, obj, atomized_key);
             frame.write(dst, value)?;
-            return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
+            return Ok(fill);
         }
         if self
             .feedback_directory
@@ -2821,12 +2826,15 @@ impl Interpreter {
         {
             self.feedback_directory
                 .install_property_stub(site, PropertyIcKind::Load, ic);
-            frame.write(dst, value)?;
+            // `dst` may alias the receiver in an optimized register window;
+            // capture its relocated object identity before the commit.
             let current_obj = frame
                 .read(obj_reg)?
                 .as_object()
                 .ok_or(VmError::InvalidOperand)?;
-            return Ok(self.whisker_load_cell_fill(site, current_obj, atomized_key));
+            let fill = self.whisker_load_cell_fill(site, current_obj, atomized_key);
+            frame.write(dst, value)?;
+            return Ok(fill);
         }
         // Not cache-representable (accessor, deep prototype, absent):
         // complete the load in place through the full cascade.
@@ -3022,40 +3030,70 @@ impl Interpreter {
         key_reg: u16,
         value_reg: u16,
     ) -> Result<(), VmError> {
-        let target = *read_register(&stack[top_idx], obj_reg)?;
-        let key_value = *read_register(&stack[top_idx], key_reg)?;
-        let value = *read_register(&stack[top_idx], value_reg)?;
-        let key = self.to_property_key_sync(context, key_value)?;
-        // Fast path: a plain object receiver takes the shape-friendly
-        // construction-time store (no prototype consult — define semantics).
-        if let Some(obj) = target.as_object() {
-            match &key {
-                VmPropertyKey::Symbol(sym) => {
-                    object::set_symbol(obj, &mut self.gc_heap, *sym, value);
+        let frame = stack.get_mut(top_idx).ok_or(VmError::InvalidOperand)?;
+        let new_target = self
+            .frame_cold(frame)
+            .and_then(|cold| cold.new_target)
+            .unwrap_or_else(Value::undefined);
+        let mut frame = ActiveFrameMut::materialized_with_new_target(frame, new_target);
+        self.run_define_data_property_active(context, &mut frame, obj_reg, key_reg, value_reg)
+    }
+
+    /// Representation-neutral object-literal property definition.
+    ///
+    /// All three source values enter the handle arena before key coercion can
+    /// allocate or re-enter JavaScript. This lets a frameless compiled callee
+    /// complete the opcode against its canonical register window without a
+    /// temporary interpreter frame or copied window.
+    pub(crate) fn run_define_data_property_active(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut ActiveFrameMut<'_>,
+        obj_reg: u16,
+        key_reg: u16,
+        value_reg: u16,
+    ) -> Result<(), VmError> {
+        let target = frame.read(obj_reg)?;
+        let key_value = frame.read(key_reg)?;
+        let value = frame.read(value_reg)?;
+        self.with_handle_scope(|interp, scope| {
+            let target = interp.scoped_value(scope, target);
+            let key_value = interp.scoped_value(scope, key_value);
+            let value = interp.scoped_value(scope, value);
+            let key = interp.to_property_key_sync(context, interp.escape_scoped(key_value))?;
+            let target = interp.escape_scoped(target);
+            let value = interp.escape_scoped(value);
+            // Fast path: a plain object receiver takes the shape-friendly
+            // construction-time store (no prototype consult — define semantics).
+            if let Some(obj) = target.as_object() {
+                match &key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::set_symbol(obj, &mut interp.gc_heap, *sym, value);
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling")
+                            .to_string();
+                        interp.set_property(obj, &name, value)?;
+                    }
                 }
-                _ => {
-                    let name = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling")
-                        .to_string();
-                    self.set_property(obj, &name, value)?;
+            } else {
+                let descriptor = object::PartialPropertyDescriptor {
+                    value: Some(value),
+                    writable: Some(true),
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                    ..Default::default()
+                };
+                if !interp.define_own_property_value(context, &target, &key, descriptor)? {
+                    return Err(interp.err_type(
+                        ("Cannot define property on object literal".to_string()).into(),
+                    ));
                 }
             }
-        } else {
-            let descriptor = object::PartialPropertyDescriptor {
-                value: Some(value),
-                writable: Some(true),
-                enumerable: Some(true),
-                configurable: Some(true),
-                ..Default::default()
-            };
-            if !self.define_own_property_value(context, &target, &key, descriptor)? {
-                return Err(
-                    self.err_type(("Cannot define property on object literal".to_string()).into())
-                );
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Typed JIT allocation operation for `NewObject`. It uses the shared

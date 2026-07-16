@@ -584,13 +584,9 @@ pub(crate) fn step_iterator(
                         index_val.trace_value_slots(visit);
                         v.trace_value_slots(visit);
                     };
-                    crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
+                    crate::array::from_elements_with_roots(gc_heap, [index_val, v], &mut visitor)
                         .map_err(|_| VmError::TypeMismatch)?
                 };
-                crate::array::with_elements_mut(pair, gc_heap, |elements| {
-                    elements.push(index_val);
-                    elements.push(v);
-                });
                 gc_heap.with_payload(iter, |state| {
                     if let IteratorState::ArrayEntry { index, .. } = state {
                         *index += 1;
@@ -649,13 +645,13 @@ pub(crate) fn step_iterator(
                                 index_val.trace_value_slots(visit);
                                 element.trace_value_slots(visit);
                             };
-                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
-                                .map_err(|_| VmError::TypeMismatch)?
+                            crate::array::from_elements_with_roots(
+                                gc_heap,
+                                [index_val, element],
+                                &mut visitor,
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?
                         };
-                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
-                            elements.push(index_val);
-                            elements.push(element);
-                        });
                         advance(gc_heap);
                         Some(Value::array(pair))
                     }
@@ -703,13 +699,13 @@ pub(crate) fn step_iterator(
                                 index_val.trace_value_slots(visit);
                                 element.trace_value_slots(visit);
                             };
-                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
-                                .map_err(|_| VmError::TypeMismatch)?
+                            crate::array::from_elements_with_roots(
+                                gc_heap,
+                                [index_val, element],
+                                &mut visitor,
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?
                         };
-                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
-                            elements.push(index_val);
-                            elements.push(element);
-                        });
                         advance(gc_heap);
                         Some(Value::array(pair))
                     }
@@ -767,13 +763,13 @@ pub(crate) fn step_iterator(
                                 key.trace_value_slots(visit);
                                 value.trace_value_slots(visit);
                             };
-                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
-                                .map_err(|_| VmError::TypeMismatch)?
+                            crate::array::from_elements_with_roots(
+                                gc_heap,
+                                [key, value],
+                                &mut visitor,
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?
                         };
-                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
-                            elements.push(key);
-                            elements.push(value);
-                        });
                         Value::array(pair)
                     }
                 })
@@ -808,13 +804,13 @@ pub(crate) fn step_iterator(
                                 set_root.trace_value_slots(visit);
                                 value.trace_value_slots(visit);
                             };
-                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
-                                .map_err(|_| VmError::TypeMismatch)?
+                            crate::array::from_elements_with_roots(
+                                gc_heap,
+                                [value, value],
+                                &mut visitor,
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?
                         };
-                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
-                            elements.push(value);
-                            elements.push(value);
-                        });
                         Value::array(pair)
                     }
                 })

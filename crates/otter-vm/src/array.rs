@@ -1909,22 +1909,21 @@ pub(crate) fn write_dense_range_with_roots(
     Ok(())
 }
 
-/// Crate-internal mutable access to dense elements for in-place
-/// rewrites that do not grow capacity.
+/// Crate-internal mutable access to the fixed dense element slice.
 ///
 /// The helper conservatively fires write barriers for every
 /// GC-bearing element left in the array after the mutation. This keeps
-/// internal algorithms such as `reverse`, `sort`, and `splice` from
-/// having to duplicate barrier bookkeeping while preventing external
-/// code from storing untraced values through an arbitrary closure.
-pub(crate) fn with_elements_mut<R>(
+/// fixed-length rewrites from duplicating barrier bookkeeping. Exposing a
+/// slice instead of the backing `Vec` makes growth impossible: allocation,
+/// external-byte accounting, and the JIT-visible dense cache must stay owned
+/// by this module's rooted construction and mutation APIs.
+pub(crate) fn with_elements_rewrite<R>(
     arr: JsArray,
     heap: &mut otter_gc::GcHeap,
-    f: impl FnOnce(&mut Vec<Value>) -> R,
+    f: impl FnOnce(&mut [Value]) -> R,
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
-        let out = f(&mut body.elements);
-        body.length = body.elements.len();
+        let out = f(body.elements.as_mut_slice());
         body.mark_dirty();
         let children: SmallVec<[Value; 8]> = body.elements.iter().cloned().collect();
         (out, children)

@@ -1385,11 +1385,18 @@ impl Interpreter {
         // Root every local read after this allocation: a collection here
         // moves young targets, and `current` / `effective_new_target` feed the
         // frame build and the cold-frame `new_target` below — an unrooted copy
-        // would wire the constructor chain to a vacated cell.
+        // would wire the constructor chain to a vacated cell. `proto` is parked
+        // on the traced iteration-anchor stack rather than passed as an ad-hoc
+        // value root: the collector rewrites a value root through a shared
+        // reference, which a stack local's register copy can outlive, so the
+        // relocated prototype is read back from the anchor slot instead.
+        let proto_anchor = self.push_iteration_anchor(proto) - 1;
         let receiver = self.alloc_stack_rooted_object_with_extra_roots(
             stack,
-            &[&proto, &current, &effective_new_target],
+            &[&current, &effective_new_target],
         )?;
+        let proto = self.iteration_anchor(proto_anchor);
+        self.pop_iteration_anchors_to(proto_anchor);
         crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         if is_direct_class_construct
             && let Some(function_id) = current
@@ -1717,11 +1724,18 @@ impl Interpreter {
             Some(proto) => proto,
             None => self.constructor_prototype_value("Object")?,
         };
-        let receiver = {
-            let value_roots: SmallVec<[&Value; 4]> =
-                smallvec::smallvec![&callee, &new_target, &proto];
-            self.alloc_stack_rooted_object_with_value_roots(stack, value_roots.as_slice(), &args)?
-        };
+        // Park `proto` on the traced iteration-anchor stack across the receiver
+        // allocation. A moving collection triggered by the allocation relocates
+        // a young prototype (e.g. `%Date.prototype%`, not in the directly-rooted
+        // realm-intrinsic set), and the ad-hoc value-root external visit does not
+        // reliably rewrite this detached stack local; the anchor slot is a real
+        // GC root, so reading it back yields the relocated handle before it wires
+        // the receiver's `[[Prototype]]`.
+        let proto_anchor = self.push_iteration_anchor(proto) - 1;
+        let receiver =
+            self.alloc_stack_rooted_object_with_value_roots(stack, &[&callee, &new_target], &args)?;
+        let proto = self.iteration_anchor(proto_anchor);
+        self.pop_iteration_anchors_to(proto_anchor);
         crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         let this_value = Value::object(receiver);
         // Built-in constructor objects (`Number`, `Boolean`, …)

@@ -5139,6 +5139,9 @@ mod tests {
             direct_code_object_id: 0,
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
+            activation_base: std::ptr::null_mut(),
+            activation_top_ptr: std::ptr::null_mut(),
+            activation_limit: 0,
         };
         let result = entry(&mut ctx);
         (result, frame, native_frame.header.pc)

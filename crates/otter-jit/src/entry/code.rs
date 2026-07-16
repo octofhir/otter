@@ -67,6 +67,11 @@ pub(crate) unsafe fn enter_compiled(
         // stable base / `reg_top` address of the flat JIT register stack.
         let reg_stack_base = unsafe { (*vm).jit_reg_stack_base() };
         let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
+        // SAFETY: same contract; the activation array is isolate-owned, never
+        // resized, and outlives every compiled activation.
+        let activation_base = unsafe { (*vm).jit_native_activation_base() };
+        let activation_top_ptr = unsafe { (*vm).jit_native_activation_top_addr() };
+        let activation_limit = unsafe { (*vm).jit_native_activation_limit() };
         let sync_reentry_depth_ptr = unsafe { (*vm).jit_sync_reentry_depth_ptr() };
         let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
@@ -135,6 +140,9 @@ pub(crate) unsafe fn enter_compiled(
             direct_code_object_id: 0,
             reg_stack_base,
             reg_top_ptr,
+            activation_base: activation_base.cast(),
+            activation_top_ptr,
+            activation_limit,
         };
         // SAFETY: the mapping is live and `entry` was emitted with the
         // `JitEntry` ABI.

@@ -15,6 +15,8 @@
 //! - Rejected awaits re-enter through the same throw-unwind path as
 //!   synchronous `throw`.
 //! - Async frames absorb unhandled throws by rejecting their result promise.
+//! - Every resume exit releases frames, cold records, and register windows back
+//!   to the activation floor while that stack is still published as a GC root.
 //!
 //! # See also
 //! - [`crate::microtask`]
@@ -204,122 +206,139 @@ impl Interpreter {
         if let Some(c) = cold {
             self.frame_attach_cold(&mut frame, c);
         }
-        if fulfilled {
-            if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
-                *slot = value;
-            } else {
-                return Err(RunError {
-                    error: VmError::InvalidOperand,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-        }
         let mut stack: ActivationStack = ActivationStack::new();
+        let floor = stack.floor();
         stack.push(frame);
-        owner.set_async_state(
-            &mut self.gc_heap,
-            crate::generator::AsyncGeneratorState::Executing,
-        );
-        // Same rooting contract as [`Self::run_async_resume`]: the
-        // resumed frame, the settlement value, and the owning
-        // generator must be GC roots across the allocating
-        // unwind / completion steps that run outside
-        // `dispatch_loop`'s own provider scope.
-        let anchor_depth = self.push_iteration_anchor(value);
-        self.push_iteration_anchor(Value::generator(owner));
-        let frame_roots = otter_gc::RawFrameRoots::new(
-            &stack as *const ActivationStack,
-            &self.cold_frames as *const crate::cold_frame::ColdFramePool,
-            crate::ActivationStack::trace_roots,
-        );
-        let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-        let frame_roots_guard = self
-            .gc_heap
-            .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
-        let result = (|| -> Result<(), RunError> {
-            if !fulfilled {
-                if let Err(error) = self.unwind_throw(context, &mut stack, value) {
-                    // Unhandled anywhere in the parked gen body —
-                    // §27.6.3 AsyncGenerator resumption settles the
-                    // front request as rejected instead of letting the
-                    // throw escape the dispatch tick.
-                    if matches!(error, VmError::Uncaught) {
-                        let reason = self.take_pending_uncaught_throw().unwrap_or(value);
-                        owner.mark_done(&mut self.gc_heap);
-                        self.async_generator_complete_step(context, &owner, Err(reason), true)
-                            .map_err(RunError::bare)?;
-                        self.async_generator_drain_done(context, &owner)
-                            .map_err(RunError::bare)?;
-                        return Ok(());
+        // The value and owner remain live even after unwind pops the resumed
+        // frame. The activation envelope publishes this anchor stack and the
+        // local frame stack exactly once across both pre-dispatch rejection
+        // injection and nested bytecode dispatch.
+        let value_anchor = self.push_iteration_anchor(value) - 1;
+        let owner_anchor = self.push_iteration_anchor(Value::generator(owner)) - 1;
+        let result = self.with_activation_stack_roots(&mut stack, |interp, stack| {
+            let result = (|| -> Result<(), RunError> {
+                let value = interp.iteration_anchor(value_anchor);
+                let owner = interp
+                    .iteration_anchor(owner_anchor)
+                    .as_generator()
+                    .ok_or_else(|| RunError::bare(VmError::InvalidOperand))?;
+                if fulfilled {
+                    let valid_destination = stack
+                        .last()
+                        .is_some_and(|frame| frame.registers.get(await_dst as usize).is_some());
+                    if !valid_destination {
+                        return Err(RunError {
+                            error: VmError::InvalidOperand,
+                            frames: snapshot_frames(context, stack),
+                            detail: interp.take_error_detail(),
+                        });
                     }
-                    let frames = snapshot_frames(context, &stack);
-                    return Err(RunError {
-                        error,
-                        frames,
-                        detail: self.take_error_detail(),
-                    });
+                    *stack
+                        .last_mut()
+                        .and_then(|frame| frame.registers.get_mut(await_dst as usize))
+                        .expect("await destination was validated") = value;
                 }
-                if stack.is_empty() {
-                    // Throw drained out of the gen body; settle the
-                    // front request as rejected.
-                    self.async_generator_complete_step(context, &owner, Err(value), true)
-                        .map_err(RunError::bare)?;
-                    owner.mark_done(&mut self.gc_heap);
-                    self.async_generator_drain_done(context, &owner)
-                        .map_err(RunError::bare)?;
-                    return Ok(());
-                }
-            }
-            match self.dispatch_loop(context, &mut stack) {
-                Ok(value) => {
-                    let yielded_already = owner.has_yielded(&self.gc_heap);
-                    if yielded_already {
-                        // Op::Yield already settled the request and
-                        // saved the frame back to the gen.
-                        owner.take_yielded(&mut self.gc_heap);
-                        return Ok(());
-                    }
-                    // Body completed: settle the front request with
-                    // the final return value as `done: true`.
-                    self.async_generator_complete_step(context, &owner, Ok(value), true)
-                        .map_err(RunError::bare)?;
-                    owner.mark_done(&mut self.gc_heap);
-                    self.async_generator_drain_done(context, &owner)
-                        .map_err(RunError::bare)?;
-                    Ok(())
-                }
-                Err(error) => {
-                    owner.mark_done(&mut self.gc_heap);
-                    if matches!(error, VmError::MissingReturn) {
-                        self.async_generator_drain_done(context, &owner)
-                            .map_err(RunError::bare)?;
-                        return Ok(());
-                    }
-                    let rejection = if let Some(thrown) = self.pending_uncaught_throw.take() {
-                        Some(thrown)
-                    } else {
-                        self.vm_error_to_throwable_with_stack_roots(Some(context), &stack, &error)
-                    };
-                    if let Some(reason) = rejection {
-                        self.async_generator_complete_step(context, &owner, Err(reason), true)
-                            .map_err(RunError::bare)?;
-                        self.async_generator_drain_done(context, &owner)
-                            .map_err(RunError::bare)?;
-                        Ok(())
-                    } else {
-                        let frames = snapshot_frames(context, &stack);
-                        Err(RunError {
+                owner.set_async_state(
+                    &mut interp.gc_heap,
+                    crate::generator::AsyncGeneratorState::Executing,
+                );
+                if !fulfilled {
+                    if let Err(error) = interp.unwind_throw(context, stack, value) {
+                        // Unhandled anywhere in the parked gen body —
+                        // §27.6.3 AsyncGenerator resumption settles the
+                        // front request as rejected instead of letting the
+                        // throw escape the dispatch tick.
+                        if matches!(error, VmError::Uncaught) {
+                            let reason = interp.take_pending_uncaught_throw().unwrap_or(value);
+                            owner.mark_done(&mut interp.gc_heap);
+                            interp
+                                .async_generator_complete_step(context, &owner, Err(reason), true)
+                                .map_err(RunError::bare)?;
+                            interp
+                                .async_generator_drain_done(context, &owner)
+                                .map_err(RunError::bare)?;
+                            return Ok(());
+                        }
+                        let frames = snapshot_frames(context, stack);
+                        return Err(RunError {
                             error,
                             frames,
-                            detail: self.take_error_detail(),
-                        })
+                            detail: interp.take_error_detail(),
+                        });
+                    }
+                    if stack.is_empty() {
+                        // Throw drained out of the gen body; settle the
+                        // front request as rejected.
+                        interp
+                            .async_generator_complete_step(context, &owner, Err(value), true)
+                            .map_err(RunError::bare)?;
+                        owner.mark_done(&mut interp.gc_heap);
+                        interp
+                            .async_generator_drain_done(context, &owner)
+                            .map_err(RunError::bare)?;
+                        return Ok(());
                     }
                 }
-            }
-        })();
-        drop(frame_roots_guard);
-        self.pop_iteration_anchors_to(anchor_depth - 1);
+                match interp.dispatch_loop_above(context, stack, floor) {
+                    Ok(value) => {
+                        let yielded_already = owner.has_yielded(&interp.gc_heap);
+                        if yielded_already {
+                            // Op::Yield already settled the request and
+                            // saved the frame back to the gen.
+                            owner.take_yielded(&mut interp.gc_heap);
+                            return Ok(());
+                        }
+                        // Body completed: settle the front request with
+                        // the final return value as `done: true`.
+                        interp
+                            .async_generator_complete_step(context, &owner, Ok(value), true)
+                            .map_err(RunError::bare)?;
+                        owner.mark_done(&mut interp.gc_heap);
+                        interp
+                            .async_generator_drain_done(context, &owner)
+                            .map_err(RunError::bare)?;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        owner.mark_done(&mut interp.gc_heap);
+                        if matches!(error, VmError::MissingReturn) {
+                            interp
+                                .async_generator_drain_done(context, &owner)
+                                .map_err(RunError::bare)?;
+                            return Ok(());
+                        }
+                        let rejection = if let Some(thrown) = interp.pending_uncaught_throw.take() {
+                            Some(thrown)
+                        } else {
+                            interp.vm_error_to_throwable_with_stack_roots(
+                                Some(context),
+                                stack,
+                                &error,
+                            )
+                        };
+                        if let Some(reason) = rejection {
+                            interp
+                                .async_generator_complete_step(context, &owner, Err(reason), true)
+                                .map_err(RunError::bare)?;
+                            interp
+                                .async_generator_drain_done(context, &owner)
+                                .map_err(RunError::bare)?;
+                            Ok(())
+                        } else {
+                            let frames = snapshot_frames(context, stack);
+                            Err(RunError {
+                                error,
+                                frames,
+                                detail: interp.take_error_detail(),
+                            })
+                        }
+                    }
+                }
+            })();
+            interp.release_frames_above(stack, floor);
+            result
+        });
+        self.pop_iteration_anchors_to(value_anchor);
         result
     }
 
@@ -359,67 +378,63 @@ impl Interpreter {
         if let Some(c) = cold {
             self.frame_attach_cold(&mut frame, c);
         }
-        if fulfilled {
-            if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
-                *slot = value;
-            } else {
-                return Err(RunError {
-                    error: VmError::InvalidOperand,
-                    frames: Vec::new(),
-                    detail: self.take_error_detail(),
-                });
-            }
-        }
         let mut stack: ActivationStack = ActivationStack::new();
+        let floor = stack.floor();
         stack.push(frame);
-        // The resumed frame and the settlement value must be GC
-        // roots *before* `dispatch_loop` registers its own provider:
-        // the rejection path below allocates (thrown-value
-        // rendering, promise rejection jobs) while the frame only
-        // lives on this local stack.
-        let anchor_depth = self.push_iteration_anchor(value);
-        let frame_roots = otter_gc::RawFrameRoots::new(
-            &stack as *const ActivationStack,
-            &self.cold_frames as *const crate::cold_frame::ColdFramePool,
-            crate::ActivationStack::trace_roots,
-        );
-        let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-        let frame_roots_guard = self
-            .gc_heap
-            .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
-        let result = (|| -> Result<(), RunError> {
-            if !fulfilled {
-                // Inject the rejection as a throw so the parked frame
-                // observes it through its `try`/`catch`/`finally`
-                // structure exactly as a synchronous throw would.
-                if let Err(error) = self.unwind_throw(context, &mut stack, value) {
-                    let frames = snapshot_frames(context, &stack);
-                    return Err(RunError {
-                        error,
-                        frames,
-                        detail: self.take_error_detail(),
-                    });
+        let value_anchor = self.push_iteration_anchor(value) - 1;
+        let result = self.with_activation_stack_roots(&mut stack, |interp, stack| {
+            let result = (|| -> Result<(), RunError> {
+                let value = interp.iteration_anchor(value_anchor);
+                if fulfilled {
+                    let valid_destination = stack
+                        .last()
+                        .is_some_and(|frame| frame.registers.get(await_dst as usize).is_some());
+                    if !valid_destination {
+                        return Err(RunError {
+                            error: VmError::InvalidOperand,
+                            frames: snapshot_frames(context, stack),
+                            detail: interp.take_error_detail(),
+                        });
+                    }
+                    *stack
+                        .last_mut()
+                        .and_then(|frame| frame.registers.get_mut(await_dst as usize))
+                        .expect("await destination was validated") = value;
                 }
-                if stack.is_empty() {
-                    // The rejection drained through the async frame's
-                    // result promise — nothing left to dispatch.
-                    return Ok(());
+                if !fulfilled {
+                    // Inject the rejection as a throw so the parked frame
+                    // observes it through its `try`/`catch`/`finally`
+                    // structure exactly as a synchronous throw would.
+                    if let Err(error) = interp.unwind_throw(context, stack, value) {
+                        let frames = snapshot_frames(context, stack);
+                        return Err(RunError {
+                            error,
+                            frames,
+                            detail: interp.take_error_detail(),
+                        });
+                    }
+                    if stack.is_empty() {
+                        // The rejection drained through the async frame's
+                        // result promise — nothing left to dispatch.
+                        return Ok(());
+                    }
                 }
-            }
-            match self.dispatch_loop(context, &mut stack) {
-                Ok(_) => Ok(()),
-                Err(error) => {
-                    let frames = snapshot_frames(context, &stack);
-                    Err(RunError {
-                        error,
-                        frames,
-                        detail: self.take_error_detail(),
-                    })
+                match interp.dispatch_loop_above(context, stack, floor) {
+                    Ok(_) => Ok(()),
+                    Err(error) => {
+                        let frames = snapshot_frames(context, stack);
+                        Err(RunError {
+                            error,
+                            frames,
+                            detail: interp.take_error_detail(),
+                        })
+                    }
                 }
-            }
-        })();
-        drop(frame_roots_guard);
-        self.pop_iteration_anchors_to(anchor_depth - 1);
+            })();
+            interp.release_frames_above(stack, floor);
+            result
+        });
+        self.pop_iteration_anchors_to(value_anchor);
         result
     }
 
@@ -651,6 +666,8 @@ mod tests {
     use super::*;
     use otter_bytecode::{BytecodeModule, Function, SourceKind};
 
+    use crate::frame_state::{AsyncFrameState, ParkedFrameState, TryHandler};
+
     fn empty_context() -> ExecutionContext {
         ExecutionContext::from_module(BytecodeModule {
             module: "async-ops-test.js".to_string(),
@@ -668,6 +685,143 @@ mod tests {
             locals: registers,
             ..Function::default()
         }
+    }
+
+    fn park_regular_async_frame(
+        interp: &mut Interpreter,
+        context: &ExecutionContext,
+        mut frame: Frame,
+    ) -> (
+        Box<ParkedFrameState>,
+        Option<Box<crate::cold_frame::ColdFrame>>,
+    ) {
+        let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
+            .pending_runtime_rooted(interp, &[], &[])
+            .unwrap();
+        interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
+        let cold = interp.frame_detach_cold(&mut frame);
+        let parked = Box::new(interp.park_active_frame(frame));
+        (parked, cold)
+    }
+
+    fn park_async_generator_frame(
+        interp: &mut Interpreter,
+        frame: Frame,
+    ) -> (
+        Box<ParkedFrameState>,
+        Option<Box<crate::cold_frame::ColdFrame>>,
+        crate::generator::JsGenerator,
+    ) {
+        let parked = interp.park_active_frame(frame);
+        let owner = crate::generator::JsGenerator::new_with_prototype(
+            &mut interp.gc_heap,
+            parked,
+            None,
+            None,
+        )
+        .unwrap();
+        owner.set_async(&mut interp.gc_heap, true);
+        owner.install_owner_on_frame(&mut interp.gc_heap);
+        let (parked, cold) = owner.take_frame(&mut interp.gc_heap).unwrap();
+        (parked, cold, owner)
+    }
+
+    fn malformed_catch() -> TryHandler {
+        TryHandler {
+            catch_pc: Some(0),
+            finally_pc: None,
+            exc_register: 1,
+        }
+    }
+
+    fn assert_invalid_resume_cleanup(interp: &Interpreter, error: RunError) {
+        assert!(matches!(error.error, VmError::InvalidOperand));
+        assert_eq!(interp.cold_frames.live_len(), 0);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+    }
+
+    #[test]
+    fn async_resume_invalid_destination_releases_cold_record_and_window() {
+        let mut interp = Interpreter::new();
+        let context = empty_context();
+        let frame = interp.test_frame_for_function(&function(1)).unwrap();
+        let (parked, cold) = park_regular_async_frame(&mut interp, &context, frame);
+
+        assert_eq!(interp.cold_frames.live_len(), 0);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+
+        let error = interp
+            .run_async_resume(&context, parked, cold, 1, true, Value::number_i32(7))
+            .unwrap_err();
+
+        assert_invalid_resume_cleanup(&interp, error);
+    }
+
+    #[test]
+    fn async_generator_resume_invalid_destination_releases_cold_record_and_window() {
+        let mut interp = Interpreter::new();
+        let context = empty_context();
+        let frame = interp.test_frame_for_function(&function(1)).unwrap();
+        let (parked, cold, owner) = park_async_generator_frame(&mut interp, frame);
+
+        assert_eq!(interp.cold_frames.live_len(), 0);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+
+        let error = interp
+            .run_async_gen_resume(&context, parked, cold, 1, true, Value::number_i32(7), owner)
+            .unwrap_err();
+
+        assert_invalid_resume_cleanup(&interp, error);
+    }
+
+    #[test]
+    fn async_resume_malformed_handler_releases_cold_record_and_window() {
+        let mut interp = Interpreter::new();
+        let context = empty_context();
+        let frame = interp.test_frame_for_function(&function(1)).unwrap();
+        let (parked, mut cold) = park_regular_async_frame(&mut interp, &context, frame);
+        cold.as_mut()
+            .expect("async frame owns a cold record")
+            .handlers
+            .push(malformed_catch());
+
+        assert_eq!(interp.cold_frames.live_len(), 0);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+
+        let error = interp
+            .run_async_resume(&context, parked, cold, 0, false, Value::number_i32(11))
+            .unwrap_err();
+
+        assert_invalid_resume_cleanup(&interp, error);
+    }
+
+    #[test]
+    fn async_generator_resume_malformed_handler_releases_cold_record_and_window() {
+        let mut interp = Interpreter::new();
+        let context = empty_context();
+        let frame = interp.test_frame_for_function(&function(1)).unwrap();
+        let (parked, mut cold, owner) = park_async_generator_frame(&mut interp, frame);
+        cold.as_mut()
+            .expect("generator frame owns a cold record")
+            .handlers
+            .push(malformed_catch());
+
+        assert_eq!(interp.cold_frames.live_len(), 0);
+        assert_eq!(interp.register_stack.checkpoint(), 0);
+
+        let error = interp
+            .run_async_gen_resume(
+                &context,
+                parked,
+                cold,
+                0,
+                false,
+                Value::number_i32(11),
+                owner,
+            )
+            .unwrap_err();
+
+        assert_invalid_resume_cleanup(&interp, error);
     }
 
     #[test]

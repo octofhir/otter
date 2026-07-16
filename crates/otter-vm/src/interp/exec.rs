@@ -3,7 +3,7 @@
 //! # Contents
 //! `run`/`run_inner`, `link_module`, GC-heap accessors and `force_gc`,
 //! microtask drain (with per-task origin contexts) and capability
-//! settlement, and the `dispatch_loop`/`dispatch_loop_tracked` shells.
+//! settlement, and the activation-root / `dispatch_loop` shells.
 //!
 //! # Invariants
 //! Drains that run outside `run`'s rooted scope must push the
@@ -782,7 +782,47 @@ impl Interpreter {
         }
     }
 
-    /// Thin wrapper around [`Self::dispatch_loop_tracked`] that publishes
+    /// Run `body` while `stack` is the single published activation/root source.
+    ///
+    /// Nested execution on the same stack reuses the existing provider; a
+    /// genuinely different nested stack publishes its own lexical provider and
+    /// restores the parent on exit. Async resume uses this boundary before it
+    /// injects a rejected await, so pre-dispatch unwind and bytecode dispatch
+    /// share one root walk instead of registering the same stack twice.
+    pub(crate) fn with_activation_stack_roots<R>(
+        &mut self,
+        stack: &mut ActivationStack,
+        body: impl FnOnce(&mut Self, &mut ActivationStack) -> R,
+    ) -> R {
+        let stack_ptr = std::ptr::NonNull::from(&mut *stack);
+        let already_published = self.active_frame_stack == Some(stack_ptr);
+        let active_stack =
+            ActiveFrameStackPublication::publish(&mut self.active_frame_stack, stack);
+        let frame_roots = otter_gc::RawFrameRoots::new(
+            stack as *const ActivationStack,
+            &self.cold_frames as *const cold_frame::ColdFramePool,
+            ActivationStack::trace_roots,
+        );
+        let frame_roots_guard = if already_published {
+            None
+        } else {
+            let provider: &dyn otter_gc::FrameRoots = &frame_roots;
+            Some(
+                self.gc_heap
+                    .register_frame_roots(provider as *const dyn otter_gc::FrameRoots),
+            )
+        };
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_roots_guard =
+            (!already_published).then(|| self.gc_heap.register_extra_roots(extra_roots));
+        let result = body(self, stack);
+        drop(extra_roots_guard);
+        drop(frame_roots_guard);
+        drop(active_stack);
+        result
+    }
+
+    /// Thin wrapper around [`Self::dispatch_loop_rooted`] that publishes
     /// `stack` as the interpreter's [`Self::active_frame_stack`] for the
     /// duration of the loop, restoring the parent pointer on exit. This
     /// is how inline native calls (the `Error` constructor,
@@ -812,10 +852,6 @@ impl Interpreter {
         if floor.depth() > stack.len() {
             return Err(VmError::InvalidOperand);
         }
-        let stack_ptr = std::ptr::NonNull::from(&mut *stack);
-        let roots_already_published = self.active_frame_stack == Some(stack_ptr);
-        let active_stack =
-            ActiveFrameStackPublication::publish(&mut self.active_frame_stack, stack);
         // A nested dispatch allocates its frames' register windows above the
         // caller's flat-stack cursor; on exit clamp the cursor down to release
         // any window a non-locally-exited sub-frame left behind. Only ever
@@ -824,9 +860,10 @@ impl Interpreter {
         // that frame returned here), the cursor is already below `saved` and
         // raising it back would re-leak that window on every `run_callable_sync`.
         let register_checkpoint = self.register_stack.checkpoint();
-        let result = self.dispatch_loop_tracked(context, stack, floor, roots_already_published);
+        let result = self.with_activation_stack_roots(stack, |interp, stack| {
+            interp.dispatch_loop_rooted(context, stack, floor)
+        });
         self.register_stack.restore(register_checkpoint);
-        drop(active_stack);
         result
     }
 
@@ -843,38 +880,20 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    pub(crate) fn dispatch_loop_tracked(
+    fn dispatch_loop_rooted(
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         floor: ActivationFloor,
-        roots_already_published: bool,
     ) -> Result<Value, VmError> {
+        debug_assert_eq!(
+            self.active_frame_stack,
+            Some(std::ptr::NonNull::from(&mut *stack)),
+            "rooted dispatch must use the published activation stack",
+        );
+        debug_assert!(self.gc_heap.has_frame_root_providers());
         self.ensure_property_ic_capacity(context);
         self.begin_runtime_budget_turn();
-        let frame_roots = otter_gc::RawFrameRoots::new(
-            stack as *const ActivationStack,
-            &self.cold_frames as *const cold_frame::ColdFramePool,
-            ActivationStack::trace_roots,
-        );
-        let frame_roots_guard = if roots_already_published {
-            None
-        } else {
-            let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
-            Some(
-                self.gc_heap
-                    .register_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots),
-            )
-        };
-        // Catch-all runtime-roots registration: every bytecode tick
-        // can allocate, and some dispatch entries (generator
-        // prologues spawned from host-driven drains, future embedder
-        // entry points) reach here without an enclosing rooted scope.
-        // The heap dedupes same-source stack entries, so re-pushing
-        // under `run` / `run_callable_sync` costs one Vec slot.
-        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard =
-            (!roots_already_published).then(|| self.gc_heap.register_extra_roots(extra_roots));
         let result = (|| -> Result<Value, VmError> {
             loop {
                 match self.dispatch_loop_inner(context, stack, floor) {
@@ -938,8 +957,6 @@ impl Interpreter {
                 }
             }
         })();
-        drop(extra_roots_guard);
-        drop(frame_roots_guard);
         self.finish_runtime_budget_turn();
         result
     }

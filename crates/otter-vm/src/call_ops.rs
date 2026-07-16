@@ -16,6 +16,8 @@
 //!   callables, bound functions, class constructors, and proxies.
 //! - Constructor dispatch preserves `new.target` and receiver substitution
 //!   invariants used by `pop_frame`.
+//! - A freshly-started generator remains in a moving GC root through observable
+//!   `prototype` lookup and publication into the caller.
 //!
 //! # See also
 //! - [`crate::Frame`]
@@ -866,28 +868,37 @@ impl Interpreter {
             // Backlink the generator into the frame so `Op::Yield`
             // can find its owner once execution starts.
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            let (frame, cold) = gen_handle
-                .take_frame(&mut self.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
-            let mut frame = self.resume_parked_frame(*frame)?;
-            if let Some(cold) = cold {
-                self.frame_attach_cold(&mut frame, cold);
-            }
-            let prologue_floor = stack.floor();
-            stack.push(frame);
-            let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
-            self.release_frames_above(stack, prologue_floor);
-            prologue?;
-            self.resolve_generator_prototype_stack_rooted(
-                context,
-                stack,
-                callee_closure,
-                generator_function_id,
-                &gen_handle,
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
-            return Ok(());
+            let generator_anchor = self.push_iteration_anchor(Value::generator(gen_handle)) - 1;
+            let result = (|| -> Result<(), VmError> {
+                let gen_handle = self
+                    .iteration_anchor(generator_anchor)
+                    .as_generator()
+                    .ok_or(VmError::InvalidOperand)?;
+                let (frame, cold) = gen_handle
+                    .take_frame(&mut self.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                let mut frame = self.resume_parked_frame(*frame)?;
+                if let Some(cold) = cold {
+                    self.frame_attach_cold(&mut frame, cold);
+                }
+                let prologue_floor = stack.floor();
+                stack.push(frame);
+                let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
+                self.release_frames_above(stack, prologue_floor);
+                prologue?;
+                self.resolve_generator_prototype_stack_rooted(
+                    context,
+                    stack,
+                    callee_closure,
+                    generator_function_id,
+                    generator_anchor,
+                )?;
+                let generator = self.iteration_anchor(generator_anchor);
+                let top_idx = stack.len() - 1;
+                write_register(&mut stack[top_idx], dst, generator)
+            })();
+            self.pop_iteration_anchors_to(generator_anchor);
+            return result;
         }
         stack.push(new_frame);
         window_rollback.commit();
@@ -964,7 +975,7 @@ impl Interpreter {
         stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
-        gen_handle: &crate::generator::JsGenerator,
+        generator_anchor: usize,
     ) -> Result<(), VmError> {
         // `owner` is the invoked closure instance: `fn.prototype`
         // materializes per closure, so resolving through the template
@@ -977,6 +988,10 @@ impl Interpreter {
             function_id,
             "prototype",
         )?;
+        let gen_handle = self
+            .iteration_anchor(generator_anchor)
+            .as_generator()
+            .ok_or(VmError::InvalidOperand)?;
         gen_handle.set_prototype_override(
             &mut self.gc_heap,
             proto.as_object().is_some().then_some(proto),
@@ -1010,28 +1025,37 @@ impl Interpreter {
             )?;
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            let (frame, cold) = gen_handle
-                .take_frame(&mut self.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
-            let mut frame = self.resume_parked_frame(*frame)?;
-            if let Some(cold) = cold {
-                self.frame_attach_cold(&mut frame, cold);
-            }
-            let prologue_floor = stack.floor();
-            stack.push(frame);
-            let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
-            self.release_frames_above(stack, prologue_floor);
-            prologue?;
-            self.resolve_generator_prototype_stack_rooted(
-                context,
-                stack,
-                callee_closure,
-                generator_function_id,
-                &gen_handle,
-            )?;
-            let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
-            return Ok(());
+            let generator_anchor = self.push_iteration_anchor(Value::generator(gen_handle)) - 1;
+            let result = (|| -> Result<(), VmError> {
+                let gen_handle = self
+                    .iteration_anchor(generator_anchor)
+                    .as_generator()
+                    .ok_or(VmError::InvalidOperand)?;
+                let (frame, cold) = gen_handle
+                    .take_frame(&mut self.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                let mut frame = self.resume_parked_frame(*frame)?;
+                if let Some(cold) = cold {
+                    self.frame_attach_cold(&mut frame, cold);
+                }
+                let prologue_floor = stack.floor();
+                stack.push(frame);
+                let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
+                self.release_frames_above(stack, prologue_floor);
+                prologue?;
+                self.resolve_generator_prototype_stack_rooted(
+                    context,
+                    stack,
+                    callee_closure,
+                    generator_function_id,
+                    generator_anchor,
+                )?;
+                let generator = self.iteration_anchor(generator_anchor);
+                let top_idx = stack.len() - 1;
+                write_register(&mut stack[top_idx], dst, generator)
+            })();
+            self.pop_iteration_anchors_to(generator_anchor);
+            return result;
         }
         stack.push(frame);
         Ok(())
@@ -2644,6 +2668,7 @@ impl Interpreter {
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            roots.set_scratch(0, Value::generator(gen_handle));
             // §27.5 — run the generator prologue (mirroring the opcode
             // `invoke` path) so the handle is primed to its
             // suspended-start state. Without it a generator created
@@ -2651,35 +2676,47 @@ impl Interpreter {
             // `@@iterator` that is a generator function, driven by
             // `Array.from` / `GetSetRecord` / the iterator helpers) is
             // never started and reports `done` on its first `next`.
-            let (frame, cold) = gen_handle
-                .take_frame(&mut self.gc_heap)
-                .ok_or(VmError::InvalidOperand)?;
-            let mut frame = self.resume_parked_frame(*frame)?;
-            if let Some(cold) = cold {
-                self.frame_attach_cold(&mut frame, cold);
-            }
-            let prologue_floor = inner.floor();
-            inner.push(frame);
-            let prologue = self.dispatch_loop_above(context, inner, prologue_floor);
-            self.release_frames_above(inner, prologue_floor);
-            prologue?;
-            // §27.5.1 step 3 — resolve [[Prototype]] after the
-            // prologue (FunctionDeclarationInstantiation) ran, through
-            // the invoked closure's bag so the generator's prototype is
-            // the same object later `fn.prototype` reads observe.
-            let proto = self.function_property_get_runtime_rooted(
-                context,
-                roots.target().as_closure(&self.gc_heap),
-                function_id,
-                "prototype",
-                &[],
-                &[],
-            )?;
-            gen_handle.set_prototype_override(
-                &mut self.gc_heap,
-                proto.as_object().is_some().then_some(proto),
-            );
-            return Ok(Value::generator(gen_handle));
+            let result = (|| -> Result<Value, VmError> {
+                let gen_handle = roots
+                    .scratch(0)
+                    .as_generator()
+                    .ok_or(VmError::InvalidOperand)?;
+                let (frame, cold) = gen_handle
+                    .take_frame(&mut self.gc_heap)
+                    .ok_or(VmError::InvalidOperand)?;
+                let mut frame = self.resume_parked_frame(*frame)?;
+                if let Some(cold) = cold {
+                    self.frame_attach_cold(&mut frame, cold);
+                }
+                let prologue_floor = inner.floor();
+                inner.push(frame);
+                let prologue = self.dispatch_loop_above(context, inner, prologue_floor);
+                self.release_frames_above(inner, prologue_floor);
+                prologue?;
+                // §27.5.1 step 3 — resolve [[Prototype]] after the
+                // prologue (FunctionDeclarationInstantiation) ran, through
+                // the invoked closure's bag so the generator's prototype is
+                // the same object later `fn.prototype` reads observe.
+                let proto = self.function_property_get_runtime_rooted(
+                    context,
+                    roots.target().as_closure(&self.gc_heap),
+                    function_id,
+                    "prototype",
+                    &[],
+                    &[],
+                )?;
+                let gen_handle = roots
+                    .scratch(0)
+                    .as_generator()
+                    .ok_or(VmError::InvalidOperand)?;
+                gen_handle.set_prototype_override(
+                    &mut self.gc_heap,
+                    proto.as_object().is_some().then_some(proto),
+                );
+                Ok(roots.scratch(0))
+            })();
+            roots.set_scratch(0, Value::undefined());
+            return result;
         }
         // The caller owns `inner` (a reservation-stable pooled stack): the entry
         // frame may tier up and run compiled, and a compiled callee appends its

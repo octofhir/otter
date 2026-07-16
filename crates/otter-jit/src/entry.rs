@@ -42,7 +42,7 @@ pub(crate) use abi::*;
 pub(crate) use code::enter_compiled;
 pub use lowering::Unsupported;
 pub(crate) use lowering::{
-    BaselinePlan, MAX_METHOD_ARGS, pack_method_arg_regs, reg_offset, unpack_method_arg_regs,
+    BaselinePlan, MAX_METHOD_ARGS, decode_packed_arg_regs, pack_method_arg_regs, reg_offset,
 };
 use runtime_ops::*;
 pub(crate) use runtime_ops::{IC_WAYS, WhiskerIcCell, jit_backedge_poll_stub};

@@ -481,7 +481,10 @@ mod tests {
             ),
             (Op::ReturnValue, vec![Operand::Register(0)]),
         ]);
-        assert!(compile(&five_args).is_err());
+        assert!(
+            compile(&five_args).is_ok(),
+            "argument lists beyond the inline lanes spill into the code object's register table"
+        );
     }
 
     #[test]

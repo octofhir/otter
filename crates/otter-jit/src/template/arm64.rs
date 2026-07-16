@@ -481,7 +481,7 @@ pub(super) fn compile(
                     dst,
                     callee,
                     argc,
-                    packed_args,
+                    plan.resolve_packed_args(argc, packed_args),
                     bail,
                     threw,
                 );
@@ -498,7 +498,7 @@ pub(super) fn compile(
                     dst,
                     callee,
                     argc,
-                    packed_args,
+                    plan.resolve_packed_args(argc, packed_args),
                     bail,
                     threw,
                 );
@@ -523,7 +523,7 @@ pub(super) fn compile(
                     name,
                     site,
                     argc,
-                    packed_args,
+                    plan.resolve_packed_args(argc, packed_args),
                     byte_pc,
                     arg0,
                     arg1,

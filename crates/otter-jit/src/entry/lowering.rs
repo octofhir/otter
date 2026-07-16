@@ -664,13 +664,6 @@ impl BaselinePlan {
             match op {
                 Op::LoadProperty => load_property_count += 1,
                 Op::StoreProperty => store_property_count += 1,
-                Op::CallMethodValue => {
-                    if let Some(argc) = instr.const_index(code_block, 3)
-                        && argc as usize > MAX_METHOD_ARGS
-                    {
-                        return Err(Unsupported::ArgCount(argc as usize));
-                    }
-                }
                 _ => {}
             }
 
@@ -1209,6 +1202,28 @@ pub(crate) fn pack_method_arg_regs(arg_regs: &[u16]) -> u64 {
         packed |= u64::from(areg) << (16 * slot);
     }
     packed
+}
+
+/// Decode a call's argument-register list from its packed word.
+///
+/// Up to [`MAX_METHOD_ARGS`] registers travel inline as four u16 lanes; a
+/// longer list travels as the address of a register table inside the
+/// executing code object's decoded-operand buffer, which stays alive for the
+/// code's whole lifetime (the emitter bakes the address after the buffer is
+/// frozen).
+pub(crate) fn decode_packed_arg_regs(
+    argc: usize,
+    packed: u64,
+    inline: &mut [u16; MAX_METHOD_ARGS],
+) -> &[u16] {
+    if argc <= MAX_METHOD_ARGS {
+        *inline = unpack_method_arg_regs(packed);
+        &inline[..argc]
+    } else {
+        // SAFETY: emitted code passes the baked address of an `argc`-length
+        // register table owned by the executing code object.
+        unsafe { std::slice::from_raw_parts(packed as *const u16, argc) }
+    }
 }
 
 /// Unpack method-call argument register indices from one word.

@@ -18,7 +18,6 @@ use otter_vm::{JitExceptionOutcome, Value, VmError};
 
 use super::super::{
     JitCtx, JitRet, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED, STATUS_THREW,
-    unpack_method_arg_regs,
 };
 
 pub(crate) fn park_jit_error(ctx: &mut JitCtx, err: VmError) {
@@ -920,14 +919,14 @@ pub(crate) extern "C" fn jit_prepare_direct_call_stub(
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
+    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
+    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_prepare_direct_call(
         context,
         stack,
         ctx.frame_index,
         callee_reg as u16,
-        &all[..argc],
+        args,
         ctx.regs.cast::<otter_vm::Value>().cast_const(),
     ) {
         Ok(Some(prepared)) => {
@@ -969,8 +968,8 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
+    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
+    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_prepare_direct_method_call(
         context,
         stack,
@@ -978,7 +977,7 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
         recv as u16,
         name_idx as u32,
         site as usize,
-        &all[..argc],
+        args,
         ctx.regs.cast::<otter_vm::Value>().cast_const(),
     ) {
         Ok(Some(prepared)) => {
@@ -1023,8 +1022,8 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
     let vm = unsafe { &mut *activation.vm_ptr() };
     let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
+    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
+    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_runtime_call_method_in_place(
         context,
         stack,
@@ -1033,7 +1032,7 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
         recv as u16,
         name_idx as u32,
         site as usize,
-        &all[..argc],
+        args,
         ctx.regs.cast::<otter_vm::Value>(),
     ) {
         Ok(true) => 0,
@@ -1070,13 +1069,13 @@ pub(crate) extern "C" fn jit_call_generic_stub(
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
+    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
+    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_runtime_call_in_place(
         context,
         dst as u16,
         callee as u16,
-        &all[..argc],
+        args,
         ctx.regs.cast::<otter_vm::Value>(),
     ) {
         Ok(true) => 0,
@@ -1113,13 +1112,13 @@ pub(crate) extern "C" fn jit_construct_stub(
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
     let context = unsafe { &*activation.context_ptr() };
-    let all = unpack_method_arg_regs(packed_args);
-    let argc = (argc as usize).min(all.len());
+    let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
+    let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_runtime_construct_in_place(
         context,
         dst as u16,
         callee as u16,
-        &all[..argc],
+        args,
         ctx.regs.cast::<otter_vm::Value>(),
     ) {
         Ok(true) => 0,

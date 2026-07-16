@@ -130,6 +130,8 @@ mod tests {
         let mut sync_reentry_depth_probe: u32 = 0;
         let mut reg_stack_probe = [0u64; 64];
         let mut reg_top_probe: usize = 0;
+        let mut activation_probe = [0u64; 32];
+        let mut activation_top_probe: usize = 0;
         let mut native_frame = otter_vm::native_abi::NativeFrame {
             header: otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
             previous_frame: 0,
@@ -171,6 +173,9 @@ mod tests {
             direct_code_object_id: 0,
             reg_stack_base: reg_stack_probe.as_mut_ptr(),
             reg_top_ptr: std::ptr::addr_of_mut!(reg_top_probe),
+            activation_base: activation_probe.as_mut_ptr().cast(),
+            activation_top_ptr: std::ptr::addr_of_mut!(activation_top_probe),
+            activation_limit: 16,
         };
         // SAFETY: subset code never re-enters the VM; the entry was emitted
         // with the shared compiled-entry ABI and its mapping outlives the call.

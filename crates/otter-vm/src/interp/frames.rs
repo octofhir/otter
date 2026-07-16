@@ -150,6 +150,26 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Base of the native JIT activation array. The backing allocation is
+    /// created once at interpreter construction and never resized, so the
+    /// pointer stays valid for the isolate's lifetime; compiled code indexes
+    /// it directly to publish/unpublish activations without a Rust call.
+    pub fn jit_native_activation_base(&mut self) -> *mut jit::JitNativeActivation {
+        self.jit_native_activations.as_mut_ptr()
+    }
+
+    /// Address of the native JIT activation cursor, read and bumped by
+    /// compiled direct-call sequences.
+    pub fn jit_native_activation_top_addr(&mut self) -> *mut usize {
+        &mut self.jit_native_activation_top
+    }
+
+    /// Capacity of the native JIT activation array — the overflow bound
+    /// compiled code checks before an inline publish.
+    pub fn jit_native_activation_limit(&self) -> usize {
+        self.jit_native_activations.len()
+    }
+
     /// Unpublish the most recently pushed native JIT activation.
     #[inline]
     pub fn jit_pop_native_activation(&mut self) {

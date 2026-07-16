@@ -926,6 +926,7 @@ impl Interpreter {
         arg_regs: &[u16],
         caller_regs: *const Value,
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
+        let _ = frame_index;
         // Polymorphic cache: find the entry whose cached receiver shape still
         // resolves the same method. A miss just falls to the generic path — the
         // other cached shapes stay, so a site that alternates shapes does not
@@ -933,14 +934,27 @@ impl Interpreter {
         let Some(set) = self.jit_direct_method_cache.get(site) else {
             return Ok(None);
         };
+        let current_epoch = self.jit_code_registry.invalidation_epoch();
         let mut resolved = None;
         for cache in set {
             if self.cached_direct_method_value(obj, &cache.hit) == Some(cache.method_value) {
-                resolved = Some((cache.method_value, cache.function_id, cache.code.clone()));
+                // A moved invalidation epoch means some installed code became
+                // invalid since this plan was proved; re-prove through the slow
+                // path, which reinstalls the way with a fresh plan.
+                if cache.plan_epoch != current_epoch {
+                    return Ok(None);
+                }
+                resolved = Some((
+                    cache.method_value,
+                    cache.function_id,
+                    cache.plan,
+                    cache.own_upvalue_count,
+                    cache.code.clone(),
+                ));
                 break;
             }
         }
-        let Some((method_value, function_id, code)) = resolved else {
+        let Some((method_value, function_id, plan, own_upvalue_count, code)) = resolved else {
             return Ok(None);
         };
         // Derive the callee's upvalue spine and `this` from the resolved method
@@ -961,26 +975,84 @@ impl Interpreter {
         {
             return Ok(None);
         }
-        let Some(function) = context.exec_function(function_id) else {
-            return Ok(None);
-        };
-        let Some(plan) = self.jit_direct_call_plan_for(function, code.as_ref()) else {
-            return Ok(None);
-        };
 
         self.enter_sync_reentry()?;
-        match self.prepare_jit_direct_call_frame(
-            context,
-            stack,
-            frame_index,
-            function,
-            parent_upvalues,
-            this0,
-            plan,
-            None,
-            arg_regs,
-            caller_regs,
-        ) {
+        let prepared = (|| -> Result<jit::JitPreparedDirectCall, VmError> {
+            let bind_count = usize::from(plan.param_count).min(arg_regs.len());
+            // SAFETY: `caller_regs` is the caller's live register base;
+            // `arg_regs` are compiler-emitted indices into it.
+            let read_caller = |reg: u16| -> Value { unsafe { *caller_regs.add(reg as usize) } };
+            let upvalues = if own_upvalue_count == 0 {
+                parent_upvalues
+            } else {
+                let function = context
+                    .exec_function(function_id)
+                    .ok_or(VmError::InvalidOperand)?;
+                Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?
+            };
+            // An object receiver passes through the `this` resolution
+            // identically in strict and sloppy callees; only a primitive
+            // (a closure-bound `this`) needs the full coercion.
+            let this_for_callee = if this0.is_object() {
+                this0
+            } else {
+                let function = context
+                    .exec_function(function_id)
+                    .ok_or(VmError::InvalidOperand)?;
+                self.this_for_bytecode_call_runtime_rooted(function, this0, &[])?
+            };
+            let window_rollback = self.register_window_rollback();
+            let window = self.alloc_reg_window(usize::from(plan.register_count))?;
+            let mut callee_frame = HoltCallReservation::from_frame(Frame::for_jit_direct_call(
+                plan.function_id,
+                plan.register_count,
+                upvalues,
+                this_for_callee,
+                window,
+            ));
+            for (dst_slot, &src) in callee_frame
+                .frame_mut()
+                .registers
+                .iter_mut()
+                .zip(arg_regs.iter())
+                .take(bind_count)
+            {
+                *dst_slot = read_caller(src);
+            }
+            // The method path bails `makes_function` callees at install, so the
+            // SELF binding is always the bare interned function value.
+            let self_closure_bits = Value::function(plan.function_id).to_bits();
+            let this_bits = this_for_callee.to_bits();
+            let upvalues_ptr = {
+                let spine = &callee_frame.frame_mut().upvalues;
+                if spine.is_empty() {
+                    0
+                } else {
+                    spine.as_ptr() as usize
+                }
+            };
+            let frame_desc = callee_frame.publish(stack);
+            window_rollback.commit();
+            let frame_flags = if plan.has_safepoints {
+                crate::native_abi::NativeFrameFlags::HAS_SAFEPOINTS
+            } else {
+                0
+            };
+            Ok(jit::JitPreparedDirectCall {
+                entry_addr: plan.entry_addr,
+                regs: frame_desc.register_window().as_mut_ptr().cast::<u64>(),
+                self_closure: self_closure_bits,
+                this_value: this_bits,
+                frame_index: frame_desc.index(),
+                upvalues_ptr,
+                frame_ids: u64::from(plan.function_id) | (u64::from(plan.function_id) << 32),
+                frame_meta: (u64::from(plan.register_count) << 32)
+                    | ((crate::native_abi::NativeFrameKind::Baseline as u64) << 48)
+                    | (u64::from(frame_flags) << 56),
+                code_object_id: plan.code_object_id,
+            })
+        })();
+        match prepared {
             Ok(prepared) => {
                 self.pin_jit_direct_code(prepared.frame_index, code);
                 self.jit_runtime_stats.direct_calls =
@@ -994,6 +1066,7 @@ impl Interpreter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_jit_direct_method_cache(
         &mut self,
         site: usize,
@@ -1002,6 +1075,8 @@ impl Interpreter {
         method: Value,
         function_id: u32,
         code: std::sync::Arc<dyn jit::JitFunctionCode>,
+        plan: jit::JitDirectCallPlan,
+        own_upvalue_count: u16,
     ) {
         let method_is_plain_function = method == Value::function(function_id);
         // A closure method only caches at a monomorphic site. A polymorphic receiver
@@ -1082,6 +1157,9 @@ impl Interpreter {
                     function_id,
                     method_value: method,
                     code,
+                    plan,
+                    plan_epoch: self.jit_code_registry.invalidation_epoch(),
+                    own_upvalue_count,
                 };
                 // Replace a same-receiver-shape entry (method reassigned) in place;
                 // otherwise append while the site stays within the way budget.
@@ -1208,7 +1286,16 @@ impl Interpreter {
         let Some(plan) = self.jit_direct_call_plan_for(function, code.as_ref()) else {
             return Ok(None);
         };
-        self.install_jit_direct_method_cache(site, obj, key, method, function_id, code.clone());
+        self.install_jit_direct_method_cache(
+            site,
+            obj,
+            key,
+            method,
+            function_id,
+            code.clone(),
+            plan,
+            function.own_upvalue_count,
+        );
 
         self.enter_sync_reentry()?;
         match self.prepare_jit_direct_call_frame(

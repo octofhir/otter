@@ -55,6 +55,12 @@ pub struct JitCodeRegistry {
     codes: rustc_hash::FxHashMap<u64, RegisteredCode>,
     /// Latest isolate-local epoch by dependency family and stable identity.
     epochs: rustc_hash::FxHashMap<(CodeDependencyKind, u32), u64>,
+    /// Monotonic counter bumped whenever any installed code can become
+    /// invalid (function invalidation or dependency-epoch publication).
+    /// Cached per-call-site entry plans snapshot it; an equal snapshot proves
+    /// the cached plan's compatibility check is still current without
+    /// re-walking the registry.
+    invalidation_epoch: u64,
 }
 
 impl JitCodeRegistry {
@@ -68,6 +74,7 @@ impl JitCodeRegistry {
             },
             codes: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
+            invalidation_epoch: 0,
         });
         registry.view.context = std::ptr::addr_of!(*registry) as u64;
         registry
@@ -133,6 +140,7 @@ impl JitCodeRegistry {
     /// no new entries, while active frames keep returning through it via their
     /// `Arc` anchors.
     pub(crate) fn invalidate_function(&mut self, function_id: u32) {
+        self.invalidation_epoch += 1;
         for registered in self.codes.values_mut() {
             if registered.state == CodeLifetimeState::Installed
                 && registered.code.metadata().code_block_id == function_id
@@ -165,6 +173,7 @@ impl JitCodeRegistry {
             return;
         }
         *published = current_epoch;
+        self.invalidation_epoch += 1;
         for registered in self.codes.values_mut() {
             if registered.state == CodeLifetimeState::Installed
                 && registered.dependencies.iter().any(|dependency| {
@@ -189,6 +198,12 @@ impl JitCodeRegistry {
                 || Arc::strong_count(&registered.code) > 1
         });
         before - self.codes.len()
+    }
+
+    /// Current invalidation-epoch snapshot for cached per-site entry plans.
+    #[must_use]
+    pub(crate) fn invalidation_epoch(&self) -> u64 {
+        self.invalidation_epoch
     }
 
     /// Address of the published view for [`crate::native_abi::VmThread`].

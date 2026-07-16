@@ -673,6 +673,16 @@ struct JitDirectMethodCache {
     /// re-resolves rather than reading a dangling pointer.
     method_value: Value,
     code: std::sync::Arc<dyn jit::JitFunctionCode>,
+    /// Entry plan resolved once at install so the per-call hit path skips the
+    /// code-object virtual calls and registry walk entirely.
+    plan: jit::JitDirectCallPlan,
+    /// Registry invalidation-epoch snapshot at install; a differing current
+    /// epoch means some installed code was invalidated since, so the cached
+    /// plan must be re-proved through the slow path.
+    plan_epoch: u64,
+    /// Callee's own captured-cell count; a nonzero count needs the exec
+    /// `CodeBlock` per call to build fresh cells, so the fused path defers.
+    own_upvalue_count: u16,
 }
 
 impl JitDirectMethodCache {

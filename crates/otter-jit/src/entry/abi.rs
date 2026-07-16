@@ -79,6 +79,14 @@ pub(crate) struct JitCtx {
     /// adding the callee register count, and stores it back; the matching pop on
     /// return restores it.
     pub(crate) reg_top_ptr: *mut usize,
+    /// Base of the interpreter's native JIT activation array (16-byte
+    /// `JitNativeActivation` records). Compiled direct-call sequences publish
+    /// and unpublish the callee's SELF/`this` GC slots inline through it.
+    pub(crate) activation_base: *mut u8,
+    /// Address of the interpreter's native activation cursor.
+    pub(crate) activation_top_ptr: *mut usize,
+    /// Capacity of the activation array — the inline publish overflow bound.
+    pub(crate) activation_limit: usize,
 }
 
 impl JitCtx {
@@ -159,6 +167,13 @@ pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_s
 /// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
 /// `reg_top`, bumped to reserve a callee window and restored on return.
 pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
+/// Byte offsets of the native-activation publish fields in [`JitCtx`], used by
+/// inline direct-call activation push/pop sequences.
+pub(crate) const ACTIVATION_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, activation_base) as u32;
+pub(crate) const ACTIVATION_TOP_PTR_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, activation_top_ptr) as u32;
+pub(crate) const ACTIVATION_LIMIT_OFFSET: u32 =
+    std::mem::offset_of!(JitCtx, activation_limit) as u32;
 pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, thread) as u32;
 pub(crate) const ALLOC_CTX_FRAME_OFFSET: u32 =

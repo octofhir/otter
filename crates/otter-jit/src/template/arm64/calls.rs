@@ -31,6 +31,7 @@ use super::collections::{
 use super::transitions::TransitionTable;
 use super::values::emit_load_u64;
 use crate::entry::{
+    ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
     CTX_PLUS_FRAME_STACK_SIZE, DIRECT_CODE_OBJECT_ID_OFFSET, DIRECT_ENTRY_OFFSET,
     DIRECT_FRAME_IDS_OFFSET, DIRECT_FRAME_INDEX_OFFSET, DIRECT_FRAME_META_OFFSET,
     DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET, DIRECT_UPVALUES_OFFSET,
@@ -285,8 +286,9 @@ pub(crate) fn emit_direct_call_tail(
     let direct_returned = ops.new_dynamic_label();
     let direct_bailed = ops.new_dynamic_label();
     let direct_threw = ops.new_dynamic_label();
+    let push_slow = ops.new_dynamic_label();
+    let push_done = ops.new_dynamic_label();
     let push_activation = table.entry(abi::STUB_JIT_PUSH_NATIVE_ACTIVATION);
-    let pop_activation = table.entry(abi::STUB_JIT_POP_NATIVE_ACTIVATION);
     dynasm!(ops
         ; .arch aarch64
         ; sub sp, sp, CTX_PLUS_FRAME_STACK_SIZE
@@ -334,13 +336,29 @@ pub(crate) fn emit_direct_call_tail(
         ; str x9, [sp, REG_STACK_BASE_OFFSET]
         ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
         ; str x9, [sp, REG_TOP_PTR_OFFSET]
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 16, push_activation);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; cbnz x0, =>threw
+        ; ldr x9, [x20, ACTIVATION_BASE_OFFSET]
+        ; str x9, [sp, ACTIVATION_BASE_OFFSET]
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; str x9, [sp, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x9, [x20, ACTIVATION_LIMIT_OFFSET]
+        ; str x9, [sp, ACTIVATION_LIMIT_OFFSET]
+        // Publish the callee's SELF/`this` GC slots inline: bump the
+        // activation cursor and record the two slot addresses. Overflow takes
+        // the stub slow path, which parks the stack-overflow error.
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; ldr x11, [x20, ACTIVATION_LIMIT_OFFSET]
+        ; cmp x10, x11
+        ; b.hs =>push_slow
+        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; add x12, x11, x10, lsl #4
+        ; add x13, sp, #8
+        ; str x13, [x12]
+        ; add x13, sp, #16
+        ; str x13, [x12, #8]
+        ; add x10, x10, #1
+        ; str x10, [x9]
+        ; =>push_done
         ; mov x0, sp
         ; ldr x16, [x20, DIRECT_ENTRY_OFFSET]
         ; blr x16
@@ -355,17 +373,16 @@ pub(crate) fn emit_direct_call_tail(
         ; b.eq =>direct_bailed
         ; b =>direct_threw
         ; =>direct_returned
-        ; str x0, [sp, DIRECT_ENTRY_OFFSET]
-        ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 16, pop_activation);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; ldr x2, [sp, DIRECT_FRAME_INDEX_OFFSET]
-        ; ldr x3, [sp, DIRECT_ENTRY_OFFSET]
+        ; mov x3, x0
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; sub x10, x10, #1
+        ; str x10, [x9]
+        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; add x12, x11, x10, lsl #4
+        ; str xzr, [x12]
+        ; str xzr, [x12, #8]
+        ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
         ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
         ; movz x1, dst as u32
@@ -381,21 +398,18 @@ pub(crate) fn emit_direct_call_tail(
         ; cbnz x0, =>threw
         ; b =>done
         ; =>direct_bailed
-        // The callee stamped its exact bail PC into its own published frame;
-        // park it in the spent entry slot across the activation pop.
+        // The callee stamped its exact bail PC into its own published frame.
         ; add x9, sp, JIT_CTX_STACK_SIZE
-        ; ldr w9, [x9, NATIVE_FRAME_PC_OFFSET]
-        ; str w9, [sp, DIRECT_ENTRY_OFFSET]
-        ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 16, pop_activation);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; ldr x2, [sp, DIRECT_FRAME_INDEX_OFFSET]
-        ; ldr w3, [sp, DIRECT_ENTRY_OFFSET]
+        ; ldr w3, [x9, NATIVE_FRAME_PC_OFFSET]
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; sub x10, x10, #1
+        ; str x10, [x9]
+        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; add x12, x11, x10, lsl #4
+        ; str xzr, [x12]
+        ; str xzr, [x12, #8]
+        ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
         ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
         ; movz x1, dst as u32
@@ -411,15 +425,15 @@ pub(crate) fn emit_direct_call_tail(
         ; cbnz x0, =>threw
         ; b =>done
         ; =>direct_threw
-        ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; str x9, [sp, DIRECT_FRAME_INDEX_OFFSET]
-        ; mov x0, sp
-    );
-    emit_load_u64(ops, 16, pop_activation);
-    dynasm!(ops
-        ; .arch aarch64
-        ; blr x16
-        ; ldr x1, [sp, DIRECT_FRAME_INDEX_OFFSET]
+        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
+        ; ldr x10, [x9]
+        ; sub x10, x10, #1
+        ; str x10, [x9]
+        ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
+        ; add x12, x11, x10, lsl #4
+        ; str xzr, [x12]
+        ; str xzr, [x12, #8]
+        ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
         ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
         ; mov x0, x20
     );
@@ -430,5 +444,16 @@ pub(crate) fn emit_direct_call_tail(
         ; cmp x0, #2
         ; b.eq =>bail
         ; b =>threw
+        // Out-of-line activation-publish overflow: the stub re-checks, parks
+        // the stack-overflow error, and reports it.
+        ; =>push_slow
+        ; mov x0, sp
+    );
+    emit_load_u64(ops, 16, push_activation);
+    dynasm!(ops
+        ; .arch aarch64
+        ; blr x16
+        ; cbnz x0, =>threw
+        ; b =>push_done
     );
 }

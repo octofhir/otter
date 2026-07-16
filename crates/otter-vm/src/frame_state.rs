@@ -546,6 +546,31 @@ impl Frame {
         }
     }
 
+    /// Build a compiled direct-call callee frame from a cached entry plan,
+    /// without touching the exec `CodeBlock`. The caller guarantees `window`
+    /// spans exactly `register_count` slots and `upvalues` already includes
+    /// the callee's own cells (the cached plan defers nonzero
+    /// `own_upvalue_count` callees to the exec-backed constructor).
+    pub(crate) fn for_jit_direct_call(
+        function_id: u32,
+        register_count: u16,
+        upvalues: UpvalueSpine,
+        this_value: Value,
+        window: RegisterWindow,
+    ) -> Self {
+        debug_assert_eq!(window.len(), register_count as usize);
+        Self {
+            header: VmFrameHeader::interpreter(function_id, register_count),
+            registers: window,
+            return_register: None,
+            upvalues,
+            this_value,
+            async_state: None,
+            cold: None,
+            generator_owner: None,
+        }
+    }
+
     /// Trace locals, register window, receiver, parked side-channel
     /// values, and nested generator / async state held by this frame.
     pub(crate) fn trace_frame_slots(&self, visitor: &mut SlotVisitor<'_>) {

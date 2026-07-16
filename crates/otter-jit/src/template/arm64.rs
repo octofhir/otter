@@ -30,7 +30,7 @@
 #![allow(clippy::useless_conversion)]
 
 pub(crate) mod arith;
-pub(crate) mod calls;
+mod calls;
 mod class_ops;
 mod class_value;
 mod collections;
@@ -56,6 +56,7 @@ pub(crate) mod values;
 mod variadic;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::Op;
@@ -66,7 +67,9 @@ use self::arith::{
     emit_increment, emit_int_bitwise, emit_loose_compare, emit_negate, emit_numeric_slow_paths,
     emit_to_numeric, emit_to_primitive, emit_unsigned_shift_right,
 };
-use self::values::{emit_load_reg, emit_load_u64, emit_store_reg};
+use self::values::{
+    BoxedSlotSlowPath, emit_boxed_slot_slow_paths, emit_load_reg, emit_load_u64, emit_store_reg,
+};
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::entry::{
@@ -88,6 +91,7 @@ pub(super) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
+    call_trampoline: Arc<crate::arm64::CallTrampoline>,
 ) -> Result<TemplateCode, Unsupported> {
     let plan = TemplatePlan::build(view)?;
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
@@ -101,9 +105,11 @@ pub(super) fn compile(
         vec![crate::entry::WhiskerIcCell::default(); plan.store_property_count].into_boxed_slice();
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
+    let mut boxed_slot_slow_paths = Vec::<BoxedSlotSlowPath>::new();
     let mut coercion_slow_paths = Vec::new();
     let mut numeric_slow_paths = Vec::new();
-    let mut ops = Assembler::new().expect("assembler alloc");
+    let mut ops = Assembler::new()
+        .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let bail = ops.new_dynamic_label();
     let returned = ops.new_dynamic_label();
     let threw = ops.new_dynamic_label();
@@ -445,6 +451,7 @@ pub(super) fn compile(
                     site,
                     array_length,
                     cell_addr,
+                    &mut boxed_slot_slow_paths,
                     threw,
                 )?;
             }
@@ -478,6 +485,7 @@ pub(super) fn compile(
                 calls::emit_call(
                     &mut ops,
                     transitions,
+                    call_trampoline.as_ref(),
                     dst,
                     callee,
                     argc,
@@ -517,6 +525,7 @@ pub(super) fn compile(
                 calls::emit_method_call(
                     &mut ops,
                     transitions,
+                    call_trampoline.as_ref(),
                     view,
                     dst,
                     receiver,
@@ -1007,11 +1016,15 @@ pub(super) fn compile(
         }
     }
 
-    // Preserve the old end-of-stream exact exit while keeping every coercion
-    // transition out of line. Each cold continuation returns to the label
-    // immediately after its source operation's inline fast path.
-    if !coercion_slow_paths.is_empty() || !numeric_slow_paths.is_empty() {
+    // Preserve the old end-of-stream exact exit while keeping cold
+    // continuations out of line. Each returns to the label immediately after
+    // its source operation's inline fast path.
+    if !boxed_slot_slow_paths.is_empty()
+        || !coercion_slow_paths.is_empty()
+        || !numeric_slow_paths.is_empty()
+    {
         dynasm!(ops ; .arch aarch64 ; b =>bail);
+        emit_boxed_slot_slow_paths(&mut ops, view, boxed_slot_slow_paths);
         emit_numeric_slow_paths(&mut ops, transitions, numeric_slow_paths, bail, threw);
         emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, bail, threw);
     }
@@ -1077,7 +1090,9 @@ pub(super) fn compile(
         osr_entries.insert(header_pc, offset);
     }
 
-    let buf = ops.finalize().expect("finalize");
+    let buf = ops
+        .finalize()
+        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
     let TemplatePlan {
         register_count,
         register_operands,
@@ -1089,6 +1104,7 @@ pub(super) fn compile(
     safepoint_records.sort_by_key(|record| record.id);
     Ok(TemplateCode::from_emission(
         CompiledCode::new(buf, entry),
+        call_trampoline,
         code_object_id,
         view.code_block.id,
         register_count,

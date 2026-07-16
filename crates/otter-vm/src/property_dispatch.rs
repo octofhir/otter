@@ -3375,39 +3375,45 @@ impl Interpreter {
         let Some(obj) = receiver.as_object() else {
             return full_get(self, stack);
         };
-        if site >= self.load_property_ics.len() || self.load_property_ics[site].is_megamorphic() {
+        if self
+            .feedback_directory
+            .property_is_megamorphic(site, PropertyIcKind::Load)
+            != Some(false)
+        {
             return full_get(self, stack);
         }
-        let mut hit_value: Option<Value> = None;
-        for ic in self.load_property_ics[site].entries() {
-            if let Some(value) = ic.run_load(obj, &self.gc_heap, atomized_key) {
-                hit_value = Some(value);
-                break;
-            }
-        }
-        if let Some(value) = hit_value {
-            self.property_ic_stats.record_hit(PropertyIcKind::Load);
+        if let Some(value) =
+            self.feedback_directory
+                .probe_load(site, obj, &self.gc_heap, atomized_key)
+        {
+            self.feedback_directory
+                .record_property_hit(PropertyIcKind::Load);
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
             return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
         }
-        if self.load_property_ics[site].entry_count() > 0 {
-            self.load_property_ics[site]
-                .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+        if self
+            .feedback_directory
+            .property_entry_count(site, PropertyIcKind::Load)
+            .unwrap_or_default()
+            > 0
+        {
+            self.feedback_directory
+                .record_property_guard_miss(site, PropertyIcKind::Load);
         } else {
-            self.load_property_ics[site]
-                .record_uncached_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Load);
+            self.feedback_directory
+                .record_property_uncached_miss(site, PropertyIcKind::Load);
         }
-        if !self.load_property_ics[site].is_megamorphic()
+        if self
+            .feedback_directory
+            .property_is_megamorphic(site, PropertyIcKind::Load)
+            == Some(false)
             && let Some((ic, value)) =
                 cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
         {
-            self.load_property_ics[site].install_with_stats(
-                &mut self.property_ic_stats,
-                PropertyIcKind::Load,
-                ic,
-            );
+            self.feedback_directory
+                .install_property_stub(site, PropertyIcKind::Load, ic);
             unsafe {
                 *regs.add(dst as usize) = value.to_bits();
             }
@@ -3467,44 +3473,42 @@ impl Interpreter {
         if !matches!(set_outcome, object::SetOutcome::AssignData) {
             return full_set(self, stack);
         }
-        if site < self.store_property_ics.len() {
-            let entries_len = self.store_property_ics[site].entry_count();
-            for idx in 0..entries_len {
-                let ic = self.store_property_ics[site].entries()[idx].clone();
-                if ic
-                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
-                    .is_some()
-                {
-                    self.property_ic_stats.record_hit(PropertyIcKind::Store);
-                    return Ok(self.whisker_store_cell_fill(
-                        site,
-                        object::shape(obj, &self.gc_heap).offset(),
-                    ));
-                }
+        if let Some(entries_len) = self
+            .feedback_directory
+            .property_entry_count(site, PropertyIcKind::Store)
+        {
+            if self.feedback_directory.probe_store(
+                site,
+                obj,
+                &mut self.gc_heap,
+                atomized_key,
+                &value,
+            ) {
+                self.feedback_directory
+                    .record_property_hit(PropertyIcKind::Store);
+                return Ok(
+                    self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
+                );
             }
             if entries_len > 0 {
-                self.store_property_ics[site].record_guard_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Store,
-                );
+                self.feedback_directory
+                    .record_property_guard_miss(site, PropertyIcKind::Store);
             } else {
-                self.store_property_ics[site].record_uncached_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Store,
-                );
+                self.feedback_directory
+                    .record_property_uncached_miss(site, PropertyIcKind::Store);
             }
-            if !self.store_property_ics[site].is_megamorphic()
+            if self
+                .feedback_directory
+                .property_is_megamorphic(site, PropertyIcKind::Store)
+                == Some(false)
                 && let Some(ic) =
                     cache_ir::CacheStub::install_store_existing(obj, &self.gc_heap, atomized_key)
                 && ic
                     .run_store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()
             {
-                self.store_property_ics[site].install_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Store,
-                    ic,
-                );
+                self.feedback_directory
+                    .install_property_stub(site, PropertyIcKind::Store, ic);
                 return Ok(
                     self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
                 );
@@ -3529,22 +3533,8 @@ impl Interpreter {
         obj: JsObject,
         atomized_key: AtomizedPropertyKey<'_>,
     ) -> u64 {
-        let recv_shape = object::shape(obj, &self.gc_heap).offset();
-        if recv_shape == 0 {
-            return 0;
-        }
-        for ic in self.load_property_ics[site].entries() {
-            if let Some(hit) = ic.own_data_hit()
-                && hit.shape.offset() == recv_shape
-                && hit.atom_id == atomized_key.atom().id()
-                && object::load_own_data_slot_atom(obj, &self.gc_heap, atomized_key, hit).is_some()
-            {
-                let value_byte = u32::from(hit.slot)
-                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-                return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
-            }
-        }
-        0
+        self.feedback_directory
+            .whisker_load_cell_fill(site, obj, &self.gc_heap, atomized_key)
     }
 
     /// JIT bridge for a computed `LoadElement` (`recv[idx]`) from compiled code.
@@ -3775,19 +3765,8 @@ impl Interpreter {
     /// keeps also guarantees the slot is the writable data slot the IC captured
     /// (a shape encodes per-slot flags and key), so the inline write is sound.
     fn whisker_store_cell_fill(&self, site: usize, recv_shape: u32) -> u64 {
-        if recv_shape == 0 {
-            return 0;
-        }
-        for ic in self.store_property_ics[site].entries() {
-            if let Some(hit) = ic.store_own_data_hit()
-                && hit.shape.offset() == recv_shape
-            {
-                let value_byte = u32::from(hit.slot)
-                    * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-                return (u64::from(value_byte) << 32) | u64::from(hit.shape.offset());
-            }
-        }
-        0
+        self.feedback_directory
+            .whisker_store_cell_fill(site, recv_shape)
     }
 
     /// JIT bridge: run the GC write barrier after an inline `StoreProperty`
@@ -3878,31 +3857,32 @@ impl Interpreter {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
-            let mut site_disabled = self.load_property_ics[site].is_megamorphic();
-            let entries = self.load_property_ics[site].entries();
-            let mut hit_value: Option<Value> = None;
-            for ic in entries {
-                if let Some(value) = ic.run_load(obj, &self.gc_heap, atomized_key) {
-                    hit_value = Some(value);
-                    break;
-                }
-            }
-            if let Some(value) = hit_value {
-                self.property_ic_stats.record_hit(PropertyIcKind::Load);
+            let mut site_disabled = self
+                .feedback_directory
+                .property_is_megamorphic(site, PropertyIcKind::Load)
+                .unwrap_or(true);
+            if let Some(value) =
+                self.feedback_directory
+                    .probe_load(site, obj, &self.gc_heap, atomized_key)
+            {
+                self.feedback_directory
+                    .record_property_hit(PropertyIcKind::Load);
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
                 return Ok(true);
             }
-            if self.load_property_ics[site].entry_count() > 0 {
-                self.load_property_ics[site].record_guard_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Load,
-                );
-                site_disabled = self.load_property_ics[site].is_megamorphic();
+            if self
+                .feedback_directory
+                .property_entry_count(site, PropertyIcKind::Load)
+                .unwrap_or_default()
+                > 0
+            {
+                site_disabled = self
+                    .feedback_directory
+                    .record_property_guard_miss(site, PropertyIcKind::Load)
+                    .unwrap_or(true);
             } else {
-                self.load_property_ics[site].record_uncached_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Load,
-                );
+                self.feedback_directory
+                    .record_property_uncached_miss(site, PropertyIcKind::Load);
             }
             // The IC probing / miss bookkeeping above can materialise a rope
             // key and scavenge, relocating the receiver; re-read it from its
@@ -3915,11 +3895,8 @@ impl Interpreter {
                 && let Some((ic, value)) =
                     cache_ir::CacheStub::install_load(obj, &self.gc_heap, atomized_key)
             {
-                self.load_property_ics[site].install_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Load,
-                    ic,
-                );
+                self.feedback_directory
+                    .install_property_stub(site, PropertyIcKind::Load, ic);
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
                 return Ok(true);
             }
@@ -5190,36 +5167,32 @@ impl Interpreter {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
-            let entries_len = self.store_property_ics[site].entry_count();
+            let entries_len = self
+                .feedback_directory
+                .property_entry_count(site, PropertyIcKind::Store)
+                .unwrap_or_default();
             // The stub program is `&self`; only `gc_heap` is mutated by a store.
-            // `store_property_ics` and `gc_heap` are disjoint fields, so the
-            // entries slice and the `&mut gc_heap` a store writes through can be
-            // held at once — no per-store clone of the whole stub is needed.
-            let mut store_hit = false;
-            for ic in self.store_property_ics[site].entries() {
-                if ic
-                    .run_store(obj, &mut self.gc_heap, atomized_key, &value)
-                    .is_some()
-                {
-                    store_hit = true;
-                    break;
-                }
-            }
-            if store_hit {
-                self.property_ic_stats.record_hit(PropertyIcKind::Store);
+            // The feedback directory and `gc_heap` are disjoint fields, so the
+            // stub slice and the `&mut gc_heap` a store writes through can be
+            // held at once — no per-store clone of the whole bank is needed.
+            if self.feedback_directory.probe_store(
+                site,
+                obj,
+                &mut self.gc_heap,
+                atomized_key,
+                &value,
+            ) {
+                self.feedback_directory
+                    .record_property_hit(PropertyIcKind::Store);
                 Self::advance_property_fast_path(&mut stack[top_idx])?;
                 return Ok(true);
             }
             if entries_len > 0 {
-                self.store_property_ics[site].record_guard_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Store,
-                );
+                self.feedback_directory
+                    .record_property_guard_miss(site, PropertyIcKind::Store);
             } else {
-                self.store_property_ics[site].record_uncached_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Store,
-                );
+                self.feedback_directory
+                    .record_property_uncached_miss(site, PropertyIcKind::Store);
             }
         }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
@@ -5567,12 +5540,15 @@ impl Interpreter {
                     let site = context
                         .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                         .ok_or(VmError::InvalidOperand)?;
-                    if !self.store_property_ics[site].is_megamorphic()
+                    if self
+                        .feedback_directory
+                        .property_is_megamorphic(site, PropertyIcKind::Store)
+                        == Some(false)
                         && object::supports_fast_property_ic(obj, &self.gc_heap)
                     {
                         if let Some(transition) = transition {
-                            self.store_property_ics[site].install_with_stats(
-                                &mut self.property_ic_stats,
+                            self.feedback_directory.install_property_stub(
+                                site,
                                 PropertyIcKind::Store,
                                 cache_ir::CacheStub::store_transition(transition),
                             );
@@ -5581,8 +5557,8 @@ impl Interpreter {
                             &self.gc_heap,
                             atomized_key,
                         ) {
-                            self.store_property_ics[site].install_with_stats(
-                                &mut self.property_ic_stats,
+                            self.feedback_directory.install_property_stub(
+                                site,
                                 PropertyIcKind::Store,
                                 ic,
                             );
@@ -5656,18 +5632,20 @@ impl Interpreter {
             lhs.as_string(&self.gc_heap),
             context.property_ic_site(stack[top_idx].function_id, stack[top_idx].pc),
         ) {
-            let mut site_disabled = self.has_property_ics[site].is_megamorphic();
-            let entries_len = self.has_property_ics[site].entry_count();
-            let mut probe_hit = false;
-            for idx in 0..entries_len {
-                let ic = self.has_property_ics[site].entries()[idx].clone();
-                if ic.run_has(obj, &self.gc_heap, key_string).is_some() {
-                    probe_hit = true;
-                    break;
-                }
-            }
-            if probe_hit {
-                self.property_ic_stats.record_hit(PropertyIcKind::Has);
+            let mut site_disabled = self
+                .feedback_directory
+                .property_is_megamorphic(site, PropertyIcKind::Has)
+                .unwrap_or(true);
+            let entries_len = self
+                .feedback_directory
+                .property_entry_count(site, PropertyIcKind::Has)
+                .unwrap_or_default();
+            if self
+                .feedback_directory
+                .probe_has(site, obj, &self.gc_heap, key_string)
+            {
+                self.feedback_directory
+                    .record_property_hit(PropertyIcKind::Has);
                 Self::finish_property_fast_path_value(
                     &mut stack[top_idx],
                     dst,
@@ -5676,23 +5654,19 @@ impl Interpreter {
                 return Ok(true);
             }
             if entries_len > 0 {
-                self.has_property_ics[site]
-                    .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
-                site_disabled = self.has_property_ics[site].is_megamorphic();
+                site_disabled = self
+                    .feedback_directory
+                    .record_property_guard_miss(site, PropertyIcKind::Has)
+                    .unwrap_or(true);
             } else {
-                self.has_property_ics[site].record_uncached_miss_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Has,
-                );
+                self.feedback_directory
+                    .record_property_uncached_miss(site, PropertyIcKind::Has);
             }
             if !site_disabled
                 && let Some(ic) = cache_ir::CacheStub::install_has(obj, &self.gc_heap, key_string)
             {
-                self.has_property_ics[site].install_with_stats(
-                    &mut self.property_ic_stats,
-                    PropertyIcKind::Has,
-                    ic,
-                );
+                self.feedback_directory
+                    .install_property_stub(site, PropertyIcKind::Has, ic);
                 Self::finish_property_fast_path_value(
                     &mut stack[top_idx],
                     dst,
@@ -5700,8 +5674,8 @@ impl Interpreter {
                 )?;
                 return Ok(true);
             }
-            self.has_property_ics[site]
-                .disable_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
+            self.feedback_directory
+                .disable_property(site, PropertyIcKind::Has);
         }
         let key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
             VmPropertyKey::Symbol(sym)

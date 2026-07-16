@@ -40,7 +40,7 @@ mod runtime_ops;
 mod value_abi;
 pub(crate) use abi::*;
 pub(crate) use code::enter_compiled;
-pub use lowering::Unsupported;
+pub use lowering::{BackendFailure, Unsupported};
 pub(crate) use lowering::{
     BaselinePlan, MAX_METHOD_ARGS, decode_packed_arg_regs, pack_method_arg_regs, reg_offset,
 };

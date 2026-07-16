@@ -3,12 +3,15 @@
 //! # Contents
 //! - Register-window loads/stores and 64-bit immediate materialization.
 //! - Number guards, int32/double boxing, and NaN-purifying double encode.
+//! - Compressed property-slot decoding with cold boxed-payload recovery.
 //! - Full-semantics `ToInt32`/`ToUint32` fast paths for bitwise operators.
 //!
 //! # Invariants
 //! - Every helper documents its scratch registers; nothing survives a call.
 //! - Boxed doubles are purified before encoding, so no emitted value aliases
 //!   the cell space.
+//! - Boxed property slots validate their tag and `HeapNumber` body before the
+//!   exact full-Value payload is recovered.
 //! - Coercions the fast path cannot represent exactly branch to the caller's
 //!   supplied pre-effect continuation, normally an outlined VM transition.
 //!
@@ -239,8 +242,8 @@ pub(crate) fn emit_slab_base(ops: &mut Assembler, view: &JitCompileSnapshot, reg
 ///
 /// A small-int, cell-ref, immediate, or function-id slot decodes inline; a
 /// boxed slot (a heap-boxed double / wide int) branches to `boxed_bail`,
-/// where the interpreter reads the box. Fixed registers: `x9` is the slot
-/// in/out, `x10` scratch.
+/// where a deferred cold path reads the box. Fixed registers: `x9` is the
+/// slot in/out, `x10` scratch.
 pub(crate) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_bail: DynamicLabel) {
     use otter_vm::value::compressed as cslot;
     // The literal slot tags below are the frozen `compressed` layout.
@@ -324,6 +327,61 @@ pub(crate) fn emit_decompress_slot(ops: &mut Assembler, cage_base: u64, boxed_ba
         ; movz x9, VALUE_HOLE as u32
         ; =>l_done
     );
+}
+
+/// One deferred boxed-slot decoder emitted after a compiled function's hot
+/// instruction stream. The hot site arrives with the compressed slot in `w9`;
+/// an exact payload returns through `continuation`, while a corrupt type tag
+/// takes that property's ordinary `miss` transition.
+pub(crate) struct BoxedSlotSlowPath {
+    pub(crate) entry: DynamicLabel,
+    pub(crate) continuation: DynamicLabel,
+    pub(crate) miss: DynamicLabel,
+}
+
+/// Emit every deferred boxed-slot load outside the hot instruction stream.
+/// Each path validates the heap body tag before recovering the exact full
+/// `Value` bits, including `-0`, NaN, and wide int32 payloads.
+pub(crate) fn emit_boxed_slot_slow_paths(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    slow_paths: Vec<BoxedSlotSlowPath>,
+) {
+    use otter_vm::value::compressed as cslot;
+
+    if slow_paths.is_empty() {
+        return;
+    }
+    debug_assert_eq!(cslot::TAG_BOXED, 0b010);
+    debug_assert_ne!(view.cage_base, 0);
+    debug_assert_ne!(view.heap_number_type_tag, 0);
+    let heap_number_type_tag = u32::from(view.heap_number_type_tag);
+    let heap_number_bits_byte = view.heap_number_bits_byte;
+    for path in slow_paths {
+        let BoxedSlotSlowPath {
+            entry,
+            continuation,
+            miss,
+        } = path;
+        dynasm!(ops
+            ; .arch aarch64
+            ; =>entry
+            ; and w10, w9, #0x7
+            ; cmp w10, #0x2
+            ; b.ne =>miss
+            ; and w9, w9, #0xfffffff8
+        );
+        emit_load_u64(ops, 10, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x9, x10, x9
+            ; ldrb w10, [x9]
+            ; cmp w10, heap_number_type_tag
+            ; b.ne =>miss
+            ; ldr x9, [x9, heap_number_bits_byte]
+            ; b =>continuation
+        );
+    }
 }
 
 /// Compress the tagged `Value` in `x9` into a 4-byte object slot in `w10`.

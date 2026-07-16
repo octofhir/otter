@@ -28,7 +28,7 @@ use otter_bytecode::Op;
 
 use crate::{
     Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint,
-    jit_feedback::InstructionFeedbackRecorder, number, oom_to_vm, read_register, write_register,
+    feedback::InstructionFeedbackRecorder, number, oom_to_vm, read_register, write_register,
 };
 
 /// Signature of every BigInt binary op routed through this module.

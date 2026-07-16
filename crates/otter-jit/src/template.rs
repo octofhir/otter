@@ -53,7 +53,21 @@ pub fn compile(
     code_object_id: u64,
     transitions: &TransitionTable,
 ) -> Result<TemplateCode, Unsupported> {
-    arm64::compile(view, code_object_id, transitions)
+    let call_trampoline = std::sync::Arc::new(crate::arm64::CallTrampoline::compile(transitions)?);
+    compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
+}
+
+/// Compile using the hook-owned call trampoline retained by the produced code
+/// object. This is the production path; [`compile`] remains a fallible
+/// convenience for standalone callers and tests.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn compile_with_trampoline(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+    call_trampoline: std::sync::Arc<crate::arm64::CallTrampoline>,
+) -> Result<TemplateCode, Unsupported> {
+    arm64::compile(view, code_object_id, transitions, call_trampoline)
 }
 
 /// Non-arm64 stub: the template backend is arm64-only for now.
@@ -162,15 +176,7 @@ mod tests {
             frame_index: 0,
             upvalues_ptr: 0,
             error: &mut error,
-            direct_entry_addr: 0,
-            direct_regs: std::ptr::null_mut(),
-            direct_self_closure: 0,
-            direct_this_value: 0,
-            direct_frame_index: 0,
-            direct_upvalues_ptr: 0,
-            direct_frame_ids: 0,
-            direct_frame_meta: 0,
-            direct_code_object_id: 0,
+            direct_call: std::mem::MaybeUninit::uninit(),
             reg_stack_base: reg_stack_probe.as_mut_ptr(),
             reg_top_ptr: std::ptr::addr_of_mut!(reg_top_probe),
             activation_base: activation_probe.as_mut_ptr().cast(),

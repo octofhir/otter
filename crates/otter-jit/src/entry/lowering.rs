@@ -39,6 +39,18 @@ pub enum Unsupported {
     RegisterRange(u16),
     /// A call with more arguments than baseline lowering inlines.
     ArgCount(usize),
+    /// The selected machine backend could not allocate or finalize executable
+    /// code. This is an ordinary interpreter fallback, never a process panic.
+    Backend(BackendFailure),
+}
+
+/// Fallible machine-backend operations that must preserve runtime fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFailure {
+    /// The assembler could not allocate its writable code buffer.
+    AssemblerAllocation,
+    /// W^X finalization or executable-memory publication failed.
+    Finalization,
 }
 
 /// Typed destination register for fixed-operand loads.

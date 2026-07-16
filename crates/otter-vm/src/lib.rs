@@ -83,6 +83,8 @@ mod error_ops;
 mod eval_ops;
 mod executable;
 pub mod execution_context;
+#[path = "jit_feedback.rs"]
+pub mod feedback;
 pub mod field_repr;
 mod frame_ops;
 mod frame_state;
@@ -112,7 +114,10 @@ mod jit_construct_ops;
 mod jit_control_ops;
 mod jit_delete_ops;
 mod jit_exception_ops;
-pub mod jit_feedback;
+/// Compatibility path for JIT consumers while feedback ownership migrates to
+/// the tier-neutral [`feedback`] API.
+#[doc(hidden)]
+pub use feedback as jit_feedback;
 mod jit_global_ops;
 mod jit_iterator_ops;
 mod jit_module_ops;
@@ -508,8 +513,9 @@ pub(crate) enum CallTargetFeedback {
 /// resolved to the same method function — so the emitter can guard the receiver
 /// shape and method identity, then splice the body.
 ///
-/// `recv_shape` is the receiver's hidden-class handle (immortal, so it is safe
-/// to hold untraced and to bake). Absence from the map = unobserved.
+/// `recv_shape` is the receiver's stable VM-local hidden-class identity, so the
+/// isolate-owned distribution never retains a movable GC handle. Absence from
+/// the directory = unobserved.
 /// Maximum number of distinct `(receiver shape, method)` targets one
 /// polymorphic method-call site keeps for inline guard-chain baking. Mirrors
 /// the V8/JSC polymorphic IC width: enough to cover real OO dispatch (a family
@@ -531,7 +537,7 @@ pub(crate) const MAX_POLY_METHOD_TARGETS: usize = 8;
 /// hop costs one flat-prototype chase + shape compare per call).
 pub(crate) const MAX_METHOD_PROTO_CHAIN: usize = 4;
 
-/// Shapes of each prototype hopped from the receiver to the method holder,
+/// Stable shape identities for each prototype hopped from the receiver to the method holder,
 /// in hop order — the last entry is the holder's shape. Empty when the
 /// method slot is an own property of the receiver. Each level's shape check
 /// both pins that object's layout (an own-property insertion that would
@@ -540,7 +546,7 @@ pub(crate) const MAX_METHOD_PROTO_CHAIN: usize = 4;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MethodProtoChain {
     len: u8,
-    shapes: [object::ShapeHandle; MAX_METHOD_PROTO_CHAIN],
+    shapes: [object::ShapeId; MAX_METHOD_PROTO_CHAIN],
 }
 
 impl MethodProtoChain {
@@ -548,13 +554,13 @@ impl MethodProtoChain {
     pub(crate) fn own() -> Self {
         Self {
             len: 0,
-            shapes: [object::ShapeHandle::null(); MAX_METHOD_PROTO_CHAIN],
+            shapes: [object::ShapeId::UNASSIGNED; MAX_METHOD_PROTO_CHAIN],
         }
     }
 
     /// Append one hopped prototype's shape; `false` when the chain is full
     /// (the site must stay on the bridge).
-    pub(crate) fn push(&mut self, shape: object::ShapeHandle) -> bool {
+    pub(crate) fn push(&mut self, shape: object::ShapeId) -> bool {
         if (self.len as usize) == MAX_METHOD_PROTO_CHAIN {
             return false;
         }
@@ -563,18 +569,18 @@ impl MethodProtoChain {
         true
     }
 
-    pub(crate) fn as_slice(&self) -> &[object::ShapeHandle] {
+    pub(crate) fn as_slice(&self) -> &[object::ShapeId] {
         &self.shapes[..self.len as usize]
     }
 
-    /// Whether both chains walk the same shapes (compared by handle offset).
+    /// Whether both chains walk the same stable shape identities.
     pub(crate) fn same(&self, other: &Self) -> bool {
         self.len == other.len
             && self
                 .as_slice()
                 .iter()
                 .zip(other.as_slice())
-                .all(|(a, b)| a.offset() == b.offset())
+                .all(|(a, b)| a == b)
     }
 }
 
@@ -585,7 +591,7 @@ impl MethodProtoChain {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PolyMethodTarget {
     pub(crate) method_fid: u32,
-    pub(crate) recv_shape: object::ShapeHandle,
+    pub(crate) recv_shape: object::ShapeId,
     pub(crate) proto_chain: MethodProtoChain,
     pub(crate) method_value_byte: u32,
     /// Observations that resolved to exactly this target. Used only to order
@@ -598,7 +604,7 @@ impl PolyMethodTarget {
     /// target (the inline guard for one cannot serve the other).
     fn matches(&self, method_fid: u32, site: &MethodSite) -> bool {
         self.method_fid == method_fid
-            && self.recv_shape.offset() == site.recv_shape.offset()
+            && self.recv_shape == site.recv_shape
             && self.proto_chain.same(&site.proto_chain)
             && self.method_value_byte == site.method_value_byte
     }
@@ -617,15 +623,15 @@ pub(crate) enum MethodCallFeedback {
     /// resolve bridge.
     Mono {
         method_fid: u32,
-        recv_shape: object::ShapeHandle,
+        recv_shape: object::ShapeId,
         proto_chain: MethodProtoChain,
         method_value_byte: u32,
     },
     /// Two-to-[`MAX_POLY_METHOD_TARGETS`] distinct inlinable targets observed
     /// at this site. The baseline bakes one inline guard+body per target into a
     /// most-frequent-first chain; a receiver matching none of the guards falls
-    /// through to the in-place method bridge. Still GC-safe: each target only
-    /// holds immortal shape handles and a function id.
+    /// through to the in-place method bridge. Still GC-safe and Send/Sync: each
+    /// target only holds stable shape ids and a function id.
     ///
     /// Boxed: the inline target array dwarfs the `Mono` payload, and most
     /// sites stay monomorphic, so keeping it out of line keeps every
@@ -644,64 +650,14 @@ pub(crate) enum MethodCallFeedback {
 /// the resolved method id is known.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MethodSite {
-    /// Receiver hidden-class handle (immortal).
-    recv_shape: object::ShapeHandle,
-    /// Shapes of the prototypes hopped to the method holder (immortal);
+    /// Stable receiver hidden-class identity.
+    recv_shape: object::ShapeId,
+    /// Stable identities of prototypes hopped to the method holder;
     /// empty when the method slot lives directly on the receiver.
     proto_chain: MethodProtoChain,
     /// Byte offset of the method slot within the holder's value slab.
     method_value_byte: u32,
 }
-
-#[derive(Clone)]
-enum JitDirectMethodHit {
-    Own(crate::object::AtomOwnPropertyHit),
-    DirectPrototype {
-        receiver_shape_id: crate::object::ShapeId,
-        prototype_hit: crate::object::AtomOwnPropertyHit,
-    },
-}
-
-#[derive(Clone)]
-struct JitDirectMethodCache {
-    hit: JitDirectMethodHit,
-    function_id: u32,
-    /// The resolved method value the receiver slot must still hold for this cached
-    /// way to apply. Held as exact bits (a plain function or a closure singleton on
-    /// a shared prototype) and only ever bit-compared against the freshly loaded
-    /// slot value — never dereferenced — so a moved/stale entry simply misses and
-    /// re-resolves rather than reading a dangling pointer.
-    method_value: Value,
-    code: std::sync::Arc<dyn jit::JitFunctionCode>,
-    /// Entry plan resolved once at install so the per-call hit path skips the
-    /// code-object virtual calls and registry walk entirely.
-    plan: jit::JitDirectCallPlan,
-    /// Registry invalidation-epoch snapshot at install; a differing current
-    /// epoch means some installed code was invalidated since, so the cached
-    /// plan must be re-proved through the slow path.
-    plan_epoch: u64,
-    /// Callee's own captured-cell count; a nonzero count needs the exec
-    /// `CodeBlock` per call to build fresh cells, so the fused path defers.
-    own_upvalue_count: u16,
-}
-
-impl JitDirectMethodCache {
-    /// The receiver shape id this cached way keys on.
-    fn cached_shape_id(&self) -> crate::object::ShapeId {
-        match &self.hit {
-            JitDirectMethodHit::Own(h) => h.shape_id,
-            JitDirectMethodHit::DirectPrototype {
-                receiver_shape_id, ..
-            } => *receiver_shape_id,
-        }
-    }
-}
-
-/// Maximum receiver shapes cached per direct-method call site before it is left
-/// to the generic path. A polymorphic site (e.g. richards `task.run()` across
-/// four task classes) keeps every observed shape so each call hits the cache
-/// instead of re-resolving the method every time.
-const MAX_DIRECT_METHOD_WAYS: usize = jit::JIT_DIRECT_METHOD_WAYS;
 
 /// Match-based dispatch loop. The harness baseline; slice tasks may
 /// later switch to threaded dispatch after benchmark-driven review
@@ -924,26 +880,11 @@ pub struct Interpreter {
         std::sync::Arc<str>,
         std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
     >,
-    /// Monomorphic `LoadProperty` inline caches keyed by
-    /// dense executable IC site id. These are interpreter-local
-    /// hints and never affect bytecode dumps or JS-visible semantics.
-    load_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
-    /// Monomorphic `StoreProperty` inline caches keyed by
-    /// dense executable IC site id. These only cover ordinary own writable
-    /// data slots; every miss falls back to full `[[Set]]` semantics.
-    store_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
-    /// Monomorphic `HasProperty` inline caches keyed by dense executable IC
-    /// site id. These only cover ordinary own/direct-prototype data presence.
-    has_property_ics: Vec<property_ic::PropertyIcEntry<cache_ir::CacheStub>>,
-    /// Monomorphic method-call inline caches keyed by dense executable IC site
-    /// id. Each entry records a resolved prototype builtin (`Array`, `Map`, or
-    /// `Set`) so a hot `recv.method(args)` site skips the per-call name
-    /// resolution, prototype slot hash, and dispatch string-match — validated
-    /// by a prototype shape + slot-identity guard. See
-    /// [`method_ops::MethodCallIc`].
-    method_call_ics: Vec<Option<method_ops::MethodCallIc>>,
-    /// Cheap aggregate counters for interpreter property IC behavior.
-    property_ic_stats: property_ic::PropertyIcStats,
+    /// Isolate-owned high-level facade over CodeBlock lock-free feedback,
+    /// executable property/method IC banks, and method target distributions.
+    /// GC-bearing recipes stay behind this boundary and never enter CodeBlock
+    /// feedback DTOs.
+    feedback_directory: interp::FeedbackDirectory,
     /// Runtime-installed native-tier compiler hook. The hook lives behind a VM
     /// trait object so `otter-vm` never depends on executable-memory code.
     /// `Some` is also the tier-up gate: with no hook installed, all tier-up
@@ -955,14 +896,6 @@ pub struct Interpreter {
     /// Isolate-local optimizing-tier feedback-stability telemetry. Entry
     /// selection samples it only after the shared call counter is hot.
     optimizing_tier_policy: tier_policy::TierPolicy,
-    /// Bounded ordinary-call target distributions for the future optimizing
-    /// tier, keyed by `(caller function id, canonical instruction index)`.
-    /// Populated additively; no current decision reads this table.
-    jit_call_site_feedback: call_feedback::CallSiteFeedbackTable,
-    /// Dense method-call feedback driving baseline method inlining, keyed by
-    /// the same executable IC site id as `method_call_ics`. Only mutated when a
-    /// JIT hook is installed.
-    jit_method_site_feedback: Vec<Option<MethodCallFeedback>>,
     /// Per-function count of *entry* bails out of an installed compiled body
     /// (function-entry, sync-entry, and direct-call callee entries alike). A
     /// body that bails on every call — typically compiled early against
@@ -1036,15 +969,11 @@ pub struct Interpreter {
     /// the `Arc` clone (an atomic refcount round-trip), and the `osr_only()`
     /// virtual call on every invocation of an interpreter-resident method body.
     jit_entry_osr_only: rustc_hash::FxHashSet<u32>,
-    /// Active compiled→compiled callees whose emitted caller holds only raw
-    /// entry/safepoint pointers while the native stack is inside that callee.
-    /// The VM-local anchor keeps the executable mapping alive even if feedback
-    /// invalidates the installed body before control returns to the caller.
-    jit_direct_code_anchors: Vec<(usize, std::sync::Arc<dyn jit::JitFunctionCode>)>,
     /// Per-method-call-site compiled direct-call cache. Each entry is guarded by
     /// the same shape/slot metadata as the load IC and re-reads the method value
-    /// before entry, so overwriting a method slot falls back to full resolution.
-    jit_direct_method_cache: Vec<Vec<JitDirectMethodCache>>,
+    /// before entry, so replacements are freshly decoded and mismatching targets
+    /// fall back to full resolution.
+    jit_direct_method_cache: Vec<Vec<interp::JitDirectMethodCache>>,
     /// Lightweight JIT bridge/tiering counters for OtterLab diagnostics.
     jit_runtime_stats: JitRuntimeStats,
     /// Address-stable registry of installed code objects behind the one

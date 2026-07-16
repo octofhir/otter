@@ -3,6 +3,8 @@
 //! # Contents
 //! - Full `[[Get]]` completion for accessors, proxies, primitive receivers,
 //!   megamorphic sites, exceptions, and allocating getter reentry.
+//! - Exact compiled loads of boxed doubles, negative zero, NaN, and wide
+//!   int32s through a cold decoder after GC-producing allocation churn.
 //! - In-place `ToPrimitive`/`ToNumeric` completion through observable
 //!   `@@toPrimitive` and `valueOf` hooks.
 //! - Cold numeric-family completion for BigInt arithmetic/bitwise operations,
@@ -13,9 +15,10 @@
 //! - Every matrix runs through loop OSR in the production template tier.
 //! - A throwing getter/coercion hook advances no later instruction and is
 //!   never replayed after its observable counter increment.
-//! - Interpreter and compiled completion values remain identical under GC.
+//! - Interpreter and compiled completion values remain identical under GC,
+//!   including every full-Value payload recovered from a compressed slot.
 
-use otter_runtime::{JitSelection, Runtime, SourceInput};
+use otter_runtime::{JitSelection, Runtime, RuntimeExecutionStats, SourceInput};
 
 const LOAD_SOURCE: &str = r#"
 let own = {x: 7};
@@ -117,6 +120,42 @@ JSON.stringify([
   throwCalls, throwProgress, throwName,
   proxySum, proxyCalls, primitiveSum, primitiveCalls,
   reentrySum, reentryCalls, reentryAllocs
+]);
+"#;
+
+const BOXED_PROPERTY_SOURCE: &str = r#"
+const halfObject = { value: 0.5 };
+const negativeZeroObject = { value: -0 };
+const nanObject = { value: NaN };
+const wideIntObject = { value: 2147483647 };
+
+function churn(rounds) {
+  let latest = "";
+  for (let i = 0; i < rounds; i++) latest = "boxed-property-" + i;
+  return latest.length;
+}
+
+function readBoxed(object, rounds) {
+  let value;
+  for (let i = 0; i < rounds; i++) value = object.value;
+  return value;
+}
+
+let churnScore = churn(2048);
+let half = readBoxed(halfObject, 512);
+churnScore += churn(2048);
+let negativeZero = readBoxed(negativeZeroObject, 512);
+churnScore += churn(2048);
+let nan = readBoxed(nanObject, 512);
+churnScore += churn(2048);
+let wideInt = readBoxed(wideIntObject, 512);
+
+JSON.stringify([
+  half,
+  1 / negativeZero === -Infinity,
+  nan !== nan,
+  wideInt,
+  churnScore > 0
 ]);
 "#;
 
@@ -313,6 +352,23 @@ fn run(source: &str, selection: JitSelection) -> (String, u64, u64, u64) {
     )
 }
 
+fn run_boxed_properties(selection: JitSelection) -> (String, RuntimeExecutionStats) {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_osr_threshold(1)
+        .build()
+        .expect("runtime");
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(BOXED_PROPERTY_SOURCE.to_string()),
+            "jit-boxed-property-load.js",
+        )
+        .expect("boxed property load matrix")
+        .completion_string()
+        .to_owned();
+    (completion, runtime.execution_stats())
+}
+
 #[test]
 fn property_load_misses_complete_in_place_with_exact_throw_order() {
     let (oracle, _, _, _) = run(LOAD_SOURCE, JitSelection::InterpreterOnly);
@@ -326,6 +382,31 @@ fn property_load_misses_complete_in_place_with_exact_throw_order() {
     assert!(
         property_stubs > 0,
         "load matrix must execute the JIT transition"
+    );
+}
+
+#[test]
+fn boxed_property_loads_recover_exact_values_through_cold_path_after_gc_churn() {
+    let (oracle, _) = run_boxed_properties(JitSelection::InterpreterOnly);
+    assert_eq!(oracle, "[0.5,true,true,2147483647,true]");
+
+    let (compiled, stats) = run_boxed_properties(JitSelection::Template);
+    assert_eq!(compiled, oracle);
+    assert!(
+        stats.jit_osr_attempts > 0,
+        "fixture must request loop OSR: {stats:?}"
+    );
+    assert!(
+        stats.jit_optimized_osr_entries > 0,
+        "boxed property loop must enter compiled optimized code: {stats:?}"
+    );
+    assert!(
+        stats.jit_runtime_property_stubs > 0,
+        "the property IC must be populated through its runtime transition: {stats:?}"
+    );
+    assert!(
+        stats.jit_runtime_property_stubs < 64,
+        "warmed boxed property loads must stay compiled instead of missing per iteration: {stats:?}"
     );
 }
 

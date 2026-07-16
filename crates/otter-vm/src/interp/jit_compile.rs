@@ -48,12 +48,9 @@ impl Interpreter {
         if let Some((_, code)) = &self.jit_optimized_code_cache {
             record(code);
         }
-        for (_, code) in &self.jit_direct_code_anchors {
-            record(code);
-        }
         for cache_set in &self.jit_direct_method_cache {
             for entry in cache_set {
-                record(&entry.code);
+                record(entry.code());
             }
         }
 
@@ -75,6 +72,7 @@ impl Interpreter {
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut snapshot = context.jit_compile_snapshot(fid)?;
+        self.publish_property_feedback_for_view(&snapshot);
         // The optimizing tier consumes the same baked compile inputs as the
         // template tier: without the cage base and body offsets no inline access
         // can be emitted at all, and without monomorphic call-site candidates
@@ -82,6 +80,7 @@ impl Interpreter {
         Self::bake_typed_array_layout(&mut snapshot);
         Self::bake_string_layout(&mut snapshot);
         self.bake_inline_callees(&mut snapshot, context, fid);
+        let function = snapshot.code_block.clone();
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_optimized_function(jit::JitCompileRequest {
@@ -94,7 +93,7 @@ impl Interpreter {
                 self.jit_next_code_object_id += 1;
                 self.jit_code_registry.retire_unreferenced();
                 self.jit_code_registry
-                    .register(code_object_id, code.clone())
+                    .install_compiled(code_object_id, code.clone(), &function)
                     .then_some(code)
             }
             _ => None,
@@ -157,6 +156,7 @@ impl Interpreter {
         osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let mut view = context.jit_compile_snapshot(fid)?;
+        self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         self.bake_inline_callees(&mut view, context, fid);
@@ -176,11 +176,7 @@ impl Interpreter {
                 .filter(|instr| {
                     instr
                         .property_ic_site(&view.code_block)
-                        .is_some_and(|site| {
-                            self.jit_method_site_feedback
-                                .get(site)
-                                .is_some_and(Option::is_some)
-                        })
+                        .is_some_and(|site| self.method_target_feedback(site).is_some())
                 })
                 .count();
             let call_feedback = view
@@ -201,6 +197,7 @@ impl Interpreter {
             );
         }
         let (regs, params) = (view.code_block.register_count, view.code_block.param_count);
+        let function = view.code_block.clone();
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_function(jit::JitCompileRequest {
@@ -214,13 +211,12 @@ impl Interpreter {
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => {
                 self.jit_next_code_object_id += 1;
-                // Sweep before registering: every live use of a code object —
-                // an entered frame, a direct-call anchor, a map or cache slot —
-                // holds its own `Arc`, so only invalid code whose last anchor
-                // is the registry itself retires here.
+                // Sweep before registering: cached/installed users hold an
+                // `Arc`, while executing native generations hold an entry-cell
+                // lease. Only invalid code with neither kind of owner retires.
                 self.jit_code_registry.retire_unreferenced();
                 self.jit_code_registry
-                    .register(code_object_id, code.clone())
+                    .install_compiled(code_object_id, code.clone(), &function)
                     .then_some(code)
             }
             _ => None,
@@ -258,20 +254,19 @@ impl Interpreter {
     fn monomorphic_own_property_feedback(&self, op: Op, site: usize) -> Option<(u32, u32)> {
         const SLOT_BYTES: u32 =
             std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32;
-        let entry = match op {
-            Op::LoadProperty => self.load_property_ics.get(site)?,
-            Op::StoreProperty => self.store_property_ics.get(site)?,
+        let kind = match op {
+            Op::LoadProperty => crate::property_ic::PropertyIcKind::Load,
+            Op::StoreProperty => crate::property_ic::PropertyIcKind::Store,
             _ => return None,
         };
-        let [stub] = entry.entries() else {
+        self.publish_property_feedback(site, kind);
+        let crate::feedback::PropertyFeedbackState::MonomorphicOwnData { shape_id, slot } =
+            self.property_feedback_state(site, kind)?
+        else {
             return None;
         };
-        let hit = match op {
-            Op::LoadProperty => stub.own_data_hit()?,
-            Op::StoreProperty => stub.store_own_data_hit()?,
-            _ => unreachable!(),
-        };
-        (!hit.shape.is_null()).then_some((hit.shape.offset(), u32::from(hit.slot) * SLOT_BYTES))
+        let shape = self.shape_runtime.handle_for_id(shape_id)?;
+        Some((shape.offset(), u32::from(slot) * SLOT_BYTES))
     }
 
     /// Whether a method-call site's feedback has already saturated to
@@ -280,10 +275,7 @@ impl Interpreter {
     /// shape walk that only exists to build the `MethodSite` argument — the hot
     /// path for a megamorphic site (e.g. one `arr[i].run()` over many classes).
     pub(crate) fn method_site_feedback_saturated(&self, site: usize) -> bool {
-        matches!(
-            self.jit_method_site_feedback.get(site),
-            Some(Some(MethodCallFeedback::Megamorphic))
-        )
+        self.method_target_feedback_saturated(site)
     }
 
     /// Record the live `Mono`/`Poly` overlay for one `Op::CallMethodValue` site.
@@ -301,65 +293,7 @@ impl Interpreter {
         method_fid: u32,
         site: MethodSite,
     ) {
-        let new_target = PolyMethodTarget {
-            method_fid,
-            recv_shape: site.recv_shape,
-            proto_chain: site.proto_chain,
-            method_value_byte: site.method_value_byte,
-            hits: 1,
-        };
-        let Some(slot) = self.jit_method_site_feedback.get_mut(feedback_site) else {
-            return;
-        };
-        match slot {
-            None => {
-                *slot = Some(MethodCallFeedback::Mono {
-                    method_fid,
-                    recv_shape: site.recv_shape,
-                    proto_chain: site.proto_chain,
-                    method_value_byte: site.method_value_byte,
-                });
-            }
-            Some(state) => match state {
-                MethodCallFeedback::Mono {
-                    method_fid: seen_fid,
-                    recv_shape: seen_shape,
-                    proto_chain: seen_proto_chain,
-                    method_value_byte: seen_value_byte,
-                } => {
-                    let same = *seen_fid == method_fid
-                        && seen_shape.offset() == site.recv_shape.offset()
-                        && seen_proto_chain.same(&site.proto_chain)
-                        && *seen_value_byte == site.method_value_byte;
-                    if !same {
-                        let prior = PolyMethodTarget {
-                            method_fid: *seen_fid,
-                            recv_shape: *seen_shape,
-                            proto_chain: *seen_proto_chain,
-                            method_value_byte: *seen_value_byte,
-                            hits: 1,
-                        };
-                        let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
-                            SmallVec::new();
-                        targets.push(prior);
-                        targets.push(new_target);
-                        *state = MethodCallFeedback::Poly(Box::new(targets));
-                    }
-                }
-                MethodCallFeedback::Poly(targets) => {
-                    if let Some(existing) =
-                        targets.iter_mut().find(|t| t.matches(method_fid, &site))
-                    {
-                        existing.hits = existing.hits.saturating_add(1);
-                    } else if targets.len() < MAX_POLY_METHOD_TARGETS {
-                        targets.push(new_target);
-                    } else {
-                        *state = MethodCallFeedback::Megamorphic;
-                    }
-                }
-                MethodCallFeedback::Megamorphic => {}
-            },
-        }
+        self.record_method_target_feedback(feedback_site, method_fid, site);
     }
 
     pub(crate) fn method_site_for_receiver(
@@ -371,14 +305,15 @@ impl Interpreter {
     ) -> Option<MethodSite> {
         let name = context.property_atom_for_function(caller_fid, name_idx)?;
         let recv = recv.as_object()?;
-        let recv_shape = crate::object::shape(recv, &self.gc_heap);
-        if recv_shape.is_null() {
+        let recv_shape_handle = crate::object::shape(recv, &self.gc_heap);
+        if recv_shape_handle.is_null() {
             return None;
         }
+        let recv_shape = crate::object::shape_id(recv, &self.gc_heap);
         let slot_byte = |slot: u32| {
             slot * std::mem::size_of::<crate::value::compressed::CompressedValue>() as u32
         };
-        if let Some(slot) = self.shape_offset_of(recv_shape, name.name()) {
+        if let Some(slot) = self.shape_offset_of(recv_shape_handle, name.name()) {
             return Some(MethodSite {
                 recv_shape,
                 proto_chain: crate::MethodProtoChain::own(),
@@ -393,7 +328,7 @@ impl Interpreter {
         loop {
             cur = crate::object::prototype(cur, &self.gc_heap)?;
             let shape = crate::object::shape(cur, &self.gc_heap);
-            if shape.is_null() || !proto_chain.push(shape) {
+            if shape.is_null() || !proto_chain.push(crate::object::shape_id(cur, &self.gc_heap)) {
                 return None;
             }
             if let Some(slot) = self.shape_offset_of(shape, name.name()) {
@@ -525,14 +460,13 @@ impl Interpreter {
             instruction_pc: u32,
             targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]>,
         }
-        let method_feedback = &self.jit_method_site_feedback;
         let method_sites: Vec<PolySnapshot> = view
             .instructions
             .iter()
             .filter_map(|instr| {
                 let instruction_pc = instr.instruction_pc(&view.code_block);
                 let site = instr.property_ic_site(&view.code_block)?;
-                let state = method_feedback.get(site)?.as_ref()?;
+                let state = self.method_target_feedback(site)?;
                 match state {
                     MethodCallFeedback::Mono {
                         method_fid,
@@ -543,10 +477,10 @@ impl Interpreter {
                         let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
                             SmallVec::new();
                         targets.push(PolyMethodTarget {
-                            method_fid: *method_fid,
-                            recv_shape: *recv_shape,
-                            proto_chain: *proto_chain,
-                            method_value_byte: *method_value_byte,
+                            method_fid,
+                            recv_shape,
+                            proto_chain,
+                            method_value_byte,
                             hits: 1,
                         });
                         Some(PolySnapshot {
@@ -555,7 +489,7 @@ impl Interpreter {
                         })
                     }
                     MethodCallFeedback::Poly(observed) => {
-                        let mut targets = (**observed).clone();
+                        let mut targets = (*observed).clone();
                         // Most-frequent target first: the common receiver shape
                         // then hits the shortest guard chain.
                         targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
@@ -662,7 +596,8 @@ impl Interpreter {
                 return None;
             };
             let key = context.property_atom(name_idx)?;
-            if let Some(slot) = self.shape_offset_of(target.recv_shape, key.name()) {
+            let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
+            if let Some(slot) = self.shape_offset_of(recv_shape, key.name()) {
                 prop_offsets.insert(instr.byte_pc, slot * SLOT_BYTES);
                 continue;
             }
@@ -694,18 +629,15 @@ impl Interpreter {
                     recv_shape,
                     proto_chain,
                     method_value_byte,
-                }) = self
-                    .jit_method_site_feedback
-                    .get(site)
-                    .and_then(Option::as_ref)
+                }) = self.method_target_feedback(site)
                 {
                     nested_targets.push((
                         instr.byte_pc,
                         PolyMethodTarget {
-                            method_fid: *method_fid,
-                            recv_shape: *recv_shape,
-                            proto_chain: *proto_chain,
-                            method_value_byte: *method_value_byte,
+                            method_fid,
+                            recv_shape,
+                            proto_chain,
+                            method_value_byte,
                             hits: 1,
                         },
                     ));
@@ -719,16 +651,22 @@ impl Interpreter {
                 nested_methods.insert(pc, nested);
             }
         }
+        let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
+        let proto_chain = target
+            .proto_chain
+            .as_slice()
+            .iter()
+            .map(|shape_id| {
+                self.shape_runtime
+                    .handle_for_id(*shape_id)
+                    .map(|shape| shape.offset())
+            })
+            .collect::<Option<Vec<_>>>()?;
         Some(jit::JitInlineMethod {
             code_block: std::sync::Arc::clone(&method_view.code_block),
             method_fid: target.method_fid,
-            recv_shape: target.recv_shape.offset(),
-            proto_chain: target
-                .proto_chain
-                .as_slice()
-                .iter()
-                .map(|s| s.offset())
-                .collect(),
+            recv_shape: recv_shape.offset(),
+            proto_chain,
             method_value_byte: target.method_value_byte,
             param_count: method_view.code_block.param_count,
             register_count: method_view.code_block.register_count,

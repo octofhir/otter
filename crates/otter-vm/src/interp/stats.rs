@@ -259,31 +259,4 @@ impl Interpreter {
             false
         }
     }
-
-    pub(crate) fn ensure_property_ic_capacity(&mut self, context: &ExecutionContext) {
-        let site_count = context.property_ic_site_end();
-        if self.load_property_ics.len() < site_count {
-            self.load_property_ics
-                .resize(site_count, property_ic::PropertyIcEntry::Empty);
-        }
-        if self.store_property_ics.len() < site_count {
-            self.store_property_ics
-                .resize(site_count, property_ic::PropertyIcEntry::Empty);
-        }
-        if self.has_property_ics.len() < site_count {
-            self.has_property_ics
-                .resize(site_count, property_ic::PropertyIcEntry::Empty);
-        }
-        if self.method_call_ics.len() < site_count {
-            self.method_call_ics.resize(site_count, None);
-        }
-        if self.jit_method_site_feedback.len() < site_count {
-            self.jit_method_site_feedback
-                .resize_with(site_count, || None);
-        }
-        if self.jit_direct_method_cache.len() < site_count {
-            self.jit_direct_method_cache
-                .resize_with(site_count, Vec::new);
-        }
-    }
 }

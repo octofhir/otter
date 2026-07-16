@@ -1,7 +1,7 @@
 //! Arm64 emission for the reducible numeric and reentrant-transition optimizing subset.
 //!
 //! # Contents
-//! - Whole-pipeline construction and eligibility validation.
+//! - Backend eligibility validation over a pre-verified optimizing unit.
 //! - Reducible loop checks, numeric comparisons, and per-edge phi copies.
 //! - Loop-header OSR trampolines materializing allocated state from the
 //!   interpreter register window.
@@ -62,41 +62,44 @@
 #![allow(clippy::useless_conversion)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_bytecode::{Op, Operand};
-use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTable};
 use otter_vm::native_abi::{
-    FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
-    STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
-    STUB_JIT_CALL_GENERIC, STUB_JIT_LOAD_UPVALUE, STUB_JIT_PREPARE_DIRECT_CALL,
-    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED,
-    STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
-    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
-    STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
+    FrameMap, NO_FRAME_STATE, STUB_JIT_BACKEDGE_POLL, STUB_JIT_CALL_GENERIC,
+    STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT, STUB_JIT_DEOPT_REIFY_FRAME,
+    STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOAD_UPVALUE,
+    STUB_JIT_LOOSE_EQ, STUB_JIT_MATH_CALL, STUB_JIT_PREPARE_DIRECT_CALL,
+    STUB_JIT_PREPARE_DIRECT_METHOD_CALL, STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW,
+    STUB_JIT_STORE_UPVALUE, STUB_JIT_STORE_UPVALUE_CHECKED, SafepointId, SafepointRecord,
 };
+use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
-use super::{OptimizedCode, OptimizedMetadata};
+use super::{
+    OptimizedCode, OptimizedMetadata,
+    pipeline::{
+        OptimizationError, OptimizationPipeline, total_spill_slots as analyzed_spill_slot_count,
+    },
+};
 use crate::{
     CompiledCode,
+    arm64::CallTrampoline,
     entry::{
-        UPVALUES_PTR_OFFSET,
-        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-        NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
-        MAX_METHOD_ARGS, THREAD_OFFSET,
-        TransitionTable, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
-        VALUE_TRUE,
-        VALUE_UNDEFINED, pack_method_arg_regs,
-        IC_WAYS, OBJECT_BODY_TYPE_TAG, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET,
-        VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell,
+        CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, IC_WAYS, MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET,
+        NATIVE_FRAME_PC_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG, STATUS_BAILED,
+        STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET, THREAD_OFFSET, TransitionTable,
+        UPVALUES_PTR_OFFSET, Unsupported, VALUE_FALSE, VALUE_FALSE_LOW, VALUE_HOLE, VALUE_NULL,
+        VALUE_TRUE, VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
+        VM_THREAD_INTERRUPT_CELL_OFFSET, WhiskerIcCell, pack_method_arg_regs,
     },
     ir::{
         cfg::{BlockId, ControlFlowGraph, Terminator},
-        inline::{InlineId, InlineTree},
         deopt_lower::DeoptLowering,
         dom::DominatorTree,
         frame_state::{AbstractFrameState, FrameStateTable},
+        inline::{InlineId, InlineTree},
         liveness::Liveness,
         regalloc::{
             Allocation, EdgeMoves, Location, Move, RegClass, RegisterBudget, has_non_dead_use,
@@ -112,8 +115,7 @@ const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
     gpr: ALLOCATABLE_REGISTER_COUNT,
     fp: 8,
 };
-const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] =
-    [21, 22, 23, 24, 25, 26, 27, 28];
+const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 24, 25, 26, 27, 28];
 const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 const FP_SCRATCH_2: u8 = 17;
@@ -224,7 +226,9 @@ struct EmissionPlan<'a> {
     store_upvalue_entry: u64,
     /// TDZ-checked captured-binding write.
     store_upvalue_checked_entry: u64,
-    /// Hook-lifetime transition inventory for the shared direct-call tail.
+    /// Hook/code-object-owned compiled-to-compiled call lifecycle.
+    call_trampoline: &'a CallTrampoline,
+    /// Hook-lifetime transition inventory used by allocating slow paths.
     transitions: &'a TransitionTable,
     /// Owning function id, baked into property/global transitions so the stub
     /// resolves the name constant against this function's constant pool.
@@ -247,98 +251,71 @@ pub(super) fn compile_with_transitions(
     code_object_id: u64,
     transitions: &TransitionTable,
 ) -> Result<OptimizedCode, Unsupported> {
+    let call_trampoline = Arc::new(CallTrampoline::compile(transitions)?);
+    compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
+}
+
+pub(super) fn compile_with_trampoline(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+    call_trampoline: Arc<CallTrampoline>,
+) -> Result<OptimizedCode, Unsupported> {
     // The unit is the root function plus every callee body the inline tree
     // splices into it, from the VM-baked monomorphic candidates. Only bodies
     // this backend lowers entirely into machine registers are spliced: a
     // reentrant transition inside a callee would need an interpreter window the
     // spliced frame does not have, and one unsuitable callee would otherwise
     // cost the whole unit its compilation.
-    let tree = InlineTree::build_where(view, splice_lowerable);
-    let cfg = ControlFlowGraph::build_inlined(&tree)
-        .map_err(|_| Unsupported::OperandShape("optimizing CFG construction"))?;
-    cfg.verify()
-        .map_err(|_| Unsupported::OperandShape("optimizing CFG verification"))?;
-    let dom = DominatorTree::compute(&cfg);
-    dom.verify(&cfg)
-        .map_err(|_| Unsupported::OperandShape("optimizing dominance verification"))?;
-    let ssa = SsaFunction::build_inlined(&tree, &cfg)
-        .map_err(|_| Unsupported::OperandShape("optimizing SSA construction"))?;
-    ssa.verify(&cfg, &dom)
-        .map_err(|_| Unsupported::OperandShape("optimizing SSA verification"))?;
-    let liveness = Liveness::compute(&ssa, &cfg);
-    liveness
-        .verify(&ssa, &cfg, &dom)
-        .map_err(|_| Unsupported::OperandShape("optimizing liveness verification"))?;
-    let reprs = ReprMap::compute(&tree, &ssa);
-    reprs
-        .verify(&tree, &ssa)
-        .map_err(|_| Unsupported::OperandShape("optimizing representation verification"))?;
-    let allocation = Allocation::compute(&ssa, &cfg, &liveness, &reprs, REGISTER_BUDGET)
-        .map_err(|_| Unsupported::OperandShape("optimizing register allocation"))?;
-    allocation
-        .verify(&ssa, &cfg, &liveness, &reprs)
-        .map_err(|_| Unsupported::OperandShape("optimizing allocation verification"))?;
-    let call_sites: Vec<_> = tree
-        .frames
-        .iter()
-        .map(|frame| frame.call_site.clone())
-        .collect();
-    let frame_states = FrameStateTable::build_inlined(&call_sites, &ssa, &cfg)
-        .map_err(|_| Unsupported::OperandShape("optimizing frame-state construction"))?;
-    frame_states
-        .verify(&ssa, &cfg, &dom)
-        .map_err(|_| Unsupported::OperandShape("optimizing frame-state verification"))?;
-    let linear_scan_spill_slot_count = total_spill_slots(&allocation)?;
-    let mut allocation = legalize_deopt_locations(&allocation, &frame_states)?;
-    allocation
-        .rebuild_edge_moves(&ssa, &cfg, &reprs)
-        .map_err(|_| Unsupported::OperandShape("optimizing legalized phi moves"))?;
-    let deopt = DeoptLowering::build(view, &tree, &ssa, &frame_states, &allocation, &reprs)
-        .map_err(|_| Unsupported::OperandShape("optimizing deopt lowering"))?;
+    let unit = OptimizationPipeline::new(REGISTER_BUDGET)
+        .analyze(view, splice_lowerable)
+        .map_err(OptimizationError::into_unsupported)?;
 
     let eligibility = check_eligibility(
         view,
-        &tree,
-        &cfg,
-        &dom,
-        &ssa,
+        &unit.tree,
+        &unit.cfg,
+        &unit.dom,
+        &unit.ssa,
         EligibilityAnalyses {
-            liveness: &liveness,
-            reprs: &reprs,
-            allocation: &allocation,
-            frame_states: &frame_states,
+            liveness: &unit.liveness,
+            reprs: &unit.reprs,
+            allocation: &unit.allocation,
+            frame_states: &unit.frame_states,
         },
     )?;
-    let load_property_sites = dom
+    let load_property_sites = unit
+        .dom
         .reverse_postorder()
         .iter()
-        .flat_map(|block| ssa.blocks[block.0 as usize].instrs.iter())
+        .flat_map(|block| unit.ssa.blocks[block.0 as usize].instrs.iter())
         .filter(|instruction| instruction.op == Op::LoadProperty)
         .count();
     let mut load_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); load_property_sites].into_boxed_slice();
-    let store_property_sites = dom
+    let store_property_sites = unit
+        .dom
         .reverse_postorder()
         .iter()
-        .flat_map(|block| ssa.blocks[block.0 as usize].instrs.iter())
+        .flat_map(|block| unit.ssa.blocks[block.0 as usize].instrs.iter())
         .filter(|instruction| instruction.op == Op::StoreProperty)
         .count();
     let mut store_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
     let emission = emit(
         view,
-        &cfg,
-        dom.reverse_postorder(),
-        &ssa,
+        &unit.cfg,
+        unit.dom.reverse_postorder(),
+        &unit.ssa,
         &mut load_ic_cells,
         &mut store_ic_cells,
         EmissionPlan {
-            reprs: &reprs,
-            allocation: &allocation,
+            reprs: &unit.reprs,
+            allocation: &unit.allocation,
             eligibility: &eligibility,
-            deopt_table: deopt.table(),
-            frame_states: &frame_states,
-            tree: &tree,
+            deopt_table: unit.deopt.table(),
+            frame_states: &unit.frame_states,
+            tree: &unit.tree,
             load_element_entry: transitions.variadic_entry(STUB_JIT_LOAD_ELEMENT),
             store_element_entry: transitions.variadic_entry(STUB_JIT_STORE_ELEMENT),
             load_property_entry: transitions.variadic_entry(STUB_JIT_LOAD_PROP_WINDOW),
@@ -350,14 +327,13 @@ pub(super) fn compile_with_transitions(
             reify_frame_entry: transitions.variadic_entry(STUB_JIT_DEOPT_REIFY_FRAME),
             math_call_entry: transitions.variadic_entry(STUB_JIT_MATH_CALL),
             poll_entry: transitions.entry(STUB_JIT_BACKEDGE_POLL),
-            prepare_direct_method_entry: transitions
-                .entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
+            prepare_direct_method_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
             prepare_direct_call_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
             call_generic_entry: transitions.entry(STUB_JIT_CALL_GENERIC),
             load_upvalue_entry: transitions.variadic_entry(STUB_JIT_LOAD_UPVALUE),
             store_upvalue_entry: transitions.variadic_entry(STUB_JIT_STORE_UPVALUE),
-            store_upvalue_checked_entry: transitions
-                .variadic_entry(STUB_JIT_STORE_UPVALUE_CHECKED),
+            store_upvalue_checked_entry: transitions.variadic_entry(STUB_JIT_STORE_UPVALUE_CHECKED),
+            call_trampoline: call_trampoline.as_ref(),
             transitions,
             function_id: u64::from(view.code_block.id),
         },
@@ -386,7 +362,8 @@ pub(super) fn compile_with_transitions(
         .into_boxed_slice();
     Ok(OptimizedCode::new(
         emission.code,
-        deopt.table().clone(),
+        call_trampoline,
+        unit.deopt.table().clone(),
         safepoint_records,
         frame_maps,
         eligibility.element_transitions.bitmap_words,
@@ -399,52 +376,18 @@ pub(super) fn compile_with_transitions(
             function_id: view.code_block.id,
             param_count: view.code_block.param_count,
             register_count: view.code_block.register_count,
-            machine_register_count: allocation
+            machine_register_count: unit
+                .allocation
                 .register_budget
                 .gpr
-                .checked_add(allocation.register_budget.fp)
+                .checked_add(unit.allocation.register_budget.fp)
                 .ok_or(Unsupported::OperandShape(
                     "optimizing machine register count overflow",
                 ))?,
-            linear_scan_spill_slot_count,
-            spill_slot_count: total_spill_slots(&allocation)?,
+            linear_scan_spill_slot_count: unit.linear_scan_spill_slot_count,
+            spill_slot_count: unit.spill_slot_count,
         },
     ))
-}
-
-/// Linear scan may reuse a register after its live interval ends while an
-/// abstract frame state still names the stale interpreter-register value.
-/// Give only those colliding values fresh spill homes before concrete deopt
-/// lowering. This preserves every non-conflicting register assignment and the
-/// emitter materializes supported definitions directly into the legalized
-/// location, so machine code and the returned deopt table agree.
-fn legalize_deopt_locations(
-    allocation: &Allocation,
-    frame_states: &FrameStateTable,
-) -> Result<Allocation, Unsupported> {
-    let mut legalized = allocation.clone();
-    for state in frame_states.states() {
-        let mut owners = BTreeMap::<Location, ValueId>::new();
-        for value in state.registers.iter().flatten().copied() {
-            let location = legalized.location(value);
-            if owners.get(&location).is_some_and(|owner| *owner != value) {
-                let class = location.class();
-                let next_spill = match class {
-                    RegClass::Gpr => &mut legalized.spill_slot_counts.gpr,
-                    RegClass::Fp => &mut legalized.spill_slot_counts.fp,
-                };
-                let slot = *next_spill;
-                *next_spill = next_spill
-                    .checked_add(1)
-                    .ok_or(Unsupported::OperandShape("optimizing deopt spill overflow"))?;
-                legalized.locations[value.0 as usize] = Location::Spill(class, slot);
-                owners.insert(legalized.location(value), value);
-            } else {
-                owners.insert(location, value);
-            }
-        }
-    }
-    Ok(legalized)
 }
 
 /// `true` when every instruction of `callee` lowers into machine registers.
@@ -649,11 +592,9 @@ fn check_eligibility(
                 // this site are moot — the op is never emitted — but they must
                 // not fail the unit-wide conversion sweep.
                 for conversion in reprs.conversions() {
-                    if conversion.inline == instruction.inline
-                        && conversion.at_pc == instruction.pc
+                    if conversion.inline == instruction.inline && conversion.at_pc == instruction.pc
                     {
-                        allowed_conversions
-                            .insert((conversion.at_pc, conversion.operand_index));
+                        allowed_conversions.insert((conversion.at_pc, conversion.operand_index));
                     }
                 }
                 continue;
@@ -1277,11 +1218,12 @@ fn build_osr_entry_sites(
         .iter()
         .filter(|block| block.is_loop_header && block.inline == InlineId::ROOT)
     {
-        let frame_state = frame_states
-            .at(InlineId::ROOT, block.start_pc)
-            .ok_or(Unsupported::OperandShape(
-                "optimizing OSR header frame state",
-            ))?;
+        let frame_state =
+            frame_states
+                .at(InlineId::ROOT, block.start_pc)
+                .ok_or(Unsupported::OperandShape(
+                    "optimizing OSR header frame state",
+                ))?;
         let live_in = liveness.live_in(block.id);
         let mut register_by_value = BTreeMap::<ValueId, u16>::new();
         for (register, value) in frame_state.registers.iter().copied().enumerate() {
@@ -1665,7 +1607,6 @@ fn is_exact_i32(number: f64) -> bool {
         && number == f64::from(number as i32)
 }
 
-
 /// Name the exit an instruction deoptimizes through.
 fn deopt_exit_at(
     frame_states: &FrameStateTable,
@@ -1709,13 +1650,16 @@ fn emit(
         load_upvalue_entry,
         store_upvalue_entry,
         store_upvalue_checked_entry,
+        call_trampoline,
         transitions,
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
-    let mut ops = Assembler::new().expect("arm64 optimizing assembler allocation");
+    let mut ops = Assembler::new()
+        .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
+    let mut boxed_slot_slow_paths = Vec::new();
     let mut deopt_exits = Vec::<(DynamicLabel, DeoptExitId, u32)>::new();
     let threw = ops.new_dynamic_label();
     let block_labels: Vec<_> = (0..cfg.blocks.len())
@@ -1772,11 +1716,7 @@ fn emit(
                     ValueDef::Uninitialized { .. } | ValueDef::InlineUndefinedReturn { .. }
                 ) {
                     emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
-                    emit_store_tagged_location(
-                        &mut ops,
-                        allocation.location(head),
-                        9,
-                    )?;
+                    emit_store_tagged_location(&mut ops, allocation.location(head), 9)?;
                 }
             }
         }
@@ -1841,7 +1781,11 @@ fn emit(
                                 FP_SCRATCH,
                             )?;
                         }
-                        Representation::Tagged => unreachable!("eligibility checked number"),
+                        Representation::Tagged => {
+                            return Err(Unsupported::OperandShape(
+                                "optimizing LoadNumber tagged representation",
+                            ));
+                        }
                     }
                 }
                 Op::LoadTrue | Op::LoadFalse => {
@@ -1887,9 +1831,8 @@ fn emit(
                     emit_load_u32(&mut ops, 9, otter_vm::Value::null().to_bits() as u32);
                     emit_store_tagged_location(
                         &mut ops,
-                        allocation.location(
-                            instruction.result.expect("eligibility checked null result"),
-                        ),
+                        allocation
+                            .location(instruction.result.expect("eligibility checked null result")),
                         9,
                     )?;
                 }
@@ -2029,10 +1972,8 @@ fn emit(
                     // observe the store — and a tagged value may be a cell that
                     // needs the generational barrier, so both take the stub.
                     let value_repr = reprs.representation(instruction.inputs[2]);
-                    let store_fast = matches!(
-                        value_repr,
-                        Representation::Int32 | Representation::Float64
-                    );
+                    let store_fast =
+                        matches!(value_repr, Representation::Int32 | Representation::Float64);
                     let miss = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
                     if store_fast {
@@ -2070,7 +2011,11 @@ fn emit(
                                 )?;
                                 emit_box_double(&mut ops, FP_SCRATCH, 9);
                             }
-                            Representation::Tagged => unreachable!("store_fast is numeric"),
+                            Representation::Tagged => {
+                                return Err(Unsupported::OperandShape(
+                                    "optimizing element-store tagged fast value",
+                                ));
+                            }
                         }
                         dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
                         emit_store_tagged_location(
@@ -2212,11 +2157,21 @@ fn emit(
                             ; cbz x13, =>miss
                             ; ldr w9, [x13, x17]       // 4-byte compressed slot
                         );
+                        let boxed_entry = ops.new_dynamic_label();
+                        let continuation = ops.new_dynamic_label();
+                        boxed_slot_slow_paths.push(
+                            crate::template::arm64::values::BoxedSlotSlowPath {
+                                entry: boxed_entry,
+                                continuation,
+                                miss,
+                            },
+                        );
                         crate::template::arm64::values::emit_decompress_slot(
                             &mut ops,
                             view.cage_base as u64,
-                            miss,
+                            boxed_entry,
                         );
+                        dynasm!(ops ; .arch aarch64 ; =>continuation);
                         emit_store_tagged_location(&mut ops, result_location, 9)?;
                         dynasm!(ops ; .arch aarch64 ; b =>done);
                     }
@@ -2407,9 +2362,7 @@ fn emit(
                             ; b =>done
                             ; =>store_prim
                         );
-                        crate::template::arm64::values::emit_compress_slot_or_bail(
-                            &mut ops, miss,
-                        );
+                        crate::template::arm64::values::emit_compress_slot_or_bail(&mut ops, miss);
                         dynasm!(ops ; .arch aarch64 ; str w10, [x13, x17] ; b =>done);
                     }
 
@@ -2762,7 +2715,7 @@ fn emit(
 
                     // Direct dispatch first: the prepare transition resolves the
                     // method through its IC and stages the callee's entry, and
-                    // the shared tail calls it compiled-to-compiled — no
+                    // the shared trampoline calls it compiled-to-compiled — no
                     // interpreter dispatch on the hot path. A bailed callee is
                     // finished by the VM and this caller keeps running compiled;
                     // only an abort report side-exits at this call.
@@ -2787,9 +2740,9 @@ fn emit(
                         ; cmp x0, #2
                         ; b.eq =>generic
                     );
-                    crate::template::arm64::calls::emit_direct_call_tail(
+                    crate::arm64::emit_prepared_call(
                         &mut ops,
-                        transitions,
+                        call_trampoline,
                         dst,
                         bail,
                         threw,
@@ -2836,7 +2789,11 @@ fn emit(
                     )?;
                     // An exotic-receiver report (`2`) side-exits before the opcode
                     // takes effect: a full deopt re-runs it in the interpreter.
-                    deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
+                    deopt_exits.push((
+                        bail,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
                 }
                 Op::New => {
                     let dst = instruction
@@ -2901,19 +2858,17 @@ fn emit(
                     )?;
                     // A non-constructor report (`2`) has no committed effects;
                     // deopt re-runs the opcode to create the canonical TypeError.
-                    deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
+                    deopt_exits.push((
+                        bail,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
                 }
                 Op::LogicalNot => {
                     let result = instruction
                         .result
                         .expect("eligibility checked logical-not result");
-                    emit_load_boxed_value(
-                        &mut ops,
-                        reprs,
-                        allocation,
-                        instruction.inputs[0],
-                        9,
-                    )?;
+                    emit_load_boxed_value(&mut ops, reprs, allocation, instruction.inputs[0], 9)?;
                     let bail = ops.new_dynamic_label();
                     emit_truthiness_reduce(&mut ops, bail);
                     emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
@@ -2924,15 +2879,17 @@ fn emit(
                         ; movz w12, VALUE_FALSE_LOW
                         ; add w11, w11, w12
                     );
-                    emit_store_tagged_location(
-                        &mut ops,
-                        allocation.location(result),
-                        11,
-                    )?;
-                    deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
+                    emit_store_tagged_location(&mut ops, allocation.location(result), 11)?;
+                    deopt_exits.push((
+                        bail,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
                 }
                 Op::Neg => {
-                    let result = instruction.result.expect("eligibility checked negate result");
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked negate result");
                     match reprs.representation(result) {
                         Representation::Int32 => {
                             emit_load_int_operand(
@@ -2976,11 +2933,17 @@ fn emit(
                                 FP_SCRATCH,
                             )?;
                         }
-                        Representation::Tagged => unreachable!("eligibility checked negate"),
+                        Representation::Tagged => {
+                            return Err(Unsupported::OperandShape(
+                                "optimizing negate tagged representation",
+                            ));
+                        }
                     }
                 }
                 Op::Increment => {
-                    let result = instruction.result.expect("eligibility checked increment result");
+                    let result = instruction
+                        .result
+                        .expect("eligibility checked increment result");
                     let delta = view.instructions[instruction.pc as usize]
                         .imm32(view.code_block.as_ref(), 2)
                         .ok_or(Unsupported::OperandShape("increment delta operand"))?;
@@ -3001,7 +2964,11 @@ fn emit(
                         ; b.vs =>deopt
                     );
                     emit_store_location(&mut ops, allocation.location(result), 11)?;
-                    deopt_exits.push((deopt, deopt_exit_at(frame_states, instruction)?, instruction.pc));
+                    deopt_exits.push((
+                        deopt,
+                        deopt_exit_at(frame_states, instruction)?,
+                        instruction.pc,
+                    ));
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                     let result = instruction.result.expect("eligibility checked result");
@@ -3044,7 +3011,7 @@ fn emit(
                                     ; cmp x11, x12
                                     ; b.ne =>deopt
                                 ),
-                                _ => unreachable!("int32 division is ineligible"),
+                                _ => return Err(Unsupported::Opcode(instruction.op)),
                             }
                             emit_store_location(&mut ops, allocation.location(result), 11)?;
                             deopt_exits.push((
@@ -3120,7 +3087,7 @@ fn emit(
                                         instruction.pc,
                                     ));
                                 }
-                                _ => unreachable!(),
+                                _ => return Err(Unsupported::Opcode(instruction.op)),
                             }
                             emit_store_fp_location(
                                 &mut ops,
@@ -3129,13 +3096,16 @@ fn emit(
                                 FP_SCRATCH,
                             )?;
                         }
-                        Representation::Tagged => unreachable!("eligibility checked arithmetic"),
+                        Representation::Tagged => {
+                            return Err(Unsupported::OperandShape(
+                                "optimizing arithmetic tagged representation",
+                            ));
+                        }
                     }
                 }
                 Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor | Op::Shl | Op::Shr => {
                     let result = instruction.result.expect("eligibility checked result");
-                    let float_form =
-                        reprs.representation(result) == Representation::Float64;
+                    let float_form = reprs.representation(result) == Representation::Float64;
                     if float_form {
                         // Mixed numeric operands: exact JS ToInt32 per operand
                         // (fjcvtzs truncates and wraps modulo 2^32), integer
@@ -3165,10 +3135,22 @@ fn emit(
                         );
                     } else {
                         emit_load_int_operand(
-                            &mut ops, reprs, allocation, instruction, 0, 9, guard_deopt,
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            0,
+                            9,
+                            guard_deopt,
                         )?;
                         emit_load_int_operand(
-                            &mut ops, reprs, allocation, instruction, 1, 10, guard_deopt,
+                            &mut ops,
+                            reprs,
+                            allocation,
+                            instruction,
+                            1,
+                            10,
+                            guard_deopt,
                         )?;
                     }
                     match instruction.op {
@@ -3186,7 +3168,7 @@ fn emit(
                             ; and w10, w10, #31
                             ; asr w11, w9, w10
                         ),
-                        _ => unreachable!("eligibility checked bitwise op"),
+                        _ => return Err(Unsupported::Opcode(instruction.op)),
                     }
                     if float_form {
                         dynasm!(ops ; .arch aarch64 ; scvtf D(FP_SCRATCH), w11);
@@ -3297,7 +3279,7 @@ fn emit(
                 }
                 Op::JumpIfTrue | Op::JumpIfFalse => {
                     let Terminator::Branch { taken, fallthrough } = block.terminator else {
-                        unreachable!("eligibility checked branch terminator");
+                        return Err(Unsupported::OperandShape("optimizing branch terminator"));
                     };
                     emit_load_tagged_location(
                         &mut ops,
@@ -3309,7 +3291,11 @@ fn emit(
                     if !is_boolean_value(ssa, instruction.inputs[0]) {
                         let bail = ops.new_dynamic_label();
                         emit_truthiness_reduce(&mut ops, bail);
-                        deopt_exits.push((bail, deopt_exit_at(frame_states, instruction)?, instruction.pc));
+                        deopt_exits.push((
+                            bail,
+                            deopt_exit_at(frame_states, instruction)?,
+                            instruction.pc,
+                        ));
                     }
                     emit_load_u32(&mut ops, 10, VALUE_TRUE as u32);
                     let taken_edge = ops.new_dynamic_label();
@@ -3343,7 +3329,7 @@ fn emit(
                     )?;
                 }
                 // A plain call: prepare resolves the callee against installed
-                // code and the shared tail runs it compiled-to-compiled. An
+                // code and the shared trampoline runs it compiled-to-compiled. An
                 // ineligible callee completes through the generic in-place
                 // transition; only a non-callable report side-exits.
                 Op::Call if !is_spliced_call(cfg, block_id, instruction) => {
@@ -3392,9 +3378,9 @@ fn emit(
                         ; cmp x0, #2
                         ; b.eq =>generic
                     );
-                    crate::template::arm64::calls::emit_direct_call_tail(
+                    crate::arm64::emit_prepared_call(
                         &mut ops,
-                        transitions,
+                        call_trampoline,
                         dst,
                         bail,
                         threw,
@@ -3426,9 +3412,7 @@ fn emit(
                         Some((
                             dst,
                             allocation.location(
-                                instruction
-                                    .result
-                                    .expect("eligibility checked call result"),
+                                instruction.result.expect("eligibility checked call result"),
                             ),
                         )),
                     )?;
@@ -3445,7 +3429,9 @@ fn emit(
                     let Terminator::InlineCall { callee_entry, .. } =
                         cfg.blocks[block_id.0 as usize].terminator
                     else {
-                        unreachable!("a spliced call block ends in a splice");
+                        return Err(Unsupported::OperandShape(
+                            "optimizing spliced-call terminator",
+                        ));
                     };
                     let callee =
                         &tree.frames[cfg.blocks[callee_entry.0 as usize].inline.0 as usize];
@@ -3523,7 +3509,7 @@ fn emit(
                     dynasm!(ops ; .arch aarch64 ; movz x1, STATUS_RETURNED as u32);
                     emit_epilogue(&mut ops, spill_frame_bytes);
                 }
-                _ => unreachable!("eligibility rejected unsupported opcode"),
+                _ => return Err(Unsupported::Opcode(instruction.op)),
             }
         }
 
@@ -3554,6 +3540,12 @@ fn emit(
         ; movz x1, STATUS_THREW as u32
     );
     emit_epilogue(&mut ops, spill_frame_bytes);
+
+    crate::template::arm64::values::emit_boxed_slot_slow_paths(
+        &mut ops,
+        view,
+        boxed_slot_slow_paths,
+    );
 
     for (label, exit, resume_pc) in deopt_exits {
         dynasm!(ops ; .arch aarch64 ; =>label);
@@ -3638,7 +3630,7 @@ fn emit(
 
     let buffer = ops
         .finalize()
-        .expect("arm64 optimizing assembler finalization");
+        .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
     Ok(OptimizedEmission {
         code: CompiledCode::new(buffer, entry),
         osr_entries,
@@ -3686,11 +3678,7 @@ fn emit_cfg_edge(
 /// calls the leaf poll stub, which refills the budget and returns to the
 /// compiled loop, or raises (interrupt, timeout) through the throw epilogue.
 /// Deoptimizing here would abandon the compiled loop once per budget window.
-fn emit_backedge_poll(
-    ops: &mut Assembler,
-    poll_entry: u64,
-    threw: DynamicLabel,
-) {
+fn emit_backedge_poll(ops: &mut Assembler, poll_entry: u64, threw: DynamicLabel) {
     let slow = ops.new_dynamic_label();
     let cont = ops.new_dynamic_label();
     dynasm!(ops
@@ -4293,13 +4281,7 @@ fn load_int32(view: &JitCompileSnapshot, pc: u32) -> Result<i32, Unsupported> {
 }
 
 fn total_spill_slots(allocation: &Allocation) -> Result<u32, Unsupported> {
-    allocation
-        .spill_slot_counts
-        .gpr
-        .checked_add(allocation.spill_slot_counts.fp)
-        .ok_or(Unsupported::OperandShape(
-            "optimizing total spill slot overflow",
-        ))
+    analyzed_spill_slot_count(allocation).map_err(OptimizationError::into_unsupported)
 }
 
 fn aligned_spill_bytes(spill_slot_count: u32) -> Result<u32, Unsupported> {
@@ -5128,15 +5110,7 @@ mod tests {
             frame_index: 0,
             upvalues_ptr: 0,
             error: &mut error,
-            direct_entry_addr: 0,
-            direct_regs: std::ptr::null_mut(),
-            direct_self_closure: 0,
-            direct_this_value: 0,
-            direct_frame_index: 0,
-            direct_upvalues_ptr: 0,
-            direct_frame_ids: 0,
-            direct_frame_meta: 0,
-            direct_code_object_id: 0,
+            direct_call: std::mem::MaybeUninit::uninit(),
             reg_stack_base: std::ptr::null_mut(),
             reg_top_ptr: std::ptr::null_mut(),
             activation_base: std::ptr::null_mut(),
@@ -5854,10 +5828,7 @@ mod tests {
             1,
             2,
             vec![
-                (
-                    Op::Neg,
-                    vec![Operand::Register(1), Operand::Register(0)],
-                ),
+                (Op::Neg, vec![Operand::Register(1), Operand::Register(0)]),
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
         );
@@ -5870,20 +5841,14 @@ mod tests {
             1,
             2,
             vec![
-                (
-                    Op::Neg,
-                    vec![Operand::Register(1), Operand::Register(0)],
-                ),
+                (Op::Neg, vec![Operand::Register(1), Operand::Register(0)]),
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
             &[0],
             &[],
         );
         let float_code = compile(&float_view, 119).expect("float negate is eligible");
-        assert_eq!(
-            execute(&float_code, &[box_f64(-0.0)]).value,
-            box_f64(0.0)
-        );
+        assert_eq!(execute(&float_code, &[box_f64(-0.0)]).value, box_f64(0.0));
     }
 
     #[test]
@@ -6623,10 +6588,7 @@ mod tests {
             1,
             2,
             vec![
-                (
-                    Op::TypeOf,
-                    vec![Operand::Register(1), Operand::Register(0)],
-                ),
+                (Op::TypeOf, vec![Operand::Register(1), Operand::Register(0)]),
                 (Op::ReturnValue, vec![Operand::Register(1)]),
             ],
         );
@@ -6929,8 +6891,8 @@ mod tests {
             otter_vm::native_abi::STUB_JIT_BACKEDGE_POLL,
             refilling_poll as *const () as usize,
         );
-        let code = compile_with_transitions(&view, 16, &transitions)
-            .expect("summation loop is eligible");
+        let code =
+            compile_with_transitions(&view, 16, &transitions).expect("summation loop is eligible");
         let interrupt = 0_u8;
         let mut fuel = 1_u64;
         let (result, _, _) = execute_with_poll_cells(

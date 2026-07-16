@@ -223,16 +223,10 @@ impl Interpreter {
             deferred_namespaces: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
-            load_property_ics: Vec::new(),
-            store_property_ics: Vec::new(),
-            method_call_ics: Vec::new(),
-            has_property_ics: Vec::new(),
-            property_ic_stats: property_ic::PropertyIcStats::default(),
+            feedback_directory: crate::interp::FeedbackDirectory::default(),
             jit_hook: None,
             jit_call_counts: rustc_hash::FxHashMap::default(),
             optimizing_tier_policy: tier_policy::TierPolicy::default(),
-            jit_call_site_feedback: call_feedback::CallSiteFeedbackTable::new(),
-            jit_method_site_feedback: Vec::new(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),
             jit_entry_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
@@ -249,7 +243,6 @@ impl Interpreter {
             jit_osr_code: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
-            jit_direct_code_anchors: Vec::new(),
             jit_direct_method_cache: Vec::new(),
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
@@ -945,24 +938,20 @@ impl Interpreter {
 
     #[cfg(test)]
     pub(crate) fn load_property_ic_count(&self) -> usize {
-        self.load_property_ics
-            .iter()
-            .filter(|entry| entry.is_polymorphic())
-            .count()
+        self.feedback_directory
+            .polymorphic_property_count(property_ic::PropertyIcKind::Load)
     }
 
     #[cfg(test)]
     pub(crate) fn store_property_ic_count(&self) -> usize {
-        self.store_property_ics
-            .iter()
-            .filter(|entry| entry.is_polymorphic())
-            .count()
+        self.feedback_directory
+            .polymorphic_property_count(property_ic::PropertyIcKind::Store)
     }
 
     /// Return aggregate property inline-cache counters.
     #[must_use]
     pub fn property_ic_stats(&self) -> property_ic::PropertyIcStats {
-        self.property_ic_stats
+        self.feedback_directory.property_stats()
     }
 
     /// Override the back-edge count at which a hot loop tiers up via OSR.
@@ -1071,24 +1060,7 @@ impl Interpreter {
     /// Return the current collection method IC summary.
     #[must_use]
     pub fn jit_collection_method_ic_stats(&self) -> JitCollectionMethodIcStats {
-        let mut stats = JitCollectionMethodIcStats {
-            slots: self.method_call_ics.len() as u64,
-            ..JitCollectionMethodIcStats::default()
-        };
-        for slot in &self.method_call_ics {
-            if let Some(method_ops::MethodCallIc::Collection(ic)) = slot {
-                stats.collection_slots = stats.collection_slots.saturating_add(1);
-                if ic.leaf_stub_id.is_some() {
-                    stats.leaf_stub_slots = stats.leaf_stub_slots.saturating_add(1);
-                }
-                if ic.alloc_stub_id.is_some() {
-                    stats.alloc_stub_slots = stats.alloc_stub_slots.saturating_add(1);
-                }
-            } else {
-                stats.empty_slots = stats.empty_slots.saturating_add(1);
-            }
-        }
-        stats
+        self.feedback_directory.collection_method_stats()
     }
 
     /// Call-count at which a function body is offered to the JIT. Low enough

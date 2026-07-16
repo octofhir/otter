@@ -28,8 +28,8 @@
 //!   try-handler slots by the serialized verifier.
 //! - Named property IC sites receive dense VM-local ids during build; the
 //!   bytecode JSON dump stays unchanged.
-//! - Feedback epochs are CodeBlock-owned monotonic counters; instruction cells
-//!   remain fixed at eight bytes and never carry per-cell epochs.
+//! - A tier-neutral [`crate::feedback::FeedbackVector`] owns both dense
+//!   instruction cells and their monotonic material-transition epoch.
 //!
 //! # See also
 //! - [`crate::execution_context`]
@@ -43,10 +43,7 @@ use otter_bytecode::{
     FunctionCodeBuilder, Op, Operand, SpanEntry, WordInstruction,
     encoding::{FunctionLayout, layout_wordcode_function, translate_spans_to_byte_pcs},
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicU32, Ordering},
-};
+use std::sync::Arc;
 
 use code_block_cfg::{CodeBlockControlFlow, CodeBlockExceptionRegion};
 
@@ -114,6 +111,33 @@ pub(crate) struct ExecutableModule {
     property_ic_site_end: u32,
 }
 
+/// Stable directory entry mapping a globally dense property/method site id
+/// back to its owning CodeBlock feedback slot or method marker.
+#[derive(Debug, Clone)]
+pub(crate) struct FeedbackSlotAddress {
+    code_block: Arc<CodeBlock>,
+    instruction_index: usize,
+}
+
+impl FeedbackSlotAddress {
+    #[must_use]
+    pub(crate) fn property(
+        &self,
+        kind: crate::property_ic::PropertyIcKind,
+    ) -> Option<crate::feedback::PropertyFeedbackSlot<'_>> {
+        self.code_block
+            .feedback
+            .property_slot(self.instruction_index, kind)
+    }
+
+    #[must_use]
+    pub(crate) fn is_method(&self) -> bool {
+        self.code_block
+            .feedback
+            .is_method_slot(self.instruction_index)
+    }
+}
+
 impl ExecutableModule {
     /// Build a frozen execution view from the compiler/debug module DTO.
     #[cfg(test)]
@@ -149,6 +173,25 @@ impl ExecutableModule {
     #[must_use]
     pub(crate) const fn property_ic_site_end(&self) -> u32 {
         self.property_ic_site_end
+    }
+
+    /// Build directory entries for the property/method sites in this chunk.
+    pub(crate) fn feedback_slot_addresses(&self) -> Vec<(usize, FeedbackSlotAddress)> {
+        let mut slots = Vec::new();
+        for code_block in &self.functions {
+            for (instruction_index, instruction) in code_block.code.iter().enumerate() {
+                if let Some(site) = instruction.property_ic_site() {
+                    slots.push((
+                        site,
+                        FeedbackSlotAddress {
+                            code_block: Arc::clone(code_block),
+                            instruction_index,
+                        },
+                    ));
+                }
+            }
+        }
+        slots
     }
 }
 
@@ -221,9 +264,9 @@ impl CodeBlock {
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,
-                    arith_feedback: crate::jit_feedback::ArithFeedback::from_bits(
+                    arith_feedback: crate::feedback::ArithFeedback::from_bits(
                         self.feedback_at(index)
-                            .map_or(0, crate::jit_feedback::InstructionFeedback::arith_bits),
+                            .map_or(0, crate::feedback::InstructionFeedback::arith_bits),
                     ),
                 })
                 .collect(),
@@ -270,10 +313,9 @@ impl CodeBlock {
                 )
             })
             .collect();
-        let feedback = (0..code.len())
-            .map(|_| crate::jit_feedback::InstructionFeedback::default())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
+            instructions.iter().map(|instruction| instruction.op),
+        );
         let control_flow = CodeBlockControlFlow::from_verified_wordcode(&wordcode);
         Arc::new(Self {
             id,
@@ -301,7 +343,6 @@ impl CodeBlock {
             wordcode,
             control_flow,
             feedback,
-            feedback_epoch: AtomicU32::new(0),
             byte_pcs: byte_pcs.into_boxed_slice(),
             byte_spans: Box::new([]),
         })
@@ -325,8 +366,8 @@ impl CodeBlock {
     pub(crate) fn feedback_at(
         &self,
         index: usize,
-    ) -> Option<&crate::jit_feedback::InstructionFeedback> {
-        self.feedback.get(index)
+    ) -> Option<&crate::feedback::InstructionFeedback> {
+        self.feedback.cell(index)
     }
 
     /// CodeBlock-wide version of material feedback transitions.
@@ -335,7 +376,7 @@ impl CodeBlock {
     /// it to require stable feedback before compilation.
     #[must_use]
     pub fn feedback_epoch(&self) -> u32 {
-        self.feedback_epoch.load(Ordering::Acquire)
+        self.feedback.epoch()
     }
 
     /// Pair one dense feedback cell with this CodeBlock's transition epoch.
@@ -343,20 +384,27 @@ impl CodeBlock {
     pub(crate) fn feedback_recorder_at(
         &self,
         index: usize,
-    ) -> Option<crate::jit_feedback::InstructionFeedbackRecorder<'_>> {
-        self.feedback
-            .get(index)
-            .map(|cell| crate::jit_feedback::InstructionFeedbackRecorder::new(self, cell))
+    ) -> Option<crate::feedback::InstructionFeedbackRecorder<'_>> {
+        self.feedback.recorder(index)
     }
 
-    /// Advance the feedback epoch without permitting wraparound.
-    #[inline]
-    pub(crate) fn bump_feedback_epoch(&self) {
-        let _ = self
-            .feedback_epoch
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |epoch| {
-                epoch.checked_add(1)
-            });
+    /// Bounded ordinary-call distribution at one canonical instruction.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn call_distribution_at(
+        &self,
+        index: usize,
+    ) -> Option<crate::feedback::CallSiteDistribution> {
+        self.feedback.call_slot(index)?.distribution()
+    }
+
+    /// Record one ordinary bytecode target through the feedback facade.
+    pub(crate) fn record_call_feedback(
+        &self,
+        instruction_index: usize,
+        callee_fid: u32,
+    ) -> crate::feedback::CallTargetTransition {
+        self.feedback.record_call(instruction_index, callee_fid)
     }
 
     /// Cold serialized byte PC for one logical instruction index.
@@ -681,12 +729,9 @@ pub struct CodeBlock {
     wordcode: FunctionCode,
     /// Precomputed logical-PC block, loop, and exception-region tables.
     control_flow: CodeBlockControlFlow,
-    /// Advisory feedback parallel to `code`, shared without hash lookup.
-    feedback: Box<[crate::jit_feedback::InstructionFeedback]>,
-    /// Monotonic version of material transitions in `feedback` and its bounded
-    /// ordinary-call distribution. Future optimizing tiers may snapshot it;
-    /// current compilation and tier-up decisions never read it.
-    feedback_epoch: AtomicU32,
+    /// Tier-neutral advisory feedback parallel to `code`, including its single
+    /// monotonic transition epoch, shared without hash lookup.
+    feedback: crate::feedback::FeedbackVector,
     /// Cold serialized byte PCs parallel to `code`.
     byte_pcs: Box<[u32]>,
     /// Source-map entries with `pc` expressed as a byte offset into the
@@ -722,7 +767,6 @@ impl Clone for CodeBlock {
             wordcode: self.wordcode.clone(),
             control_flow: self.control_flow.clone(),
             feedback: self.feedback.clone(),
-            feedback_epoch: AtomicU32::new(self.feedback_epoch()),
             byte_pcs: self.byte_pcs.clone(),
             byte_spans: self.byte_spans.clone(),
         }
@@ -776,10 +820,9 @@ impl CodeBlock {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let feedback = (0..code.len())
-            .map(|_| crate::jit_feedback::InstructionFeedback::default())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
+            function.code.iter().map(|instruction| instruction.op),
+        );
         let mapped_argument_bindings = function
             .mapped_argument_bindings
             .iter()
@@ -839,7 +882,6 @@ impl CodeBlock {
             wordcode,
             control_flow,
             feedback,
-            feedback_epoch: AtomicU32::new(0),
             byte_pcs: instr_to_byte_pc,
             byte_spans,
         }

@@ -2589,8 +2589,8 @@ fn make_aggregate_error_native_rooted(
     // sibling. The prototype resolves through the registry at use
     // time; the raw read is parked before the next allocation.
     let proto = Value::object(registry.prototype(ErrorKind::AggregateError));
-    ctx.scope(|ctx, s| {
-        let mut cx = crate::marshal::MarshalCx::new(ctx, s);
+    ctx.scope(|scope| {
+        let mut cx = crate::marshal::MarshalCx::new(scope);
         let proto = cx.park(proto);
         let errors_array = {
             let array = cx

@@ -91,26 +91,25 @@ pub fn run_builtin_cjs_shim(
     // bare locals dangling. The module-root stack relocates its slots in place,
     // so after every subsequent allocation we re-fetch the live handles from the
     // slots instead of trusting the stale `module` / `exports` locals.
-    let (exports_val, module_val) = ctx
-        .scope(|ctx, scope| {
-            let exports = ctx.scoped_object_bare(scope)?;
-            let module = ctx.scoped_object_bare(scope)?;
-            Ok::<_, NativeError>((ctx.escape(exports), ctx.escape(module)))
+    let module_val = ctx
+        .scope(|mut scope| {
+            let exports = scope.bare_object()?;
+            let module = scope.bare_object()?;
+            scope.set(module, "exports", exports)?;
+            Ok::<_, NativeError>(scope.finish(module))
         })
         .map_err(|err| err.to_string())?;
 
     let root_base = ctx.interp_mut().module_root_depth();
     let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
-    let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
-
-    // From here on, re-fetch the relocated `module` handle after each allocation.
-    let mut module = ctx
+    let module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    let exports_val = ctx.interp_mut().module_root(exports_idx);
-    object::set(&mut module, ctx.heap_mut(), "exports", exports_val);
+    let exports_val =
+        object::get(module, ctx.heap(), "exports").expect("module owns rooted exports");
+    let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
 
     let id_val = runtime_string_value(ctx, name).map_err(|e| e.to_string())?;
     let id_idx = ctx.interp_mut().push_module_root(id_val) - 1;
@@ -164,41 +163,39 @@ pub fn run_builtin_cjs_shim(
 /// The deps are stored on a plain JS object (which roots their values) captured
 /// by the closure; `require(spec)` returns `deps[spec]` or throws.
 fn make_shim_require(ctx: &mut NativeCtx<'_>, deps: &[(&str, Value)]) -> Result<Value, String> {
-    ctx.scope(|ctx, scope| {
+    let table = ctx.scope(|mut scope| {
         let deps: Vec<_> = deps
             .iter()
-            .map(|(spec, value)| (*spec, ctx.scoped_value(scope, *value)))
+            .map(|(spec, value)| (*spec, scope.value(*value)))
             .collect();
-        let table = ctx
-            .scoped_object_bare(scope)
-            .map_err(|err| err.to_string())?;
+        let table = scope.bare_object().map_err(|err| err.to_string())?;
         for (spec, value) in deps {
-            ctx.scoped_set(scope, table, spec, value)
+            scope
+                .set(table, spec, value)
                 .map_err(|err| err.to_string())?;
         }
-        let captures: SmallVec<[Value; 4]> = smallvec![ctx.escape(table)];
-        let closure = move |ctx: &mut NativeCtx<'_>,
-                            args: &[Value],
-                            captures: &[Value]|
-              -> Result<Value, NativeError> {
-            let table = captures
-                .first()
-                .and_then(|value| value.as_object())
-                .ok_or_else(|| runtime_type_error("require", "missing shim dependency table"))?;
-            let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
-            match object::get(table, ctx.heap(), &spec) {
-                Some(value) => Ok(value),
-                None => Err(runtime_type_error(
-                    "require",
-                    format!("Cannot find module '{spec}'"),
-                )),
-            }
-        };
-        // `NativeCtx::native_value` traces runtime state and captures itself;
-        // the scoped dependency table remains current until capture completes.
-        ctx.native_value("require", captures, closure)
-            .map_err(|err| err.to_string())
-    })
+        Ok::<Value, String>(scope.finish(table))
+    })?;
+    let captures: SmallVec<[Value; 4]> = smallvec![table];
+    let closure = move |ctx: &mut NativeCtx<'_>,
+                        args: &[Value],
+                        captures: &[Value]|
+          -> Result<Value, NativeError> {
+        let table = captures
+            .first()
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| runtime_type_error("require", "missing shim dependency table"))?;
+        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+        match object::get(table, ctx.heap(), &spec) {
+            Some(value) => Ok(value),
+            None => Err(runtime_type_error(
+                "require",
+                format!("Cannot find module '{spec}'"),
+            )),
+        }
+    };
+    ctx.native_value("require", captures, closure)
+        .map_err(|err| err.to_string())
 }
 
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier
@@ -330,15 +327,10 @@ pub(crate) fn cjs_load(
         if let Some(cached) = object::get(cache, ctx.heap(), &key) {
             return Ok(cached);
         }
-        return ctx.scope(|ctx, scope| {
-            // Installing a hosted module can allocate enough to move the
-            // require cache. Adopt it into the public handle arena before
-            // entering the installer and use scoped access for the store.
-            let cache = ctx.scoped_value(scope, Value::object(cache));
+        let root_base = ctx.interp_mut().module_root_depth();
+        let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
+        let result: Result<Value, NativeError> = (|| {
             let value = if let Some(value_install) = hm.cjs_value() {
-                // Value installers (e.g. `assert`) build via `ModuleScope`,
-                // which pops its roots on return. Adopt the export below
-                // before the scoped cache store, which may allocate.
                 value_install(ctx, &cfg.capabilities)
                     .map_err(|err| runtime_type_error("require", err))?
             } else {
@@ -358,10 +350,20 @@ pub(crate) fn cjs_load(
                 };
                 Value::object(namespace)
             };
-            let value = ctx.scoped_value(scope, value);
-            ctx.scoped_set(scope, cache, &key, value)?;
-            Ok(ctx.escape(value))
-        });
+            let cache = ctx
+                .interp_mut()
+                .module_root(cache_idx)
+                .as_object()
+                .expect("require cache survives hosted module installation");
+            ctx.scope(|mut scope| {
+                let cache = scope.value(Value::object(cache));
+                let value = scope.value(value);
+                scope.set(cache, &key, value)?;
+                Ok(scope.finish(value))
+            })
+        })();
+        ctx.interp_mut().pop_module_roots_to(root_base);
+        return result;
     }
 
     // 2. File module.
@@ -384,20 +386,29 @@ pub(crate) fn cjs_load(
                 format!("native addons are not enabled for '{id}'"),
             )
         })?;
-        return ctx.scope(|ctx, scope| {
-            // Park the cache before entering addon code: registration can run
-            // arbitrary allocating N-API calls and relocate this young object.
-            let cache = ctx.scoped_value(scope, Value::object(cache));
+        let root_base = ctx.interp_mut().module_root_depth();
+        let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
+        let result: Result<Value, NativeError> = (|| {
             let value = loader(
                 ctx,
                 &resolved,
                 &cfg.capabilities,
                 cfg.runtime_task_spawner.clone(),
             )?;
-            let value = ctx.scoped_value(scope, value);
-            ctx.scoped_set(scope, cache, &id, value)?;
-            Ok(ctx.escape(value))
-        });
+            let cache = ctx
+                .interp_mut()
+                .module_root(cache_idx)
+                .as_object()
+                .expect("require cache survives addon registration");
+            ctx.scope(|mut scope| {
+                let cache = scope.value(Value::object(cache));
+                let value = scope.value(value);
+                scope.set(cache, &id, value)?;
+                Ok(scope.finish(value))
+            })
+        })();
+        ctx.interp_mut().pop_module_roots_to(root_base);
+        return result;
     }
     let source = std::fs::read_to_string(&resolved)
         .map_err(|err| runtime_type_error("require", format!("io error for '{id}': {err}")))?;
@@ -429,25 +440,21 @@ pub(crate) fn cjs_instantiate_file(
     let root_base = ctx.interp_mut().module_root_depth();
     let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
 
-    let exports_val = ctx.scope(|ctx, scope| {
-        let exports = ctx.scoped_object(scope)?;
-        Ok::<Value, NativeError>(ctx.escape(exports))
-    })?;
-    let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
-    let module_val = ctx.scope(|ctx, scope| {
-        let module = ctx.scoped_object(scope)?;
-        Ok::<Value, NativeError>(ctx.escape(module))
+    let module_val = ctx.scope(|mut scope| {
+        let exports = scope.object()?;
+        let module = scope.object()?;
+        scope.set(module, "exports", exports)?;
+        Ok::<Value, NativeError>(scope.finish(module))
     })?;
     let module_idx = ctx.interp_mut().push_module_root(module_val) - 1;
-
-    // From here on, re-fetch the relocated handles after each allocation.
-    let mut module = ctx
+    let module = ctx
         .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    let exports_val = ctx.interp_mut().module_root(exports_idx);
-    object::set(&mut module, ctx.heap_mut(), "exports", exports_val);
+    let exports_val = object::get(module, ctx.heap(), "exports")
+        .expect("module owns rooted exports after construction");
+    let exports_idx = ctx.interp_mut().push_module_root(exports_val) - 1;
 
     let id_val = runtime_string_value(ctx, &id)?;
     let mut module = ctx

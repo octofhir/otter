@@ -1303,7 +1303,6 @@ mod tests {
                         Operand::Register(0),
                         Operand::Register(1),
                         Operand::Register(2),
-                        Operand::Register(4),
                     ],
                 ),
                 instr(

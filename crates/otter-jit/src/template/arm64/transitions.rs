@@ -345,7 +345,6 @@ pub(super) fn emit_load_element(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_store_element(
     ops: &mut Assembler,
     table: &TransitionTable,
@@ -353,7 +352,6 @@ pub(super) fn emit_store_element(
     receiver: u16,
     index: u16,
     value: u16,
-    scratch: u16,
     threw: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let miss = ops.new_dynamic_label();
@@ -389,7 +387,6 @@ pub(super) fn emit_store_element(
         ; movz x1, receiver as u32
         ; movz x2, index as u32
         ; movz x3, value as u32
-        ; movz x4, scratch as u32
     );
     emit_transition_call(
         ops,

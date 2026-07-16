@@ -753,7 +753,7 @@ const WRITE_READ_CONST: &[OperandSpec] = &[W, R, CONST];
 const WRITE_CONST_CONST: &[OperandSpec] = &[W, CONST, CONST];
 const READ_CONST_READ_WRITE: &[OperandSpec] = &[R, CONST, R, W];
 const READ_READ: &[OperandSpec] = &[R, R];
-const READ_READ_READ_WRITE: &[OperandSpec] = &[R, R, R, W];
+const READ_READ_READ: &[OperandSpec] = &[R, R, R];
 const WRITE_WRITE_READ: &[OperandSpec] = &[W, W, R];
 const WRITE_CONST_IMM: &[OperandSpec] = &[W, CONST, IMM];
 const JUMP_VIA_FINALLY: &[OperandSpec] = &[IMM, IMM];
@@ -836,7 +836,7 @@ const fn operand_shape(op: Op) -> OperandShape {
         Op::LoadElement | Op::DeleteElement | Op::HasProperty | Op::Instanceof => {
             OperandShape::Fixed(WRITE_READ_READ)
         }
-        Op::StoreElement => OperandShape::Fixed(READ_READ_READ_WRITE),
+        Op::StoreElement => OperandShape::Fixed(READ_READ_READ),
         Op::IteratorNext => OperandShape::Fixed(WRITE_WRITE_READ),
         Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => {
             OperandShape::Fixed(&[R])

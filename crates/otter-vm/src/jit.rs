@@ -495,9 +495,9 @@ pub struct JitPreparedDirectCall {
     pub self_closure: u64,
     /// Boxed `this` bits for the callee context.
     pub this_value: u64,
-    /// Base of the callee frame's upvalue spine (`Box<[UpvalueCell]>` data), or
-    /// `0` when it captures nothing — lets emitted upvalue ops in the direct
-    /// callee read its cells inline instead of routing through the stub.
+    /// Base of the callee frame's stable upvalue source, or `0` when it captures
+    /// nothing. Inherited-only calls borrow the exact closure's immutable
+    /// allocation; calls with fresh own cells publish owner-allocated storage.
     pub upvalues_ptr: usize,
     /// VM-owned frameless-call resources released or materialized exactly once
     /// when native execution completes.
@@ -863,11 +863,11 @@ pub struct JitDeoptFrame {
 #[derive(Clone, Copy)]
 pub struct VmRuntimeActivation {
     /// Owning interpreter.
-    vm: *mut crate::Interpreter,
+    pub(crate) vm: *mut crate::Interpreter,
     /// Active stable-address frame stack.
-    stack: *mut crate::HoltStack,
+    pub(crate) stack: *mut crate::HoltStack,
     /// Linked execution context.
-    context: *const crate::ExecutionContext,
+    pub(crate) context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
     frame_index: usize,
 }

@@ -4233,7 +4233,6 @@ fn bytecode_store_element_uses_root_aware_growth_with_frame_roots() {
                     Operand::Register(4),
                     Operand::Register(5),
                     Operand::Register(6),
-                    Operand::Register(7),
                 ],
             },
             Instruction {

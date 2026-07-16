@@ -644,97 +644,136 @@ impl Interpreter {
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        // Intrinsics can allocate before forwarding to their terminal callee
+        // (`apply` materializes an argument list; `bind` performs observable
+        // property gets). Own and register the incoming state here instead of
+        // relying on a caller whose argument slot has already been emptied by
+        // a zero-copy hand-off.
+        let roots = crate::call_ops::SyncJsCallRoots::call(
+            self,
+            this_value,
+            Value::undefined(),
+            args,
+            true,
+        );
+        let roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.run_vm_intrinsic_sync_rooted(context, intrinsic, &roots);
+        drop(roots_guard);
+        result
+    }
+
+    fn run_vm_intrinsic_sync_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        intrinsic: VmIntrinsicFunction,
+        roots: &crate::call_ops::SyncJsCallRoots,
+    ) -> Result<Value, VmError> {
         match intrinsic {
             VmIntrinsicFunction::FunctionPrototypeCall => {
-                if !self.is_callable_runtime(&this_value) {
+                if !self.is_callable_runtime(&roots.target()) {
                     return Err(VmError::NotCallable);
                 }
-                let mut iter = args.into_iter();
-                let receiver = iter.next().unwrap_or(Value::undefined());
-                let forwarded: SmallVec<[Value; 8]> = iter.collect();
-                self.run_callable_sync(context, &this_value, receiver, forwarded)
+                let mut forwarded = roots.take_args();
+                let receiver = if forwarded.is_empty() {
+                    Value::undefined()
+                } else {
+                    forwarded.remove(0)
+                };
+                let target = roots.target();
+                self.run_callable_sync(context, &target, receiver, forwarded)
             }
             VmIntrinsicFunction::FunctionPrototypeApply => {
-                if !self.is_callable_runtime(&this_value) {
+                if !self.is_callable_runtime(&roots.target()) {
                     return Err(VmError::NotCallable);
                 }
-                let mut iter = args.into_iter();
-                let receiver = iter.next().unwrap_or(Value::undefined());
-                let forwarded: SmallVec<[Value; 8]> = match iter.next() {
+                let mut inputs = roots.take_args().into_iter();
+                let receiver = inputs.next().unwrap_or(Value::undefined());
+                roots.set_receiver(receiver);
+                let forwarded: SmallVec<[Value; 8]> = match inputs.next() {
                     None => SmallVec::new(),
                     Some(v) if v.is_nullish() => SmallVec::new(),
-                    Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
+                    Some(arg_array) => {
+                        roots.set_scratch(0, arg_array);
+                        self.create_list_from_array_like(context, roots.scratch(0))?
+                    }
                 };
-                self.run_callable_sync(context, &this_value, receiver, forwarded)
+                let target = roots.target();
+                let receiver = roots.receiver_value();
+                self.run_callable_sync(context, &target, receiver, forwarded)
             }
             VmIntrinsicFunction::FunctionPrototypeBind => {
-                if !self.is_callable_runtime(&this_value) {
+                if !self.is_callable_runtime(&roots.target()) {
                     return Err(VmError::NotCallable);
                 }
-                let mut iter = args.into_iter();
-                let receiver = iter.next().unwrap_or(Value::undefined());
-                let bound_args: SmallVec<[Value; 4]> = iter.collect();
+                let mut bound_args = roots.take_args();
+                let receiver = if bound_args.is_empty() {
+                    Value::undefined()
+                } else {
+                    bound_args.remove(0)
+                };
+                roots.set_receiver(receiver);
+                roots.replace_args(bound_args);
                 // §20.2.3.2 / §10.4.1.3 — name and length come from
                 // spec-observable [[Get]]s on the target, so a Proxy get
                 // trap (Function.prototype.bind.call(proxy)) is honoured.
                 let target_name = {
+                    let target = roots.target();
                     let key = VmPropertyKey::String("name");
                     let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
-                        this_value,
+                        target,
                         &key,
                         0,
-                        &[&this_value],
+                        &[&target],
                         &[],
                     )?;
                     if own.is_some() {
-                        self.get_property_value_for_call(context, this_value, "name")?
+                        self.get_property_value_for_call(context, target, "name")?
                     } else {
                         Value::undefined()
                     }
                 };
+                roots.set_scratch(0, target_name);
                 // §20.2.3.2 step 5 — the length transfer keys off
                 // HasOwnProperty(Target, "length"): an inherited
                 // `length` (mutated [[Prototype]]) leaves L = 0.
                 let target_length = {
+                    let target = roots.target();
                     let key = VmPropertyKey::String("length");
                     let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
-                        this_value,
+                        target,
                         &key,
                         0,
-                        &[&this_value],
+                        &[&target],
                         &[],
                     )?;
                     if own.is_some() {
-                        self.get_property_value_for_call(context, this_value, "length")?
+                        self.get_property_value_for_call(context, target, "length")?
                     } else {
                         Value::undefined()
                     }
                 };
+                roots.set_scratch(1, target_length);
                 let metadata = function_metadata::bound_create_metadata_from_values(
-                    &target_name,
-                    &target_length,
-                    bound_args.len(),
+                    &roots.scratch(0),
+                    &roots.scratch(1),
+                    roots.args_len(),
                     &self.gc_heap,
                 );
-                let this_root = this_value;
-                let receiver_root = receiver;
-                let bound_args_root = bound_args.clone();
-                let roots = self.collect_runtime_roots();
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    for &slot in &roots {
-                        visitor(slot);
-                    }
-                    this_root.trace_value_slots(visitor);
-                    receiver_root.trace_value_slots(visitor);
-                    for arg in &bound_args_root {
-                        arg.trace_value_slots(visitor);
-                    }
-                };
+                // Reconstitute the owned inline-4 representation only at the
+                // bound-function storage boundary. No VM allocation can occur
+                // between taking it from the registered state and handing it
+                // to the constructor, which roots its exact owned parameters.
+                let bound_args: SmallVec<[Value; 4]> = roots.take_args().into_iter().collect();
+                let target = roots.target();
+                let receiver = roots.receiver_value();
+                let mut external_visit = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
                 let bound = BoundFunction::new_with_metadata_and_roots(
                     &mut self.gc_heap,
-                    this_value,
+                    target,
                     receiver,
                     bound_args,
                     metadata,
@@ -743,18 +782,19 @@ impl Interpreter {
                 Ok(Value::bound_function(bound))
             }
             VmIntrinsicFunction::FunctionPrototypeToString => {
-                if !self.is_callable_runtime(&this_value) {
+                if !self.is_callable_runtime(&roots.target()) {
                     return Err(VmError::NotCallable);
                 }
                 let display = {
-                    let owner_bag = self.callable_bag_for_value(&this_value);
+                    let target = roots.target();
+                    let owner_bag = self.callable_bag_for_value(&target);
                     let mut ctx = function_metadata::FunctionMetadataContext::new(
                         context,
                         &mut self.gc_heap,
                         owner_bag,
                         &self.function_deleted_metadata,
                     );
-                    function_metadata::callable_to_string(&mut ctx, &this_value)
+                    function_metadata::callable_to_string(&mut ctx, &target)
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
@@ -764,8 +804,15 @@ impl Interpreter {
                 // §20.2.3.6: Return ? OrdinaryHasInstance(F, V) where
                 // F is the `this` value and V is the first argument.
                 // <https://tc39.es/ecma262/#sec-function.prototype-@@hasinstance>
-                let v = args.into_iter().next().unwrap_or(Value::undefined());
-                let result = self.ordinary_has_instance(context, &this_value, &v)?;
+                let v = roots
+                    .take_args()
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Value::undefined());
+                roots.set_receiver(v);
+                let target = roots.target();
+                let result =
+                    self.ordinary_has_instance(context, &target, &roots.receiver_value())?;
                 Ok(Value::boolean(result))
             }
         }

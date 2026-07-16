@@ -53,7 +53,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
     CodeBlock, JsPromiseHandle, RegisterWindow, UpvalueCell, Value, VmError, VmFrameHeader,
-    abstract_ops, cold_frame::ColdFrameIdx,
+    abstract_ops, cold_frame::ColdFrameIdx, upvalue_source::UpvalueSource,
 };
 
 pub(crate) type UpvalueSpine = Box<[UpvalueCell]>;
@@ -442,6 +442,54 @@ impl Frame {
             parent_upvalues,
             external_visit,
         )
+    }
+
+    /// Build an owned interpreter/native spine from an allocation-neutral
+    /// inherited source.
+    ///
+    /// This is the direct-call counterpart of
+    /// [`Self::build_upvalues_for_exec_with_roots`]. It never creates an
+    /// intermediate clone of inherited cells: callees with fresh own cells make
+    /// one final allocation, while inherited-only callers copy only when an
+    /// owned/materialized frame explicitly requests one.
+    ///
+    /// `external_visit` must trace the owner of `parent_upvalues` (the exact
+    /// closure for a closure-backed source) in addition to any scalar call
+    /// values. The source visits its cell slots directly during each collection
+    /// so no shared Rust slice spans a relocation.
+    pub(crate) fn build_upvalues_for_exec_from_source_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        function: &CodeBlock,
+        parent_upvalues: UpvalueSource,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<UpvalueSpine, otter_gc::OutOfMemory> {
+        let own = function.own_upvalue_count as usize;
+        if own == 0 {
+            return Ok(parent_upvalues.copy_owned());
+        }
+        let mut cells = Vec::with_capacity(own + parent_upvalues.len());
+        for _ in 0..own {
+            let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external_visit(visitor);
+                for cell in &cells {
+                    visitor(cell as *const UpvalueCell as *mut RawGc);
+                }
+                parent_upvalues.trace_slots(visitor);
+            };
+            cells.push(crate::alloc_upvalue_with_roots(
+                heap,
+                Value::undefined(),
+                &mut build_roots,
+            )?);
+        }
+        for index in 0..parent_upvalues.len() {
+            cells.push(
+                parent_upvalues
+                    .read(index)
+                    .expect("upvalue source index in bounds"),
+            );
+        }
+        Ok(cells.into_boxed_slice())
     }
 
     fn build_upvalues_for_count(

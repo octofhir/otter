@@ -50,39 +50,38 @@ fn path_to_file_url(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             name: "pathToFileURL",
             reason: "URL constructor is not installed".to_string(),
         })?;
-    ctx.scope(|ctx, scope| {
-        let constructor = ctx.scoped_value(scope, constructor);
-        let href = ctx.scoped_string(scope, &href)?;
-        let constructor = ctx.escape(constructor);
-        let href = ctx.escape(href);
-        ctx.construct(constructor, &[href])
+    ctx.scope(|mut scope| {
+        let constructor = scope.value(constructor);
+        let href = scope.string(&href)?;
+        let result = scope.construct(constructor, &[href])?;
+        Ok(scope.finish(result))
     })
 }
 
 fn file_url_to_path(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let input = file_url_input(ctx, args)?;
     let path = file_url_to_path_string(&input)?;
-    ctx.scope(|ctx, scope| {
-        let value = ctx.scoped_string(scope, &path)?;
-        Ok(ctx.escape(value))
+    ctx.scope(|mut scope| {
+        let value = scope.string(&path)?;
+        Ok(scope.finish(value))
     })
 }
 
 fn domain_to_ascii(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let input = required_string(ctx, args, 0, "domainToASCII", "domain")?;
     let output = idna::domain_to_ascii(&input).unwrap_or_default();
-    ctx.scope(|ctx, scope| {
-        let value = ctx.scoped_string(scope, &output)?;
-        Ok(ctx.escape(value))
+    ctx.scope(|mut scope| {
+        let value = scope.string(&output)?;
+        Ok(scope.finish(value))
     })
 }
 
 fn domain_to_unicode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let input = required_string(ctx, args, 0, "domainToUnicode", "domain")?;
     let output = idna::domain_to_unicode(&input).0;
-    ctx.scope(|ctx, scope| {
-        let value = ctx.scoped_string(scope, &output)?;
-        Ok(ctx.escape(value))
+    ctx.scope(|mut scope| {
+        let value = scope.string(&output)?;
+        Ok(scope.finish(value))
     })
 }
 
@@ -108,12 +107,11 @@ fn file_url_input(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<String, Nat
             reason: "URL constructor is not installed".to_string(),
         })?;
     let value = if let Some(input) = string_input {
-        ctx.scope(|ctx, scope| {
-            let constructor = ctx.scoped_value(scope, constructor);
-            let input = ctx.scoped_string(scope, &input)?;
-            let constructor = ctx.escape(constructor);
-            let input = ctx.escape(input);
-            ctx.construct(constructor, &[input])
+        ctx.scope(|mut scope| {
+            let constructor = scope.value(constructor);
+            let input = scope.string(&input)?;
+            let result = scope.construct(constructor, &[input])?;
+            Ok::<Value, NativeError>(scope.finish(result))
         })?
     } else {
         input

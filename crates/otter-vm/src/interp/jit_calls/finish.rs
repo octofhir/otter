@@ -11,8 +11,9 @@
 //!   synchronous re-entry guard.
 //! - Normal return and abort never construct or inspect a [`HoltStack`]. The
 //!   compiled caller writes the returned value through its live ActiveFrame.
-//! - Bailout moves the owner's register window and upvalue spine into one
-//!   [`Frame`] without copying registers and never materializes the parent.
+//! - Bailout moves the owner's register window into one [`Frame`] without
+//!   copying registers. Owned upvalues move with it; a borrowed closure spine
+//!   is copied exactly once here, after the bailout has fired.
 //! - The copied [`NativeFrame`] descriptor must still match the owner that
 //!   backed it. Descriptor validation happens before interpreter dispatch.
 //!
@@ -29,21 +30,15 @@ fn validate_owner_frame(
     owner: &crate::native_call_owners::NativeCallOwner,
     frame: &NativeFrame,
 ) -> Result<(), VmError> {
-    let expected_upvalue_base = if owner.upvalues.is_empty() {
-        0
-    } else {
-        owner.upvalues.as_ptr() as u64
-    };
+    let upvalues = owner.upvalues.source();
+    let expected_upvalue_base = upvalues.base_ptr_or_null() as u64;
     if frame.native_owner_id() != Some(owner_id)
-        || !matches!(
-            frame.header.kind,
-            NativeFrameKind::Baseline | NativeFrameKind::Optimizing
-        )
+        || frame.header.kind != owner.tier
         || frame.header.function_id != owner.function_id
         || usize::from(frame.header.register_count) != owner.registers.len()
         || frame.register_base != owner.registers.as_mut_ptr() as u64
         || frame.upvalue_base != expected_upvalue_base
-        || usize::try_from(frame.upvalue_count).ok() != Some(owner.upvalues.len())
+        || frame.upvalue_count != upvalues.len_u32()
     {
         return Err(VmError::InvalidOperand);
     }
@@ -60,7 +55,7 @@ fn materialize_owner_frame(
     Frame {
         header: native.header,
         registers: owner.registers,
-        upvalues: owner.upvalues,
+        upvalues: owner.upvalues.into_materialized(),
         self_value: native.self_value(),
         this_value: native.this_value(),
         return_register: None,
@@ -69,13 +64,25 @@ fn materialize_owner_frame(
 }
 
 impl Interpreter {
+    /// Record a direct call only after native entry actually ran.
+    fn note_direct_call_entry(&mut self, tier: NativeFrameKind) {
+        self.jit_runtime_stats.direct_calls = self.jit_runtime_stats.direct_calls.saturating_add(1);
+        if tier == NativeFrameKind::Optimizing {
+            self.jit_runtime_stats.optimized_entries =
+                self.jit_runtime_stats.optimized_entries.saturating_add(1);
+        }
+    }
+
     /// Release a direct compiled call that returned normally.
     ///
     /// The returned `Value` is intentionally absent: generated code still has
     /// the caller ActiveFrame live and performs the destination write itself.
     pub fn jit_finish_direct_call_returned(&mut self, owner_id: u32) -> Result<(), VmError> {
         let owner = self.native_call_owners.pop(owner_id)?;
-        self.note_jit_entry_success(owner.function_id);
+        self.note_direct_call_entry(owner.tier);
+        if owner.tier == NativeFrameKind::Baseline {
+            self.note_jit_entry_success(owner.function_id);
+        }
         self.free_reg_window(owner.registers.stack_base());
         self.leave_sync_reentry();
         Ok(())
@@ -99,8 +106,19 @@ impl Interpreter {
             return Err(err);
         }
 
-        self.note_jit_entry_bail(owner.function_id);
+        let function_id = owner.function_id;
+        let tier = owner.tier;
+        // Materialize borrowed storage before tiering bookkeeping. The native
+        // activation has just been unpublished by the trampoline, so this
+        // short non-GC step closes the borrowed-source lifetime immediately.
         let frame = materialize_owner_frame(owner, native);
+        self.note_direct_call_entry(tier);
+        if tier == NativeFrameKind::Baseline {
+            self.note_jit_entry_bail(function_id);
+        } else {
+            self.jit_runtime_stats.optimized_deopts =
+                self.jit_runtime_stats.optimized_deopts.saturating_add(1);
+        }
         let mut stack = self.draw_stack();
         debug_assert!(stack.is_empty(), "pooled HoltStack must be drained");
         stack.push(frame);
@@ -110,9 +128,12 @@ impl Interpreter {
         result
     }
 
-    /// Abort a prepared or rejected direct entry without materialization.
-    pub fn jit_abort_direct_call(&mut self, owner_id: u32) -> Result<(), VmError> {
+    /// Abort a direct entry after throw or before native entry was accepted.
+    pub fn jit_abort_direct_call(&mut self, owner_id: u32, entered: bool) -> Result<(), VmError> {
         let owner = self.native_call_owners.pop(owner_id)?;
+        if entered {
+            self.note_direct_call_entry(owner.tier);
+        }
         self.free_reg_window(owner.registers.stack_base());
         self.leave_sync_reentry();
         Ok(())
@@ -122,7 +143,10 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_call_owners::NativeCallOwner;
+    use crate::{
+        native_call_owners::{NativeCallOwner, NativeCallUpvalues},
+        upvalue_source::UpvalueSource,
+    };
 
     fn publish_test_owner(vm: &mut Interpreter, function_id: u32) -> (u32, RegisterWindow) {
         vm.enter_sync_reentry().unwrap();
@@ -131,8 +155,9 @@ mod tests {
             .native_call_owners
             .push(NativeCallOwner {
                 function_id,
+                tier: NativeFrameKind::Baseline,
                 registers,
-                upvalues: Vec::new().into_boxed_slice(),
+                upvalues: NativeCallUpvalues::borrowed(UpvalueSource::empty()),
             })
             .unwrap();
         (owner_id, registers)

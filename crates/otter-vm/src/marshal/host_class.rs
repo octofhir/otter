@@ -39,7 +39,7 @@
 
 use std::any::{Any, TypeId};
 
-use crate::handles::Scoped;
+use crate::handles::Local;
 use crate::{Value, object};
 
 use super::cx::MarshalCx;
@@ -132,7 +132,7 @@ impl HostInstance {
 /// cells, ancestry-aware) and legacy bare-`T` host objects.
 pub(super) fn host_data_view<T: Any, R>(
     cx: &MarshalCx<'_, '_, '_>,
-    v: Scoped<'_>,
+    v: Local<'_>,
     f: impl FnOnce(&T) -> R,
 ) -> Result<R, JsError> {
     let raw = cx.escape(v);
@@ -175,7 +175,7 @@ pub fn construct_instance<'s, T: HostAncestry>(
     cx: &mut MarshalCx<'_, '_, 's>,
     class_name: &'static str,
     data: T,
-) -> Result<Scoped<'s>, JsError> {
+) -> Result<Local<'s>, JsError> {
     // Resolve the prototype before installing the data, mirroring
     // OrdinaryCreateFromConstructor ordering. A construct call honors
     // `new.target.prototype` (JS subclasses); everything else — plain
@@ -204,7 +204,7 @@ pub fn construct_instance<'s, T: HostAncestry>(
 fn prototype_for_construction<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     class_name: &str,
-) -> Option<Scoped<'s>> {
+) -> Option<Local<'s>> {
     if let Some(new_target) = cx.ctx().new_target().copied() {
         let target_handle = cx.park(new_target);
         if let Some(proto) = constructor_prototype_read(cx, target_handle)
@@ -222,7 +222,7 @@ fn prototype_for_construction<'s>(
 /// `class`-declared constructor (the exotic representation
 /// `new.target` carries for user subclasses). The returned raw value
 /// is parked by the caller before any further allocation.
-fn constructor_prototype_read(cx: &mut MarshalCx<'_, '_, '_>, ctor: Scoped<'_>) -> Option<Value> {
+fn constructor_prototype_read(cx: &mut MarshalCx<'_, '_, '_>, ctor: Local<'_>) -> Option<Value> {
     let raw = cx.escape(ctor);
     if let Some(class) = raw.as_class_constructor() {
         return Some(Value::object(class.prototype(cx.heap())));
@@ -252,7 +252,7 @@ pub fn class_instance<'s, T: HostAncestry>(
     cx: &mut MarshalCx<'_, '_, 's>,
     class_name: &'static str,
     data: T,
-) -> Result<Scoped<'s>, JsError> {
+) -> Result<Local<'s>, JsError> {
     let proto = cx
         .ctx()
         .class_instance_prototype(class_name)
@@ -277,7 +277,7 @@ pub fn class_instance<'s, T: HostAncestry>(
 /// classes with a bare-`T` fallback for legacy host objects.
 pub(super) fn host_data_view_mut<T: Any, R>(
     cx: &mut MarshalCx<'_, '_, '_>,
-    v: Scoped<'_>,
+    v: Local<'_>,
     f: impl FnOnce(&mut T) -> R,
 ) -> Result<R, JsError> {
     let raw = cx.escape(v);
@@ -322,14 +322,14 @@ pub trait HostClassMeta {
 /// override it.
 pub trait JsUnionProbe {
     /// Whether `v` distinguishes as `Self`.
-    fn probe(cx: &MarshalCx<'_, '_, '_>, v: Scoped<'_>) -> bool {
+    fn probe(cx: &MarshalCx<'_, '_, '_>, v: Local<'_>) -> bool {
         let _ = (cx, v);
         true
     }
 }
 
 impl JsUnionProbe for super::BufferSource {
-    fn probe(cx: &MarshalCx<'_, '_, '_>, v: Scoped<'_>) -> bool {
+    fn probe(cx: &MarshalCx<'_, '_, '_>, v: Local<'_>) -> bool {
         let raw = cx.escape(v);
         raw.as_typed_array(cx.heap()).is_some() || raw.as_array_buffer().is_some()
     }

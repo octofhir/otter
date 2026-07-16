@@ -2467,7 +2467,6 @@ dependencies = [
  "otter-vm",
  "sha1",
  "sha2",
- "smallvec",
  "tempfile",
  "thiserror",
 ]

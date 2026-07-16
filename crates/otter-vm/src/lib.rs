@@ -167,6 +167,7 @@ mod register_stack;
 #[doc(hidden)]
 pub mod rooting;
 pub mod run_control;
+mod runtime_activation;
 pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
@@ -184,6 +185,7 @@ pub mod tier_policy;
 pub mod timers;
 pub mod uint8_base64;
 pub mod upvalue;
+mod upvalue_source;
 pub mod value;
 pub mod weak_refs;
 
@@ -207,6 +209,7 @@ pub use run_control::{
     DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, ErrorDetail, InterruptFlag,
     NO_HANDLER_OFFSET, RunError, StackFrameSnapshot, VmError,
 };
+pub use runtime_activation::RuntimeCall;
 
 #[cfg(test)]
 use otter_bytecode::ArgumentsObjectKind;
@@ -231,7 +234,7 @@ pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKe
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
-pub use handles::{HandleArena, HandleScope, Scoped};
+pub use handles::{HandleArena, Local};
 pub use holt_stack::HoltStack;
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
@@ -346,7 +349,7 @@ pub use upvalue::{
 };
 
 pub use runtime_budget::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
-pub use runtime_cx::{NativeCallInfo, NativeCtx};
+pub use runtime_cx::{NativeCallInfo, NativeCtx, NativeScope};
 
 use runtime_budget::RuntimeHeapSnapshot;
 
@@ -692,9 +695,9 @@ pub struct Interpreter {
     bigint_constant_cache: rustc_hash::FxHashMap<(usize, u32), Value>,
     /// Prepared bytecode callback metadata for native loops that repeatedly
     /// call the same JS function. Entries are a strict stack: acquisition
-    /// pushes resolved closure state, release pops it. Runtime root tracing
-    /// visits every live entry so cached closure upvalues and lexical receiver
-    /// slots move with the heap across callback allocations.
+    /// pushes the exact callable and scalar closure state, release pops it.
+    /// Runtime root tracing reaches inherited cells through the callable itself;
+    /// no second upvalue spine is cloned into this stack.
     lean_callback_roots: Vec<call_ops::LeanCallbackRoot>,
     /// Owned dynamic payload for the most recently raised [`VmError`]. The
     /// error itself is `Copy` (no drop glue on the hot `Result` chain); its

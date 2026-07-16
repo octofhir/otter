@@ -1,7 +1,7 @@
 //! The marshalling context: a borrowed view over a native call.
 //!
 //! [`MarshalCx`] bundles the two things every conversion needs — the
-//! call's [`crate::NativeCtx`] and an open [`HandleScope`] — and
+//! call's [`crate::NativeScope`] — and
 //! exposes the marshalling primitives on top of them: scoped value
 //! creation, spec coercions, binary builders, promise builders, host
 //! data access, and callable re-entry. [`super::FromJs`] /
@@ -13,7 +13,7 @@
 //!
 //! # Invariants
 //! - Every JS value this type hands out or accepts is a
-//!   [`Scoped`] handle parked in the ambient scope; raw
+//!   [`Local`] handle parked in the ambient scope; raw
 //!   [`Value`]s appear only at the [`MarshalCx::park`] /
 //!   [`MarshalCx::escape`] boundary.
 //! - Coercions that can re-enter user JS (`to_string` / `to_number` on
@@ -25,12 +25,12 @@
 //! - [`super::scoped_ext`] — the interpreter builders wrapped here.
 
 use crate::binary::typed_array::TypedArrayKind;
-use crate::handles::{HandleScope, Scoped};
-use crate::{ExecutionContext, NativeCtx, Value, VmError};
+use crate::handles::{HandleScope, Local};
+use crate::{ExecutionContext, NativeCtx, NativeScope, Value, VmError};
 
 use super::error::JsError;
 
-/// Borrowed conversion context over (`&mut NativeCtx`, `&HandleScope`).
+/// Borrowed conversion context over one [`NativeScope`].
 ///
 /// `'rt` is the mutator turn, `'cx` the borrow of the native context,
 /// `'s` the ambient handle scope every minted handle is pinned to.
@@ -39,22 +39,19 @@ pub struct MarshalCx<'rt, 'cx, 's> {
     scope: &'s HandleScope,
 }
 
-impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
-    /// Wrap a native call context and an open scope.
+impl<'rt, 's> MarshalCx<'rt, 's, 's> {
+    /// Consume one native scope and expose its typed conversion surface.
     #[must_use]
-    pub fn new(ctx: &'cx mut NativeCtx<'rt>, scope: &'s HandleScope) -> Self {
-        Self { ctx, scope }
+    pub fn new(scope: NativeScope<'s, 'rt>) -> Self {
+        let (ctx, token) = scope.into_parts();
+        Self { ctx, scope: token }
     }
+}
 
+impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Borrow the underlying native context (the manual escape hatch).
     pub fn ctx(&mut self) -> &mut NativeCtx<'rt> {
         self.ctx
-    }
-
-    /// The ambient handle scope.
-    #[must_use]
-    pub fn scope(&self) -> &'s HandleScope {
-        self.scope
     }
 
     /// Borrow the GC heap immutably (non-allocating reads).
@@ -86,7 +83,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Park an incoming raw `Value` (an argument, a receiver) in the
     /// scope. Do this before the first allocation.
     #[must_use]
-    pub fn park(&mut self, value: Value) -> Scoped<'s> {
+    pub fn park(&mut self, value: Value) -> Local<'s> {
         let scope = self.scope;
         self.interp().scoped_value(scope, value)
     }
@@ -95,45 +92,45 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// hand-off (a return to the VM, a store into a rooted object).
     /// Valid only until the next allocation.
     #[must_use]
-    pub fn escape(&self, v: Scoped<'_>) -> Value {
-        self.ctx.escape(v)
+    pub fn escape(&self, v: Local<'_>) -> Value {
+        self.ctx.cx.interp.escape_scoped(v)
     }
 
     /// Whether the handle currently holds `undefined`.
     #[must_use]
-    pub fn is_undefined(&self, v: Scoped<'_>) -> bool {
-        self.ctx.escape(v).is_undefined()
+    pub fn is_undefined(&self, v: Local<'_>) -> bool {
+        self.ctx.cx.interp.escape_scoped(v).is_undefined()
     }
 
     /// Whether the handle currently holds `null`.
     #[must_use]
-    pub fn is_null(&self, v: Scoped<'_>) -> bool {
-        self.ctx.escape(v).is_null()
+    pub fn is_null(&self, v: Local<'_>) -> bool {
+        self.ctx.cx.interp.escape_scoped(v).is_null()
     }
 
     /// Whether the handle currently holds `undefined` or `null`.
     #[must_use]
-    pub fn is_nullish(&self, v: Scoped<'_>) -> bool {
-        let raw = self.ctx.escape(v);
+    pub fn is_nullish(&self, v: Local<'_>) -> bool {
+        let raw = self.ctx.cx.interp.escape_scoped(v);
         raw.is_undefined() || raw.is_null()
     }
 
     /// Whether the handle currently holds an ordinary object.
     #[must_use]
-    pub fn is_object(&self, v: Scoped<'_>) -> bool {
-        self.ctx.escape(v).as_object().is_some()
+    pub fn is_object(&self, v: Local<'_>) -> bool {
+        self.ctx.cx.interp.escape_scoped(v).as_object().is_some()
     }
 
     /// Non-coercing number read.
     #[must_use]
-    pub fn as_f64(&self, v: Scoped<'_>) -> Option<f64> {
-        self.ctx.escape(v).as_f64()
+    pub fn as_f64(&self, v: Local<'_>) -> Option<f64> {
+        self.ctx.cx.interp.escape_scoped(v).as_f64()
     }
 
     /// Non-coercing string read (lossy Rust rendering).
     #[must_use]
-    pub fn as_string_lossy(&self, v: Scoped<'_>) -> Option<String> {
-        let raw = self.ctx.escape(v);
+    pub fn as_string_lossy(&self, v: Local<'_>) -> Option<String> {
+        let raw = self.ctx.cx.interp.escape_scoped(v);
         raw.as_string(self.ctx.heap())
             .map(|s| s.to_lossy_string(self.ctx.heap()))
     }
@@ -142,37 +139,58 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// Park the `undefined` immediate.
     #[must_use]
-    pub fn undefined(&mut self) -> Scoped<'s> {
+    pub fn undefined(&mut self) -> Local<'s> {
         let scope = self.scope;
         self.interp().scoped_undefined(scope)
     }
 
     /// Park the `null` immediate.
     #[must_use]
-    pub fn null(&mut self) -> Scoped<'s> {
+    pub fn null(&mut self) -> Local<'s> {
         let scope = self.scope;
         self.interp().scoped_null(scope)
     }
 
     /// Park a number immediate.
     #[must_use]
-    pub fn number(&mut self, n: f64) -> Scoped<'s> {
+    pub fn number(&mut self, n: f64) -> Local<'s> {
         let scope = self.scope;
         self.interp().scoped_number(scope, n)
     }
 
     /// Park a boolean immediate.
     #[must_use]
-    pub fn boolean(&mut self, b: bool) -> Scoped<'s> {
+    pub fn boolean(&mut self, b: bool) -> Local<'s> {
         let scope = self.scope;
         self.interp().scoped_boolean(scope, b)
+    }
+
+    /// Allocate and park an already-classified native call target. Static
+    /// bindings should normally use generated specs; dynamic adapters such as
+    /// WebAssembly exports use this explicit terminal constructor.
+    pub fn native_call(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: crate::NativeCall,
+    ) -> Result<Local<'s>, JsError> {
+        let scope = self.scope;
+        let value =
+            match self
+                .interp()
+                .native_function_from_call_host_rooted(name, length, call, &[], &[])
+            {
+                Ok(value) => value,
+                Err(error) => return Err(self.vm_err(VmError::from(error))),
+            };
+        Ok(self.interp().scoped_value(scope, value))
     }
 
     /// Park a `BigInt` immediate built from a signed 64-bit integer. Unlike
     /// [`Self::number`], this preserves the full 64-bit range — the
     /// marshalling the WebAssembly spec mandates for `i64` values, which map to
     /// JS `BigInt` rather than a lossy `Number`.
-    pub fn bigint_i64(&mut self, n: i64) -> Result<Scoped<'s>, JsError> {
+    pub fn bigint_i64(&mut self, n: i64) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_bigint_i64(scope, n)
@@ -198,7 +216,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Allocate a JS string from UTF-8 text.
-    pub fn string(&mut self, text: &str) -> Result<Scoped<'s>, JsError> {
+    pub fn string(&mut self, text: &str) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_string(scope, text)
@@ -207,7 +225,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// Allocate a JS string from WTF-16 code units (lone surrogates
     /// preserved).
-    pub fn string_from_units(&mut self, units: &[u16]) -> Result<Scoped<'s>, JsError> {
+    pub fn string_from_units(&mut self, units: &[u16]) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         let interp = self.ctx.interp_mut();
         let string = crate::string::JsString::from_utf16_units(units, interp.gc_heap_mut())
@@ -219,7 +237,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Allocate an ordinary object (`%Object.prototype%`).
-    pub fn object(&mut self) -> Result<Scoped<'s>, JsError> {
+    pub fn object(&mut self) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_object(scope)
@@ -227,7 +245,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Allocate an array of `len` holes.
-    pub fn array(&mut self, len: usize) -> Result<Scoped<'s>, JsError> {
+    pub fn array(&mut self, len: usize) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_array(scope, len)
@@ -235,7 +253,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Allocate a fixed-length `ArrayBuffer` owning `bytes`.
-    pub fn array_buffer_from_bytes(&mut self, bytes: Vec<u8>) -> Result<Scoped<'s>, JsError> {
+    pub fn array_buffer_from_bytes(&mut self, bytes: Vec<u8>) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_array_buffer_from_bytes(scope, bytes)
@@ -248,7 +266,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         &mut self,
         kind: TypedArrayKind,
         bytes: Vec<u8>,
-    ) -> Result<Scoped<'s>, JsError> {
+    ) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_typed_array_from_bytes(scope, kind, bytes)
@@ -256,12 +274,12 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Allocate a `Uint8Array` over a fresh buffer owning `bytes`.
-    pub fn uint8_array_from_bytes(&mut self, bytes: Vec<u8>) -> Result<Scoped<'s>, JsError> {
+    pub fn uint8_array_from_bytes(&mut self, bytes: Vec<u8>) -> Result<Local<'s>, JsError> {
         self.typed_array_from_bytes(TypedArrayKind::Uint8, bytes)
     }
 
     /// Allocate a pre-fulfilled promise carrying `value`.
-    pub fn promise_fulfilled(&mut self, value: Scoped<'_>) -> Result<Scoped<'s>, JsError> {
+    pub fn promise_fulfilled(&mut self, value: Local<'_>) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_promise_fulfilled(scope, value)
@@ -269,7 +287,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Allocate a pre-rejected promise carrying `reason`.
-    pub fn promise_rejected(&mut self, reason: Scoped<'_>) -> Result<Scoped<'s>, JsError> {
+    pub fn promise_rejected(&mut self, reason: Local<'_>) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_promise_rejected(scope, reason)
@@ -280,7 +298,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// Read property `key` from the object handle `obj` (absent reads
     /// as `undefined`).
-    pub fn get(&mut self, obj: Scoped<'_>, key: &str) -> Result<Scoped<'s>, JsError> {
+    pub fn get(&mut self, obj: Local<'_>, key: &str) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_get(scope, obj, key)
@@ -288,7 +306,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     }
 
     /// Write `value` to property `key` on the object handle `obj`.
-    pub fn set(&mut self, obj: Scoped<'_>, key: &str, value: Scoped<'_>) -> Result<(), JsError> {
+    pub fn set(&mut self, obj: Local<'_>, key: &str, value: Local<'_>) -> Result<(), JsError> {
         let scope = self.scope;
         self.interp()
             .scoped_set(scope, obj, key, value)
@@ -298,9 +316,9 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Store `value` at array index `index` on the array handle `arr`.
     pub fn set_index(
         &mut self,
-        arr: Scoped<'_>,
+        arr: Local<'_>,
         index: usize,
-        value: Scoped<'_>,
+        value: Local<'_>,
     ) -> Result<(), JsError> {
         let scope = self.scope;
         self.interp()
@@ -313,8 +331,8 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// §7.1.17 `ToString`, returning the lossy Rust rendering (lone
     /// surrogates replaced — USVString semantics). Objects re-enter
     /// user JS and need the call's execution context.
-    pub fn to_string_spec(&mut self, v: Scoped<'_>) -> Result<String, JsError> {
-        let value = self.ctx.escape(v);
+    pub fn to_string_spec(&mut self, v: Local<'_>) -> Result<String, JsError> {
+        let value = self.ctx.cx.interp.escape_scoped(v);
         if crate::abstract_ops::is_primitive(&value) {
             let interp = self.ctx.interp_mut();
             return crate::coerce::primitive_to_string_lossy(interp, &value)
@@ -325,7 +343,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                 "cannot coerce an object to a string without an execution context".to_string(),
             ));
         };
-        let value = self.ctx.escape(v);
+        let value = self.ctx.cx.interp.escape_scoped(v);
         let interp = self.ctx.interp_mut();
         interp
             .coerce_to_string(context, &value)
@@ -334,15 +352,15 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// §7.1.17 `ToString`, returning WTF-16 code units (lone
     /// surrogates preserved — DOMString semantics).
-    pub fn to_string_units(&mut self, v: Scoped<'_>) -> Result<Vec<u16>, JsError> {
-        let value = self.ctx.escape(v);
+    pub fn to_string_units(&mut self, v: Local<'_>) -> Result<Vec<u16>, JsError> {
+        let value = self.ctx.cx.interp.escape_scoped(v);
         if !crate::abstract_ops::is_primitive(&value) && self.context().is_none() {
             return Err(JsError::Type(
                 "cannot coerce an object to a string without an execution context".to_string(),
             ));
         }
         let context = self.context();
-        let value = self.ctx.escape(v);
+        let value = self.ctx.cx.interp.escape_scoped(v);
         let interp = self.ctx.interp_mut();
         let string = crate::coerce::to_js_string_units(interp, context, &value);
         match string {
@@ -353,8 +371,8 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// §7.1.4 `ToNumber`. Objects re-enter user JS and need the call's
     /// execution context.
-    pub fn to_number_spec(&mut self, v: Scoped<'_>) -> Result<f64, JsError> {
-        let value = self.ctx.escape(v);
+    pub fn to_number_spec(&mut self, v: Local<'_>) -> Result<f64, JsError> {
+        let value = self.ctx.cx.interp.escape_scoped(v);
         if crate::abstract_ops::is_primitive(&value) {
             let interp = self.ctx.interp_mut();
             return crate::coerce::primitive_to_number(interp, &value)
@@ -366,7 +384,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
                 "cannot coerce an object to a number without an execution context".to_string(),
             ));
         };
-        let value = self.ctx.escape(v);
+        let value = self.ctx.cx.interp.escape_scoped(v);
         let interp = self.ctx.interp_mut();
         interp
             .coerce_to_number(context, &value)
@@ -376,16 +394,20 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// §7.1.2 `ToBoolean` (never re-enters).
     #[must_use]
-    pub fn to_boolean(&self, v: Scoped<'_>) -> bool {
-        self.ctx.escape(v).to_boolean(self.ctx.heap())
+    pub fn to_boolean(&self, v: Local<'_>) -> bool {
+        self.ctx
+            .cx
+            .interp
+            .escape_scoped(v)
+            .to_boolean(self.ctx.heap())
     }
 
     /// Copy the live byte range out of a `BufferSource` handle — an
     /// `ArrayBuffer` or any typed-array view. `None` when the handle
     /// holds neither; a detached buffer reads as empty.
     #[must_use]
-    pub fn buffer_source_bytes(&self, v: Scoped<'_>) -> Option<Vec<u8>> {
-        let raw = self.ctx.escape(v);
+    pub fn buffer_source_bytes(&self, v: Local<'_>) -> Option<Vec<u8>> {
+        let raw = self.ctx.cx.interp.escape_scoped(v);
         let heap = self.ctx.heap();
         if let Some(view) = raw.as_typed_array(heap) {
             let offset = view.byte_offset(heap);
@@ -409,7 +431,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Drain an iterable (§7.4.13) and park every element in the
     /// scope. Arrays take a dense fast path; anything else drives the
     /// `Symbol.iterator` protocol and needs the execution context.
-    pub fn iterate_to_handles(&mut self, v: Scoped<'_>) -> Result<Vec<Scoped<'s>>, JsError> {
+    pub fn iterate_to_handles(&mut self, v: Local<'_>) -> Result<Vec<Local<'s>>, JsError> {
         let context = self.context();
         let scope = self.scope;
         let interp = self.ctx.interp_mut();
@@ -424,7 +446,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// read succeeds on a subclass instance.
     pub fn with_host_data<T: std::any::Any, R>(
         &self,
-        v: Scoped<'_>,
+        v: Local<'_>,
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, JsError> {
         super::host_class::host_data_view::<T, R>(self, v, f)
@@ -433,7 +455,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// Mutable counterpart of [`Self::with_host_data`].
     pub fn with_host_data_mut<T: std::any::Any, R>(
         &mut self,
-        v: Scoped<'_>,
+        v: Local<'_>,
         f: impl FnOnce(&mut T) -> R,
     ) -> Result<R, JsError> {
         super::host_class::host_data_view_mut::<T, R>(self, v, f)
@@ -441,8 +463,8 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
 
     /// Whether the handle currently holds a callable value.
     #[must_use]
-    pub fn is_callable(&mut self, v: Scoped<'_>) -> bool {
-        let raw = self.ctx.escape(v);
+    pub fn is_callable(&mut self, v: Local<'_>) -> bool {
+        let raw = self.ctx.cx.interp.escape_scoped(v);
         self.ctx.interp_mut().is_callable_runtime(&raw)
     }
 
@@ -451,10 +473,10 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     /// scope. Needs the call's execution context.
     pub fn call(
         &mut self,
-        callee: Scoped<'_>,
-        this_value: Scoped<'_>,
-        args: &[Scoped<'_>],
-    ) -> Result<Scoped<'s>, JsError> {
+        callee: Local<'_>,
+        this_value: Local<'_>,
+        args: &[Local<'_>],
+    ) -> Result<Local<'s>, JsError> {
         let Some(context) = self.context() else {
             return Err(JsError::Type(
                 "cannot invoke a callback without an execution context".to_string(),

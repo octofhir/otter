@@ -40,7 +40,9 @@ use otter_vm::binary::JsArrayBuffer;
 use otter_vm::binary::array_buffer::SharedBody;
 use otter_vm::number::NumberValue;
 use otter_vm::string::JsString;
-use otter_vm::{NativeCall, NativeCtx, NativeError, NativeFn, Value, array, collections, object};
+use otter_vm::{
+    Local, NativeCall, NativeCtx, NativeError, NativeFn, Value, array, collections, object,
+};
 use smallvec::smallvec;
 
 use crate::module_loader;
@@ -232,128 +234,115 @@ fn worker_constructor_call(host: Arc<WorkerHostState>) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
         let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
         let id = spawn_worker_record(&host, specifier)?;
-        ctx.scope(|ctx, scope| {
-            let worker = ctx.scoped_object(scope)?;
-            let worker_id = ctx.scoped_number(scope, id as f64);
-            ctx.scoped_set(scope, worker, "__otterWorkerId", worker_id)?;
-            let null = ctx.scoped_null(scope);
-            ctx.scoped_set(scope, worker, "onmessage", null)?;
-            ctx.scoped_set(scope, worker, "onerror", null)?;
-            ctx.scoped_set(scope, worker, "onmessageerror", null)?;
-            let listeners = ctx.scoped_object(scope)?;
-            ctx.scoped_set(scope, worker, "__otterListeners", listeners)?;
-
-            let post_host = host.clone();
-            let post =
-                ctx.native_value("postMessage", smallvec![], move |ctx, args, _captures| {
-                    let id = worker_id_from_this(ctx, "Worker.postMessage")?;
-                    let Some(record) = post_host.get(id) else {
-                        return Err(type_err(
-                            "Worker.postMessage",
-                            "worker is not running".to_string(),
-                        ));
-                    };
-                    if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
-                        return Err(type_err(
-                            "Worker.postMessage",
-                            "worker has been terminated".to_string(),
-                        ));
-                    }
-                    let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
-                    let payload = clone_worker_value(
-                        args.first().unwrap_or(&Value::undefined()),
-                        ctx.heap(),
-                        &transfers,
-                    )?;
-                    detach_worker_transfers(&transfers, ctx.heap_mut());
-                    record
-                        .tx
-                        .send(WorkerCommand::Message(payload))
-                        .map_err(|_| {
-                            type_err("Worker.postMessage", "worker channel is closed".to_string())
-                        })?;
-                    Ok(Value::undefined())
-                })?;
-            let post = ctx.scoped_value(scope, post);
-            ctx.scoped_set(scope, worker, "postMessage", post)?;
-
-            let terminate_host = host.clone();
-            let terminate =
-                ctx.native_value("terminate", smallvec![], move |ctx, _args, _captures| {
-                    let worker = ctx.this_value().as_object().ok_or_else(|| {
-                        type_err("Worker.terminate", "invalid receiver".to_string())
-                    })?;
-                    clear_worker_poll_timer(ctx, worker)?;
-                    let id = worker_id_from_object(ctx, worker, "Worker.terminate")?;
-                    if let Some(record) = terminate_host.remove(id) {
-                        record.terminate();
-                    }
-                    Ok(Value::undefined())
-                })?;
-            let terminate = ctx.scoped_value(scope, terminate);
-            ctx.scoped_set(scope, worker, "terminate", terminate)?;
-
-            let dispatch =
-                ctx.native_value("dispatchEvent", smallvec![], move |ctx, args, _captures| {
-                    let worker = ctx.this_value().as_object().ok_or_else(|| {
-                        type_err("Worker.dispatchEvent", "invalid receiver".to_string())
-                    })?;
-                    let event = args.first().copied().unwrap_or(Value::undefined());
-                    let event_obj = event.as_object().ok_or_else(|| {
-                        type_err(
-                            "Worker.dispatchEvent",
-                            "event must be an object".to_string(),
-                        )
-                    })?;
-                    dispatch_event_object(ctx, worker, event_obj)?;
-                    Ok(Value::boolean(true))
-                })?;
-            let dispatch = ctx.scoped_value(scope, dispatch);
-            ctx.scoped_set(scope, worker, "dispatchEvent", dispatch)?;
-
-            let add = ctx.native_value(
-                "addEventListener",
-                smallvec![],
-                move |ctx, args, _captures| {
-                    let worker = ctx.this_value().as_object().ok_or_else(|| {
-                        type_err("Worker.addEventListener", "invalid receiver".to_string())
-                    })?;
-                    let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-                    if let Some(listener) = args.get(1)
-                        && listener.is_callable()
-                    {
-                        add_worker_event_listener(ctx, worker, &ty, *listener)?;
-                    }
-                    Ok(Value::undefined())
-                },
+        let post_host = host.clone();
+        let post: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+            let id = worker_id_from_this(ctx, "Worker.postMessage")?;
+            let Some(record) = post_host.get(id) else {
+                return Err(type_err(
+                    "Worker.postMessage",
+                    "worker is not running".to_string(),
+                ));
+            };
+            if record.terminated.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(type_err(
+                    "Worker.postMessage",
+                    "worker has been terminated".to_string(),
+                ));
+            }
+            let transfers = parse_worker_transfer_list(args.get(1), ctx)?;
+            let payload = clone_worker_value(
+                args.first().unwrap_or(&Value::undefined()),
+                ctx.heap(),
+                &transfers,
             )?;
-            let add = ctx.scoped_value(scope, add);
-            ctx.scoped_set(scope, worker, "addEventListener", add)?;
+            detach_worker_transfers(&transfers, ctx.heap_mut());
+            record
+                .tx
+                .send(WorkerCommand::Message(payload))
+                .map_err(|_| {
+                    type_err("Worker.postMessage", "worker channel is closed".to_string())
+                })?;
+            Ok(Value::undefined())
+        });
 
-            let remove = ctx.native_value(
-                "removeEventListener",
-                smallvec![],
-                move |ctx, args, _captures| {
-                    let worker = ctx.this_value().as_object().ok_or_else(|| {
-                        type_err("Worker.removeEventListener", "invalid receiver".to_string())
-                    })?;
-                    let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-                    if let Some(listener) = args.get(1) {
-                        remove_worker_event_listener(ctx, worker, &ty, *listener)?;
-                    }
-                    Ok(Value::undefined())
-                },
-            )?;
-            let remove = ctx.scoped_value(scope, remove);
-            ctx.scoped_set(scope, worker, "removeEventListener", remove)?;
-
-            let mut worker_object = ctx
-                .escape(worker)
+        let terminate_host = host.clone();
+        let terminate: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
+            let worker = ctx
+                .this_value()
                 .as_object()
-                .expect("scoped worker remains an object");
-            install_worker_poll_timer(ctx, host.clone(), &mut worker_object)?;
-            Ok(ctx.escape(worker))
-        })
+                .ok_or_else(|| type_err("Worker.terminate", "invalid receiver".to_string()))?;
+            clear_worker_poll_timer(ctx, worker)?;
+            let id = worker_id_from_object(ctx, worker, "Worker.terminate")?;
+            if let Some(record) = terminate_host.remove(id) {
+                record.terminate();
+            }
+            Ok(Value::undefined())
+        });
+
+        let dispatch: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+            let worker = ctx
+                .this_value()
+                .as_object()
+                .ok_or_else(|| type_err("Worker.dispatchEvent", "invalid receiver".to_string()))?;
+            let event = args.first().copied().unwrap_or(Value::undefined());
+            let event_obj = event.as_object().ok_or_else(|| {
+                type_err(
+                    "Worker.dispatchEvent",
+                    "event must be an object".to_string(),
+                )
+            })?;
+            dispatch_event_object(ctx, worker, event_obj)?;
+            Ok(Value::boolean(true))
+        });
+
+        let add: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+            let worker = ctx.this_value().as_object().ok_or_else(|| {
+                type_err("Worker.addEventListener", "invalid receiver".to_string())
+            })?;
+            let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+            if let Some(listener) = args.get(1)
+                && listener.is_callable()
+            {
+                add_worker_event_listener(ctx, worker, &ty, *listener)?;
+            }
+            Ok(Value::undefined())
+        });
+
+        let remove: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
+            let worker = ctx.this_value().as_object().ok_or_else(|| {
+                type_err("Worker.removeEventListener", "invalid receiver".to_string())
+            })?;
+            let ty = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+            if let Some(listener) = args.get(1) {
+                remove_worker_event_listener(ctx, worker, &ty, *listener)?;
+            }
+            Ok(Value::undefined())
+        });
+
+        let worker = ctx.scope(|mut scope| {
+            let worker = scope.object()?;
+            let worker_id = scope.number(id as f64);
+            scope.set(worker, "__otterWorkerId", worker_id)?;
+            let null = scope.null();
+            scope.set(worker, "onmessage", null)?;
+            scope.set(worker, "onerror", null)?;
+            scope.set(worker, "onmessageerror", null)?;
+            let listeners = scope.object()?;
+            scope.set(worker, "__otterListeners", listeners)?;
+
+            for (name, length, call) in [
+                ("postMessage", 1, NativeCall::Dynamic(post)),
+                ("terminate", 0, NativeCall::Dynamic(terminate)),
+                ("dispatchEvent", 1, NativeCall::Dynamic(dispatch)),
+                ("addEventListener", 2, NativeCall::Dynamic(add)),
+                ("removeEventListener", 2, NativeCall::Dynamic(remove)),
+            ] {
+                let function = scope.native_call(name, length, call)?;
+                scope.set(worker, name, function)?;
+            }
+            Ok::<Value, NativeError>(scope.finish(worker))
+        })?;
+        install_worker_poll_timer(ctx, host.clone(), worker)
     });
     NativeCall::Dynamic(call)
 }
@@ -498,9 +487,8 @@ fn worker_drain_call(host: Arc<WorkerHostState>) -> NativeCall {
 fn install_worker_poll_timer(
     ctx: &mut NativeCtx<'_>,
     host: Arc<WorkerHostState>,
-    worker: &mut object::JsObject,
-) -> Result<(), NativeError> {
-    let worker_value = Value::object(*worker);
+    worker_value: Value,
+) -> Result<Value, NativeError> {
     let poll = ctx.native_value(
         "__otter_worker_poll",
         smallvec![worker_value],
@@ -543,105 +531,46 @@ fn install_worker_poll_timer(
             Ok(Value::undefined())
         },
     )?;
-    let set_interval = {
-        let (interp, _exec) = ctx.interp_mut_and_context();
-        object::get(*interp.global_this(), interp.gc_heap(), "setInterval")
-    }
-    .ok_or_else(|| type_err("Worker", "setInterval is not installed".to_string()))?;
-    let exec = ctx
-        .interp_mut_and_context()
-        .1
-        .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
-    ctx.scope(|ctx, scope| {
-        let worker_handle = ctx.scoped_value(scope, worker_value);
-        let poll_handle = ctx.scoped_value(scope, poll);
-        let interval_handle = ctx.scoped_value(scope, set_interval);
-        let interval_ms = ctx.scoped_number(scope, 1.0);
-        let interval = ctx.escape(interval_handle);
-        let poll = ctx.escape(poll_handle);
-        let interval_ms = ctx.escape(interval_ms);
-        let (interp, _) = ctx.interp_mut_and_context();
-        let token = interp
-            .run_callable_sync(
-                &exec,
-                &interval,
-                Value::undefined(),
-                smallvec![poll, interval_ms],
-            )
-            .map_err(vm_error_to_native)?;
-        let token = ctx.scoped_value(scope, token);
-        *worker = ctx
-            .escape(worker_handle)
-            .as_object()
-            .expect("worker stays rooted across the timer install");
-        let token = ctx.escape(token);
-        object::set(worker, ctx.heap_mut(), "__otterPoll", token);
-        Ok(())
+    ctx.scope(|mut scope| {
+        let worker = scope.value(worker_value);
+        let poll = scope.value(poll);
+        let set_interval = scope
+            .global("setInterval")
+            .ok_or_else(|| type_err("Worker", "setInterval is not installed".to_string()))?;
+        let interval_ms = scope.number(1.0);
+        let undefined = scope.undefined();
+        let token = scope.call(set_interval, undefined, &[poll, interval_ms])?;
+        scope.set(worker, "__otterPoll", token)?;
+        Ok(scope.finish(worker))
     })
 }
 
 fn dispatch_event_object(
     ctx: &mut NativeCtx<'_>,
-    mut worker: object::JsObject,
-    mut event: object::JsObject,
+    worker: object::JsObject,
+    event: object::JsObject,
 ) -> Result<(), NativeError> {
-    ctx.scope(|ctx, scope| {
-        let worker_root = ctx.scoped_value(scope, Value::object(worker));
-        let event_root = ctx.scoped_value(scope, Value::object(event));
-        let ty = object::get(event, ctx.heap(), "type")
-            .and_then(|value| value.as_string(ctx.heap()))
-            .map(|s| s.to_lossy_string(ctx.heap()))
-            .unwrap_or_default();
-        let handler_key = format!("on{ty}");
-        let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
-        let handler = ctx.scoped_value(scope, handler);
-        let listeners = worker_event_listeners(ctx, worker, &ty);
-        let listeners: Vec<_> = listeners
+    let ty = object::get(event, ctx.heap(), "type")
+        .and_then(|value| value.as_string(ctx.heap()))
+        .map(|s| s.to_lossy_string(ctx.heap()))
+        .unwrap_or_default();
+    let handler_key = format!("on{ty}");
+    let handler = object::get(worker, ctx.heap(), &handler_key).unwrap_or(Value::undefined());
+    let listeners = worker_event_listeners(ctx, worker, &ty);
+    ctx.scope(|mut scope| {
+        let worker = scope.value(Value::object(worker));
+        let event = scope.value(Value::object(event));
+        let handler = scope.value(handler);
+        let listeners: Vec<Local<'_>> = listeners
             .into_iter()
-            .map(|listener| ctx.scoped_value(scope, listener))
+            .map(|listener| scope.value(listener))
             .collect();
-        let exec = ctx
-            .interp_mut_and_context()
-            .1
-            .ok_or_else(|| type_err("Worker", "missing execution context".to_string()))?;
-        if ctx.escape(handler).is_callable() {
-            worker = ctx
-                .escape(worker_root)
-                .as_object()
-                .expect("worker stays rooted across event dispatch");
-            event = ctx
-                .escape(event_root)
-                .as_object()
-                .expect("event stays rooted across event dispatch");
-            let handler = ctx.escape(handler);
-            let (interp, _) = ctx.interp_mut_and_context();
-            let call_result = interp.run_callable_sync(
-                &exec,
-                &handler,
-                Value::object(worker),
-                smallvec![Value::object(event)],
-            );
-            call_result.map_err(vm_error_to_native)?;
+        if scope.is_callable(handler) {
+            scope.call(handler, worker, &[event])?;
         }
-        for listener_root in listeners {
-            let listener = ctx.escape(listener_root);
-            if listener.is_callable() {
-                worker = ctx
-                    .escape(worker_root)
-                    .as_object()
-                    .expect("worker stays rooted across event dispatch");
-                event = ctx
-                    .escape(event_root)
-                    .as_object()
-                    .expect("event stays rooted across event dispatch");
-                let (interp, _) = ctx.interp_mut_and_context();
-                let call_result = interp.run_callable_sync(
-                    &exec,
-                    &listener,
-                    Value::object(worker),
-                    smallvec![Value::object(event)],
-                );
-                call_result.map_err(vm_error_to_native)?;
+        for listener in listeners {
+            if scope.is_callable(listener) {
+                scope.call(listener, worker, &[event])?;
             }
         }
         Ok(())

@@ -405,7 +405,6 @@ pub(super) fn compile(
                 receiver,
                 index,
                 value,
-                scratch,
             } => {
                 transitions::emit_store_element(
                     &mut ops,
@@ -414,7 +413,6 @@ pub(super) fn compile(
                     receiver,
                     index,
                     value,
-                    scratch,
                     threw,
                 )?;
             }

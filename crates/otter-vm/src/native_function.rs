@@ -783,12 +783,6 @@ impl NativeFunction {
         })
     }
 
-    /// Ordinary expando property bag backing non-metadata native
-    /// function properties.
-    pub(crate) fn own_properties_object(&self, heap: &otter_gc::GcHeap) -> JsObject {
-        heap.read_payload(self.inner, |body| body.own_properties)
-    }
-
     /// Return enumerable own string keys for the function object's
     /// metadata properties. Built-in `name` / `length` are not
     /// enumerable; overridden descriptors participate according to

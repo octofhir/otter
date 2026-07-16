@@ -759,9 +759,7 @@ impl FunctionContext {
         );
     }
 
-    /// Emit `Op::StoreElement obj_reg, key_reg, src_reg, scratch`.
-    /// The scratch slot is reserved for computed-property accessor
-    /// setter dispatch and mirrors `Op::StoreProperty`.
+    /// Emit `Op::StoreElement obj_reg, key_reg, src_reg`.
     pub(crate) fn emit_store_element(
         &mut self,
         obj_reg: u16,
@@ -769,14 +767,12 @@ impl FunctionContext {
         src: u16,
         span: (u32, u32),
     ) {
-        let scratch = self.alloc_scratch();
         self.emit(
             Op::StoreElement,
             vec![
                 Operand::Register(obj_reg),
                 Operand::Register(key_reg),
                 Operand::Register(src),
-                Operand::Register(scratch),
             ],
             span,
         );

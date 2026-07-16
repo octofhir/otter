@@ -32,9 +32,8 @@ use otter_runtime::{
     CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
     RuntimeAttr as Attr, RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness,
     RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeFn, RuntimePersistentRootId, RuntimeScoped as Scoped, RuntimeTask,
-    RuntimeTaskSpawner, RuntimeValue as Value, SourceInput, object, runtime_this_object,
-    runtime_with_host_data,
+    RuntimeNativeFn, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
+    RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -720,25 +719,25 @@ fn build_server_object(
     // Mint each JS value inside the scope right before its define; `server` moves
     // into the host object and the strings are built from the Rust locals above,
     // so no unrooted JsString local is held across another allocation.
-    ctx.scope(|ctx, s| {
-        let obj = ctx.scoped_host_object(s, server)?;
+    ctx.scope(|mut scope| {
+        let obj = scope.host_object(server)?;
         let read_only = Attr::read_only().to_flags();
-        let hostname_value = ctx.scoped_string(s, &hostname)?;
-        ctx.scoped_define_data(s, obj, "hostname", hostname_value, read_only)?;
-        let port_value = ctx.scoped_number(s, f64::from(port));
-        ctx.scoped_define_data(s, obj, "port", port_value, read_only)?;
-        let url_value = ctx.scoped_string(s, &url)?;
-        ctx.scoped_define_data(s, obj, "url", url_value, read_only)?;
+        let hostname_value = scope.string(&hostname)?;
+        scope.define(obj, "hostname", hostname_value, read_only)?;
+        let port_value = scope.number(f64::from(port));
+        scope.define(obj, "port", port_value, read_only)?;
+        let url_value = scope.string(&url)?;
+        scope.define(obj, "url", url_value, read_only)?;
         let builtin = Attr::builtin_function().to_flags();
-        let stop = ctx.scoped_native_method(s, "stop", 0, server_stop)?;
-        ctx.scoped_define_data(s, obj, "stop", stop, builtin)?;
-        let close = ctx.scoped_native_method(s, "close", 0, server_stop)?;
-        ctx.scoped_define_data(s, obj, "close", close, builtin)?;
-        let ref_method = ctx.scoped_native_method(s, "ref", 0, server_ref)?;
-        ctx.scoped_define_data(s, obj, "ref", ref_method, builtin)?;
-        let unref = ctx.scoped_native_method(s, "unref", 0, server_unref)?;
-        ctx.scoped_define_data(s, obj, "unref", unref, builtin)?;
-        Ok::<Value, NativeError>(ctx.escape(obj))
+        let stop = scope.native_method("stop", 0, server_stop)?;
+        scope.define(obj, "stop", stop, builtin)?;
+        let close = scope.native_method("close", 0, server_stop)?;
+        scope.define(obj, "close", close, builtin)?;
+        let ref_method = scope.native_method("ref", 0, server_ref)?;
+        scope.define(obj, "ref", ref_method, builtin)?;
+        let unref = scope.native_method("unref", 0, server_unref)?;
+        scope.define(obj, "unref", unref, builtin)?;
+        Ok::<Value, NativeError>(scope.finish(obj))
     })
 }
 
@@ -871,60 +870,70 @@ fn make_request(
     // attributes so a handler observes an identical Request.
     let read_only = Attr::new(false, false, false).to_flags();
     let hidden_writable = Attr::new(true, false, false).to_flags();
-    ctx.scope(|ctx, s| {
+    let rooted = |ctx: &NativeCtx<'_>, id| {
+        ctx.persistent_root_get(id)
+            .ok_or_else(|| crate::type_error("serve", "Fetch slot root is closed"))
+    };
+    let request_proto = rooted(ctx, slots.request_proto)?;
+    let headers_proto = rooted(ctx, slots.headers_proto)?;
+    let sym_header_list = rooted(ctx, slots.header_list)?;
+    let sym_guard = rooted(ctx, slots.guard)?;
+    let sym_url = rooted(ctx, slots.url)?;
+    let sym_method = rooted(ctx, slots.method)?;
+    let sym_headers = rooted(ctx, slots.headers)?;
+    let sym_signal = rooted(ctx, slots.signal)?;
+    let sym_body_text = rooted(ctx, slots.body_text)?;
+    let sym_body_bytes = rooted(ctx, slots.body_bytes)?;
+    let sym_body_stream = rooted(ctx, slots.body_stream)?;
+    let sym_body_used = rooted(ctx, slots.body_used)?;
+    ctx.scope(|mut scope| {
         // Park the incoming body value and every rooted slot symbol/prototype
         // before the first allocation, so a scavenge can never strand them.
-        let body_h = ctx.scoped_value(s, body_value);
-        let park = |ctx: &mut NativeCtx<'_>, id| -> Result<Scoped<'_>, NativeError> {
-            let value = ctx
-                .persistent_root_get(id)
-                .ok_or_else(|| crate::type_error("serve", "Fetch slot root is closed"))?;
-            Ok(ctx.scoped_value(s, value))
-        };
-        let request_proto = park(ctx, slots.request_proto)?;
-        let headers_proto = park(ctx, slots.headers_proto)?;
-        let sym_header_list = park(ctx, slots.header_list)?;
-        let sym_guard = park(ctx, slots.guard)?;
-        let sym_url = park(ctx, slots.url)?;
-        let sym_method = park(ctx, slots.method)?;
-        let sym_headers = park(ctx, slots.headers)?;
-        let sym_signal = park(ctx, slots.signal)?;
-        let sym_body_text = park(ctx, slots.body_text)?;
-        let sym_body_bytes = park(ctx, slots.body_bytes)?;
-        let sym_body_stream = park(ctx, slots.body_stream)?;
-        let sym_body_used = park(ctx, slots.body_used)?;
+        let body_h = scope.value(body_value);
+        let request_proto = scope.value(request_proto);
+        let headers_proto = scope.value(headers_proto);
+        let sym_header_list = scope.value(sym_header_list);
+        let sym_guard = scope.value(sym_guard);
+        let sym_url = scope.value(sym_url);
+        let sym_method = scope.value(sym_method);
+        let sym_headers = scope.value(sym_headers);
+        let sym_signal = scope.value(sym_signal);
+        let sym_body_text = scope.value(sym_body_text);
+        let sym_body_bytes = scope.value(sym_body_bytes);
+        let sym_body_stream = scope.value(sym_body_stream);
+        let sym_body_used = scope.value(sym_body_used);
 
         // Headers: `kHeaderList` of `[name, value]` pairs + a mutable `kGuard`.
-        let headers_obj = ctx.scoped_object_with_proto(s, headers_proto)?;
-        let list = ctx.scoped_array(s, request.headers.len())?;
+        let headers_obj = scope.object_with_prototype(headers_proto)?;
+        let list = scope.array(request.headers.len())?;
         for (i, (name, value)) in request.headers.iter().enumerate() {
-            let pair = ctx.scoped_array(s, 2)?;
-            let name_v = ctx.scoped_string(s, name)?;
-            let value_v = ctx.scoped_string(s, value)?;
-            ctx.scoped_set_index(s, pair, 0, name_v)?;
-            ctx.scoped_set_index(s, pair, 1, value_v)?;
-            ctx.scoped_set_index(s, list, i, pair)?;
+            let pair = scope.array(2)?;
+            let name_v = scope.string(name)?;
+            let value_v = scope.string(value)?;
+            scope.set_index(pair, 0, name_v)?;
+            scope.set_index(pair, 1, value_v)?;
+            scope.set_index(list, i, pair)?;
         }
-        ctx.scoped_define_symbol(s, headers_obj, sym_header_list, list, read_only)?;
-        let guard_v = ctx.scoped_string(s, "none")?;
-        ctx.scoped_define_symbol(s, headers_obj, sym_guard, guard_v, hidden_writable)?;
+        scope.define_symbol(headers_obj, sym_header_list, list, read_only)?;
+        let guard_v = scope.string("none")?;
+        scope.define_symbol(headers_obj, sym_guard, guard_v, hidden_writable)?;
 
         // Request: value slots + body slots. Only `kBodyBytes` may carry data.
-        let request_obj = ctx.scoped_object_with_proto(s, request_proto)?;
-        let null_v = ctx.scoped_null(s);
-        let false_v = ctx.scoped_boolean(s, false);
-        ctx.scoped_define_symbol(s, request_obj, sym_body_text, null_v, hidden_writable)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_body_bytes, body_h, hidden_writable)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_body_stream, null_v, hidden_writable)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_body_used, false_v, hidden_writable)?;
-        let method_v = ctx.scoped_string(s, &request.method)?;
-        let url_v = ctx.scoped_string(s, &request.url)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_url, url_v, read_only)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_method, method_v, read_only)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_headers, headers_obj, read_only)?;
-        ctx.scoped_define_symbol(s, request_obj, sym_signal, null_v, read_only)?;
+        let request_obj = scope.object_with_prototype(request_proto)?;
+        let null_v = scope.null();
+        let false_v = scope.boolean(false);
+        scope.define_symbol(request_obj, sym_body_text, null_v, hidden_writable)?;
+        scope.define_symbol(request_obj, sym_body_bytes, body_h, hidden_writable)?;
+        scope.define_symbol(request_obj, sym_body_stream, null_v, hidden_writable)?;
+        scope.define_symbol(request_obj, sym_body_used, false_v, hidden_writable)?;
+        let method_v = scope.string(&request.method)?;
+        let url_v = scope.string(&request.url)?;
+        scope.define_symbol(request_obj, sym_url, url_v, read_only)?;
+        scope.define_symbol(request_obj, sym_method, method_v, read_only)?;
+        scope.define_symbol(request_obj, sym_headers, headers_obj, read_only)?;
+        scope.define_symbol(request_obj, sym_signal, null_v, read_only)?;
 
-        Ok(ctx.escape(request_obj))
+        Ok(scope.finish(request_obj))
     })
 }
 

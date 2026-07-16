@@ -58,6 +58,36 @@ pub fn alloc_eval_env(
     })
 }
 
+/// Allocate a fresh record while tracing a not-yet-published frame and the
+/// parent slot. The body is first allocated with no parent, then linked to the
+/// relocated parent after allocation; this avoids copying a pre-GC handle into
+/// the untraced allocation payload.
+pub(crate) fn alloc_eval_env_with_roots(
+    heap: &mut otter_gc::GcHeap,
+    mut parent: Option<EvalEnvHandle>,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<EvalEnvHandle, otter_gc::OutOfMemory> {
+    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        external_visit(visitor);
+        if let Some(parent) = &mut parent {
+            visitor(parent as *mut EvalEnvHandle as *mut otter_gc::raw::RawGc);
+        }
+    };
+    let env = heap.alloc_old_with_roots(
+        EvalEnvBody {
+            names: Vec::new(),
+            cells: Vec::new(),
+            parent: None,
+        },
+        &mut visit,
+    )?;
+    if let Some(parent) = parent {
+        heap.with_payload(env, |body| body.parent = Some(parent));
+        heap.write_barrier(env, parent);
+    }
+    Ok(env)
+}
+
 /// Remove `name` from the nearest env in the chain that binds it —
 /// §19.2.1.3 eval-created var bindings are CreateMutableBinding(vn,
 /// true), i.e. deletable. Lookup is by name on every read, so index

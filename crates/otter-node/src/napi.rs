@@ -21,7 +21,7 @@
 //! - `napi_env` has addon lifetime, while its mutator context is installed only
 //!   for the current isolate turn. Addons may retain the environment pointer,
 //!   but worker threads may only use APIs documented as thread-safe.
-//! - VM allocations and mutations use `NativeCtx::scope` / `scoped_*` APIs.
+//! - VM allocations and mutations use the `NativeScope` / `Local` API.
 //! - The raw context pointer is confined to the synchronous C ABI turn.
 //! - Async execute/completion callbacks receive the stable addon environment
 //!   at the runtime checkpoint; no VM context crosses a thread boundary.
@@ -497,14 +497,15 @@ fn make_uint8_array(ctx: &mut NativeCtx<'_>, bytes: &[u8]) -> Result<Value, Nati
     let constructor = ctx
         .global_value("Uint8Array")
         .ok_or_else(|| invalid("napi_create_buffer_copy", "Uint8Array is unavailable"))?;
-    ctx.scope(|ctx, scope| {
-        let constructor = ctx.scoped_value(scope, constructor);
-        let array = ctx.scoped_array(scope, bytes.len())?;
+    ctx.scope(|mut scope| {
+        let constructor = scope.value(constructor);
+        let array = scope.array(bytes.len())?;
         for (index, byte) in bytes.iter().copied().enumerate() {
-            let value = ctx.scoped_number(scope, f64::from(byte));
-            ctx.scoped_set_index(scope, array, index, value)?;
+            let value = scope.number(f64::from(byte));
+            scope.set_index(array, index, value)?;
         }
-        ctx.construct(ctx.escape(constructor), &[ctx.escape(array)])
+        let result = scope.construct(constructor, &[array])?;
+        Ok(scope.finish(result))
     })
 }
 
@@ -512,10 +513,11 @@ fn make_uint8_array_len(ctx: &mut NativeCtx<'_>, length: usize) -> Result<Value,
     let constructor = ctx
         .global_value("Uint8Array")
         .ok_or_else(|| invalid("napi_create_buffer", "Uint8Array is unavailable"))?;
-    ctx.scope(|ctx, scope| {
-        let constructor = ctx.scoped_value(scope, constructor);
-        let length = ctx.scoped_number(scope, length as f64);
-        ctx.construct(ctx.escape(constructor), &[ctx.escape(length)])
+    ctx.scope(|mut scope| {
+        let constructor = scope.value(constructor);
+        let length = scope.number(length as f64);
+        let result = scope.construct(constructor, &[length])?;
+        Ok(scope.finish(result))
     })
 }
 
@@ -544,10 +546,11 @@ fn error_value(
     let constructor = ctx
         .global_value(constructor_name)
         .ok_or_else(|| invalid("napi_create_error", "Error constructor is unavailable"))?;
-    ctx.scope(|ctx, scope| {
-        let constructor = ctx.scoped_value(scope, constructor);
-        let message = ctx.scoped_string(scope, message)?;
-        ctx.construct(ctx.escape(constructor), &[ctx.escape(message)])
+    ctx.scope(|mut scope| {
+        let constructor = scope.value(constructor);
+        let message = scope.string(message)?;
+        let result = scope.construct(constructor, &[message])?;
+        Ok(scope.finish(result))
     })
 }
 
@@ -631,9 +634,9 @@ pub fn load_addon(
         )
     })?;
 
-    let exports = ctx.scope(|ctx, scope| {
-        let exports = ctx.scoped_object(scope)?;
-        Ok::<Value, NativeError>(ctx.escape(exports))
+    let exports = ctx.scope(|mut scope| {
+        let exports = scope.object()?;
+        Ok::<Value, NativeError>(scope.finish(exports))
     })?;
     let state = Arc::new(NapiState::new(
         library.clone(),
@@ -747,9 +750,9 @@ pub unsafe extern "C" fn napi_create_string_utf8(
     }
     let env = unsafe { &mut *env };
     let text = unsafe { read_utf8(value, len) };
-    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let value = ctx.scoped_string(scope, &text)?;
-        Ok::<Value, NativeError>(ctx.escape(value))
+    let created = unsafe { env.ctx() }.scope(|mut scope| {
+        let value = scope.string(&text)?;
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match created {
         Ok(value) => {
@@ -766,9 +769,9 @@ pub unsafe extern "C" fn napi_create_object(env: napi_env, result: *mut napi_val
         return NAPI_INVALID_ARG;
     }
     let env = unsafe { &mut *env };
-    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let value = ctx.scoped_object(scope)?;
-        Ok::<Value, NativeError>(ctx.escape(value))
+    let created = unsafe { env.ctx() }.scope(|mut scope| {
+        let value = scope.object()?;
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match created {
         Ok(value) => {
@@ -794,9 +797,9 @@ pub unsafe extern "C" fn napi_create_array_with_length(
         return NAPI_INVALID_ARG;
     }
     let env = unsafe { &mut *env };
-    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let value = ctx.scoped_array(scope, length)?;
-        Ok::<Value, NativeError>(ctx.escape(value))
+    let created = unsafe { env.ctx() }.scope(|mut scope| {
+        let value = scope.array(length)?;
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match created {
         Ok(value) => {
@@ -827,9 +830,9 @@ pub unsafe extern "C" fn napi_create_function(
     let call = NativeCall::Dynamic(Arc::new(move |ctx, args, _captures| {
         invoke_addon_callback(ctx, callback_addr, data_addr, args, state.clone())
     }));
-    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let value = ctx.scoped_native_call(scope, "napiCallback", 0, call)?;
-        Ok::<Value, NativeError>(ctx.escape(value))
+    let created = unsafe { env.ctx() }.scope(|mut scope| {
+        let value = scope.native_call("napiCallback", 0, call)?;
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match created {
         Ok(value) => {
@@ -903,14 +906,12 @@ pub unsafe extern "C" fn napi_coerce_to_object(
             "Object constructor is unavailable",
         ));
     };
-    let converted = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let constructor = ctx.scoped_value(scope, constructor);
-        let value = ctx.scoped_value(scope, value);
-        ctx.call(
-            ctx.escape(constructor),
-            Value::undefined(),
-            &[ctx.escape(value)],
-        )
+    let converted = unsafe { env.ctx() }.scope(|mut scope| {
+        let constructor = scope.value(constructor);
+        let value = scope.value(value);
+        let this_value = scope.undefined();
+        let result = scope.call(constructor, this_value, &[value])?;
+        Ok(scope.finish(result))
     });
     match converted {
         Ok(value) => {
@@ -933,9 +934,9 @@ pub unsafe extern "C" fn napi_create_external(
         return NAPI_INVALID_ARG;
     }
     let env = unsafe { &mut *env };
-    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let value = ctx.scoped_object_bare(scope)?;
-        Ok::<Value, NativeError>(ctx.escape(value))
+    let created = unsafe { env.ctx() }.scope(|mut scope| {
+        let value = scope.bare_object()?;
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match created {
         Ok(value) => {
@@ -1088,9 +1089,9 @@ pub unsafe extern "C" fn napi_coerce_to_string(
         return NAPI_INVALID_ARG;
     };
     let text = value.display_string(unsafe { env.ctx() }.heap());
-    let created = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let value = ctx.scoped_string(scope, &text)?;
-        Ok::<Value, NativeError>(ctx.escape(value))
+    let created = unsafe { env.ctx() }.scope(|mut scope| {
+        let value = scope.string(&text)?;
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match created {
         Ok(value) => {
@@ -1310,10 +1311,10 @@ unsafe fn define_one_property(
             descriptor.attributes & NAPI_ENUMERABLE != 0,
             descriptor.attributes & NAPI_CONFIGURABLE != 0,
         );
-        let defined = unsafe { env.ctx() }.scope(|ctx, scope| {
-            let object = ctx.scoped_value(scope, object);
-            let value = ctx.scoped_value(scope, value);
-            ctx.scoped_define_data(scope, object, &name_text, value, flags)
+        let defined = unsafe { env.ctx() }.scope(|mut scope| {
+            let object = scope.value(object);
+            let value = scope.value(value);
+            scope.define(object, &name_text, value, flags)
         });
         return match defined {
             Ok(()) => NAPI_OK,
@@ -1366,33 +1367,28 @@ unsafe fn define_one_property(
     let Some(object_constructor) = (unsafe { env.ctx() }).global_value("Object") else {
         return NAPI_GENERIC_FAILURE;
     };
-    let defined = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let object = ctx.scoped_value(scope, object);
-        let object_constructor = ctx.scoped_value(scope, object_constructor);
-        let descriptor_object = ctx.scoped_object(scope)?;
-        let name = ctx.scoped_string(scope, &name_text)?;
+    let defined = unsafe { env.ctx() }.scope(|mut scope| {
+        let object = scope.value(object);
+        let object_constructor = scope.value(object_constructor);
+        let descriptor_object = scope.object()?;
+        let name = scope.string(&name_text)?;
         if let Some(getter) = getter {
-            let getter = ctx.scoped_value(scope, getter);
-            ctx.scoped_set(scope, descriptor_object, "get", getter)?;
+            let getter = scope.value(getter);
+            scope.set(descriptor_object, "get", getter)?;
         }
         if let Some(setter) = setter {
-            let setter = ctx.scoped_value(scope, setter);
-            ctx.scoped_set(scope, descriptor_object, "set", setter)?;
+            let setter = scope.value(setter);
+            scope.set(descriptor_object, "set", setter)?;
         }
-        let enumerable = ctx.scoped_boolean(scope, descriptor.attributes & NAPI_ENUMERABLE != 0);
-        let configurable =
-            ctx.scoped_boolean(scope, descriptor.attributes & NAPI_CONFIGURABLE != 0);
-        ctx.scoped_set(scope, descriptor_object, "enumerable", enumerable)?;
-        ctx.scoped_set(scope, descriptor_object, "configurable", configurable)?;
-        let define_property = ctx.scoped_get(scope, object_constructor, "defineProperty")?;
-        ctx.call(
-            ctx.escape(define_property),
-            ctx.escape(object_constructor),
-            &[
-                ctx.escape(object),
-                ctx.escape(name),
-                ctx.escape(descriptor_object),
-            ],
+        let enumerable = scope.boolean(descriptor.attributes & NAPI_ENUMERABLE != 0);
+        let configurable = scope.boolean(descriptor.attributes & NAPI_CONFIGURABLE != 0);
+        scope.set(descriptor_object, "enumerable", enumerable)?;
+        scope.set(descriptor_object, "configurable", configurable)?;
+        let define_property = scope.get(object_constructor, "defineProperty")?;
+        let _ = scope.call(
+            define_property,
+            object_constructor,
+            &[object, name, descriptor_object],
         )?;
         Ok::<(), NativeError>(())
     });
@@ -1420,13 +1416,13 @@ pub unsafe extern "C" fn napi_set_element(
     let Some(value) = (unsafe { env.value(value) }) else {
         return NAPI_INVALID_ARG;
     };
-    let result = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let object = ctx.scoped_value(scope, object);
-        let value = ctx.scoped_value(scope, value);
-        if ctx.escape(object).is_array() {
-            ctx.scoped_set_index(scope, object, index as usize, value)
+    let result = unsafe { env.ctx() }.scope(|mut scope| {
+        let object = scope.value(object);
+        let value = scope.value(value);
+        if scope.is_array(object)? {
+            scope.set_index(object, index as usize, value)
         } else {
-            ctx.scoped_set(scope, object, &name, value)
+            scope.set(object, &name, value)
         }
     });
     match result {
@@ -1450,14 +1446,14 @@ pub unsafe extern "C" fn napi_get_element(
     let Some(object) = (unsafe { env.value(object) }) else {
         return NAPI_INVALID_ARG;
     };
-    let value = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let object = ctx.scoped_value(scope, object);
-        let value = if ctx.escape(object).is_array() {
-            ctx.scoped_get_index(scope, object, index as usize)?
+    let value = unsafe { env.ctx() }.scope(|mut scope| {
+        let object = scope.value(object);
+        let value = if scope.is_array(object)? {
+            scope.index(object, index as usize)?
         } else {
-            ctx.scoped_get(scope, object, &name)?
+            scope.get(object, &name)?
         };
-        Ok::<Value, NativeError>(ctx.escape(value))
+        Ok::<Value, NativeError>(scope.finish(value))
     });
     match value {
         Ok(value) => {
@@ -2409,16 +2405,12 @@ pub unsafe extern "C" fn napi_get_property_names(
             "Object constructor is unavailable",
         ));
     };
-    let names = unsafe { env.ctx() }.scope(|ctx, scope| {
-        let constructor = ctx.scoped_value(scope, object_constructor);
-        let object = ctx.scoped_value(scope, object);
-        let keys = ctx.get_value_property(ctx.escape(constructor), "keys")?;
-        let keys = ctx.scoped_value(scope, keys);
-        ctx.call(
-            ctx.escape(keys),
-            ctx.escape(constructor),
-            &[ctx.escape(object)],
-        )
+    let names = unsafe { env.ctx() }.scope(|mut scope| {
+        let constructor = scope.value(object_constructor);
+        let object = scope.value(object);
+        let keys = scope.get(constructor, "keys")?;
+        let names = scope.call(keys, constructor, &[object])?;
+        Ok(scope.finish(names))
     });
     match names {
         Ok(names) => {
@@ -2518,9 +2510,9 @@ pub unsafe extern "C" fn napi_queue_async_work(
             Ok(Value::undefined())
         })
     }));
-    let task = match unsafe { env.ctx() }.scope(|ctx, scope| {
-        let task = ctx.scoped_native_call(scope, "napiAsyncWork", 0, call)?;
-        Ok::<Value, NativeError>(ctx.escape(task))
+    let task = match unsafe { env.ctx() }.scope(|mut scope| {
+        let task = scope.native_call("napiAsyncWork", 0, call)?;
+        Ok::<Value, NativeError>(scope.finish(task))
     }) {
         Ok(task) => task,
         Err(error) => return env.fail(error),

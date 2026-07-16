@@ -46,11 +46,10 @@
 //!   inline `ToBoolean` reduction before selecting an edge. `LogicalNot` uses
 //!   the same reduction and materializes the inverted canonical boolean.
 //! - Every reentrant transition boxes its operands plus tagged SSA values live
-//!   across the call into their interpreter-window slots. Its precise frame
+//!   across the call into their canonical native-frame slots. Its precise frame
 //!   bitmap names every tagged input and live-across value; moving-GC reloads
 //!   restore live values and load results while numeric machine locations
-//!   remain untouched. Store scratch slots are non-roots that the runtime may
-//!   clobber.
+//!   remain untouched.
 //!   Poll slow paths still bail so the interpreter owns interrupt/budget handling.
 //!
 //! # See also
@@ -656,15 +655,12 @@ fn check_eligibility(
                     ));
                 }
                 Op::StoreElement => {
-                    let scratch = instruction
-                        .result_register
-                        .ok_or(Unsupported::OperandShape("element-store scratch"))?;
-                    if instruction.result.is_none()
+                    if instruction.result.is_some()
+                        || instruction.result_register.is_some()
                         || instruction.inputs.len() != 3
                         || instruction.input_registers.len() != 3
                         || reprs.representation(instruction.inputs[0]) != Representation::Tagged
                         || reprs.representation(instruction.inputs[1]) == Representation::Float64
-                        || instruction.input_registers.contains(&scratch)
                     {
                         return Err(Unsupported::Opcode(instruction.op));
                     }
@@ -1294,17 +1290,10 @@ fn build_element_transition_sites(
             .ok_or(Unsupported::OperandShape(
                 "optimizing element-transition live-out boundary",
             ))?;
-        let result = instruction.result.ok_or(Unsupported::OperandShape(
-            "optimizing element-transition result",
-        ))?;
-        let is_store_transition = matches!(instruction.op, Op::StoreElement | Op::StoreProperty);
-        // The scratch register receives a setter's ignored return value, so a
-        // live-after scratch is fine: the emitter reloads its window slot into
-        // the value's machine location after the transition, exactly like a
-        // load result.
+        let result = instruction.result;
         let mut tagged_live_across = Vec::new();
         for value in live_after {
-            if value == result || reprs.representation(value) != Representation::Tagged {
+            if Some(value) == result || reprs.representation(value) != Representation::Tagged {
                 continue;
             }
             let register =
@@ -1325,11 +1314,11 @@ fn build_element_transition_sites(
                 root_registers.insert(register);
             }
         }
-        if is_store_transition
+        if instruction.op == Op::StoreProperty
             && root_registers.contains(
                 &instruction
                     .result_register
-                    .expect("eligibility checked store-transition scratch"),
+                    .expect("eligibility checked property-store scratch"),
             )
         {
             return Err(Unsupported::OperandShape(
@@ -1957,12 +1946,6 @@ fn emit(
                     let receiver = instruction.input_registers[0];
                     let index = instruction.input_registers[1];
                     let value = instruction.input_registers[2];
-                    // The bytecode compiler owns this spare interpreter-window
-                    // register. The store stub may clobber it, so it is never a
-                    // precise root and eligibility requires it not to alias one.
-                    let scratch = instruction
-                        .result_register
-                        .expect("eligibility checked element-store scratch");
                     let site = eligibility
                         .element_transitions
                         .sites
@@ -2025,15 +2008,6 @@ fn emit(
                             }
                         }
                         dynasm!(ops ; .arch aarch64 ; str x9, [x16]);
-                        emit_store_tagged_location(
-                            &mut ops,
-                            allocation.location(
-                                instruction
-                                    .result
-                                    .expect("eligibility checked element-store scratch"),
-                            ),
-                            9,
-                        )?;
                         dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
                     }
                     emit_materialize_element_transition(
@@ -2052,7 +2026,6 @@ fn emit(
                         ; movz x1, receiver as u32
                         ; movz x2, index as u32
                         ; movz x3, value as u32
-                        ; movz x4, scratch as u32
                     );
                     emit_load_u64(&mut ops, 16, store_element_entry);
                     let succeeded = ops.new_dynamic_label();
@@ -2063,19 +2036,7 @@ fn emit(
                         ; b =>threw
                         ; =>succeeded
                     );
-                    emit_reload_element_transition(
-                        &mut ops,
-                        allocation,
-                        site,
-                        Some((
-                            scratch,
-                            allocation.location(
-                                instruction
-                                    .result
-                                    .expect("eligibility checked element-store scratch"),
-                            ),
-                        )),
-                    )?;
+                    emit_reload_element_transition(&mut ops, allocation, site, None)?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LoadProperty => {
@@ -4203,8 +4164,7 @@ fn emit_load_boxed_value(
 }
 
 /// Reload every tagged value live across moving GC, then optionally load an
-/// element-load result last. Numeric homes and indices stay untouched. Store
-/// scratch slots are deliberately ignored because the runtime may clobber them.
+/// element-load result last. Numeric homes and indices stay untouched.
 fn emit_reload_element_transition(
     ops: &mut Assembler,
     allocation: &Allocation,
@@ -5227,26 +5187,20 @@ mod tests {
         receiver: u64,
         index: u64,
         value: u64,
-        scratch: u64,
     ) -> u64 {
         // SAFETY: this fixture owns a seven-slot interpreter window for the
         // transition. Slots 0..=2 model moving-GC rewrites; the numeric index
-        // and non-root scratch are poisoned to prove optimized code ignores
-        // their window contents after the call.
+        // is poisoned to prove optimized code ignores its window contents
+        // after the call.
         let regs = unsafe { fixture_registers(ctx) };
         unsafe {
             assert_eq!(*regs.add(receiver as usize), box_i32(99));
             assert_eq!(*regs.add(index as usize), box_i32(0));
             assert_eq!(*regs.add(value as usize), box_i32(20));
-            assert_eq!(
-                *regs.add(scratch as usize),
-                otter_vm::Value::undefined().to_bits()
-            );
             *regs.add(0) = box_i32(5);
             *regs.add(1) = box_i32(7);
             *regs.add(2) = box_i32(11);
             *regs.add(index as usize) = box_i32(1_000);
-            *regs.add(scratch as usize) = box_i32(2_000);
         }
         0
     }
@@ -5256,7 +5210,6 @@ mod tests {
         _receiver: u64,
         _index: u64,
         _value: u64,
-        _scratch: u64,
     ) -> u64 {
         // SAFETY: the execution fixture owns the live error slot for the
         // complete entry call, matching the production transition contract.
@@ -5522,7 +5475,7 @@ mod tests {
     }
 
     #[test]
-    fn element_store_reloads_tagged_roots_and_ignores_scratch() {
+    fn element_store_reloads_tagged_roots() {
         let view = view(
             3,
             7,
@@ -5534,7 +5487,6 @@ mod tests {
                         Operand::Register(0),
                         Operand::Register(3),
                         Operand::Register(1),
-                        Operand::Register(4),
                     ],
                 ),
                 (
@@ -5590,7 +5542,6 @@ mod tests {
                         Operand::Register(0),
                         Operand::Register(1),
                         Operand::Register(2),
-                        Operand::Register(3),
                     ],
                 ),
                 (Op::ReturnValue, vec![Operand::Register(2)]),

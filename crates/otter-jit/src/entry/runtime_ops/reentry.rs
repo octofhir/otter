@@ -18,9 +18,7 @@
 //! - `super::super::abi` — machine-visible entry context.
 //! - `super::calls` — plain/method-call adapters and direct-call lifecycle.
 
-use otter_vm::{
-    JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, UnaryPrimitiveHint, VmError,
-};
+use otter_vm::{JitExceptionOutcome, NumericRuntimeOp, UnaryCoercionOp, VmError};
 
 use super::super::{JitCtx, JitRet, STATUS_BAILED, STATUS_CONTINUE, STATUS_RETURNED, STATUS_THREW};
 use super::decode_register;
@@ -946,25 +944,13 @@ fn complete_unary_coercion(
     src: u16,
     request: AbiUnaryCoercion,
 ) -> Result<(), VmError> {
-    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
-    let vm_ptr = activation.vm_ptr();
-    let context_ptr = activation.context_ptr();
-    let mut frame = ctx.active_frame_mut()?;
-    let context = unsafe { &*context_ptr };
-    let operation = match request {
-        AbiUnaryCoercion::ToNumeric => UnaryCoercionOp::ToNumeric,
+    let mut runtime = ctx.runtime_call()?;
+    match request {
+        AbiUnaryCoercion::ToNumeric => runtime.coerce_unary(dst, src, UnaryCoercionOp::ToNumeric),
         AbiUnaryCoercion::ToPrimitive { hint_index } => {
-            let token = context
-                .string_constant_str_for_function(frame.function_id(), hint_index)
-                .ok_or(VmError::InvalidOperand)?;
-            let hint = UnaryPrimitiveHint::from_token(token).ok_or(VmError::InvalidOperand)?;
-            UnaryCoercionOp::ToPrimitive { hint }
+            runtime.coerce_unary_hint(dst, src, hint_index)
         }
-    };
-    // SAFETY: the published activation retains both pointers for this compiled
-    // entry's dynamic extent. ActiveFrame performs copied reads and a final
-    // single-slot commit, with no exclusive register slice spanning coercion.
-    unsafe { &mut *vm_ptr }.jit_runtime_coerce_unary(context, &mut frame, dst, src, operation)
+    }
 }
 
 /// Complete one `ToPrimitive`/`ToNumeric` opcode in the VM. `0` means the
@@ -1002,20 +988,7 @@ fn complete_numeric_op(
     lhs: u16,
     operation: NumericRuntimeOp,
 ) -> Result<(), VmError> {
-    let activation = ctx.checked_activation().ok_or(VmError::InvalidOperand)?;
-    let vm_ptr = activation.vm_ptr();
-    let context_ptr = activation.context_ptr();
-    let mut frame = ctx.active_frame_mut()?;
-    // SAFETY: the published activation retains both pointers for this compiled
-    // entry's dynamic extent. ActiveFrame retains raw validated windows and
-    // performs no long-lived register borrow across numeric execution.
-    unsafe { &mut *vm_ptr }.jit_runtime_numeric_op(
-        unsafe { &*context_ptr },
-        &mut frame,
-        dst,
-        lhs,
-        operation,
-    )
+    ctx.runtime_call()?.numeric(dst, lhs, operation)
 }
 
 /// Complete one numeric-family opcode in the VM. `0` means the destination
@@ -1085,15 +1058,17 @@ pub(crate) extern "C" fn jit_make_fn_stub(ctx: *mut JitCtx, dst: u64, idx: u64) 
 pub(crate) extern "C" fn jit_backedge_poll_stub(ctx: *mut JitCtx) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm_ptr = ctx
-        .checked_activation()
-        .map_or(std::ptr::null_mut(), |activation| activation.vm_ptr());
-    if vm_ptr.is_null() {
-        return 0;
-    }
-    // SAFETY: a published activation names a live interpreter for this entry.
-    let vm = unsafe { &mut *vm_ptr };
-    match vm.jit_backedge_poll() {
+    let mut runtime = match ctx.try_runtime_call() {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => return 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    let result = runtime.backedge_poll();
+    drop(runtime);
+    match result {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);

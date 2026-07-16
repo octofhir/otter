@@ -805,7 +805,6 @@ impl Interpreter {
                     continue;
                 }
                 Op::StoreElement => {
-                    let operands = function.operand_view(instr);
                     let recv_reg = context
                         .exec_register(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
@@ -819,17 +818,22 @@ impl Interpreter {
                         let value = *read_register(&stack[top_idx], src_reg)?;
                         feedback.record_arith(value, value);
                     }
-                    if self.drive_store_element(stack, context, operands)? {
-                        continue;
-                    }
-                    self.run_store_element_regs(
-                        context,
-                        &mut *stack,
-                        top_idx,
-                        recv_reg,
-                        idx_reg,
-                        src_reg,
-                    )?;
+                    // Copy the operands through a short representation-neutral
+                    // view, then end the frame borrow before `[[Set]]` can
+                    // allocate, collect, or synchronously re-enter JavaScript.
+                    let (function_id, receiver, key, value) = {
+                        let frame = ActiveFrameRef::materialized(&stack[top_idx]);
+                        (
+                            frame.function_id(),
+                            frame.read(recv_reg)?,
+                            frame.read(idx_reg)?,
+                            frame.read(src_reg)?,
+                        )
+                    };
+                    self.store_element_values(context, function_id, receiver, key, value)?;
+                    // The synchronous helper completed the full effect (or
+                    // threw), so publish exactly one resume increment.
+                    stack[top_idx].advance_pc()?;
                     continue;
                 }
                 Op::Instanceof => {

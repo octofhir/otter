@@ -134,7 +134,6 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
                 Operand::Register(0),
                 Operand::Register(7),
                 Operand::Register(4),
-                Operand::Register(8),
             ],
         ),
         instr(
@@ -167,7 +166,6 @@ fn computed_string_property_loop(iterations: i32) -> ExecutionContext {
                 Operand::Register(0),
                 Operand::Register(7),
                 Operand::Register(6),
-                Operand::Register(8),
             ],
         ),
         instr(

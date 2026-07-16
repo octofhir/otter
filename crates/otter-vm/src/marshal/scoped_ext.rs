@@ -31,7 +31,7 @@
 use otter_gc::raw::RawGc;
 
 use crate::binary::typed_array::{JsTypedArray, TypedArrayKind};
-use crate::handles::{HandleScope, Scoped};
+use crate::handles::{HandleScope, Local};
 use crate::promise::JsPromiseHandle;
 use crate::{ExecutionContext, Interpreter, Value, VmError};
 
@@ -44,7 +44,7 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         bytes: Vec<u8>,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let roots = self.collect_runtime_roots();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -67,7 +67,7 @@ impl Interpreter {
         scope: &'s HandleScope,
         kind: TypedArrayKind,
         bytes: Vec<u8>,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let width = kind.bytes_per_element();
         if !bytes.len().is_multiple_of(width) {
             return Err(self.err_type(
@@ -103,8 +103,8 @@ impl Interpreter {
     pub(crate) fn scoped_promise_fulfilled<'s>(
         &mut self,
         scope: &'s HandleScope,
-        value: Scoped<'_>,
-    ) -> Result<Scoped<'s>, VmError> {
+        value: Local<'_>,
+    ) -> Result<Local<'s>, VmError> {
         let value = self.handle_arena.get(value.index());
         self.scoped_promise_settled(scope, value, true)
     }
@@ -114,8 +114,8 @@ impl Interpreter {
     pub(crate) fn scoped_promise_rejected<'s>(
         &mut self,
         scope: &'s HandleScope,
-        reason: Scoped<'_>,
-    ) -> Result<Scoped<'s>, VmError> {
+        reason: Local<'_>,
+    ) -> Result<Local<'s>, VmError> {
         let reason = self.handle_arena.get(reason.index());
         self.scoped_promise_settled(scope, reason, false)
     }
@@ -125,7 +125,7 @@ impl Interpreter {
         scope: &'s HandleScope,
         payload: Value,
         fulfilled: bool,
-    ) -> Result<Scoped<'s>, VmError> {
+    ) -> Result<Local<'s>, VmError> {
         let roots = self.collect_runtime_roots();
         // The payload local is stored into the promise body by the same
         // allocation that can move it; tracing it rewrites this frame's
@@ -164,8 +164,8 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
         context: Option<&ExecutionContext>,
-        iterable: Scoped<'_>,
-    ) -> Result<Vec<Scoped<'s>>, VmError> {
+        iterable: Local<'_>,
+    ) -> Result<Vec<Local<'s>>, VmError> {
         let value = self.handle_arena.get(iterable.index());
         let elements = if let Some(array) = value.as_array() {
             crate::array::with_elements(array, &self.gc_heap, <[Value]>::to_vec)

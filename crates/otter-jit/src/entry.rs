@@ -550,7 +550,6 @@ mod tests {
                     Operand::Register(0),
                     Operand::Register(1),
                     Operand::Register(3),
-                    Operand::Register(5),
                 ],
             ),
             (Op::ReturnValue, vec![Operand::Register(3)]),
@@ -592,10 +591,9 @@ mod tests {
             (
                 store_element.receiver,
                 store_element.index,
-                store_element.value,
-                store_element.scratch
+                store_element.value
             ),
-            (0, 1, 3, 5)
+            (0, 1, 3)
         );
         assert_eq!(
             plan.instructions[7]

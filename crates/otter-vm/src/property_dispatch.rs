@@ -22,7 +22,6 @@
 use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
-use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 
 use crate::{
@@ -34,8 +33,9 @@ use crate::{
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
     property_ic::PropertyIcKind,
-    read_register, regexp_prototype, symbol, symbol_prototype, temporal, value_kind_name,
-    write_register,
+    read_register, regexp_prototype,
+    rooting::RootScopeExt,
+    symbol, symbol_prototype, temporal, value_kind_name, write_register,
 };
 
 /// Resolution of an OrdinarySet for a callable's deleted `name` /
@@ -2136,23 +2136,20 @@ impl Interpreter {
         frame.write(idx_reg, idx_value)?;
         let recv = frame.read(recv_reg)?;
         let value = if let Some(obj) = recv.as_object() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let key = VmPropertyKey::Symbol(sym);
-                match self.ordinary_get_value(context, Value::object(obj), recv, &key, 0)? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv, args)?
-                    }
-                }
+            let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(sym)
             } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                crate::object::get(obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
-                    .unwrap_or(Value::undefined())
+                VmPropertyKey::OwnedString(key.to_lossy_string(&self.gc_heap))
             } else if let Some(n) = idx_value.as_number() {
-                let key = n.to_display_string();
-                crate::object::get(obj, &self.gc_heap, &key).unwrap_or(Value::undefined())
+                VmPropertyKey::OwnedString(n.to_display_string())
             } else {
                 return Err(VmError::TypeMismatch);
+            };
+            match self.ordinary_get_value(context, Value::object(obj), recv, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, recv, SmallVec::new())?
+                }
             }
         } else if let Some(arr) = recv.as_array() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
@@ -2604,605 +2601,6 @@ impl Interpreter {
             Value::number(crate::coerce::to_number_or_throw(self, context, &value)?)
         };
         binary::dispatch::coerce_element_for_store(&mut self.gc_heap, kind, &converted)
-    }
-
-    /// §10.4.2 — strict-mode writes to a non-writable array slot
-    /// (frozen / per-key flags) throw TypeError instead of silently
-    /// dropping.
-    fn array_strict_write_guard(
-        &self,
-        arr: crate::array::JsArray,
-        key: &str,
-        strict: bool,
-    ) -> Result<(), VmError> {
-        if strict && !crate::array::can_write_array_property(arr, &self.gc_heap, key) {
-            return Err(self.err_type(
-                (format!("Cannot assign to read only property '{key}' of array")).into(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// OrdinarySet slow path for an array index write when the
-    /// element-store protector is tripped: an absent own element must
-    /// consult the prototype chain — a setter consumes the write, a
-    /// getter-only accessor or non-writable data property rejects it
-    /// (TypeError in strict code). Returns `true` when the write was
-    /// consumed either way; `false` falls back to the own-element
-    /// fast path.
-    fn array_index_store_via_proto(
-        &mut self,
-        context: &ExecutionContext,
-        arr: crate::array::JsArray,
-        idx: usize,
-        value: Value,
-        strict: bool,
-    ) -> Result<bool, VmError> {
-        let custom_proto = crate::array::prototype_override(arr, &self.gc_heap);
-        if (!self.array_index_accessor_protector && custom_proto.is_none())
-            || crate::array::has_own_element(arr, &self.gc_heap, idx)
-        {
-            return Ok(false);
-        }
-        let key = idx.to_string();
-        // A custom prototype (e.g. a TypedArray installed via
-        // setPrototypeOf) takes the full [[Set]] funnel: an invalid
-        // canonical index on a chained typed array consumes the
-        // write as a no-op (§10.4.5.5), a setter fires, a data
-        // outcome falls back to the own-element fast path.
-        if let Some(proto) = custom_proto {
-            if proto.is_null() {
-                return Ok(false);
-            }
-            if proto.as_object().is_none() {
-                let vm_key = VmPropertyKey::OwnedString(key);
-                let receiver = Value::array(arr);
-                let handled =
-                    self.ordinary_set_data_value(context, proto, &vm_key, value, receiver, 0)?;
-                if !handled {
-                    self.failed_set_result(strict, "Cannot assign to property")?;
-                }
-                return Ok(true);
-            }
-        }
-        let proto = match custom_proto {
-            Some(p) => p,
-            None => self.constructor_prototype_value("Array")?,
-        };
-        let Some(proto_obj) = proto.as_object() else {
-            return Ok(false);
-        };
-        match object::resolve_set(proto_obj, &self.gc_heap, &key) {
-            object::SetOutcome::InvokeSetter { setter } => {
-                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                args.push(value);
-                self.run_callable_sync(context, &setter, Value::array(arr), args)?;
-                Ok(true)
-            }
-            object::SetOutcome::Reject { .. } => {
-                self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
-                Ok(true)
-            }
-            object::SetOutcome::ExoticParent { parent } => {
-                let vm_key = VmPropertyKey::OwnedString(key);
-                let receiver = Value::array(arr);
-                let handled =
-                    self.ordinary_set_data_value(context, parent, &vm_key, value, receiver, 1)?;
-                if !handled {
-                    self.failed_set_result(strict, "Cannot assign to property")?;
-                }
-                Ok(true)
-            }
-            object::SetOutcome::AssignData => Ok(false),
-        }
-    }
-
-    pub(crate) fn run_store_element_regs(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut HoltStack,
-        top_idx: usize,
-        recv_reg: u16,
-        idx_reg: u16,
-        src_reg: u16,
-    ) -> Result<(), VmError> {
-        let frame = &stack[top_idx];
-        let recv = *read_register(frame, recv_reg)?;
-        let idx_value_raw = *read_register(frame, idx_reg)?;
-        let value = *read_register(frame, src_reg)?;
-        let strict = context.function_is_strict(frame.function_id);
-        let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
-        if let Some(obj) = recv.as_object() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                // §7.3.28 — adding a private element (brand install)
-                // to a non-extensible object is a TypeError.
-                if sym.is_private_name()
-                    && object::get_own_symbol_descriptor(obj, &self.gc_heap, sym).is_none()
-                    && !object::is_extensible(obj, &self.gc_heap)
-                {
-                    return Err(self.err_type(
-                        ("Cannot define private member on a non-extensible object".to_string())
-                            .into(),
-                    ));
-                }
-                if object::deferred_namespace_target(obj, &self.gc_heap).is_some() {
-                    self.ensure_deferred_namespace_ready(context, &recv, false)?;
-                    if !object::deferred_namespace_is_populated(obj, &self.gc_heap)
-                        && object::get_own_symbol_descriptor(obj, &self.gc_heap, sym).is_none()
-                    {
-                        return Err(self.err_type(
-                            ("Cannot add symbol property to non-extensible module namespace"
-                                .to_string())
-                            .into(),
-                        ));
-                    } else {
-                        self.ordinary_set_symbol_with_callable_setter(
-                            context, obj, sym, value, strict,
-                        )?;
-                    }
-                } else {
-                    self.ordinary_set_symbol_with_callable_setter(
-                        context, obj, sym, value, strict,
-                    )?;
-                }
-            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let key = key.to_lossy_string(&self.gc_heap);
-                self.ensure_deferred_namespace_ready(
-                    context,
-                    &recv,
-                    !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
-                )?;
-                self.store_computed_ordinary_property(context, recv, obj, &key, value, strict)?;
-            } else if let Some(n) = idx_value.as_number() {
-                let key = n.to_display_string();
-                self.ensure_deferred_namespace_ready(
-                    context,
-                    &recv,
-                    !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
-                )?;
-                self.store_computed_ordinary_property(context, recv, obj, &key, value, strict)?;
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(fid) = recv
-            .as_function()
-            .or_else(|| recv.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
-            let owner = recv.as_closure(&self.gc_heap);
-            if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let key = key.to_lossy_string(&self.gc_heap);
-                let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
-                    context, owner, fid, &key,
-                )?;
-                match self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    owner,
-                    fid,
-                    &key,
-                )? {
-                    Some(desc) if !desc.writable() => {
-                        self.failed_set_result(
-                            strict,
-                            format!("Cannot assign to read-only property '{key}' of function"),
-                        )?;
-                    }
-                    _ => {
-                        if !has_own && !self.ordinary_function_is_extensible(fid) {
-                            self.failed_set_result(
-                                strict,
-                                format!("Cannot add property '{key}' to non-extensible function"),
-                            )?;
-                        } else {
-                            let bag = self.function_user_bag_stack_rooted(
-                                stack,
-                                owner,
-                                fid,
-                                &[&recv, &idx_value, &value],
-                            )?;
-                            self.set_property(bag, &key, value)?;
-                            if let Some(metadata_key) =
-                                function_metadata::ordinary_function_metadata_key(&key)
-                            {
-                                self.function_deleted_metadata.remove(&(fid, metadata_key));
-                            }
-                        }
-                    }
-                }
-            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if !self
-                    .ordinary_function_has_own_symbol_property_for_extensibility(owner, fid, sym)
-                    && !self.ordinary_function_is_extensible(fid)
-                {
-                    self.failed_set_result(
-                        strict,
-                        "Cannot add symbol property to non-extensible function",
-                    )?;
-                    stack[top_idx].advance_pc()?;
-                    return Ok(());
-                }
-                let bag = self.function_user_bag_stack_rooted(
-                    stack,
-                    owner,
-                    fid,
-                    &[&recv, &idx_value, &value],
-                )?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(self.err_type(
-                        ("Cannot store symbol property on function".to_string()).into(),
-                    ));
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(native) = recv.as_native_function() {
-            if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let key = key.to_lossy_string(&self.gc_heap);
-                match native.own_property_descriptor(&mut self.gc_heap, &key)? {
-                    Some(desc) if !desc.writable() => {
-                        self.failed_set_result(
-                            strict,
-                            format!(
-                                "Cannot assign to read-only property '{key}' of function {}",
-                                native.name(&self.gc_heap)
-                            ),
-                        )?;
-                    }
-                    _ => {
-                        let desc =
-                            crate::object::PropertyDescriptor::data(value, true, false, true);
-                        if !native.define_own_property(&mut self.gc_heap, &key, desc) {
-                            self.failed_set_result(
-                                strict,
-                                format!(
-                                    "Cannot define property '{key}' on function {}",
-                                    native.name(&self.gc_heap)
-                                ),
-                            )?;
-                        }
-                    }
-                }
-            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let desc = object::PartialPropertyDescriptor {
-                    value: Some(value),
-                    writable: Some(true),
-                    enumerable: Some(false),
-                    configurable: Some(true),
-                    ..Default::default()
-                };
-                native.define_own_symbol_property(&mut self.gc_heap, sym, desc);
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(bound) = recv.as_bound_function() {
-            let bound = &bound;
-            if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let key = key.to_lossy_string(&self.gc_heap);
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &mut self.gc_heap,
-                    &key,
-                )? {
-                    Some(desc) if !desc.writable() => {
-                        self.failed_set_result(
-                            strict,
-                            format!(
-                                "Cannot assign to read-only property '{key}' of bound function"
-                            ),
-                        )?;
-                    }
-                    _ => {
-                        let desc =
-                            crate::object::PropertyDescriptor::data(value, true, false, true);
-                        if !function_metadata::bound_define_own_property(
-                            bound,
-                            &mut self.gc_heap,
-                            &key,
-                            desc,
-                        ) {
-                            self.failed_set_result(
-                                strict,
-                                format!("Cannot define property '{key}' on bound function"),
-                            )?;
-                        }
-                    }
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(arr) = recv.as_array() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                // §22.1 Array exotic — symbol-keyed writes land in
-                // per-array symbol-property table.
-                crate::array::set_symbol_property(arr, &mut self.gc_heap, sym, value);
-            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let name = key.to_lossy_string(&self.gc_heap);
-                if self.store_array_accessor_property(context, arr, &name, &value, strict)? {
-                    // Accessor setter handled assignment.
-                } else if let Some(idx) = crate::object::array_index_property_name(&name) {
-                    if self.array_index_store_via_proto(
-                        context,
-                        arr,
-                        idx as usize,
-                        value,
-                        strict,
-                    )? {
-                        // Prototype-chain setter (or rejection) consumed the write.
-                    } else {
-                        self.array_strict_write_guard(arr, &name, strict)?;
-                        let roots = self.collect_allocation_roots(stack);
-                        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                            for &slot in &roots {
-                                visitor(slot);
-                            }
-                        };
-                        crate::array::set_with_roots(
-                            arr,
-                            &mut self.gc_heap,
-                            idx as usize,
-                            value,
-                            &mut external_visit,
-                        )?;
-                    }
-                } else {
-                    let has_own_named =
-                        crate::array::get_named_property(arr, &self.gc_heap, &name).is_some();
-                    if !has_own_named {
-                        let proto = self.constructor_prototype_value("Array")?;
-                        if let Some(proto) = proto.as_object() {
-                            match crate::object::resolve_set(proto, &self.gc_heap, &name) {
-                                object::SetOutcome::InvokeSetter { setter } => {
-                                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                    args.push(value);
-                                    self.run_callable_sync(
-                                        context,
-                                        &setter,
-                                        Value::array(arr),
-                                        args,
-                                    )?;
-                                    stack[top_idx].advance_pc()?;
-                                    return Ok(());
-                                }
-                                object::SetOutcome::Reject { .. } => {
-                                    self.failed_set_result(
-                                        strict,
-                                        format!("Cannot assign to property '{name}'"),
-                                    )?;
-                                    stack[top_idx].advance_pc()?;
-                                    return Ok(());
-                                }
-                                object::SetOutcome::AssignData => {}
-                                // %Array.prototype% chains stay ordinary.
-                                object::SetOutcome::ExoticParent { .. } => {}
-                            }
-                        }
-                    }
-                    crate::array::set_named_property(arr, &mut self.gc_heap, &name, value)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                }
-            } else if let Some(n) = idx_value.as_number() {
-                let key = n.to_display_string();
-                if self.store_array_accessor_property(context, arr, &key, &value, strict)? {
-                    // Accessor setter handled.
-                } else if let Some(idx) = crate::array::index_from_number(n) {
-                    if self.array_index_store_via_proto(context, arr, idx, value, strict)? {
-                        // Prototype-chain setter (or rejection) consumed the write.
-                    } else {
-                        self.array_strict_write_guard(arr, &key, strict)?;
-                        let roots = self.collect_allocation_roots(stack);
-                        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                            for &slot in &roots {
-                                visitor(slot);
-                            }
-                        };
-                        crate::array::set_with_roots(
-                            arr,
-                            &mut self.gc_heap,
-                            idx,
-                            value,
-                            &mut external_visit,
-                        )?;
-                    }
-                } else {
-                    self.array_strict_write_guard(arr, &key, strict)?;
-                    crate::array::set_named_property(arr, &mut self.gc_heap, &key, value)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(t) = recv.as_typed_array(&self.gc_heap) {
-            // §10.4.5.16 TypedArraySetElement / §10.4.5.5 [[Set]] —
-            // determine the canonical numeric index, then convert the
-            // value with ToNumber / ToBigInt (firing `valueOf` and
-            // throwing for a Symbol / cross-type) **before** the index
-            // validity check, so the conversion side effects run even
-            // when the index is out of bounds; an invalid index then
-            // discards the converted value (§10.4.5.9 step 2).
-            let numeric_index: Option<f64> = if let Some(n) = idx_value.as_number() {
-                Some(n.as_f64())
-            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
-                let name = key.to_lossy_string(&self.gc_heap);
-                match canonical_numeric_index_string(&name) {
-                    Some(nf) => Some(nf),
-                    None => {
-                        // Same funnel as the named-store arm: chain
-                        // walk + receiver-phase semantics.
-                        let vm_key = VmPropertyKey::OwnedString(name);
-                        self.ordinary_set_data_value(context, recv, &vm_key, value, recv, 0)?;
-                        stack[top_idx].advance_pc()?;
-                        return Ok(());
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(nf) = numeric_index {
-                if t.kind() == crate::binary::TypedArrayKind::Uint8
-                    && let Some(number) = value.as_number()
-                {
-                    if let Some(idx) = typed_array_valid_index(&t, &self.gc_heap, nf) {
-                        t.set_uint8_number(&mut self.gc_heap, idx, number);
-                    }
-                    stack[top_idx].advance_pc()?;
-                    return Ok(());
-                }
-                let converted = self.typed_array_coerce_element(context, t.kind(), value)?;
-                if let Some(idx) = typed_array_valid_index(&t, &self.gc_heap, nf)
-                    && !t.set_uint8_value(&mut self.gc_heap, idx, &converted)
-                {
-                    t.set(&mut self.gc_heap, idx, &converted);
-                }
-            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let bag = typed_array_ensure_expando(self, &t)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(self.err_type(
-                        ("Cannot store symbol property on TypedArray".to_string()).into(),
-                    ));
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(r) = recv.as_regexp() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                // §22.2.6 — symbol-keyed writes land in expando bag.
-                let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
-                    object::get_own_symbol_descriptor(bag, &self.gc_heap, sym).is_none()
-                });
-                if absent && !r.is_extensible(&self.gc_heap) {
-                    self.failed_set_result(
-                        strict,
-                        "Cannot add symbol property to non-extensible RegExp",
-                    )?;
-                    stack[top_idx].advance_pc()?;
-                    return Ok(());
-                }
-                let bag = regexp_ensure_expando(self, &r, &recv)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(self
-                        .err_type(("Cannot store symbol property on RegExp".to_string()).into()));
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(p) = recv.as_promise() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let bag = promise_ensure_expando_pub(&mut self.gc_heap, &p)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(self
-                        .err_type(("Cannot store symbol property on Promise".to_string()).into()));
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(dv) = recv.as_data_view() {
-            // §25.3 — ordinary object: route both symbol- and
-            // string-keyed writes into the lazy expando bag.
-            let bag = data_view_ensure_expando_pub(&mut self.gc_heap, &dv)?;
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
-                    return Err(self.err_type(
-                        ("Cannot store symbol property on DataView".to_string()).into(),
-                    ));
-                }
-            } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
-                let name = s.to_lossy_string(&self.gc_heap);
-                self.set_property(bag, &name, value)?;
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if let Some(c) = recv.as_class_constructor() {
-            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                let statics = c.statics(&self.gc_heap);
-                if !crate::object::set_symbol(statics, &mut self.gc_heap, sym, value) {
-                    return Err(self.err_type(
-                        ("Cannot store symbol property on class constructor".to_string()).into(),
-                    ));
-                }
-            } else {
-                return Err(VmError::TypeMismatch);
-            }
-        } else if recv.is_map() || recv.is_set() || recv.is_generator() {
-            // §10.1.9 OrdinarySet — computed string/symbol writes land
-            // in the lazy expando via the shared [[Set]] funnel.
-            let vm_key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                VmPropertyKey::Symbol(sym)
-            } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
-                VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-            } else if let Some(n) = idx_value.as_number() {
-                VmPropertyKey::OwnedString(n.to_display_string())
-            } else {
-                return Err(VmError::TypeMismatch);
-            };
-            if !self.ordinary_set_data_value(context, recv, &vm_key, value, recv, 0)? {
-                self.failed_set_result(strict, "Cannot assign to read-only property")?;
-            }
-        } else if recv.is_undefined() || recv.is_null() || recv.is_hole() {
-            return Err(self
-                .err_type((format!("Cannot set property on {}", value_kind_name(&recv))).into()));
-        } else if recv.is_boolean()
-            || recv.is_number()
-            || recv.is_string()
-            || recv.is_symbol()
-            || recv.is_big_int()
-        {
-            self.failed_set_result(
-                strict,
-                format!("Cannot set property on {}", value_kind_name(&recv)),
-            )?;
-        } else {
-            return Err(VmError::TypeMismatch);
-        }
-        let frame = &mut stack[top_idx];
-        frame.advance_pc()?;
-        Ok(())
-    }
-
-    /// Apply descriptor-aware data assignment for computed ordinary-object
-    /// writes (`obj[key] = value`).
-    pub(crate) fn store_computed_ordinary_property(
-        &mut self,
-        context: &ExecutionContext,
-        receiver: Value,
-        obj: JsObject,
-        key: &str,
-        value: Value,
-        strict: bool,
-    ) -> Result<(), VmError> {
-        match crate::object::resolve_set(obj, &self.gc_heap, key) {
-            object::SetOutcome::AssignData => {
-                if self.ordinary_set_data_property(obj, key, value)? {
-                    Ok(())
-                } else {
-                    self.failed_set_result(
-                        strict,
-                        format!("Cannot assign to read-only property '{key}'"),
-                    )
-                }
-            }
-            object::SetOutcome::InvokeSetter { .. } => self.failed_set_result(
-                strict,
-                format!("Cannot assign to accessor property '{key}' without a setter"),
-            ),
-            object::SetOutcome::Reject { .. } => {
-                self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))
-            }
-            // §10.1.9.2 step 2 — the walk hit an exotic prototype
-            // (e.g. a TypedArray): continue through parent.[[Set]]
-            // so its override (§10.4.5.5) is observable.
-            object::SetOutcome::ExoticParent { parent } => {
-                if !self.ordinary_set_data_value(
-                    context,
-                    parent,
-                    &VmPropertyKey::String(key),
-                    value,
-                    receiver,
-                    1,
-                )? {
-                    self.failed_set_result(strict, format!("Cannot assign to property '{key}'"))?;
-                }
-                Ok(())
-            }
-        }
     }
 
     /// §10.1.9 `OrdinarySet` — descriptor-aware set that *invokes
@@ -3696,74 +3094,96 @@ impl Interpreter {
         frame.write(dst, value)
     }
 
-    /// JIT bridge for a computed `StoreElement` (`recv[idx] = src`) from compiled
-    /// code. Mirrors the interpreter dispatch: the typed-array / dense-array fast
-    /// path ([`Self::drive_store_element`]) first, then the general
-    /// [`Self::run_store_element_regs`] (`[[Set]]` over arrays, objects, string
-    /// exotics). `scratch_reg` is the bytecode's scratch operand. Frame PC is
-    /// saved/restored so a later guard bail re-runs from PC 0.
+    /// Representation-neutral JIT bridge for computed stores.
     ///
-    /// # Errors
-    /// Propagates a throwing setter, a read-only-target `TypeError` in strict
-    /// mode, and `InvalidOperand`.
+    /// The published activation is only an operand source. Once the operands
+    /// are rooted, the value-level `[[Set]]` funnel owns every receiver shape:
+    /// ordinary objects and arrays, typed arrays, proxies, callable setters,
+    /// and hosted object families all complete synchronously without
+    /// materialising an interpreter frame. This keeps one semantic authority
+    /// for interpreted and compiled `StoreElement` execution.
     pub fn jit_runtime_store_element(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &ActiveFrameRef<'_>,
         recv_reg: u16,
         idx_reg: u16,
         src_reg: u16,
-        scratch_reg: u16,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let receiver = *read_register(&stack[frame_index], recv_reg)?;
-        let key_value = *read_register(&stack[frame_index], idx_reg)?;
-        let value = *read_register(&stack[frame_index], src_reg)?;
-        if let Some(arr) = receiver.as_array()
-            && let Some(n) = key_value.as_number()
-            && let Some(idx) = crate::array::index_from_number(n)
-            && crate::array::can_fast_fill_dense_range(arr, &self.gc_heap, idx, idx + 1)
-        {
-            let strict = context.function_is_strict(stack[frame_index].function_id);
-            if !self.array_index_store_via_proto(context, arr, idx, value, strict)? {
-                if strict {
-                    let key = idx.to_string();
-                    self.array_strict_write_guard(arr, &key, true)?;
-                }
-                let roots = self.collect_allocation_roots(stack);
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    for &slot in &roots {
-                        visitor(slot);
-                    }
-                };
-                crate::array::fill_dense_range_with_roots(
-                    arr,
-                    &mut self.gc_heap,
-                    idx,
-                    idx + 1,
-                    value,
-                    &mut external_visit,
-                )?;
-            }
-            return Ok(());
+        let function_id = frame.function_id();
+        let receiver = frame.read(recv_reg)?;
+        let key_value = frame.read(idx_reg)?;
+        let value = frame.read(src_reg)?;
+        self.store_element_values(context, function_id, receiver, key_value, value)
+    }
+
+    /// Complete computed `[[Set]]` from copied, representation-independent
+    /// operands. No frame or stack view survives into this method, so GC and
+    /// synchronous JavaScript reentry can revisit the published activation
+    /// without aliasing a retained Rust borrow.
+    pub(crate) fn store_element_values(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        mut receiver: Value,
+        mut key_value: Value,
+        mut value: Value,
+    ) -> Result<(), VmError> {
+        let mut property_key = Value::undefined();
+        let strict = context.function_is_strict(function_id);
+
+        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: all four locals are declared before `roots` and remain live
+        // and unmoved until the scope is explicitly dropped below.
+        unsafe {
+            roots.add_value(&mut receiver);
+            roots.add_value(&mut key_value);
+            roots.add_value(&mut value);
+            roots.add_value(&mut property_key);
         }
-        let saved_pc = stack[frame_index].pc;
-        let operands = [
-            Operand::Register(recv_reg),
-            Operand::Register(idx_reg),
-            Operand::Register(src_reg),
-            Operand::Register(scratch_reg),
-        ];
-        let result = match self.drive_store_element(stack, context, &operands) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                self.run_store_element_regs(context, stack, frame_index, recv_reg, idx_reg, src_reg)
-            }
-            Err(err) => Err(err),
+        property_key = self.coerce_property_key_value(context, key_value)?;
+
+        let key = if let Some(symbol) = property_key.as_symbol(&self.gc_heap) {
+            VmPropertyKey::Symbol(symbol)
+        } else if let Some(string) = property_key.as_string(&self.gc_heap) {
+            VmPropertyKey::OwnedString(string.to_lossy_string(&self.gc_heap))
+        } else if let Some(number) = property_key.as_number() {
+            VmPropertyKey::OwnedString(number.to_display_string())
+        } else {
+            return Err(VmError::InvalidOperand);
         };
-        stack[frame_index].pc = saved_pc;
-        result
+
+        if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
+            return Err(self.err_type(
+                (format!("Cannot set property on {}", value_kind_name(&receiver))).into(),
+            ));
+        }
+        let wrapper_name = if receiver.is_boolean() {
+            Some("Boolean")
+        } else if receiver.is_number() {
+            Some("Number")
+        } else if receiver.is_string() {
+            Some("String")
+        } else if receiver.is_symbol() {
+            Some("Symbol")
+        } else if receiver.is_big_int() {
+            Some("BigInt")
+        } else {
+            None
+        };
+        let accepted = if let Some(wrapper_name) = wrapper_name {
+            let parent = self.primitive_wrapper_prototype(wrapper_name)?;
+            self.ordinary_set_data_value(context, Value::object(parent), &key, value, receiver, 0)?
+        } else {
+            self.ordinary_set_data_value(context, receiver, &key, value, receiver, 0)?
+        };
+        if !accepted {
+            let name = key.string_name().unwrap_or("symbol");
+            self.failed_set_result(strict, format!("Cannot assign to property '{name}'"))?;
+        }
+        drop(roots);
+        Ok(())
     }
 
     /// Packed WhiskerIC inline-store cell fill for `site`, or `0` for "no
@@ -4593,524 +4013,6 @@ impl Interpreter {
         )?;
         stack[top_idx].advance_pc()?;
         Ok(true)
-    }
-
-    /// Drive one tick of [`Op::StoreElement`] when a computed
-    /// string, numeric, or symbol property write on an ordinary
-    /// object/proxy must obey §10.1.9 OrdinarySet.
-    pub(crate) fn drive_store_element(
-        &mut self,
-        stack: &mut HoltStack,
-        context: &ExecutionContext,
-        operands: impl crate::executable::OperandSource,
-    ) -> Result<bool, VmError> {
-        let obj_reg = register_operand(operands.first())?;
-        let key_reg = register_operand(operands.get(1))?;
-        let src_reg = register_operand(operands.get(2))?;
-        let scratch_reg = register_operand(operands.get(3))?;
-        let top_idx = stack.len() - 1;
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
-        let key_value = self.coerce_property_key_value(context, key_value_raw)?;
-        let value = *read_register(&stack[top_idx], src_reg)?;
-
-        // Fast path: an integer-keyed write of an already-Number value into a
-        // non-BigInt typed array is an IntegerIndexedElementSet (§10.4.5.5)
-        // with no observable coercion — `ToNumber(number)` is identity, never
-        // throws, and has no side effects, so the value conversion folds into
-        // the in-place element write with no index stringification and no
-        // expando (a canonical numeric index never creates one).
-        // `JsTypedArray::set` truncates per element kind and silently no-ops on
-        // a detached buffer or out-of-bounds index; a negative / fractional
-        // index has no valid integer index and is likewise a no-op. BigInt
-        // arrays, non-Number values, and observable coercions (which can throw
-        // or resize the buffer) fall through to the spec `[[Set]]` ladder.
-        if let Some(t) = receiver.as_typed_array(&self.gc_heap)
-            && value.is_number()
-            && !t.kind().is_bigint()
-            && let Some(n) = key_value.as_number()
-        {
-            if let Some(idx) = crate::array::index_from_number(n) {
-                t.set(&mut self.gc_heap, idx, &value);
-            }
-            stack[top_idx].advance_pc()?;
-            return Ok(true);
-        }
-
-        let strict = Self::current_frame_is_strict(stack, context);
-        enum ComputedPropertyKey {
-            String(String),
-            Symbol(crate::symbol::JsSymbol),
-        }
-        let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
-            ComputedPropertyKey::String(s.to_lossy_string(&self.gc_heap))
-        } else if let Some(n) = key_value.as_number() {
-            ComputedPropertyKey::String(n.to_display_string())
-        } else if let Some(sym) = key_value.as_symbol(&self.gc_heap) {
-            ComputedPropertyKey::Symbol(sym)
-        } else {
-            return Ok(false);
-        };
-        if let Some(proxy) = receiver.as_proxy() {
-            // §6.2.12 — private-name writes land in the proxy's own
-            // [[PrivateElements]]; the set trap never fires.
-            if let ComputedPropertyKey::Symbol(sym) = &key
-                && sym.is_private_name()
-            {
-                self.proxy_private_upsert(&proxy, *sym, value);
-                stack[top_idx].advance_pc()?;
-                return Ok(true);
-            }
-            let key_arg = match &key {
-                ComputedPropertyKey::String(key) => {
-                    Value::string(JsString::from_str(key, &mut self.gc_heap)?)
-                }
-                ComputedPropertyKey::Symbol(sym) => Value::symbol(*sym),
-            };
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(&self.gc_heap),
-                key_arg,
-                value,
-                Value::proxy(proxy),
-            ];
-            stack[top_idx].advance_pc()?;
-            match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
-                Some(result) => {
-                    // §10.5.9 step 13–14 invariants — a trap that reports
-                    // success must not contradict a non-configurable,
-                    // non-writable data property or a setter-less accessor
-                    // on the target.
-                    if result.to_boolean(&self.gc_heap) {
-                        let target_value = proxy.target(&self.gc_heap);
-                        let vm_key = match &key {
-                            ComputedPropertyKey::String(k) => VmPropertyKey::OwnedString(k.clone()),
-                            ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                        };
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_stack_rooted(
-                                context,
-                                stack,
-                                target_value,
-                                &vm_key,
-                                0,
-                            )?;
-                        if let Some(desc) = target_desc.as_ref()
-                            && !desc.configurable()
-                        {
-                            match &desc.kind {
-                                object::DescriptorKind::Data { value: target_v }
-                                    if !desc.writable()
-                                        && !abstract_ops::same_value(
-                                            target_v,
-                                            &value,
-                                            &self.gc_heap,
-                                        ) =>
-                                {
-                                    return Err(self.err_type((
-                                            "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                .to_string()).into()));
-                                }
-                                object::DescriptorKind::Accessor { setter: None, .. } => {
-                                    return Err(self.err_type((
-                                            "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                                .to_string()).into()));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                None => {
-                    // §10.5.9 step 9 — a missing `set` trap forwards to
-                    // `target.[[Set]](P, V, Receiver)` with the proxy as
-                    // Receiver, so OrdinarySet's own-property steps fire
-                    // the proxy's getOwnPropertyDescriptor / defineProperty
-                    // traps (and an inherited setter sees `this === proxy`).
-                    let target_value = proxy.target(&self.gc_heap);
-                    let vm_key = match &key {
-                        ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key.clone()),
-                        ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                    };
-                    if !self.ordinary_set_data_value(
-                        context,
-                        target_value,
-                        &vm_key,
-                        value,
-                        Value::proxy(proxy),
-                        0,
-                    )? {
-                        self.failed_set_result(strict, "Cannot assign to property")?;
-                    }
-                }
-            }
-            return Ok(true);
-        }
-        if let (Some(bound), ComputedPropertyKey::String(key)) =
-            (receiver.as_bound_function(), &key)
-        {
-            let bound = &bound;
-            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, key)? {
-                Some(object::PropertyDescriptor {
-                    kind: object::DescriptorKind::Accessor { setter, .. },
-                    ..
-                }) => {
-                    let setter = setter.ok_or(VmError::TypeMismatch)?;
-                    if !abstract_ops::is_callable(&setter) {
-                        return Err(VmError::TypeMismatch);
-                    }
-                    stack[top_idx].advance_pc()?;
-                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                    args.push(value);
-                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
-                    return Ok(true);
-                }
-                Some(_) => return Ok(false),
-                None => {
-                    if let Some(object::PropertyDescriptor {
-                        kind: object::DescriptorKind::Accessor { setter, .. },
-                        ..
-                    }) = object::get_own_descriptor(
-                        self.function_prototype_object()?,
-                        &self.gc_heap,
-                        key,
-                    ) {
-                        let setter = setter.ok_or(VmError::TypeMismatch)?;
-                        if !abstract_ops::is_callable(&setter) {
-                            return Err(VmError::TypeMismatch);
-                        }
-                        stack[top_idx].advance_pc()?;
-                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                        args.push(value);
-                        self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
-                        return Ok(true);
-                    }
-                    if is_restricted_function_property(key) {
-                        stack[top_idx].advance_pc()?;
-                        let callee = self.restricted_throw_type_error()?;
-                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                        args.push(value);
-                        self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        if let ComputedPropertyKey::String(key) = &key
-            && (receiver.is_function()
-                || receiver.is_closure()
-                || receiver.is_native_function()
-                || receiver.is_class_constructor())
-        {
-            let own_present = if let Some(fid) = receiver.as_function().or_else(|| {
-                receiver
-                    .as_closure(&self.gc_heap)
-                    .map(|c| c.cached_function_id)
-            }) {
-                let owner = receiver.as_closure(&self.gc_heap);
-                self.callable_bag_read(owner, fid).is_some_and(|bag| {
-                    !matches!(
-                        object::lookup_own(bag, &self.gc_heap, key),
-                        object::PropertyLookup::Absent
-                    )
-                })
-            } else if let Some(c) = receiver.as_class_constructor() {
-                !matches!(
-                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, key),
-                    object::PropertyLookup::Absent
-                )
-            } else if let Some(native) = receiver.as_native_function() {
-                native
-                    .own_property_descriptor(&mut self.gc_heap, key)?
-                    .is_some()
-            } else {
-                false
-            };
-            if !own_present && is_restricted_function_property(key) {
-                stack[top_idx].advance_pc()?;
-                let callee = self.restricted_throw_type_error()?;
-                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                args.push(value);
-                self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
-                return Ok(true);
-            }
-        }
-        if let (Some(native), ComputedPropertyKey::Symbol(sym)) =
-            (receiver.as_native_function(), &key)
-        {
-            let obj = native.own_properties_object(&self.gc_heap);
-            match object::resolve_symbol_set(obj, &self.gc_heap, *sym) {
-                object::SetOutcome::AssignData => {
-                    if !object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            "Cannot assign to symbol property",
-                        );
-                    }
-                }
-                object::SetOutcome::InvokeSetter { setter } => {
-                    if !abstract_ops::is_callable(&setter) {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            "Cannot assign to accessor property without a setter",
-                        );
-                    }
-                    stack[top_idx].advance_pc()?;
-                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                    args.push(value);
-                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
-                    return Ok(true);
-                }
-                object::SetOutcome::Reject { .. } => {
-                    return self.finish_failed_set(
-                        stack,
-                        context,
-                        "Cannot assign to symbol property",
-                    );
-                }
-                // The own-properties bag has no exotic prototype.
-                object::SetOutcome::ExoticParent { .. } => {
-                    let _ = object::set_symbol(obj, &mut self.gc_heap, *sym, value);
-                }
-            }
-            stack[top_idx].advance_pc()?;
-            return Ok(true);
-        }
-        if receiver.is_boolean()
-            || receiver.is_number()
-            || receiver.is_string()
-            || receiver.is_symbol()
-            || receiver.is_big_int()
-        {
-            let key = match key {
-                ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key),
-                ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym),
-            };
-            return self.store_to_primitive_base(stack, context, receiver, key, value, scratch_reg);
-        }
-        if let Some(r) = receiver.as_regexp() {
-            let r = &r;
-            match &key {
-                ComputedPropertyKey::String(key) if key == "lastIndex" => {
-                    regexp_prototype::store_property(r, &mut self.gc_heap, key, value);
-                }
-                ComputedPropertyKey::String(key) => {
-                    let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
-                        matches!(
-                            object::lookup_own(bag, &self.gc_heap, key),
-                            object::PropertyLookup::Absent
-                        )
-                    });
-                    if absent {
-                        // §10.1.9.2 OrdinarySet — with no own shadow, the
-                        // prototype chain decides: an inherited getter-only
-                        // accessor (`global`, `source`, …) rejects the write
-                        // instead of installing an own slot on the regexp.
-                        let proto = self.get_prototype_for_op(&receiver)?;
-                        if let Some(proto_obj) = proto.as_object() {
-                            match object::resolve_set(proto_obj, &self.gc_heap, key) {
-                                object::SetOutcome::InvokeSetter { setter } => {
-                                    if !abstract_ops::is_callable(&setter) {
-                                        return self.finish_failed_set(
-                                            stack,
-                                            context,
-                                            "Cannot assign to accessor property without a setter",
-                                        );
-                                    }
-                                    stack[top_idx].advance_pc()?;
-                                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                    args.push(value);
-                                    self.invoke(
-                                        stack,
-                                        context,
-                                        &setter,
-                                        receiver,
-                                        args,
-                                        scratch_reg,
-                                    )?;
-                                    return Ok(true);
-                                }
-                                object::SetOutcome::Reject { .. } => {
-                                    return self.finish_failed_set(
-                                        stack,
-                                        context,
-                                        format!("Cannot assign to read-only property '{key}'"),
-                                    );
-                                }
-                                object::SetOutcome::AssignData => {}
-                                // %RegExp.prototype% chains stay ordinary.
-                                object::SetOutcome::ExoticParent { .. } => {}
-                            }
-                        }
-                        if !r.is_extensible(&self.gc_heap) {
-                            return self.finish_failed_set(
-                                stack,
-                                context,
-                                format!("Cannot add property '{key}' to non-extensible RegExp"),
-                            );
-                        }
-                    }
-                    let bag = regexp_ensure_expando(self, r, &receiver)?;
-                    if !self.ordinary_set_data_property(bag, key, value)? {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            format!("Cannot assign to property '{key}'"),
-                        );
-                    }
-                }
-                ComputedPropertyKey::Symbol(sym) => {
-                    let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
-                        object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym).is_none()
-                    });
-                    if absent && !r.is_extensible(&self.gc_heap) {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            "Cannot add symbol property to non-extensible RegExp",
-                        );
-                    }
-                    let bag = regexp_ensure_expando(self, r, &receiver)?;
-                    if !object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            "Cannot assign to symbol property",
-                        );
-                    }
-                }
-            }
-            stack[top_idx].advance_pc()?;
-            return Ok(true);
-        }
-        let obj = if let Some(obj) = receiver.as_object() {
-            obj
-        } else if let Some(class) = receiver.as_class_constructor() {
-            if let ComputedPropertyKey::String(name) = &key
-                && self.class_store_hits_readonly_intrinsic(context, class, name)?
-            {
-                return self.finish_failed_set(
-                    stack,
-                    context,
-                    format!("Cannot assign to read-only property '{name}' of class"),
-                );
-            }
-            class.statics(&self.gc_heap)
-        } else if let Some(fid) = receiver.as_function().or_else(|| {
-            receiver
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        }) {
-            let owner = receiver.as_closure(&self.gc_heap);
-            match &key {
-                ComputedPropertyKey::String(key) => {
-                    if function_metadata::ordinary_function_metadata_key(key).is_some()
-                        && let Some(desc) = self.ordinary_function_own_property_descriptor(
-                            Some(context),
-                            owner,
-                            fid,
-                            key,
-                        )?
-                        && !desc.writable()
-                    {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            format!("Cannot assign to read-only property '{key}' of function"),
-                        );
-                    }
-                    let has_own = self
-                        .ordinary_function_has_own_string_property_for_extensibility(
-                            context, owner, fid, key,
-                        )?;
-                    if !has_own && !self.ordinary_function_is_extensible(fid) {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            format!("Cannot add property '{key}' to non-extensible function"),
-                        );
-                    }
-                }
-                ComputedPropertyKey::Symbol(sym) => {
-                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(
-                        owner, fid, *sym,
-                    ) && !self.ordinary_function_is_extensible(fid)
-                    {
-                        return self.finish_failed_set(
-                            stack,
-                            context,
-                            "Cannot add symbol property to non-extensible function",
-                        );
-                    }
-                }
-            }
-            self.function_user_bag_stack_rooted(stack, owner, fid, &[&receiver, &value])?
-        } else {
-            return Ok(false);
-        };
-        let outcome = match &key {
-            ComputedPropertyKey::String(key) => crate::object::resolve_set(obj, &self.gc_heap, key),
-            ComputedPropertyKey::Symbol(sym) => {
-                crate::object::resolve_symbol_set(obj, &self.gc_heap, *sym)
-            }
-        };
-        match outcome {
-            // §10.1.9.2 step 2 — an exotic prototype (TypedArray,
-            // Proxy value) owns [[Set]]: continue through the
-            // value-level funnel with the ORIGINAL receiver.
-            object::SetOutcome::ExoticParent { parent } => {
-                let pkey = match &key {
-                    ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key.clone()),
-                    ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                };
-                if !self.ordinary_set_data_value(context, parent, &pkey, value, receiver, 1)? {
-                    return self.finish_failed_set(
-                        stack,
-                        context,
-                        "Cannot assign to read-only property",
-                    );
-                }
-                stack[top_idx].advance_pc()?;
-                Ok(true)
-            }
-            object::SetOutcome::AssignData => {
-                let ok = match &key {
-                    ComputedPropertyKey::String(key) => {
-                        self.ordinary_set_data_property(obj, key, value)?
-                    }
-                    ComputedPropertyKey::Symbol(sym) => {
-                        object::set_symbol(obj, &mut self.gc_heap, *sym, value)
-                    }
-                };
-                if !ok {
-                    return self.finish_failed_set(
-                        stack,
-                        context,
-                        "Cannot assign to read-only property",
-                    );
-                }
-                stack[top_idx].advance_pc()?;
-                Ok(true)
-            }
-            object::SetOutcome::InvokeSetter { setter } => {
-                if !abstract_ops::is_callable(&setter) {
-                    return self.finish_failed_set(
-                        stack,
-                        context,
-                        "Cannot assign to accessor property without a setter",
-                    );
-                }
-                stack[top_idx].advance_pc()?;
-                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                args.push(value);
-                self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
-                Ok(true)
-            }
-            object::SetOutcome::Reject { .. } => {
-                self.finish_failed_set(stack, context, "Cannot assign to property")
-            }
-        }
     }
 
     /// Drive one tick of [`Op::StoreProperty`] when §10.1.9

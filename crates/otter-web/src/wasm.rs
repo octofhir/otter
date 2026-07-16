@@ -454,8 +454,8 @@ fn run_import(
     let bridge = unsafe { &*(bridge_addr as *const Bridge) };
     let ctx: &mut NativeCtx<'_> = unsafe { &mut *(bridge.ctx as *mut NativeCtx<'_>) };
     let params: Vec<Val> = params.to_vec();
-    let outcome: Result<Vec<Val>, ImportFailure> = ctx.scope(|ctx, scope| {
-        let mut cx = MarshalCx::new(ctx, scope);
+    let outcome: Result<Vec<Val>, ImportFailure> = ctx.scope(|scope| {
+        let mut cx = MarshalCx::new(scope);
         let callback = cx
             .ctx()
             .persistent_root_get(root)
@@ -627,8 +627,8 @@ fn make_export_function<'s>(
     let arity = u8::try_from(params.len()).unwrap_or(u8::MAX);
     let store = store.clone();
     let call = move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let mut inputs: Vec<Val> = Vec::with_capacity(params.len());
             for (index, ty) in params.iter().enumerate() {
                 let handle = cx.park(args.get(index).copied().unwrap_or_else(Value::undefined));
@@ -661,10 +661,7 @@ fn make_export_function<'s>(
         })
     };
     let call: Arc<RuntimeNativeFn> = Arc::new(call);
-    let scope = cx.scope();
-    cx.ctx()
-        .scoped_native_call(scope, "", arity, NativeCall::Dynamic(call))
-        .map_err(|err| JsError::Type(err.to_string()))
+    cx.native_call("", arity, NativeCall::Dynamic(call))
 }
 
 /// The `[[Prototype]]` a built `Instance` object must carry.
@@ -941,8 +938,8 @@ impl WebAssembly {
     /// `WebAssembly.validate(bytes)` — true when `bytes` is a valid module.
     #[method(name = "validate", length = 1, raw)]
     fn validate(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let Some(bytes) = cx.buffer_source_bytes(handle) else {
                 let v = cx.boolean(false);
@@ -960,8 +957,8 @@ impl WebAssembly {
     /// `WebAssembly.compile(bytes)` — a promise of a `Module`.
     #[method(name = "compile", length = 1, raw)]
     fn compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let result = compile_module(&mut cx, handle);
             settle_promise(&mut cx, result, "WebAssembly.compile")
@@ -971,8 +968,8 @@ impl WebAssembly {
     /// `WebAssembly.instantiate(bytesOrModule, importObject?)`.
     #[method(name = "instantiate", length = 1, raw)]
     fn instantiate(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let source = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let imports = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let result = instantiate_entry(&mut cx, source, imports);
@@ -983,8 +980,8 @@ impl WebAssembly {
     /// Synchronous instantiation backing `new WebAssembly.Instance(...)`.
     #[method(name = "__buildInstance", length = 2, raw)]
     fn build_instance(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let module_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let imports = cx.park(args.get(1).copied().unwrap_or_else(Value::undefined));
             let module = cx
@@ -1008,8 +1005,8 @@ impl WebAssembly {
     /// `WebAssembly.JSTag`.
     #[method(name = "__jsTag", length = 0, raw)]
     fn js_tag(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let realm =
                 realm_handle(&mut cx).map_err(|err| err.into_native("WebAssembly.JSTag"))?;
             let value = WasmTag {
@@ -1059,8 +1056,8 @@ pub struct WasmModule {
 impl WasmModule {
     #[constructor(raw)]
     fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let bytes = cx
                 .buffer_source_bytes(handle)
@@ -1100,8 +1097,8 @@ pub struct WasmMemory {
 impl WasmMemory {
     #[constructor(raw)]
     fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let descriptor: MemoryDescriptor =
                 <MemoryDescriptor as otter_runtime::marshal::FromJs>::from_js(
@@ -1170,8 +1167,8 @@ pub struct WasmGlobal {
 impl WasmGlobal {
     #[constructor(raw)]
     fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let desc_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let descriptor: GlobalDescriptor =
                 <GlobalDescriptor as otter_runtime::marshal::FromJs>::from_js(
@@ -1222,8 +1219,8 @@ impl WasmGlobal {
     #[getter(name = "value", raw)]
     fn get_value(&self, ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let val = {
                 let mut guard = store.lock().expect("wasm store poisoned");
                 self.global.get(&mut *guard)
@@ -1237,8 +1234,8 @@ impl WasmGlobal {
     fn set_value(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let content = self.content.clone();
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let new_value = js_to_val(&mut cx, &store, handle, &content)
                 .map_err(|err| err.into_native("WebAssembly.Global"))?;
@@ -1273,8 +1270,8 @@ pub struct WasmTable {
 impl WasmTable {
     #[constructor(raw)]
     fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let descriptor: TableDescriptor =
                 <TableDescriptor as otter_runtime::marshal::FromJs>::from_js(
@@ -1329,8 +1326,8 @@ impl WasmTable {
     fn get(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let table = self.table;
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let index = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let index =
                 cx.to_number_spec(index)
@@ -1357,8 +1354,8 @@ impl WasmTable {
     fn set(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let table = self.table;
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let index_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let index =
                 cx.to_number_spec(index_handle)
@@ -1440,8 +1437,8 @@ pub struct WasmTag {
 impl WasmTag {
     #[constructor(raw)]
     fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let descriptor = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let params = read_tag_parameters(&mut cx, descriptor)
                 .map_err(|err| err.into_native("WebAssembly.Tag"))?;
@@ -1462,8 +1459,8 @@ impl WasmTag {
     fn type_of(&self, ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let tag = self.tag;
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let params: Vec<ValType> = {
                 let guard = store.lock().expect("wasm store poisoned");
                 tag.ty(&*guard).ty().params().collect()
@@ -1513,8 +1510,8 @@ pub struct WasmException {
 impl WasmException {
     #[constructor(raw)]
     fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let tag_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let tag = tag_argument(&mut cx, tag_handle)
                 .map_err(|err| err.into_native("WebAssembly.Exception"))?;
@@ -1573,8 +1570,8 @@ impl WasmException {
     fn is(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let exn = self.exn;
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let tag_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let tag = tag_argument(&mut cx, tag_handle)
                 .map_err(|err| err.into_native("WebAssembly.Exception"))?;
@@ -1597,8 +1594,8 @@ impl WasmException {
     fn get_arg(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let exn = self.exn;
-        ctx.scope(|ctx, scope| {
-            let mut cx = MarshalCx::new(ctx, scope);
+        ctx.scope(|scope| {
+            let mut cx = MarshalCx::new(scope);
             let tag_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
             let tag = tag_argument(&mut cx, tag_handle)
                 .map_err(|err| err.into_native("WebAssembly.Exception"))?;

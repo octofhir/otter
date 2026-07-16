@@ -346,6 +346,7 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; ldr w1, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
         ; add sp, sp, NATIVE_FRAME_STACK_SIZE
         ; mov x0, x20
+        ; movz x2, #1
     );
     emit_load_u64(ops, 16, abort_direct_call);
     dynasm!(ops
@@ -382,6 +383,7 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; ldr w1, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
         ; add sp, sp, NATIVE_FRAME_STACK_SIZE
         ; mov x0, x20
+        ; movz x2, #0
     );
     emit_load_u64(ops, 16, abort_direct_call);
     dynasm!(ops
@@ -407,6 +409,7 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; =>entry_rejected
         ; ldr w1, [x20, DIRECT_OWNER_ID_OFFSET]
         ; mov x0, x20
+        ; movz x2, #0
     );
     emit_load_u64(ops, 16, abort_direct_call);
     dynasm!(ops

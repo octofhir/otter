@@ -28,7 +28,7 @@
 //!
 //! # Invariants
 //! - No raw `Value` is held across an allocating call anywhere in this
-//!   module; every JS value lives behind a [`crate::Scoped`] handle
+//!   module; every JS value lives behind a [`crate::Local`] handle
 //!   minted in the caller's scope.
 //! - Spec coercions (`ToString` / `ToNumber` / `ToPrimitive`) may
 //!   re-enter user JS. They require the call's

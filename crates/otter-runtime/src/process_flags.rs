@@ -16,7 +16,7 @@
 //! # See also
 //! - <https://nodejs.org/api/process.html#processallowednodeenvironmentflags>
 
-use otter_vm::{Attr, HandleScope, NativeCall, NativeCtx, NativeError, Scoped, Value};
+use otter_vm::{Attr, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
 
 const ALLOWED_NODE_ENVIRONMENT_FLAGS: &[&str] = &[
     "-C",
@@ -197,26 +197,14 @@ const ALLOWED_NODE_ENVIRONMENT_FLAGS: &[&str] = &[
     "--zero-fill-buffers",
 ];
 
-pub(crate) fn build<'s>(
-    ctx: &mut NativeCtx<'_>,
-    scope: &'s HandleScope,
-) -> Result<Scoped<'s>, NativeError> {
-    let flags = ctx.scoped_collection_set(scope)?;
+pub(crate) fn build<'s>(scope: &mut NativeScope<'s, '_>) -> Result<Local<'s>, NativeError> {
+    let flags = scope.set_collection()?;
     for flag in ALLOWED_NODE_ENVIRONMENT_FLAGS {
-        let value = ctx.scoped_string(scope, flag)?;
-        let mut set = ctx
-            .escape(flags)
-            .as_set()
-            .expect("scoped_collection_set must produce a Set");
-        ctx.set_add(&mut set, ctx.escape(value))
-            .map_err(|error| NativeError::TypeError {
-                name: "process.allowedNodeEnvironmentFlags",
-                reason: error.to_string(),
-            })?;
+        let value = scope.string(flag)?;
+        scope.set_add(flags, value)?;
     }
-    let has = ctx.scoped_native_call(scope, "has", 1, NativeCall::Static(allowed_flags_has))?;
-    ctx.scoped_define_data(
-        scope,
+    let has = scope.native_call("has", 1, NativeCall::Static(allowed_flags_has))?;
+    scope.define(
         flags,
         "has",
         has,
@@ -227,7 +215,7 @@ pub(crate) fn build<'s>(
         }
         .to_flags(),
     )?;
-    ctx.make_set_readonly(ctx.escape(flags))?;
+    scope.make_set_readonly(flags)?;
     Ok(flags)
 }
 

@@ -21,6 +21,8 @@
 //! - [`crate::Frame`]
 //! - [`crate::executable`]
 
+use std::cell::UnsafeCell;
+
 use crate::holt_stack::HoltStack;
 use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
@@ -45,6 +47,154 @@ struct SyncNativeCallRoots<'a> {
     interp_roots: otter_gc::ExtraRoots,
     value_roots: SmallVec<[&'a Value; 4]>,
     slice_roots: SmallVec<[&'a [Value]; 2]>,
+}
+
+/// Mutable root state for synchronous JS re-entry before a callee frame owns
+/// the values. Bound/proxy unwrapping replaces these fields in place; the
+/// registered provider therefore rewrites the exact cells the dispatch loop
+/// reads after any moving collection, rather than merely keeping duplicate
+/// handle-arena entries alive.
+struct JsCallRootSlot(UnsafeCell<Value>);
+
+impl JsCallRootSlot {
+    fn new(value: Value) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    #[inline]
+    fn get(&self) -> Value {
+        // SAFETY: VM re-entry and GC run on one mutator thread. This short read
+        // never spans a VM call or safepoint.
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
+    fn set(&self, value: Value) {
+        // SAFETY: same single-mutator contract as `get`; no reference into the
+        // slot escapes this non-allocating store.
+        unsafe { *self.0.get() = value };
+    }
+
+    fn trace(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        // SAFETY: the collector is the only writer while this callback runs;
+        // all ordinary state operations are short and cannot trigger GC.
+        unsafe { (&mut *self.0.get()).trace_value_slot_mut(visitor) };
+    }
+}
+
+pub(crate) struct SyncJsCallRoots {
+    interp_roots: Option<otter_gc::ExtraRoots>,
+    current: JsCallRootSlot,
+    receiver: JsCallRootSlot,
+    new_target: JsCallRootSlot,
+    args: UnsafeCell<SmallVec<[Value; 8]>>,
+    scratch_0: JsCallRootSlot,
+    scratch_1: JsCallRootSlot,
+}
+
+impl SyncJsCallRoots {
+    pub(crate) fn call(
+        interp: &Interpreter,
+        current: Value,
+        receiver: Value,
+        args: SmallVec<[Value; 8]>,
+        include_interpreter: bool,
+    ) -> Self {
+        Self {
+            interp_roots: include_interpreter
+                .then(|| otter_gc::ExtraRoots::new::<Interpreter>(interp)),
+            current: JsCallRootSlot::new(current),
+            receiver: JsCallRootSlot::new(receiver),
+            new_target: JsCallRootSlot::new(Value::undefined()),
+            args: UnsafeCell::new(args),
+            scratch_0: JsCallRootSlot::new(Value::undefined()),
+            scratch_1: JsCallRootSlot::new(Value::undefined()),
+        }
+    }
+
+    fn construct(
+        interp: &Interpreter,
+        current: Value,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
+        include_interpreter: bool,
+    ) -> Self {
+        Self {
+            interp_roots: include_interpreter
+                .then(|| otter_gc::ExtraRoots::new::<Interpreter>(interp)),
+            current: JsCallRootSlot::new(current),
+            receiver: JsCallRootSlot::new(Value::undefined()),
+            new_target: JsCallRootSlot::new(new_target),
+            args: UnsafeCell::new(args),
+            scratch_0: JsCallRootSlot::new(Value::undefined()),
+            scratch_1: JsCallRootSlot::new(Value::undefined()),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn target(&self) -> Value {
+        self.current.get()
+    }
+
+    pub(crate) fn receiver_value(&self) -> Value {
+        self.receiver.get()
+    }
+
+    pub(crate) fn set_receiver(&self, value: Value) {
+        self.receiver.set(value);
+    }
+
+    pub(crate) fn scratch(&self, index: usize) -> Value {
+        match index {
+            0 => self.scratch_0.get(),
+            1 => self.scratch_1.get(),
+            _ => unreachable!("synchronous call roots expose two scratch slots"),
+        }
+    }
+
+    pub(crate) fn set_scratch(&self, index: usize, value: Value) {
+        match index {
+            0 => self.scratch_0.set(value),
+            1 => self.scratch_1.set(value),
+            _ => unreachable!("synchronous call roots expose two scratch slots"),
+        }
+    }
+
+    pub(crate) fn args_len(&self) -> usize {
+        // SAFETY: this short read cannot allocate or overlap root tracing.
+        unsafe { (&*self.args.get()).len() }
+    }
+
+    pub(crate) fn replace_args(&self, args: SmallVec<[Value; 8]>) {
+        // SAFETY: short single-mutator write with no VM allocation.
+        unsafe { *self.args.get() = args };
+    }
+
+    pub(crate) fn take_args(&self) -> SmallVec<[Value; 8]> {
+        // SAFETY: the destination installs its own root provider before the
+        // first possible collection; moving the SmallVec itself cannot run GC.
+        unsafe { std::mem::take(&mut *self.args.get()) }
+    }
+}
+
+impl otter_gc::ExtraRootSource for SyncJsCallRoots {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        if let Some(interp_roots) = self.interp_roots {
+            interp_roots.visit(visitor);
+        }
+        self.current.trace(visitor);
+        self.receiver.trace(visitor);
+        self.new_target.trace(visitor);
+        self.scratch_0.trace(visitor);
+        self.scratch_1.trace(visitor);
+        // SAFETY: root tracing is the only operation active on this state while
+        // GC runs; ordinary reads/writes never hold a borrow across safepoints.
+        let args = self.args.get();
+        let (ptr, len) = unsafe { ((*args).as_mut_ptr(), (*args).len()) };
+        for index in 0..len {
+            unsafe { (&mut *ptr.add(index)).trace_value_slot_mut(visitor) };
+        }
+    }
 }
 
 impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
@@ -128,7 +278,6 @@ pub(crate) type BytecodeCallTargetParts = (
 pub(crate) struct LeanCallbackRoot {
     callback: Value,
     function_id: u32,
-    parent_upvalues: crate::frame_state::UpvalueSpine,
     bound_this: Option<Value>,
     bound_new_target: Option<Value>,
     bound_derived_this: Option<crate::UpvalueCell>,
@@ -141,7 +290,6 @@ impl LeanCallbackRoot {
             return Some(Self {
                 callback,
                 function_id,
-                parent_upvalues: Frame::empty_upvalues(),
                 bound_this: None,
                 bound_new_target: None,
                 bound_derived_this: None,
@@ -150,33 +298,39 @@ impl LeanCallbackRoot {
         }
         let closure = callback.as_closure(heap)?;
         let function_id = closure.function_id();
-        let (parent_upvalues, bound_this, bound_new_target, bound_derived_this, eval_env) = heap
-            .read_payload(closure.handle, |body| {
-                (
-                    body.upvalues.clone().into_boxed_slice(),
-                    body.bound_this_option(),
-                    body.bound_new_target_option(),
-                    body.bound_derived_this_option(),
-                    body.eval_env_option(),
-                )
-            });
+        let state = closure.call_state(heap);
         Some(Self {
             callback,
             function_id,
-            parent_upvalues,
-            bound_this,
-            bound_new_target,
-            bound_derived_this,
-            eval_env,
+            bound_this: state.bound_this,
+            bound_new_target: state.bound_new_target,
+            bound_derived_this: state.bound_derived_this,
+            eval_env: state.eval_env,
         })
+    }
+
+    /// Re-read the allocation-neutral captured spine from the currently traced
+    /// callback value. The callback root keeps the closure allocation alive and
+    /// is relocation-refreshed between builtin elements.
+    fn upvalue_source(
+        &self,
+        heap: &otter_gc::GcHeap,
+    ) -> Result<crate::upvalue_source::UpvalueSource, VmError> {
+        if self.callback.as_function().is_some() {
+            return Ok(crate::upvalue_source::UpvalueSource::empty());
+        }
+        let closure = self
+            .callback
+            .as_closure(heap)
+            .ok_or(VmError::InvalidOperand)?;
+        if closure.function_id() != self.function_id {
+            return Err(VmError::InvalidOperand);
+        }
+        Ok(closure.call_state(heap).upvalues)
     }
 
     pub(crate) fn trace_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.callback.trace_value_slots(visitor);
-        for slot in self.parent_upvalues.iter() {
-            let p = slot as *const crate::UpvalueCell as *mut RawGc;
-            visitor(p);
-        }
         if let Some(value) = &self.bound_this {
             value.trace_value_slots(visitor);
         }
@@ -237,9 +391,9 @@ impl Interpreter {
     ) -> Option<crate::UpvalueCell> {
         self.lean_callback_roots
             .get(state.root_index)?
-            .parent_upvalues
-            .get(idx)
-            .copied()
+            .upvalue_source(&self.gc_heap)
+            .ok()?
+            .read(idx)
     }
 
     /// §9.1 — install the frame's direct-eval variable environment:
@@ -254,8 +408,15 @@ impl Interpreter {
         inherited: Option<crate::eval_env::EvalEnvHandle>,
     ) -> Result<(), VmError> {
         if function.contains_direct_eval {
-            let env = crate::eval_env::alloc_eval_env(&mut self.gc_heap, inherited)
-                .map_err(crate::oom_to_vm)?;
+            let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                frame.trace_frame_slots(visitor);
+            };
+            let env = crate::eval_env::alloc_eval_env_with_roots(
+                &mut self.gc_heap,
+                inherited,
+                &mut frame_roots,
+            )
+            .map_err(crate::oom_to_vm)?;
             self.frame_ensure_cold(frame).eval_env = Some(env);
         } else if inherited.is_some() {
             self.frame_ensure_cold(frame).eval_env = inherited;
@@ -583,7 +744,7 @@ impl Interpreter {
         self.record_runtime_native_call();
         // Same root coverage as the call path (`invoke_native_call_with_roots`):
         // trace the interpreter's full root set (crucially the scope-handle
-        // arena, so a native constructor's `scoped_*` handles stay live) and
+        // arena, so a native constructor's `Local` handles stay live) and
         // pin `this`, `new.target`, and the argument slice across every
         // scavenge the constructor triggers. Without this a native `new X(…)`
         // ran fully unrooted — e.g. `new Set([...])` stranded its iterable.
@@ -2078,9 +2239,11 @@ impl Interpreter {
         // inner body allocates (upvalue spines, `this` boxing) before
         // `dispatch_loop` registers frame roots — so the runtime
         // roots must be registered for the whole call.
-        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
-        let result = self.run_callable_sync_inner(context, callee, this_value, args);
+        let roots = SyncJsCallRoots::call(self, *callee, this_value, args, true);
+        let extra_roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.run_callable_sync_inner(context, &roots);
         drop(extra_roots_guard);
         self.leave_sync_reentry();
         result
@@ -2108,7 +2271,12 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
         self.enter_sync_reentry()?;
-        let result = self.run_callable_sync_inner(context, callee, this_value, args);
+        let roots = SyncJsCallRoots::call(self, *callee, this_value, args, false);
+        let roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.run_callable_sync_inner(context, &roots);
+        drop(roots_guard);
         self.leave_sync_reentry();
         result
     }
@@ -2116,13 +2284,8 @@ impl Interpreter {
     fn run_callable_sync_inner(
         &mut self,
         context: &ExecutionContext,
-        callee: &Value,
-        this_value: Value,
-        args: SmallVec<[Value; 8]>,
+        roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
-        let mut current = *callee;
-        let mut effective_this = this_value;
-        let mut effective_args = args;
         let mut hops: u32 = 0;
         loop {
             if hops >= self.max_stack_depth {
@@ -2130,22 +2293,23 @@ impl Interpreter {
                     limit: self.max_stack_depth,
                 });
             }
-            if let Some(bound) = current.as_bound_function() {
+            if let Some(bound) = roots.current.get().as_bound_function() {
                 hops += 1;
                 let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
+                let effective_args = roots.take_args();
                 let mut combined: SmallVec<[Value; 8]> =
                     SmallVec::with_capacity(bound_args.len() + effective_args.len());
                 combined.extend(bound_args);
                 combined.extend(effective_args);
-                effective_this = bound_this;
-                effective_args = combined;
-                current = target;
-            } else if current.as_class_constructor().is_some() {
+                roots.receiver.set(bound_this);
+                roots.replace_args(combined);
+                roots.current.set(target);
+            } else if roots.current.get().as_class_constructor().is_some() {
                 // §10.3.1 — class constructors reject [[Call]].
                 return Err(self.err_type(
                     ("Class constructor cannot be invoked without 'new'".to_string()).into(),
                 ));
-            } else if let Some(proxy) = current.as_proxy() {
+            } else if let Some(proxy) = roots.current.get().as_proxy() {
                 // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
                 // fall through to target.[[Call]] when the trap is
                 // absent.
@@ -2156,29 +2320,45 @@ impl Interpreter {
                     ));
                 }
                 hops += 1;
-                let handler = proxy.handler(&self.gc_heap);
+                roots.scratch_0.set(proxy.handler(&self.gc_heap));
                 let trap_key = VmPropertyKey::String("apply");
-                let trap_value =
+                let trap_value = {
+                    let handler = roots.scratch_0.get();
                     match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
                         VmGetOutcome::Value(value) => value,
                         VmGetOutcome::InvokeGetter { getter } => {
+                            let handler = roots.scratch_0.get();
                             self.run_callable_sync(context, &getter, handler, SmallVec::new())?
                         }
-                    };
+                    }
+                };
+                roots.scratch_1.set(trap_value);
                 if self.is_callable_runtime(&trap_value) {
+                    let effective_args = roots.take_args();
+                    let current = roots.current.get();
+                    let effective_this = roots.receiver.get();
+                    let handler = roots.scratch_0.get();
+                    let trap_value = roots.scratch_1.get();
                     let argv_array = self.alloc_runtime_rooted_array_from_values(
-                        effective_args.iter().cloned(),
+                        effective_args.iter().copied(),
                         &[&current, &effective_this, &handler, &trap_value],
                         &[effective_args.as_slice()],
                     )?;
+                    let proxy = roots.current.get().as_proxy().ok_or(VmError::NotCallable)?;
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         proxy.target(&self.gc_heap),
-                        effective_this,
+                        roots.receiver.get(),
                         Value::array(argv_array),
                     ];
-                    return self.run_callable_sync(context, &trap_value, handler, trap_args);
+                    return self.run_callable_sync(
+                        context,
+                        &roots.scratch_1.get(),
+                        roots.scratch_0.get(),
+                        trap_args,
+                    );
                 } else if trap_value.is_undefined() || trap_value.is_null() {
-                    current = proxy.target(&self.gc_heap);
+                    let proxy = roots.current.get().as_proxy().ok_or(VmError::NotCallable)?;
+                    roots.current.set(proxy.target(&self.gc_heap));
                 } else {
                     return Err(
                         self.err_type(("Proxy apply trap is not callable".to_string()).into())
@@ -2188,54 +2368,55 @@ impl Interpreter {
                 break;
             }
         }
-        if let Some(obj) = current.as_object()
+        if let Some(obj) = roots.current.get().as_object()
             && let Some(native) =
                 crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
             self.record_runtime_native_call();
             let realm_global = native.realm_global(&self.gc_heap);
+            let current = roots.current.get();
+            let receiver = roots.receiver.get();
+            let args = roots.take_args();
             return invoke_native_call_with_roots(
                 self,
                 context,
                 call,
                 realm_global,
-                effective_this,
+                receiver,
                 &[&current],
-                effective_args.as_slice(),
+                args.as_slice(),
             );
         }
-        if let Some(native) = current.as_native_function() {
+        if let Some(native) = roots.current.get().as_native_function() {
             let native = &native;
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                return self.run_vm_intrinsic_sync(
-                    context,
-                    intrinsic,
-                    effective_this,
-                    effective_args,
-                );
+                let receiver = roots.receiver.get();
+                let args = roots.take_args();
+                return self.run_vm_intrinsic_sync(context, intrinsic, receiver, args);
             }
             self.record_runtime_native_call();
             let realm_global = native.realm_global(&self.gc_heap);
+            let current = roots.current.get();
+            let receiver = roots.receiver.get();
+            let args = roots.take_args();
             return invoke_native_call_with_roots(
                 self,
                 context,
                 call,
                 realm_global,
-                effective_this,
+                receiver,
                 &[&current],
-                effective_args.as_slice(),
+                args.as_slice(),
             );
         }
         let mut inner = self.draw_stack();
-        let result = self.run_bytecode_callable_committed(
-            &mut inner,
-            context,
-            current,
-            effective_this,
-            effective_args,
-        );
+        let current = roots.current.get();
+        let receiver = roots.receiver.get();
+        let args = roots.take_args();
+        let result =
+            self.run_bytecode_callable_committed(&mut inner, context, current, receiver, args);
         self.return_stack(inner);
         result
     }
@@ -2279,7 +2460,7 @@ impl Interpreter {
         let register_count = function.register_count as usize;
         let param_count = function.param_count as usize;
         let this_passthrough = function.is_strict || function.is_arrow;
-        let has_parent_upvalues = !root.parent_upvalues.is_empty();
+        let has_parent_upvalues = !root.upvalue_source(&self.gc_heap).ok()?.is_empty();
         // A callback with no bound `new.target` / derived-`this` cell / captured
         // eval environment needs no pooled cold record, so its per-element frame
         // is a flat register window the prepared fast path can recycle in place.
@@ -2340,14 +2521,31 @@ impl Interpreter {
         effective_this: Value,
         effective_args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
-        let (
-            function_id,
-            parent_upvalues,
-            this_for_callee,
-            new_target_for_callee,
-            derived_this_cell,
-            callee_eval_env,
-        ) = Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
+        // The caller transfers its argument buffer with `mem::take`, so its
+        // provider deliberately stops tracing those slots. Install the callee
+        // entry provider before even inspecting the target; it owns the moved
+        // buffer until the completed frame takes it at the terminal hand-off.
+        let roots = SyncJsCallRoots::call(self, current, effective_this, effective_args, true);
+        let roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.run_bytecode_callable_committed_rooted(inner, context, &roots);
+        drop(roots_guard);
+        result
+    }
+
+    fn run_bytecode_callable_committed_rooted(
+        &mut self,
+        inner: &mut HoltStack,
+        context: &ExecutionContext,
+        roots: &SyncJsCallRoots,
+    ) -> Result<Value, VmError> {
+        let (function_id, _, this_for_callee, _, _, _) = Self::bytecode_call_target_parts(
+            roots.target(),
+            roots.receiver_value(),
+            &self.gc_heap,
+        )?;
+        roots.set_receiver(this_for_callee);
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -2365,33 +2563,48 @@ impl Interpreter {
         let async_result_promise = if is_plain_async {
             Some(
                 promise_dispatch::PromiseBuilder::with_context(context.clone())
-                    .pending_stack_rooted(
-                        self,
-                        inner,
-                        &[&this_for_callee],
-                        &[effective_args.as_slice()],
-                    )?,
+                    .pending_stack_rooted(self, inner, &[], &[])?,
             )
         } else {
             None
         };
+        // The promise allocation above can relocate closure-owned cells. Read
+        // the target parts again from the registered target instead of using a
+        // detached pre-allocation snapshot.
+        let (_, _, this_for_callee, _, _, _) = Self::bytecode_call_target_parts(
+            roots.target(),
+            roots.receiver_value(),
+            &self.gc_heap,
+        )?;
+        roots.set_receiver(this_for_callee);
+        let this_for_callee =
+            self.this_for_bytecode_call_runtime_rooted(function, roots.receiver_value(), &[])?;
+        roots.set_receiver(this_for_callee);
+        let (_, parent_upvalues, _, _, _, _) = Self::bytecode_call_target_parts(
+            roots.target(),
+            roots.receiver_value(),
+            &self.gc_heap,
+        )?;
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
-        let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
-            function,
-            this_for_callee,
-            &[effective_args.as_slice()],
-        )?;
+        // Building own upvalue cells can collect as well; refresh every
+        // closure-owned optional handle before installing it on the frame.
+        let (_, _, _, new_target_for_callee, derived_this_cell, callee_eval_env) =
+            Self::bytecode_call_target_parts(
+                roots.target(),
+                roots.receiver_value(),
+                &self.gc_heap,
+            )?;
         let _window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
         let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             None,
             upvalues,
-            this_for_callee,
+            roots.receiver_value(),
             window,
         );
-        new_frame.self_value = current;
+        new_frame.self_value = roots.target();
         if let Some(result_promise) = async_result_promise {
             self.frame_set_async_state(
                 &mut new_frame,
@@ -2407,7 +2620,7 @@ impl Interpreter {
             cold.derived_this_cell = Some(cell);
         }
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
-        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        self.bind_bytecode_call_arguments(function, &mut new_frame, roots.take_args())?;
         // §27.5.1 GeneratorFunction call evaluation returns a
         // generator object without executing the body. `invoke`
         // handles this for opcode calls; the synchronous re-entry
@@ -2450,7 +2663,7 @@ impl Interpreter {
             // the same object later `fn.prototype` reads observe.
             let proto = self.function_property_get_runtime_rooted(
                 context,
-                current.as_closure(&self.gc_heap),
+                roots.target().as_closure(&self.gc_heap),
                 function_id,
                 "prototype",
                 &[],
@@ -2551,12 +2764,12 @@ impl Interpreter {
         // traced, so its captured upvalues / receiver could be relocated by a
         // moving collection the builtin triggers between elements. Reading them
         // back from `lean_callback_roots` (which IS traced) keeps them current.
-        let (self_value, bound_this) = {
+        let bound_this = {
             let root = self
                 .lean_callback_roots
                 .get(state.root_index)
                 .ok_or(VmError::InvalidOperand)?;
-            (root.callback, root.bound_this.unwrap_or(effective_this))
+            root.bound_this.unwrap_or(effective_this)
         };
         // The builtin passes a constant receiver across the whole loop, so the
         // §10.2 sloppy-`this` coercion is computed once and reused.
@@ -2580,6 +2793,16 @@ impl Interpreter {
             }
         };
         let register_count = state.register_count;
+        // Receiver coercion may collect. Re-read both exact SELF and the stable
+        // source from the traced root afterwards; no cloned spine is parked in
+        // the root stack.
+        let (self_value, parent_upvalues) = {
+            let root = self
+                .lean_callback_roots
+                .get(state.root_index)
+                .ok_or(VmError::InvalidOperand)?;
+            (root.callback, root.upvalue_source(&self.gc_heap)?)
+        };
         let mut frame = match state.reuse_frame.take() {
             Some(mut frame) => {
                 debug_assert_eq!(frame.registers.len(), register_count);
@@ -2588,16 +2811,7 @@ impl Interpreter {
                 frame.self_value = self_value;
                 frame.this_value = this_for_callee;
                 if state.has_parent_upvalues {
-                    let root = self
-                        .lean_callback_roots
-                        .get(state.root_index)
-                        .ok_or(VmError::InvalidOperand)?;
-                    if frame.upvalues.len() != root.parent_upvalues.len() {
-                        return Err(VmError::InvalidOperand);
-                    }
-                    frame
-                        .upvalues
-                        .copy_from_slice(root.parent_upvalues.as_ref());
+                    parent_upvalues.copy_into(frame.upvalues.as_mut())?;
                 }
                 frame
             }
@@ -2605,20 +2819,12 @@ impl Interpreter {
                 let function = context
                     .exec_function(state.function_id)
                     .ok_or(VmError::InvalidOperand)?;
+                debug_assert_eq!(function.own_upvalue_count, 0);
                 let window = self.alloc_reg_window(register_count)?;
-                let parent_upvalues = if state.has_parent_upvalues {
-                    self.lean_callback_roots
-                        .get(state.root_index)
-                        .ok_or(VmError::InvalidOperand)?
-                        .parent_upvalues
-                        .clone()
-                } else {
-                    Frame::empty_upvalues()
-                };
                 let mut frame = Frame::with_exec_return_upvalues_and_this(
                     function,
                     None,
-                    parent_upvalues,
+                    parent_upvalues.copy_owned(),
                     this_for_callee,
                     window,
                 );
@@ -2692,28 +2898,12 @@ impl Interpreter {
         effective_args: &[Value],
         probe: bool,
     ) -> Result<Value, VmError> {
-        let (
-            self_value,
-            function_id,
-            parent_upvalues,
-            this_for_callee,
-            new_target_for_callee,
-            derived_this_cell,
-            callee_eval_env,
-        ) = {
+        let (function_id, this_for_callee) = {
             let root = self
                 .lean_callback_roots
                 .get(state.root_index)
                 .ok_or(VmError::InvalidOperand)?;
-            (
-                root.callback,
-                root.function_id,
-                root.parent_upvalues.clone(),
-                root.bound_this.unwrap_or(effective_this),
-                root.bound_new_target,
-                root.bound_derived_this,
-                root.eval_env,
-            )
+            (root.function_id, root.bound_this.unwrap_or(effective_this))
         };
         let function = context
             .exec_function(function_id)
@@ -2729,13 +2919,55 @@ impl Interpreter {
                 && !function.is_derived_constructor,
             "lean callback eligibility must be checked before the loop"
         );
-        let upvalues =
-            Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee = self.this_for_bytecode_call_runtime_rooted(
             function,
             this_for_callee,
             &[effective_args],
         )?;
+        // Coercion may collect; reload every closure-derived value and source
+        // from the traced root before allocating fresh cells/materializing.
+        let (
+            mut self_value,
+            parent_upvalues,
+            new_target_for_callee,
+            mut derived_this_cell,
+            mut callee_eval_env,
+        ) = {
+            let root = self
+                .lean_callback_roots
+                .get(state.root_index)
+                .ok_or(VmError::InvalidOperand)?;
+            (
+                root.callback,
+                root.upvalue_source(&self.gc_heap)?,
+                root.bound_new_target,
+                root.bound_derived_this,
+                root.eval_env,
+            )
+        };
+        let mut rooted_this = this_for_callee;
+        let mut rooted_new_target = new_target_for_callee;
+        let mut build_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            self_value.trace_value_slot_mut(visitor);
+            rooted_this.trace_value_slot_mut(visitor);
+            if let Some(value) = &mut rooted_new_target {
+                value.trace_value_slot_mut(visitor);
+            }
+            if let Some(cell) = &mut derived_this_cell {
+                visitor(cell as *mut crate::UpvalueCell as *mut RawGc);
+            }
+            if let Some(env) = &mut callee_eval_env {
+                visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
+            }
+        };
+        let upvalues = Frame::build_upvalues_for_exec_from_source_with_roots(
+            &mut self.gc_heap,
+            function,
+            parent_upvalues,
+            &mut build_roots,
+        )?;
+        let this_for_callee = rooted_this;
+        let new_target_for_callee = rooted_new_target;
         let _window_rollback = self.register_window_rollback();
         let window = self.alloc_reg_window(function.register_count as usize)?;
         let mut new_frame = Frame::with_exec_return_upvalues_and_this(
@@ -2783,9 +3015,11 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         self.enter_sync_reentry()?;
         // Same rooting contract as [`Self::run_callable_sync`].
-        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
-        let result = self.run_construct_sync_inner(context, target, new_target, args);
+        let roots = SyncJsCallRoots::construct(self, *target, new_target, args, true);
+        let extra_roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.run_construct_sync_inner(context, &roots);
         drop(extra_roots_guard);
         self.leave_sync_reentry();
         result
@@ -2812,7 +3046,12 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
         self.enter_sync_reentry()?;
-        let result = self.run_construct_sync_inner(context, target, new_target, args);
+        let roots = SyncJsCallRoots::construct(self, *target, new_target, args, false);
+        let roots_guard = self
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let result = self.run_construct_sync_inner(context, &roots);
+        drop(roots_guard);
         self.leave_sync_reentry();
         result
     }
@@ -2820,14 +3059,9 @@ impl Interpreter {
     fn run_construct_sync_inner(
         &mut self,
         context: &ExecutionContext,
-        target: &Value,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
+        roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
         self.record_runtime_construct_call();
-        let mut current = *target;
-        let mut effective_new_target = new_target;
-        let mut effective_args = args;
         let mut hops: u32 = 0;
         loop {
             if hops >= self.max_stack_depth {
@@ -2835,19 +3069,24 @@ impl Interpreter {
                     limit: self.max_stack_depth,
                 });
             }
-            if let Some(bound) = current.as_bound_function() {
+            if let Some(bound) = roots.current.get().as_bound_function() {
                 hops += 1;
                 let (next_target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
+                let effective_args = roots.take_args();
                 let mut combined: SmallVec<[Value; 8]> =
                     SmallVec::with_capacity(bound_args.len() + effective_args.len());
                 combined.extend(bound_args);
                 combined.extend(effective_args);
-                if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
-                    effective_new_target = next_target;
+                if abstract_ops::same_value(
+                    &roots.current.get(),
+                    &roots.new_target.get(),
+                    &self.gc_heap,
+                ) {
+                    roots.new_target.set(next_target);
                 }
-                current = next_target;
-                effective_args = combined;
-            } else if let Some(proxy) = current.as_proxy() {
+                roots.current.set(next_target);
+                roots.replace_args(combined);
+            } else if let Some(proxy) = roots.current.get().as_proxy() {
                 // §10.5.13 Proxy [[Construct]].
                 if proxy.is_revoked(&self.gc_heap) {
                     return Err(self.err_type(
@@ -2856,19 +3095,31 @@ impl Interpreter {
                     ));
                 }
                 hops += 1;
-                let handler = proxy.handler(&self.gc_heap);
+                roots.scratch_0.set(proxy.handler(&self.gc_heap));
                 let trap_key = VmPropertyKey::String("construct");
-                let trap_value =
+                let trap_value = {
+                    let handler = roots.scratch_0.get();
                     match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
                         VmGetOutcome::Value(value) => value,
                         VmGetOutcome::InvokeGetter { getter } => {
+                            let handler = roots.scratch_0.get();
                             self.run_callable_sync(context, &getter, handler, SmallVec::new())?
                         }
-                    };
+                    }
+                };
+                roots.scratch_1.set(trap_value);
                 if self.is_callable_runtime(&trap_value) {
-                    let target_value = proxy.target(&self.gc_heap);
+                    let current = roots.current.get();
+                    let target_value = current
+                        .as_proxy()
+                        .ok_or(VmError::NotCallable)?
+                        .target(&self.gc_heap);
+                    let effective_new_target = roots.new_target.get();
+                    let handler = roots.scratch_0.get();
+                    let trap_value = roots.scratch_1.get();
+                    let effective_args = roots.take_args();
                     let argv_array = self.alloc_runtime_rooted_array_from_values(
-                        effective_args.iter().cloned(),
+                        effective_args.iter().copied(),
                         &[
                             &current,
                             &target_value,
@@ -2881,10 +3132,14 @@ impl Interpreter {
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         target_value,
                         Value::array(argv_array),
-                        effective_new_target,
+                        roots.new_target.get(),
                     ];
-                    let result =
-                        self.run_callable_sync(context, &trap_value, handler, trap_args)?;
+                    let result = self.run_callable_sync(
+                        context,
+                        &roots.scratch_1.get(),
+                        roots.scratch_0.get(),
+                        trap_args,
+                    )?;
                     if !result.is_object_type() {
                         return Err(self.err_type(
                             ("Proxy construct trap returned non-object".to_string()).into(),
@@ -2892,7 +3147,8 @@ impl Interpreter {
                     }
                     return Ok(result);
                 } else if trap_value.is_undefined() || trap_value.is_null() {
-                    current = proxy.target(&self.gc_heap);
+                    let proxy = roots.current.get().as_proxy().ok_or(VmError::NotCallable)?;
+                    roots.current.set(proxy.target(&self.gc_heap));
                 } else {
                     return Err(
                         self.err_type(("Proxy construct trap is not callable".to_string()).into())
@@ -2903,16 +3159,18 @@ impl Interpreter {
             }
         }
 
-        if let Some(native) = self.native_promise_constructor(&current) {
+        let effective_args = roots.take_args();
+        if let Some(native) = self.native_promise_constructor(&roots.current.get()) {
+            let new_target = roots.new_target.get();
             return self.invoke_native_construct(
                 context,
                 native,
                 &Value::undefined(),
-                &effective_new_target,
+                &new_target,
                 effective_args.as_slice(),
             );
         }
-        if let Some(native) = current.as_native_function()
+        if let Some(native) = roots.current.get().as_native_function()
             && matches!(
                 native.name(&self.gc_heap),
                 "ArrayBuffer"
@@ -2932,15 +3190,18 @@ impl Interpreter {
                     | "BigUint64Array"
             )
         {
+            let new_target = roots.new_target.get();
             return self.invoke_native_construct(
                 context,
                 native,
                 &Value::undefined(),
-                &effective_new_target,
+                &new_target,
                 effective_args.as_slice(),
             );
         }
 
+        let current = roots.current.get();
+        let effective_new_target = roots.new_target.get();
         let mut proto = self.construct_prototype_for_callee_runtime_rooted(
             context,
             &effective_new_target,
@@ -2948,7 +3209,9 @@ impl Interpreter {
             &[effective_args.as_slice()],
         )?;
         if proto.is_none()
-            && current
+            && roots
+                .current
+                .get()
                 .as_native_function()
                 .is_some_and(|native| native.name(&self.gc_heap) == "Date")
         {
@@ -2962,6 +3225,8 @@ impl Interpreter {
         // becomes the receiver's `[[Prototype]]`.
         let proto_anchor = proto.map(|value| self.push_iteration_anchor(value) - 1);
         let receiver = {
+            let current = roots.current.get();
+            let effective_new_target = roots.new_target.get();
             let mut value_roots: SmallVec<[&Value; 4]> =
                 smallvec::smallvec![&current, &effective_new_target];
             if let Some(proto_value) = proto.as_ref() {
@@ -2979,49 +3244,57 @@ impl Interpreter {
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         }
-        let this_value = Value::object(receiver);
+        roots.receiver.set(Value::object(receiver));
 
-        if let Some(obj) = current.as_object()
+        if let Some(obj) = roots.current.get().as_object()
             && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
                 .and_then(|v| v.as_native_function())
         {
+            let this_value = roots.receiver.get();
+            let new_target = roots.new_target.get();
             return self.invoke_native_construct(
                 context,
                 native,
                 &this_value,
-                &effective_new_target,
+                &new_target,
                 effective_args.as_slice(),
             );
         }
-        if let Some(native) = current.as_native_function() {
+        if let Some(native) = roots.current.get().as_native_function() {
+            let this_value = roots.receiver.get();
+            let new_target = roots.new_target.get();
             return self.invoke_native_construct(
                 context,
                 native,
                 &this_value,
-                &effective_new_target,
+                &new_target,
                 effective_args.as_slice(),
             );
         }
-        if let Some(class) = current.as_class_constructor()
+        if let Some(class) = roots.current.get().as_class_constructor()
             && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
         {
+            let this_value = roots.receiver.get();
+            let new_target = roots.new_target.get();
             return self.invoke_native_construct(
                 context,
                 native,
                 &this_value,
-                &effective_new_target,
+                &new_target,
                 effective_args.as_slice(),
             );
         }
-        if let Some(class) = current.as_class_constructor() {
-            current = class.ctor(&self.gc_heap);
+        if let Some(class) = roots.current.get().as_class_constructor() {
+            roots.current.set(class.ctor(&self.gc_heap));
         }
 
+        let current = roots.current.get();
+        let new_target = roots.new_target.get();
         let new_frame = self.build_construct_bytecode_frame(
             context,
             current,
             receiver,
-            effective_new_target,
+            new_target,
             effective_args,
             None,
         )?;

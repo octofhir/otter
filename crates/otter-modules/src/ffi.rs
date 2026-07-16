@@ -220,10 +220,10 @@ fn open_library(
     // raw handle across the object alloc. The scope parks each handle so a
     // moving collection can never strand it.
     let path_text = library.path().display().to_string();
-    ctx.scope(|ctx, s| {
-        let object = ctx.scoped_object(s)?;
-        let path_value = ctx.scoped_string(s, &path_text)?;
-        ctx.scoped_define_data(s, object, "path", path_value, Attr::data().to_flags())?;
-        Ok::<Value, NativeError>(ctx.escape(object))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let path_value = scope.string(&path_text)?;
+        scope.define(object, "path", path_value, Attr::data().to_flags())?;
+        Ok::<Value, NativeError>(scope.finish(object))
     })
 }

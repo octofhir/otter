@@ -70,7 +70,8 @@ use otter_vm::deopt::{DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptTa
 use otter_vm::native_abi::{
     FrameMap, NO_FRAME_STATE, STUB_JIT_CALL_METHOD_GENERIC, STUB_JIT_CONSTRUCT,
     STUB_JIT_BACKEDGE_POLL, STUB_JIT_DEOPT_REIFY_FRAME, STUB_JIT_MATH_CALL,
-    STUB_JIT_CALL_GENERIC, STUB_JIT_PREPARE_DIRECT_CALL, STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
+    STUB_JIT_CALL_GENERIC, STUB_JIT_LOAD_UPVALUE, STUB_JIT_PREPARE_DIRECT_CALL,
+    STUB_JIT_PREPARE_DIRECT_METHOD_CALL,
     STUB_JIT_LOAD_ELEMENT, STUB_JIT_LOAD_GLOBAL, STUB_JIT_LOAD_PROP_WINDOW, STUB_JIT_LOOSE_EQ,
     STUB_JIT_STORE_ELEMENT, STUB_JIT_STORE_PROP_WINDOW, SafepointId, SafepointRecord,
 };
@@ -104,17 +105,18 @@ use crate::{
     },
 };
 
-const ALLOCATABLE_REGISTER_COUNT: u8 = 4;
+const ALLOCATABLE_REGISTER_COUNT: u8 = 8;
 const REGISTER_BUDGET: RegisterBudget = RegisterBudget {
     gpr: ALLOCATABLE_REGISTER_COUNT,
     fp: 8,
 };
-const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] = [21, 22, 23, 24];
+const VALUE_REGISTERS: [u8; ALLOCATABLE_REGISTER_COUNT as usize] =
+    [21, 22, 23, 24, 25, 26, 27, 28];
 const FP_REGISTERS: [u8; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
 const FP_SCRATCH: u8 = 16;
 const FP_SCRATCH_2: u8 = 17;
 const STACK_SLOT_BYTES: u32 = 8;
-const MAX_SPILL_FRAME_BYTES: u32 = 4080;
+const MAX_SPILL_FRAME_BYTES: u32 = 1 << 20;
 const MAX_PARAMETER_OFFSET: u32 = 32_760;
 
 #[derive(Debug, Clone, Copy)]
@@ -209,6 +211,8 @@ struct EmissionPlan<'a> {
     prepare_direct_call_entry: u64,
     /// Completes an ineligible plain call in place.
     call_generic_entry: u64,
+    /// Reads one captured binding into a window slot; TDZ reads throw.
+    load_upvalue_entry: u64,
     /// Hook-lifetime transition inventory for the shared direct-call tail.
     transitions: &'a TransitionTable,
     /// Owning function id, baked into property/global transitions so the stub
@@ -338,6 +342,7 @@ pub(super) fn compile_with_transitions(
                 .entry(STUB_JIT_PREPARE_DIRECT_METHOD_CALL),
             prepare_direct_call_entry: transitions.entry(STUB_JIT_PREPARE_DIRECT_CALL),
             call_generic_entry: transitions.entry(STUB_JIT_CALL_GENERIC),
+            load_upvalue_entry: transitions.variadic_entry(STUB_JIT_LOAD_UPVALUE),
             transitions,
             function_id: u64::from(view.code_block.id),
         },
@@ -1029,6 +1034,21 @@ fn check_eligibility(
                         ));
                     }
                 }
+                // A captured-binding read is a leaf: it reaches the upvalue
+                // cell through pointers, never allocates or runs JS, and only
+                // a TDZ read throws. No safepoint or materialization is owed;
+                // the destination reloads from the window after the call.
+                Op::LoadUpvalue => {
+                    let result = instruction
+                        .result
+                        .ok_or(Unsupported::OperandShape("upvalue-load result"))?;
+                    if reprs.representation(result) != Representation::Tagged
+                        || instruction.result_register.is_none()
+                        || !instruction.inputs.is_empty()
+                    {
+                        return Err(Unsupported::Opcode(instruction.op));
+                    }
+                }
                 Op::Jump => {
                     if instruction.result.is_some() || !instruction.inputs.is_empty() {
                         return Err(Unsupported::OperandShape("optimizing jump shape"));
@@ -1585,6 +1605,7 @@ fn emit(
         prepare_direct_method_entry,
         prepare_direct_call_entry,
         call_generic_entry,
+        load_upvalue_entry,
         transitions,
         function_id,
     } = plan;
@@ -1605,7 +1626,14 @@ fn emit(
         ; mov x20, x0
         ; ldr x19, [x20]
     );
+    // Entry seeds initialize at their own defining block, not at the unit
+    // entry: a spliced frame's seeds come alive only when control reaches that
+    // frame, and their registers may legitimately be reused from values that
+    // are still live at the unit entry.
     for value in &ssa.values {
+        if value.def_block != cfg.entry {
+            continue;
+        }
         match value.def {
             ValueDef::Param { index, .. } => {
                 emit_load_parameter(&mut ops, index, 9);
@@ -1615,11 +1643,8 @@ fn emit(
                 emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
                 emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
             }
-            ValueDef::InlineUndefinedReturn { .. } => {
-                emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
-                emit_store_tagged_location(&mut ops, allocation.location(value.id), 9)?;
-            }
             ValueDef::ExceptionInput { .. }
+            | ValueDef::InlineUndefinedReturn { .. }
             | ValueDef::InlineResult { .. }
             | ValueDef::Phi { .. }
             | ValueDef::Op { .. } => {}
@@ -1637,6 +1662,21 @@ fn emit(
             allocation,
             &ssa.blocks[block_id.0 as usize].phis,
         )?;
+        if block_id != cfg.entry {
+            for &head in &ssa.blocks[block_id.0 as usize].phis {
+                if matches!(
+                    ssa.values[head.0 as usize].def,
+                    ValueDef::Uninitialized { .. } | ValueDef::InlineUndefinedReturn { .. }
+                ) {
+                    emit_load_u32(&mut ops, 9, otter_vm::Value::undefined().to_bits() as u32);
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation.location(head),
+                        9,
+                    )?;
+                }
+            }
+        }
         for instruction in &ssa.blocks[block_id.0 as usize].instrs {
             let guard_deopt = match eligibility
                 .guarded_uses
@@ -2289,6 +2329,42 @@ fn emit(
                     );
                     emit_reload_element_transition(&mut ops, allocation, site, None)?;
                     dynasm!(ops ; .arch aarch64 ; =>done);
+                }
+                Op::LoadUpvalue => {
+                    let dst = instruction
+                        .result_register
+                        .expect("eligibility checked upvalue-load destination");
+                    let index = view.instructions[instruction.pc as usize]
+                        .imm32(view.code_block.as_ref(), 1)
+                        .ok_or(Unsupported::OperandShape("upvalue-load index"))?;
+                    emit_load_u32(&mut ops, 9, instruction.pc);
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                        ; str w9, [x10, NATIVE_FRAME_PC_OFFSET]
+                        ; mov x0, x20
+                        ; movz x1, dst as u32
+                    );
+                    emit_load_u64(&mut ops, 2, u64::from(index as u32));
+                    emit_load_u64(&mut ops, 16, load_upvalue_entry);
+                    let succeeded = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; .arch aarch64
+                        ; blr x16
+                        ; cbz x0, =>succeeded
+                        ; b =>threw
+                        ; =>succeeded
+                    );
+                    emit_load_frame_register(&mut ops, u32::from(dst), 9)?;
+                    emit_store_tagged_location(
+                        &mut ops,
+                        allocation.location(
+                            instruction
+                                .result
+                                .expect("eligibility checked upvalue-load result"),
+                        ),
+                        9,
+                    )?;
                 }
                 Op::LoadGlobalOrThrow => {
                     let dst = instruction
@@ -3495,21 +3571,18 @@ fn emit_raw_move(
         (Location::Register(RegClass::Gpr, src), Location::Spill(RegClass::Gpr, dst)) => {
             let src = gpr_move_register(src)?;
             let offset = spill_offset(dst)?;
-            dynasm!(ops ; .arch aarch64 ; str X(src), [sp, offset]);
+            emit_sp_str_x(ops, src, offset);
         }
         (Location::Spill(RegClass::Gpr, src), Location::Register(RegClass::Gpr, dst)) => {
             let dst = gpr_move_register(dst)?;
             let offset = spill_offset(src)?;
-            dynasm!(ops ; .arch aarch64 ; ldr X(dst), [sp, offset]);
+            emit_sp_ldr_x(ops, dst, offset);
         }
         (Location::Spill(RegClass::Gpr, src), Location::Spill(RegClass::Gpr, dst)) => {
             let src_offset = spill_offset(src)?;
             let dst_offset = spill_offset(dst)?;
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr x9, [sp, src_offset]
-                ; str x9, [sp, dst_offset]
-            );
+            emit_sp_ldr_x(ops, 9, src_offset);
+            emit_sp_str_x(ops, 9, dst_offset);
         }
         (Location::Register(RegClass::Fp, src), Location::Register(RegClass::Fp, dst)) => {
             let src = fp_move_register(src)?;
@@ -3519,21 +3592,18 @@ fn emit_raw_move(
         (Location::Register(RegClass::Fp, src), Location::Spill(RegClass::Fp, dst)) => {
             let src = fp_move_register(src)?;
             let offset = fp_spill_offset(allocation, dst)?;
-            dynasm!(ops ; .arch aarch64 ; str D(src), [sp, offset]);
+            emit_sp_str_d(ops, src, offset);
         }
         (Location::Spill(RegClass::Fp, src), Location::Register(RegClass::Fp, dst)) => {
             let dst = fp_move_register(dst)?;
             let offset = fp_spill_offset(allocation, src)?;
-            dynasm!(ops ; .arch aarch64 ; ldr D(dst), [sp, offset]);
+            emit_sp_ldr_d(ops, dst, offset);
         }
         (Location::Spill(RegClass::Fp, src), Location::Spill(RegClass::Fp, dst)) => {
             let src_offset = fp_spill_offset(allocation, src)?;
             let dst_offset = fp_spill_offset(allocation, dst)?;
-            dynasm!(ops
-                ; .arch aarch64
-                ; ldr D(FP_SCRATCH_2), [sp, src_offset]
-                ; str D(FP_SCRATCH_2), [sp, dst_offset]
-            );
+            emit_sp_ldr_d(ops, FP_SCRATCH_2, src_offset);
+            emit_sp_str_d(ops, FP_SCRATCH_2, dst_offset);
         }
         _ => return Err(Unsupported::OperandShape("optimizing cross-class phi move")),
     }
@@ -3552,7 +3622,7 @@ fn emit_load_move_gpr(
         }
         Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
-            dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [sp, offset]);
+            emit_sp_ldr_x(ops, scratch, offset);
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape("optimizing non-GPR phi source"));
@@ -3573,7 +3643,7 @@ fn emit_store_move_gpr(
         }
         Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
-            dynasm!(ops ; .arch aarch64 ; str X(scratch), [sp, offset]);
+            emit_sp_str_x(ops, scratch, offset);
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape(
@@ -3597,7 +3667,7 @@ fn emit_load_move_fp(
         }
         Location::Spill(RegClass::Fp, slot) => {
             let offset = fp_spill_offset(allocation, slot)?;
-            dynasm!(ops ; .arch aarch64 ; ldr D(scratch), [sp, offset]);
+            emit_sp_ldr_d(ops, scratch, offset);
         }
         Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
             return Err(Unsupported::OperandShape("optimizing non-FP phi source"));
@@ -3619,7 +3689,7 @@ fn emit_store_move_fp(
         }
         Location::Spill(RegClass::Fp, slot) => {
             let offset = fp_spill_offset(allocation, slot)?;
-            dynasm!(ops ; .arch aarch64 ; str D(scratch), [sp, offset]);
+            emit_sp_str_d(ops, scratch, offset);
         }
         Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
             return Err(Unsupported::OperandShape(
@@ -3780,10 +3850,10 @@ fn emit_deopt_writeback(
                     Unsupported::OperandShape("optimizing negative deopt spill offset")
                 })?;
                 match slot.repr {
-                    DeoptRepr::Int32 => dynasm!(ops ; .arch aarch64 ; ldr w9, [sp, offset]),
-                    DeoptRepr::Tagged => dynasm!(ops ; .arch aarch64 ; ldr x9, [sp, offset]),
+                    DeoptRepr::Int32 => emit_sp_ldr_w(ops, 9, offset),
+                    DeoptRepr::Tagged => emit_sp_ldr_x(ops, 9, offset),
                     DeoptRepr::Float64 => {
-                        dynasm!(ops ; .arch aarch64 ; ldr D(FP_SCRATCH), [sp, offset]);
+                        emit_sp_ldr_d(ops, FP_SCRATCH, offset);
                     }
                 }
             }
@@ -3993,6 +4063,60 @@ fn aligned_spill_bytes(spill_slot_count: u32) -> Result<u32, Unsupported> {
     Ok(bytes)
 }
 
+/// Largest unsigned scaled immediate offset for a 64-bit `ldr`/`str`.
+const MAX_SP_IMM_OFFSET: u32 = 4095 * 8;
+
+/// `ldr X(reg), [sp, offset]` for any spill offset; big frames go through the
+/// `x12` scratch the same way window addressing does.
+fn emit_sp_ldr_x(ops: &mut Assembler, reg: u8, offset: u32) {
+    if offset <= MAX_SP_IMM_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; ldr X(reg), [sp, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; ldr X(reg), [sp, x12]);
+    }
+}
+
+/// `str X(reg), [sp, offset]` for any spill offset.
+fn emit_sp_str_x(ops: &mut Assembler, reg: u8, offset: u32) {
+    if offset <= MAX_SP_IMM_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; str X(reg), [sp, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; str X(reg), [sp, x12]);
+    }
+}
+
+/// `ldr W(reg), [sp, offset]` for any spill offset.
+fn emit_sp_ldr_w(ops: &mut Assembler, reg: u8, offset: u32) {
+    if offset <= MAX_SP_IMM_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; ldr W(reg), [sp, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; ldr W(reg), [sp, x12]);
+    }
+}
+
+/// `ldr D(reg), [sp, offset]` for any spill offset.
+fn emit_sp_ldr_d(ops: &mut Assembler, reg: u8, offset: u32) {
+    if offset <= MAX_SP_IMM_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; ldr D(reg), [sp, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; ldr D(reg), [sp, x12]);
+    }
+}
+
+/// `str D(reg), [sp, offset]` for any spill offset.
+fn emit_sp_str_d(ops: &mut Assembler, reg: u8, offset: u32) {
+    if offset <= MAX_SP_IMM_OFFSET {
+        dynasm!(ops ; .arch aarch64 ; str D(reg), [sp, offset]);
+    } else {
+        emit_load_u32(ops, 12, offset);
+        dynasm!(ops ; .arch aarch64 ; str D(reg), [sp, x12]);
+    }
+}
+
 fn spill_offset(slot: u32) -> Result<u32, Unsupported> {
     slot.checked_mul(STACK_SLOT_BYTES)
         .ok_or(Unsupported::OperandShape("optimizing spill offset"))
@@ -4194,7 +4318,7 @@ fn emit_load_fp_location(
         }
         Location::Spill(RegClass::Fp, slot) => {
             let offset = fp_spill_offset(allocation, slot)?;
-            dynasm!(ops ; .arch aarch64 ; ldr D(scratch), [sp, offset]);
+            emit_sp_ldr_d(ops, scratch, offset);
         }
         Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
             return Err(Unsupported::OperandShape("optimizing non-FP location"));
@@ -4219,7 +4343,7 @@ fn emit_store_fp_location(
         }
         Location::Spill(RegClass::Fp, slot) => {
             let offset = fp_spill_offset(allocation, slot)?;
-            dynasm!(ops ; .arch aarch64 ; str D(scratch), [sp, offset]);
+            emit_sp_str_d(ops, scratch, offset);
         }
         Location::Register(RegClass::Gpr, _) | Location::Spill(RegClass::Gpr, _) => {
             return Err(Unsupported::OperandShape("optimizing non-FP location"));
@@ -4243,7 +4367,7 @@ fn emit_load_location(
         }
         Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
-            dynasm!(ops ; .arch aarch64 ; ldr W(scratch), [sp, offset]);
+            emit_sp_ldr_w(ops, scratch, offset);
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape("optimizing FP location"));
@@ -4274,11 +4398,8 @@ fn emit_store_location(
             // value. The `mov` zero-extends in case the caller's register
             // carries tag bits above the payload (OSR reloads pass the boxed
             // form).
-            dynasm!(ops
-                ; .arch aarch64
-                ; mov W(scratch), W(scratch)
-                ; str X(scratch), [sp, offset]
-            );
+            dynasm!(ops ; .arch aarch64 ; mov W(scratch), W(scratch));
+            emit_sp_str_x(ops, scratch, offset);
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape("optimizing FP location"));
@@ -4302,7 +4423,7 @@ fn emit_load_tagged_location(
         }
         Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
-            dynasm!(ops ; .arch aarch64 ; ldr X(scratch), [sp, offset]);
+            emit_sp_ldr_x(ops, scratch, offset);
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape("optimizing FP location"));
@@ -4326,7 +4447,7 @@ fn emit_store_tagged_location(
         }
         Location::Spill(RegClass::Gpr, slot) => {
             let offset = spill_offset(slot)?;
-            dynasm!(ops ; .arch aarch64 ; str X(scratch), [sp, offset]);
+            emit_sp_str_x(ops, scratch, offset);
         }
         Location::Register(RegClass::Fp, _) | Location::Spill(RegClass::Fp, _) => {
             return Err(Unsupported::OperandShape("optimizing FP location"));
@@ -4471,22 +4592,34 @@ fn emit_prologue(ops: &mut Assembler, spill_frame_bytes: u32) {
     dynasm!(ops
         ; .arch aarch64
         ; stp x29, x30, [sp, #-16]!
-        ; stp x19, x20, [sp, #-48]!
+        ; stp x19, x20, [sp, #-80]!
         ; stp x21, x22, [sp, #16]
         ; stp x23, x24, [sp, #32]
+        ; stp x25, x26, [sp, #48]
+        ; stp x27, x28, [sp, #64]
         ; stp d8, d9, [sp, #-64]!
         ; stp d10, d11, [sp, #16]
         ; stp d12, d13, [sp, #32]
         ; stp d14, d15, [sp, #48]
     );
     if spill_frame_bytes != 0 {
-        dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill_frame_bytes);
+        if spill_frame_bytes <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; sub sp, sp, spill_frame_bytes);
+        } else {
+            emit_load_u32(ops, 12, spill_frame_bytes);
+            dynasm!(ops ; .arch aarch64 ; sub sp, sp, x12);
+        }
     }
 }
 
 fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
     if spill_frame_bytes != 0 {
-        dynasm!(ops ; .arch aarch64 ; add sp, sp, spill_frame_bytes);
+        if spill_frame_bytes <= 4095 {
+            dynasm!(ops ; .arch aarch64 ; add sp, sp, spill_frame_bytes);
+        } else {
+            emit_load_u32(ops, 12, spill_frame_bytes);
+            dynasm!(ops ; .arch aarch64 ; add sp, sp, x12);
+        }
     }
     dynasm!(ops
         ; .arch aarch64
@@ -4494,9 +4627,11 @@ fn emit_epilogue(ops: &mut Assembler, spill_frame_bytes: u32) {
         ; ldp d12, d13, [sp, #32]
         ; ldp d10, d11, [sp, #16]
         ; ldp d8, d9, [sp], #64
+        ; ldp x27, x28, [sp, #64]
+        ; ldp x25, x26, [sp, #48]
         ; ldp x23, x24, [sp, #32]
         ; ldp x21, x22, [sp, #16]
-        ; ldp x19, x20, [sp], #48
+        ; ldp x19, x20, [sp], #80
         ; ldp x29, x30, [sp], #16
         ; ret
     );

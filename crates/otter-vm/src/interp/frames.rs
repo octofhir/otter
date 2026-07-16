@@ -56,12 +56,51 @@ impl Interpreter {
         frame.cold.map(|idx| self.cold_frames.get_mut(idx))
     }
 
-    /// Base pointer of the flat JIT register stack, allocating its fixed backing
-    /// buffer on first use. Stable for the interpreter's life (never
-    /// reallocated). Compiled code reads it from `JitCtx.reg_stack_base` to build
-    /// self-recursive callee windows inline.
-    pub fn jit_reg_stack_base(&mut self) -> *mut u64 {
-        self.register_stack.base_ptr()
+    /// Whether this frame owns the result promise of a regular async call.
+    #[inline]
+    #[must_use]
+    pub(crate) fn frame_has_async_state(&self, frame: &Frame) -> bool {
+        self.frame_cold(frame)
+            .is_some_and(|cold| cold.async_state.is_some())
+    }
+
+    /// Attach regular async-call ownership to a frame. Async frames are cold by
+    /// definition; ordinary synchronous frames never allocate a side record.
+    #[inline]
+    pub(crate) fn frame_set_async_state(
+        &mut self,
+        frame: &mut Frame,
+        state: crate::frame_state::AsyncFrameState,
+    ) {
+        self.frame_ensure_cold(frame).async_state = Some(state);
+    }
+
+    /// Remove and return a regular async call's result-promise ownership.
+    #[inline]
+    pub(crate) fn frame_take_async_state(
+        &mut self,
+        frame: &mut Frame,
+    ) -> Option<crate::frame_state::AsyncFrameState> {
+        self.frame_cold_mut(frame)?.async_state.take()
+    }
+
+    /// Generator object owning this active body, if this is a generator frame.
+    #[inline]
+    #[must_use]
+    pub(crate) fn frame_generator_owner(
+        &self,
+        frame: &Frame,
+    ) -> Option<crate::generator::JsGenerator> {
+        self.frame_cold(frame).and_then(|cold| cold.generator_owner)
+    }
+
+    /// Async and generator frames use suspension-specific dispatch and are not
+    /// eligible for ordinary synchronous JIT entry.
+    #[inline]
+    #[must_use]
+    pub(crate) fn frame_has_suspension_owner(&self, frame: &Frame) -> bool {
+        self.frame_cold(frame)
+            .is_some_and(|cold| cold.async_state.is_some() || cold.generator_owner.is_some())
     }
 
     /// Reserve a zero-filled `count`-slot window at the top of the flat register
@@ -82,12 +121,19 @@ impl Interpreter {
         self.register_stack.rollback_checkpoint()
     }
 
-    /// Convert an active frame into owned suspension state and atomically
-    /// unpublish its register window from the arena.
+    /// Convert a cold-detached active frame into owned suspension state and
+    /// atomically unpublish its register window from the arena. The detached
+    /// cold record travels beside the returned snapshot in generator/promise
+    /// ownership; accepting an attached pool index here would lose GC roots and
+    /// is rejected even in release builds.
     pub(crate) fn park_active_frame(
         &mut self,
         frame: Frame,
     ) -> crate::frame_state::ParkedFrameState {
+        assert!(
+            frame.cold.is_none(),
+            "cold ownership must be detached before parking a frame"
+        );
         let (parked, window) = crate::frame_state::ParkedFrameState::copy_from_active(frame);
         self.free_reg_window(window.stack_base());
         parked
@@ -120,31 +166,29 @@ impl Interpreter {
         self.register_stack.release(base);
     }
 
-    /// Address of `reg_top` (the live extent of the flat register stack, in
-    /// slots). Compiled code reads it from `JitCtx.reg_top_ptr` to reserve and
-    /// release callee windows.
-    pub fn jit_reg_top_ptr(&mut self) -> *mut usize {
-        self.register_stack.top_ptr()
-    }
-
-    /// Publish the binding scalar slots of a live native JIT context for GC.
+    /// Publish a canonical native activation for GC and tier-neutral frame
+    /// access.
     ///
     /// # Safety
-    /// Both pointers must name writable boxed-`Value` slots in a native context
-    /// that remains live until the matching [`Self::jit_pop_native_activation`].
-    pub unsafe fn jit_push_native_activation(
+    /// `frame` and its explicit register/upvalue windows must remain live,
+    /// initialized, stable, and exclusively owned by the active mutator until
+    /// the matching [`Self::jit_pop_native_activation`].
+    pub unsafe fn jit_push_native_frame(
         &mut self,
-        self_slot: *mut u64,
-        this_slot: *mut u64,
+        frame: &mut crate::native_abi::NativeFrame,
     ) -> Result<(), VmError> {
         if self.jit_native_activation_top >= self.jit_native_activations.len() {
             return Err(VmError::StackOverflow {
                 limit: self.max_stack_depth,
             });
         }
+        // SAFETY: forwarded from this function's publication contract. The
+        // checked view centralizes null/alignment/window validation before the
+        // activation becomes visible to GC.
+        unsafe { crate::ActiveFrameMut::from_native_ptr(frame) }
+            .map_err(|_| VmError::InvalidOperand)?;
         self.jit_native_activations[self.jit_native_activation_top] = jit::JitNativeActivation {
-            self_slot,
-            this_slot,
+            frame: std::ptr::from_mut(frame),
         };
         self.jit_native_activation_top += 1;
         Ok(())
@@ -179,31 +223,17 @@ impl Interpreter {
             jit::JitNativeActivation::EMPTY;
     }
 
-    /// Trace the scalar SELF/`this` fields of every native activation currently
-    /// capable of crossing a safepoint.
+    /// Trace the non-register roots of every canonical native activation
+    /// currently capable of crossing a safepoint. Register windows are traced
+    /// once by [`Self::trace_reg_stack`].
     pub(crate) fn trace_native_jit_activations(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         for activation in &self.jit_native_activations[..self.jit_native_activation_top] {
-            for slot in [activation.self_slot, activation.this_slot] {
-                if !slot.is_null() {
-                    // SAFETY: publication requires the native context to remain
-                    // live; `Value::trace_value_slots` updates its low-word GC
-                    // offset in place when the referent moves.
-                    unsafe { (&*slot.cast::<Value>()).trace_value_slots(visitor) };
-                }
-            }
+            // SAFETY: `jit_push_native_frame`/the equivalent generated fast
+            // publication keep the frame and its windows live until pop.
+            let frame = unsafe { crate::ActiveFrameRef::from_native_ptr(activation.frame) }
+                .expect("published native activation must remain valid");
+            frame.trace_non_register_slots(visitor);
         }
-    }
-
-    /// Address of synchronous reentry depth shared by framed and frameless JIT
-    /// calls. Emitted code checks and updates it around native recursion.
-    pub fn jit_sync_reentry_depth_ptr(&mut self) -> *mut u32 {
-        &mut self.sync_reentry_depth
-    }
-
-    /// Effective synchronous reentry limit for emitted native calls.
-    pub fn jit_sync_reentry_limit(&self) -> u32 {
-        self.max_stack_depth
-            .min(crate::run_control::DEFAULT_MAX_SYNC_REENTRY_DEPTH)
     }
 
     /// Opaque heap pointer for native leaf runtime stubs.
@@ -233,9 +263,8 @@ impl Interpreter {
         self.free_reg_window(frame.registers.stack_base());
     }
 
-    /// Draw a reservation-stable [`HoltStack`] for a synchronous re-entry,
-    /// reusing a pooled buffer when one is free so the per-stack reservation is
-    /// not re-`malloc`ed on the hot callback path.
+    /// Draw a materialized frame stack for synchronous re-entry, reusing its
+    /// observed capacity when a pooled stack is available.
     #[inline]
     pub(crate) fn draw_stack(&mut self) -> HoltStack {
         self.holt_pool.pop().unwrap_or_default()
@@ -363,6 +392,7 @@ impl Interpreter {
         {
             derived_this = crate::read_upvalue(&self.gc_heap, cell);
         }
+        let async_state = self.frame_take_async_state(&mut popped);
         // Release the cold slot now so the pool can reuse it; the
         // remaining cold-record reads above already happened.
         self.frame_release_cold(&mut popped);
@@ -394,7 +424,7 @@ impl Interpreter {
                 None => value,
             }
         };
-        if let Some(state) = popped.async_state {
+        if let Some(state) = async_state {
             crate::promise_dispatch::resolve_promise_from_interpreter(
                 self,
                 state.result_promise,

@@ -21,12 +21,14 @@
 //!
 //! # See also
 //! - [`super::CodeObjectMetadata`] — immutable compiled-object identity.
-//! - [`super::NativeFrame`] — publishes the active code-object id.
+//! - [`super::CodeRegistryView`] — safepoint metadata selected by this id.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The compiled generation owns precise safepoint metadata.
 pub const CODE_ENTRY_HAS_SAFEPOINTS: u32 = 1 << 0;
+/// The compiled generation belongs to the optimizing tier.
+pub const CODE_ENTRY_OPTIMIZING_TIER: u32 = 1 << 2;
 
 /// Stable per-generation entry cell consumed by native call linkage.
 #[repr(C, align(8))]
@@ -42,30 +44,21 @@ pub struct CodeEntryCell {
     pub param_count: u16,
     /// Full initialized register-window length.
     pub register_count: u16,
-    /// Stable machine-readable feedback-vector base, or zero while absent.
-    pub feedback_base: u64,
-    /// Dense feedback-vector identity, or zero while absent.
-    pub feedback_id: u32,
-    /// [`CODE_ENTRY_HAS_SAFEPOINTS`] and future versioned entry flags.
+    /// Static properties of this compiled generation.
     pub flags: u32,
     /// Native activations that acquired this generation and have not returned.
     pub active_count: AtomicU32,
-    /// Reserved; zero in version 1.
-    pub reserved0: u32,
 }
 
 impl CodeEntryCell {
     /// Construct one linked code generation.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         entry_addr: usize,
         code_object_id: u64,
         function_id: u32,
         param_count: u16,
         register_count: u16,
-        feedback_base: u64,
-        feedback_id: u32,
         flags: u32,
     ) -> Self {
         debug_assert_ne!(entry_addr, 0);
@@ -76,11 +69,8 @@ impl CodeEntryCell {
             function_id,
             param_count,
             register_count,
-            feedback_base,
-            feedback_id,
             flags,
             active_count: AtomicU32::new(0),
-            reserved0: 0,
         }
     }
 
@@ -165,19 +155,19 @@ impl Drop for CodeEntryLease<'_> {
     }
 }
 
-const _: [(); 48] = [(); std::mem::size_of::<CodeEntryCell>()];
+const _: [(); 32] = [(); std::mem::size_of::<CodeEntryCell>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeEntryCell>()];
 const _: [(); 0] = [(); std::mem::offset_of!(CodeEntryCell, entry_addr)];
 const _: [(); 8] = [(); std::mem::offset_of!(CodeEntryCell, code_object_id)];
-const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, feedback_base)];
-const _: [(); 40] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
+const _: [(); 24] = [(); std::mem::offset_of!(CodeEntryCell, flags)];
+const _: [(); 28] = [(); std::mem::offset_of!(CodeEntryCell, active_count)];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn cell() -> CodeEntryCell {
-        CodeEntryCell::new(0x1234, 7, 9, 2, 12, 0, 0, CODE_ENTRY_HAS_SAFEPOINTS)
+        CodeEntryCell::new(0x1234, 7, 9, 2, 12, CODE_ENTRY_HAS_SAFEPOINTS)
     }
 
     #[test]

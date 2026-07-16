@@ -26,8 +26,8 @@ use otter_bytecode::Operand;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, SuperReadKey, Value,
-    VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
+    ActiveFrameRef, ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue,
+    SuperReadKey, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
     binary, cache_ir, collections_prototype, descriptor_value, function_metadata,
     is_restricted_function_property, object,
@@ -2106,15 +2106,35 @@ impl Interpreter {
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), VmError> {
-        let recv = *read_register(frame, recv_reg)?;
-        let idx_value_raw = *read_register(frame, idx_reg)?;
+        let mut active = crate::ActiveFrameMut::materialized(frame);
+        self.frame_load_element(context, &mut active, dst, recv_reg, idx_reg)?;
+        active.advance_pc()
+    }
+
+    /// Complete computed element lookup against either physical activation.
+    ///
+    /// Coercion may allocate or invoke JavaScript, so the coerced key is first
+    /// committed and the receiver is then re-read from the traced frame. This
+    /// prevents a moving collection from leaving a stale receiver in a Rust
+    /// local. Dispatch owns PC advancement.
+    pub(crate) fn frame_load_element(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut crate::ActiveFrameMut<'_>,
+        dst: u16,
+        recv_reg: u16,
+        idx_reg: u16,
+    ) -> Result<(), VmError> {
+        let idx_value_raw = frame.read(idx_reg)?;
+        let recv = frame.read(recv_reg)?;
         if recv.is_nullish() {
             return Err(
                 self.err_type(("Cannot read property of null or undefined".to_string()).into())
             );
         }
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
-        write_register(frame, idx_reg, idx_value)?;
+        frame.write(idx_reg, idx_value)?;
+        let recv = frame.read(recv_reg)?;
         let value = if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let key = VmPropertyKey::Symbol(sym);
@@ -2564,9 +2584,7 @@ impl Interpreter {
                 }
             }
         };
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        frame.write(dst, value)
     }
 
     /// §10.4.5.16 step 2 — convert a value being stored into a typed
@@ -3327,24 +3345,18 @@ impl Interpreter {
             }
         }
     }
-    /// Frameless `LoadProperty`: resolve an own-data monomorphic load directly
-    /// against the register window `regs`, with no `HoltStack` frame. Used by a
-    /// self-recursive callee that runs frameless on the flat JIT register stack.
+    /// Resolve a compiled `LoadProperty` against the canonical activation.
     ///
-    /// Writes the result into `regs[dst]` and returns the WhiskerIC cell-fill
+    /// Writes the result into `frame[dst]` and returns the WhiskerIC cell-fill
     /// (`0` = no inline). Non-object, accessor, prototype, proxy, exotic, and
     /// megamorphic misses complete through the full `[[Get]]` ladder; this
     /// transition never requests an exact side exit.
     ///
-    /// # Safety
-    /// `regs` must point at a live, GC-traced register window with at least
-    /// `max(dst, obj_reg) + 1` slots (the flat JIT register stack is scanned for
-    /// the call's duration, so the receiver and result stay rooted).
-    pub unsafe fn jit_runtime_load_property_window(
+    pub fn jit_runtime_load_property(
         &mut self,
         context: &ExecutionContext,
+        frame: &mut crate::ActiveFrameMut<'_>,
         stack: &mut HoltStack,
-        regs: *mut u64,
         function_id: u32,
         dst: u16,
         obj_reg: u16,
@@ -3355,32 +3367,31 @@ impl Interpreter {
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+        let receiver = frame.read(obj_reg)?;
         // Non-object receivers (primitives, proxies) and saturated sites
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
-        let full_get = |vm: &mut Self, stack: &mut HoltStack| -> Result<u64, VmError> {
-            // Re-read the receiver from the traced window: the IC probes
+        let full_get = |vm: &mut Self,
+                        frame: &mut crate::ActiveFrameMut<'_>,
+                        stack: &mut HoltStack|
+         -> Result<u64, VmError> {
+            // Re-read the receiver from the traced activation: the IC probes
             // above may have allocated (cache-stub install) and moved the
             // handle read at entry.
-            let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
+            let receiver = frame.read(obj_reg)?;
             let value = vm.load_property_value(context, stack, receiver, atomized_key.name())?;
-            // SAFETY: `dst` is a compiler-emitted index into the pinned
-            // caller window, which a getter's nested dispatch cannot move.
-            unsafe {
-                *regs.add(dst as usize) = value.to_bits();
-            }
+            frame.write(dst, value)?;
             Ok(0)
         };
         let Some(obj) = receiver.as_object() else {
-            return full_get(self, stack);
+            return full_get(self, frame, stack);
         };
         if self
             .feedback_directory
             .property_is_megamorphic(site, PropertyIcKind::Load)
             != Some(false)
         {
-            return full_get(self, stack);
+            return full_get(self, frame, stack);
         }
         if let Some(value) =
             self.feedback_directory
@@ -3388,9 +3399,7 @@ impl Interpreter {
         {
             self.feedback_directory
                 .record_property_hit(PropertyIcKind::Load);
-            unsafe {
-                *regs.add(dst as usize) = value.to_bits();
-            }
+            frame.write(dst, value)?;
             return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
         }
         if self
@@ -3414,29 +3423,29 @@ impl Interpreter {
         {
             self.feedback_directory
                 .install_property_stub(site, PropertyIcKind::Load, ic);
-            unsafe {
-                *regs.add(dst as usize) = value.to_bits();
-            }
-            return Ok(self.whisker_load_cell_fill(site, obj, atomized_key));
+            frame.write(dst, value)?;
+            let current_obj = frame
+                .read(obj_reg)?
+                .as_object()
+                .ok_or(VmError::InvalidOperand)?;
+            return Ok(self.whisker_load_cell_fill(site, current_obj, atomized_key));
         }
         // Not cache-representable (accessor, deep prototype, absent):
         // complete the load in place through the full cascade.
-        full_get(self, stack)
+        full_get(self, frame, stack)
     }
 
-    /// Frameless `StoreProperty` — the [`Self::jit_runtime_load_property_window`]
-    /// counterpart. Resolves existing-own-data stores and ordinary shape
+    /// Canonical-activation `StoreProperty` — the
+    /// [`Self::jit_runtime_load_property`] counterpart. Resolves existing-own-data stores and ordinary shape
     /// transitions through the current IC/data path. Every non-cacheable miss
     /// completes through [`Self::store_property_value`], including accessors,
     /// exotics, proxies, primitive bases, megamorphic sites, and exceptions.
     ///
-    /// # Safety
-    /// As [`Self::jit_runtime_load_property_window`].
-    pub unsafe fn jit_runtime_store_property_window(
+    pub fn jit_runtime_store_property(
         &mut self,
         context: &ExecutionContext,
+        frame: &mut crate::ActiveFrameMut<'_>,
         stack: &mut HoltStack,
-        regs: *mut u64,
         function_id: u32,
         obj_reg: u16,
         name_idx: u32,
@@ -3447,23 +3456,26 @@ impl Interpreter {
         let atomized_key = context
             .property_atom_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
-        let value = Value::from_bits(unsafe { *regs.add(src as usize) });
-        let full_set = |vm: &mut Self, stack: &mut HoltStack| -> Result<u64, VmError> {
+        let receiver = frame.read(obj_reg)?;
+        let value = frame.read(src)?;
+        let full_set = |vm: &mut Self,
+                        frame: &mut crate::ActiveFrameMut<'_>,
+                        stack: &mut HoltStack|
+         -> Result<u64, VmError> {
             // Re-read both values from the published, traced window. IC setup
             // and property-key materialisation may allocate and move either
             // operand before the semantic slow path begins.
-            let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
-            let value = Value::from_bits(unsafe { *regs.add(src as usize) });
+            let receiver = frame.read(obj_reg)?;
+            let value = frame.read(src)?;
             let strict = context.function_is_strict(function_id);
             vm.store_property_value(context, stack, receiver, atomized_key.name(), value, strict)?;
             Ok(0)
         };
         let Some(obj) = receiver.as_object() else {
-            return full_set(self, stack);
+            return full_set(self, frame, stack);
         };
         if !object::supports_fast_property_ic(obj, &self.gc_heap) {
-            return full_set(self, stack);
+            return full_set(self, frame, stack);
         }
         // A store IC may describe the receiver's shaped own-data layout, but it
         // is not authority to bypass an inherited accessor/non-writable/exotic
@@ -3471,7 +3483,7 @@ impl Interpreter {
         // before consulting any cached store entry.
         let set_outcome = object::resolve_set(obj, &self.gc_heap, atomized_key.name());
         if !matches!(set_outcome, object::SetOutcome::AssignData) {
-            return full_set(self, stack);
+            return full_set(self, frame, stack);
         }
         if let Some(entries_len) = self
             .feedback_directory
@@ -3486,9 +3498,14 @@ impl Interpreter {
             ) {
                 self.feedback_directory
                     .record_property_hit(PropertyIcKind::Store);
-                return Ok(
-                    self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
-                );
+                let current_obj = frame
+                    .read(obj_reg)?
+                    .as_object()
+                    .ok_or(VmError::InvalidOperand)?;
+                return Ok(self.whisker_store_cell_fill(
+                    site,
+                    object::shape(current_obj, &self.gc_heap).offset(),
+                ));
             }
             if entries_len > 0 {
                 self.feedback_directory
@@ -3509,13 +3526,23 @@ impl Interpreter {
             {
                 self.feedback_directory
                     .install_property_stub(site, PropertyIcKind::Store, ic);
-                return Ok(
-                    self.whisker_store_cell_fill(site, object::shape(obj, &self.gc_heap).offset())
-                );
+                let current_obj = frame
+                    .read(obj_reg)?
+                    .as_object()
+                    .ok_or(VmError::InvalidOperand)?;
+                return Ok(self.whisker_store_cell_fill(
+                    site,
+                    object::shape(current_obj, &self.gc_heap).offset(),
+                ));
             }
         }
 
-        self.set_property(obj, atomized_key.name(), value)?;
+        let current_obj = frame
+            .read(obj_reg)?
+            .as_object()
+            .ok_or(VmError::InvalidOperand)?;
+        let current_value = frame.read(src)?;
+        self.set_property(current_obj, atomized_key.name(), current_value)?;
         Ok(0)
     }
 
@@ -3550,18 +3577,13 @@ impl Interpreter {
     pub fn jit_runtime_load_element(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut crate::ActiveFrameMut<'_>,
         dst: u16,
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let saved_pc = stack[frame_index].pc;
-        let frame = &mut stack[frame_index];
-        let result = self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.frame_load_element(context, frame, dst, recv_reg, idx_reg)
     }
 
     /// JIT bridge for `LoadGlobalOrThrow` from compiled code, delegating to the
@@ -3576,24 +3598,14 @@ impl Interpreter {
     pub fn jit_runtime_load_global(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut crate::ActiveFrameMut<'_>,
         function_id: u32,
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let saved_pc = stack[frame_index].pc;
-        let frame = &mut stack[frame_index];
-        let result = self.run_load_global_or_throw_reg_for_function(
-            context,
-            frame,
-            function_id,
-            dst,
-            name_idx,
-        );
-        stack[frame_index].pc = saved_pc;
-        result
+        let value = self.load_global_or_throw_value(context, function_id, name_idx)?;
+        frame.write(dst, value)
     }
 
     /// `Op::DefineDataProperty obj, key, value` — construction-time data-property
@@ -3657,14 +3669,11 @@ impl Interpreter {
     /// Propagates allocation failures.
     pub fn jit_runtime_new_object(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut crate::ActiveFrameMut<'_>,
         dst: u16,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_new_object_reg(stack, frame_index, dst);
-        stack[frame_index].pc = saved_pc;
-        result
+        let value = self.allocate_object_literal_value()?;
+        frame.write(dst, value)
     }
 
     /// Typed JIT allocation operation for `NewArray`. The compiler supplies the
@@ -3675,15 +3684,16 @@ impl Interpreter {
     /// Propagates invalid operands and allocation failures.
     pub fn jit_runtime_new_array(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut crate::ActiveFrameMut<'_>,
         dst: u16,
         source_regs: &[u16],
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_new_array_regs(stack, frame_index, dst, source_regs);
-        stack[frame_index].pc = saved_pc;
-        result
+        let mut elements = Vec::with_capacity(source_regs.len());
+        for &register in source_regs {
+            elements.push(frame.read(register)?);
+        }
+        let value = self.allocate_array_literal_value(elements)?;
+        frame.write(dst, value)
     }
 
     /// JIT bridge for a computed `StoreElement` (`recv[idx] = src`) from compiled
@@ -3769,52 +3779,26 @@ impl Interpreter {
             .whisker_store_cell_fill(site, recv_shape)
     }
 
-    /// JIT bridge: run the GC write barrier after an inline `StoreProperty`
-    /// wrote a heap-pointer value into `obj_reg`'s object slab or dense array
-    /// storage. The emitted
-    /// fast path already performed the slot store and only calls here when the
-    /// stored value is a pointer (primitive stores need no barrier), so this
-    /// just marks the parent container's card for the old→young edge.
+    /// Run the GC write barrier after an inline pointer-valued property store.
+    ///
+    /// Parent and child are read through the canonical activation. The
+    /// emitted fast path already performed the slot store and calls here only
+    /// for heap-pointer values, so this operation merely records the old→young
+    /// edge; it never needs a materialized interpreter frame or raw window.
     pub fn jit_runtime_write_barrier(
         &mut self,
-        stack: &HoltStack,
-        frame_index: usize,
+        frame: &ActiveFrameRef<'_>,
         obj_reg: u16,
         src: u16,
-    ) {
-        let Ok(receiver) = read_register(&stack[frame_index], obj_reg) else {
-            return;
-        };
-        let Ok(value) = read_register(&stack[frame_index], src) else {
-            return;
-        };
-        if let Some(obj) = receiver.as_object() {
-            self.gc_heap.record_write(obj, value);
-        } else if let Some(arr) = receiver.as_array() {
-            self.gc_heap.record_write(arr, value);
-        }
-    }
-
-    /// Frameless generational write barrier — the
-    /// [`Self::jit_runtime_write_barrier`] counterpart that reads the parent and
-    /// child from the register window instead of a `HoltStack` frame.
-    ///
-    /// # Safety
-    /// `regs` must point at a live, GC-traced register window covering
-    /// `max(obj_reg, src) + 1` slots.
-    pub unsafe fn jit_runtime_write_barrier_window(
-        &mut self,
-        regs: *mut u64,
-        obj_reg: u16,
-        src: u16,
-    ) {
-        let receiver = Value::from_bits(unsafe { *regs.add(obj_reg as usize) });
-        let value = Value::from_bits(unsafe { *regs.add(src as usize) });
+    ) -> Result<(), VmError> {
+        let receiver = frame.read(obj_reg)?;
+        let value = frame.read(src)?;
         if let Some(obj) = receiver.as_object() {
             self.gc_heap.record_write(obj, &value);
         } else if let Some(arr) = receiver.as_array() {
             self.gc_heap.record_write(arr, &value);
         }
+        Ok(())
     }
 
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is

@@ -95,7 +95,7 @@ Expansion:
 - Generated installer goes into `BOOTSTRAP_ENTRIES` via
   `bootstrap_entry!(crate::intrinsics::math::MathIntrinsic)`.
 - The Rust functions (`native_abs`, …) are referenced by path; the
-  macro never emits or rewrites their bodies. ABI v1 signature
+  macro never emits or rewrites their bodies. The current native signature
   (`for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>`)
   is the only accepted shape; mismatches surface as ordinary type
   errors at the generated call site.
@@ -329,7 +329,7 @@ Compile-fail tests at minimum:
 - `holt!` with duplicate `name` field
 - `holt!` with missing `name`
 - `holt!` with a method whose Rust function signature mismatches
-  the ABI v1 native fn signature
+  the native fn signature
 - `couch!` with no `constructor`
 - `couch!` with `abstract = true` and missing `call` body
 - `raft!` with duplicate JS method name
@@ -419,7 +419,7 @@ Task 4.1 is DONE when:
 
 ## Cross-references
 
-- [Native Call ABI](/otter/engine/native-call-abi/) — ABI v1 the
+- [Native Call ABI](/otter/engine/native-call-abi/) — the native contract the
   generated code targets.
 - [`crates/otter-macros/src/lib.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-macros/src/lib.rs)
   — current proc-macro implementations.

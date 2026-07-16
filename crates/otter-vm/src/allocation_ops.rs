@@ -516,13 +516,6 @@ impl Interpreter {
         Ok(Value::object(obj))
     }
 
-    pub(crate) fn alloc_stack_rooted_object(
-        &mut self,
-        stack: &HoltStack,
-    ) -> Result<crate::object::JsObject, VmError> {
-        self.alloc_stack_rooted_object_with_extra_roots(stack, &[])
-    }
-
     pub(crate) fn alloc_stack_rooted_object_with_extra_roots(
         &mut self,
         stack: &HoltStack,
@@ -731,34 +724,33 @@ impl Interpreter {
         Ok(handle)
     }
 
-    fn alloc_stack_rooted_array_from_vec(
-        &mut self,
-        stack: &HoltStack,
-        elements: Vec<Value>,
-    ) -> Result<crate::array::JsArray, VmError> {
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
-        crate::array::from_vec_with_roots(&mut self.gc_heap, elements, &mut external_visit)
-            .map_err(VmError::from)
-    }
-
     pub(crate) fn run_new_object_reg(
         &mut self,
         stack: &mut HoltStack,
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {
+        let value = self.allocate_object_literal_value()?;
+        let frame = &mut stack[top_idx];
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Allocate the ordinary object created by `Op::NewObject` without tying
+    /// allocation semantics to an interpreter frame representation.
+    ///
+    /// The runtime root provider traces materialized and native activations;
+    /// the returned value can therefore be committed through either a
+    /// `Frame` or an `ActiveFrameMut` after collection.
+    pub(crate) fn allocate_object_literal_value(&mut self) -> Result<Value, VmError> {
         let shape_root = self.shape_root();
         let obj = match crate::object::try_alloc_object_with_shape_no_collect(
             &mut self.gc_heap,
             shape_root,
         ) {
             Some(obj) => obj,
-            None => self.alloc_stack_rooted_object(stack)?,
+            None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,
         };
         // Allocate first, THEN read `%Object.prototype%`. The slow allocation
         // can trigger a scavenge that relocates the realm prototype while
@@ -771,10 +763,7 @@ impl Interpreter {
         if let Some(proto) = self.object_prototype_object_opt() {
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::object(obj))?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(Value::object(obj))
     }
 
     pub(crate) fn run_new_array_operands(
@@ -806,11 +795,24 @@ impl Interpreter {
                 elements.push(*read_register(frame, r)?);
             }
         }
-        let array = self.alloc_stack_rooted_array_from_vec(stack, elements)?;
+        let value = self.allocate_array_literal_value(elements)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::array(array))?;
+        write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(())
+    }
+
+    /// Allocate an array literal from already-decoded element values.
+    ///
+    /// The owned element buffer is traced by the array allocator while the
+    /// runtime provider keeps both materialized and native activations live.
+    /// Callers therefore need no stack index or physical-frame adapter.
+    pub(crate) fn allocate_array_literal_value<I>(&mut self, elements: I) -> Result<Value, VmError>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let array = self.alloc_runtime_rooted_array_from_values(elements, &[], &[])?;
+        Ok(Value::array(array))
     }
 
     pub(crate) fn run_load_regexp_reg(
@@ -820,6 +822,19 @@ impl Interpreter {
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
+        let value = self.load_regexp_literal_value(context, idx)?;
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Compile/materialize a fresh RegExp literal as a representation-neutral
+    /// value operation shared by interpreter and compiled tiers.
+    pub(crate) fn load_regexp_literal_value(
+        &mut self,
+        context: &ExecutionContext,
+        idx: u32,
+    ) -> Result<Value, VmError> {
         let (pattern_utf16, flags) = context
             .regexp_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
@@ -834,31 +849,25 @@ impl Interpreter {
             flags,
         )
         .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
-        write_register(frame, dst, Value::regexp(regex))?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(Value::regexp(regex))
     }
 
     /// Typed JIT allocation operation for `LoadRegExp`: materialize a fresh
     /// RegExp from the constant-pool `(pattern, flags)` through the isolate
-    /// compile cache and publish it to the frame's destination register.
-    /// The frame PC is saved and restored so a later guard bail re-runs the
-    /// compiled body from its entry.
+    /// compile cache and publish it to the canonical activation. Compiled code
+    /// owns PC progress.
     ///
     /// # Errors
     /// Propagates an invalid-pattern `SyntaxError` and allocation failure.
     pub fn jit_runtime_load_regexp(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut crate::ActiveFrameMut<'_>,
         dst: u16,
         idx: u32,
     ) -> Result<(), VmError> {
-        let saved_pc = stack[frame_index].pc;
-        let result = self.run_load_regexp_reg(context, &mut stack[frame_index], dst, idx);
-        stack[frame_index].pc = saved_pc;
-        result
+        let value = self.load_regexp_literal_value(context, idx)?;
+        frame.write(dst, value)
     }
 
     pub(crate) fn run_array_push_regs(

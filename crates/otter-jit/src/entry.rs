@@ -206,16 +206,16 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_finish_direct_call_bailed_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_SELF_CALL_BAIL,
-            jit_self_call_bail_stub as *const () as usize,
+            abi::STUB_JIT_DEOPT_MATERIALIZE_SELF_CALL,
+            jit_deopt_materialize_self_call_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_LOAD_PROP_WINDOW,
-            jit_load_prop_window_stub as *const () as usize,
+            abi::STUB_JIT_LOAD_PROPERTY,
+            jit_load_property_stub as *const () as usize,
         ),
         binding(
-            abi::STUB_JIT_STORE_PROP_WINDOW,
-            jit_store_prop_window_stub as *const () as usize,
+            abi::STUB_JIT_STORE_PROPERTY,
+            jit_store_property_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_DEFINE_DATA_PROPERTY,
@@ -291,7 +291,7 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         ),
         binding(
             abi::STUB_JIT_WRITE_BARRIER_WINDOW,
-            jit_write_barrier_window_stub as *const () as usize,
+            jit_write_barrier_stub as *const () as usize,
         ),
         binding(
             abi::STUB_JIT_INLINE_CLOSURE_UPVALUES,

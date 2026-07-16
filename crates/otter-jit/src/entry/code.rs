@@ -20,7 +20,7 @@ use super::{
     jit_push_native_activation_stub,
 };
 use otter_vm::{
-    HoltStack, Interpreter, JitExecOutcome, Value, VmError, VmRuntimeActivation,
+    ActiveFrameMut, HoltStack, Interpreter, JitExecOutcome, Value, VmError, VmRuntimeActivation,
     native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader, VmThread},
 };
 
@@ -43,37 +43,40 @@ pub(crate) unsafe fn enter_compiled(
     code_object_id: u64,
     function_id: u32,
     register_count: u16,
+    kind: NativeFrameKind,
     has_safepoints: bool,
 ) -> JitExecOutcome {
     {
         let stack = activation.stack_ptr().cast::<HoltStack>();
         let vm = activation.vm_ptr().cast::<Interpreter>();
-        // SAFETY: `activation.stack_ptr()` is a valid `*mut HoltStack` for this call.
-        let regs =
-            Interpreter::jit_frame_regs_ptr(unsafe { &mut *stack }, activation.frame_index());
-        // SAFETY: `activation.vm_ptr()`/`activation.stack_ptr()` are valid for this call and not aliased
-        // by a live `&mut` (the VM froze its borrows); read the self closure up
-        // front so a `MakeFunction`-of-self needs no Rust round-trip.
-        let self_closure =
-            unsafe { (*vm).jit_frame_self_closure_bits(&*stack, activation.frame_index()) };
-        // SAFETY: same validity/aliasing contract as `self_closure` above.
-        let this_value = unsafe { (*vm).jit_frame_this_bits(&*stack, activation.frame_index()) };
-        // SAFETY: same validity/aliasing contract; the spine `Box` outlives this
-        // entry (frame-owned), and the cells it holds are old-space (immobile).
-        let upvalues_ptr =
-            Interpreter::jit_frame_upvalues_ptr(unsafe { &*stack }, activation.frame_index());
-        // SAFETY: `vm` is a valid `*mut Interpreter` for this entry and not
-        // aliased by a live `&mut` (the VM froze its borrows); these return the
-        // stable base / `reg_top` address of the flat JIT register stack.
-        let reg_stack_base = unsafe { (*vm).jit_reg_stack_base() };
-        let reg_top_ptr = unsafe { (*vm).jit_reg_top_ptr() };
+        // This is the remaining interpreter-to-native entry adapter. It reads
+        // the materialized activation once through the tier-neutral API; the
+        // resulting NativeFrame is the sole machine-visible state thereafter.
+        let (regs, self_value, this_value, upvalue_base, upvalue_count) = {
+            // SAFETY: `activation.stack_ptr()` names the exclusively frozen
+            // interpreter stack for this compiled-entry transaction.
+            let stack_ref = unsafe { &mut *stack };
+            let frame = &mut stack_ref[activation.frame_index()];
+            let active = ActiveFrameMut::materialized(frame);
+            let regs = active.register_base_ptr().cast::<u64>();
+            let upvalue_base = if active.upvalue_count() == 0 {
+                0
+            } else {
+                active.upvalue_base_ptr() as u64
+            };
+            (
+                regs,
+                active.self_value(),
+                active.this_value(),
+                upvalue_base,
+                active.upvalue_count() as u32,
+            )
+        };
         // SAFETY: same contract; the activation array is isolate-owned, never
         // resized, and outlives every compiled activation.
         let activation_base = unsafe { (*vm).jit_native_activation_base() };
         let activation_top_ptr = unsafe { (*vm).jit_native_activation_top_addr() };
         let activation_limit = unsafe { (*vm).jit_native_activation_limit() };
-        let sync_reentry_depth_ptr = unsafe { (*vm).jit_sync_reentry_depth_ptr() };
-        let sync_reentry_limit = unsafe { (*vm).jit_sync_reentry_limit() };
         let gc_heap = unsafe { (*vm).jit_gc_heap_ptr() };
         let interrupt_flag = unsafe { (*vm).jit_interrupt_flag_ptr() };
         let backedge_fuel = unsafe { (*vm).jit_backedge_fuel_ptr() };
@@ -82,34 +85,25 @@ pub(crate) unsafe fn enter_compiled(
         } else {
             NativeFrameFlags::empty()
         };
-        let mut native_frame = NativeFrame {
-            header: VmFrameHeader {
+        let mut native_frame = NativeFrame::new(
+            VmFrameHeader {
                 function_id,
                 code_block_id: function_id,
                 pc: 0,
                 register_count,
-                kind: NativeFrameKind::Baseline,
+                kind,
                 flags,
             },
-            previous_frame: 0,
-            register_base: regs as u64,
-            argument_base: 0,
-            feedback_base: 0,
-            code_object_id,
-            this_value_bits: this_value,
-            new_target_bits: Value::undefined().to_bits(),
-            return_register: u32::MAX,
-            cold_state_index: u32::MAX,
-            argument_count: 0,
-            reserved0: 0,
-            feedback_id: 0,
-        };
+            regs as u64,
+            self_value,
+            this_value,
+        );
+        native_frame.set_upvalue_window(upvalue_base, upvalue_count);
+        native_frame.set_materialized_activation(activation.frame_index() as u32);
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
+        thread.current_code_object_id = code_object_id;
         thread.runtime_context = std::ptr::addr_of!(activation) as u64;
-        // SAFETY: `vm` is a valid `*mut Interpreter` for this entry; the header
-        // and entry columns are isolate-owned and outlive every activation.
-        thread.runtime_stub_table = unsafe { (*vm).jit_runtime_stub_table_addr() };
         // SAFETY: the boxed registry cell is isolate-owned and address-stable;
         // its view resolves safepoints for any installed code object, so a
         // nested compiled callee's allocating stubs root through real maps.
@@ -117,21 +111,12 @@ pub(crate) unsafe fn enter_compiled(
         thread.interrupt_cell = interrupt_flag as u64;
         thread.gc_heap = gc_heap as u64;
         thread.backedge_fuel_cell = backedge_fuel as u64;
-        thread.sync_reentry_depth_cell = sync_reentry_depth_ptr as u64;
-        thread.sync_reentry_limit = sync_reentry_limit;
         let mut error = None;
         let mut ctx = JitCtx {
-            regs,
-            self_closure,
-            this_value,
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(native_frame),
-            frame_index: activation.frame_index(),
-            upvalues_ptr,
             error: &mut error,
             direct_call: std::mem::MaybeUninit::uninit(),
-            reg_stack_base,
-            reg_top_ptr,
             activation_base: activation_base.cast(),
             activation_top_ptr,
             activation_limit,

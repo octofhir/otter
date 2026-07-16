@@ -21,7 +21,7 @@
 use otter_bytecode::Op;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, JsString, Value, VmError, abstract_ops,
+    ActiveFrameMut, ExecutionContext, Frame, Interpreter, JsString, Value, VmError, abstract_ops,
     holt_stack::HoltStack, number::NumberValue, read_register, write_register,
 };
 
@@ -156,7 +156,15 @@ impl Interpreter {
                 self.run_typeof_regs(&mut stack[frame_index], dst, src)?;
             }
             value if value == Op::LoadNewTarget as u8 => {
-                self.run_load_new_target_reg(&mut stack[frame_index], dst)?;
+                let new_target = self
+                    .frame_cold(&stack[frame_index])
+                    .and_then(|cold| cold.new_target)
+                    .unwrap_or(Value::undefined());
+                let mut frame = ActiveFrameMut::materialized_with_new_target(
+                    &mut stack[frame_index],
+                    new_target,
+                );
+                self.frame_load_new_target(&mut frame, dst)?;
             }
             value if value == Op::SameValue as u8 => {
                 self.run_same_value_regs(&mut stack[frame_index], dst, src, arg2 as u16)?;

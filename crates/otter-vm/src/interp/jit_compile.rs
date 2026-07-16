@@ -116,7 +116,7 @@ impl Interpreter {
         if let Some(Some(code)) = self.jit_optimized_code.get(&fid) {
             return self
                 .jit_code_registry
-                .is_compatible_for_entry(code.as_ref())
+                .is_current_for_entry(code.as_ref())
                 .then(|| code.clone());
         }
         // A declined body is retried at a back-edge only when its feedback epoch

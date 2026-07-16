@@ -10,15 +10,15 @@
 //!   effective `this`, and the caller-held SELF value are never taken from a
 //!   call-site cache.
 //! - A [`frame::ResolvedCallTarget`] owns the exact code `Arc` whose scalar
-//!   entry plan it carries; frame publication pins that same `Arc`.
+//!   entry plan it carries; owner publication pins that same `Arc`.
 //! - Method calls reject named-SELF callees because their callable does not
-//!   live in a caller register that frame construction can re-read after GC.
+//!   live in a caller register that owner construction can re-read after GC.
 //! - Resolution returns `None` before entering synchronous re-entry; only
 //!   [`frame::prepare_jit_resolved_call`] owns the prepare transaction.
 //!
 //! # See also
 //! - [`super::cache`] for shape/slot guards and cached code-plan ownership.
-//! - [`super::frame`] for the shared frame-publication transaction.
+//! - [`super::frame`] for the shared owner-publication transaction.
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ use crate::*;
 use super::frame;
 
 /// Where a callable came from, including the rooting capability available to
-/// frame construction after it performs allocations.
+/// owner construction after it performs allocations.
 #[derive(Clone, Copy)]
 pub(super) enum CallTargetOrigin {
     /// `Op::Call`: the caller register can be re-read for named SELF binding.
@@ -93,6 +93,18 @@ impl Interpreter {
             return None;
         }
 
+        // Owner construction must not carry a cloned upvalue spine across an
+        // untracked allocation. Bind every non-allocating receiver here and
+        // reject the one coercing case (sloppy ordinary function + primitive
+        // receiver) to the generic call path.
+        let this_value = if function.is_strict || function.is_arrow || this_value.is_object_type() {
+            this_value
+        } else if this_value.is_undefined() || this_value.is_null() {
+            Value::object(self.global_this)
+        } else {
+            return None;
+        };
+
         Some(DecodedCallTarget {
             function,
             parent_upvalues,
@@ -155,7 +167,6 @@ impl Interpreter {
         // or registry probes to the release hit path.
         debug_assert_eq!(plan.function_id, expected_fid);
         debug_assert_eq!(plan.function_id, decoded.function.id);
-        debug_assert_eq!(plan.code_object_id, code.metadata().id);
         debug_assert_eq!(
             Some(plan),
             self.jit_code_registry
@@ -186,18 +197,12 @@ impl Interpreter {
     ) -> Option<Arc<dyn jit::JitFunctionCode>> {
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
-            && self
-                .jit_code_registry
-                .is_compatible_for_entry(code.as_ref())
+            && self.jit_code_registry.is_current_for_entry(code.as_ref())
         {
             return Some(code.clone());
         }
         let code = self.jit_code.get(&fid)?.clone()?;
-        if code.osr_only()
-            || !self
-                .jit_code_registry
-                .is_compatible_for_entry(code.as_ref())
-        {
+        if code.osr_only() || !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
             return None;
         }
         self.jit_code_cache = Some((fid, code.clone()));
@@ -210,15 +215,15 @@ impl Interpreter {
     ///
     /// Resolves the method through the call site's monomorphic load IC (only the
     /// IC-cacheable own/direct-prototype data-slot case; anything else returns
-    /// `Ok(None)`), then publishes a callee frame bound with `this = recv`.
+    /// `Ok(None)`), then publishes callee resources bound with `this = recv`.
     /// Returns `Ok(None)` for any cold / ineligible / non-object-receiver case so
     /// the emitted site falls back to the in-place full method-call stub (not a
     /// bail — a native/polymorphic method in a hot loop must keep running
-    /// compiled). On `Ok(Some(_))` the callee frame is published and the
+    /// compiled). On `Ok(Some(_))` the callee owner is published and the
     /// sync-reentry guard is held until a direct-call finish/abort helper runs.
     ///
     /// # Errors
-    /// Propagates a sync-reentry stack-depth overflow or a frame-build failure.
+    /// Propagates a sync-reentry stack-depth overflow or owner-setup failure.
     ///
     /// # Safety contract
     /// `caller_regs` must point at the caller's live register window
@@ -228,14 +233,14 @@ impl Interpreter {
     pub fn jit_prepare_direct_method_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        caller_function_id: u32,
         recv_reg: u16,
         name_idx: u32,
         site: usize,
         arg_regs: &[u16],
         // Caller's live register window (`JitCtx.regs`). Receiver and args are
-        // read from here, not `stack[frame_index]`, so frameless callers work.
+        // read directly from this window, so frameless callers need no parent
+        // stack entry.
         caller_regs: *const Value,
     ) -> Result<Option<jit::JitPreparedDirectCall>, VmError> {
         self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Alloc);
@@ -255,8 +260,6 @@ impl Interpreter {
         };
         if let Some(prepared) = self.try_prepare_cached_direct_method_call(
             context,
-            stack,
-            frame_index,
             recv,
             obj,
             site,
@@ -265,9 +268,7 @@ impl Interpreter {
         )? {
             return Ok(Some(prepared));
         }
-        let Some(key) =
-            context.property_atom_for_function(stack[frame_index].function_id, name_idx)
-        else {
+        let Some(key) = context.property_atom_for_function(caller_function_id, name_idx) else {
             return Ok(None);
         };
         // Monomorphic IC-resolved data-slot method only; misses (accessor, deep
@@ -290,7 +291,7 @@ impl Interpreter {
             target.plan,
         );
 
-        self.prepare_jit_resolved_call(stack, frame_index, target, arg_regs, caller_regs)
+        self.prepare_jit_resolved_call(target, arg_regs, caller_regs)
             .map(Some)
     }
 
@@ -307,8 +308,6 @@ impl Interpreter {
     pub fn jit_prepare_direct_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frame_index: usize,
         callee_reg: u16,
         arg_regs: &[u16],
         caller_regs: *const Value,
@@ -326,7 +325,7 @@ impl Interpreter {
         ) else {
             return Ok(None);
         };
-        self.prepare_jit_resolved_call(stack, frame_index, target, arg_regs, caller_regs)
+        self.prepare_jit_resolved_call(target, arg_regs, caller_regs)
             .map(Some)
     }
 }

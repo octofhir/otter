@@ -40,7 +40,7 @@ impl Interpreter {
         let saved_pc = stack[frame_index].pc;
         match opcode {
             value if value == Op::CollectRest as u8 => {
-                self.run_collect_rest_reg(stack, frame_index, arg0 as u16)?;
+                self.materialized_collect_rest(stack, frame_index, arg0 as u16)?;
             }
             value if value == Op::NewError as u8 => {
                 self.run_new_error_regs(context, stack, frame_index, arg0 as u16, arg1 as u16)?;

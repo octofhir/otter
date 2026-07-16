@@ -37,8 +37,9 @@ use otter_vm::native_abi as abi;
 
 /// One cold coercion continuation emitted after the function's hot operation
 /// stream. The source instruction has already published its canonical PC;
-/// success branches to `resume`, while throws and isolate-less probe misses use
-/// the function's shared status epilogues.
+/// success branches to `resume`, while throws use the function's shared status
+/// epilogue. A live canonical activation is part of the runtime-op contract;
+/// function ownership is read from its frame header rather than emitted again.
 pub(super) struct CoercionSlowPath {
     entry: DynamicLabel,
     resume: DynamicLabel,
@@ -46,7 +47,6 @@ pub(super) struct CoercionSlowPath {
     src: u16,
     mode: u32,
     hint: u32,
-    function_id: u32,
 }
 
 /// One cold completion for a numeric-family fast-path miss. `rhs_or_delta`
@@ -272,7 +272,11 @@ pub(super) fn emit_add_generic(
 /// reference identity with distinct cells completing content equality through
 /// the leaf probe. `bail` fires only on the probe's null-heap miss.
 pub(crate) fn emit_strict_eq_tagged(ops: &mut Assembler, negate: bool, bail: DynamicLabel) {
-    let kind = if negate { CompareKind::Ne } else { CompareKind::Eq };
+    let kind = if negate {
+        CompareKind::Ne
+    } else {
+        CompareKind::Eq
+    };
     let float_path = ops.new_dynamic_label();
     let have_bool = ops.new_dynamic_label();
     dynasm!(ops
@@ -820,12 +824,10 @@ pub(super) fn emit_bitwise_not(
 
 /// Emit `dst = ToNumeric(src)`: identity on a number (int32 or double);
 /// every coercive case completes through the shared reentrant VM transition.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_to_numeric(
     ops: &mut Assembler,
     dst: u16,
     src: u16,
-    function_id: u32,
     slow_paths: &mut Vec<CoercionSlowPath>,
 ) -> Result<(), Unsupported> {
     let slow = ops.new_dynamic_label();
@@ -846,7 +848,6 @@ pub(super) fn emit_to_numeric(
         src,
         mode: 1,
         hint: 0,
-        function_id,
     });
     Ok(())
 }
@@ -855,13 +856,11 @@ pub(super) fn emit_to_numeric(
 /// and bytecode-function references complete observable `@@toPrimitive` /
 /// `valueOf` / `toString` hooks through the shared VM transition; immediate
 /// primitives pass through inline.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_to_primitive(
     ops: &mut Assembler,
     dst: u16,
     src: u16,
     hint: u32,
-    function_id: u32,
     slow_paths: &mut Vec<CoercionSlowPath>,
 ) -> Result<(), Unsupported> {
     let keep = ops.new_dynamic_label();
@@ -890,7 +889,6 @@ pub(super) fn emit_to_primitive(
         src,
         mode: 0,
         hint,
-        function_id,
     });
     Ok(())
 }
@@ -945,7 +943,6 @@ pub(super) fn emit_coercion_slow_paths(
     ops: &mut Assembler,
     table: &TransitionTable,
     slow_paths: Vec<CoercionSlowPath>,
-    bail: DynamicLabel,
     threw: DynamicLabel,
 ) {
     let entry = table.entry(abi::STUB_JIT_COERCE_UNARY);
@@ -957,7 +954,6 @@ pub(super) fn emit_coercion_slow_paths(
             src,
             mode,
             hint,
-            function_id,
         } = path;
         dynasm!(ops
             ; .arch aarch64
@@ -968,15 +964,12 @@ pub(super) fn emit_coercion_slow_paths(
             ; movz x3, mode
         );
         emit_load_u64(ops, 4, u64::from(hint));
-        emit_load_u64(ops, 5, u64::from(function_id));
         emit_load_u64(ops, 16, entry);
         dynasm!(ops
             ; .arch aarch64
             ; blr x16
             ; cmp x0, #1
             ; b.eq =>threw
-            ; cmp x0, #2
-            ; b.eq =>bail
             ; b =>resume
         );
     }

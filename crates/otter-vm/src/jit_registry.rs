@@ -39,8 +39,9 @@
 
 use crate::jit::{JitDirectCallPlan, JitFunctionCode};
 use crate::native_abi::{
-    CODE_ENTRY_HAS_SAFEPOINTS, CodeDependency, CodeDependencyKind, CodeEntryCell,
-    CodeLifetimeState, CodeRegistryView, SafepointId, SafepointRecord,
+    CODE_ENTRY_HAS_SAFEPOINTS, CODE_ENTRY_OPTIMIZING_TIER, CodeDependency, CodeDependencyKind,
+    CodeEntryCell, CodeLifetimeState, CodeRegistryView, NativeFrameKind, SafepointId,
+    SafepointRecord,
 };
 use std::sync::Arc;
 
@@ -91,11 +92,11 @@ impl JitCodeRegistry {
 
     /// Register one current code object under its unique id.
     ///
-    /// Returns `false` without installing when metadata is incompatible, the
-    /// declared count differs from the dependency slice, or any dependency is
-    /// not exactly current. The code object owns the declaration surface; the
-    /// registry snapshots it so later invalidation never depends on a virtual
-    /// call into mutable compiler state.
+    /// Returns `false` without installing when the metadata identity or code
+    /// size is invalid, the declared count differs from the dependency slice,
+    /// or any dependency is not exactly current. The code object owns the
+    /// declaration surface; the registry snapshots it so later invalidation
+    /// never depends on a virtual call into mutable compiler state.
     #[cfg(test)]
     pub(crate) fn register(&mut self, code_object_id: u64, code: Arc<dyn JitFunctionCode>) -> bool {
         self.register_inner(code_object_id, code, None)
@@ -121,8 +122,6 @@ impl JitCodeRegistry {
             code,
             function.param_count,
             function.register_count,
-            0,
-            0,
         )
     }
 
@@ -134,8 +133,6 @@ impl JitCodeRegistry {
         code: Arc<dyn JitFunctionCode>,
         param_count: u16,
         register_count: u16,
-        feedback_base: u64,
-        feedback_id: u32,
     ) -> bool {
         let Some(entry_addr) = code.entry_addr() else {
             return false;
@@ -144,19 +141,19 @@ impl JitCodeRegistry {
             return false;
         }
         let metadata = code.metadata();
-        let flags = if code.safepoint_count() != 0 {
-            CODE_ENTRY_HAS_SAFEPOINTS
-        } else {
-            0
-        };
+        let mut flags = 0;
+        if code.safepoint_count() != 0 {
+            flags |= CODE_ENTRY_HAS_SAFEPOINTS;
+        }
+        if code.native_frame_kind() == NativeFrameKind::Optimizing {
+            flags |= CODE_ENTRY_OPTIMIZING_TIER;
+        }
         let entry_cell = Box::new(CodeEntryCell::new(
             entry_addr,
             code_object_id,
             metadata.code_block_id,
             param_count,
             register_count,
-            feedback_base,
-            feedback_id,
             flags,
         ));
         self.register_inner(code_object_id, code, Some(entry_cell))
@@ -172,7 +169,9 @@ impl JitCodeRegistry {
         debug_assert_eq!(code.metadata().id, code_object_id);
         let metadata = code.metadata();
         let dependencies: Box<[CodeDependency]> = code.dependencies().into();
-        if !metadata.is_compatible_with_current_vm()
+        if code_object_id == 0
+            || metadata.id != code_object_id
+            || metadata.code_size == 0
             || metadata.dependency_count as usize != dependencies.len()
             || !self.dependencies_are_current(&dependencies)
         {
@@ -200,22 +199,12 @@ impl JitCodeRegistry {
         true
     }
 
-    /// Whether `code` passes layout/build compatibility and exact dependency
-    /// epoch consistency for a new entry selection.
+    /// Whether this exact installed generation remains current for entry.
     ///
     /// Entry requires the exact registered generation to remain Installed even
     /// when it declares no external dependencies. Cache eviction is therefore
     /// an optimization, not the only correctness barrier after invalidation.
-    pub(crate) fn is_compatible_for_entry(&self, code: &dyn JitFunctionCode) -> bool {
-        let metadata = code.metadata();
-        metadata.is_compatible_with_current_vm() && self.dependencies_are_current_for_entry(code)
-    }
-
-    /// Whether only the declared dependency slice is exactly current.
-    ///
-    /// Kept separate from layout/build compatibility so OSR can add the epoch
-    /// gate without changing its existing template-owned layout mismatch path.
-    pub(crate) fn dependencies_are_current_for_entry(&self, code: &dyn JitFunctionCode) -> bool {
+    pub(crate) fn is_current_for_entry(&self, code: &dyn JitFunctionCode) -> bool {
         let metadata = code.metadata();
         self.codes.get(&metadata.id).is_some_and(|registered| {
             registered.state == CodeLifetimeState::Installed
@@ -245,8 +234,6 @@ impl JitCodeRegistry {
             entry_cell: self.entry_cell_addr_for_entry(code)?,
             param_count: function.param_count,
             register_count: function.register_count,
-            code_object_id: code.metadata().id,
-            has_safepoints: code.safepoint_count() != 0,
         })
     }
 
@@ -258,7 +245,7 @@ impl JitCodeRegistry {
     /// entry address.
     #[must_use]
     fn entry_cell_addr_for_entry(&self, code: &dyn JitFunctionCode) -> Option<u64> {
-        if !self.is_compatible_for_entry(code) {
+        if !self.is_current_for_entry(code) {
             return None;
         }
         self.entry_cells
@@ -362,13 +349,12 @@ impl JitCodeRegistry {
 
     fn dependencies_are_current(&self, dependencies: &[CodeDependency]) -> bool {
         dependencies.iter().all(|dependency| {
-            dependency.flags == 0
-                && dependency.expected
-                    == self
-                        .epochs
-                        .get(&(dependency.kind, dependency.identity))
-                        .copied()
-                        .unwrap_or(0)
+            dependency.expected
+                == self
+                    .epochs
+                    .get(&(dependency.kind, dependency.identity))
+                    .copied()
+                    .unwrap_or(0)
         })
     }
 
@@ -427,7 +413,7 @@ mod tests {
 
     impl JitFunctionCode for FakeCode {
         fn metadata(&self) -> CodeObjectMetadata {
-            let mut metadata = CodeObjectMetadata {
+            CodeObjectMetadata {
                 id: self.id,
                 code_block_id: 0,
                 entry_offset: 0,
@@ -436,15 +422,7 @@ mod tests {
                 frame_map_count: 0,
                 spill_map_count: 0,
                 dependency_count: self.dependencies.len() as u32,
-                reserved: 0,
-                layout: crate::native_abi::LayoutVersionRecord::CURRENT,
-                build: crate::native_abi::BuildVersionRecord {
-                    vm_build: crate::native_abi::VM_BUILD_VERSION,
-                    target_abi: 1,
-                },
-            };
-            metadata.safepoint_count = self.records.len() as u32;
-            metadata
+            }
         }
 
         fn dependencies(&self) -> &[CodeDependency] {
@@ -511,11 +489,11 @@ mod tests {
         });
         let anchor = code.clone();
         assert!(registry.register(11, code.clone()));
-        assert!(registry.is_compatible_for_entry(code.as_ref()));
+        assert!(registry.is_current_for_entry(code.as_ref()));
 
         registry.invalidate_function(0);
         assert!(
-            !registry.is_compatible_for_entry(code.as_ref()),
+            !registry.is_current_for_entry(code.as_ref()),
             "unlinked zero-dependency code must reject every new entry"
         );
         drop(code);
@@ -534,7 +512,7 @@ mod tests {
     fn production_entry_cell_unlinks_before_code_retires_and_remains_a_tombstone() {
         let mut registry = JitCodeRegistry::new_boxed();
         let code = fake_code(13, Vec::new());
-        assert!(registry.register_generation(13, code.clone(), 2, 9, 0, 0));
+        assert!(registry.register_generation(13, code.clone(), 2, 9));
         let cell_addr = registry.entry_cell_addr(13).expect("entry cell installed");
         assert_eq!(
             registry.entry_cell_addr_for_entry(code.as_ref()),
@@ -619,7 +597,7 @@ mod tests {
         assert!(
             !interp
                 .jit_code_registry
-                .is_compatible_for_entry(interp.jit_code_registry.codes[&21].code.as_ref())
+                .is_current_for_entry(interp.jit_code_registry.codes[&21].code.as_ref())
         );
 
         let current = CodeDependency::epoch(
@@ -644,7 +622,7 @@ mod tests {
         assert!(
             interp
                 .jit_code_registry
-                .is_compatible_for_entry(interp.jit_code_registry.codes[&24].code.as_ref())
+                .is_current_for_entry(interp.jit_code_registry.codes[&24].code.as_ref())
         );
     }
 

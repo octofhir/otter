@@ -74,10 +74,11 @@ use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
-    NUMBER_TAG_HI16, SELF_CLOSURE_OFFSET, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW,
-    THIS_VALUE_OFFSET, THREAD_OFFSET, Unsupported, VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE,
-    VALUE_UNDEFINED, VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET,
-    VM_THREAD_INTERRUPT_CELL_OFFSET, reg_offset,
+    NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
+    NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THREAD_OFFSET, Unsupported,
+    VALUE_FALSE, VALUE_HOLE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
+    VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET, VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_INTERRUPT_CELL_OFFSET,
+    reg_offset,
 };
 use otter_vm::native_abi as abi;
 
@@ -247,23 +248,10 @@ pub(super) fn compile(
                 emit_bitwise_not(&mut ops, dst, src, &mut numeric_slow_paths)?;
             }
             TemplateOp::ToNumeric { dst, src } => {
-                emit_to_numeric(
-                    &mut ops,
-                    dst,
-                    src,
-                    view.code_block.id,
-                    &mut coercion_slow_paths,
-                )?;
+                emit_to_numeric(&mut ops, dst, src, &mut coercion_slow_paths)?;
             }
             TemplateOp::ToPrimitive { dst, src, hint } => {
-                emit_to_primitive(
-                    &mut ops,
-                    dst,
-                    src,
-                    hint,
-                    view.code_block.id,
-                    &mut coercion_slow_paths,
-                )?;
+                emit_to_primitive(&mut ops, dst, src, hint, &mut coercion_slow_paths)?;
             }
             TemplateOp::AddGeneric {
                 dst,
@@ -282,7 +270,11 @@ pub(super) fn compile(
                 )?;
             }
             TemplateOp::LoadThis { dst } => {
-                dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, THIS_VALUE_OFFSET]);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                    ; ldr x9, [x10, NATIVE_FRAME_THIS_OFFSET]
+                );
                 emit_load_u64(&mut ops, 12, VALUE_HOLE);
                 // A derived-ctor `this`-before-`super` hole resolves in the
                 // interpreter.
@@ -290,7 +282,11 @@ pub(super) fn compile(
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::LoadSelfClosure { dst } => {
-                dynasm!(ops ; .arch aarch64 ; ldr x9, [x20, SELF_CLOSURE_OFFSET]);
+                dynasm!(ops
+                    ; .arch aarch64
+                    ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+                    ; ldr x9, [x10, NATIVE_FRAME_SELF_OFFSET]
+                );
                 emit_store_reg(&mut ops, 9, dst)?;
             }
             TemplateOp::MakeFunction { dst, constant } => {
@@ -481,6 +477,7 @@ pub(super) fn compile(
                 callee,
                 argc,
                 packed_args,
+                byte_pc: _,
             } => {
                 calls::emit_call(
                     &mut ops,
@@ -1026,7 +1023,7 @@ pub(super) fn compile(
         dynasm!(ops ; .arch aarch64 ; b =>bail);
         emit_boxed_slot_slow_paths(&mut ops, view, boxed_slot_slow_paths);
         emit_numeric_slow_paths(&mut ops, transitions, numeric_slow_paths, bail, threw);
-        emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, bail, threw);
+        emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, threw);
     }
 
     // Shared normal-return epilogue. `x0` already carries the boxed value.
@@ -1119,8 +1116,8 @@ pub(super) fn compile(
 }
 
 /// Emit the function prologue: save fp/lr + callee-saved bases, then set
-/// `x20 = ctx` (arg in `x0`) and `x19 = ctx.regs` (the frame register base) —
-/// the shared compiled-entry ABI.
+/// `x20 = ctx` (arg in `x0`) and `x19 = NativeFrame.register_base` — the
+/// shared compiled-entry ABI. No register pointer is duplicated in `JitCtx`.
 fn emit_prologue(ops: &mut Assembler) {
     dynasm!(ops
         ; .arch aarch64
@@ -1128,7 +1125,8 @@ fn emit_prologue(ops: &mut Assembler) {
         ; stp x19, x20, [sp, #16]
         ; mov x29, sp
         ; mov x20, x0
-        ; ldr x19, [x20]
+        ; ldr x9, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x19, [x9, NATIVE_FRAME_REGISTER_BASE_OFFSET]
     );
 }
 

@@ -141,44 +141,25 @@ mod tests {
         let mut error = None;
         let interrupt_probe: u8 = interrupt;
         let mut backedge_fuel_probe: u64 = fuel;
-        let mut sync_reentry_depth_probe: u32 = 0;
-        let mut reg_stack_probe = [0u64; 64];
-        let mut reg_top_probe: usize = 0;
         let mut activation_probe = [0u64; 32];
         let mut activation_top_probe: usize = 0;
-        let mut native_frame = otter_vm::native_abi::NativeFrame {
-            header: otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
-            previous_frame: 0,
-            register_base: regs.as_mut_ptr() as u64,
-            argument_base: 0,
-            feedback_base: 0,
-            code_object_id: 1,
-            this_value_bits: 0,
-            new_target_bits: 0,
-            return_register: u32::MAX,
-            cold_state_index: u32::MAX,
-            argument_count: 0,
-            reserved0: 0,
-            feedback_id: 0,
-        };
+        let mut native_frame = otter_vm::native_abi::NativeFrame::new(
+            otter_vm::native_abi::VmFrameHeader::interpreter(0, regs.len() as u16),
+            regs.as_mut_ptr() as u64,
+            otter_vm::Value::undefined(),
+            otter_vm::Value::undefined(),
+        );
+        native_frame.set_materialized_activation(0);
         let mut thread = otter_vm::native_abi::VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(native_frame) as u64;
+        thread.current_code_object_id = 1;
         thread.interrupt_cell = std::ptr::addr_of!(interrupt_probe) as u64;
         thread.backedge_fuel_cell = std::ptr::addr_of_mut!(backedge_fuel_probe) as u64;
-        thread.sync_reentry_depth_cell = std::ptr::addr_of_mut!(sync_reentry_depth_probe) as u64;
-        thread.sync_reentry_limit = u32::MAX;
         let mut ctx = JitCtx {
-            regs: regs.as_mut_ptr(),
-            self_closure: 0,
-            this_value: 0,
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: &mut native_frame,
-            frame_index: 0,
-            upvalues_ptr: 0,
             error: &mut error,
             direct_call: std::mem::MaybeUninit::uninit(),
-            reg_stack_base: reg_stack_probe.as_mut_ptr(),
-            reg_top_ptr: std::ptr::addr_of_mut!(reg_top_probe),
             activation_base: activation_probe.as_mut_ptr().cast(),
             activation_top_ptr: std::ptr::addr_of_mut!(activation_top_probe),
             activation_limit: 16,
@@ -370,14 +351,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_publishes_a_compatible_code_object() {
+    fn metadata_publishes_the_code_object_shape() {
         let code = compile(&countdown_view()).expect("template compiles");
         let metadata = code.metadata();
-        assert!(metadata.is_compatible_with_current_vm());
         assert_eq!(metadata.safepoint_count, 0);
         assert_eq!(code.safepoint_count(), 0);
         assert!(!code.osr_only());
-        assert!(!code.frameless_entry_safe());
     }
 
     /// Executable fixtures spanning constants, branches, moves, and returns,

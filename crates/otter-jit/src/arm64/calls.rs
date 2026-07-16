@@ -9,9 +9,9 @@
 //! # Invariants
 //! - A prepare transition publishes one complete `direct_call` record before
 //!   the trampoline is called with `(caller_ctx, destination_register)`.
-//! - After compiled callee entry, its frame lives exactly as long as its
-//!   machine-stack reservation; the caller's frame is republished before the
-//!   returned, bailed, or threw status is dispatched.
+//! - Nested calls reuse the current `JitCtx`; only the compact callee frame is
+//!   stack-resident. Caller context fields are restored before returned,
+//!   bailed, or threw status is dispatched.
 //! - The callee's SELF and `this` slots are published in the activation arena
 //!   before compiled entry and removed exactly once on every completed entry.
 //! - Runtime-stub addresses come from [`TransitionTable`]; the callee machine
@@ -26,16 +26,17 @@ use otter_vm::native_abi as abi;
 
 use crate::entry::{
     ACTIVATION_BASE_OFFSET, ACTIVATION_LIMIT_OFFSET, ACTIVATION_TOP_PTR_OFFSET,
-    CODE_ENTRY_ACTIVE_COUNT_OFFSET, CTX_PLUS_FRAME_STACK_SIZE, DIRECT_CODE_OBJECT_ID_OFFSET,
-    DIRECT_ENTRY_CELL_OFFSET, DIRECT_FRAME_IDS_OFFSET, DIRECT_FRAME_INDEX_OFFSET,
-    DIRECT_FRAME_META_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
-    DIRECT_UPVALUES_OFFSET, ERROR_SLOT_OFFSET, FRAME_INDEX_OFFSET, JIT_CTX_STACK_SIZE,
-    NATIVE_FRAME_ARGUMENT_BASE_OFFSET, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET,
-    NATIVE_FRAME_FEEDBACK_BASE_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
-    NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_PREVIOUS_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET,
-    NATIVE_FRAME_RETURN_REGISTER_OFFSET, NATIVE_FRAME_TAIL_OFFSET, NATIVE_FRAME_THIS_OFFSET,
-    REG_STACK_BASE_OFFSET, REG_TOP_PTR_OFFSET, STATUS_BAILED, STATUS_RETURNED, THREAD_OFFSET,
-    TransitionTable, UPVALUES_PTR_OFFSET, VALUE_UNDEFINED,
+    CODE_ENTRY_ACTIVE_COUNT_OFFSET, CODE_ENTRY_CODE_OBJECT_ID_OFFSET, CODE_ENTRY_FLAGS_OFFSET,
+    CODE_ENTRY_FUNCTION_ID_OFFSET, CODE_ENTRY_REGISTER_COUNT_OFFSET, DIRECT_ENTRY_CELL_OFFSET,
+    DIRECT_OWNER_ID_OFFSET, DIRECT_REGS_OFFSET, DIRECT_SELF_OFFSET, DIRECT_THIS_OFFSET,
+    DIRECT_UPVALUE_COUNT_OFFSET, DIRECT_UPVALUES_OFFSET, NATIVE_FRAME_ACTIVATION_ID_OFFSET,
+    NATIVE_FRAME_CODE_BLOCK_ID_OFFSET, NATIVE_FRAME_FLAGS_OFFSET, NATIVE_FRAME_FUNCTION_ID_OFFSET,
+    NATIVE_FRAME_KIND_OFFSET, NATIVE_FRAME_NEW_TARGET_OFFSET, NATIVE_FRAME_OFFSET,
+    NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_REGISTER_COUNT_OFFSET,
+    NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_STACK_SIZE, NATIVE_FRAME_THIS_OFFSET,
+    NATIVE_FRAME_UPVALUE_BASE_OFFSET, NATIVE_FRAME_UPVALUE_COUNT_OFFSET, STATUS_BAILED,
+    STATUS_RETURNED, THREAD_OFFSET, TransitionTable, VALUE_UNDEFINED,
+    VM_THREAD_CODE_OBJECT_ID_OFFSET,
 };
 use crate::{BackendFailure, CompiledCode, Unsupported};
 
@@ -43,6 +44,18 @@ use crate::{BackendFailure, CompiledCode, Unsupported};
 const CALL_DONE: u64 = 0;
 const CALL_THREW: u64 = 1;
 const CALL_BAILED: u64 = 2;
+const CODE_ENTRY_SAFEPOINT_FLAG: u32 = abi::CODE_ENTRY_HAS_SAFEPOINTS;
+const CODE_ENTRY_OPTIMIZING_TIER_FLAG: u32 = abi::CODE_ENTRY_OPTIMIZING_TIER;
+const _: () = assert!(
+    CODE_ENTRY_SAFEPOINT_FLAG == abi::NativeFrameFlags::HAS_SAFEPOINTS as u32,
+    "entry and frame safepoint bits must match"
+);
+const _: () = assert!(
+    abi::NativeFrameKind::Baseline as u8 == 1
+        && abi::NativeFrameKind::Optimizing as u8 == 2
+        && CODE_ENTRY_OPTIMIZING_TIER_FLAG == 1 << 2,
+    "entry tier flag must fold to the native-frame tier discriminant"
+);
 
 /// Shared AArch64 compiled-to-compiled call lifecycle.
 ///
@@ -136,10 +149,13 @@ pub(crate) fn emit_prepared_call(
 
 /// Emit the single callable trampoline body.
 ///
-/// It builds the callee `JitCtx` and published `NativeFrame`, enters the
-/// prepared code, and owns every finish/abort path. The caller context is kept
-/// in callee-saved `x20`; the dynamic destination register is kept in `x19`;
-/// `x21`/`x22` retain the acquired entry cell and exact generation address.
+/// It reuses the current `JitCtx`, builds only the callee `NativeFrame`, enters
+/// the prepared code, and owns every finish/abort path. The caller context is
+/// kept in callee-saved `x20`; the dynamic destination register is kept in
+/// `x19`; `x21`/`x22` retain the acquired entry cell and exact entry address;
+/// `x23`/`x24` retain caller activation identity. The callee's owner id is
+/// copied into its canonical `NativeFrame`; bail completion receives that live
+/// frame before its 64-byte machine-stack record is released.
 fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
     let entry_acquire_retry = ops.new_dynamic_label();
     let entry_acquire_saturated = ops.new_dynamic_label();
@@ -162,16 +178,21 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
     let abort_direct_call = table.entry(abi::STUB_JIT_ABORT_DIRECT_CALL);
     dynasm!(ops
         ; .arch aarch64
-        ; stp x29, x30, [sp, #-48]!
+        ; stp x29, x30, [sp, #-64]!
         ; stp x19, x20, [sp, #16]
         ; stp x21, x22, [sp, #32]
+        ; stp x23, x24, [sp, #48]
         ; mov x29, sp
         ; mov x20, x0
         ; mov x19, x1
+        ; ldr x23, [x20, NATIVE_FRAME_OFFSET]
+        ; ldr x9, [x20, THREAD_OFFSET]
+        ; ldr x24, [x9, VM_THREAD_CODE_OBJECT_ID_OFFSET]
         // Acquire the exact registry-owned code generation before constructing
         // native activation state. x21 retains the never-reused cell; x22
         // retains the confirmed entry while invalidation is allowed to unlink
-        // the cell concurrently. active_count prevents mapping retirement.
+        // the cell concurrently.
+        // active_count prevents mapping retirement.
         ; ldr x21, [x20, DIRECT_ENTRY_CELL_OFFSET]
         ; cbz x21, =>entry_rejected
         ; ldar x22, [x21]
@@ -190,28 +211,27 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; cbz x9, =>entry_acquire_rollback
         ; cmp x9, x22
         ; b.ne =>entry_acquire_rollback
-        ; sub sp, sp, CTX_PLUS_FRAME_STACK_SIZE
-        ; ldr x9, [x20, DIRECT_REGS_OFFSET]
-        ; str x9, [sp]
-        ; ldr x9, [x20, DIRECT_SELF_OFFSET]
-        ; str x9, [sp, #8]
-        ; ldr x9, [x20, DIRECT_THIS_OFFSET]
-        ; str x9, [sp, #16]
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x9, [sp, THREAD_OFFSET]
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; add x15, sp, JIT_CTX_STACK_SIZE
-        ; ldr x9, [x20, DIRECT_FRAME_IDS_OFFSET]
-        ; str x9, [x15]
-        ; ldr x9, [x20, DIRECT_FRAME_META_OFFSET]
-        ; str x9, [x15, #8]
-        ; str x10, [x15, NATIVE_FRAME_PREVIOUS_OFFSET]
+        ; sub sp, sp, NATIVE_FRAME_STACK_SIZE
+        ; mov x15, sp
+        // Build the canonical header directly from the immutable entry cell;
+        // prepare staging carries no duplicate function/layout words.
+        ; ldr w9, [x21, CODE_ENTRY_FUNCTION_ID_OFFSET]
+        ; str w9, [x15, NATIVE_FRAME_FUNCTION_ID_OFFSET]
+        ; str w9, [x15, NATIVE_FRAME_CODE_BLOCK_ID_OFFSET]
+        ; str wzr, [x15, NATIVE_FRAME_PC_OFFSET]
+        ; ldrh w9, [x21, CODE_ENTRY_REGISTER_COUNT_OFFSET]
+        ; strh w9, [x15, NATIVE_FRAME_REGISTER_COUNT_OFFSET]
+        ; ldr w10, [x21, CODE_ENTRY_FLAGS_OFFSET]
+        // Baseline=1, Optimizing=2. Fold the entry tier bit directly into the
+        // enum discriminant without another machine-visible field.
+        ; and w9, w10, #CODE_ENTRY_OPTIMIZING_TIER_FLAG
+        ; lsr w9, w9, #2
+        ; add w9, w9, #1
+        ; strb w9, [x15, NATIVE_FRAME_KIND_OFFSET]
+        ; and w9, w10, #CODE_ENTRY_SAFEPOINT_FLAG
+        ; strb w9, [x15, NATIVE_FRAME_FLAGS_OFFSET]
         ; ldr x9, [x20, DIRECT_REGS_OFFSET]
         ; str x9, [x15, NATIVE_FRAME_REGISTER_BASE_OFFSET]
-        ; str xzr, [x15, NATIVE_FRAME_ARGUMENT_BASE_OFFSET]
-        ; str xzr, [x15, NATIVE_FRAME_FEEDBACK_BASE_OFFSET]
-        ; ldr x9, [x20, DIRECT_CODE_OBJECT_ID_OFFSET]
-        ; str x9, [x15, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
         ; ldr x9, [x20, DIRECT_THIS_OFFSET]
         ; str x9, [x15, NATIVE_FRAME_THIS_OFFSET]
     );
@@ -219,53 +239,41 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
     dynasm!(ops
         ; .arch aarch64
         ; str x9, [x15, NATIVE_FRAME_NEW_TARGET_OFFSET]
-        ; movn x9, #0
-        ; str x9, [x15, NATIVE_FRAME_RETURN_REGISTER_OFFSET]
-        ; str xzr, [x15, NATIVE_FRAME_TAIL_OFFSET]
-        ; str x15, [sp, NATIVE_FRAME_OFFSET]
-        ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x15, [x9]
-        ; ldr x9, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; str x9, [sp, FRAME_INDEX_OFFSET]
-        ; ldr x9, [x20, ERROR_SLOT_OFFSET]
-        ; str x9, [sp, ERROR_SLOT_OFFSET]
+        ; ldr x9, [x20, DIRECT_SELF_OFFSET]
+        ; str x9, [x15, NATIVE_FRAME_SELF_OFFSET]
         ; ldr x9, [x20, DIRECT_UPVALUES_OFFSET]
-        ; str x9, [sp, UPVALUES_PTR_OFFSET]
-        ; ldr x9, [x20, REG_STACK_BASE_OFFSET]
-        ; str x9, [sp, REG_STACK_BASE_OFFSET]
-        ; ldr x9, [x20, REG_TOP_PTR_OFFSET]
-        ; str x9, [sp, REG_TOP_PTR_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_BASE_OFFSET]
-        ; str x9, [sp, ACTIVATION_BASE_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
-        ; str x9, [sp, ACTIVATION_TOP_PTR_OFFSET]
-        ; ldr x9, [x20, ACTIVATION_LIMIT_OFFSET]
-        ; str x9, [sp, ACTIVATION_LIMIT_OFFSET]
-        // Publish the callee's SELF/`this` GC slots inline: bump the
-        // activation cursor and record the two slot addresses. Overflow takes
-        // the stub slow path, which parks the stack-overflow error.
+        ; str x9, [x15, NATIVE_FRAME_UPVALUE_BASE_OFFSET]
+        ; ldr w9, [x20, DIRECT_UPVALUE_COUNT_OFFSET]
+        ; str w9, [x15, NATIVE_FRAME_UPVALUE_COUNT_OFFSET]
+        ; ldr w9, [x20, DIRECT_OWNER_ID_OFFSET]
+        ; str w9, [x15, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
+        ; ldr x9, [x21, CODE_ENTRY_CODE_OBJECT_ID_OFFSET]
+        ; ldr x10, [x20, THREAD_OFFSET]
+        ; str x9, [x10, VM_THREAD_CODE_OBJECT_ID_OFFSET]
+        ; str x15, [x20, NATIVE_FRAME_OFFSET]
+        ; str x15, [x10]
+        // Publish the complete canonical frame inline. Overflow takes the
+        // stub slow path, which parks the stack-overflow error.
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; ldr x11, [x20, ACTIVATION_LIMIT_OFFSET]
         ; cmp x10, x11
         ; b.hs =>push_slow
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
-        ; add x13, sp, #8
-        ; str x13, [x12]
-        ; add x13, sp, #16
-        ; str x13, [x12, #8]
+        ; add x12, x11, x10, lsl #3
+        ; str x15, [x12]
         ; add x10, x10, #1
         ; str x10, [x9]
         ; =>push_done
-        ; mov x0, sp
+        ; mov x0, x20
         ; blr x22
         // The callee has returned. Unpublish its native frame before releasing
         // the entry lease so retirement can never observe a published frame
         // whose code-object metadata is no longer registry-owned.
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; str x23, [x20, NATIVE_FRAME_OFFSET]
         ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x10, [x9]
+        ; str x24, [x9, VM_THREAD_CODE_OBJECT_ID_OFFSET]
+        ; str x23, [x9]
         ; add x15, x21, CODE_ENTRY_ACTIVE_COUNT_OFFSET
         ; =>entry_release_after_call
         ; ldaxr w9, [x15]
@@ -284,11 +292,10 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; sub x10, x10, #1
         ; str x10, [x9]
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
+        ; add x12, x11, x10, lsl #3
         ; str xzr, [x12]
-        ; str xzr, [x12, #8]
-        ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
+        ; ldr w2, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
+        ; add sp, sp, NATIVE_FRAME_STACK_SIZE
         ; mov x0, x20
         ; mov x1, x19
     );
@@ -303,19 +310,17 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; cbnz x0, =>direct_finish_threw
         ; b =>direct_done
         ; =>direct_bailed
-        // The callee stamped its exact bail PC into its own published frame.
-        ; add x9, sp, JIT_CTX_STACK_SIZE
-        ; ldr w3, [x9, NATIVE_FRAME_PC_OFFSET]
+        // Preserve the complete live callee frame through the cold
+        // materialization call. The VM copies it before re-entering.
         ; ldr x9, [x20, ACTIVATION_TOP_PTR_OFFSET]
         ; ldr x10, [x9]
         ; sub x10, x10, #1
         ; str x10, [x9]
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
+        ; add x12, x11, x10, lsl #3
         ; str xzr, [x12]
-        ; str xzr, [x12, #8]
-        ; ldr x2, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
+        ; ldr w2, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
+        ; mov x3, sp
         ; mov x0, x20
         ; mov x1, x19
     );
@@ -327,6 +332,7 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
+        ; add sp, sp, NATIVE_FRAME_STACK_SIZE
         ; cbnz x0, =>direct_finish_threw
         ; b =>direct_done
         ; =>direct_threw
@@ -335,11 +341,10 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; sub x10, x10, #1
         ; str x10, [x9]
         ; ldr x11, [x20, ACTIVATION_BASE_OFFSET]
-        ; add x12, x11, x10, lsl #4
+        ; add x12, x11, x10, lsl #3
         ; str xzr, [x12]
-        ; str xzr, [x12, #8]
-        ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
+        ; ldr w1, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
+        ; add sp, sp, NATIVE_FRAME_STACK_SIZE
         ; mov x0, x20
     );
     emit_load_u64(ops, 16, abort_direct_call);
@@ -352,7 +357,7 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         // Out-of-line activation-publish overflow: the stub re-checks, parks
         // the stack-overflow error, and reports it.
         ; =>push_slow
-        ; mov x0, sp
+        ; mov x0, x20
     );
     emit_load_u64(ops, 16, push_activation);
     dynasm!(ops
@@ -364,17 +369,18 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         // Activation publication failed before the cursor advanced. Restore
         // the caller machine state, then abort the VM-owned prepared frame and
         // its sync-reentry guard without attempting an activation pop.
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
+        ; str x23, [x20, NATIVE_FRAME_OFFSET]
         ; ldr x9, [x20, THREAD_OFFSET]
-        ; str x10, [x9]
+        ; str x24, [x9, VM_THREAD_CODE_OBJECT_ID_OFFSET]
+        ; str x23, [x9]
         ; add x15, x21, CODE_ENTRY_ACTIVE_COUNT_OFFSET
         ; =>entry_release_after_push_failure
         ; ldaxr w9, [x15]
         ; sub w10, w9, #1
         ; stlxr w11, w10, [x15]
         ; cbnz w11, =>entry_release_after_push_failure
-        ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
-        ; add sp, sp, CTX_PLUS_FRAME_STACK_SIZE
+        ; ldr w1, [sp, NATIVE_FRAME_ACTIVATION_ID_OFFSET]
+        ; add sp, sp, NATIVE_FRAME_STACK_SIZE
         ; mov x0, x20
     );
     emit_load_u64(ops, 16, abort_direct_call);
@@ -399,7 +405,7 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; stlxr w11, w10, [x15]
         ; cbnz w11, =>entry_rollback_retry
         ; =>entry_rejected
-        ; ldr x1, [x20, DIRECT_FRAME_INDEX_OFFSET]
+        ; ldr w1, [x20, DIRECT_OWNER_ID_OFFSET]
         ; mov x0, x20
     );
     emit_load_u64(ops, 16, abort_direct_call);
@@ -418,16 +424,17 @@ fn emit_call_trampoline(ops: &mut Assembler, table: &TransitionTable) {
         ; =>direct_finish_bailed
         ; movz x0, CALL_BAILED as u32
         ; =>direct_exit
+        ; ldp x23, x24, [sp, #48]
         ; ldp x21, x22, [sp, #32]
         ; ldp x19, x20, [sp, #16]
-        ; ldp x29, x30, [sp], #48
+        ; ldp x29, x30, [sp], #64
         ; ret
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use otter_vm::{
         Value, VmError,
@@ -442,20 +449,22 @@ mod tests {
 
     static PUSH_SAW_CALLEE_FRAME: AtomicBool = AtomicBool::new(false);
     static ABORT_SAW_CALLER_FRAME: AtomicBool = AtomicBool::new(false);
-    static ABORT_FRAME_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static ABORT_OWNER_ID: AtomicU64 = AtomicU64::new(u64::MAX);
     static RETURN_CALLEE_SAW_PUBLISHED_FRAME: AtomicBool = AtomicBool::new(false);
+    static RETURN_CALLEE_SAW_NATIVE_OWNER: AtomicBool = AtomicBool::new(false);
     static RETURN_FINISH_SAW_CALLER_FRAME: AtomicBool = AtomicBool::new(false);
     static RETURN_FINISH_DST: AtomicU64 = AtomicU64::new(u64::MAX);
-    static RETURN_FINISH_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static RETURN_FINISH_OWNER: AtomicU64 = AtomicU64::new(u64::MAX);
     static RETURN_FINISH_VALUE: AtomicU64 = AtomicU64::new(0);
     static BAIL_CALLEE_SAW_PUBLISHED_FRAME: AtomicBool = AtomicBool::new(false);
     static BAIL_FINISH_SAW_CALLER_FRAME: AtomicBool = AtomicBool::new(false);
+    static BAIL_FINISH_SAW_NATIVE_FRAME: AtomicBool = AtomicBool::new(false);
     static BAIL_FINISH_DST: AtomicU64 = AtomicU64::new(u64::MAX);
-    static BAIL_FINISH_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static BAIL_FINISH_OWNER: AtomicU64 = AtomicU64::new(u64::MAX);
     static BAIL_FINISH_PC: AtomicU64 = AtomicU64::new(u64::MAX);
     static THROW_CALLEE_SAW_PUBLISHED_FRAME: AtomicBool = AtomicBool::new(false);
     static THROW_ABORT_SAW_CALLER_FRAME: AtomicBool = AtomicBool::new(false);
-    static THROW_ABORT_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+    static THROW_ABORT_OWNER: AtomicU64 = AtomicU64::new(u64::MAX);
     static UNLINKED_CALLEE_ENTERED: AtomicBool = AtomicBool::new(false);
     static SATURATED_CALLEE_ENTERED: AtomicBool = AtomicBool::new(false);
 
@@ -479,7 +488,7 @@ mod tests {
         1
     }
 
-    extern "C" fn observe_abort(ctx: *mut JitCtx, callee_frame_index: u64) -> u64 {
+    extern "C" fn observe_abort(ctx: *mut JitCtx, owner_id: u64) -> u64 {
         // SAFETY: the failure path must pass the live outer context after
         // restoring its stack reservation.
         let ctx = unsafe { &mut *ctx };
@@ -489,7 +498,7 @@ mod tests {
             thread.current_frame == ctx.native_frame as u64,
             Ordering::SeqCst,
         );
-        ABORT_FRAME_INDEX.store(callee_frame_index as usize, Ordering::SeqCst);
+        ABORT_OWNER_ID.store(owner_id, Ordering::SeqCst);
         0
     }
 
@@ -502,18 +511,17 @@ mod tests {
             thread.current_frame == ctx.native_frame as u64,
             Ordering::SeqCst,
         );
+        RETURN_CALLEE_SAW_NATIVE_OWNER.store(
+            unsafe { &*ctx.native_frame }.native_owner_id() == Some(41),
+            Ordering::SeqCst,
+        );
         JitRet {
             value: RETURN_VALUE,
             status: STATUS_RETURNED,
         }
     }
 
-    extern "C" fn finish_returned(
-        ctx: *mut JitCtx,
-        dst: u64,
-        callee_frame_index: u64,
-        value: u64,
-    ) -> u64 {
+    extern "C" fn finish_returned(ctx: *mut JitCtx, dst: u64, owner_id: u64, value: u64) -> u64 {
         // SAFETY: the trampoline has restored the live caller context.
         let ctx = unsafe { &mut *ctx };
         // SAFETY: the fixture supplies a live thread.
@@ -523,7 +531,7 @@ mod tests {
             Ordering::SeqCst,
         );
         RETURN_FINISH_DST.store(dst, Ordering::SeqCst);
-        RETURN_FINISH_FRAME.store(callee_frame_index, Ordering::SeqCst);
+        RETURN_FINISH_OWNER.store(owner_id, Ordering::SeqCst);
         RETURN_FINISH_VALUE.store(value, Ordering::SeqCst);
         0
     }
@@ -549,8 +557,8 @@ mod tests {
     extern "C" fn finish_bailed(
         ctx: *mut JitCtx,
         dst: u64,
-        callee_frame_index: u64,
-        resume_pc: u64,
+        owner_id: u64,
+        callee_frame: *const NativeFrame,
     ) -> u64 {
         // SAFETY: the trampoline has restored the live caller context.
         let ctx = unsafe { &mut *ctx };
@@ -561,8 +569,19 @@ mod tests {
             Ordering::SeqCst,
         );
         BAIL_FINISH_DST.store(dst, Ordering::SeqCst);
-        BAIL_FINISH_FRAME.store(callee_frame_index, Ordering::SeqCst);
-        BAIL_FINISH_PC.store(resume_pc, Ordering::SeqCst);
+        let frame = unsafe { callee_frame.as_ref() };
+        BAIL_FINISH_SAW_NATIVE_FRAME.store(
+            frame.is_some_and(|frame| {
+                frame.native_owner_id() == Some(owner_id as u32)
+                    && frame.materialized_frame_index().is_none()
+            }),
+            Ordering::SeqCst,
+        );
+        BAIL_FINISH_OWNER.store(owner_id, Ordering::SeqCst);
+        BAIL_FINISH_PC.store(
+            frame.map_or(u64::MAX, |frame| u64::from(frame.header.pc)),
+            Ordering::SeqCst,
+        );
         0
     }
 
@@ -600,7 +619,7 @@ mod tests {
         }
     }
 
-    extern "C" fn abort_thrown_callee(ctx: *mut JitCtx, callee_frame_index: u64) -> u64 {
+    extern "C" fn abort_thrown_callee(ctx: *mut JitCtx, owner_id: u64) -> u64 {
         // SAFETY: the trampoline restores the caller before aborting.
         let ctx = unsafe { &mut *ctx };
         // SAFETY: the fixture supplies a live thread.
@@ -609,7 +628,7 @@ mod tests {
             thread.current_frame == ctx.native_frame as u64,
             Ordering::SeqCst,
         );
-        THROW_ABORT_FRAME.store(callee_frame_index, Ordering::SeqCst);
+        THROW_ABORT_OWNER.store(owner_id, Ordering::SeqCst);
         0
     }
 
@@ -627,8 +646,7 @@ mod tests {
         callee_entry: extern "C" fn(*mut JitCtx) -> JitRet,
         dst: u64,
     ) -> FixtureOutcome {
-        let entry_cell =
-            CodeEntryCell::new(callee_entry as *const () as usize, 17, 9, 0, 1, 0, 0, 0);
+        let entry_cell = CodeEntryCell::new(callee_entry as *const () as usize, 17, 9, 0, 1, 0);
         invoke_prepared_cell(transitions, &entry_cell, dst)
     }
 
@@ -643,31 +661,23 @@ mod tests {
         let caller_frame_addr = std::ptr::addr_of_mut!(caller_frame) as u64;
         let mut thread = VmThread::empty();
         thread.current_frame = caller_frame_addr;
+        thread.current_code_object_id = 11;
         let mut error = None;
         let mut activation_slots = [0u64; 2];
         let mut activation_top = 0usize;
         let mut ctx = JitCtx {
-            regs: regs.as_mut_ptr(),
-            self_closure: Value::undefined().to_bits(),
-            this_value: Value::undefined().to_bits(),
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(caller_frame),
-            frame_index: 3,
-            upvalues_ptr: 0,
             error: std::ptr::addr_of_mut!(error),
             direct_call: std::mem::MaybeUninit::new(JitPreparedDirectCall {
                 entry_cell: std::ptr::from_ref(entry_cell) as u64,
                 regs: regs.as_mut_ptr(),
                 self_closure: Value::undefined().to_bits(),
                 this_value: Value::undefined().to_bits(),
-                frame_index: 41,
                 upvalues_ptr: 0,
-                frame_ids: 9 | (9_u64 << 32),
-                frame_meta: 1_u64 << 32,
-                code_object_id: 17,
+                owner_id: 41,
+                upvalue_count: 0,
             }),
-            reg_stack_base: std::ptr::null_mut(),
-            reg_top_ptr: std::ptr::null_mut(),
             activation_base: activation_slots.as_mut_ptr().cast(),
             activation_top_ptr: std::ptr::addr_of_mut!(activation_top),
             activation_limit: 1,
@@ -685,8 +695,8 @@ mod tests {
     }
 
     fn native_frame(regs: *mut u64) -> NativeFrame {
-        NativeFrame {
-            header: VmFrameHeader {
+        let mut frame = NativeFrame::new(
+            VmFrameHeader {
                 function_id: 7,
                 code_block_id: 7,
                 pc: 0,
@@ -694,27 +704,21 @@ mod tests {
                 kind: NativeFrameKind::Baseline,
                 flags: NativeFrameFlags::empty(),
             },
-            previous_frame: 0,
-            register_base: regs as u64,
-            argument_base: 0,
-            feedback_base: 0,
-            code_object_id: 11,
-            this_value_bits: Value::undefined().to_bits(),
-            new_target_bits: Value::undefined().to_bits(),
-            return_register: u32::MAX,
-            cold_state_index: u32::MAX,
-            argument_count: 0,
-            reserved0: 0,
-            feedback_id: 0,
-        }
+            regs as u64,
+            Value::undefined(),
+            Value::undefined(),
+        );
+        frame.set_materialized_activation(3);
+        frame
     }
 
     #[test]
     fn returned_callee_finishes_dynamic_destination_and_releases_activation() {
         RETURN_CALLEE_SAW_PUBLISHED_FRAME.store(false, Ordering::SeqCst);
+        RETURN_CALLEE_SAW_NATIVE_OWNER.store(false, Ordering::SeqCst);
         RETURN_FINISH_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
         RETURN_FINISH_DST.store(u64::MAX, Ordering::SeqCst);
-        RETURN_FINISH_FRAME.store(u64::MAX, Ordering::SeqCst);
+        RETURN_FINISH_OWNER.store(u64::MAX, Ordering::SeqCst);
         RETURN_FINISH_VALUE.store(0, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
@@ -731,9 +735,10 @@ mod tests {
         assert_eq!(outcome.activation_slots, [0, 0]);
         assert!(outcome.error.is_none());
         assert!(RETURN_CALLEE_SAW_PUBLISHED_FRAME.load(Ordering::SeqCst));
+        assert!(RETURN_CALLEE_SAW_NATIVE_OWNER.load(Ordering::SeqCst));
         assert!(RETURN_FINISH_SAW_CALLER_FRAME.load(Ordering::SeqCst));
         assert_eq!(RETURN_FINISH_DST.load(Ordering::SeqCst), 29);
-        assert_eq!(RETURN_FINISH_FRAME.load(Ordering::SeqCst), 41);
+        assert_eq!(RETURN_FINISH_OWNER.load(Ordering::SeqCst), 41);
         assert_eq!(RETURN_FINISH_VALUE.load(Ordering::SeqCst), RETURN_VALUE);
     }
 
@@ -741,8 +746,9 @@ mod tests {
     fn bailed_callee_forwards_exact_pc_and_releases_activation() {
         BAIL_CALLEE_SAW_PUBLISHED_FRAME.store(false, Ordering::SeqCst);
         BAIL_FINISH_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
+        BAIL_FINISH_SAW_NATIVE_FRAME.store(false, Ordering::SeqCst);
         BAIL_FINISH_DST.store(u64::MAX, Ordering::SeqCst);
-        BAIL_FINISH_FRAME.store(u64::MAX, Ordering::SeqCst);
+        BAIL_FINISH_OWNER.store(u64::MAX, Ordering::SeqCst);
         BAIL_FINISH_PC.store(u64::MAX, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
@@ -760,8 +766,9 @@ mod tests {
         assert!(outcome.error.is_none());
         assert!(BAIL_CALLEE_SAW_PUBLISHED_FRAME.load(Ordering::SeqCst));
         assert!(BAIL_FINISH_SAW_CALLER_FRAME.load(Ordering::SeqCst));
+        assert!(BAIL_FINISH_SAW_NATIVE_FRAME.load(Ordering::SeqCst));
         assert_eq!(BAIL_FINISH_DST.load(Ordering::SeqCst), 31);
-        assert_eq!(BAIL_FINISH_FRAME.load(Ordering::SeqCst), 41);
+        assert_eq!(BAIL_FINISH_OWNER.load(Ordering::SeqCst), 41);
         assert_eq!(BAIL_FINISH_PC.load(Ordering::SeqCst), u64::from(BAIL_PC));
     }
 
@@ -769,7 +776,7 @@ mod tests {
     fn thrown_callee_restores_caller_then_aborts_once() {
         THROW_CALLEE_SAW_PUBLISHED_FRAME.store(false, Ordering::SeqCst);
         THROW_ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        THROW_ABORT_FRAME.store(u64::MAX, Ordering::SeqCst);
+        THROW_ABORT_OWNER.store(u64::MAX, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
         transitions.replace_entry_for_test(
@@ -786,14 +793,14 @@ mod tests {
         assert!(matches!(outcome.error, Some(VmError::InvalidOperand)));
         assert!(THROW_CALLEE_SAW_PUBLISHED_FRAME.load(Ordering::SeqCst));
         assert!(THROW_ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(THROW_ABORT_FRAME.load(Ordering::SeqCst), 41);
+        assert_eq!(THROW_ABORT_OWNER.load(Ordering::SeqCst), 41);
     }
 
     #[test]
     fn failed_activation_push_restores_caller_and_aborts_prepared_frame() {
         PUSH_SAW_CALLEE_FRAME.store(false, Ordering::SeqCst);
         ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        ABORT_FRAME_INDEX.store(usize::MAX, Ordering::SeqCst);
+        ABORT_OWNER_ID.store(u64::MAX, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
         transitions.replace_entry_for_test(
@@ -806,37 +813,28 @@ mod tests {
         );
 
         let trampoline = CallTrampoline::compile(&transitions).expect("call trampoline");
-        let entry_cell =
-            CodeEntryCell::new(returning_callee as *const () as usize, 17, 9, 0, 1, 0, 0, 0);
+        let entry_cell = CodeEntryCell::new(returning_callee as *const () as usize, 17, 9, 0, 1, 0);
 
         let mut regs = [Value::undefined().to_bits()];
         let mut caller_frame = native_frame(regs.as_mut_ptr());
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::addr_of_mut!(caller_frame) as u64;
+        thread.current_code_object_id = 11;
         let mut error = None;
         let mut activation_top = 1usize;
         let mut ctx = JitCtx {
-            regs: regs.as_mut_ptr(),
-            self_closure: Value::undefined().to_bits(),
-            this_value: Value::undefined().to_bits(),
             thread: std::ptr::addr_of_mut!(thread),
             native_frame: std::ptr::addr_of_mut!(caller_frame),
-            frame_index: 3,
-            upvalues_ptr: 0,
             error: std::ptr::addr_of_mut!(error),
             direct_call: std::mem::MaybeUninit::new(JitPreparedDirectCall {
                 entry_cell: std::ptr::addr_of!(entry_cell) as u64,
                 regs: regs.as_mut_ptr(),
                 self_closure: Value::undefined().to_bits(),
                 this_value: Value::undefined().to_bits(),
-                frame_index: 41,
                 upvalues_ptr: 0,
-                frame_ids: 9 | (9_u64 << 32),
-                frame_meta: 1_u64 << 32,
-                code_object_id: 17,
+                owner_id: 41,
+                upvalue_count: 0,
             }),
-            reg_stack_base: std::ptr::null_mut(),
-            reg_top_ptr: std::ptr::null_mut(),
             activation_base: std::ptr::null_mut(),
             activation_top_ptr: std::ptr::addr_of_mut!(activation_top),
             activation_limit: 1,
@@ -847,7 +845,7 @@ mod tests {
         assert_eq!(status, CALL_THREW);
         assert!(PUSH_SAW_CALLEE_FRAME.load(Ordering::SeqCst));
         assert!(ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(ABORT_FRAME_INDEX.load(Ordering::SeqCst), 41);
+        assert_eq!(ABORT_OWNER_ID.load(Ordering::SeqCst), 41);
         assert_eq!(
             thread.current_frame,
             std::ptr::addr_of!(caller_frame) as u64
@@ -860,7 +858,7 @@ mod tests {
     #[test]
     fn unlinked_entry_cell_aborts_prepared_frame_without_native_entry() {
         ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        ABORT_FRAME_INDEX.store(usize::MAX, Ordering::SeqCst);
+        ABORT_OWNER_ID.store(u64::MAX, Ordering::SeqCst);
         UNLINKED_CALLEE_ENTERED.store(false, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
@@ -868,16 +866,8 @@ mod tests {
             abi::STUB_JIT_ABORT_DIRECT_CALL,
             observe_abort as *const () as usize,
         );
-        let entry_cell = CodeEntryCell::new(
-            unlinked_probe_callee as *const () as usize,
-            17,
-            9,
-            0,
-            1,
-            0,
-            0,
-            0,
-        );
+        let entry_cell =
+            CodeEntryCell::new(unlinked_probe_callee as *const () as usize, 17, 9, 0, 1, 0);
         assert!(entry_cell.unlink().is_some());
 
         let outcome = invoke_prepared_cell(&transitions, &entry_cell, 0);
@@ -888,13 +878,13 @@ mod tests {
         assert_eq!(outcome.activation_top, 0);
         assert!(!UNLINKED_CALLEE_ENTERED.load(Ordering::SeqCst));
         assert!(ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(ABORT_FRAME_INDEX.load(Ordering::SeqCst), 41);
+        assert_eq!(ABORT_OWNER_ID.load(Ordering::SeqCst), 41);
     }
 
     #[test]
     fn saturated_entry_cell_rejects_without_wrapping_activation_count() {
         ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        ABORT_FRAME_INDEX.store(usize::MAX, Ordering::SeqCst);
+        ABORT_OWNER_ID.store(u64::MAX, Ordering::SeqCst);
         SATURATED_CALLEE_ENTERED.store(false, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
@@ -902,16 +892,8 @@ mod tests {
             abi::STUB_JIT_ABORT_DIRECT_CALL,
             observe_abort as *const () as usize,
         );
-        let entry_cell = CodeEntryCell::new(
-            saturated_probe_callee as *const () as usize,
-            17,
-            9,
-            0,
-            1,
-            0,
-            0,
-            0,
-        );
+        let entry_cell =
+            CodeEntryCell::new(saturated_probe_callee as *const () as usize, 17, 9, 0, 1, 0);
         entry_cell.active_count.store(u32::MAX, Ordering::Release);
 
         let outcome = invoke_prepared_cell(&transitions, &entry_cell, 0);
@@ -922,6 +904,6 @@ mod tests {
         assert_eq!(outcome.activation_top, 0);
         assert!(!SATURATED_CALLEE_ENTERED.load(Ordering::SeqCst));
         assert!(ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(ABORT_FRAME_INDEX.load(Ordering::SeqCst), 41);
+        assert_eq!(ABORT_OWNER_ID.load(Ordering::SeqCst), 41);
     }
 }

@@ -62,15 +62,32 @@ impl Interpreter {
         dst: u16,
         name_idx: u32,
     ) -> Result<(), VmError> {
+        let value = self.load_global_or_throw_value(context, function_id, name_idx)?;
+        write_register(frame, dst, value)?;
+        frame.advance_pc()?;
+        Ok(())
+    }
+
+    /// Resolve one throwing global binding read without coupling the semantic
+    /// operation to a physical frame representation.
+    ///
+    /// Interpreter and compiled tiers commit the returned value through their
+    /// own active-frame view. Accessor invocation, lexical caching, and TDZ
+    /// errors therefore have one implementation while PC ownership remains at
+    /// the dispatch tier.
+    pub(crate) fn load_global_or_throw_value(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name_idx: u32,
+    ) -> Result<Value, VmError> {
         // A previously-resolved lexical cell for this load site reads directly,
         // skipping the name-string hash and const-table lookup. The cell is
         // permanent once bound, so the only per-read check is the TDZ hole.
         if let Some(&cell) = self.global_lexical_load_ic.get(&(function_id, name_idx)) {
             let value = crate::read_upvalue(&self.gc_heap, cell);
             if !value.is_hole() {
-                write_register(frame, dst, value)?;
-                frame.advance_pc()?;
-                return Ok(());
+                return Ok(value);
             }
             let name = context
                 .string_constant_str_for_function(function_id, name_idx)
@@ -93,9 +110,7 @@ impl Interpreter {
                     (format!("Cannot access '{name}' before initialization")).into(),
                 ));
             }
-            write_register(frame, dst, value)?;
-            frame.advance_pc()?;
-            return Ok(());
+            return Ok(value);
         }
         let receiver = Value::object(self.global_this);
         let key = VmPropertyKey::String(name);
@@ -108,9 +123,7 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
             }
         };
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        Ok(value)
     }
 
     pub(crate) fn run_load_global_or_undefined_reg(

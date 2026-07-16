@@ -83,8 +83,8 @@ impl Interpreter {
     ///    `dst` register on resume.
     ///
     /// # Invariants
-    /// - The frame at the top of `stack` MUST be an async frame
-    ///   (its `async_state.is_some()`); the compiler enforces
+    /// - The frame at the top of `stack` MUST have async ownership in its cold
+    ///   record; the compiler enforces
     ///   this. Violating it is a bytecode-malformation error and
     ///   surfaces as `VmError::InvalidOperand`.
     /// - On return, `stack` no longer contains the parked frame.
@@ -104,14 +104,14 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
         // §27.6 Async-generator body — the running frame has no
-        // `async_state` (it isn't a regular async-function frame),
-        // but it carries a `generator_owner` whose body was flagged
+        // regular async-function state, but its cold record carries a
+        // generator owner whose body was flagged
         // async. Park the frame on a dedicated resume native that
         // re-enters the generator body and either settles the
         // front queued request from a subsequent `Op::Yield` /
         // completion, or chains another `Op::Await`.
-        if stack[top_idx].async_state.is_none() {
-            if let Some(owner) = stack[top_idx].generator_owner
+        if !self.frame_has_async_state(&stack[top_idx]) {
+            if let Some(owner) = self.frame_generator_owner(&stack[top_idx])
                 && owner.is_async(&self.gc_heap)
             {
                 return self.do_await_async_gen(stack, context, dst, awaited, owner);
@@ -437,8 +437,8 @@ impl Interpreter {
     ///      depth), jump pc to the finally entry, pop the handler,
     ///      return `Ok(())`. [`otter_bytecode::Op::EndFinally`]
     ///      re-throws unless a later unwind discarded the entry.
-    ///    - **No handler in this frame** — if the frame is async
-    ///      (`async_state.is_some()`), settle its result promise
+    ///    - **No handler in this frame** — if the cold record owns an async
+    ///      result promise, settle it
     ///      as rejected, drain the resulting jobs into the
     ///      microtask queue, pop the frame, and stop unwinding.
     ///      The caller is in a different "logical thread" — its pc
@@ -493,16 +493,17 @@ impl Interpreter {
                 // before the frame is discarded.
                 let closers = self.take_frame_closers_above(stack.last_mut().expect("frame"), -1);
                 self.close_unwind_iterators(context, closers);
-                let frame = stack.last_mut().expect("frame still present");
                 // Async frames absorb their own unhandled throws into the
                 // result promise as a rejection — spec §27.7.5.3
                 // step 1.h.iii.
-                if frame.async_state.is_some() {
-                    let popped = stack.pop().expect("frame existed at last_mut");
-                    let result_promise = popped
-                        .async_state
-                        .expect("async_state checked just above")
+                if self.frame_has_async_state(stack.last().expect("frame still present")) {
+                    let mut popped = stack.pop().expect("frame existed at last");
+                    let result_promise = self
+                        .frame_take_async_state(&mut popped)
+                        .expect("async ownership checked just above")
                         .result_promise;
+                    self.frame_release_cold(&mut popped);
+                    self.reclaim_registers(&mut popped);
                     let jobs = result_promise.reject(&mut self.gc_heap, payload);
                     self.note_settle_rejection(&jobs);
                     for j in jobs.jobs {
@@ -510,7 +511,9 @@ impl Interpreter {
                     }
                     return Ok(());
                 }
-                stack.pop();
+                let mut popped = stack.pop().expect("frame still present");
+                self.frame_release_cold(&mut popped);
+                self.reclaim_registers(&mut popped);
                 continue;
             };
             // Landing in this frame's catch / finally: §7.4.9 closes the

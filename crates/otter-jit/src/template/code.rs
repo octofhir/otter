@@ -10,8 +10,7 @@
 //!   only through the frozen `JitCtx`/`JitRet` contract.
 //! - Allocating runtime calls name a concrete code-object-owned safepoint;
 //!   the sorted record table resolves ids for the moving collector.
-//! - Metadata versions are validated before every entry selection, exactly as
-//!   for the baseline emitter's code objects.
+//! - Installed code uses the single in-process VM layout.
 //!
 //! # See also
 //! - [`crate::entry`] — owner of the shared entry context and epilogue
@@ -21,9 +20,7 @@ use crate::CompiledCode;
 #[cfg(target_arch = "aarch64")]
 use crate::arm64::CallTrampoline;
 use crate::entry::enter_compiled;
-use otter_vm::native_abi::{
-    BuildVersionRecord, CodeObjectMetadata, LayoutVersionRecord, VM_BUILD_VERSION,
-};
+use otter_vm::native_abi::CodeObjectMetadata;
 use otter_vm::{JitExecOutcome, JitFunctionCode, SafepointRecord, VmRuntimeActivation};
 
 /// Finalized template machine code for one function.
@@ -83,7 +80,6 @@ impl TemplateCode {
         osr_entries: std::collections::BTreeMap<u32, usize>,
         osr_only: bool,
     ) -> Self {
-        const AARCH64_TEMPLATE_ABI: u64 = 0x4136_3454_504c_0001;
         let metadata = CodeObjectMetadata {
             id: code_object_id,
             code_block_id: function_id,
@@ -93,12 +89,6 @@ impl TemplateCode {
             frame_map_count: safepoint_records.len() as u32,
             spill_map_count: 0,
             dependency_count: 0,
-            reserved: 0,
-            layout: LayoutVersionRecord::CURRENT,
-            build: BuildVersionRecord {
-                vm_build: VM_BUILD_VERSION,
-                target_abi: AARCH64_TEMPLATE_ABI,
-            },
         };
         Self {
             code,
@@ -170,9 +160,6 @@ impl JitFunctionCode for TemplateCode {
         activation: VmRuntimeActivation,
         logical_pc: u32,
     ) -> Option<JitExecOutcome> {
-        if !self.metadata.is_compatible_with_current_vm() {
-            return None;
-        }
         let offset = *self.osr_entries.get(&logical_pc)?;
         // SAFETY: `offset` is an assembler offset recorded for this buffer and
         // points at a prologue trampoline emitted with the shared entry ABI.
@@ -185,16 +172,13 @@ impl JitFunctionCode for TemplateCode {
                 self.code_object_id,
                 self.function_id,
                 self.register_count,
+                otter_vm::native_abi::NativeFrameKind::Baseline,
                 !self.safepoint_records.is_empty(),
             )
         })
     }
 
     fn run_entry(&self, activation: VmRuntimeActivation) -> JitExecOutcome {
-        assert!(
-            self.metadata.is_compatible_with_current_vm(),
-            "incompatible native code reached entry"
-        );
         // SAFETY: the mapping is live and the main entry was emitted with the
         // shared compiled-entry ABI.
         let entry = unsafe { self.code.entry_ptr() };
@@ -207,6 +191,7 @@ impl JitFunctionCode for TemplateCode {
                 self.code_object_id,
                 self.function_id,
                 self.register_count,
+                otter_vm::native_abi::NativeFrameKind::Baseline,
                 !self.safepoint_records.is_empty(),
             )
         }

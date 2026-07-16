@@ -14,61 +14,37 @@
 //! - `otter_vm::native_abi` — authoritative VM frame and thread records.
 
 use otter_vm::{
-    RuntimeStubAllocContext, VmError, VmRuntimeActivation,
+    ActiveFrameMut, ActiveFrameRef, RuntimeStubAllocContext, Value, VmError, VmRuntimeActivation,
     jit::JitPreparedDirectCall,
-    native_abi::{CodeEntryCell, NativeFrame, VmThread},
+    native_abi::{CodeEntryCell, NativeFrame, VmFrameHeader, VmThread},
 };
 /// Machine-visible context shared by every compiled tier.
 ///
-/// Generated code reads `regs` (offset 0) and `self_closure` (offset 8)
-/// directly, so those fields stay first. The full struct is
-/// machine-constructible: nested direct calls copy plain pointers/scalars and
-/// share the caller's initialized `error` slot.
+/// The context contains execution services, not duplicated JavaScript frame
+/// state. Registers, SELF, `this`, upvalues, PC, and tier state live only in
+/// [`NativeFrame`]; every compiled tier resolves them through that canonical
+/// activation. Nested calls reuse this context and swap only its active-frame
+/// pointer for the dynamic extent of the callee.
 #[repr(C)]
 pub(crate) struct JitCtx {
-    /// Base of the executing frame's register window (`*mut u64` over Values).
-    pub(crate) regs: *mut u64,
-    /// Boxed `Value` bits of this frame's SELF closure (the named-function self
-    /// binding). Read directly by a `MakeFunction`-of-self at offset 8.
-    pub(crate) self_closure: u64,
-    /// Boxed `Value` bits of this frame's `this` binding, read once at entry.
-    /// A `LoadThis` reads it directly at offset 16 (and bails on a hole).
-    pub(crate) this_value: u64,
     /// Sole machine-visible VM state pointer.
     pub(crate) thread: *mut VmThread,
     /// Published authoritative activation.
     pub(crate) native_frame: *mut NativeFrame,
-    /// Index of the executing frame within `stack`.
-    pub(crate) frame_index: usize,
-    /// Base of this frame's upvalue spine (`Box<[UpvalueCell]>` data; each a
-    /// 4-byte compressed cell handle), or `0` when the frame captures nothing
-    /// or the function captures nothing. Inline `LoadUpvalue` /
-    /// `StoreUpvalue` read `[upvalues_ptr + idx*4]`.
-    pub(crate) upvalues_ptr: usize,
     /// Error slot shared by direct callees and bridge stubs when a re-entered
-    /// operation throws. Pointer form keeps `JitCtx` constructible by emitted
-    /// code; assembly never initializes a Rust enum in place.
+    /// operation throws. Pointer form keeps the slot stable while the shared
+    /// context swaps its active native frame for a nested callee.
     pub(crate) error: *mut Option<VmError>,
     /// VM-published direct-callee state.
     ///
     /// Plain and method prepare transitions replace this whole record on
     /// success. Keeping the VM/JIT boundary as one C-layout value prevents the
     /// two adapters and native tiers from growing parallel staging contracts.
-    /// Machine-built nested contexts intentionally leave the slot uninitialized
-    /// until a successful prepare; generated code reads it only after status 0.
+    /// Generated code reads it only after a successful prepare transition.
     pub(crate) direct_call: std::mem::MaybeUninit<JitPreparedDirectCall>,
-    /// Base of the interpreter's flat JIT register stack
-    /// (`reg_stack[0]`). Compiled code builds a self-recursive callee window at
-    /// `reg_stack_base + reg_top*8` without a Rust frame-build bridge.
-    pub(crate) reg_stack_base: *mut u64,
-    /// Address of the interpreter's `reg_top` (live extent of the flat register
-    /// stack, in slots). Compiled code loads it, reserves a callee window by
-    /// adding the callee register count, and stores it back; the matching pop on
-    /// return restores it.
-    pub(crate) reg_top_ptr: *mut usize,
-    /// Base of the interpreter's native JIT activation array (16-byte
-    /// `JitNativeActivation` records). Compiled direct-call sequences publish
-    /// and unpublish the callee's SELF/`this` GC slots inline through it.
+    /// Base of the interpreter's native activation array (one pointer-sized
+    /// `JitNativeActivation` per entry). Compiled call sequences publish and
+    /// unpublish the complete canonical frame through it.
     pub(crate) activation_base: *mut u8,
     /// Address of the interpreter's native activation cursor.
     pub(crate) activation_top_ptr: *mut usize,
@@ -77,6 +53,54 @@ pub(crate) struct JitCtx {
 }
 
 impl JitCtx {
+    /// Representation-neutral shared view of the canonical activation.
+    pub(crate) fn active_frame(&self) -> Result<ActiveFrameRef<'_>, VmError> {
+        // SAFETY: the JIT entry contract publishes this frame and its windows
+        // for the complete dynamic extent of `self`. A shared context borrow
+        // cannot mutate either descriptor while the view is live.
+        unsafe { ActiveFrameRef::from_native_ptr(self.native_frame) }
+            .map_err(|_| VmError::InvalidOperand)
+    }
+
+    /// Representation-neutral mutable view of the canonical activation.
+    pub(crate) fn active_frame_mut(&mut self) -> Result<ActiveFrameMut<'_>, VmError> {
+        // SAFETY: the JIT entry contract publishes this frame for the complete
+        // dynamic extent of `self`; `&mut self` provides exclusive logical
+        // access to its header and window descriptors. ActiveFrame keeps those
+        // windows raw so no slice borrow spans reentrant/allocating VM work.
+        unsafe { ActiveFrameMut::from_native_ptr(self.native_frame) }
+            .map_err(|_| VmError::InvalidOperand)
+    }
+
+    /// Stable register-window base derived from the canonical frame.
+    pub(crate) fn register_base(&mut self) -> Result<*mut Value, VmError> {
+        Ok(self.active_frame_mut()?.register_base_ptr())
+    }
+
+    /// Interpreter activation index for an entry that originated in the
+    /// interpreter. Frameless direct callees deliberately return an error so
+    /// operations requiring interpreter-only state can side-exit pre-effect.
+    pub(crate) fn materialized_frame_index(&self) -> Result<usize, VmError> {
+        // SAFETY: every live JIT context publishes an aligned `NativeFrame`
+        // for its complete dynamic extent. Direct-call linkage swaps this
+        // pointer only after the callee record is fully initialized.
+        let frame = unsafe { self.native_frame.as_ref() }.ok_or(VmError::InvalidOperand)?;
+        let Some(index) = frame.materialized_frame_index() else {
+            debug_assert!(self.native_owner_id().is_ok());
+            return Err(VmError::InvalidOperand);
+        };
+        Ok(index as usize)
+    }
+
+    /// VM resource owner attached to the active frameless direct callee.
+    pub(crate) fn native_owner_id(&self) -> Result<u32, VmError> {
+        // SAFETY: same published-frame lifetime as
+        // `materialized_frame_index`; the frame flag makes the two identities
+        // mutually exclusive.
+        let frame = unsafe { self.native_frame.as_ref() }.ok_or(VmError::InvalidOperand)?;
+        frame.native_owner_id().ok_or(VmError::InvalidOperand)
+    }
+
     /// VM-owned activation published through the sole machine-visible thread
     /// pointer. Runtime stubs use this explicitly; emitted code never observes
     /// its Rust pointers or container types.
@@ -121,13 +145,7 @@ pub(crate) const STATUS_THREW: u64 = 2;
 /// current machine-code fallthrough remains authoritative.
 pub(crate) const STATUS_CONTINUE: u64 = 3;
 
-/// Byte offset of [`JitCtx::error`] for nested direct-call context construction.
-#[allow(dead_code)]
-pub(crate) const ERROR_SLOT_OFFSET: u32 = std::mem::offset_of!(JitCtx, error) as u32;
 pub(crate) const THREAD_OFFSET: u32 = std::mem::offset_of!(JitCtx, thread) as u32;
-/// Byte offset of the SELF-closure bits in [`JitCtx`], for inline
-/// named-function self bindings.
-pub(crate) const SELF_CLOSURE_OFFSET: u32 = std::mem::offset_of!(JitCtx, self_closure) as u32;
 pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_frame) as u32;
 /// Byte offset of the canonical instruction-index PC in the published native
 /// frame. Generated code updates this together with its nested-call exit
@@ -135,9 +153,6 @@ pub(crate) const NATIVE_FRAME_OFFSET: u32 = std::mem::offset_of!(JitCtx, native_
 pub(crate) const NATIVE_FRAME_PC_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
     + std::mem::offset_of!(otter_vm::native_abi::VmFrameHeader, pc))
     as u32;
-pub(crate) const NATIVE_FRAME_CODE_OBJECT_ID_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, code_object_id) as u32;
-pub(crate) const FRAME_INDEX_OFFSET: u32 = std::mem::offset_of!(JitCtx, frame_index) as u32;
 /// Byte offsets of the isolate-published cells on [`VmThread`] read by
 /// emitted code: interrupt poll byte, back-edge fuel counter, and the
 /// leaf-stub heap pointer.
@@ -146,14 +161,8 @@ pub(crate) const VM_THREAD_INTERRUPT_CELL_OFFSET: u32 =
 pub(crate) const VM_THREAD_BACKEDGE_FUEL_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, backedge_fuel_cell) as u32;
 pub(crate) const VM_THREAD_GC_HEAP_OFFSET: u32 = std::mem::offset_of!(VmThread, gc_heap) as u32;
-/// Byte offset of [`JitCtx::upvalues_ptr`] for inline upvalue access.
-pub(crate) const UPVALUES_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, upvalues_ptr) as u32;
-/// Byte offset of [`JitCtx::reg_stack_base`] — the flat JIT register stack base
-/// used to build a self-recursive callee window inline.
-pub(crate) const REG_STACK_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_stack_base) as u32;
-/// Byte offset of [`JitCtx::reg_top_ptr`] — the address of the interpreter's
-/// `reg_top`, bumped to reserve a callee window and restored on return.
-pub(crate) const REG_TOP_PTR_OFFSET: u32 = std::mem::offset_of!(JitCtx, reg_top_ptr) as u32;
+pub(crate) const VM_THREAD_CODE_OBJECT_ID_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, current_code_object_id) as u32;
 /// Byte offsets of the native-activation publish fields in [`JitCtx`], used by
 /// inline direct-call activation push/pop sequences.
 pub(crate) const ACTIVATION_BASE_OFFSET: u32 = std::mem::offset_of!(JitCtx, activation_base) as u32;
@@ -163,16 +172,8 @@ pub(crate) const ACTIVATION_LIMIT_OFFSET: u32 =
     std::mem::offset_of!(JitCtx, activation_limit) as u32;
 pub(crate) const ALLOC_CTX_THREAD_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, thread) as u32;
-pub(crate) const ALLOC_CTX_FRAME_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, frame) as u32;
-pub(crate) const ALLOC_CTX_CODE_OBJECT_ID_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, code_object_id) as u32;
 pub(crate) const ALLOC_CTX_SAFEPOINT_ID_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, safepoint_id) as u32;
-pub(crate) const ALLOC_CTX_RESERVED0_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, reserved0) as u32;
-pub(crate) const ALLOC_CTX_RESERVED1_OFFSET: u32 =
-    std::mem::offset_of!(RuntimeStubAllocContext, reserved1) as u32;
 pub(crate) const ALLOC_CTX_SPILL_SLOTS_OFFSET: u32 =
     std::mem::offset_of!(RuntimeStubAllocContext, spill_slots) as u32;
 pub(crate) const ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET: u32 =
@@ -188,58 +189,67 @@ pub(crate) const DIRECT_SELF_OFFSET: u32 =
     (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, self_closure)) as u32;
 pub(crate) const DIRECT_THIS_OFFSET: u32 =
     (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, this_value)) as u32;
-/// Byte offset of the precomputed `this` bits in [`JitCtx`], for inline
-/// `LoadThis` in baseline entries.
-pub(crate) const THIS_VALUE_OFFSET: u32 = std::mem::offset_of!(JitCtx, this_value) as u32;
-pub(crate) const DIRECT_FRAME_INDEX_OFFSET: u32 =
-    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, frame_index)) as u32;
 pub(crate) const DIRECT_UPVALUES_OFFSET: u32 =
     (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, upvalues_ptr)) as u32;
-pub(crate) const DIRECT_FRAME_IDS_OFFSET: u32 =
-    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, frame_ids)) as u32;
-pub(crate) const DIRECT_FRAME_META_OFFSET: u32 =
-    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, frame_meta)) as u32;
-pub(crate) const DIRECT_CODE_OBJECT_ID_OFFSET: u32 =
-    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, code_object_id)) as u32;
+pub(crate) const DIRECT_OWNER_ID_OFFSET: u32 =
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, owner_id)) as u32;
+pub(crate) const DIRECT_UPVALUE_COUNT_OFFSET: u32 =
+    (DIRECT_CALL_OFFSET + std::mem::offset_of!(JitPreparedDirectCall, upvalue_count)) as u32;
 /// Fixed-layout fields consumed by native call linkage. Entry cells are boxed
 /// by the isolate registry and never reused for another code generation.
 pub(crate) const CODE_ENTRY_ACTIVE_COUNT_OFFSET: u32 =
     std::mem::offset_of!(CodeEntryCell, active_count) as u32;
-pub(crate) const JIT_CTX_STACK_SIZE: u32 = ((std::mem::size_of::<JitCtx>() + 15) & !15) as u32;
-/// 16-aligned machine-stack reservation for a nested callee's own published
-/// [`NativeFrame`], placed immediately above its `JitCtx`.
+pub(crate) const CODE_ENTRY_CODE_OBJECT_ID_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, code_object_id) as u32;
+pub(crate) const CODE_ENTRY_FUNCTION_ID_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, function_id) as u32;
+pub(crate) const CODE_ENTRY_REGISTER_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(CodeEntryCell, register_count) as u32;
+pub(crate) const CODE_ENTRY_FLAGS_OFFSET: u32 = std::mem::offset_of!(CodeEntryCell, flags) as u32;
+/// 16-aligned machine-stack reservation for a nested callee's compact frame.
 pub(crate) const NATIVE_FRAME_STACK_SIZE: u32 =
     ((std::mem::size_of::<NativeFrame>() + 15) & !15) as u32;
-/// Combined nested-call reservation: callee `JitCtx` at `sp`, callee
-/// `NativeFrame` at `sp + JIT_CTX_STACK_SIZE`.
-pub(crate) const CTX_PLUS_FRAME_STACK_SIZE: u32 = JIT_CTX_STACK_SIZE + NATIVE_FRAME_STACK_SIZE;
 /// Byte offsets of the callee-frame fields emitted nested-call sequences fill.
-pub(crate) const NATIVE_FRAME_PREVIOUS_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, previous_frame) as u32;
 pub(crate) const NATIVE_FRAME_REGISTER_BASE_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, register_base) as u32;
-pub(crate) const NATIVE_FRAME_ARGUMENT_BASE_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, argument_base) as u32;
-pub(crate) const NATIVE_FRAME_FEEDBACK_BASE_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, feedback_base) as u32;
+pub(crate) const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 = (std::mem::offset_of!(NativeFrame, header)
+    + std::mem::offset_of!(VmFrameHeader, function_id))
+    as u32;
+pub(crate) const NATIVE_FRAME_CODE_BLOCK_ID_OFFSET: u32 = (std::mem::offset_of!(
+    NativeFrame,
+    header
+) + std::mem::offset_of!(
+    VmFrameHeader,
+    code_block_id
+)) as u32;
+pub(crate) const NATIVE_FRAME_REGISTER_COUNT_OFFSET: u32 =
+    (std::mem::offset_of!(NativeFrame, header)
+        + std::mem::offset_of!(VmFrameHeader, register_count)) as u32;
+pub(crate) const NATIVE_FRAME_KIND_OFFSET: u32 =
+    (std::mem::offset_of!(NativeFrame, header) + std::mem::offset_of!(VmFrameHeader, kind)) as u32;
+pub(crate) const NATIVE_FRAME_FLAGS_OFFSET: u32 =
+    (std::mem::offset_of!(NativeFrame, header) + std::mem::offset_of!(VmFrameHeader, flags)) as u32;
 pub(crate) const NATIVE_FRAME_THIS_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, this_value_bits) as u32;
 pub(crate) const NATIVE_FRAME_NEW_TARGET_OFFSET: u32 =
     std::mem::offset_of!(NativeFrame, new_target_bits) as u32;
-pub(crate) const NATIVE_FRAME_RETURN_REGISTER_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, return_register) as u32;
-pub(crate) const NATIVE_FRAME_TAIL_OFFSET: u32 =
-    std::mem::offset_of!(NativeFrame, argument_count) as u32;
+pub(crate) const NATIVE_FRAME_SELF_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, self_value_bits) as u32;
+pub(crate) const NATIVE_FRAME_UPVALUE_BASE_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, upvalue_base) as u32;
+pub(crate) const NATIVE_FRAME_UPVALUE_COUNT_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, upvalue_count) as u32;
+pub(crate) const NATIVE_FRAME_ACTIVATION_ID_OFFSET: u32 =
+    std::mem::offset_of!(NativeFrame, activation_id) as u32;
 
-// The native entry ABI currently targets 64-bit engines. Embedding the VM's
-// prepared-call record must remain layout-identical to the former contiguous
-// scalar staging fields: generated code loads these offsets directly.
+// The native entry ABI targets 64-bit engines. These assertions describe the
+// one current VM/JIT layout generated code consumes directly.
 #[cfg(target_pointer_width = "64")]
-const _: [(); 64] = [(); std::mem::offset_of!(JitCtx, direct_call)];
+const _: [(); 24] = [(); std::mem::offset_of!(JitCtx, direct_call)];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 72] = [(); std::mem::size_of::<JitPreparedDirectCall>()];
+const _: [(); 48] = [(); std::mem::size_of::<JitPreparedDirectCall>()];
 #[cfg(target_pointer_width = "64")]
-const _: [(); 176] = [(); std::mem::size_of::<JitCtx>()];
+const _: [(); 96] = [(); std::mem::size_of::<JitCtx>()];
 
 /// Compiled-code entry signature.
 pub(crate) type JitEntry = extern "C" fn(*mut JitCtx) -> JitRet;

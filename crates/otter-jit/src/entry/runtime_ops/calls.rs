@@ -9,10 +9,10 @@
 //! # Invariants
 //! - Every entry receives a live [`JitCtx`] whose frame/register roots remain
 //!   published across allocating or reentrant VM work.
-//! - A successful prepare publishes the callee frame before staging its
-//!   machine entry state in `ctx.direct_call`.
+//! - A successful prepare reserves native owner resources but never pushes an
+//!   interpreter frame; the trampoline publishes the stack-local native frame.
 //! - Every prepared direct call is paired with exactly one returned, bailed,
-//!   or abort completion that releases the VM-owned frame lifecycle state.
+//!   or abort completion that consumes its owner id.
 //! - JavaScript exceptions are parked in the shared context slot and never
 //!   unwind through generated machine frames.
 //!
@@ -56,14 +56,13 @@ pub(crate) extern "C" fn jit_push_native_activation_stub(ctx: *mut JitCtx) -> u6
     // keeps it live until the matching pop stub.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    // SAFETY: both fields live inside `ctx`, whose native allocation remains
-    // live across the compiled callee's dynamic extent.
-    match unsafe {
-        vm.jit_push_native_activation(
-            std::ptr::addr_of_mut!(ctx.self_closure),
-            std::ptr::addr_of_mut!(ctx.this_value),
-        )
-    } {
+    let Some(frame) = (unsafe { ctx.native_frame.as_mut() }) else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return 1;
+    };
+    // SAFETY: the complete canonical frame remains live on the native stack
+    // until the matching pop; the VM publishes and traces it as one unit.
+    match unsafe { vm.jit_push_native_frame(frame) } {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -91,11 +90,15 @@ pub(crate) extern "C" fn jit_inline_closure_upvalues_stub(
 ) -> usize {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let callee = match ctx
+        .active_frame_mut()
+        .and_then(|frame| frame.read(callee_reg as u16))
+    {
+        Ok(callee) => callee,
+        Err(_) => return 0,
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    // SAFETY: `callee_reg` comes from a bytecode register operand inside the
-    // active frame window.
-    let callee_bits = unsafe { *ctx.regs.add(callee_reg as usize) };
-    vm.jit_inline_closure_upvalues(Value::from_bits(callee_bits), expected_fid as u32)
+    vm.jit_inline_closure_upvalues(callee, expected_fid as u32)
         .unwrap_or(0)
 }
 
@@ -112,19 +115,18 @@ pub(crate) extern "C" fn jit_prepare_direct_call_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let caller_regs = match ctx.register_base() {
+        Ok(regs) => regs.cast_const(),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    let prepared = vm.jit_prepare_direct_call(
-        context,
-        stack,
-        ctx.frame_index,
-        callee_reg as u16,
-        args,
-        ctx.regs.cast::<otter_vm::Value>().cast_const(),
-    );
+    let prepared = vm.jit_prepare_direct_call(context, callee_reg as u16, args, caller_regs);
     stage_prepared_call(ctx, prepared)
 }
 
@@ -144,20 +146,32 @@ pub(crate) extern "C" fn jit_prepare_direct_method_call_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let caller_regs = match ctx.register_base() {
+        Ok(regs) => regs.cast_const(),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    let caller_function_id = match ctx.active_frame() {
+        Ok(frame) => frame.function_id(),
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     let prepared = vm.jit_prepare_direct_method_call(
         context,
-        stack,
-        ctx.frame_index,
+        caller_function_id,
         recv as u16,
         name_idx as u32,
         site as usize,
         args,
-        ctx.regs.cast::<otter_vm::Value>().cast_const(),
+        caller_regs,
     );
     stage_prepared_call(ctx, prepared)
 }
@@ -178,6 +192,17 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let caller_regs = match ctx.register_base() {
+        Ok(regs) => regs,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => return 2,
+    };
     let Some(activation) = ctx.checked_activation() else {
         return 2;
     };
@@ -189,13 +214,13 @@ pub(crate) extern "C" fn jit_call_method_generic_stub(
     match vm.jit_runtime_call_method_in_place(
         context,
         stack,
-        ctx.frame_index,
+        frame_index,
         dst as u16,
         recv as u16,
         name_idx as u32,
         site as usize,
         args,
-        ctx.regs.cast::<otter_vm::Value>(),
+        caller_regs,
     ) {
         Ok(true) => 0,
         Ok(false) => 2,
@@ -226,6 +251,13 @@ pub(crate) extern "C" fn jit_call_generic_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let caller_regs = match ctx.register_base() {
+        Ok(regs) => regs,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let Some(activation) = ctx.checked_activation() else {
         return 2;
     };
@@ -233,13 +265,7 @@ pub(crate) extern "C" fn jit_call_generic_stub(
     let context = unsafe { &*activation.context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    match vm.jit_runtime_call_in_place(
-        context,
-        dst as u16,
-        callee as u16,
-        args,
-        ctx.regs.cast::<otter_vm::Value>(),
-    ) {
+    match vm.jit_runtime_call_in_place(context, dst as u16, callee as u16, args, caller_regs) {
         Ok(true) => 0,
         Ok(false) => 2,
         Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {
@@ -259,20 +285,20 @@ pub(crate) extern "C" fn jit_call_generic_stub(
 pub(crate) extern "C" fn jit_finish_direct_call_returned_stub(
     ctx: *mut JitCtx,
     dst: u64,
-    callee_frame_index: u64,
+    owner_id: u64,
     value: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    match vm.jit_finish_direct_call_returned(
-        stack,
-        ctx.frame_index,
-        callee_frame_index as usize,
-        dst as u16,
-        Value::from_bits(value),
-    ) {
+    if let Err(err) = vm.jit_finish_direct_call_returned(owner_id as u32) {
+        park_jit_error(ctx, err);
+        return 1;
+    }
+    match ctx
+        .active_frame_mut()
+        .and_then(|mut frame| frame.write(dst as u16, Value::from_bits(value)))
+    {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -284,23 +310,31 @@ pub(crate) extern "C" fn jit_finish_direct_call_returned_stub(
 pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
     ctx: *mut JitCtx,
     dst: u64,
-    callee_frame_index: u64,
-    resume_pc: u64,
+    owner_id: u64,
+    callee_frame: *const otter_vm::native_abi::NativeFrame,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    // SAFETY: the trampoline keeps its stack-local callee frame allocated for
+    // this call. Copying it first prevents reentrant VM work from observing a
+    // pointer into machine stack storage after that storage is released.
+    let Some(callee_frame) = (unsafe { callee_frame.as_ref() }).copied() else {
+        park_jit_error(ctx, VmError::InvalidOperand);
+        return 1;
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_finish_direct_call_bailed(
-        context,
-        stack,
-        ctx.frame_index,
-        callee_frame_index as usize,
-        dst as u16,
-        resume_pc as u32,
-    ) {
-        Ok(()) => 0,
+    match vm.jit_finish_direct_call_bailed(context, owner_id as u32, callee_frame) {
+        Ok(value) => match ctx
+            .active_frame_mut()
+            .and_then(|mut frame| frame.write(dst as u16, value))
+        {
+            Ok(()) => 0,
+            Err(err) => {
+                park_jit_error(ctx, err);
+                1
+            }
+        },
         Err(err) => {
             park_jit_error(ctx, err);
             1
@@ -308,20 +342,22 @@ pub(crate) extern "C" fn jit_finish_direct_call_bailed_stub(
     }
 }
 
-pub(crate) extern "C" fn jit_abort_direct_call_stub(
-    ctx: *mut JitCtx,
-    callee_frame_index: u64,
-) -> u64 {
+pub(crate) extern "C" fn jit_abort_direct_call_stub(ctx: *mut JitCtx, owner_id: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     // SAFETY: direct callees share the caller's initialized error slot.
     let can_resume = unsafe { &*ctx.error }
         .as_ref()
         .is_some_and(|err| matches!(err, VmError::Uncaught));
+    // Drop the dead callee's resources before catch materialization can
+    // allocate or trigger GC. The trampoline has already restored and
+    // published the caller frame, so only caller state may remain live here.
+    let release = unsafe { &mut *ctx.activation().vm_ptr() }.jit_abort_direct_call(owner_id as u32);
+    if let Err(err) = release {
+        park_jit_error(ctx, err);
+        return 1;
+    }
     let resume = try_resume_caller_throw(ctx, can_resume);
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    vm.jit_abort_direct_call(stack, callee_frame_index as usize);
     match resume {
         Ok(true) => {
             // SAFETY: this throw was absorbed by the caller handler.
@@ -338,24 +374,36 @@ pub(crate) extern "C" fn jit_abort_direct_call_stub(
     }
 }
 
-/// Bridge stub for a *frameless* self-recursive callee that bailed: rebuild an
-/// interpreter frame from the live register-stack window and run it to
-/// completion. Returns the callee's value in `x0` with `STATUS_RETURNED`, or
-/// `STATUS_THREW` (error parked in `ctx`) on an uncaught throw.
-pub(crate) extern "C" fn jit_self_call_bail_stub(
+/// Cold deopt bridge for a frameless self-recursive callee.
+///
+/// This is explicitly not a normal interpreter tier transition: it
+/// materializes an interpreter activation only after the native side exit
+/// fired, runs the callee to completion, and returns its value in `x0` with
+/// `STATUS_RETURNED`. An uncaught throw returns `STATUS_THREW` with the error
+/// parked in `ctx`.
+pub(crate) extern "C" fn jit_deopt_materialize_self_call_stub(
     ctx: *mut JitCtx,
     resume_pc: u64,
     regcount: u64,
 ) -> JitRet {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(_) => {
+            return JitRet {
+                value: 0,
+                status: super::super::STATUS_BAILED,
+            };
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_self_call_bail(
+    match vm.jit_deopt_materialize_self_call(
         context,
         stack,
-        ctx.frame_index,
+        frame_index,
         resume_pc as u32,
         regcount as usize,
     ) {

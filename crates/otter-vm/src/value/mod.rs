@@ -599,7 +599,7 @@ impl Value {
     #[must_use]
     pub fn as_closure(self, heap: &otter_gc::GcHeap) -> Option<JsClosure> {
         let handle = self.as_raw_gc()?.checked_cast::<JsClosureBody>()?;
-        let function_id = heap.read_payload(handle, |body| body.function_id);
+        let function_id = heap.read_payload(handle, |body| body.call_header.function_id);
         Some(JsClosure::from_parts(handle, function_id))
     }
 

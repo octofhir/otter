@@ -8,8 +8,9 @@
 //! `otter-vm` back to `otter-jit`.
 //!
 //! # Contents
-//! - [`JitCompileSnapshot`] and [`JitInstructionMetadata`] — immutable
-//!   CodeBlock plus per-tier feedback/layout metadata.
+//! - [`JitCompileSnapshot`], [`JitClosureCallLayout`], and
+//!   [`JitInstructionMetadata`] — immutable CodeBlock plus per-tier
+//!   feedback/layout metadata.
 //! - [`JitCompilerHook`] — runtime-installed compile hook implemented outside
 //!   `otter-vm`.
 //! - [`JitFunctionCode`] and [`JitCompileStatus`] — type-erased compiled-code
@@ -41,7 +42,7 @@ use otter_bytecode::{Op, Operand};
 use crate::{
     CodeBlock, CodeBlockInstruction,
     feedback::ArithFeedback,
-    native_abi::{SafepointId, SafepointRecord},
+    native_abi::{NativeFrameKind, SafepointId, SafepointRecord},
 };
 
 /// Canonical handlers owned by one compiled `EnterTry` instruction.
@@ -73,6 +74,48 @@ pub struct JitCompileRequest {
     /// object — including a nested callee's — from `(id, safepoint_id)`.
     pub code_object_id: u64,
 }
+
+/// Typed closure-call layout shared by VM snapshotting and native backends.
+///
+/// Every byte offset is measured from the decompressed closure's
+/// [`otter_gc::GcHeader`], not from [`crate::closure::JsClosureBody`]'s payload.
+/// The flag masks travel with the offsets so a backend never duplicates Rust
+/// enum/container layout or independently guesses closure-call semantics.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitClosureCallLayout {
+    /// Byte offset of [`crate::closure::ClosureCallHeader::function_id`].
+    pub function_id_byte: u32,
+    /// Byte offset of [`crate::closure::ClosureCallHeader::flags`].
+    pub flags_byte: u32,
+    /// Byte offset of [`crate::closure::ClosureCallHeader::upvalue_base`].
+    pub upvalue_base_byte: u32,
+    /// Byte offset of [`crate::closure::ClosureCallHeader::upvalue_count`].
+    pub upvalue_count_byte: u32,
+    /// Byte offset of canonical [`crate::closure::JsClosureBody::bound_this`].
+    pub bound_this_byte: u32,
+    /// Byte offset of canonical
+    /// [`crate::closure::JsClosureBody::bound_new_target`].
+    pub bound_new_target_byte: u32,
+    /// Presence bit for canonical `bound_this`.
+    pub bound_this_flag: u32,
+    /// Presence bit for canonical `bound_new_target`.
+    pub bound_new_target_flag: u32,
+    /// Flags requiring the call-setup runtime stub before compiled entry.
+    pub runtime_setup_flags: u32,
+}
+
+const _: [(); 36] = [(); std::mem::size_of::<JitClosureCallLayout>()];
+const _: [(); 4] = [(); std::mem::align_of::<JitClosureCallLayout>()];
+const _: [(); 0] = [(); std::mem::offset_of!(JitClosureCallLayout, function_id_byte)];
+const _: [(); 4] = [(); std::mem::offset_of!(JitClosureCallLayout, flags_byte)];
+const _: [(); 8] = [(); std::mem::offset_of!(JitClosureCallLayout, upvalue_base_byte)];
+const _: [(); 12] = [(); std::mem::offset_of!(JitClosureCallLayout, upvalue_count_byte)];
+const _: [(); 16] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_byte)];
+const _: [(); 20] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte)];
+const _: [(); 24] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_this_flag)];
+const _: [(); 28] = [(); std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag)];
+const _: [(); 32] = [(); std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags)];
 
 /// Owned snapshot of one executable function body.
 #[derive(Debug, Clone)]
@@ -145,11 +188,10 @@ pub struct JitCompileSnapshot {
     /// Byte offset from a decompressed heap-number pointer to its raw boxed
     /// `Value` bits (`HEADER_SIZE + offset_of!(HeapNumberBody, bits)`).
     pub heap_number_bits_byte: u32,
-    /// Byte offset from a decompressed closure pointer to its `function_id`
-    /// (`HEADER_SIZE + offset_of!(JsClosureBody, function_id)`). The
-    /// method-inline guard reads `[closure_ptr + closure_fid_byte]` to compare
-    /// a resolved prototype method against the baked target id.
-    pub closure_fid_byte: u32,
+    /// Complete VM-owned closure-call ABI contract. Method identity guards use
+    /// its function-id offset; native call linkage additionally consumes its
+    /// flags, immutable upvalue spine, and canonical bound-value metadata.
+    pub closure_call_layout: JitClosureCallLayout,
     /// Ready-to-use byte offsets and type tags for baseline collection method
     /// IC guards.
     pub collection_layout: JitCollectionLayout,
@@ -203,7 +245,7 @@ pub struct JitCompileSnapshot {
     /// shape and method slot before a primitive-specific leaf stub runs.
     pub primitive_method_guards: rustc_hash::FxHashMap<u32, JitPrimitiveMethodGuard>,
     /// Safepoint records baked for allocating runtime-stub call sites, keyed by
-    /// `SafepointId`. Baseline v1 uses frame-slot roots for the full register
+    /// `SafepointId`. Baseline uses frame-slot roots for the full register
     /// window, so allocating stubs can trigger moving GC without keeping raw
     /// untracked `Value` bits live only in machine registers.
     pub safepoints: rustc_hash::FxHashMap<SafepointId, SafepointRecord>,
@@ -399,40 +441,32 @@ pub struct JitDirectCallPlan {
     pub param_count: u16,
     /// Total callee register-window length.
     pub register_count: u16,
-    /// Installed code-object identity published in the callee's native frame.
-    pub code_object_id: u64,
-    /// Whether the callee owns precise safepoint maps.
-    pub has_safepoints: bool,
 }
 
 /// VM-owned root descriptor for one native JIT activation.
 ///
-/// The slots point into the activation's live native [`JitCtx`](crate-local ABI)
-/// record. The descriptor owns no executable state and copies no `Value`: the
-/// collector rewrites the exact scalar fields machine code will reload after a
-/// safepoint.
+/// The pointer names the canonical [`crate::native_abi::NativeFrame`]. The
+/// descriptor owns no executable state and copies no `Value`: the collector
+/// reaches SELF, `this`, `new.target`, and the explicit upvalue spine through
+/// the active-frame API and rewrites the exact fields every tier reloads after
+/// a safepoint.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct JitNativeActivation {
-    /// Address of the boxed SELF binding bits.
-    pub self_slot: *mut u64,
-    /// Address of the boxed `this` binding bits.
-    pub this_slot: *mut u64,
+    /// Published canonical native activation.
+    pub frame: *mut crate::native_abi::NativeFrame,
 }
 
 impl JitNativeActivation {
     /// Empty inactive descriptor.
     pub const EMPTY: Self = Self {
-        self_slot: std::ptr::null_mut(),
-        this_slot: std::ptr::null_mut(),
+        frame: std::ptr::null_mut(),
     };
 }
 
-// The descriptor is an opaque pointer carrier. Dereferencing occurs only under
-// `Interpreter`'s single-threaded execution contract; it does not make the VM
-// itself transferable (the heap and value handles remain `!Send`/`!Sync`).
-unsafe impl Send for JitNativeActivation {}
-unsafe impl Sync for JitNativeActivation {}
+const _: [(); 8] = [(); std::mem::size_of::<JitNativeActivation>()];
+const _: [(); 8] = [(); std::mem::align_of::<JitNativeActivation>()];
+const _: [(); 0] = [(); std::mem::offset_of!(JitNativeActivation, frame)];
 
 /// Receiver shapes cached per direct-method call site, and the number of flat
 /// inline-link ways the optimizing tier walks. Shared with the VM so the flat
@@ -441,13 +475,13 @@ pub const JIT_DIRECT_METHOD_WAYS: usize = 4;
 
 /// Prepared direct-call entry state returned by the VM to emitted code.
 ///
-/// The frame has already been published onto the active [`HoltStack`], so its
-/// value slots are visible to precise GC tracing. Emitted code uses this to
-/// construct the callee `JitCtx` and branch through the entry cell without the
-/// generic call bridge. It acquires `entry_cell` before native entry, so an
-/// invalidated generation rejects the call without branching through a stale
-/// raw address. The record is staged as a single C-layout unit; generated code
-/// reads it only after the prepare transition reports success.
+/// The VM has reserved one native-call owner and one register window, but has
+/// not materialized an interpreter [`crate::Frame`]. Emitted code publishes a
+/// stack-local [`crate::native_abi::NativeFrame`] and branches through the
+/// entry cell without the generic call bridge. It acquires `entry_cell` before
+/// native entry, so an invalidated generation rejects the call without
+/// branching through a stale raw address. The record is staged as one compact
+/// C-layout unit and consumed only after prepare reports success.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct JitPreparedDirectCall {
@@ -461,22 +495,24 @@ pub struct JitPreparedDirectCall {
     pub self_closure: u64,
     /// Boxed `this` bits for the callee context.
     pub this_value: u64,
-    /// Callee frame index in the active stack.
-    pub frame_index: usize,
     /// Base of the callee frame's upvalue spine (`Box<[UpvalueCell]>` data), or
     /// `0` when it captures nothing — lets emitted upvalue ops in the direct
     /// callee read its cells inline instead of routing through the stub.
     pub upvalues_ptr: usize,
-    /// Callee native-frame identity word: `function_id | code_block_id << 32`.
-    pub frame_ids: u64,
-    /// Callee native-frame header word at byte 8 with `pc = 0`:
-    /// `register_count << 32 | kind << 48 | flags << 56`.
-    pub frame_meta: u64,
-    /// Installed code-object identity for the callee's native frame.
-    pub code_object_id: u64,
+    /// VM-owned frameless-call resources released or materialized exactly once
+    /// when native execution completes.
+    pub owner_id: u32,
+    /// Number of initialized handles at [`Self::upvalues_ptr`].
+    pub upvalue_count: u32,
 }
 
-/// Versioned offsets needed by native Array guards.
+const _: [(); 48] = [(); std::mem::size_of::<JitPreparedDirectCall>()];
+const _: [(); 8] = [(); std::mem::align_of::<JitPreparedDirectCall>()];
+const _: [(); 32] = [(); std::mem::offset_of!(JitPreparedDirectCall, upvalues_ptr)];
+const _: [(); 40] = [(); std::mem::offset_of!(JitPreparedDirectCall, owner_id)];
+const _: [(); 44] = [(); std::mem::offset_of!(JitPreparedDirectCall, upvalue_count)];
+
+/// Current static offsets needed by native Array guards.
 ///
 /// Dense element storage remains behind runtime stubs because Rust container
 /// layout is not part of the native ABI.
@@ -646,7 +682,7 @@ impl JitCompileSnapshot {
             jit_proto_byte: 0,
             heap_number_type_tag: 0,
             heap_number_bits_byte: 0,
-            closure_fid_byte: 0,
+            closure_call_layout: JitClosureCallLayout::default(),
             upvalue_value_byte: 0,
             collection_layout: JitCollectionLayout::default(),
             native_static_fn_byte: 0,
@@ -788,11 +824,13 @@ pub enum JitMethodHint {
     NumberToString,
 }
 
-/// One reconstructed interpreter frame in a nested inline-resume, decoded from
-/// the emitted deopt exit's stack buffer by the resume stub and handed to
-/// [`crate::Interpreter::jit_resume_inline_callee_stack`]. Frames are ordered
-/// outermost inlined method first; the top frame resumes at the failing guard.
-pub struct JitResumeFrame {
+/// Cold reconstruction input for one frame in a nested inline deopt.
+///
+/// Decoded from the emitted side-exit buffer and consumed only by
+/// [`crate::Interpreter::jit_deopt_materialize_inline_frames`]. Normal tier
+/// transitions retain the canonical native activation and never build this
+/// owned record.
+pub struct JitDeoptFrame {
     /// Function id this frame executes.
     pub callee_fid: u32,
     /// Logical PC to resume this frame at.
@@ -919,8 +957,13 @@ pub enum JitExecOutcome {
 /// emitted callers can branch to an already-installed callee without routing
 /// through the generic runtime call bridge.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
-    /// Immutable versioned metadata for this installed code object.
+    /// Immutable metadata for this installed code object.
     fn metadata(&self) -> crate::native_abi::CodeObjectMetadata;
+
+    /// Native activation kind published for this tier.
+    fn native_frame_kind(&self) -> NativeFrameKind {
+        NativeFrameKind::Baseline
+    }
 
     /// Immutable isolate-state dependencies declared by this code object.
     ///
@@ -948,17 +991,6 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// object is installed in the VM JIT code table.
     fn entry_addr(&self) -> Option<usize> {
         None
-    }
-
-    /// `true` when this body is sound to run *frameless* — entered directly
-    /// from another compiled function's machine code with only a raw register
-    /// window and no published VM frame. That requires every op in the body to
-    /// address registers through the window (`JitCtx.regs`); any stub that
-    /// resolves registers through `JitCtx.frame_index` (interpreter delegates,
-    /// call/closure bridges) would read and write the *caller's* frame instead.
-    /// Gates the bridge-free direct-method inline link. Default `false`.
-    fn frameless_entry_safe(&self) -> bool {
-        false
     }
 
     /// Number of safepoints owned by this installed code object.
@@ -1129,5 +1161,49 @@ pub trait JitCompilerHook: Send + Sync {
         _request: JitCompileRequest,
     ) -> Result<JitCompileStatus, JitCompileError> {
         Ok(JitCompileStatus::Unavailable)
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn closure_call_layout_has_stable_c_field_offsets() {
+        assert_eq!(std::mem::size_of::<JitClosureCallLayout>(), 36);
+        assert_eq!(std::mem::align_of::<JitClosureCallLayout>(), 4);
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, function_id_byte),
+            0
+        );
+        assert_eq!(std::mem::offset_of!(JitClosureCallLayout, flags_byte), 4);
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, upvalue_base_byte),
+            8
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, upvalue_count_byte),
+            12
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, bound_this_byte),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, bound_new_target_byte),
+            20
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, bound_this_flag),
+            24
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, bound_new_target_flag),
+            28
+        );
+        assert_eq!(
+            std::mem::offset_of!(JitClosureCallLayout, runtime_setup_flags),
+            32
+        );
     }
 }

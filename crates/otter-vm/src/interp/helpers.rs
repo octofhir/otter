@@ -312,16 +312,11 @@ pub(crate) fn read_register(frame: &Frame, idx: u16) -> Result<&Value, VmError> 
     frame
         .registers
         .get(idx as usize)
-        .ok_or_else(|| VmError::InvalidOperand)
+        .ok_or(VmError::InvalidOperand)
 }
 
 pub(crate) fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmError> {
-    let slot = frame
-        .registers
-        .get_mut(idx as usize)
-        .ok_or_else(|| VmError::InvalidOperand)?;
-    *slot = value;
-    Ok(())
+    crate::ActiveFrameMut::materialized(frame).write(idx, value)
 }
 
 /// Build the native callable that `arr[Symbol.iterator]` evaluates

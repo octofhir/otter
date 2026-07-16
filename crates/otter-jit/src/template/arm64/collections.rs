@@ -25,10 +25,8 @@ use otter_vm::{JitCollectionAllocMethod, JitCollectionLeafMethod, JitCompileSnap
 
 use super::values::{emit_decompress_slot, emit_load_reg, emit_load_u64, emit_store_reg};
 use crate::entry::{
-    ALLOC_CTX_CODE_OBJECT_ID_OFFSET, ALLOC_CTX_FRAME_OFFSET, ALLOC_CTX_RESERVED0_OFFSET,
-    ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
-    ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
-    NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
+    ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, NUMBER_TAG_HI16, OBJECT_BODY_TYPE_TAG,
     THREAD_OFFSET, Unsupported, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
 };
 
@@ -262,15 +260,9 @@ pub(super) fn emit_alloc_method_guarded_call(
         ; sub sp, sp, ALLOC_CTX_STACK_SIZE
         ; ldr x9, [x20, THREAD_OFFSET]
         ; str x9, [sp, ALLOC_CTX_THREAD_OFFSET]
-        ; ldr x10, [x20, NATIVE_FRAME_OFFSET]
-        ; str x10, [sp, ALLOC_CTX_FRAME_OFFSET]
-        ; ldr x9, [x10, NATIVE_FRAME_CODE_OBJECT_ID_OFFSET]
-        ; str x9, [sp, ALLOC_CTX_CODE_OBJECT_ID_OFFSET]
         ; movz w9, alloc.safepoint_id
         ; str w9, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
-        ; str wzr, [sp, ALLOC_CTX_RESERVED0_OFFSET]
         ; strh wzr, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
-        ; strh wzr, [sp, ALLOC_CTX_RESERVED1_OFFSET]
         ; str xzr, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
         ; mov x0, sp
     );

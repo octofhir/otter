@@ -4,33 +4,35 @@
 //! Tier-up dispatch (`maybe_dispatch_jit`, backedge/OSR accounting),
 //! compiled-frame entry (`run_compiled_frame`, `jit_runtime_call`),
 //! direct-call lifecycle dispatch through focused `jit_calls` modules,
-//! in-place coercive unary operations, and
-//! raw frame-pointer accessors the emitted code reads (`jit_frame_regs_ptr`
-//! and friends). Call and back-edge accounting also feeds the additive
-//! optimizing-tier policy without consulting its decision.
+//! and cold legacy/inlined side-exit materialization in `jit_calls/deopt`.
+//! Call and back-edge accounting also feeds the additive optimizing-tier
+//! policy without consulting its decision.
 //!
 //! # Invariants
 //! Every publish of a callee frame is paired with a finish/abort helper
 //! that releases pinned code and the sync-reentry guard; bail paths must
 //! leave the frame stack exactly as the interpreter expects to resume.
-//! Reentrant unary coercion owns moving values through the handle arena and
-//! commits its destination only after the abstract operation succeeds.
-//! Every VM-side compiled entry selection applies both native-layout metadata
-//! compatibility and exact isolate-epoch dependency consistency. Safepoint
-//! resolution for already-active Invalid code remains independent.
+//! Every VM-side compiled entry selection requires the exact installed code
+//! generation and isolate-epoch dependency state. Safepoint resolution for
+//! already-active Invalid code remains independent.
 //! Optimized entries run only over fresh ordinary frames; every bail resumes
 //! the interpreter on the generated exit's fully reconstructed register
 //! window. They use the same fully wired runtime activation, published native
 //! frame, and call-scoped VM thread as baseline entries.
+//! Canonical tier transitions retain one [`NativeFrame`] and register window;
+//! construction of Rust-owned [`Frame`] adapters is confined to the cold deopt
+//! module and legacy dispatch paths.
 #![allow(unused_imports)]
 use crate::*;
 
-#[path = "jit_calls/frame.rs"]
-mod frame;
-#[path = "jit_calls/finish.rs"]
-mod finish;
 #[path = "jit_calls/cache.rs"]
 pub(crate) mod cache;
+#[path = "jit_calls/deopt.rs"]
+mod deopt;
+#[path = "jit_calls/finish.rs"]
+mod finish;
+#[path = "jit_calls/frame.rs"]
+mod frame;
 #[path = "jit_calls/resolve.rs"]
 mod resolve;
 
@@ -219,7 +221,7 @@ impl Interpreter {
         let frame = &stack[top_idx];
         // Only ordinary bytecode frames; async/generator bodies resume through
         // their own machinery and must not be entered mid-loop.
-        if frame.async_state.is_some() || frame.generator_owner.is_some() {
+        if self.frame_has_suspension_owner(frame) {
             return Ok(None);
         }
         let fid = frame.function_id;
@@ -240,10 +242,7 @@ impl Interpreter {
         let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let optimized_outcome = self
             .resolve_optimized_osr_code(context, fid)
-            .filter(|code| {
-                self.jit_code_registry
-                    .dependencies_are_current_for_entry(code.as_ref())
-            })
+            .filter(|code| self.jit_code_registry.is_current_for_entry(code.as_ref()))
             .and_then(|code| code.run_optimized_osr_entry(activation, osr_pc));
         let (outcome, optimized) = if let Some(outcome) = optimized_outcome {
             self.jit_runtime_stats.optimized_entries =
@@ -273,10 +272,7 @@ impl Interpreter {
                 self.jit_osr_disabled.insert((fid, osr_pc));
                 return Ok(None);
             };
-            if !self
-                .jit_code_registry
-                .dependencies_are_current_for_entry(code.as_ref())
-            {
+            if !self.jit_code_registry.is_current_for_entry(code.as_ref()) {
                 return Ok(None);
             }
             let Some(outcome) = code.osr_entry(activation, osr_pc) else {
@@ -496,7 +492,7 @@ impl Interpreter {
         // Only fresh, ordinary bytecode frames: at entry (pc == 0), not async,
         // not a generator body.
         let frame = &stack[top_idx];
-        if frame.pc != 0 || frame.async_state.is_some() || frame.generator_owner.is_some() {
+        if frame.pc != 0 || self.frame_has_suspension_owner(frame) {
             return None;
         }
         self.resolve_jit_code_for_fid(context, frame.function_id)
@@ -511,7 +507,7 @@ impl Interpreter {
         top_idx: usize,
     ) -> Option<jit::JitExecOutcome> {
         let frame = stack.get(top_idx)?;
-        if frame.pc != 0 || frame.async_state.is_some() || frame.generator_owner.is_some() {
+        if frame.pc != 0 || self.frame_has_suspension_owner(frame) {
             return None;
         }
         let fid = frame.function_id;
@@ -541,9 +537,7 @@ impl Interpreter {
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         if let Some((cached_fid, code)) = &self.jit_optimized_code_cache
             && *cached_fid == fid
-            && self
-                .jit_code_registry
-                .is_compatible_for_entry(code.as_ref())
+            && self.jit_code_registry.is_current_for_entry(code.as_ref())
         {
             return Some(code.clone());
         }
@@ -561,10 +555,7 @@ impl Interpreter {
             self.jit_optimized_code_cache = None;
             compiled
         };
-        let code = code.filter(|code| {
-            self.jit_code_registry
-                .is_compatible_for_entry(code.as_ref())
-        });
+        let code = code.filter(|code| self.jit_code_registry.is_current_for_entry(code.as_ref()));
         if let Some(code) = &code {
             self.jit_optimized_code_cache = Some((fid, code.clone()));
         }
@@ -590,9 +581,7 @@ impl Interpreter {
         // so it needs no further filtering.
         if let Some((cached_fid, code)) = &self.jit_code_cache
             && *cached_fid == fid
-            && self
-                .jit_code_registry
-                .is_compatible_for_entry(code.as_ref())
+            && self.jit_code_registry.is_current_for_entry(code.as_ref())
         {
             return Some(code.clone());
         }
@@ -618,9 +607,8 @@ impl Interpreter {
         // The function-entry path never runs OSR-only code (compiled with
         // unsupported opcodes emitted as bails); only loop OSR enters it, at a
         // supported loop header. The code stays cached for that OSR path.
-        let code = code.filter(|c| {
-            self.jit_code_registry.is_compatible_for_entry(c.as_ref()) && !c.osr_only()
-        });
+        let code = code
+            .filter(|c| self.jit_code_registry.is_current_for_entry(c.as_ref()) && !c.osr_only());
         if let Some(c) = &code {
             self.jit_code_cache = Some((fid, c.clone()));
         } else {
@@ -676,10 +664,13 @@ impl Interpreter {
     /// upvalue-spine base without cloning or publishing a callee frame.
     ///
     /// The baseline uses this only for leaf bodies with no allocation/call GC
-    /// points. Returning a pointer into the closure body's `Vec<UpvalueCell>` is
-    /// therefore safe for the dynamic extent of the inlined body: the closure is
-    /// still rooted in the caller frame and the upvalue vector is immutable
-    /// after closure creation.
+    /// points. The pointer comes from [`crate::closure::ClosureCallHeader`]'s
+    /// fixed-width ABI, never from interpreting Rust `Vec` / `Option` layout. It
+    /// is valid only for the dynamic extent of the inlined body: the closure
+    /// stays rooted in the caller frame and its upvalue backing allocation is
+    /// immutable. A closure with runtime-setup flags declines this frameless
+    /// leaf inline; direct-call linkage routes it through the setup stub and
+    /// then resumes the compiled callee under the same native activation.
     pub fn jit_inline_closure_upvalues(
         &mut self,
         callee: Value,
@@ -691,18 +682,13 @@ impl Interpreter {
         if closure.function_id() != expected_fid {
             return None;
         }
-        self.gc_heap.read_payload(closure.handle(), |body| {
-            if body.upvalues.is_empty()
-                || body.bound_new_target.is_some()
-                || body.bound_derived_this.is_some()
-                || body.eval_env.is_some()
-            {
-                return None;
-            }
-            Some(body.upvalues.as_ptr() as usize)
-        })
+        let header = closure.call_header(&self.gc_heap);
+        if header.upvalue_count == 0 || header.upvalue_base == 0 || header.requires_runtime_setup()
+        {
+            return None;
+        }
+        usize::try_from(header.upvalue_base).ok()
     }
-
 
     /// Complete one full `CallMethodValue` in place for a compiled caller
     /// whose direct-call prepare reported an ineligible resolution
@@ -1038,201 +1024,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Complete a coercive `ToPrimitive` or `ToNumeric` opcode in place for a
-    /// compiled caller. `numeric` selects §7.1.3; otherwise `hint_index`
-    /// identifies the compiler-emitted `default`/`number`/`string` token.
-    ///
-    /// The source, intermediate primitive, and result live in the high-level
-    /// handle arena across user `@@toPrimitive`/`valueOf`/`toString` reentry.
-    /// The published caller window remains authoritative and receives the
-    /// result only after the complete abstract operation succeeds.
-    ///
-    /// # Safety-adjacent contract
-    /// `caller_regs` is the caller's live traced register window and both
-    /// register indices are compiler-validated for that window.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn jit_runtime_coerce_unary_in_place(
-        &mut self,
-        context: &ExecutionContext,
-        dst_reg: u16,
-        src_reg: u16,
-        numeric: bool,
-        hint_index: u32,
-        function_id: u32,
-        caller_regs: *mut Value,
-    ) -> Result<(), VmError> {
-        self.record_jit_runtime_stub_class(native_abi::RuntimeStubClass::Reentrant);
-        self.with_handle_scope(|interp, scope| {
-            // SAFETY: `src_reg` is a compiler-emitted index into the published
-            // caller window.
-            let input = interp.scoped_value(scope, unsafe { *caller_regs.add(src_reg as usize) });
-            let hint = if numeric {
-                abstract_ops::ToPrimitiveHint::Number
-            } else {
-                let token = context
-                    .string_constant_str_for_function(function_id, hint_index)
-                    .ok_or(VmError::InvalidOperand)?;
-                abstract_ops::ToPrimitiveHint::from_token(token).ok_or(VmError::InvalidOperand)?
-            };
-            let current = interp.escape_scoped(input);
-            let primitive = if abstract_ops::is_primitive(&current) {
-                current
-            } else {
-                interp.evaluate_to_primitive(context, &current, hint)?
-            };
-            let primitive = interp.scoped_value(scope, primitive);
-            let primitive_value = interp.escape_scoped(primitive);
-            let result = if !numeric || primitive_value.is_number() || primitive_value.is_big_int()
-            {
-                primitive_value
-            } else if primitive_value.is_symbol() {
-                return Err(interp
-                    .err_type(("Cannot convert a Symbol value to a number".to_string()).into()));
-            } else {
-                Value::number(crate::number::NumberValue::from_f64(
-                    crate::number::parse::to_number_value(&primitive_value, &interp.gc_heap),
-                ))
-            };
-            let result = interp.scoped_value(scope, result);
-            // SAFETY: `dst_reg` is a compiler-emitted index into the pinned
-            // caller window; resolve the handle after every possible GC.
-            unsafe {
-                *caller_regs.add(dst_reg as usize) = interp.escape_scoped(result);
-            }
-            Ok(())
-        })
-    }
-
-
-    /// Resume a *frameless* self-recursive JIT callee that bailed mid-execution.
-    ///
-    /// The inline self-call ([`crate::baseline`]) runs a self-recursive callee in
-    /// compiled code with its register window in the flat register stack and no
-    /// `HoltStack` frame. On a bail it has no frame to resume, so this rebuilds
-    /// one: it attaches the live top window (`regcount` slots) to a materialized
-    /// interpreter [`Frame`] (self-recursion ⇒
-    /// the function id and upvalue spine come from the caller frame at
-    /// `caller_frame_index`), resumes the interpreter at `bail_pc`, and returns
-    /// the callee's completion value (the caller's compiled code stores it).
-    pub fn jit_self_call_bail(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut HoltStack,
-        caller_frame_index: usize,
-        bail_pc: u32,
-        regcount: usize,
-    ) -> Result<Value, VmError> {
-        let window = self.register_stack.top_window(regcount)?;
-
-        let caller = stack
-            .get(caller_frame_index)
-            .ok_or(VmError::InvalidOperand)?;
-        let fid = caller.function_id;
-        let upvalues = caller.upvalues.clone();
-        self.note_jit_entry_bail(fid);
-        let function = context.exec_function(fid).ok_or(VmError::InvalidOperand)?;
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            None,
-            upvalues,
-            Value::undefined(),
-            window,
-        );
-        frame.pc = bail_pc;
-        let initial_stack_len = stack.len();
-        stack.push(frame);
-        let result = self.dispatch_loop(context, stack);
-        while stack.len() > initial_stack_len {
-            if let Some(mut frame) = stack.pop() {
-                self.frame_release_cold(&mut frame);
-                self.reclaim_registers(&mut frame);
-            }
-        }
-        result
-    }
-
-    /// Resume a *stack* of inlined callee frames after a guard inside a nested
-    /// (recursively spliced) callee body fails. The compiled caller stays live;
-    /// this rebuilds the whole inline chain in the interpreter — the outermost
-    /// inlined method at the bottom, the guard's method on top — and runs it to
-    /// completion. The outermost frame's completion bubbles out of the dispatch
-    /// loop (its `return_register` is `None`) and is returned to emitted code,
-    /// which stores it into the compiled call's destination; each inner frame's
-    /// `return_register` names the parent-frame register the interpreter writes
-    /// when that frame returns, so the chain unwinds exactly as a real call would.
-    ///
-    /// `frames` is ordered outermost first. Every frame's `registers` slice is a
-    /// full register window (unwritten slots `undefined`) and its `pc` is the
-    /// logical PC to resume at — the guard's PC for the top frame, the PC just
-    /// past the nested call for each frame below it.
-    pub fn jit_resume_inline_callee_stack(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut HoltStack,
-        frames: &[jit::JitResumeFrame],
-    ) -> Result<Value, VmError> {
-        let _window_rollback = self.register_window_rollback();
-        let initial_stack_len = stack.len();
-        // Build every frame before pushing any: an invalid function id then
-        // returns cleanly without leaving a half-pushed reentry on the stack.
-        let mut built: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
-        for (i, f) in frames.iter().enumerate() {
-            if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-                eprintln!(
-                    "[jit-trace] resume inline stack frame {i}/{} fid={} pc={}",
-                    frames.len(),
-                    f.callee_fid,
-                    f.callee_pc
-                );
-            }
-            let function = context
-                .exec_function(f.callee_fid)
-                .ok_or(VmError::InvalidOperand)?;
-            // A body that reads an upvalue resumes with its method closure's
-            // captured spine; one that reads none carries `undefined` here and
-            // resumes with an empty spine.
-            let upvalues: crate::frame_state::UpvalueSpine =
-                match f.closure.as_closure(&self.gc_heap) {
-                    Some(c) => self
-                        .gc_heap
-                        .read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice()),
-                    None => Vec::new().into_boxed_slice(),
-                };
-            let mut window = self.alloc_reg_window(f.registers.len())?;
-            window.copy_from_slice(&f.registers);
-            // The bottom (outermost inlined) frame bubbles its result out of the
-            // dispatch loop; every frame above it returns into its parent.
-            let return_register = if i == 0 {
-                None
-            } else {
-                Some(f.return_register)
-            };
-            let mut frame = Frame::with_exec_return_upvalues_and_this(
-                function,
-                return_register,
-                upvalues,
-                f.this,
-                window,
-            );
-            frame.pc = f.callee_pc;
-            built.push(frame);
-        }
-        self.enter_sync_reentry()?;
-        for frame in built {
-            stack.push(frame);
-        }
-        let result = self.dispatch_loop(context, stack);
-        self.leave_sync_reentry();
-        while stack.len() > initial_stack_len {
-            if let Some(mut frame) = stack.pop() {
-                self.frame_release_cold(&mut frame);
-                self.reclaim_registers(&mut frame);
-            }
-        }
-        result
-    }
-
     /// JIT bridge — build the closure for a `MakeFunction` from compiled code,
     /// writing it into register `dst` of frame `frame_index` (self-reference
     /// capture and upvalue binding go through the normal interpreter path).
@@ -1259,66 +1050,5 @@ impl Interpreter {
             .for_function(frame.function_id)
             .ok_or(VmError::InvalidOperand)?;
         self.run_make_function_reg(&resolved, frame, dst, idx)
-    }
-
-    /// JIT bridge — boxed `Value` bits of frame `frame_index`'s `this` binding,
-    /// read once at compiled-entry setup so a `LoadThis` is a direct `JitCtx`
-    /// read. A hole (`this` not yet initialized in a derived constructor)
-    /// surfaces verbatim; the emitter guards against it and bails to the
-    /// interpreter, which owns the derived-constructor resolution and throw.
-    #[must_use]
-    pub fn jit_frame_this_bits(&self, stack: &HoltStack, frame_index: usize) -> u64 {
-        match stack.get(frame_index) {
-            Some(frame) => frame.this_value.to_bits(),
-            None => Value::undefined().to_bits(),
-        }
-    }
-
-    /// JIT bridge — boxed `Value` bits of frame `frame_index`'s SELF closure,
-    /// computed once at compiled-entry setup. A `MakeFunction` of the running
-    /// function (the named-function self binding) resolves to exactly this
-    /// value, so the emitter reads it from `JitCtx` instead of crossing back
-    /// into Rust per call. Mirrors the self branch of
-    /// [`Self::run_make_function_reg`]: the frame's recorded closure instance
-    /// when present, else the bare interned function value.
-    #[must_use]
-    pub fn jit_frame_self_closure_bits(&self, stack: &HoltStack, frame_index: usize) -> u64 {
-        let Some(frame) = stack.get(frame_index) else {
-            return Value::undefined().to_bits();
-        };
-        // A frame that never acquired cold state has no recorded closure
-        // instance, so the self binding is the bare interned function value.
-        let value = match self.frame_cold(frame).and_then(|cold| cold.callee_closure) {
-            Some(closure) => Value::closure(closure),
-            None => Value::function(frame.function_id),
-        };
-        value.to_bits()
-    }
-
-    /// JIT bridge — base pointer of frame `frame_index`'s register window, for
-    /// the compiled entry to address registers. The window is rooted on
-    /// `stack`, so the pointer is stable for the compiled call's duration
-    /// (recursive compiled calls append frames to this reservation-stable
-    /// HoltStack, whose buffer does not reallocate before the stack-depth guard).
-    #[must_use]
-    pub fn jit_frame_regs_ptr(stack: &mut HoltStack, frame_index: usize) -> *mut u64 {
-        stack[frame_index].registers.as_mut_ptr().cast::<u64>()
-    }
-
-    /// Raw base of frame `frame_index`'s upvalue spine (`Box<[UpvalueCell]>`
-    /// data, each a 4-byte compressed `Gc<UpvalueCellBody>` handle), or `0`
-    /// when the frame captures nothing. Emitted `LoadUpvalue`/`StoreUpvalue`
-    /// read the cell handle at `base + idx*4`, decompress it, and access the
-    /// cell body's single `Value`. The spine `Box` is owned by the frame and
-    /// stays put for the frame's life (the cells themselves are old-space, so
-    /// they never move); a `0` base routes the op to the runtime stub.
-    #[must_use]
-    pub fn jit_frame_upvalues_ptr(stack: &HoltStack, frame_index: usize) -> usize {
-        let upvalues = &stack[frame_index].upvalues;
-        if upvalues.is_empty() {
-            0
-        } else {
-            upvalues.as_ptr() as usize
-        }
     }
 }

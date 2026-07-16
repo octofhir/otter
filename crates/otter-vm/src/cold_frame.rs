@@ -30,7 +30,8 @@ use std::num::NonZeroU32;
 use otter_gc::raw::SlotVisitor;
 
 use crate::frame_state::{
-    PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive, TryHandler,
+    AsyncFrameState, PendingBindFunction, PendingGetIterator, PendingIteratorNext,
+    PendingToPrimitive, TryHandler,
 };
 use crate::{JsObject, UpvalueCell, Value};
 use smallvec::SmallVec;
@@ -106,11 +107,18 @@ impl ColdFrameIdx {
 /// Cold half of a call frame. Pool-allocated and shared via
 /// [`ColdFrameIdx`].
 ///
-/// Subsequent commits migrate the remaining cold fields (`handlers`,
-/// `module_url`, `async_state`, `generator_owner`, …) into this
-/// struct.
+/// Ordinary synchronous frames never allocate this record. Suspension ownership
+/// (`async_state` / `generator_owner`) lives here with the rest of the uncommon
+/// control-flow state instead of inflating every hot [`crate::Frame`].
 #[derive(Debug, Default, Clone)]
 pub struct ColdFrame {
+    /// Result promise owned by a regular async-function invocation. Return and
+    /// uncaught-throw paths settle it instead of writing into a caller window.
+    pub async_state: Option<AsyncFrameState>,
+    /// Generator object whose currently active or parked body owns this frame.
+    /// Yield/start/async-generator await paths use the backlink to transfer the
+    /// frame back into the generator body.
+    pub generator_owner: Option<crate::generator::JsGenerator>,
     /// State machine for the in-flight ECMA-262 §7.1.1 `ToPrimitive`
     /// ladder. See [`crate::frame_state::PendingToPrimitive`].
     pub pending_to_primitive: Option<PendingToPrimitive>,
@@ -137,12 +145,6 @@ pub struct ColdFrame {
     /// `new.target` visible to the active function body. Set only for
     /// frames entered through `[[Construct]]`.
     pub new_target: Option<Value>,
-    /// The closure value executing this frame, when entered through a
-    /// closure call. Lets the named-function SELF binding resolve to the
-    /// running instance (so `this instanceof Self` / `Self.prototype`
-    /// inside the body observe the same per-instance `.prototype` the
-    /// constructor installed). `None` for bare-function / `<main>` frames.
-    pub callee_closure: Option<crate::closure::JsClosure>,
     /// Trailing arguments past the declared `param_count`. Populated
     /// by the call dispatcher only when the callee declares a rest
     /// parameter; consumed by `Op::CollectRest`.
@@ -202,14 +204,15 @@ impl ColdFrame {
     /// keeping).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pending_to_primitive.is_none()
+        self.async_state.is_none()
+            && self.generator_owner.is_none()
+            && self.pending_to_primitive.is_none()
             && self.pending_bind_function.is_none()
             && self.pending_get_iterator.is_none()
             && self.pending_iterator_next.is_none()
             && self.parked_finally.is_empty()
             && self.construct_target.is_none()
             && self.new_target.is_none()
-            && self.callee_closure.is_none()
             && self.rest_args.is_empty()
             && self.incoming_args.is_empty()
             && self.handlers.is_empty()
@@ -226,6 +229,12 @@ impl ColdFrame {
     /// caller must additionally trace this record for any frame whose
     /// `cold` slot is `Some`.
     pub fn trace_cold_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Some(async_state) = &self.async_state {
+            async_state.result_promise.trace_value_slots(visitor);
+        }
+        if let Some(owner) = &self.generator_owner {
+            owner.trace_value_slots(visitor);
+        }
         if let Some(p) = &self.pending_to_primitive {
             p.obj.trace_value_slots(visitor);
         }
@@ -254,9 +263,6 @@ impl ColdFrame {
         if let Some(obj) = &self.construct_target {
             let p = obj as *const JsObject as *mut otter_gc::raw::RawGc;
             visitor(p);
-        }
-        if let Some(closure) = &self.callee_closure {
-            closure.trace_value_slots(visitor);
         }
         if let Some(v) = &self.new_target {
             v.trace_value_slots(visitor);

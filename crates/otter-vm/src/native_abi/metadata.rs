@@ -1,14 +1,13 @@
-//! Code-object metadata, dependency, lifetime, and version contracts.
+//! Code-object metadata, dependency, and lifetime contracts.
 //!
 //! # Contents
-//! - [`LayoutVersionRecord`] and [`BuildVersionRecord`] gate native code entry.
 //! - [`CodeObjectMetadata`] identifies immutable code and all owned side tables.
 //! - [`CodeDependency`] describes isolate state that can invalidate code.
 //!
 //! # Invariants
-//! - Entry is rejected before execution when any layout/build/stub version
-//!   differs from the installed VM or a recorded dependency epoch is not
-//!   exactly current for its `(kind, identity)` family.
+//! - Installed code always uses the current in-process VM layout.
+//! - Entry is rejected before execution when a recorded dependency epoch is
+//!   not exactly current for its `(kind, identity)` family.
 //! - Metadata contains offsets/counts and stable ids, never Rust slices or
 //!   container layouts.
 //! - Epoch invalidation is monotonic: dependencies older than the current
@@ -21,53 +20,10 @@
 //! - [`super::safepoints`] for code-object-owned root tables.
 //! - [`super::frame::NativeFrame`] for the active code-object id.
 
-/// Native VM ABI layout version.
-pub const VM_LAYOUT_VERSION: u32 = 1;
-/// Runtime-stub table version.
-pub const RUNTIME_STUB_TABLE_VERSION: u32 = 1;
-/// Code-object metadata layout version.
-pub const CODE_OBJECT_LAYOUT_VERSION: u32 = 1;
-/// Reproducible build identity for transient native code.
-pub const VM_BUILD_VERSION: u64 = 0x4f54_5445_525f_0001;
-
 /// Stable identity of the array-index accessor protector epoch.
 pub const ARRAY_INDEX_ACCESSOR_PROTECTOR_IDENTITY: u32 = 0;
 /// Stable identity of the ordinary-object prototype shape epoch.
 pub const ORDINARY_OBJECT_PROTOTYPE_SHAPE_IDENTITY: u32 = 0;
-
-/// Complete native-layout compatibility record.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LayoutVersionRecord {
-    /// VM thread/frame/dispatch layout.
-    pub vm_layout: u32,
-    /// Runtime-stub ids and descriptor layout.
-    pub runtime_stubs: u32,
-    /// Code-object metadata layout.
-    pub code_object: u32,
-    /// Reserved; zero in version 1.
-    pub reserved: u32,
-}
-
-impl LayoutVersionRecord {
-    /// Versions used by this build.
-    pub const CURRENT: Self = Self {
-        vm_layout: VM_LAYOUT_VERSION,
-        runtime_stubs: RUNTIME_STUB_TABLE_VERSION,
-        code_object: CODE_OBJECT_LAYOUT_VERSION,
-        reserved: 0,
-    };
-}
-
-/// Build and target identity folded into installed-code validity.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BuildVersionRecord {
-    /// Otter VM build identity.
-    pub vm_build: u64,
-    /// Target ABI hash selected by the JIT backend.
-    pub target_abi: u64,
-}
 
 /// Machine-visible immutable code-object metadata header.
 #[repr(C, align(8))]
@@ -89,46 +45,20 @@ pub struct CodeObjectMetadata {
     pub spill_map_count: u32,
     /// Number of validity dependencies.
     pub dependency_count: u32,
-    /// Reserved; zero in version 1.
-    pub reserved: u32,
-    /// Required native-layout versions.
-    pub layout: LayoutVersionRecord,
-    /// Required build and target identity.
-    pub build: BuildVersionRecord,
-}
-
-impl CodeObjectMetadata {
-    /// Whether this immutable code object can enter the current VM build.
-    #[must_use]
-    pub const fn is_compatible_with_current_vm(self) -> bool {
-        self.id != 0
-            && self.code_size != 0
-            && self.layout.vm_layout == VM_LAYOUT_VERSION
-            && self.layout.runtime_stubs == RUNTIME_STUB_TABLE_VERSION
-            && self.layout.code_object == CODE_OBJECT_LAYOUT_VERSION
-            && self.layout.reserved == 0
-            && self.build.vm_build == VM_BUILD_VERSION
-            && self.build.target_abi != 0
-            && self.reserved == 0
-    }
 }
 
 /// Kind of assumption that can invalidate installed native code.
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CodeDependencyKind {
-    /// VM field layout/build compatibility.
-    VmLayout = 0,
-    /// Runtime-stub table compatibility.
-    RuntimeStubTable = 1,
     /// Realm identity.
-    Realm = 2,
+    Realm = 0,
     /// Global/prototype/array protector epoch.
-    Protector = 3,
+    Protector = 1,
     /// Builtin identity epoch.
-    BuiltinIdentity = 4,
+    BuiltinIdentity = 2,
     /// Shape/prototype epoch.
-    ShapeEpoch = 5,
+    ShapeEpoch = 3,
 }
 
 /// Explicit validity dependency owned by a code object.
@@ -137,21 +67,18 @@ pub enum CodeDependencyKind {
 pub struct CodeDependency {
     /// Dependency family.
     pub kind: CodeDependencyKind,
-    /// Reserved flags; zero in version 1.
-    pub flags: u16,
     /// Isolate-local stable identity.
     pub identity: u32,
-    /// Expected version/value at code entry.
+    /// Expected epoch/value at code entry.
     pub expected: u64,
 }
 
 impl CodeDependency {
-    /// Construct one exact-match epoch dependency with version-1 flags.
+    /// Construct one exact-match epoch dependency.
     #[must_use]
     pub const fn epoch(kind: CodeDependencyKind, identity: u32, expected: u64) -> Self {
         Self {
             kind,
-            flags: 0,
             identity,
             expected,
         }
@@ -170,54 +97,6 @@ pub enum CodeLifetimeState {
     Retired = 2,
 }
 
-const _: [(); 16] = [(); std::mem::size_of::<LayoutVersionRecord>()];
-const _: [(); 16] = [(); std::mem::size_of::<BuildVersionRecord>()];
-const _: [(); 72] = [(); std::mem::size_of::<CodeObjectMetadata>()];
+const _: [(); 40] = [(); std::mem::size_of::<CodeObjectMetadata>()];
 const _: [(); 8] = [(); std::mem::align_of::<CodeObjectMetadata>()];
 const _: [(); 16] = [(); std::mem::size_of::<CodeDependency>()];
-const _: [(); 40] = [(); std::mem::offset_of!(CodeObjectMetadata, layout)];
-const _: [(); 56] = [(); std::mem::offset_of!(CodeObjectMetadata, build)];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn current_layout_record_is_complete() {
-        assert_eq!(LayoutVersionRecord::CURRENT.vm_layout, VM_LAYOUT_VERSION);
-        assert_eq!(
-            LayoutVersionRecord::CURRENT.runtime_stubs,
-            RUNTIME_STUB_TABLE_VERSION
-        );
-        assert_eq!(
-            LayoutVersionRecord::CURRENT.code_object,
-            CODE_OBJECT_LAYOUT_VERSION
-        );
-    }
-
-    #[test]
-    fn code_metadata_rejects_stale_layout_or_build() {
-        let mut metadata = CodeObjectMetadata {
-            id: 1,
-            code_block_id: 0,
-            entry_offset: 0,
-            code_size: 64,
-            safepoint_count: 0,
-            frame_map_count: 0,
-            spill_map_count: 0,
-            dependency_count: 0,
-            reserved: 0,
-            layout: LayoutVersionRecord::CURRENT,
-            build: BuildVersionRecord {
-                vm_build: VM_BUILD_VERSION,
-                target_abi: 1,
-            },
-        };
-        assert!(metadata.is_compatible_with_current_vm());
-        metadata.layout.vm_layout -= 1;
-        assert!(!metadata.is_compatible_with_current_vm());
-        metadata.layout = LayoutVersionRecord::CURRENT;
-        metadata.build.vm_build -= 1;
-        assert!(!metadata.is_compatible_with_current_vm());
-    }
-}

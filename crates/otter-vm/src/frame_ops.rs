@@ -1,191 +1,211 @@
-//! Frame-local opcode helpers.
+//! Representation-neutral active-frame opcode kernels.
 //!
-//! These opcodes only read the active frame and write registers. Keeping them
-//! out of the fallback interpreter body helps `lib.rs` shrink while preserving
-//! the dense executable operand path.
+//! Hot binding operations consume [`ActiveFrameMut`] and therefore run over
+//! either a materialized [`Frame`] or the canonical [`crate::NativeFrame`]
+//! without copying registers or reconstructing a [`HoltStack`]. Kernels never
+//! advance the PC: interpreter dispatch, baseline code, and optimizing code
+//! each own their continuation coordinate.
 //!
 //! # Contents
-//! - `this` and `new.target` register loads.
-//! - Upvalue load/store register operations.
-//! - Rest/arguments materialisation.
-//! - Try-handler stack maintenance.
+//! - Representation-neutral SELF, `this`, and `new.target` loads.
+//! - Representation-neutral upvalue load/store operations.
+//! - Explicit materialized-frame adapters for fresh upvalue spines, rest
+//!   arguments, and structured-exception cold state.
 //!
 //! # Invariants
 //! - Inputs are decoded from the executable instruction format before reaching
 //!   these helpers.
-//! - Helpers never mutate the call stack shape.
+//! - Hot kernels do not inspect [`HoltStack`] or [`crate::cold_frame::ColdFrame`].
+//! - Every captured-value write flows through [`store_upvalue`] and its GC write
+//!   barrier.
+//! - Callers advance or replace the PC only after a kernel commits.
 //!
 //! # See also
-//! - [`crate::Frame`]
+//! - [`crate::active_frame`]
 //! - [`crate::executable`]
 
 use crate::holt_stack::HoltStack;
 use smallvec::SmallVec;
 
 use crate::{
-    Frame, Interpreter, TryHandler, Value, VmError, read_register, read_upvalue, store_upvalue,
-    write_register,
+    ActiveFrameMut, Frame, Interpreter, TryHandler, Value, VmError, read_upvalue, store_upvalue,
 };
 
 impl Interpreter {
-    pub(crate) fn run_load_new_target_reg(
+    /// Load the current `this` binding into `dst` for either frame storage.
+    ///
+    /// Derived constructors publish a hole until `super()` binds `this`; the
+    /// materialized dispatch adapter resolves lexical-arrow inheritance before
+    /// entering this kernel. A remaining hole is the canonical TDZ failure.
+    pub(crate) fn frame_load_this(
         &self,
-        frame: &mut Frame,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
     ) -> Result<(), VmError> {
-        let value = self
-            .frame_cold(frame)
-            .and_then(|c| c.new_target)
-            .unwrap_or(Value::undefined());
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
-    }
-
-    pub(crate) fn run_load_upvalue_reg(
-        &self,
-        frame: &mut Frame,
-        dst: u16,
-        idx: i32,
-    ) -> Result<(), VmError> {
-        if idx < 0 {
-            return Err(VmError::InvalidOperand);
-        }
-        let cell = *frame
-            .upvalues
-            .get(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
-        let value = read_upvalue(&self.gc_heap, cell);
-        // §13.3.1 — a hole in an upvalue cell marks the Temporal Dead
-        // Zone (`Op::FreshUpvalue` installs it for a per-iteration /
-        // head-TDZ `let`). Reading it before the initializer's
-        // `Op::StoreUpvalue` runs is a `ReferenceError`.
+        let value = frame.this_value();
         if value.is_hole() {
-            return Err(VmError::TemporalDeadZone {
-                local_index: idx as u32,
-            });
+            return Err(self.err_this_uninit(
+                "must call super constructor in derived class before accessing 'this' or returning from derived constructor"
+                    .into(),
+            ));
         }
-        write_register(frame, dst, value)?;
-        frame.advance_pc()?;
-        Ok(())
+        frame.write(dst, value)
     }
 
-    /// `Op::FreshUpvalue idx` — install a freshly allocated hole cell at
-    /// own-upvalue index `idx`. Closures created before this op keep the
-    /// prior cell handle, so `for (let x of …)` materialises a distinct
-    /// `x` per iteration and a head `let` spends RHS evaluation in the
-    /// TDZ. The hole is cleared by the iteration's `Op::StoreUpvalue`.
-    pub(crate) fn run_fresh_upvalue_reg(
-        &mut self,
-        frame: &mut Frame,
+    /// Load the exact running function object (SELF) into `dst`.
+    pub(crate) fn frame_load_self(
+        &self,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let value = frame.self_value();
+        frame.write(dst, value)
+    }
+
+    /// Load the immutable `new.target` binding into `dst`.
+    pub(crate) fn frame_load_new_target(
+        &self,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let value = frame.new_target_value();
+        frame.write(dst, value)
+    }
+
+    /// Load one captured binding, rejecting an uninitialized TDZ cell.
+    pub(crate) fn frame_load_upvalue(
+        &self,
+        frame: &mut ActiveFrameMut<'_>,
+        dst: u16,
         idx: i32,
     ) -> Result<(), VmError> {
-        if idx < 0 {
-            return Err(VmError::InvalidOperand);
+        let index = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)?;
+        let cell = frame.upvalue(index)?;
+        let value = read_upvalue(&self.gc_heap, cell);
+        if value.is_hole() {
+            return Err(VmError::TemporalDeadZone { local_index: index });
         }
-        let fresh = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
-        let slot = frame
-            .upvalues
-            .get_mut(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
-        *slot = fresh;
-        frame.advance_pc()?;
-        Ok(())
+        frame.write(dst, value)
     }
 
-    pub(crate) fn run_store_upvalue_reg(
+    /// Store one captured binding through the GC write barrier.
+    pub(crate) fn frame_store_upvalue(
         &mut self,
-        frame: &mut Frame,
+        frame: &mut ActiveFrameMut<'_>,
         src: u16,
         idx: i32,
     ) -> Result<(), VmError> {
-        if idx < 0 {
-            return Err(VmError::InvalidOperand);
-        }
-        let value = *read_register(frame, src)?;
-        let cell = *frame
-            .upvalues
-            .get(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
+        let index = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)?;
+        let value = frame.read(src)?;
+        let cell = frame.upvalue(index)?;
         store_upvalue(&mut self.gc_heap, cell, value);
-        frame.advance_pc()?;
         Ok(())
     }
 
-    /// `Op::StoreUpvalueChecked` — assignment (PutValue, §6.2.4.6) to a
-    /// captured `let` / `const`. A cell still holding the Temporal Dead
-    /// Zone hole means the write precedes the declaration's initializer,
-    /// which is a `ReferenceError`. Binding initialization keeps using
-    /// [`Self::run_store_upvalue_reg`], which clears the hole.
-    pub(crate) fn run_store_upvalue_checked_reg(
+    /// Assignment to a captured lexical binding.
+    ///
+    /// A hole marks a binding whose declaration initializer has not run yet;
+    /// assignment before initialization is a `ReferenceError`.
+    pub(crate) fn frame_store_upvalue_checked(
         &mut self,
-        frame: &mut Frame,
+        frame: &mut ActiveFrameMut<'_>,
         src: u16,
         idx: i32,
     ) -> Result<(), VmError> {
-        if idx < 0 {
-            return Err(VmError::InvalidOperand);
-        }
-        let value = *read_register(frame, src)?;
-        let cell = *frame
-            .upvalues
-            .get(idx as usize)
-            .ok_or(VmError::InvalidOperand)?;
+        let index = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)?;
+        let value = frame.read(src)?;
+        let cell = frame.upvalue(index)?;
         if read_upvalue(&self.gc_heap, cell).is_hole() {
-            return Err(VmError::TemporalDeadZone {
-                local_index: idx as u32,
-            });
+            return Err(VmError::TemporalDeadZone { local_index: index });
         }
         store_upvalue(&mut self.gc_heap, cell, value);
-        frame.advance_pc()?;
         Ok(())
     }
 
-    /// JIT bridge for `LoadUpvalue` from compiled code, delegating to
-    /// [`Self::run_load_upvalue_reg`] (captured-binding read with a TDZ-hole
-    /// check). Frame PC is saved/restored so the helper's `advance_pc` does not
-    /// disturb the compiled frame's program counter.
+    /// Replace one activation-local upvalue with a fresh TDZ cell.
+    ///
+    /// Both interpreter and native activations own a mutable handle window;
+    /// closure identity requires the fresh cell allocation, but no frame or
+    /// upvalue-spine copy is performed.
+    pub(crate) fn frame_fresh_upvalue(
+        &mut self,
+        frame: &mut ActiveFrameMut<'_>,
+        idx: i32,
+    ) -> Result<(), VmError> {
+        let index = u32::try_from(idx).map_err(|_| VmError::InvalidOperand)?;
+        let fresh = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
+        frame.replace_upvalue(index, fresh)
+    }
+
+    /// Resolve a materialized frame's lexical `this` through the nearest
+    /// derived-constructor sidecar. Native activations carry their resolved
+    /// binding directly and never call this adapter.
+    pub(crate) fn materialized_this_binding(
+        &self,
+        stack: &HoltStack,
+        frame_index: usize,
+    ) -> Result<Value, VmError> {
+        let mut value = stack
+            .get(frame_index)
+            .ok_or(VmError::InvalidOperand)?
+            .this_value;
+        if value.is_hole() {
+            for index in (0..=frame_index).rev() {
+                let frame = &stack[index];
+                if self
+                    .frame_cold(frame)
+                    .is_some_and(|cold| cold.is_derived_constructor)
+                {
+                    value = frame.this_value;
+                    break;
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    /// JIT bridge for `LoadUpvalue` over the canonical activation.
+    ///
+    /// The compiled tier owns PC progress, so this operation performs only the
+    /// captured-binding read, TDZ check, and destination commit. It does not
+    /// require or materialize a [`HoltStack`] frame.
     ///
     /// # Errors
     /// Propagates `ReferenceError` for a TDZ-hole cell and `InvalidOperand`.
     pub fn jit_runtime_load_upvalue(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         dst: u16,
         idx: i32,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let saved_pc = stack[frame_index].pc;
-        let frame = &mut stack[frame_index];
-        let result = self.run_load_upvalue_reg(frame, dst, idx);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.frame_load_upvalue(frame, dst, idx)
     }
 
-    /// JIT bridge for `StoreUpvalue` from compiled code, delegating to
-    /// [`Self::run_store_upvalue_reg`] (captured-binding write, including the
-    /// write barrier). Frame PC is saved/restored as in
-    /// [`Self::jit_runtime_load_upvalue`].
+    /// JIT bridge for `StoreUpvalue` over the canonical activation.
+    ///
+    /// Captured-cell mutation still flows through [`store_upvalue`], which
+    /// owns the GC write barrier. No interpreter-frame adapter participates.
     ///
     /// # Errors
     /// Propagates `InvalidOperand` for a negative or out-of-range index.
     pub fn jit_runtime_store_upvalue(
         &mut self,
-        stack: &mut HoltStack,
-        frame_index: usize,
+        frame: &mut ActiveFrameMut<'_>,
         src: u16,
         idx: i32,
     ) -> Result<(), VmError> {
         self.record_jit_runtime_property_stub();
-        let saved_pc = stack[frame_index].pc;
-        let frame = &mut stack[frame_index];
-        let result = self.run_store_upvalue_reg(frame, src, idx);
-        stack[frame_index].pc = saved_pc;
-        result
+        self.frame_store_upvalue(frame, src, idx)
     }
 
-    pub(crate) fn run_collect_rest_reg(
+    /// Materialize a legacy cold-sidecar rest-argument buffer.
+    ///
+    /// This helper remains HoltStack-specific because allocation must trace the
+    /// complete materialized stack and because the buffer is owned by
+    /// [`crate::cold_frame::ColdFrame`]. It still leaves PC ownership to the
+    /// caller.
+    pub(crate) fn materialized_collect_rest(
         &mut self,
         stack: &mut HoltStack,
         top_idx: usize,
@@ -198,19 +218,17 @@ impl Interpreter {
             .map(|c| std::mem::take(&mut c.rest_args))
             .unwrap_or_default();
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
-        let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::array(array))?;
-        frame.advance_pc()?;
-        Ok(())
+        ActiveFrameMut::materialized(&mut stack[top_idx]).write(dst, Value::array(array))
     }
 
-    pub(crate) fn run_enter_try_region(
+    /// Install a verified exception region in a materialized cold sidecar.
+    pub(crate) fn materialized_enter_try_region(
         &mut self,
         frame: &mut Frame,
         region: crate::executable::code_block_cfg::CodeBlockExceptionRegion,
     ) -> Result<(), VmError> {
         debug_assert_eq!(region.enter_pc, frame.pc);
-        self.run_enter_try_handler(
+        self.materialized_enter_try_handler(
             frame,
             TryHandler {
                 catch_pc: region.catch_pc,
@@ -220,17 +238,18 @@ impl Interpreter {
         )
     }
 
-    pub(crate) fn run_enter_try_handler(
+    /// Install a decoded handler in a materialized cold sidecar.
+    pub(crate) fn materialized_enter_try_handler(
         &mut self,
         frame: &mut Frame,
         handler: TryHandler,
     ) -> Result<(), VmError> {
         self.frame_ensure_cold(frame).handlers.push(handler);
-        frame.advance_pc()?;
         Ok(())
     }
 
-    pub(crate) fn run_pop_parked_finally(
+    /// Drop abandoned finally completions from materialized cold state.
+    pub(crate) fn materialized_pop_parked_finally(
         &mut self,
         frame: &mut Frame,
         count: usize,
@@ -240,11 +259,11 @@ impl Interpreter {
                 cold.parked_finally.pop();
             }
         }
-        frame.advance_pc()?;
         Ok(())
     }
 
-    pub(crate) fn run_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
+    /// Leave the innermost handler in a materialized cold sidecar.
+    pub(crate) fn materialized_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
         let popped = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
         let Some(handler) = popped else {
             return Err(VmError::InvalidOperand);
@@ -259,7 +278,228 @@ impl Interpreter {
             cold.parked_finally
                 .push((crate::cold_frame::ParkedFinally::Normal, depth));
         }
-        frame.advance_pc()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        RegisterWindow, UpvalueCell, alloc_upvalue,
+        native_abi::{NativeFrame, NativeFrameFlags, NativeFrameKind, VmFrameHeader},
+        read_upvalue,
+    };
+
+    fn header(register_count: usize) -> VmFrameHeader {
+        VmFrameHeader {
+            function_id: 7,
+            code_block_id: 11,
+            pc: 3,
+            register_count: register_count as u16,
+            kind: NativeFrameKind::Interpreter,
+            flags: NativeFrameFlags::empty(),
+        }
+    }
+
+    fn materialized_frame(
+        slots: &mut [Value],
+        upvalues: Vec<UpvalueCell>,
+        self_value: Value,
+        this_value: Value,
+    ) -> Frame {
+        Frame {
+            header: header(slots.len()),
+            registers: RegisterWindow::attached(slots.as_mut_ptr(), slots.len(), 0),
+            upvalues: upvalues.into_boxed_slice(),
+            self_value,
+            this_value,
+            return_register: None,
+            cold: None,
+        }
+    }
+
+    #[test]
+    fn binding_kernels_match_materialized_and_native_frames() {
+        let interpreter = Interpreter::new();
+        let self_value = Value::function(31);
+        let this_value = Value::number_i32(17);
+        let new_target = Value::function(43);
+
+        let mut materialized_slots = [Value::undefined(); 3];
+        let mut materialized =
+            materialized_frame(&mut materialized_slots, Vec::new(), self_value, this_value);
+        {
+            let mut active =
+                ActiveFrameMut::materialized_with_new_target(&mut materialized, new_target);
+            interpreter
+                .frame_load_this(&mut active, 0)
+                .expect("materialized this");
+            interpreter
+                .frame_load_self(&mut active, 1)
+                .expect("materialized SELF");
+            interpreter
+                .frame_load_new_target(&mut active, 2)
+                .expect("materialized new.target");
+        }
+
+        let mut native_slots = [Value::undefined(); 3];
+        let mut native = NativeFrame::new(
+            header(native_slots.len()),
+            native_slots.as_mut_ptr() as u64,
+            self_value,
+            this_value,
+        );
+        native.set_new_target(new_target);
+        {
+            // SAFETY: the native frame and its initialized register window
+            // remain exclusively live and unmoved for this scoped view.
+            let mut active = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
+                .expect("valid native frame");
+            interpreter
+                .frame_load_this(&mut active, 0)
+                .expect("native this");
+            interpreter
+                .frame_load_self(&mut active, 1)
+                .expect("native SELF");
+            interpreter
+                .frame_load_new_target(&mut active, 2)
+                .expect("native new.target");
+        }
+
+        assert_eq!(materialized_slots, native_slots);
+        assert_eq!(materialized_slots, [this_value, self_value, new_target]);
+        assert_eq!(materialized.header.pc, 3);
+        assert_eq!(native.header.pc, 3);
+    }
+
+    #[test]
+    fn upvalue_kernels_match_materialized_and_native_frames() {
+        let mut interpreter = Interpreter::new();
+        let initial = Value::number_i32(11);
+        let cell = alloc_upvalue(interpreter.gc_heap_mut(), initial).expect("upvalue cell");
+        let initial_slots = [
+            Value::number_i32(23),
+            Value::undefined(),
+            Value::number_i32(37),
+        ];
+
+        let mut materialized_slots = initial_slots;
+        let mut materialized = materialized_frame(
+            &mut materialized_slots,
+            vec![cell],
+            Value::function(7),
+            Value::undefined(),
+        );
+        {
+            let mut active = ActiveFrameMut::materialized(&mut materialized);
+            interpreter
+                .frame_load_upvalue(&mut active, 1, 0)
+                .expect("materialized load");
+            interpreter
+                .frame_store_upvalue(&mut active, 0, 0)
+                .expect("materialized store");
+            interpreter
+                .frame_store_upvalue_checked(&mut active, 2, 0)
+                .expect("materialized checked store");
+        }
+        let materialized_result = read_upvalue(interpreter.gc_heap(), cell);
+
+        store_upvalue(interpreter.gc_heap_mut(), cell, initial);
+        let mut native_slots = initial_slots;
+        let native_upvalues = [cell];
+        let mut native = NativeFrame::new(
+            header(native_slots.len()),
+            native_slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        native.set_upvalue_window(
+            native_upvalues.as_ptr() as u64,
+            native_upvalues.len() as u32,
+        );
+        {
+            // SAFETY: the native frame and both initialized windows remain
+            // exclusively live and unmoved for this scoped view.
+            let mut active = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
+                .expect("valid native frame");
+            interpreter
+                .frame_load_upvalue(&mut active, 1, 0)
+                .expect("native load");
+            interpreter
+                .frame_store_upvalue(&mut active, 0, 0)
+                .expect("native store");
+            interpreter
+                .frame_store_upvalue_checked(&mut active, 2, 0)
+                .expect("native checked store");
+        }
+
+        assert_eq!(materialized_slots, native_slots);
+        assert_eq!(materialized_slots[1], initial);
+        assert_eq!(materialized_result, Value::number_i32(37));
+        assert_eq!(
+            read_upvalue(interpreter.gc_heap(), cell),
+            materialized_result
+        );
+        assert_eq!(materialized.header.pc, 3);
+        assert_eq!(native.header.pc, 3);
+    }
+
+    #[test]
+    fn upvalue_tdz_errors_match_materialized_and_native_frames() {
+        let mut interpreter = Interpreter::new();
+        let cell = alloc_upvalue(interpreter.gc_heap_mut(), Value::hole()).expect("TDZ cell");
+
+        let mut materialized_slots = [Value::number_i32(9), Value::undefined()];
+        let mut materialized = materialized_frame(
+            &mut materialized_slots,
+            vec![cell],
+            Value::function(7),
+            Value::undefined(),
+        );
+        let (materialized_load, materialized_store) = {
+            let mut active = ActiveFrameMut::materialized(&mut materialized);
+            let load = interpreter.frame_load_upvalue(&mut active, 1, 0);
+            let store = interpreter.frame_store_upvalue_checked(&mut active, 0, 0);
+            (load, store)
+        };
+
+        let mut native_slots = [Value::number_i32(9), Value::undefined()];
+        let native_upvalues = [cell];
+        let mut native = NativeFrame::new(
+            header(native_slots.len()),
+            native_slots.as_mut_ptr() as u64,
+            Value::function(7),
+            Value::undefined(),
+        );
+        native.set_upvalue_window(
+            native_upvalues.as_ptr() as u64,
+            native_upvalues.len() as u32,
+        );
+        let (native_load, native_store) = {
+            // SAFETY: the native frame and both initialized windows remain
+            // exclusively live and unmoved for this scoped view.
+            let mut active = unsafe { ActiveFrameMut::from_native_ptr(&mut native) }
+                .expect("valid native frame");
+            let load = interpreter.frame_load_upvalue(&mut active, 1, 0);
+            let store = interpreter.frame_store_upvalue_checked(&mut active, 0, 0);
+            (load, store)
+        };
+
+        for result in [
+            materialized_load,
+            materialized_store,
+            native_load,
+            native_store,
+        ] {
+            assert!(matches!(
+                result,
+                Err(VmError::TemporalDeadZone { local_index: 0 })
+            ));
+        }
+        assert_eq!(materialized_slots, native_slots);
+        assert!(read_upvalue(interpreter.gc_heap(), cell).is_hole());
+        assert_eq!(materialized.header.pc, 3);
+        assert_eq!(native.header.pc, 3);
     }
 }

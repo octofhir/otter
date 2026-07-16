@@ -9,9 +9,7 @@
 //! - Leaf/no-allocation collection probes for `Map.get`, `Map.has`, and
 //!   `Set.has`.
 //! - Allocating collection mutation and string-concat entries.
-//! - [`RuntimeStubEntry`] — the typed per-signature-family entry table built
-//!   in two phases: VM-owned entries at interpreter construction, JIT-owned
-//!   transitions at [`crate::Interpreter::set_jit_compiler`].
+//! - JIT transition-binding validation against the static descriptor inventory.
 //!
 //! # Invariants
 //! - Arguments are boxed [`crate::Value`] raw ABI bits.
@@ -215,7 +213,7 @@ pub unsafe fn alloc_safepoint_record(
     let registry = unsafe { *(thread.code_registry as *const CodeRegistryView) };
     // SAFETY: the registry publisher retains its resolver and records for the
     // native entry's dynamic extent.
-    let Some(record) = (unsafe { registry.resolve(ctx.code_object_id, safepoint) }) else {
+    let Some(record) = (unsafe { registry.resolve(ctx.code_object_id(), safepoint) }) else {
         return Err(AllocSafepointRootError::UnknownSafepoint { id: safepoint });
     };
     // SAFETY: resolver contract above.
@@ -224,7 +222,7 @@ pub unsafe fn alloc_safepoint_record(
 
 /// Validate that `safepoint` can be published from `ctx`'s frame-slot window.
 ///
-/// Baseline v1 spills every tagged value live at an allocating collection call
+/// Baseline spills every tagged value live at an allocating collection call
 /// into the interpreter-visible register window. Register and native-spill
 /// stack maps are intentionally rejected until the machine frame layout can
 /// publish those locations directly.
@@ -238,8 +236,8 @@ pub fn validate_alloc_safepoint_frame_roots(
     if !ctx.has_frame_slots() {
         return Err(AllocSafepointRootError::MissingFrameSlots);
     }
-    // SAFETY: `has_frame_slots` verified the published frame pointer/window.
-    let frame = unsafe { &*ctx.frame };
+    // SAFETY: `has_frame_slots` verified the thread-published frame/window.
+    let frame = unsafe { &*ctx.current_frame() };
     let frame_slot_count = frame.header.register_count;
     for location in &safepoint.tagged_locations {
         match location.kind {
@@ -289,7 +287,7 @@ impl<'a> AllocSafepointFrameRoots<'a> {
     ///
     /// # Safety
     ///
-    /// `ctx.frame` must publish a live, writable tagged register window for the
+    /// `ctx.thread.current_frame` must publish a live, writable tagged window for the
     /// duration of any heap registration created from this value.
     pub unsafe fn new(
         ctx: &'a RuntimeStubAllocContext,
@@ -315,7 +313,7 @@ impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
         for location in &self.safepoint.tagged_locations {
             // SAFETY: construction validated a live published frame.
-            let frame = unsafe { &*self.ctx.frame };
+            let frame = unsafe { &*self.ctx.current_frame() };
             // SAFETY: construction validated every location's storage class and
             // bounds and requires callers to keep the writable frame and spill
             // windows alive while this root source is registered. A moving
@@ -495,85 +493,63 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
     }
 }
 
-/// One resolved isolate-owned runtime-stub entry.
-///
-/// The dense entry table mirrors [`crate::native_abi::RUNTIME_STUB_DESCRIPTORS`]
-/// by `id - 1`. Every entry is typed by its descriptor's signature family;
-/// signature families are never mixed behind one untyped address array.
-#[derive(Clone, Copy)]
-pub enum RuntimeStubEntry {
-    /// Slot reserved for a JIT-owned transition until compiler-hook install.
-    Vacant,
-    /// VM-owned `(heap, v0, v1) -> RuntimeStubResultPair` leaf probe.
-    LeafValue2(LeafNoAllocStub2Fn),
-    /// VM-owned allocating `(alloc_ctx, safepoint, recv, a0, a1) -> pair` entry.
-    AllocValue3(AllocValueStubFn),
-    /// JIT-owned transition. The installing compiler owns both the call-packet
-    /// layout of the descriptor-declared signature family and every call site,
-    /// so the pairing is validated at install and consistent by construction.
-    JitOwned {
-        /// Descriptor signature family declared by the installing compiler.
-        signature: crate::native_abi::RuntimeStubSignature,
-        /// Nonzero machine entry address.
-        entry_addr: usize,
-    },
+/// Whether a descriptor is implemented by a statically typed VM entry.
+#[must_use]
+pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
+    leaf_no_alloc_stub2_by_id(id).is_some()
+        || alloc_value_stub_by_id(id)
+            .and_then(|stub| stub.entry)
+            .is_some()
 }
 
-impl RuntimeStubEntry {
-    /// Machine entry address for the published
-    /// [`crate::native_abi::RuntimeStubTable`]; zero for a vacant slot.
-    #[must_use]
-    pub fn machine_addr(self) -> u64 {
-        match self {
-            Self::Vacant => 0,
-            Self::LeafValue2(entry) => entry as usize as u64,
-            Self::AllocValue3(entry) => entry as usize as u64,
-            Self::JitOwned { entry_addr, .. } => entry_addr as u64,
-        }
+/// Validate the compiler-owned transition inventory once at hook install.
+///
+/// Runtime calls use their statically typed VM/JIT entrypoints directly; this
+/// check exists only to prove that the installed compiler's transition table
+/// covers every non-VM descriptor exactly once with the declared signature.
+pub(crate) fn validate_jit_runtime_stub_bindings(bindings: &[crate::jit::JitRuntimeStubBinding]) {
+    let mut seen = [false; crate::native_abi::RUNTIME_STUB_DESCRIPTORS.len()];
+
+    for binding in bindings {
+        let index = binding
+            .id
+            .checked_sub(1)
+            .map(|index| index as usize)
+            .expect("JIT runtime-stub id is 1-based");
+        let descriptor = crate::native_abi::RUNTIME_STUB_DESCRIPTORS
+            .get(index)
+            .expect("JIT runtime-stub id names a VM descriptor");
+        assert_eq!(descriptor.id, binding.id);
+        assert_eq!(
+            descriptor.signature, binding.signature,
+            "JIT runtime-stub binding {} declares the descriptor signature family",
+            binding.id
+        );
+        assert_ne!(binding.entry_addr, 0);
+        assert!(
+            !is_vm_owned_runtime_stub(binding.id),
+            "JIT runtime-stub binding {} may only fill a JIT-owned slot",
+            binding.id
+        );
+        assert!(
+            !std::mem::replace(&mut seen[index], true),
+            "JIT runtime-stub binding {} is duplicated",
+            binding.id
+        );
     }
 
-    /// Signature family this entry satisfies, or `None` while vacant.
-    #[must_use]
-    pub fn signature(self) -> Option<crate::native_abi::RuntimeStubSignature> {
-        match self {
-            Self::Vacant => None,
-            Self::LeafValue2(_) => Some(crate::native_abi::RuntimeStubSignature::LeafValue2),
-            Self::AllocValue3(_) => Some(crate::native_abi::RuntimeStubSignature::AllocValue3),
-            Self::JitOwned { signature, .. } => Some(signature),
+    for (index, descriptor) in crate::native_abi::RUNTIME_STUB_DESCRIPTORS
+        .iter()
+        .enumerate()
+    {
+        if !is_vm_owned_runtime_stub(descriptor.id) {
+            assert!(
+                seen[index],
+                "runtime stub {} left vacant after JIT installation",
+                index + 1
+            );
         }
     }
-}
-
-/// Build the VM-owned phase of the isolate runtime-entry table.
-///
-/// JIT-owned transition slots stay [`RuntimeStubEntry::Vacant`] until explicit
-/// compiler-hook installation. No process-global storage or lazy
-/// synchronization is used.
-pub(crate) fn vm_runtime_stub_entries() -> Box<[RuntimeStubEntry]> {
-    crate::native_abi::RUNTIME_STUB_DESCRIPTORS
-        .iter()
-        .map(|descriptor| {
-            if let Some(stub) = leaf_no_alloc_stub2_by_id(descriptor.id) {
-                debug_assert!(stub.is_valid());
-                RuntimeStubEntry::LeafValue2(stub.entry)
-            } else if let Some(entry) = alloc_value_stub_by_id(descriptor.id).and_then(|s| s.entry)
-            {
-                RuntimeStubEntry::AllocValue3(entry)
-            } else {
-                RuntimeStubEntry::Vacant
-            }
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-}
-
-/// Derive the machine-visible address column of an isolate entry table.
-pub(crate) fn machine_stub_entries(entries: &[RuntimeStubEntry]) -> Box<[u64]> {
-    entries
-        .iter()
-        .map(|entry| entry.machine_addr())
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
 }
 
 /// Invoke a fixed two-argument leaf/no-allocation stub by ABI descriptor id.
@@ -1471,8 +1447,8 @@ mod tests {
             resolve_safepoint: resolve_test_safepoint as *const () as u64,
         }));
         let reentry = Box::leak(Box::new(crate::jit::VmRuntimeActivation::for_test(vm)));
-        let frame = Box::leak(Box::new(NativeFrame {
-            header: VmFrameHeader {
+        let native_frame = NativeFrame::new(
+            VmFrameHeader {
                 function_id: 0,
                 code_block_id: 0,
                 pc: 0,
@@ -1480,25 +1456,18 @@ mod tests {
                 kind: NativeFrameKind::Baseline,
                 flags: NativeFrameFlags::from_bits(NativeFrameFlags::HAS_SAFEPOINTS),
             },
-            previous_frame: 0,
-            register_base: slots.as_mut_ptr() as u64,
-            argument_base: 0,
-            feedback_base: 0,
-            code_object_id: 1,
-            this_value_bits: Value::undefined().to_abi_bits(),
-            new_target_bits: Value::undefined().to_abi_bits(),
-            return_register: u32::MAX,
-            cold_state_index: u32::MAX,
-            argument_count: 0,
-            reserved0: 0,
-            feedback_id: 0,
-        }));
+            slots.as_mut_ptr() as u64,
+            Value::function(0),
+            Value::undefined(),
+        );
+        let frame = Box::leak(Box::new(native_frame));
         let mut thread = VmThread::empty();
         thread.current_frame = std::ptr::from_mut(frame) as u64;
+        thread.current_code_object_id = 1;
         thread.runtime_context = std::ptr::from_ref(reentry) as u64;
         thread.code_registry = std::ptr::from_ref(registry) as u64;
         let thread = Box::leak(Box::new(thread));
-        RuntimeStubAllocContext::new(thread, frame, 1, safepoint_id)
+        RuntimeStubAllocContext::new(thread, safepoint_id)
     }
 
     #[test]
@@ -1709,8 +1678,7 @@ mod tests {
             Err(AllocSafepointRootError::UnknownSafepoint { id: 9 })
         );
 
-        let missing_slots_ctx =
-            RuntimeStubAllocContext::new(std::ptr::null_mut(), std::ptr::null_mut(), 1, 1);
+        let missing_slots_ctx = RuntimeStubAllocContext::new(std::ptr::null_mut(), 1);
         let valid_safepoint = SafepointRecord::frame_slot_window(1, NO_FRAME_STATE, 1);
         assert_eq!(
             validate_alloc_safepoint_frame_roots(&missing_slots_ctx, &valid_safepoint),
@@ -2093,31 +2061,29 @@ mod tests {
     }
 
     #[test]
-    fn vm_phase_types_every_vm_owned_slot() {
-        let entries = vm_runtime_stub_entries();
-        assert_eq!(
-            entries.len(),
-            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.len()
-        );
-        for (entry, descriptor) in entries
-            .iter()
-            .zip(crate::native_abi::RUNTIME_STUB_DESCRIPTORS)
-        {
-            match entry.signature() {
-                Some(signature) => {
-                    assert_eq!(signature, descriptor.signature);
-                    assert_ne!(entry.machine_addr(), 0);
+    fn static_entries_type_every_vm_owned_descriptor() {
+        for descriptor in crate::native_abi::RUNTIME_STUB_DESCRIPTORS {
+            if is_vm_owned_runtime_stub(descriptor.id) {
+                match descriptor.signature {
+                    crate::native_abi::RuntimeStubSignature::LeafValue2 => {
+                        assert!(leaf_no_alloc_stub2_by_id(descriptor.id).is_some());
+                    }
+                    crate::native_abi::RuntimeStubSignature::AllocValue3 => {
+                        assert!(
+                            alloc_value_stub_by_id(descriptor.id)
+                                .and_then(|stub| stub.entry)
+                                .is_some()
+                        );
+                    }
+                    signature => panic!("VM-owned descriptor has unexpected {signature:?}"),
                 }
-                // Only JIT-owned transitions stay vacant before hook install.
-                None => {
-                    assert!(matches!(
-                        descriptor.signature,
-                        crate::native_abi::RuntimeStubSignature::Poll1
-                            | crate::native_abi::RuntimeStubSignature::Variadic
-                            | crate::native_abi::RuntimeStubSignature::NullaryValue
-                    ));
-                    assert_eq!(entry.machine_addr(), 0);
-                }
+            } else {
+                assert!(matches!(
+                    descriptor.signature,
+                    crate::native_abi::RuntimeStubSignature::Poll1
+                        | crate::native_abi::RuntimeStubSignature::Variadic
+                        | crate::native_abi::RuntimeStubSignature::NullaryValue
+                ));
             }
         }
     }
@@ -2146,14 +2112,12 @@ mod tests {
         }
     }
 
-    /// One fake binding per JIT-owned inventory slot (every slot the VM phase
-    /// leaves vacant), addressed by descriptor id.
+    /// One fake binding per compiler-owned inventory slot.
     fn all_jit_bindings() -> Vec<crate::jit::JitRuntimeStubBinding> {
-        vm_runtime_stub_entries()
+        crate::native_abi::RUNTIME_STUB_DESCRIPTORS
             .iter()
-            .zip(crate::native_abi::RUNTIME_STUB_DESCRIPTORS)
-            .filter(|(entry, _)| matches!(entry, RuntimeStubEntry::Vacant))
-            .map(|(_, descriptor)| crate::jit::JitRuntimeStubBinding {
+            .filter(|descriptor| !is_vm_owned_runtime_stub(descriptor.id))
+            .map(|descriptor| crate::jit::JitRuntimeStubBinding {
                 id: descriptor.id,
                 signature: descriptor.signature,
                 entry_addr: 0x1000 + descriptor.id as usize,
@@ -2161,42 +2125,14 @@ mod tests {
             .collect()
     }
 
-    fn published_machine_entries(interp: &Interpreter) -> Vec<u64> {
-        // SAFETY: the header and machine column are isolate-owned and live.
-        let table = unsafe {
-            *(interp.jit_runtime_stub_table_addr() as *const crate::native_abi::RuntimeStubTable)
-        };
-        assert_eq!(table.version, crate::native_abi::RUNTIME_STUB_TABLE_VERSION);
-        assert_eq!(
-            table.count as usize,
-            crate::native_abi::RUNTIME_STUB_DESCRIPTORS.len()
-        );
-        // SAFETY: the header names the live machine entry column.
-        unsafe {
-            std::slice::from_raw_parts(table.entries_address as *const u64, table.count as usize)
-        }
-        .to_vec()
-    }
-
     #[test]
-    fn jit_binding_installation_fills_every_slot_and_uninstall_revacates() {
+    fn jit_binding_installation_validates_inventory_without_persistent_table() {
         let mut interp = Interpreter::new();
-        let poll_index = crate::native_abi::STUB_JIT_BACKEDGE_POLL.id as usize - 1;
-
-        let before = published_machine_entries(&interp);
-        assert_eq!(before[poll_index], 0);
-
+        assert!(!interp.jit_compiler_installed());
         interp.set_jit_compiler(Some(std::sync::Arc::new(BindingHook(all_jit_bindings()))));
-        let installed = published_machine_entries(&interp);
-        assert!(installed.iter().all(|&addr| addr != 0));
-        assert_eq!(
-            installed[poll_index],
-            0x1000 + crate::native_abi::STUB_JIT_BACKEDGE_POLL.id as u64
-        );
-
+        assert!(interp.jit_compiler_installed());
         interp.set_jit_compiler(None);
-        let after = published_machine_entries(&interp);
-        assert_eq!(after[poll_index], 0);
+        assert!(!interp.jit_compiler_installed());
     }
 
     #[test]
@@ -2223,5 +2159,13 @@ mod tests {
     #[should_panic(expected = "left vacant")]
     fn jit_installation_requires_complete_inventory() {
         Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(Vec::new()))));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicated")]
+    fn jit_installation_rejects_duplicate_bindings() {
+        let mut bindings = all_jit_bindings();
+        bindings.push(bindings[0]);
+        Interpreter::new().set_jit_compiler(Some(std::sync::Arc::new(BindingHook(bindings))));
     }
 }

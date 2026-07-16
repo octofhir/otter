@@ -154,10 +154,10 @@ impl LeanCallbackRoot {
             .read_payload(closure.handle, |body| {
                 (
                     body.upvalues.clone().into_boxed_slice(),
-                    body.bound_this,
-                    body.bound_new_target,
-                    body.bound_derived_this,
-                    body.eval_env,
+                    body.bound_this_option(),
+                    body.bound_new_target_option(),
+                    body.bound_derived_this_option(),
+                    body.eval_env_option(),
                 )
             });
         Some(Self {
@@ -358,10 +358,10 @@ impl Interpreter {
                         body.upvalues.clone().into_boxed_slice();
                     (
                         ups,
-                        body.bound_this,
-                        body.bound_new_target,
-                        body.bound_derived_this,
-                        body.eval_env,
+                        body.bound_this_option(),
+                        body.bound_new_target_option(),
+                        body.bound_derived_this_option(),
+                        body.eval_env_option(),
                     )
                 });
             let this_value = bound_this.unwrap_or(effective_this);
@@ -386,8 +386,7 @@ impl Interpreter {
         }
         if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
-            let upvalues =
-                heap.read_payload(c.handle, |body| body.upvalues.clone().into_boxed_slice());
+            let upvalues = c.upvalues_snapshot(heap).into_boxed_slice();
             return Ok((function_id, upvalues));
         }
         Err(VmError::NotCallable)
@@ -449,7 +448,7 @@ impl Interpreter {
             this_value,
             window,
         );
-        let callee_closure = current.as_closure(&self.gc_heap);
+        frame.self_value = current;
         let derived_this_cell = if is_derived {
             let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
                 frame.trace_frame_slots(visitor);
@@ -477,7 +476,6 @@ impl Interpreter {
                 cold.construct_target = Some(receiver);
             }
             cold.new_target = Some(new_target);
-            cold.callee_closure = callee_closure;
         }
         self.bind_bytecode_call_arguments(function, &mut frame, args)?;
         window_rollback.commit();
@@ -531,7 +529,7 @@ impl Interpreter {
             this_value,
             window,
         );
-        let callee_closure = current.as_closure(&self.gc_heap);
+        frame.self_value = current;
         let extras = args.bind_into(function, &mut frame)?;
         let derived_this_cell = if is_derived {
             let mut frame_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -563,7 +561,6 @@ impl Interpreter {
                 cold.construct_target = Some(receiver);
             }
             cold.new_target = Some(new_target);
-            cold.callee_closure = callee_closure;
             if !extras.is_empty() {
                 cold.rest_args = extras.rest_args;
                 cold.incoming_args = extras.incoming_args;
@@ -672,7 +669,12 @@ impl Interpreter {
             this_for_callee,
             window,
         );
-        new_frame.async_state = async_state;
+        new_frame.self_value = callee_closure
+            .map(Value::closure)
+            .unwrap_or_else(|| Value::function(function_id));
+        if let Some(async_state) = async_state {
+            self.frame_set_async_state(&mut new_frame, async_state);
+        }
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);
@@ -691,10 +693,12 @@ impl Interpreter {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
             let generator_function_id = function.id;
+            let cold = self.frame_detach_cold(&mut new_frame);
             let new_frame = self.park_active_frame(new_frame);
             let gen_handle = crate::generator::JsGenerator::new_with_prototype(
                 &mut self.gc_heap,
                 new_frame,
+                cold,
                 None,
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
@@ -758,7 +762,9 @@ impl Interpreter {
             this_for_callee,
             window,
         );
-        frame.async_state = async_state;
+        if let Some(async_state) = async_state {
+            self.frame_set_async_state(&mut frame, async_state);
+        }
         let extras = args.bind_into(function, &mut frame)?;
         if !extras.is_empty() {
             let cold = self.frame_ensure_cold(&mut frame);
@@ -831,9 +837,14 @@ impl Interpreter {
         } = prepared;
         if is_generator {
             frame.return_register = None;
+            let cold = self.frame_detach_cold(&mut frame);
             let frame = self.park_active_frame(frame);
-            let gen_handle =
-                crate::generator::JsGenerator::new_with_prototype(&mut self.gc_heap, frame, None)?;
+            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
+                &mut self.gc_heap,
+                frame,
+                cold,
+                None,
+            )?;
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let (frame, cold) = gen_handle
@@ -931,14 +942,10 @@ impl Interpreter {
                 async_state,
             )?
         };
-        // Record the invoked closure so the named-function SELF binding and
-        // `arguments.callee` resolve to the live instance, not a bare
-        // interned function value.
-        if (function.makes_function || function.uses_arguments_callee)
-            && let Some(closure) = current.as_closure(&self.gc_heap)
-        {
-            self.frame_ensure_cold(&mut prepared.frame).callee_closure = Some(closure);
-        }
+        // SELF is canonical hot frame state for both interpreter and native
+        // activations. It records the exact invoked closure even when this
+        // particular body never executes a named-SELF opcode.
+        prepared.frame.self_value = current;
         prepared.callee_closure = current.as_closure(&self.gc_heap);
         self.push_prepared_bytecode_call_frame(stack, context, dst, prepared)?;
         Ok(true)
@@ -1090,7 +1097,7 @@ impl Interpreter {
         let (callee, args, ret_reg) = {
             let frame = &stack[top_idx];
             let tco_safe = frame.return_register.is_some()
-                && frame.async_state.is_none()
+                && !self.frame_has_async_state(frame)
                 && match self.frame_cold(frame) {
                     None => true,
                     Some(cold) => {
@@ -2384,19 +2391,12 @@ impl Interpreter {
             this_for_callee,
             window,
         );
+        new_frame.self_value = current;
         if let Some(result_promise) = async_result_promise {
-            new_frame.async_state = Some(crate::frame_state::AsyncFrameState { result_promise });
-        }
-        // A closure frame records its instance so the named-function SELF
-        // binding inside the body resolves to it (per-instance `.prototype`),
-        // and so `arguments.callee` exposes the invoked closure rather than a
-        // bare interned function value. Leaf callees that neither create a
-        // closure nor materialize an arguments object skip the record and the
-        // cold-frame acquire.
-        if (function.makes_function || function.uses_arguments_callee)
-            && let Some(closure) = current.as_closure(&self.gc_heap)
-        {
-            self.frame_ensure_cold(&mut new_frame).callee_closure = Some(closure);
+            self.frame_set_async_state(
+                &mut new_frame,
+                crate::frame_state::AsyncFrameState { result_promise },
+            );
         }
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
@@ -2417,10 +2417,12 @@ impl Interpreter {
         if function.is_generator {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
+            let cold = self.frame_detach_cold(&mut new_frame);
             let new_frame = self.park_active_frame(new_frame);
             let gen_handle = crate::generator::JsGenerator::new_with_prototype(
                 &mut self.gc_heap,
                 new_frame,
+                cold,
                 None,
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
@@ -2549,17 +2551,12 @@ impl Interpreter {
         // traced, so its captured upvalues / receiver could be relocated by a
         // moving collection the builtin triggers between elements. Reading them
         // back from `lean_callback_roots` (which IS traced) keeps them current.
-        let (bound_this, parent_upvalues) = {
+        let (self_value, bound_this) = {
             let root = self
                 .lean_callback_roots
                 .get(state.root_index)
                 .ok_or(VmError::InvalidOperand)?;
-            (
-                root.bound_this.unwrap_or(effective_this),
-                state
-                    .has_parent_upvalues
-                    .then(|| root.parent_upvalues.clone()),
-            )
+            (root.callback, root.bound_this.unwrap_or(effective_this))
         };
         // The builtin passes a constant receiver across the whole loop, so the
         // §10.2 sloppy-`this` coercion is computed once and reused.
@@ -2588,9 +2585,19 @@ impl Interpreter {
                 debug_assert_eq!(frame.registers.len(), register_count);
                 frame.pc = 0;
                 frame.return_register = None;
+                frame.self_value = self_value;
                 frame.this_value = this_for_callee;
-                if let Some(parent_upvalues) = parent_upvalues {
-                    frame.upvalues = parent_upvalues;
+                if state.has_parent_upvalues {
+                    let root = self
+                        .lean_callback_roots
+                        .get(state.root_index)
+                        .ok_or(VmError::InvalidOperand)?;
+                    if frame.upvalues.len() != root.parent_upvalues.len() {
+                        return Err(VmError::InvalidOperand);
+                    }
+                    frame
+                        .upvalues
+                        .copy_from_slice(root.parent_upvalues.as_ref());
                 }
                 frame
             }
@@ -2599,14 +2606,24 @@ impl Interpreter {
                     .exec_function(state.function_id)
                     .ok_or(VmError::InvalidOperand)?;
                 let window = self.alloc_reg_window(register_count)?;
-                let parent_upvalues = parent_upvalues.unwrap_or_else(Frame::empty_upvalues);
-                Frame::with_exec_return_upvalues_and_this(
+                let parent_upvalues = if state.has_parent_upvalues {
+                    self.lean_callback_roots
+                        .get(state.root_index)
+                        .ok_or(VmError::InvalidOperand)?
+                        .parent_upvalues
+                        .clone()
+                } else {
+                    Frame::empty_upvalues()
+                };
+                let mut frame = Frame::with_exec_return_upvalues_and_this(
                     function,
                     None,
                     parent_upvalues,
                     this_for_callee,
                     window,
-                )
+                );
+                frame.self_value = self_value;
+                frame
             }
         };
         if let Err(error) = Self::reset_and_bind_lean_bytecode_call_arguments(
@@ -2676,6 +2693,7 @@ impl Interpreter {
         probe: bool,
     ) -> Result<Value, VmError> {
         let (
+            self_value,
             function_id,
             parent_upvalues,
             this_for_callee,
@@ -2688,6 +2706,7 @@ impl Interpreter {
                 .get(state.root_index)
                 .ok_or(VmError::InvalidOperand)?;
             (
+                root.callback,
                 root.function_id,
                 root.parent_upvalues.clone(),
                 root.bound_this.unwrap_or(effective_this),
@@ -2726,6 +2745,7 @@ impl Interpreter {
             this_for_callee,
             window,
         );
+        new_frame.self_value = self_value;
         if let Some(new_target) = new_target_for_callee {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.new_target = Some(new_target);

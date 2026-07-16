@@ -69,12 +69,12 @@ unsafe fn whisker_ic_fill(cell: *mut WhiskerIcCell, shape: u32, value_byte: u32)
     }
 }
 
-/// Frameless `LoadProperty` miss handler for a self-recursive callee running on
-/// the flat register window. Resolves the own-data IC directly against
-/// `ctx.regs` and completes every remaining `[[Get]]` case through the VM.
+/// `LoadProperty` miss handler over the canonical active register window.
+/// Resolves the own-data IC directly and completes every remaining `[[Get]]`
+/// case through the VM.
 /// Returns `0` when handled and `1` on throw; it never requests an exact side
 /// exit. `function_id` is baked by the emitter.
-pub(crate) extern "C" fn jit_load_prop_window_stub(
+pub(crate) extern "C" fn jit_load_property_stub(
     ctx: *mut JitCtx,
     dst: u64,
     obj: u64,
@@ -83,24 +83,30 @@ pub(crate) extern "C" fn jit_load_prop_window_stub(
     cell: u64,
     function_id: u64,
 ) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract; `ctx.regs` is the GC-traced
-    // register window of the executing (framed or frameless) callee.
+    // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match unsafe {
-        vm.jit_runtime_load_property_window(
-            context,
-            stack,
-            ctx.regs,
-            function_id as u32,
-            dst as u16,
-            obj as u16,
-            name_idx as u32,
-            site as usize,
-        )
-    } {
+    let vm_ptr = ctx.activation().vm_ptr();
+    let stack_ptr = ctx.activation().stack_ptr();
+    let context_ptr = ctx.activation().context_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the runtime activation retains all three services. The frame
+    // carries raw validated windows, not references overlapping the VM/stack.
+    match unsafe { &mut *vm_ptr }.jit_runtime_load_property(
+        unsafe { &*context_ptr },
+        &mut frame,
+        unsafe { &mut *stack_ptr },
+        function_id as u32,
+        dst as u16,
+        obj as u16,
+        name_idx as u32,
+        site as usize,
+    ) {
         Ok(fill) => {
             if cell != 0 && fill != 0 {
                 let cell = cell as *mut WhiskerIcCell;
@@ -118,12 +124,11 @@ pub(crate) extern "C" fn jit_load_prop_window_stub(
     }
 }
 
-/// Frameless `StoreProperty` miss handler — the [`jit_load_prop_window_stub`]
+/// `StoreProperty` miss handler — the [`jit_load_property_stub`]
 /// counterpart. Resolves existing-own-data stores and shape transitions against
-/// `ctx.regs`, then completes all remaining `[[Set]]` semantics through the
-/// VM's shared value-level funnel. Returns `0` when handled (self-patching the
-/// cell when eligible) and `1` on throw; it never requests an exact side exit.
-pub(crate) extern "C" fn jit_store_prop_window_stub(
+/// the canonical active window, then completes all remaining `[[Set]]`
+/// semantics through the VM's shared value-level funnel.
+pub(crate) extern "C" fn jit_store_property_stub(
     ctx: *mut JitCtx,
     obj: u64,
     name_idx: u64,
@@ -132,23 +137,29 @@ pub(crate) extern "C" fn jit_store_prop_window_stub(
     cell: u64,
     function_id: u64,
 ) -> u64 {
-    // SAFETY: as `jit_load_prop_window_stub`.
+    // SAFETY: as `jit_load_property_stub`.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match unsafe {
-        vm.jit_runtime_store_property_window(
-            context,
-            stack,
-            ctx.regs,
-            function_id as u32,
-            obj as u16,
-            name_idx as u32,
-            src as u16,
-            site as usize,
-        )
-    } {
+    let vm_ptr = ctx.activation().vm_ptr();
+    let stack_ptr = ctx.activation().stack_ptr();
+    let context_ptr = ctx.activation().context_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: as `jit_load_property_stub`.
+    match unsafe { &mut *vm_ptr }.jit_runtime_store_property(
+        unsafe { &*context_ptr },
+        &mut frame,
+        unsafe { &mut *stack_ptr },
+        function_id as u32,
+        obj as u16,
+        name_idx as u32,
+        src as u16,
+        site as usize,
+    ) {
         Ok(fill) => {
             if cell != 0 && fill != 0 {
                 let cell = cell as *mut WhiskerIcCell;
@@ -173,25 +184,23 @@ pub(crate) extern "C" fn jit_store_prop_window_stub(
 pub(crate) extern "C" fn jit_write_barrier_stub(ctx: *mut JitCtx, obj: u64, src: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    vm.jit_runtime_write_barrier(stack, ctx.frame_index, obj as u16, src as u16);
-    0
-}
-
-/// Frameless write barrier — reads the parent/child from `ctx.regs` so an
-/// inline `StoreProperty` of a pointer value works without a `HoltStack` frame
-/// (used by frameless-eligible bodies, framed or frameless).
-pub(crate) extern "C" fn jit_write_barrier_window_stub(
-    ctx: *mut JitCtx,
-    obj: u64,
-    src: u64,
-) -> u64 {
-    // SAFETY: the live `JitCtx` reentry contract; `ctx.regs` is GC-traced.
-    let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    unsafe { vm.jit_runtime_write_barrier_window(ctx.regs, obj as u16, src as u16) };
-    0
+    let vm_ptr = ctx.activation().vm_ptr();
+    let frame = match ctx.active_frame() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the activation retains the VM for the compiled entry's dynamic
+    // extent; `frame` is the published canonical activation.
+    match unsafe { &mut *vm_ptr }.jit_runtime_write_barrier(&frame, obj as u16, src as u16) {
+        Ok(()) => 0,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            1
+        }
+    }
 }
 
 /// Bridge stub: perform a computed `LoadElement` (`recv[idx]`) from compiled
@@ -205,13 +214,20 @@ pub(crate) extern "C" fn jit_load_element_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_load_element(
-        context,
-        stack,
-        ctx.frame_index,
+    let vm_ptr = ctx.activation().vm_ptr();
+    let context_ptr = ctx.activation().context_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the activation retains the VM and context; frame slot access is
+    // scoped to individual reads and commits around the VM operation.
+    match unsafe { &mut *vm_ptr }.jit_runtime_load_element(
+        unsafe { &*context_ptr },
+        &mut frame,
         dst as u16,
         recv as u16,
         idx as u16,
@@ -236,13 +252,20 @@ pub(crate) extern "C" fn jit_load_global_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_load_global(
-        context,
-        stack,
-        ctx.frame_index,
+    let vm_ptr = ctx.activation().vm_ptr();
+    let context_ptr = ctx.activation().context_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the activation retains the VM and execution context; ActiveFrame
+    // holds no register slice that aliases reconstructed VM state.
+    match unsafe { &mut *vm_ptr }.jit_runtime_load_global(
+        unsafe { &*context_ptr },
+        &mut frame,
         function_id as u32,
         dst as u16,
         name_idx as u32,
@@ -262,9 +285,21 @@ pub(crate) extern "C" fn jit_load_global_stub(
 pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    match vm.jit_runtime_load_upvalue(stack, ctx.frame_index, dst as u16, idx as i32) {
+    let vm_ptr = ctx.activation().vm_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the activation retains the VM while `frame` carries the
+    // published native record and raw register/upvalue descriptors.
+    match unsafe { &mut *vm_ptr }.jit_runtime_load_upvalue(
+        &mut frame,
+        dst as u16,
+        idx as u32 as i32,
+    ) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -279,9 +314,20 @@ pub(crate) extern "C" fn jit_load_upvalue_stub(ctx: *mut JitCtx, dst: u64, idx: 
 pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    match vm.jit_runtime_store_upvalue(stack, ctx.frame_index, src as u16, idx as i32) {
+    let vm_ptr = ctx.activation().vm_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: as `jit_load_upvalue_stub`.
+    match unsafe { &mut *vm_ptr }.jit_runtime_store_upvalue(
+        &mut frame,
+        src as u16,
+        idx as u32 as i32,
+    ) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -296,9 +342,17 @@ pub(crate) extern "C" fn jit_store_upvalue_stub(ctx: *mut JitCtx, src: u64, idx:
 pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    match vm.jit_runtime_new_object(stack, ctx.frame_index, dst as u16) {
+    let vm_ptr = ctx.activation().vm_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the activation retains the VM while the canonical frame view is
+    // live and published to the collector.
+    match unsafe { &mut *vm_ptr }.jit_runtime_new_object(&mut frame, dst as u16) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -312,10 +366,23 @@ pub(crate) extern "C" fn jit_new_object_stub(ctx: *mut JitCtx, dst: u64) -> u64 
 pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
-    let vm = unsafe { &mut *ctx.activation().vm_ptr() };
-    let stack = unsafe { &mut *ctx.activation().stack_ptr() };
-    let context = unsafe { &*ctx.activation().context_ptr() };
-    match vm.jit_runtime_load_regexp(context, stack, ctx.frame_index, dst as u16, idx as u32) {
+    let vm_ptr = ctx.activation().vm_ptr();
+    let context_ptr = ctx.activation().context_ptr();
+    let mut frame = match ctx.active_frame_mut() {
+        Ok(frame) => frame,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
+    // SAFETY: the activation retains the VM and context while the canonical
+    // frame remains published to the collector.
+    match unsafe { &mut *vm_ptr }.jit_runtime_load_regexp(
+        unsafe { &*context_ptr },
+        &mut frame,
+        dst as u16,
+        idx as u32,
+    ) {
         Ok(()) => 0,
         Err(err) => {
             park_jit_error(ctx, err);
@@ -343,13 +410,20 @@ pub(crate) extern "C" fn jit_call_collection_method_ic_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
     match vm.jit_runtime_try_collection_method_ic(
         stack,
-        ctx.frame_index,
+        frame_index,
         dst as u16,
         recv as u16,
         site as usize,
@@ -377,13 +451,20 @@ pub(crate) extern "C" fn jit_store_element_stub(
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
+    let frame_index = match ctx.materialized_frame_index() {
+        Ok(index) => index,
+        Err(err) => {
+            park_jit_error(ctx, err);
+            return 1;
+        }
+    };
     let vm = unsafe { &mut *ctx.activation().vm_ptr() };
     let stack = unsafe { &mut *ctx.activation().stack_ptr() };
     let context = unsafe { &*ctx.activation().context_ptr() };
     match vm.jit_runtime_store_element(
         context,
         stack,
-        ctx.frame_index,
+        frame_index,
         recv as u16,
         idx as u16,
         src as u16,

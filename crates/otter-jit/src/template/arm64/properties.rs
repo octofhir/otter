@@ -172,7 +172,7 @@ pub(super) fn emit_load_property(
     emit_load_u64(ops, 4, site);
     emit_load_u64(ops, 5, cell_addr as u64);
     emit_load_u64(ops, 6, u64::from(view.code_block.id));
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_LOAD_PROP_WINDOW));
+    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_LOAD_PROPERTY));
     dynasm!(ops
         ; .arch aarch64
         ; blr x16
@@ -293,7 +293,7 @@ pub(super) fn emit_store_property(
     emit_load_u64(ops, 4, site);
     emit_load_u64(ops, 5, cell_addr as u64);
     emit_load_u64(ops, 6, u64::from(view.code_block.id));
-    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_STORE_PROP_WINDOW));
+    emit_load_u64(ops, 16, table.entry(abi::STUB_JIT_STORE_PROPERTY));
     dynasm!(ops
         ; .arch aarch64
         ; blr x16

@@ -96,6 +96,9 @@ pub struct JitCompileSnapshot {
     pub array_layout: JitArrayLayout,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
+    /// Byte offset from a decompressed upvalue-cell pointer to its captured
+    /// `Value`, for the inline captured-binding read.
+    pub upvalue_value_byte: u32,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the
     /// emitter reads `[obj_ptr + object_shape_byte]` for the WhiskerIC
@@ -637,6 +640,7 @@ impl JitCompileSnapshot {
             heap_number_type_tag: 0,
             heap_number_bits_byte: 0,
             closure_fid_byte: 0,
+            upvalue_value_byte: 0,
             collection_layout: JitCollectionLayout::default(),
             native_static_fn_byte: 0,
             instructions,

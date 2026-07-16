@@ -80,6 +80,7 @@ use super::{OptimizedCode, OptimizedMetadata};
 use crate::{
     CompiledCode,
     entry::{
+        UPVALUES_PTR_OFFSET,
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
         NUMBER_TAG_HI16, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW, THIS_VALUE_OFFSET,
         MAX_METHOD_ARGS, THREAD_OFFSET,
@@ -2334,9 +2335,43 @@ fn emit(
                     let dst = instruction
                         .result_register
                         .expect("eligibility checked upvalue-load destination");
+                    let result_location = allocation.location(
+                        instruction
+                            .result
+                            .expect("eligibility checked upvalue-load result"),
+                    );
                     let index = view.instructions[instruction.pc as usize]
                         .imm32(view.code_block.as_ref(), 1)
                         .ok_or(Unsupported::OperandShape("upvalue-load index"))?;
+                    let miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    // Inline captured-binding read: spine of 4-byte compressed
+                    // cell handles, value at a fixed cell offset. Only a TDZ
+                    // hole misses into the stub, which raises the right error.
+                    if view.cage_base != 0 && index >= 0 {
+                        let spine_offset = (index as u32) * 4;
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; ldr x9, [x20, UPVALUES_PTR_OFFSET]
+                            ; cbz x9, =>miss
+                            ; ldr w9, [x9, spine_offset]
+                        );
+                        emit_load_u64(&mut ops, 13, view.cage_base as u64);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; add x13, x13, x9
+                            ; ldr x9, [x13, view.upvalue_value_byte]
+                        );
+                        emit_load_u64(&mut ops, 11, VALUE_HOLE);
+                        dynasm!(ops
+                            ; .arch aarch64
+                            ; cmp x9, x11
+                            ; b.eq =>miss
+                        );
+                        emit_store_tagged_location(&mut ops, result_location, 9)?;
+                        dynasm!(ops ; .arch aarch64 ; b =>done);
+                    }
+                    dynasm!(ops ; .arch aarch64 ; =>miss);
                     emit_load_u32(&mut ops, 9, instruction.pc);
                     dynasm!(ops
                         ; .arch aarch64
@@ -2356,15 +2391,8 @@ fn emit(
                         ; =>succeeded
                     );
                     emit_load_frame_register(&mut ops, u32::from(dst), 9)?;
-                    emit_store_tagged_location(
-                        &mut ops,
-                        allocation.location(
-                            instruction
-                                .result
-                                .expect("eligibility checked upvalue-load result"),
-                        ),
-                        9,
-                    )?;
+                    emit_store_tagged_location(&mut ops, result_location, 9)?;
+                    dynasm!(ops ; .arch aarch64 ; =>done);
                 }
                 Op::LoadGlobalOrThrow => {
                     let dst = instruction

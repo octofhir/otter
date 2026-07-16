@@ -417,7 +417,7 @@ pub(super) fn compile(
                 )?;
             }
             TemplateOp::LoadUpvalue { dst, index } => {
-                transitions::emit_load_upvalue(&mut ops, transitions, dst, index, threw);
+                transitions::emit_load_upvalue(&mut ops, transitions, view, dst, index, threw)?;
             }
             TemplateOp::StoreUpvalue { src, index } => {
                 transitions::emit_store_upvalue(&mut ops, transitions, src, index, false, threw);

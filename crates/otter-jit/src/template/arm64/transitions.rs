@@ -31,7 +31,7 @@ use crate::entry::{
     ALLOC_CTX_RESERVED1_OFFSET, ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET,
     ALLOC_CTX_SPILL_SLOTS_OFFSET, ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET,
     NATIVE_FRAME_CODE_OBJECT_ID_OFFSET, NATIVE_FRAME_OFFSET, NUMBER_TAG_HI16, THREAD_OFFSET,
-    Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
+    UPVALUES_PTR_OFFSET, Unsupported, VALUE_HOLE, VALUE_UNDEFINED,
 };
 
 /// `blr` to a resolved transition entry and branch to `threw` on a nonzero
@@ -404,14 +404,47 @@ pub(super) fn emit_store_element(
 pub(super) fn emit_load_upvalue(
     ops: &mut Assembler,
     table: &TransitionTable,
+    view: &JitCompileSnapshot,
     dst: u16,
     index: i32,
     threw: DynamicLabel,
-) {
+) -> Result<(), Unsupported> {
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // Inline captured-binding read: the spine holds 4-byte compressed cell
+    // handles, and the cell's captured Value sits at a fixed offset. Only a
+    // TDZ hole misses — the stub raises the ReferenceError with the right
+    // identity. Nothing here allocates.
+    if view.cage_base != 0 && index >= 0 {
+        let spine_offset = (index as u32) * 4;
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldr x9, [x20, UPVALUES_PTR_OFFSET]
+            ; cbz x9, =>miss
+            ; ldr w9, [x9, spine_offset]
+        );
+        emit_load_u64(ops, 13, view.cage_base as u64);
+        dynasm!(ops
+            ; .arch aarch64
+            ; add x13, x13, x9
+            ; ldr x9, [x13, view.upvalue_value_byte]
+        );
+        emit_load_u64(ops, 11, crate::entry::VALUE_HOLE);
+        dynasm!(ops
+            ; .arch aarch64
+            ; cmp x9, x11
+            ; b.eq =>miss
+        );
+        emit_store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    }
+    dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_ctx_arg(ops);
     dynasm!(ops ; .arch aarch64 ; movz x1, dst as u32);
     emit_load_u64(ops, 2, u64::from(index as u32));
     emit_transition_call(ops, table.variadic_entry(abi::STUB_JIT_LOAD_UPVALUE), threw);
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 pub(super) fn emit_store_upvalue(

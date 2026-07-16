@@ -65,6 +65,7 @@ mod cpu_profile;
 pub mod date;
 pub mod eval_env;
 // `date` is a directory module — see `date/mod.rs`.
+mod activation_stack;
 pub mod bootstrap;
 pub mod bootstrap_array_buffer;
 pub mod bootstrap_bigint;
@@ -100,7 +101,6 @@ mod global_ops;
 pub mod groom;
 pub mod handles;
 pub mod heap_number;
-mod holt_stack;
 pub mod host_completion;
 pub mod inspect;
 pub mod intl;
@@ -226,6 +226,7 @@ pub use executable::code_block_cfg::{CodeBlockControlFlowView, CodeBlockExceptio
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
 use operand_decode::{apply_branch, const_operand, register_operand};
 
+pub use activation_stack::{ActivationFloor, ActivationStack};
 pub use array::JsArray;
 pub use closure::{
     JS_CLOSURE_BODY_TYPE_TAG, JsClosure, JsClosureBody, alloc_closure, alloc_closure_with_roots,
@@ -235,7 +236,6 @@ pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};
 pub use error_classes::{ErrorClassRegistry, ErrorKind};
 pub use handles::{HandleArena, Local};
-pub use holt_stack::HoltStack;
 pub use intl::{IntlKind, IntlPayload, JsIntl};
 pub use jit::{
     JitArrayLayout, JitArrayMethod, JitArrayMethodKind, JitClosureCallLayout, JitCodeResidency,
@@ -992,7 +992,7 @@ pub struct Interpreter {
     /// Pool of materialized frame vectors reused for synchronous callable
     /// re-entry. Reuse retains only capacity actually reached by prior calls;
     /// no stack pre-reserves the maximum call depth.
-    holt_pool: Vec<HoltStack>,
+    reentry_stack_cache: Vec<ActivationStack>,
     /// Flat register stack for JIT-built callee windows. Compiled code sets up a
     /// direct call by bumping `reg_top`, writing the callee's window into
     /// `reg_stack[reg_top..reg_top+regcount]`, and running the callee — no Rust
@@ -1001,7 +1001,7 @@ pub struct Interpreter {
     register_stack: register_stack::RegisterStack,
     /// LIFO ownership of frameless compiled callees. A hot direct call retains
     /// only its register window and upvalue spine here; no interpreter frame or
-    /// parent `HoltStack` entry is constructed unless that callee bails.
+    /// parent `ActivationStack` entry is constructed unless that callee bails.
     native_call_owners: native_call_owners::NativeCallOwnerStack,
     /// Fixed VM-owned descriptors for native JIT contexts whose scalar binding
     /// slots must stay visible to a moving collection across safepoints.
@@ -1109,21 +1109,21 @@ pub struct Interpreter {
     /// `Error.prototype.stack` and `util.getCallSites` without reaching
     /// back into the runtime layer.
     module_sources: source_registry::SourceRegistry,
-    /// Read-only pointer to the [`HoltStack`] currently being driven by
+    /// Read-only diagnostic pointer to the [`ActivationStack`] currently being driven by
     /// [`Self::dispatch_loop`]. Lets inline native calls (e.g. the
     /// `Error` constructor, `Error.captureStackTrace`) snapshot the live
     /// JS call stack for `Error.prototype.stack` without threading the
     /// stack through every native ABI.
     ///
     /// # Invariants
-    /// - Non-null only while a `dispatch_loop` frame is on the Rust
-    ///   stack; nested dispatch loops save/restore the parent pointer so
-    ///   it always names the innermost executing stack.
-    /// - Dereferenced as `&HoltStack` ONLY from inside an inline native
-    ///   call, where the owning `&mut HoltStack` in `dispatch_loop` is
+    /// - `Some` only while a `dispatch_loop` frame is on the Rust stack;
+    ///   a panic-safe publication guard restores the parent pointer for nested
+    ///   dispatch and unwinding.
+    /// - Dereferenced as `&ActivationStack` ONLY from inside an inline native
+    ///   call, where the owning `&mut ActivationStack` in `dispatch_loop` is
     ///   dormant (the loop is paused on the native). Never written
     ///   through.
-    active_frame_stack: *const holt_stack::HoltStack,
+    active_frame_stack: Option<std::ptr::NonNull<activation_stack::ActivationStack>>,
     /// Per-function user-property bag (§20.2.4 Function-instance
     /// properties + ordinary [[Set]] semantics for callables).
     /// `function_id` → `JsObject` carrying anything the user wrote
@@ -1455,7 +1455,7 @@ impl Interpreter {
     pub(crate) fn build_template_object(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         function_id: u32,
         site_idx: u32,
     ) -> Result<Value, VmError> {
@@ -1536,20 +1536,6 @@ impl otter_gc::ExtraRootSource for Interpreter {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);
     }
-}
-
-pub(crate) fn trace_active_frame_roots(
-    stack: &HoltStack,
-    pool: &cold_frame::ColdFramePool,
-    visitor: &mut dyn FnMut(*mut RawGc),
-) {
-    for frame in stack.iter() {
-        frame.trace_frame_slots(visitor);
-    }
-    // The WHOLE pool, not just the entries stacked frames reference: a cold
-    // record acquired during frame construction holds `new.target` / rest
-    // args before its frame reaches any stack, and must move with the heap.
-    pool.trace_all(visitor);
 }
 
 /// Compile-time options for dynamic source text.

@@ -33,7 +33,7 @@
 //! - [`crate::property_dispatch`]
 //! - [`crate::object`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use std::collections::BTreeSet;
 
 use smallvec::SmallVec;
@@ -175,7 +175,7 @@ enum DescriptorAllocationRoots<'a> {
         value_roots: &'a [&'a Value],
         slice_roots: &'a [&'a [Value]],
     },
-    Stack(&'a HoltStack),
+    Stack(&'a ActivationStack),
 }
 
 fn partial_descriptor_value_roots(descriptor: &object::PartialPropertyDescriptor) -> Vec<Value> {
@@ -468,7 +468,7 @@ impl Interpreter {
     pub(crate) fn ordinary_get_own_property_descriptor_value_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         target: Value,
         key: &VmPropertyKey,
         hops: usize,
@@ -3527,7 +3527,7 @@ impl Interpreter {
     pub(crate) fn instanceof_target_prototype_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         rhs: &Value,
     ) -> Result<Option<Value>, VmError> {
         if rhs.is_object() || rhs.is_proxy() {
@@ -4863,7 +4863,7 @@ impl Interpreter {
     pub(crate) fn try_proxy_object_static_call(
         &mut self,
         context: &ExecutionContext,
-        stack_roots: Option<&HoltStack>,
+        stack_roots: Option<&ActivationStack>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {

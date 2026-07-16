@@ -3,7 +3,7 @@
 //! Native interpreter entry normally keeps the canonical [`crate::NativeFrame`] and
 //! its register window intact. This module is the narrow exception: legacy
 //! frameless self-call exits and nested inlined deopts that still require a
-//! `HoltStack` adapter materialize one only after the side exit has fired.
+//! `ActivationStack` adapter materialize one only after the side exit has fired.
 //!
 //! # Contents
 //! - [`Interpreter::jit_deopt_materialize_self_call`] — legacy self-call bail.
@@ -24,7 +24,7 @@
 //! - [`crate::NativeFrame`] — canonical activation that these cold adapters replace
 //!   only for legacy/deopt compatibility.
 
-use crate::{ExecutionContext, Frame, HoltStack, Interpreter, Value, VmError, jit};
+use crate::{ActivationStack, ExecutionContext, Frame, Interpreter, Value, VmError, jit};
 
 impl Interpreter {
     /// Materialize and finish a legacy frameless self-call after a compiled
@@ -33,11 +33,11 @@ impl Interpreter {
     /// This is not the interpreter tier-entry path. It exists only for the old
     /// inline self-call sequence whose callee window has no canonical native
     /// frame to resume. The live top register window is attached to a cold
-    /// `HoltStack` adapter, dispatched to completion, then removed.
+    /// `ActivationStack` adapter, dispatched to completion, then removed.
     pub fn jit_deopt_materialize_self_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         caller_frame_index: usize,
         bail_pc: u32,
         register_count: usize,
@@ -85,7 +85,7 @@ impl Interpreter {
     pub fn jit_deopt_materialize_inline_frames(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frames: &[jit::JitDeoptFrame],
     ) -> Result<Value, VmError> {
         let _window_rollback = self.register_window_rollback();

@@ -135,11 +135,20 @@ pub(super) fn host_data_view<T: Any, R>(
     v: Local<'_>,
     f: impl FnOnce(&T) -> R,
 ) -> Result<R, JsError> {
-    let raw = cx.escape(v);
+    host_data_view_raw(cx.escape(v), cx.heap(), f).map_err(JsError::Type)
+}
+
+/// Brand-checked host-data read shared by the marshalling and native-scope
+/// surfaces. The callback runs while the GC payload is borrowed and therefore
+/// must not allocate JavaScript values or re-enter the VM.
+pub(crate) fn host_data_view_raw<T: Any, R>(
+    raw: Value,
+    heap: &otter_gc::GcHeap,
+    f: impl FnOnce(&T) -> R,
+) -> Result<R, String> {
     let Some(object) = raw.as_object() else {
-        return Err(JsError::Type("value is not an object".to_string()));
+        return Err("value is not an object".to_string());
     };
-    let heap = cx.heap();
     // Declared-class path: the cell knows its ancestry. `f` is consumed
     // by whichever branch runs, so thread it through the probe.
     let mut f = Some(f);
@@ -150,15 +159,13 @@ pub(super) fn host_data_view<T: Any, R>(
     match cell_result {
         Ok(Some(result)) => return Ok(result),
         Ok(None) => {
-            return Err(JsError::Type(
-                "receiver is an instance of an unrelated class".to_string(),
-            ));
+            return Err("receiver is an instance of an unrelated class".to_string());
         }
         Err(_) => {}
     }
     let f = f.take().expect("closure unconsumed on the legacy path");
     // Legacy path: bare host data of exactly `T`.
-    object::with_host_data::<T, R>(object, heap, f).map_err(|err| JsError::Type(err.to_string()))
+    object::with_host_data::<T, R>(object, heap, f).map_err(|err| err.to_string())
 }
 
 /// Build a host-class instance the way `new <Class>` must: data in a
@@ -281,10 +288,20 @@ pub(super) fn host_data_view_mut<T: Any, R>(
     f: impl FnOnce(&mut T) -> R,
 ) -> Result<R, JsError> {
     let raw = cx.escape(v);
+    host_data_view_raw_mut(raw, cx.heap_mut(), f).map_err(JsError::Type)
+}
+
+/// Mutable counterpart of [`host_data_view_raw`]. The callback owns the only
+/// mutable payload borrow for its duration and must not allocate JavaScript
+/// values or re-enter the VM.
+pub(crate) fn host_data_view_raw_mut<T: Any, R>(
+    raw: Value,
+    heap: &mut otter_gc::GcHeap,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R, String> {
     let Some(object) = raw.as_object() else {
-        return Err(JsError::Type("value is not an object".to_string()));
+        return Err("value is not an object".to_string());
     };
-    let heap = cx.heap_mut();
     let mut f = Some(f);
     let cell_result = object::with_host_data_mut::<HostInstance, _>(object, heap, |cell| {
         cell.view_mut::<T>()
@@ -293,16 +310,12 @@ pub(super) fn host_data_view_mut<T: Any, R>(
     match cell_result {
         Ok(Some(result)) => return Ok(result),
         Ok(None) => {
-            return Err(JsError::Type(
-                "receiver is an instance of an unrelated class".to_string(),
-            ));
+            return Err("receiver is an instance of an unrelated class".to_string());
         }
         Err(_) => {}
     }
     let f = f.take().expect("closure unconsumed on the legacy path");
-    let heap = cx.heap_mut();
-    object::with_host_data_mut::<T, R>(object, heap, f)
-        .map_err(|err| JsError::Type(err.to_string()))
+    object::with_host_data_mut::<T, R>(object, heap, f).map_err(|err| err.to_string())
 }
 
 /// Compile-time metadata a class declaration pins on its data type.

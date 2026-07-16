@@ -468,7 +468,7 @@ impl Interpreter {
 
     pub(crate) fn box_sloppy_this_primitive_stack_rooted(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
@@ -530,7 +530,7 @@ impl Interpreter {
 
     pub(crate) fn object_for_primitive_property_base_stack_rooted(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value: &Value,
     ) -> Result<Option<JsObject>, VmError> {
         let object = if let Some(v) = value.as_boolean() {
@@ -583,7 +583,7 @@ impl Interpreter {
     pub(crate) fn this_for_bytecode_call_stack_rooted(
         &mut self,
         function: &CodeBlock,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {

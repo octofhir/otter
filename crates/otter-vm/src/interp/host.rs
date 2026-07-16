@@ -246,17 +246,17 @@ impl Interpreter {
         &self,
         context: &ExecutionContext,
     ) -> Vec<StackFrameSnapshot> {
-        if self.active_frame_stack.is_null() {
+        let Some(stack) = self.active_frame_stack else {
             return Vec::new();
-        }
+        };
         // SAFETY: `active_frame_stack` is set by `dispatch_loop` to the
-        // `&mut HoltStack` it is driving and cleared on exit, so it is
+        // `&mut ActivationStack` it is driving and cleared on exit, so it is
         // non-null only while that stack is alive on the Rust call
         // stack. This read happens from an inline native call, where the
         // owning `&mut` borrow in `dispatch_loop_inner` is dormant (the
         // loop is paused on the native), so no aliasing access races the
         // shared read. The pointer is never written through.
-        let stack = unsafe { &*self.active_frame_stack };
+        let stack = unsafe { stack.as_ref() };
         error_ops::snapshot_frames(context, stack)
     }
 

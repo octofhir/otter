@@ -252,6 +252,14 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
             .map_err(|err| self.vm_err(err))
     }
 
+    /// Root the active realm's `globalThis` object.
+    #[must_use]
+    pub fn global_this(&mut self) -> Local<'s> {
+        let global = *self.ctx.cx.interp.global_this();
+        let scope = self.scope;
+        self.interp().scoped_value(scope, Value::object(global))
+    }
+
     /// Allocate a fixed-length `ArrayBuffer` owning `bytes`.
     pub fn array_buffer_from_bytes(&mut self, bytes: Vec<u8>) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
@@ -310,6 +318,21 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let scope = self.scope;
         self.interp()
             .scoped_set(scope, obj, key, value)
+            .map_err(|err| self.vm_err(err))
+    }
+
+    /// Define a data property with explicit descriptor flags through rooted
+    /// handles.
+    pub fn define(
+        &mut self,
+        obj: Local<'_>,
+        key: &str,
+        value: Local<'_>,
+        flags: crate::object::PropertyFlags,
+    ) -> Result<(), JsError> {
+        let scope = self.scope;
+        self.interp()
+            .scoped_define_data(scope, obj, key, value, flags)
             .map_err(|err| self.vm_err(err))
     }
 
@@ -408,22 +431,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     #[must_use]
     pub fn buffer_source_bytes(&self, v: Local<'_>) -> Option<Vec<u8>> {
         let raw = self.ctx.cx.interp.escape_scoped(v);
-        let heap = self.ctx.heap();
-        if let Some(view) = raw.as_typed_array(heap) {
-            let offset = view.byte_offset(heap);
-            let length = view.byte_length(heap);
-            let bytes = view
-                .buffer(heap)
-                .with_bytes(heap, |bytes| {
-                    bytes.get(offset..offset + length).map(<[u8]>::to_vec)
-                })
-                .unwrap_or_default();
-            return Some(bytes);
-        }
-        if let Some(buffer) = raw.as_array_buffer() {
-            return Some(buffer.with_bytes(heap, <[u8]>::to_vec));
-        }
-        None
+        crate::runtime_cx::copy_buffer_source_bytes(raw, self.ctx.heap())
     }
 
     // ---- iteration / host data / callables ----------------------------------

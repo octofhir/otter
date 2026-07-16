@@ -22,7 +22,7 @@ use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, Op};
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Interpreter, Value, VmError, holt_stack::HoltStack,
+    ExecutionContext, Interpreter, Value, VmError, activation_stack::ActivationStack,
     interp::helpers::is_constructor_runtime, object, read_register, write_register,
 };
 
@@ -32,7 +32,7 @@ impl Interpreter {
     pub(crate) fn run_collect_arguments_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
     ) -> Result<(), VmError> {
@@ -168,7 +168,7 @@ impl Interpreter {
 
     fn spread_arguments(
         &self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         frame_index: usize,
         args_reg: u16,
     ) -> Result<SmallVec<[Value; 8]>, VmError> {
@@ -244,7 +244,7 @@ impl Interpreter {
     fn run_call_spread_full_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         callee_reg: u16,
@@ -265,7 +265,7 @@ impl Interpreter {
     fn run_call_full_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         callee_reg: u16,
@@ -292,7 +292,7 @@ impl Interpreter {
     fn run_construct_spread_full_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         callee_reg: u16,
@@ -322,7 +322,7 @@ impl Interpreter {
     pub fn jit_runtime_spread_call_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

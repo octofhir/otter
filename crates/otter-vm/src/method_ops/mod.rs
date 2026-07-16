@@ -19,7 +19,7 @@
 //! - [`crate::call_ops`]
 //! - [`crate::executable`]
 
-use crate::{call_ops::LeanCallbackState, holt_stack::HoltStack};
+use crate::{activation_stack::ActivationStack, call_ops::LeanCallbackState};
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -175,7 +175,7 @@ impl Interpreter {
     /// Handle guarded `Math.<method>(args...)` intrinsic calls.
     pub(crate) fn do_math_call(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
@@ -187,7 +187,7 @@ impl Interpreter {
     /// caller frame. JIT re-entry uses the decoded-register entry below.
     pub(crate) fn do_math_call_at_frame(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame_index: usize,
         operands: impl crate::executable::OperandSource,
@@ -208,7 +208,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn do_math_call_regs(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame_index: usize,
         dst: u16,
@@ -384,7 +384,7 @@ impl Interpreter {
     ///   else surfaces as `UnknownIntrinsic`.
     pub(crate) fn do_call_method_value<'a>(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl Into<OperandView<'a>>,
     ) -> Result<(), VmError> {
@@ -1525,7 +1525,7 @@ impl Interpreter {
     pub fn jit_runtime_array_push(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         recv_reg: u16,
@@ -1782,7 +1782,7 @@ impl Interpreter {
     pub(crate) fn get_method_value_for_call(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         recv_value: Value,
         name: &str,
     ) -> Result<Option<Value>, VmError> {
@@ -2549,7 +2549,7 @@ impl Interpreter {
 
     fn dispatch_function_method(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
         name: &str,

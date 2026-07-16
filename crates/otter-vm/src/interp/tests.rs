@@ -696,7 +696,7 @@ fn bytecode_function_prototype_uses_young_allocation_with_frame_roots() {
     let module = module_with(Vec::new(), 4);
     let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -756,7 +756,7 @@ fn bytecode_instanceof_function_prototype_uses_stack_roots() {
     let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
     let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -865,7 +865,7 @@ fn get_iterator_map_snapshot_uses_old_iterator_state_allocation_with_frame_roots
     )
     .unwrap();
 
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -903,7 +903,7 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
     let mut interp = Interpreter::new();
     let iterator_obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
 
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -962,7 +962,7 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     let mapper =
         native_value_static(interp.gc_heap_mut(), "identityMapper", 1, identity_mapper).unwrap();
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1014,7 +1014,7 @@ fn call_method_on_nullish_receiver_reports_type_error() {
     };
     let mut interp = Interpreter::new();
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1058,7 +1058,7 @@ fn call_method_on_missing_primitive_method_reports_not_callable() {
     };
     let mut interp = Interpreter::new();
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1109,7 +1109,7 @@ fn call_method_string_prototype_non_callable_shadows_builtin() {
     let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1186,7 +1186,7 @@ fn call_method_string_char_code_at_non_callable_shadows_builtin() {
     assert!(matches!(err, VmError::NotCallable));
 }
 
-fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<HoltStack, VmError> {
+fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<ActivationStack, VmError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1199,7 +1199,7 @@ fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<HoltStack,
         module_inits: Vec::new(),
     };
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1247,7 +1247,7 @@ fn call_method_number_prototype_non_callable_shadows_builtin() {
     );
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1329,7 +1329,7 @@ fn call_number_to_string(
     interp: &mut Interpreter,
     recv: Value,
     arg: Option<Value>,
-) -> Result<HoltStack, VmError> {
+) -> Result<ActivationStack, VmError> {
     let module = BytecodeModule {
         module: "test.ts".to_string(),
         template_sites: Vec::new(),
@@ -1342,7 +1342,7 @@ fn call_number_to_string(
         module_inits: Vec::new(),
     };
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1399,7 +1399,7 @@ fn call_method_boolean_prototype_non_callable_shadows_builtin() {
     );
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1451,7 +1451,7 @@ fn call_method_bigint_prototype_non_callable_shadows_builtin() {
         crate::bigint::BigIntValue::from_i32(interp.gc_heap_mut(), 7).expect("bigint allocation");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1502,7 +1502,7 @@ fn call_method_symbol_prototype_non_callable_shadows_builtin() {
     let symbol = JsSymbol::new(interp.gc_heap_mut(), None).expect("symbol allocation");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1557,7 +1557,7 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
         crate::test_support::alloc_weak_ref(interp.gc_heap_mut(), &target).expect("weak ref");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1615,7 +1615,7 @@ fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
         .expect("registry");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1658,7 +1658,7 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
     object::set(&mut bag, interp.gc_heap_mut(), "then", Value::number_i32(1));
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1709,7 +1709,7 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
     );
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1753,7 +1753,7 @@ fn call_method_array_own_non_callable_shadows_builtin() {
         .expect("array expando property");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1797,7 +1797,7 @@ fn call_method_regexp_own_non_callable_shadows_builtin() {
     object::set(&mut bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1849,7 +1849,7 @@ fn call_method_regexp_prototype_non_callable_shadows_builtin() {
     let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1903,7 +1903,7 @@ fn call_method_date_prototype_non_callable_shadows_builtin() {
     object::set_date_data(date, interp.gc_heap_mut(), 0.0);
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -1957,7 +1957,7 @@ fn call_method_date_setter_prototype_non_callable_shadows_builtin() {
     object::set_date_data(date, interp.gc_heap_mut(), 0.0);
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2011,7 +2011,7 @@ fn call_method_typed_array_own_non_callable_shadows_builtin() {
     object::set(&mut bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2072,7 +2072,7 @@ fn call_method_typed_array_callback_prototype_non_callable_shadows_builtin() {
     .expect("typed array");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2133,7 +2133,7 @@ fn call_method_typed_array_slice_prototype_non_callable_shadows_builtin() {
     .expect("typed array");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2188,7 +2188,7 @@ fn call_method_iterator_prototype_non_callable_shadows_helper() {
     .expect("source array");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2243,7 +2243,7 @@ fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2294,7 +2294,7 @@ fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2345,7 +2345,7 @@ fn call_method_map_prototype_non_callable_shadows_map_method() {
     let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2396,7 +2396,7 @@ fn call_method_set_prototype_non_callable_shadows_set_add() {
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2447,7 +2447,7 @@ fn call_method_weak_map_prototype_non_callable_shadows_weak_map_method() {
     let weak_map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("weak map");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2498,7 +2498,7 @@ fn call_method_weak_set_prototype_non_callable_shadows_weak_set_method() {
     let weak_set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("weak set");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2551,7 +2551,7 @@ fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
     let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2606,7 +2606,7 @@ fn call_method_data_view_prototype_non_callable_shadows_builtin() {
         crate::binary::JsDataView::new(interp.gc_heap_mut(), buffer, 0, 1).expect("data view");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2657,7 +2657,7 @@ fn call_method_set_prototype_non_callable_shadows_es_set_method() {
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2695,7 +2695,7 @@ fn call_method_function_own_non_callable_shadows_call() {
     };
     let mut interp = Interpreter::new();
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2738,7 +2738,7 @@ fn call_method_function_own_non_callable_shadows_object_method() {
     };
     let mut interp = Interpreter::new();
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2789,7 +2789,7 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
     object::set_prototype(obj, interp.gc_heap_mut(), None);
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2844,7 +2844,7 @@ fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
     let native = native_value_static(interp.gc_heap_mut(), "target", 0, noop).expect("native");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2894,7 +2894,7 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
     );
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -2958,7 +2958,7 @@ fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
         native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
 
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3111,7 +3111,7 @@ fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
         module_inits: Vec::new(),
     };
     let context = ExecutionContext::from_module(module.clone());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3187,7 +3187,7 @@ fn bytecode_new_error_uses_young_allocation_with_frame_roots() {
 fn vm_error_throwable_uses_stack_rooted_allocation() {
     let module = module_with(Vec::new(), 1);
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -3218,7 +3218,7 @@ fn vm_error_throwable_uses_stack_rooted_allocation() {
 fn oom_throwable_uses_range_error_prototype() {
     let module = module_with(Vec::new(), 1);
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -3453,7 +3453,7 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), body_frame).expect("gen");
     generator.set_async(interp.gc_heap_mut(), true);
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp.test_frame_for_function(&main).unwrap();
     frame.registers[0] = Value::generator(generator);
     stack.push(frame);
@@ -3495,7 +3495,7 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
     };
     let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(interp.test_frame_for_function(&main).unwrap());
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -3630,7 +3630,7 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
         .test_frame_for_function(&module.functions[0])
         .unwrap();
     interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(frame);
     let context = ExecutionContext::from_module(module);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -3663,7 +3663,7 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
     let mut interp = Interpreter::new();
     let executor_value =
         native_value_static(interp.gc_heap_mut(), "executor", 2, executor).expect("executor");
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -3693,7 +3693,7 @@ fn dynamic_import_rejection_uses_stack_rooted_promise_allocation() {
     let module = module_with(Vec::new(), 2);
     let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -4344,7 +4344,7 @@ fn unwind_throw_pops_frames_until_handler_or_uncaught() {
         }],
     };
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(interp.test_frame_for_function(&main).unwrap());
     // Push a second frame on top — should be popped during
     // unwinding and not absorb the throw.
@@ -4411,7 +4411,7 @@ fn unwind_throw_lands_in_catch_handler() {
         }],
     };
     let mut interp = Interpreter::new();
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp.test_frame_for_function(&main).unwrap();
     interp
         .frame_ensure_cold(&mut frame)
@@ -4477,7 +4477,7 @@ fn native_call_context_receives_method_receiver() {
         native_value_static(interp.gc_heap_mut(), "returnThis", 0, return_this).expect("native");
     let receiver =
         Value::object(crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap());
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])
@@ -4513,7 +4513,7 @@ fn direct_native_call_uses_contiguous_argument_window() {
     let module = module_with(vec![], 4);
     let mut interp = Interpreter::new();
     let callee = native_value_static(interp.gc_heap_mut(), "sum", 2, sum_smi_args).expect("native");
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -4555,7 +4555,7 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
         crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::object(handler)).unwrap(),
     );
 
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -4640,7 +4640,7 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
         .unwrap(),
     );
 
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     let mut frame = interp
         .test_frame_for_function(&module.functions[0])
         .unwrap();
@@ -4944,7 +4944,7 @@ fn arrow_closure_overrides_call_site_this() {
     )
     .expect("closure alloc");
     let closure = Value::closure(closure_handle);
-    let mut stack: HoltStack = HoltStack::new();
+    let mut stack: ActivationStack = ActivationStack::new();
     stack.push(
         interp
             .test_frame_for_function(&module.functions[0])

@@ -7,7 +7,7 @@
 //!
 //! # Invariants
 //! Every collection reachable from JS values owned by the interpreter
-//! must be enumerated here or in [`crate::trace_active_frame_roots`];
+//! must be enumerated here or in [`crate::ActivationStack::trace_roots`];
 //! missing a source is a use-after-free under GC stress.
 #![allow(unused_imports)]
 use crate::*;

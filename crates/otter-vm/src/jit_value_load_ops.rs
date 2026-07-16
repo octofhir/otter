@@ -16,7 +16,7 @@
 
 use otter_bytecode::Op;
 
-use crate::{ExecutionContext, Interpreter, VmError, holt_stack::HoltStack};
+use crate::{ExecutionContext, Interpreter, VmError, activation_stack::ActivationStack};
 
 impl Interpreter {
     /// Complete one static value-load opcode for a published compiled frame.
@@ -25,7 +25,7 @@ impl Interpreter {
     pub fn jit_runtime_value_load_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

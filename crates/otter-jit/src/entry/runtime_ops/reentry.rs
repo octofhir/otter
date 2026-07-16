@@ -993,7 +993,7 @@ fn complete_numeric_op(
 
 /// Complete one numeric-family opcode in the VM. `0` means the destination
 /// was committed and `1` means decoding or execution threw. Unlike the former
-/// adapter, this path has no isolate-less/HoltStack bailout mode: a published
+/// adapter, this path has no isolate-less/ActivationStack bailout mode: a published
 /// [`NativeFrame`](otter_vm::native_abi::NativeFrame) and VM activation are
 /// part of the runtime-op contract.
 pub(crate) extern "C" fn jit_numeric_op_stub(

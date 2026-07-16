@@ -12,7 +12,8 @@ impl Interpreter {
     pub(crate) fn dispatch_loop_inner(
         &mut self,
         entry_context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
     ) -> Result<Value, VmError> {
         // One stack can interleave frames from several code chunks
         // (closures escaped from `eval` / `new Function` / sibling
@@ -65,7 +66,7 @@ impl Interpreter {
             if self.interrupt.is_set() {
                 return Err(VmError::Interrupted);
             }
-            if stack.is_empty() {
+            if stack.is_at_floor(floor) {
                 // Defensive: unwind paths (throw / finally) can
                 // pop the last frame without writing back to a
                 // caller register. Surface `undefined` so
@@ -212,13 +213,15 @@ impl Interpreter {
                         .get(src as usize)
                         .cloned()
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    if let Some(popped) = self.return_running_finally(stack, value)? {
+                    if let Some(popped) = self.return_running_finally_above(stack, floor, value)? {
                         return Ok(popped);
                     }
                     continue;
                 }
                 Op::ReturnUndefined => {
-                    if let Some(popped) = self.return_running_finally(stack, Value::undefined())? {
+                    if let Some(popped) =
+                        self.return_running_finally_above(stack, floor, Value::undefined())?
+                    {
                         return Ok(popped);
                     }
                     continue;
@@ -242,7 +245,7 @@ impl Interpreter {
                         if transition.evict_for_reopt() {
                             self.evict_compiled_for_reopt(function_id);
                         }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
                             return Ok(value);
                         }
                     }
@@ -302,7 +305,7 @@ impl Interpreter {
                         if let (Some(feedback_site), Some(site)) = (feedback_site, method_site) {
                             self.note_method_target(feedback_site, method_fid, site);
                         }
-                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)? {
+                        if let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)? {
                             return Ok(value);
                         }
                     }
@@ -321,7 +324,7 @@ impl Interpreter {
                     // constructor frame pushed by `new` can enter JIT at pc=0.
                     if jit_installed
                         && stack.len() > depth_before
-                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context)?
+                        && let Some(Some(value)) = self.maybe_dispatch_jit(stack, context, floor)?
                     {
                         return Ok(value);
                     }
@@ -355,7 +358,7 @@ impl Interpreter {
                     // unwind path clears `pending_uncaught_frames`
                     // through [`Self::clear_pending_uncaught_frames`].
                     self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                    let unwind = self.unwind_throw(context, stack, value);
+                    let unwind = self.unwind_throw_above(context, stack, floor, value);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
                     } else {
@@ -375,7 +378,7 @@ impl Interpreter {
                     match parked {
                         Some((crate::cold_frame::ParkedFinally::Throw(value), _)) => {
                             self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                            let unwind = self.unwind_throw(context, stack, value);
+                            let unwind = self.unwind_throw_above(context, stack, floor, value);
                             if unwind.is_ok() {
                                 self.pending_uncaught_frames = None;
                             } else {
@@ -383,11 +386,16 @@ impl Interpreter {
                             }
                             unwind?;
                         }
-                        Some((crate::cold_frame::ParkedFinally::Abrupt(completion, floor), _)) => {
+                        Some((
+                            crate::cold_frame::ParkedFinally::Abrupt(completion, handler_floor),
+                            _,
+                        )) => {
                             // Resume the parked `return`/`break`/`continue`:
                             // run the next enclosing `finally`, or perform
                             // the completion when none remain.
-                            if let Some(popped) = self.unwind_abrupt(stack, completion, floor)? {
+                            if let Some(popped) =
+                                self.unwind_abrupt_above(stack, floor, completion, handler_floor)?
+                            {
                                 return Ok(popped);
                             }
                         }
@@ -402,7 +410,7 @@ impl Interpreter {
                     let src = register_operand(function.operand(instr, 1))?;
                     let awaited = *read_register(&stack[top_idx], src)?;
                     self.do_await(stack, context, dst, awaited)?;
-                    if stack.is_empty() {
+                    if stack.is_at_floor(floor) {
                         return Ok(Value::undefined());
                     }
                     continue;
@@ -1882,7 +1890,7 @@ impl Interpreter {
                     let offset = context
                         .exec_imm32(instr, 0)
                         .ok_or_else(|| VmError::InvalidOperand)?;
-                    let floor = context
+                    let handler_floor = context
                         .exec_imm32(instr, 1)
                         .ok_or_else(|| VmError::InvalidOperand)?
                         as u32;
@@ -1890,10 +1898,11 @@ impl Interpreter {
                     if !(0..=u32::MAX as i64).contains(&next_pc) {
                         return Err(VmError::InvalidOperand);
                     }
-                    if let Some(popped) = self.unwind_abrupt(
+                    if let Some(popped) = self.unwind_abrupt_above(
                         stack,
-                        crate::cold_frame::AbruptKind::Jump(next_pc as u32),
                         floor,
+                        crate::cold_frame::AbruptKind::Jump(next_pc as u32),
+                        handler_floor,
                     )? {
                         return Ok(popped);
                     }
@@ -1906,7 +1915,7 @@ impl Interpreter {
                     apply_branch(&mut stack[top_idx], offset, &self.interrupt)?;
                     if offset < 0
                         && let Some(Some(value)) =
-                            self.note_backedge_and_maybe_osr(stack, context, top_idx)?
+                            self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
                     {
                         return Ok(value);
                     }
@@ -1928,7 +1937,7 @@ impl Interpreter {
                         apply_branch(frame, offset, &self.interrupt)?;
                         if offset < 0
                             && let Some(Some(value)) =
-                                self.note_backedge_and_maybe_osr(stack, context, top_idx)?
+                                self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
                         {
                             return Ok(value);
                         }
@@ -1953,7 +1962,7 @@ impl Interpreter {
                         apply_branch(frame, offset, &self.interrupt)?;
                         if offset < 0
                             && let Some(Some(value)) =
-                                self.note_backedge_and_maybe_osr(stack, context, top_idx)?
+                                self.note_backedge_and_maybe_osr(stack, context, top_idx, floor)?
                         {
                             return Ok(value);
                         }

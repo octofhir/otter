@@ -75,8 +75,9 @@ impl Interpreter {
 
     pub(crate) fn maybe_dispatch_jit(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
+        floor: ActivationFloor,
     ) -> Result<Option<Option<Value>>, VmError> {
         let top_idx = stack.len() - 1;
         let (outcome, optimized) =
@@ -107,7 +108,7 @@ impl Interpreter {
                 if !optimized {
                     self.note_jit_entry_success(stack[top_idx].function_id);
                 }
-                let popped = self.return_running_finally(stack, value)?;
+                let popped = self.return_running_finally_above(stack, floor, value)?;
                 Ok(Some(popped))
             }
             jit::JitExecOutcome::Threw(err) => {
@@ -117,14 +118,14 @@ impl Interpreter {
                     if self.pending_uncaught_frames.is_none() {
                         self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
                     }
-                    let unwind = self.unwind_throw(context, stack, thrown);
+                    let unwind = self.unwind_throw_above(context, stack, floor, thrown);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
                     } else {
                         self.pending_uncaught_throw = Some(thrown);
                     }
                     unwind?;
-                    return if stack.is_empty() {
+                    return if stack.is_at_floor(floor) {
                         Ok(Some(Some(Value::undefined())))
                     } else {
                         Ok(None)
@@ -142,12 +143,13 @@ impl Interpreter {
                     if self.pending_uncaught_frames.is_none() {
                         self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
                     }
-                    let unwind = self.unwind_throw_with_uncaught(context, stack, thrown, uncaught);
+                    let unwind = self
+                        .unwind_throw_with_uncaught_above(context, stack, floor, thrown, uncaught);
                     if unwind.is_ok() {
                         self.pending_uncaught_frames = None;
                     }
                     unwind?;
-                    return if stack.is_empty() {
+                    return if stack.is_at_floor(floor) {
                         Ok(Some(Some(Value::undefined())))
                     } else {
                         Ok(None)
@@ -170,9 +172,10 @@ impl Interpreter {
     #[inline]
     pub(crate) fn note_backedge_and_maybe_osr(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
+        floor: ActivationFloor,
     ) -> Result<Option<Option<Value>>, VmError> {
         // Interpreter-only (no JIT installed): pay nothing beyond this branch.
         if self.jit_hook.is_none() {
@@ -200,7 +203,7 @@ impl Interpreter {
         // attempt OSR.
         self.jit_runtime_stats.osr_attempts = self.jit_runtime_stats.osr_attempts.saturating_add(1);
         self.jit_osr_counts.remove(&key);
-        self.maybe_osr(stack, context, top_idx)
+        self.maybe_osr(stack, context, top_idx, floor)
     }
 
     /// Loop-OSR tier-up. Called from [`Self::note_backedge_and_maybe_osr`] at
@@ -214,9 +217,10 @@ impl Interpreter {
     /// (mirrors [`Self::maybe_dispatch_jit`]).
     pub(crate) fn maybe_osr(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
+        floor: ActivationFloor,
     ) -> Result<Option<Option<Value>>, VmError> {
         let frame = &stack[top_idx];
         // Only ordinary bytecode frames; async/generator bodies resume through
@@ -302,7 +306,7 @@ impl Interpreter {
                 Ok(None)
             }
             jit::JitExecOutcome::Returned(value) => {
-                let popped = self.return_running_finally(stack, value)?;
+                let popped = self.return_running_finally_above(stack, floor, value)?;
                 Ok(Some(popped))
             }
             jit::JitExecOutcome::Threw(err) => Err(err),
@@ -438,7 +442,7 @@ impl Interpreter {
     /// `Ok(None)` to interpret it normally.
     pub(crate) fn dispatch_jit_sync_entry(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
     ) -> Result<Option<Value>, VmError> {
         if self.jit_hook.is_none() {
@@ -485,7 +489,7 @@ impl Interpreter {
     /// be outside the compilable subset.
     pub(crate) fn resolve_jit_code(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
@@ -502,7 +506,7 @@ impl Interpreter {
     /// frame through the same runtime activation used by baseline code.
     pub(crate) fn run_optimized_frame(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
     ) -> Option<jit::JitExecOutcome> {
@@ -635,7 +639,7 @@ impl Interpreter {
     /// and recursive calls inside the body are GC-safe.
     pub(crate) fn run_compiled_frame(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         top_idx: usize,
         code: &std::sync::Arc<dyn jit::JitFunctionCode>,
@@ -740,7 +744,7 @@ impl Interpreter {
     pub unsafe fn jit_deopt_reify_inlined_frame(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         call_pc: u32,
         callee_pc: u32,
     ) -> Result<*mut crate::Value, VmError> {
@@ -786,7 +790,7 @@ impl Interpreter {
     pub fn jit_runtime_call_method_in_place(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst_reg: u16,
         recv_reg: u16,
@@ -1034,7 +1038,7 @@ impl Interpreter {
     pub fn jit_runtime_make_function(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         idx: u32,

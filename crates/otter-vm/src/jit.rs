@@ -865,7 +865,7 @@ pub struct VmRuntimeActivation {
     /// Owning interpreter.
     pub(crate) vm: *mut crate::Interpreter,
     /// Active stable-address frame stack.
-    pub(crate) stack: *mut crate::HoltStack,
+    pub(crate) stack: *mut crate::ActivationStack,
     /// Linked execution context.
     pub(crate) context: *const crate::ExecutionContext,
     /// Index of the executing (compiled) frame within `stack`.
@@ -876,7 +876,7 @@ impl VmRuntimeActivation {
     /// Publish one synchronous compiled activation from live VM borrows.
     pub(crate) fn new(
         vm: &mut crate::Interpreter,
-        stack: &mut crate::HoltStack,
+        stack: &mut crate::ActivationStack,
         context: &crate::ExecutionContext,
         frame_index: usize,
     ) -> Self {
@@ -897,7 +897,7 @@ impl VmRuntimeActivation {
 
     /// Active stable-address frame-stack address.
     #[must_use]
-    pub const fn stack_ptr(self) -> *mut crate::HoltStack {
+    pub const fn stack_ptr(self) -> *mut crate::ActivationStack {
         self.stack
     }
 

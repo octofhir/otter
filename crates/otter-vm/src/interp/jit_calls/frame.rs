@@ -16,7 +16,7 @@
 //! - Dynamic closure state (borrowed upvalues, `this`, and exact SELF) belongs
 //!   to this call and is never retained in a call-site cache.
 //! - Successful preparation constructs no [`Frame`] and touches no
-//!   [`HoltStack`]. Generated code publishes the returned owner id in its
+//!   [`ActivationStack`]. Generated code publishes the returned owner id in its
 //!   stack-local [`NativeFrame`] before the next possible GC boundary.
 //!
 //! # See also

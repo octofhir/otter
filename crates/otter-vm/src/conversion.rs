@@ -21,7 +21,7 @@
 //! - [`crate::number`]
 //! - [`crate::string::dispatch`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use crate::{
@@ -113,7 +113,7 @@ impl Interpreter {
     pub(crate) fn run_to_number_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         src: u16,
@@ -158,7 +158,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
     pub(crate) fn drive_to_primitive(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -492,7 +492,7 @@ impl Interpreter {
     /// a primitive result.
     fn drive_to_primitive_stage(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
         obj: Value,
@@ -670,7 +670,7 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn push_to_primitive_call(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
         obj: Value,

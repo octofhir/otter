@@ -32,9 +32,9 @@
 //! - <https://tc39.es/ecma262/#sec-promise-objects>
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+use crate::activation_stack::ActivationStack;
 use crate::error_classes::{ErrorClassRegistry, ErrorKind};
 use crate::execution_context::ExecutionContext;
-use crate::holt_stack::HoltStack;
 use crate::native_function::{
     NativeError, native_value_with_captures_unchecked_with_roots, traced_native_value_with_length,
 };
@@ -410,7 +410,7 @@ impl PromiseBuilder {
     pub(crate) fn pending_stack_rooted(
         &self,
         interp: &mut Interpreter,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
@@ -424,7 +424,7 @@ impl PromiseBuilder {
     pub(crate) fn fulfilled_stack_rooted(
         &self,
         interp: &mut Interpreter,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value: Value,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -439,7 +439,7 @@ impl PromiseBuilder {
     pub(crate) fn rejected_stack_rooted(
         &self,
         interp: &mut Interpreter,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         reason: Value,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -542,7 +542,7 @@ impl PromiseBuilder {
     pub(crate) fn construct_stack_rooted(
         &self,
         interp: &mut Interpreter,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
@@ -641,7 +641,7 @@ impl PromiseBuilder {
     pub(crate) fn capability_stack_rooted(
         &self,
         interp: &mut Interpreter,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<PromiseCapability, otter_gc::OutOfMemory> {
@@ -759,7 +759,7 @@ where
 
 fn promise_native_stack<F>(
     interp: &mut Interpreter,
-    stack: &HoltStack,
+    stack: &ActivationStack,
     name: &'static str,
     length: u8,
     captures: smallvec::SmallVec<[Value; 4]>,
@@ -3118,7 +3118,7 @@ fn make_resolve_native_runtime_rooted(
 
 fn make_resolve_native_stack_rooted(
     interp: &mut Interpreter,
-    stack: &HoltStack,
+    stack: &ActivationStack,
     promise: JsPromiseHandle,
     context: Option<ExecutionContext>,
     value_roots: &[&Value],
@@ -3458,7 +3458,7 @@ fn make_reject_native_runtime_rooted(
 
 fn make_reject_native_stack_rooted(
     interp: &mut Interpreter,
-    stack: &HoltStack,
+    stack: &ActivationStack,
     promise: JsPromiseHandle,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],

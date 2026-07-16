@@ -19,7 +19,7 @@
 //!
 //! # See also
 //! - [`crate::frame_state::Frame`]
-//! - [`crate::holt_stack::HoltStack`]
+//! - [`crate::activation_stack::ActivationStack`]
 //! - [`crate::native_abi::NativeFrame`]
 
 use crate::{Value, VmError};

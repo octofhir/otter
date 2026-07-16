@@ -54,7 +54,7 @@ pub enum AbruptKind {
 }
 
 /// Frame-local result of advancing an [`AbruptKind`] without changing the
-/// owning HoltStack shape.
+/// owning ActivationStack shape.
 pub(crate) enum AbruptFrameOutcome {
     /// Execution resumes in the same frame at its updated PC.
     Resume,

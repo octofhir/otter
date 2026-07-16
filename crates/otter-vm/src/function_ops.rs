@@ -19,7 +19,7 @@
 //! - [`crate::executable`]
 //! - [`crate::Frame`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
@@ -200,7 +200,7 @@ impl Interpreter {
 
     pub(crate) fn run_make_class_regs(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_idx: usize,
         dst: u16,
         ctor_reg: u16,
@@ -335,7 +335,7 @@ impl Interpreter {
 
     pub(crate) fn drive_bind_function(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
@@ -390,7 +390,7 @@ impl Interpreter {
 
     pub(crate) fn continue_pending_bind_function(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
     ) -> Option<Result<(), VmError>> {
@@ -438,7 +438,7 @@ impl Interpreter {
 
     pub(crate) fn continue_bind_function_after_name(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst: u16,
         target: Value,
@@ -481,7 +481,7 @@ impl Interpreter {
 
     fn finish_bind_function(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         dst: u16,
         target: Value,
         bound_this: Value,
@@ -541,7 +541,7 @@ impl Interpreter {
     pub(crate) fn bind_function_full(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         callee_reg: u16,
@@ -606,7 +606,7 @@ impl Interpreter {
     pub fn jit_runtime_bind_function(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         packed_meta: u64,
         packed_args: u64,
@@ -853,7 +853,7 @@ impl Interpreter {
     pub(crate) fn ordinary_has_instance_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         c: &Value,
         o: &Value,
     ) -> Result<bool, VmError> {
@@ -930,7 +930,7 @@ impl Interpreter {
     pub(crate) fn instanceof_operator_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
@@ -1207,7 +1207,7 @@ impl Interpreter {
 
     pub(crate) fn function_user_bag_stack_rooted(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
@@ -1505,7 +1505,7 @@ impl Interpreter {
         key: &str,
         desc_obj: Option<JsObject>,
         descriptor: object::PropertyDescriptor,
-        stack_roots: Option<&HoltStack>,
+        stack_roots: Option<&ActivationStack>,
         value_roots: &[&Value],
     ) -> Result<bool, VmError> {
         let descriptor = match self.ordinary_function_own_property_descriptor(
@@ -1609,7 +1609,7 @@ impl Interpreter {
     pub(crate) fn try_function_object_static_call(
         &mut self,
         context: Option<&ExecutionContext>,
-        stack_roots: Option<&HoltStack>,
+        stack_roots: Option<&ActivationStack>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -1999,7 +1999,7 @@ impl Interpreter {
 
     fn function_static_array_from_values(
         &mut self,
-        stack_roots: Option<&HoltStack>,
+        stack_roots: Option<&ActivationStack>,
         values: Vec<Value>,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
@@ -2017,7 +2017,7 @@ impl Interpreter {
 
     fn function_static_descriptor_to_object(
         &mut self,
-        stack_roots: Option<&HoltStack>,
+        stack_roots: Option<&ActivationStack>,
         desc: &object::PropertyDescriptor,
         value_roots: &[&Value],
         slice_roots: &[Value],
@@ -2155,7 +2155,7 @@ impl Interpreter {
     pub(crate) fn function_property_get_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
@@ -2179,7 +2179,7 @@ impl Interpreter {
     pub(crate) fn function_property_get_stack_rooted_with_receiver(
         &mut self,
         context: &ExecutionContext,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         receiver: Option<Value>,

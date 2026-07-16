@@ -21,8 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::activation_stack::ActivationStack;
 use crate::error_ops::snapshot_frames;
-use crate::holt_stack::HoltStack;
 use crate::{ExecutionContext, StackFrameSnapshot};
 
 /// Owned VM stack profile captured during one run.
@@ -69,7 +69,7 @@ impl CpuProfiler {
     }
 
     /// Tick the sampler and capture a stack when the interval expires.
-    pub(crate) fn maybe_sample(&mut self, context: &ExecutionContext, stack: &HoltStack) {
+    pub(crate) fn maybe_sample(&mut self, context: &ExecutionContext, stack: &ActivationStack) {
         if self.ticks_until_sample > 1 {
             self.ticks_until_sample -= 1;
             return;

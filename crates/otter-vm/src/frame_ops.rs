@@ -2,7 +2,7 @@
 //!
 //! Hot binding operations consume [`ActiveFrameMut`] and therefore run over
 //! either a materialized [`Frame`] or the canonical [`crate::NativeFrame`]
-//! without copying registers or reconstructing a [`HoltStack`]. Kernels never
+//! without copying registers or reconstructing a [`ActivationStack`]. Kernels never
 //! advance the PC: interpreter dispatch, baseline code, and optimizing code
 //! each own their continuation coordinate.
 //!
@@ -15,7 +15,7 @@
 //! # Invariants
 //! - Inputs are decoded from the executable instruction format before reaching
 //!   these helpers.
-//! - Hot kernels do not inspect [`HoltStack`] or [`crate::cold_frame::ColdFrame`].
+//! - Hot kernels do not inspect [`ActivationStack`] or [`crate::cold_frame::ColdFrame`].
 //! - Every captured-value write flows through [`store_upvalue`] and its GC write
 //!   barrier.
 //! - Callers advance or replace the PC only after a kernel commits.
@@ -24,7 +24,7 @@
 //! - [`crate::active_frame`]
 //! - [`crate::executable`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use crate::{
@@ -142,7 +142,7 @@ impl Interpreter {
     /// binding directly and never call this adapter.
     pub(crate) fn materialized_this_binding(
         &self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         frame_index: usize,
     ) -> Result<Value, VmError> {
         let mut value = stack
@@ -168,7 +168,7 @@ impl Interpreter {
     ///
     /// The compiled tier owns PC progress, so this operation performs only the
     /// captured-binding read, TDZ check, and destination commit. It does not
-    /// require or materialize a [`HoltStack`] frame.
+    /// require or materialize a [`ActivationStack`] frame.
     ///
     /// # Errors
     /// Propagates `ReferenceError` for a TDZ-hole cell and `InvalidOperand`.
@@ -201,13 +201,13 @@ impl Interpreter {
 
     /// Materialize a legacy cold-sidecar rest-argument buffer.
     ///
-    /// This helper remains HoltStack-specific because allocation must trace the
+    /// This helper remains ActivationStack-specific because allocation must trace the
     /// complete materialized stack and because the buffer is owned by
     /// [`crate::cold_frame::ColdFrame`]. It still leaves PC ownership to the
     /// caller.
     pub(crate) fn materialized_collect_rest(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
     ) -> Result<(), VmError> {

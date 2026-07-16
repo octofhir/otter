@@ -19,7 +19,7 @@
 //! - [`crate::array_statics`]
 //! - [`crate::executable`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
@@ -36,7 +36,7 @@ impl Interpreter {
         &mut self,
         op: Op,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
@@ -58,7 +58,7 @@ impl Interpreter {
     /// §23.1.1.1 `Array(...values)`.
     fn array_construct_stack_rooted(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         if args.len() == 1
@@ -110,7 +110,7 @@ impl Interpreter {
     /// §23.1.2.3 `Array.of(...items)`.
     fn array_of_stack_rooted(
         &mut self,
-        stack: &HoltStack,
+        stack: &ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         Ok(Value::array(
@@ -562,7 +562,7 @@ mod tests {
     fn array_of_uses_stack_rooted_result_allocation() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])
@@ -589,7 +589,7 @@ mod tests {
     fn array_construct_length_uses_stack_rooted_shell_and_growth() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])
@@ -624,7 +624,7 @@ mod tests {
     fn array_construct_moderate_length_materializes_dense_holes() {
         let mut interp = Interpreter::new();
         let module = empty_module();
-        let mut stack: HoltStack = HoltStack::new();
+        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(
             interp
                 .test_frame_for_function(&module.functions[0])

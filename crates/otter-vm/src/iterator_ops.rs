@@ -22,7 +22,7 @@
 //! - [`crate::executable`]
 //! - [`crate::IteratorState`]
 
-use crate::holt_stack::HoltStack;
+use crate::activation_stack::ActivationStack;
 use smallvec::SmallVec;
 
 use crate::{
@@ -99,7 +99,7 @@ enum IteratorStateSnapshot {
 impl Interpreter {
     pub(crate) fn run_get_iterator_regs(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -156,7 +156,7 @@ impl Interpreter {
     pub(crate) fn run_get_async_iterator_regs(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -222,7 +222,7 @@ impl Interpreter {
     pub(crate) fn wrap_iterator_method_result(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         produced: Value,
     ) -> Result<Value, VmError> {
         // §7.4.3 step 2 — `[@@iterator]()` must return an Object.
@@ -275,7 +275,7 @@ impl Interpreter {
     pub(crate) fn get_iterator_full(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         top_idx: usize,
         dst: u16,
         src: u16,
@@ -1565,7 +1565,7 @@ impl Interpreter {
             if is_async {
                 handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
             }
-            let mut sub_stack: HoltStack = HoltStack::new();
+            let mut sub_stack: ActivationStack = ActivationStack::new();
             sub_stack.push(*frame);
             return self.finish_generator_dispatch(context, handle, sub_stack, is_async);
         }
@@ -1610,7 +1610,7 @@ impl Interpreter {
                 throw_value = Some(*reason);
             }
         }
-        let mut sub_stack: HoltStack = HoltStack::new();
+        let mut sub_stack: ActivationStack = ActivationStack::new();
         sub_stack.push(*frame);
         if let Some(arg) = return_value {
             // Drive the parked frame's `finally` blocks via the abrupt
@@ -1662,7 +1662,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         handle: &crate::generator::JsGenerator,
-        mut sub_stack: HoltStack,
+        mut sub_stack: ActivationStack,
         is_async: bool,
     ) -> Result<Value, VmError> {
         let outcome = self.dispatch_loop(context, &mut sub_stack);
@@ -1767,7 +1767,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-getiterator>
     pub(crate) fn drive_get_iterator(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {
@@ -1929,7 +1929,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-iteratorvalue>
     pub(crate) fn drive_iterator_next(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         operands: impl crate::executable::OperandSource,
     ) -> Result<bool, VmError> {

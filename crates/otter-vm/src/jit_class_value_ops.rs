@@ -23,8 +23,8 @@ use otter_bytecode::{Op, Operand};
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Interpreter, JsString, Value, VmError, holt_stack::HoltStack, read_register,
-    write_register,
+    ExecutionContext, Interpreter, JsString, Value, VmError, activation_stack::ActivationStack,
+    read_register, write_register,
 };
 
 impl Interpreter {
@@ -32,7 +32,7 @@ impl Interpreter {
     pub(crate) fn run_get_template_object_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         site_idx: u32,
@@ -60,7 +60,7 @@ impl Interpreter {
     pub(crate) fn run_new_private_name_reg(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         desc_idx: u32,
@@ -81,7 +81,7 @@ impl Interpreter {
     /// §13.3.6.2 direct-eval identity probe (`SameValue(func, %eval%)`).
     pub(crate) fn run_is_eval_intrinsic_reg(
         &mut self,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         dst: u16,
         src: u16,
@@ -100,7 +100,7 @@ impl Interpreter {
     pub fn jit_runtime_class_value_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

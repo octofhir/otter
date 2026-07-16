@@ -9,7 +9,7 @@
 //!   `run_store_super_property` helper the interpreter dispatches, so home-object
 //!   `[[Prototype]]` accessor getters/setters fire identically and no super
 //!   semantics are copied into JIT code.
-//! - Accessor reentry runs through the shared HoltStack/VmThread path; a
+//! - Accessor reentry runs through the shared ActivationStack/VmThread path; a
 //!   committed super effect is never replayed by an exact side exit.
 //!
 //! # See also
@@ -19,8 +19,8 @@
 use otter_bytecode::Op;
 
 use crate::{
-    ExecutionContext, Interpreter, SuperReadKey, VmError, VmPropertyKey, holt_stack::HoltStack,
-    read_register,
+    ExecutionContext, Interpreter, SuperReadKey, VmError, VmPropertyKey,
+    activation_stack::ActivationStack, read_register,
 };
 
 impl Interpreter {
@@ -30,7 +30,7 @@ impl Interpreter {
     pub fn jit_runtime_super_op(
         &mut self,
         context: &ExecutionContext,
-        stack: &mut HoltStack,
+        stack: &mut ActivationStack,
         frame_index: usize,
         opcode: u8,
         arg0: u64,

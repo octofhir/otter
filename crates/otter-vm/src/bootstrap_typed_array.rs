@@ -280,11 +280,10 @@ fn drain_iterable_into_values(
     {
         let mut collected: Vec<Value> = Vec::new();
         loop {
-            let (value, done) = ctx
+            let next = ctx
                 .cx
-                .interp
-                .iterator_next_full(exec_ctx, &handle)
-                .map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
+                .with_parts(|interp, stack| interp.iterator_next_full(exec_ctx, stack, &handle));
+            let (value, done) = next.map_err(|e| vm_to_native(ctx.cx.interp, e, "TypedArray"))?;
             if done {
                 break;
             }

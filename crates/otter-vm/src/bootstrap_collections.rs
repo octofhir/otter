@@ -298,7 +298,9 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             name: "Map.groupBy",
             reason: "missing execution context".to_string(),
         })?;
-    let items_snapshot = match ctx.cx.interp.iterator_to_list_sync(&exec_ctx, &items) {
+    let items_snapshot = match ctx
+        .with_turn_parts(|interp, stack| interp.iterator_to_list_sync(&exec_ctx, stack, &items))
+    {
         Ok(v) => v,
         Err(e) => return Err(map_group_by_vm_error(ctx.cx.interp, e)),
     };
@@ -600,12 +602,11 @@ fn add_entries_eager<'s>(
     // each adder call below allocates, and an un-parked entry (e.g. a
     // string key) held only in the native `Vec` would strand.
     let iterable = scope.raw(iterable_h);
-    let entries = {
-        let interp = scope.context().interp_mut();
+    let entries = scope.with_turn_parts(|interp, stack| {
         interp
-            .iterator_to_list_sync(context, &iterable)
-            .map_err(|e| vm_to_native(interp, e, ctor_name))?
-    };
+            .iterator_to_list_sync(context, stack, &iterable)
+            .map_err(|e| vm_to_native(interp, e, ctor_name))
+    })?;
     let entry_handles: Vec<Local<'s>> = entries
         .into_iter()
         .map(|entry| scope.value(entry))
@@ -1813,10 +1814,11 @@ fn set_record_keys(
                 return Ok(SetRecordKeys::Generator { handle });
             }
             if iterator.is_iterator() {
-                let values = ctx
-                    .interp_mut()
-                    .iterator_to_list_sync(context, &iterator)
-                    .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
+                let values = ctx.with_turn_parts(|interp, stack| {
+                    interp
+                        .iterator_to_list_sync(context, stack, &iterator)
+                        .map_err(|err| vm_to_native(interp, err, name))
+                })?;
                 return Ok(SetRecordKeys::Snapshot { values, index: 0 });
             }
             // §24.2.1.2 GetKeysIterator returns the value of `keys()`
@@ -2079,11 +2081,12 @@ mod tests {
         collections::set_add(set, interp.gc_heap_mut(), Value::number_i32(1)).expect("seed");
         let before = interp.gc_heap().stats().old_allocated_bytes;
 
-        let result = {
-            let mut ctx =
-                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::set(set)));
-            set_proto_values(&mut ctx, &[]).expect("set values")
-        };
+        let result = NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(Value::set(set)),
+            None,
+            |ctx| set_proto_values(ctx, &[]).expect("set values"),
+        );
 
         let after = interp.gc_heap().stats().old_allocated_bytes;
         assert!(
@@ -2106,11 +2109,12 @@ mod tests {
         .expect("seed");
         let before = interp.gc_heap().stats().old_allocated_bytes;
 
-        let result = {
-            let mut ctx =
-                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::map(map)));
-            make_map_iterator(&mut ctx, map, MapIterKind::Entries).expect("map entries")
-        };
+        let result = NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(Value::map(map)),
+            None,
+            |ctx| make_map_iterator(ctx, map, MapIterKind::Entries).expect("map entries"),
+        );
 
         let after = interp.gc_heap().stats().old_allocated_bytes;
         assert!(

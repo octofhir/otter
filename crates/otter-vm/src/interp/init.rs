@@ -266,7 +266,6 @@ impl Interpreter {
             rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
             pending_uncaught_frames: None,
             module_sources: source_registry::SourceRegistry::default(),
-            active_frame_stack: None,
             function_user_props: std::collections::HashMap::new(),
             function_prototype_overrides: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),

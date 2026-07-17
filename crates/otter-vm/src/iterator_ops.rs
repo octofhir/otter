@@ -441,17 +441,19 @@ impl Interpreter {
     pub(crate) fn iterator_next_full(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
         match step_iterator(*iter, &mut self.gc_heap) {
             Ok((value, done)) => Ok((value, done)),
-            Err(_) => self.iterator_next_full_slow(context, iter),
+            Err(_) => self.iterator_next_full_slow(context, stack, iter),
         }
     }
 
     fn iterator_next_full_slow(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
         let snapshot: Option<IteratorStateSnapshot> =
@@ -606,6 +608,7 @@ impl Interpreter {
                 }
                 let result = crate::regexp_prototype::regexp_string_iterator_next_runtime(
                     self,
+                    stack,
                     context,
                     &matcher,
                     input,
@@ -640,7 +643,7 @@ impl Interpreter {
                         self.err_type(("Iterator helper is already running".to_string()).into())
                     );
                 }
-                let (v, done) = self.iterator_next_full(context, &source)?;
+                let (v, done) = self.iterator_next_full(context, stack, &source)?;
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
@@ -695,7 +698,7 @@ impl Interpreter {
                 }
                 let mut counter = counter;
                 loop {
-                    let (v, done) = self.iterator_next_full(context, &source)?;
+                    let (v, done) = self.iterator_next_full(context, stack, &source)?;
                     if done {
                         self.gc_heap.with_payload(*iter, |state| state.exhaust());
                         return Ok((Value::undefined(), true));
@@ -766,7 +769,7 @@ impl Interpreter {
                         *running = true;
                     }
                 });
-                let step = self.iterator_next_full(context, &source);
+                let step = self.iterator_next_full(context, stack, &source);
                 self.gc_heap.with_payload(*iter, |state| {
                     if let IteratorState::Take { running, .. } = state {
                         *running = false;
@@ -810,7 +813,7 @@ impl Interpreter {
                 });
                 let step = (|| {
                     for _ in 0..to_drop {
-                        let (_, done) = self.iterator_next_full(context, &source)?;
+                        let (_, done) = self.iterator_next_full(context, stack, &source)?;
                         if done {
                             return Ok(None);
                         }
@@ -820,7 +823,7 @@ impl Interpreter {
                             *to_drop = 0;
                         }
                     });
-                    let (v, done) = self.iterator_next_full(context, &source)?;
+                    let (v, done) = self.iterator_next_full(context, stack, &source)?;
                     Ok(if done { None } else { Some(v) })
                 })();
                 self.gc_heap.with_payload(*iter, |state| {
@@ -855,7 +858,7 @@ impl Interpreter {
                     );
                 }
                 if let Some(inner_iter) = inner.take() {
-                    let (v, done) = match self.iterator_next_full(context, &inner_iter) {
+                    let (v, done) = match self.iterator_next_full(context, stack, &inner_iter) {
                         Ok(next) => next,
                         Err(err) => {
                             self.gc_heap.with_payload(*iter, |state| state.exhaust());
@@ -872,7 +875,7 @@ impl Interpreter {
                         }
                     });
                 }
-                let (v, done) = self.iterator_next_full(context, &source)?;
+                let (v, done) = self.iterator_next_full(context, stack, &source)?;
                 if done {
                     self.gc_heap.with_payload(*iter, |state| state.exhaust());
                     return Ok((Value::undefined(), true));
@@ -1315,6 +1318,7 @@ impl Interpreter {
     pub(crate) fn iterator_to_list_sync(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         iterable: &Value,
     ) -> Result<Vec<Value>, VmError> {
         // Built-in iterable fast paths — §22.1.5.1 ArrayIterator,
@@ -1374,7 +1378,7 @@ impl Interpreter {
         if let Some(handle) = iterable.as_iterator() {
             let mut out: Vec<Value> = Vec::new();
             loop {
-                let (v, done) = self.iterator_next_full(context, &handle)?;
+                let (v, done) = self.iterator_next_full(context, stack, &handle)?;
                 if done {
                     return Ok(out);
                 }
@@ -2042,7 +2046,7 @@ impl Interpreter {
             )
         });
         if needs_full_step {
-            let (value, done) = self.iterator_next_full(context, iter_rc)?;
+            let (value, done) = self.iterator_next_full(context, stack, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
             stack[top_idx].advance_pc()?;

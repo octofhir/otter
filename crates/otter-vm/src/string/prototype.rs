@@ -2779,10 +2779,10 @@ mod tests {
             })
             .collect();
         let impl_fn = intrinsic_impl(method).unwrap();
-        let result = {
-            let mut ctx = NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(recv_v));
-            impl_fn(&mut ctx, &recv_v, &arg_vs).unwrap()
-        };
+        let result =
+            NativeCtx::with_host_context(&mut interp, NativeCallInfo::call(recv_v), None, |ctx| {
+                impl_fn(ctx, &recv_v, &arg_vs).unwrap()
+            });
         result.display_string(interp.gc_heap())
     }
 
@@ -2793,8 +2793,9 @@ mod tests {
         interp: &mut Interpreter,
     ) -> Result<Value, NativeError> {
         let impl_fn = intrinsic_impl(method).unwrap();
-        let mut ctx = NativeCtx::new_with_call_info(interp, NativeCallInfo::call(*receiver));
-        impl_fn(&mut ctx, receiver, args)
+        NativeCtx::with_host_context(interp, NativeCallInfo::call(*receiver), None, |ctx| {
+            impl_fn(ctx, receiver, args)
+        })
     }
 
     #[test]

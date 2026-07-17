@@ -15,6 +15,8 @@
 //! - Register values are attached/copied exactly once after the side exit.
 //! - Every temporary materialized frame and register window is removed before
 //!   returning to compiled code.
+//! - Nested dispatch stops at the caller's activation floor and reuses the
+//!   already-published runtime-turn root provider.
 //! - New interpreter/baseline/optimizer transitions must use
 //!   [`crate::ActiveFrameMut`] over the existing [`NativeFrame`] instead.
 //!
@@ -64,15 +66,10 @@ impl Interpreter {
         frame.self_value = self_value;
         frame.pc = bail_pc;
 
-        let initial_stack_len = stack.len();
+        let floor = stack.floor();
         stack.push(frame);
-        let result = self.dispatch_loop(context, stack);
-        while stack.len() > initial_stack_len {
-            if let Some(mut frame) = stack.pop() {
-                self.frame_release_cold(&mut frame);
-                self.reclaim_registers(&mut frame);
-            }
-        }
+        let result = self.dispatch_loop_above_rooted(context, stack, floor);
+        self.release_frames_above(stack, floor);
         result
     }
 
@@ -89,7 +86,7 @@ impl Interpreter {
         frames: &[jit::JitDeoptFrame],
     ) -> Result<Value, VmError> {
         let _window_rollback = self.register_window_rollback();
-        let initial_stack_len = stack.len();
+        let floor = stack.floor();
         let mut materialized: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
 
         for (index, deopt) in frames.iter().enumerate() {
@@ -128,14 +125,9 @@ impl Interpreter {
         for frame in materialized {
             stack.push(frame);
         }
-        let result = self.dispatch_loop(context, stack);
+        let result = self.dispatch_loop_above_rooted(context, stack, floor);
         self.leave_sync_reentry();
-        while stack.len() > initial_stack_len {
-            if let Some(mut frame) = stack.pop() {
-                self.frame_release_cold(&mut frame);
-                self.reclaim_registers(&mut frame);
-            }
-        }
+        self.release_frames_above(stack, floor);
         result
     }
 }

@@ -1782,6 +1782,56 @@ mod tests {
         otter.run_file(&entry).await.unwrap();
     }
 
+    /// Run with `OTTER_GC_STRESS=full` to force relocation after handler
+    /// lookup, payload materialization, and event allocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_message_event_rooting_survives_gc_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker_path = dir.path().join("worker.js");
+        fs::write(
+            &worker_path,
+            r#"
+            globalThis.onmessage = (event) => {
+              if (event.type !== "message") throw "bad event type";
+              postMessage(event.type + ":" + event.data);
+            };
+            "#,
+        )
+        .unwrap();
+        let entry = dir.path().join("entry.js");
+        fs::write(
+            &entry,
+            format!(
+                r#"
+                let got = "pending";
+                const w = new Worker({:?});
+                w.onerror = (event) => {{
+                  got = "ERR:" + event.message;
+                  w.terminate();
+                }};
+                w.onmessage = (event) => {{
+                  got = event.data;
+                  w.terminate();
+                }};
+                w.postMessage("rooted-payload");
+                setTimeout(() => {{
+                  if (got !== "message:rooted-payload") {{
+                    throw "bad rooted worker event: " + got;
+                  }}
+                }}, 20);
+                "#,
+                worker_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let otter = Otter::builder()
+            .capabilities(CapabilitySet::allow_all())
+            .build()
+            .unwrap();
+        otter.run_file(&entry).await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn global_worker_terminate_interrupts_infinite_loop() {
         let dir = tempfile::tempdir().unwrap();

@@ -33,6 +33,8 @@
 //!   construction. Active native constructor paths allocate instances through
 //!   `NativeCtx` so receiver, `new.target`, arguments, pending causes, and
 //!   AggregateError element buffers stay visible across young allocation.
+//! - Error stack capture walks the explicit activation stack carried by the
+//!   current `NativeCtx`; it never reaches through interpreter ambient state.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-error-objects>
@@ -949,7 +951,7 @@ impl ErrorClassRegistry {
             // formatted lazily on first `.stack` access).
             let limit = stack_trace_limit(ctx);
             if limit > 0 {
-                let mut frames = ctx.interp_mut().capture_active_frames(&context);
+                let mut frames = ctx.capture_active_frames(&context);
                 if frames.len() > limit {
                     frames.truncate(limit);
                 }
@@ -1279,7 +1281,7 @@ impl ErrorClassRegistry {
                     })?;
             let limit = stack_trace_limit(ctx);
             let mut frames = if limit > 0 {
-                ctx.interp_mut().capture_active_frames(&context)
+                ctx.capture_active_frames(&context)
             } else {
                 Vec::new()
             };

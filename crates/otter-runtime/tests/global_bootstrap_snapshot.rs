@@ -11,11 +11,15 @@
 //!   configurable, value-kind)` for every own property.
 //! - `global_constructor_prototype_identity` — pinned prototype
 //!   chain identity for every realm constructor.
+//! - `process_bootstrap_realm_handles_stay_current` — validates the realm
+//!   handles retained by the process installer across moving collections.
 //!
 //! # Invariants
 //! - Snapshot contents must stay deterministic across runs.
 //! - Adding a new global means updating the snapshot in the same
 //!   slice.
+//! - `process` retains its realm global, well-known tag symbol, and
+//!   `%Function.prototype%` identity under `OTTER_GC_STRESS=full`.
 //!
 //! # See also
 //! - `ENGINE_REFACTOR_EXECUTION_PLAN.md` P1.3.
@@ -179,4 +183,23 @@ URIError ctor=>Error proto.proto=>EP
 EvalError ctor=>Error proto.proto=>EP
 AggregateError ctor=>Error proto.proto=>EP";
     assert_eq!(dump, expected, "constructor prototype identity drifted");
+}
+
+#[test]
+fn process_bootstrap_realm_handles_stay_current() {
+    let dump = run(r#"
+        const churn = [];
+        for (let i = 0; i < 512; i++) {
+            churn.push({ i, payload: [i, i + 1, i + 2] });
+        }
+        [
+            globalThis.process === process,
+            Object.prototype.toString.call(process),
+            Object.getPrototypeOf(process.hrtime) === Function.prototype,
+            typeof process.hrtime.bigint,
+            process.argv.length > 0
+        ].join("|");
+        "#);
+
+    assert_eq!(dump, "true|[object process]|true|function|true");
 }

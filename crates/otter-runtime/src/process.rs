@@ -49,169 +49,178 @@ pub(crate) fn install_global(
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
+    let function_prototype = function_prototype_object(interp);
+    let global_object = *interp.global_this();
     let process_tag_symbol = interp
         .well_known_symbols()
         .get(otter_vm::symbol::WellKnown::ToStringTag);
-    let global_object = *interp.global_this();
-    let function_prototype = function_prototype_object(interp);
-    let mut ctx = NativeCtx::new_with_call_info_and_context(
+    let result: Result<(), NativeError> = NativeCtx::with_host_context(
         interp,
         otter_vm::NativeCallInfo::default_call(),
         None,
+        |ctx| {
+            ctx.scope(|mut scope| {
+                // Park the realm values before the first allocation. Bootstrap
+                // allocates enough young objects to scavenge under GC stress;
+                // retaining raw handles here would otherwise leave the final
+                // global write, @@toStringTag key, or hrtime prototype stale.
+                let process_tag_symbol = scope.value(Value::symbol(process_tag_symbol));
+                let global_object = scope.value(Value::object(global_object));
+                let function_prototype =
+                    function_prototype.map(|prototype| scope.value(Value::object(prototype)));
+
+                let process = scope.bare_object()?;
+
+                let process_tag = scope.string("process")?;
+                scope.define_symbol(
+                    process,
+                    process_tag_symbol,
+                    process_tag,
+                    Attr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    }
+                    .to_flags(),
+                )?;
+
+                let argv = scope.array(process_argv.len())?;
+                for (index, arg) in process_argv.iter().enumerate() {
+                    let arg = scope.string(arg)?;
+                    scope.set_index(argv, index, arg)?;
+                }
+                scope.set(process, "argv", argv)?;
+                let exec_argv = scope.array(0)?;
+                scope.set(process, "execArgv", exec_argv)?;
+
+                for (name, value) in [
+                    (
+                        "argv0",
+                        process_argv.first().map(String::as_str).unwrap_or("otter"),
+                    ),
+                    ("execPath", snapshot.exec_path.as_str()),
+                    ("platform", node_platform()),
+                    ("arch", node_arch()),
+                    ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
+                ] {
+                    let value = scope.string(value)?;
+                    scope.set(process, name, value)?;
+                }
+
+                let versions = scope.bare_object()?;
+                for (name, value) in [
+                    ("otter", env!("CARGO_PKG_VERSION")),
+                    ("node", env!("CARGO_PKG_VERSION")),
+                    ("openssl", "3.0.0"),
+                    ("v8", "12.0.0"),
+                ] {
+                    let value = scope.string(value)?;
+                    scope.set(versions, name, value)?;
+                }
+                scope.set(process, "versions", versions)?;
+
+                let release = scope.bare_object()?;
+                let release_name = scope.string("node")?;
+                scope.set(release, "name", release_name)?;
+                scope.set(process, "release", release)?;
+
+                let pid = scope.number(f64::from(pid_to_i32(snapshot.pid)));
+                scope.set(process, "pid", pid)?;
+                let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
+                scope.set(process, "ppid", ppid)?;
+                let undefined = scope.undefined();
+                scope.set(process, "exitCode", undefined)?;
+
+                let env = crate::process_env::build(&mut scope, capabilities, hooks)?;
+                scope.set(process, "env", env)?;
+                let allowed_flags = crate::process_flags::build(&mut scope)?;
+                scope.set(process, "allowedNodeEnvironmentFlags", allowed_flags)?;
+
+                for (name, length, call) in [
+                    (
+                        "cwd",
+                        0,
+                        cwd_call(process_cwd.to_string_lossy().to_string()),
+                    ),
+                    ("exit", 1, NativeCall::Static(process_exit)),
+                    ("nextTick", 1, NativeCall::Static(process_next_tick)),
+                    ("binding", 1, NativeCall::Static(process_binding)),
+                    ("uptime", 0, uptime_call(start, uptime_base_secs)),
+                    ("cpuUsage", 1, NativeCall::Static(process_cpu_usage)),
+                    ("memoryUsage", 0, NativeCall::Static(process_memory_usage)),
+                    (
+                        "availableMemory",
+                        0,
+                        NativeCall::Static(process_available_memory),
+                    ),
+                    (
+                        "constrainedMemory",
+                        0,
+                        NativeCall::Static(process_constrained_memory),
+                    ),
+                ] {
+                    define_process_method(&mut scope, process, name, length, call)?;
+                }
+                let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
+                scope.set(process, "hrtime", hrtime)?;
+                install_stdio_streams(&mut scope, process)?;
+                define_process_method(
+                    &mut scope,
+                    process,
+                    "umask",
+                    1,
+                    NativeCall::Static(process_umask),
+                )?;
+
+                crate::process_events::install(&mut scope, process)?;
+
+                let config = scope.bare_object()?;
+                let variables = scope.bare_object()?;
+                let disabled = scope.boolean(false);
+                scope.set(variables, "v8_enable_i18n_support", disabled)?;
+                scope.define(
+                    config,
+                    "variables",
+                    variables,
+                    Attr {
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                    }
+                    .to_flags(),
+                )?;
+                scope.set(process, "config", config)?;
+
+                let features = scope.bare_object()?;
+                for (name, on) in [
+                    ("inspector", false),
+                    ("quic", false),
+                    ("tls", false),
+                    ("debug", false),
+                    ("uv", true),
+                    ("ipv6", true),
+                    ("openssl_is_boringssl", false),
+                    ("tls_alpn", false),
+                    ("tls_sni", false),
+                    ("tls_ocsp", false),
+                    ("cached_builtins", false),
+                    ("require_module", true),
+                    ("typescript", false),
+                ] {
+                    let value = scope.boolean(on);
+                    scope.set(features, name, value)?;
+                }
+                scope.set(process, "features", features)?;
+
+                scope.define(
+                    global_object,
+                    "process",
+                    process,
+                    Attr::global_binding().to_flags(),
+                )
+            })
+        },
     );
-    let result: Result<(), NativeError> = ctx.scope(|mut scope| {
-        let process = scope.bare_object()?;
-
-        let process_tag = scope.string("process")?;
-        let tag_sym = scope.value(Value::symbol(process_tag_symbol));
-        scope.define_symbol(
-            process,
-            tag_sym,
-            process_tag,
-            Attr {
-                writable: false,
-                enumerable: false,
-                configurable: true,
-            }
-            .to_flags(),
-        )?;
-
-        let argv = scope.array(process_argv.len())?;
-        for (index, arg) in process_argv.iter().enumerate() {
-            let arg = scope.string(arg)?;
-            scope.set_index(argv, index, arg)?;
-        }
-        scope.set(process, "argv", argv)?;
-        let exec_argv = scope.array(0)?;
-        scope.set(process, "execArgv", exec_argv)?;
-
-        for (name, value) in [
-            (
-                "argv0",
-                process_argv.first().map(String::as_str).unwrap_or("otter"),
-            ),
-            ("execPath", snapshot.exec_path.as_str()),
-            ("platform", node_platform()),
-            ("arch", node_arch()),
-            ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
-        ] {
-            let value = scope.string(value)?;
-            scope.set(process, name, value)?;
-        }
-
-        let versions = scope.bare_object()?;
-        for (name, value) in [
-            ("otter", env!("CARGO_PKG_VERSION")),
-            ("node", env!("CARGO_PKG_VERSION")),
-            ("openssl", "3.0.0"),
-            ("v8", "12.0.0"),
-        ] {
-            let value = scope.string(value)?;
-            scope.set(versions, name, value)?;
-        }
-        scope.set(process, "versions", versions)?;
-
-        let release = scope.bare_object()?;
-        let release_name = scope.string("node")?;
-        scope.set(release, "name", release_name)?;
-        scope.set(process, "release", release)?;
-
-        let pid = scope.number(f64::from(pid_to_i32(snapshot.pid)));
-        scope.set(process, "pid", pid)?;
-        let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
-        scope.set(process, "ppid", ppid)?;
-        let undefined = scope.undefined();
-        scope.set(process, "exitCode", undefined)?;
-
-        let env = crate::process_env::build(&mut scope, capabilities, hooks)?;
-        scope.set(process, "env", env)?;
-        let allowed_flags = crate::process_flags::build(&mut scope)?;
-        scope.set(process, "allowedNodeEnvironmentFlags", allowed_flags)?;
-
-        for (name, length, call) in [
-            (
-                "cwd",
-                0,
-                cwd_call(process_cwd.to_string_lossy().to_string()),
-            ),
-            ("exit", 1, NativeCall::Static(process_exit)),
-            ("nextTick", 1, NativeCall::Static(process_next_tick)),
-            ("binding", 1, NativeCall::Static(process_binding)),
-            ("uptime", 0, uptime_call(start, uptime_base_secs)),
-            ("cpuUsage", 1, NativeCall::Static(process_cpu_usage)),
-            ("memoryUsage", 0, NativeCall::Static(process_memory_usage)),
-            (
-                "availableMemory",
-                0,
-                NativeCall::Static(process_available_memory),
-            ),
-            (
-                "constrainedMemory",
-                0,
-                NativeCall::Static(process_constrained_memory),
-            ),
-        ] {
-            define_process_method(&mut scope, process, name, length, call)?;
-        }
-        let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
-        scope.set(process, "hrtime", hrtime)?;
-        install_stdio_streams(&mut scope, process)?;
-        define_process_method(
-            &mut scope,
-            process,
-            "umask",
-            1,
-            NativeCall::Static(process_umask),
-        )?;
-
-        crate::process_events::install(&mut scope, process)?;
-
-        let config = scope.bare_object()?;
-        let variables = scope.bare_object()?;
-        let disabled = scope.boolean(false);
-        scope.set(variables, "v8_enable_i18n_support", disabled)?;
-        scope.define(
-            config,
-            "variables",
-            variables,
-            Attr {
-                writable: false,
-                enumerable: true,
-                configurable: false,
-            }
-            .to_flags(),
-        )?;
-        scope.set(process, "config", config)?;
-
-        let features = scope.bare_object()?;
-        for (name, on) in [
-            ("inspector", false),
-            ("quic", false),
-            ("tls", false),
-            ("debug", false),
-            ("uv", true),
-            ("ipv6", true),
-            ("openssl_is_boringssl", false),
-            ("tls_alpn", false),
-            ("tls_sni", false),
-            ("tls_ocsp", false),
-            ("cached_builtins", false),
-            ("require_module", true),
-            ("typescript", false),
-        ] {
-            let value = scope.boolean(on);
-            scope.set(features, name, value)?;
-        }
-        scope.set(process, "features", features)?;
-
-        let global = scope.value(Value::object(global_object));
-        scope.define(
-            global,
-            "process",
-            process,
-            Attr::global_binding().to_flags(),
-        )
-    });
     result.map_err(process_bootstrap_error)
 }
 
@@ -629,7 +638,7 @@ fn function_prototype_object(interp: &mut Interpreter) -> Option<otter_vm::objec
 fn hrtime_value<'s>(
     scope: &mut NativeScope<'s, '_>,
     start: Instant,
-    function_prototype: Option<otter_vm::object::JsObject>,
+    function_prototype: Option<Local<'_>>,
 ) -> Result<Local<'s>, NativeError> {
     let function = scope.native_call("hrtime", 1, hrtime_call(start))?;
     let bigint = scope.native_call("bigint", 0, hrtime_bigint_call(start))?;
@@ -644,7 +653,6 @@ fn hrtime_value<'s>(
     // form. Re-seat it on `%Function.prototype%` to match an ordinary
     // function object.
     if let Some(function_prototype) = function_prototype {
-        let function_prototype = scope.value(Value::object(function_prototype));
         scope.set_prototype(object, Some(function_prototype))?;
     }
     Ok(object)

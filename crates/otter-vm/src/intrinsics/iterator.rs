@@ -1033,7 +1033,9 @@ fn iterator_proto_to_array(
             })?;
     let mut collected: Vec<Value> = Vec::new();
     loop {
-        let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
         let (v, done) = next.map_err(|e| {
             crate::native_function::vm_to_native_error(
                 ctx.cx.interp,
@@ -1080,7 +1082,9 @@ fn iterator_proto_for_each(
             })?;
     let mut idx: f64 = 0.0;
     loop {
-        let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
         let (v, done) = next.map_err(|e| {
             crate::native_function::vm_to_native_error(
                 ctx.cx.interp,
@@ -1143,7 +1147,9 @@ fn iterator_proto_reduce(
     let mut has_acc = has_initial;
     let mut idx: f64 = 0.0;
     loop {
-        let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
         let (v, done) = next.map_err(|e| {
             crate::native_function::vm_to_native_error(
                 ctx.cx.interp,
@@ -1227,7 +1233,9 @@ fn iterator_proto_find(
             })?;
     let mut idx: f64 = 0.0;
     loop {
-        let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
         let (v, done) = next.map_err(|e| {
             crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.find")
         })?;
@@ -1293,7 +1301,9 @@ pub(crate) fn iterator_proto_next(
                 reason: "missing execution context".to_string(),
             })?;
     let iter_value = Value::iterator(handle);
-    let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+    let next = ctx
+        .cx
+        .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
     let (value, done) = next.map_err(|e| {
         crate::native_function::vm_to_native_error(ctx.cx.interp, e, "Iterator.prototype.next")
     })?;
@@ -1469,7 +1479,9 @@ fn regexp_string_iterator_proto_next(
                 reason: "missing execution context".to_string(),
             })?;
     let iter_value = Value::iterator(handle);
-    let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+    let next = ctx
+        .cx
+        .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
     let (value, done) =
         next.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
     let obj = ctx
@@ -1667,7 +1679,9 @@ fn iterator_predicate_drain(
             })?;
     let mut idx: f64 = 0.0;
     loop {
-        let next = ctx.cx.interp.iterator_next_full(&exec_ctx, &handle);
+        let next = ctx
+            .cx
+            .with_parts(|interp, stack| interp.iterator_next_full(&exec_ctx, stack, &handle));
         let (v, done) =
             next.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, name))?;
         if done {

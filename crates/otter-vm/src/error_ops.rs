@@ -15,6 +15,8 @@
 //! - VM-raised errors use the top bytecode frame's `[[Realm]]`; linked
 //!   function metadata carries only scalar realm ids, and the existing traced
 //!   realm swap owns all moving-GC state.
+//! - Native failures synthesized inside a runtime turn retain that turn's
+//!   activation stack as the allocation root set.
 //!
 //! # See also
 //! - [`crate::error_classes`]
@@ -542,13 +544,24 @@ pub(crate) fn symbol_to_vm_error(
 }
 
 pub(crate) fn native_to_vm_error(interp: &mut crate::Interpreter, err: NativeError) -> VmError {
+    native_to_vm_error_with_stack(interp, &ActivationStack::new(), err)
+}
+
+/// Convert a native failure while retaining the current activation stack as an
+/// allocation root for the synthesized JavaScript error object.
+pub(crate) fn native_to_vm_error_with_stack(
+    interp: &mut crate::Interpreter,
+    stack: &ActivationStack,
+    err: NativeError,
+) -> VmError {
     fn native_spec_error(
         interp: &mut crate::Interpreter,
+        stack: &ActivationStack,
         kind: ErrorKind,
         message: String,
     ) -> VmError {
         match interp.make_error_instance_with_stack_roots(
-            &ActivationStack::new(),
+            stack,
             kind,
             Some(message.clone()),
             &Value::undefined(),
@@ -563,28 +576,43 @@ pub(crate) fn native_to_vm_error(interp: &mut crate::Interpreter, err: NativeErr
 
     match err {
         NativeError::Thrown { name: _, message } => interp.err_uncaught(message.into()),
-        NativeError::Error { message } => native_spec_error(interp, ErrorKind::Error, message),
+        NativeError::Error { message } => {
+            native_spec_error(interp, stack, ErrorKind::Error, message)
+        }
         NativeError::Coded {
             kind,
             code,
             message,
         } => interp.err_coded(kind, code, message),
-        NativeError::TypeError { name, reason } => {
-            native_spec_error(interp, ErrorKind::TypeError, format!("{name}: {reason}"))
-        }
-        NativeError::SyntaxError { name, reason } => {
-            native_spec_error(interp, ErrorKind::SyntaxError, format!("{name}: {reason}"))
-        }
-        NativeError::RangeError { name, reason } => {
-            native_spec_error(interp, ErrorKind::RangeError, format!("{name}: {reason}"))
-        }
-        NativeError::URIError { name, reason } => {
-            native_spec_error(interp, ErrorKind::URIError, format!("{name}: {reason}"))
-        }
+        NativeError::TypeError { name, reason } => native_spec_error(
+            interp,
+            stack,
+            ErrorKind::TypeError,
+            format!("{name}: {reason}"),
+        ),
+        NativeError::SyntaxError { name, reason } => native_spec_error(
+            interp,
+            stack,
+            ErrorKind::SyntaxError,
+            format!("{name}: {reason}"),
+        ),
+        NativeError::RangeError { name, reason } => native_spec_error(
+            interp,
+            stack,
+            ErrorKind::RangeError,
+            format!("{name}: {reason}"),
+        ),
+        NativeError::URIError { name, reason } => native_spec_error(
+            interp,
+            stack,
+            ErrorKind::URIError,
+            format!("{name}: {reason}"),
+        ),
         // Round-trips back to a ReferenceError-classed VmError so a TDZ
         // error raised behind a native boundary keeps its class.
         NativeError::ReferenceError { name, reason } => native_spec_error(
             interp,
+            stack,
             ErrorKind::ReferenceError,
             format!("{name}: {reason}"),
         ),

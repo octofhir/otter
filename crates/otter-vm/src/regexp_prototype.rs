@@ -900,6 +900,7 @@ pub(crate) fn regexp_exec_runtime(
 /// `Get(R, "lastIndex")`, `ToLength`, and `Set(R, "lastIndex", …)`.
 pub(crate) fn regexp_string_iterator_next_runtime(
     interp: &mut crate::Interpreter,
+    stack: &mut crate::ActivationStack,
     context: &crate::ExecutionContext,
     matcher: &Value,
     input: JsString,
@@ -907,37 +908,35 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     full_unicode: bool,
 ) -> Result<Option<Value>, crate::VmError> {
     let name = "RegExp String Iterator.next";
-    let mut ctx = NativeCtx::new_with_call_info_and_context(
-        interp,
-        crate::NativeCallInfo::call(*matcher),
-        Some(context),
-    );
-    let result = regexp_exec_runtime(&mut ctx, matcher, input, name)
-        .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
+    let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
+    let mut ctx =
+        NativeCtx::from_runtime_turn(turn, crate::NativeCallInfo::call(*matcher), Some(context));
+    let ctx = &mut ctx;
+    let result =
+        regexp_exec_runtime(ctx, matcher, input, name).map_err(|e| ctx.native_error_to_vm(e))?;
     if result.is_null() {
         return Ok(None);
     }
     if global {
-        let matched_val = get_property_runtime(&mut ctx, &result, "0", name)
-            .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
-        let matched_str = coerce_to_jsstring_runtime(&mut ctx, &matched_val, name)
-            .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
+        let matched_val =
+            get_property_runtime(ctx, &result, "0", name).map_err(|e| ctx.native_error_to_vm(e))?;
+        let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)
+            .map_err(|e| ctx.native_error_to_vm(e))?;
         if matched_str.is_empty() {
-            let li_val = get_property_runtime(&mut ctx, matcher, "lastIndex", name)
-                .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
-            let this_index = to_length_runtime(&mut ctx, &li_val, name)
-                .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?
-                as usize;
+            let li_val = get_property_runtime(ctx, matcher, "lastIndex", name)
+                .map_err(|e| ctx.native_error_to_vm(e))?;
+            let this_index = to_length_runtime(ctx, &li_val, name)
+                .map_err(|e| ctx.native_error_to_vm(e))? as usize;
             let input_units = input.to_utf16_vec(ctx.heap());
             let next_index = advance_string_index(&input_units, this_index, full_unicode);
             set_property_runtime(
-                &mut ctx,
+                ctx,
                 matcher,
                 "lastIndex",
                 Value::number_f64(next_index as f64),
                 name,
             )
-            .map_err(|e| crate::native_to_vm_error(ctx.interp_mut(), e))?;
+            .map_err(|e| ctx.native_error_to_vm(e))?;
         }
     }
     Ok(Some(result))
@@ -1945,21 +1944,18 @@ mod tests {
     fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {
         let re = recv.as_regexp().unwrap();
         let context = empty_context();
-        let mut ctx = NativeCtx::new_with_call_info_and_context(
-            interp,
-            NativeCallInfo::call(*recv),
-            Some(&context),
-        );
-        let text = string_arg_to_jsstring_for_test(args, 0, &mut ctx).unwrap();
-        match method {
-            "exec" => exec_once_native(&re, recv, text, &mut ctx, &[]).unwrap(),
-            "test" => Value::boolean(
-                !exec_once_native(&re, recv, text, &mut ctx, &[])
-                    .unwrap()
-                    .is_null(),
-            ),
-            _ => panic!("unknown regexp test method {method}"),
-        }
+        NativeCtx::with_host_context(interp, NativeCallInfo::call(*recv), Some(&context), |ctx| {
+            let text = string_arg_to_jsstring_for_test(args, 0, ctx).unwrap();
+            match method {
+                "exec" => exec_once_native(&re, recv, text, ctx, &[]).unwrap(),
+                "test" => Value::boolean(
+                    !exec_once_native(&re, recv, text, ctx, &[])
+                        .unwrap()
+                        .is_null(),
+                ),
+                _ => panic!("unknown regexp test method {method}"),
+            }
+        })
     }
 
     fn string_arg_to_jsstring_for_test(

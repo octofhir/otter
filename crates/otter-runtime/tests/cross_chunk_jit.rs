@@ -59,7 +59,7 @@ fn compiled_entries_resolve_the_owning_chunk() {
     };
     let oracle = run_pair(&harness, JitSelection::InterpreterOnly).expect("interpreter oracle");
     assert_eq!(
-        run_pair(&harness, JitSelection::Baseline).as_deref(),
+        run_pair(&harness, JitSelection::ProductionTiered).as_deref(),
         Ok(oracle.as_str())
     );
     assert_eq!(

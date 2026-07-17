@@ -31,11 +31,11 @@ use otter_benchmark::{
     JitMode, MemoryMetrics, RuntimeMode, ValidationStatus,
 };
 use otter_compiler::compile_script_source;
-use otter_jit::{BaselineJitCompiler, TransitionTable, compile};
+use otter_jit::{OtterJitCompiler, TransitionTable, compile};
 use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_runtime::{
-    ConsoleLevel, ConsoleSink, Runtime, RuntimeExecutionStats, SourceInput,
+    ConsoleLevel, ConsoleSink, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
     module_graph::ModulePhaseTimings,
 };
 use otter_syntax::SourceKind;
@@ -356,7 +356,7 @@ fn run_call(
     let context = ExecutionContext::from_module(module);
     let mut interpreter = Interpreter::new();
     if matches!(jit_mode, CallJitMode::Baseline) {
-        interpreter.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+        interpreter.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     }
     let validate = |value: otter_vm::Value| {
         value
@@ -533,7 +533,7 @@ fn run_jit_compile(
         }
     };
     let mut validation_interpreter = Interpreter::new();
-    validation_interpreter.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+    validation_interpreter.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     match validation_interpreter.run(&context) {
         Ok(value) if value.as_f64() == Some(expected) => {}
         Ok(value) => {
@@ -755,8 +755,6 @@ fn run_memory(iterations: u32, samples: u32) -> BenchmarkResult {
 fn configured_runtime_jit_mode() -> JitMode {
     if std::env::var("OTTER_JIT").as_deref() == Ok("0") {
         JitMode::InterpreterOnly
-    } else if std::env::var("OTTER_EXPERIMENTAL_OPTIMIZER").as_deref() == Ok("1") {
-        JitMode::ExperimentalOptimizer
     } else {
         JitMode::Baseline
     }
@@ -764,7 +762,20 @@ fn configured_runtime_jit_mode() -> JitMode {
 
 fn build_runtime() -> Result<(Runtime, u64), String> {
     let started = Instant::now();
-    Runtime::builder()
+    let selection = if std::env::var("OTTER_JIT").as_deref() == Ok("0") {
+        JitSelection::InterpreterOnly
+    } else {
+        JitSelection::ProductionTiered
+    };
+    let mut builder = Runtime::builder().jit_selection(selection);
+    if let Some(threshold) = std::env::var("OTTER_JIT_OSR_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|threshold| *threshold > 0)
+    {
+        builder = builder.jit_osr_threshold(threshold);
+    }
+    builder
         .build()
         .map(|runtime| (runtime, elapsed_ns(started)))
         .map_err(|error| format!("runtime build failed: {error}"))

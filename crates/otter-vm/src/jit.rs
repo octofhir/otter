@@ -1136,6 +1136,14 @@ impl std::error::Error for JitCompileError {}
 /// `otter-runtime` wires an implementation from `otter-jit`; `otter-vm` only
 /// owns this trait object and supplies owned compile-input DTOs.
 pub trait JitCompilerHook: Send + Sync {
+    /// Whether this hook exposes an optimizing tier in addition to its baseline
+    /// compiler. The VM checks this before collecting feedback snapshots or
+    /// running promotion policy. Hooks overriding
+    /// [`Self::compile_optimized_function`] must also return `true` here.
+    fn optimizing_tier_enabled(&self) -> bool {
+        false
+    }
+
     /// JIT-owned runtime transitions installed once into the target VM.
     fn runtime_stub_bindings(&self) -> Vec<JitRuntimeStubBinding> {
         Vec::new()

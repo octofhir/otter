@@ -174,7 +174,7 @@ fn run(selection: JitSelection) -> (String, FinalStats) {
 #[test]
 fn frameless_store_element_completes_object_array_and_typed_array_set() {
     let (oracle, _) = run(JitSelection::InterpreterOnly);
-    let (compiled, stats) = run(JitSelection::Baseline);
+    let (compiled, stats) = run(JitSelection::ProductionTiered);
 
     assert_eq!(compiled, oracle);
     assert_eq!(

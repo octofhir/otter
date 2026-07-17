@@ -539,6 +539,13 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if !self
+            .jit_hook
+            .as_ref()
+            .is_some_and(|hook| hook.optimizing_tier_enabled())
+        {
+            return None;
+        }
         if let Some((cached_fid, code)) = &self.jit_optimized_code_cache
             && *cached_fid == fid
             && self.jit_code_registry.is_current_for_entry(code.as_ref())

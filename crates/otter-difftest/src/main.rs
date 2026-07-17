@@ -100,7 +100,6 @@ fn run(otter: &Path, source: &str, case: &str, mode: &Mode, timeout: Duration) -
         .arg(source)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        .env_remove("OTTER_EXPERIMENTAL_OPTIMIZER")
         .env_remove("OTTER_GC_STRESS")
         .env_remove("OTTER_GC_VERIFY")
         .env_remove("OTTER_JIT_OSR_THRESHOLD");

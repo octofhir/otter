@@ -33,7 +33,9 @@ use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission, SourceInput};
+use otter_runtime::{
+    CapabilitySet, DiagnosticCode, JitSelection, OtterError, Permission, SourceInput,
+};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
 
@@ -705,8 +707,12 @@ async fn run_file_with_cpu_profile(
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
+        .jit_selection(cli_jit_selection())
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
+    if let Some(threshold) = cli_jit_osr_threshold() {
+        builder = builder.jit_osr_threshold(threshold);
+    }
     if let Some(bytes) = max_heap_bytes {
         builder = builder.max_heap_bytes(bytes);
     }
@@ -1510,7 +1516,11 @@ fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
         .capabilities(caps.clone())
         .with_node_apis()
         .with_otter_modules()
-        .with_web_apis();
+        .with_web_apis()
+        .jit_selection(cli_jit_selection());
+    if let Some(threshold) = cli_jit_osr_threshold() {
+        builder = builder.jit_osr_threshold(threshold);
+    }
     if let Some(secs) = cli_timeout_secs() {
         builder = builder.timeout(std::time::Duration::from_secs(secs));
     }
@@ -1518,6 +1528,23 @@ fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
         builder = builder.tracer_factory(Some(trace_factory_for_target(&target)));
     }
     builder
+}
+
+/// Translate legacy process knobs at the CLI boundary. Runtime and VM builders
+/// remain deterministic and use only their explicit structured configuration.
+fn cli_jit_selection() -> JitSelection {
+    if std::env::var("OTTER_JIT").as_deref() == Ok("0") {
+        JitSelection::InterpreterOnly
+    } else {
+        JitSelection::ProductionTiered
+    }
+}
+
+fn cli_jit_osr_threshold() -> Option<u32> {
+    std::env::var("OTTER_JIT_OSR_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|threshold| *threshold > 0)
 }
 
 /// Top-level `--timeout <secs>` installed by [`main`]. `None` keeps

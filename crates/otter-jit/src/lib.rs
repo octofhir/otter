@@ -51,13 +51,22 @@ pub use entry::{BackendFailure, TransitionTable, Unsupported};
 pub use optimizing::{OptimizedCode, compile_optimized};
 pub use template::{TemplateCode, compile};
 
-/// Production JIT compiler implementation wired into `otter-vm` through the
-/// VM-owned [`otter_vm::JitCompilerHook`] trait.
+/// Native-tier policy selected by the embedding runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitTierPolicy {
+    /// Run the optimizing tier before falling back to template compilation.
+    ProductionTiered,
+    /// Compile only with the template tier.
+    TemplateOnly,
+}
+
+/// JIT compiler implementation wired into `otter-vm` through the VM-owned
+/// [`otter_vm::JitCompilerHook`] trait.
 ///
-/// Drives the optimizing leaf tier before the [`template`] compiler. There is no
-/// environment or runtime toggle for compiler selection; hosts opt out of
-/// native execution by not installing the hook at all.
-pub struct BaselineJitCompiler {
+/// The constructor requires an explicit [`JitTierPolicy`]. Hosts that want
+/// interpreter-only execution do not install the hook.
+pub struct OtterJitCompiler {
+    policy: JitTierPolicy,
     /// Hook-lifetime resolution of the transition inventory; every compile
     /// bakes entry addresses through this table.
     transitions: TransitionTable,
@@ -68,26 +77,39 @@ pub struct BaselineJitCompiler {
     call_trampoline: Result<std::sync::Arc<arm64::CallTrampoline>, Unsupported>,
 }
 
-impl Default for BaselineJitCompiler {
+impl Default for OtterJitCompiler {
     fn default() -> Self {
-        Self::new()
+        Self::production_tiered()
     }
 }
 
-impl std::fmt::Debug for BaselineJitCompiler {
+impl std::fmt::Debug for OtterJitCompiler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BaselineJitCompiler").finish()
+        f.debug_struct("OtterJitCompiler")
+            .field("policy", &self.policy)
+            .finish()
     }
 }
 
-impl BaselineJitCompiler {
-    /// Construct the production baseline JIT compiler hook.
+impl OtterJitCompiler {
+    /// Construct the production tiered compiler.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn production_tiered() -> Self {
+        Self::with_policy(JitTierPolicy::ProductionTiered)
+    }
+
+    /// Construct a template-only compiler.
+    #[must_use]
+    pub fn template_only() -> Self {
+        Self::with_policy(JitTierPolicy::TemplateOnly)
+    }
+
+    fn with_policy(policy: JitTierPolicy) -> Self {
         let transitions = TransitionTable::resolve();
         #[cfg(target_arch = "aarch64")]
         let call_trampoline = arm64::CallTrampoline::compile(&transitions).map(std::sync::Arc::new);
         Self {
+            policy,
             transitions,
             #[cfg(target_arch = "aarch64")]
             call_trampoline,
@@ -95,7 +117,11 @@ impl BaselineJitCompiler {
     }
 }
 
-impl otter_vm::JitCompilerHook for BaselineJitCompiler {
+impl otter_vm::JitCompilerHook for OtterJitCompiler {
+    fn optimizing_tier_enabled(&self) -> bool {
+        self.policy == JitTierPolicy::ProductionTiered
+    }
+
     fn runtime_stub_bindings(&self) -> Vec<otter_vm::JitRuntimeStubBinding> {
         entry::runtime_stub_bindings()
     }
@@ -139,6 +165,9 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
+        if self.policy == JitTierPolicy::TemplateOnly {
+            return Ok(otter_vm::JitCompileStatus::Unavailable);
+        }
         let fid = request.snapshot.code_block.id;
         #[cfg(target_arch = "aarch64")]
         let compiled = self
@@ -167,6 +196,25 @@ impl otter_vm::JitCompilerHook for BaselineJitCompiler {
                 reason: format!("function {fid} not in optimizing subset: {reason:?}"),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_policy_tests {
+    use otter_vm::JitCompilerHook;
+
+    use super::OtterJitCompiler;
+
+    #[test]
+    fn compiler_reports_only_the_selected_tiers() {
+        assert!(
+            OtterJitCompiler::production_tiered().optimizing_tier_enabled(),
+            "production policy must expose optimizing compilation"
+        );
+        assert!(
+            !OtterJitCompiler::template_only().optimizing_tier_enabled(),
+            "template-only policy must stop promotion before snapshotting"
+        );
     }
 }
 

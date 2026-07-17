@@ -70,7 +70,7 @@ fn once_called_float_array_loop_enters_optimized_osr() {
     );
     let (tiered, stats) = run(
         ARRAY_RMW,
-        JitSelection::Baseline,
+        JitSelection::ProductionTiered,
         "optimizing-osr-rmw-tiered.js",
     );
 
@@ -91,7 +91,7 @@ fn deopt_after_optimized_osr_reconstructs_loop_state() {
     );
     let (tiered, stats) = run(
         POST_OSR_DEOPT,
-        JitSelection::Baseline,
+        JitSelection::ProductionTiered,
         "optimizing-osr-deopt-tiered.js",
     );
 

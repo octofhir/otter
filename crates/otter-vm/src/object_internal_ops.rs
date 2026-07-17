@@ -97,50 +97,6 @@ fn property_key_value_to_vm_key(
     Err(interp.err_type(("property key must be a string or symbol".to_string()).into()))
 }
 
-fn complete_partial_descriptor_against_current(
-    current: &object::PropertyDescriptor,
-    partial: &object::PartialPropertyDescriptor,
-) -> object::PropertyDescriptor {
-    match &current.kind {
-        object::DescriptorKind::Data { value } if !partial.is_accessor() => {
-            object::PropertyDescriptor::data(
-                partial.value.unwrap_or(*value),
-                partial.writable.unwrap_or(current.writable()),
-                partial.enumerable.unwrap_or(current.enumerable()),
-                partial.configurable.unwrap_or(current.configurable()),
-            )
-        }
-        object::DescriptorKind::Accessor { getter, setter } if !partial.is_data() => {
-            object::PropertyDescriptor::accessor(
-                if partial.get.is_some() {
-                    normalize_accessor_slot(partial.get)
-                } else {
-                    *getter
-                },
-                if partial.set.is_some() {
-                    normalize_accessor_slot(partial.set)
-                } else {
-                    *setter
-                },
-                partial.enumerable.unwrap_or(current.enumerable()),
-                partial.configurable.unwrap_or(current.configurable()),
-            )
-        }
-        _ if partial.is_accessor() => object::PropertyDescriptor::accessor(
-            normalize_accessor_slot(partial.get),
-            normalize_accessor_slot(partial.set),
-            partial.enumerable.unwrap_or(false),
-            partial.configurable.unwrap_or(false),
-        ),
-        _ => object::PropertyDescriptor::data(
-            partial.value.unwrap_or(Value::undefined()),
-            partial.writable.unwrap_or(false),
-            partial.enumerable.unwrap_or(false),
-            partial.configurable.unwrap_or(false),
-        ),
-    }
-}
-
 fn normalize_accessor_slot(value: Option<Value>) -> Option<Value> {
     value.filter(|value| !value.is_undefined())
 }
@@ -1574,11 +1530,7 @@ impl Interpreter {
                 let k = key
                     .string_name()
                     .expect("non-symbol key has string spelling");
-                native.define_own_property(
-                    &mut self.gc_heap,
-                    k,
-                    descriptor.complete_for_new_property(),
-                )
+                native.define_own_property_partial(&mut self.gc_heap, k, descriptor)?
             });
         }
         if let Some(class) = target.as_class_constructor() {
@@ -1639,7 +1591,7 @@ impl Interpreter {
                 function_id,
                 k,
             )? {
-                Some(current) => complete_partial_descriptor_against_current(&current, &descriptor),
+                Some(current) => descriptor.complete_against_current(&current),
                 None => descriptor.complete_for_new_property(),
             };
             return self.ordinary_function_define_own_property(
@@ -1660,7 +1612,7 @@ impl Interpreter {
                     false,
                     false,
                 );
-                let completed = complete_partial_descriptor_against_current(&current, &descriptor);
+                let completed = descriptor.complete_against_current(&current);
                 let Some(updated) =
                     object::validate_descriptor_update(&current, &completed, &self.gc_heap)
                 else {

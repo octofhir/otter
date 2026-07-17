@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::object::{JsObject, PropertyDescriptor};
+use crate::object::{JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::string::JsString;
 use crate::{NativeCtx, Value};
 use otter_gc::heap::RootSlotVisitor;
@@ -727,6 +727,16 @@ impl NativeFunction {
         heap: &mut otter_gc::GcHeap,
         key: &str,
     ) -> Result<Option<PropertyDescriptor>, otter_gc::OutOfMemory> {
+        let mut external_visit = no_roots;
+        self.own_property_descriptor_with_roots(heap, key, &mut external_visit)
+    }
+
+    fn own_property_descriptor_with_roots(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        key: &str,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Option<PropertyDescriptor>, otter_gc::OutOfMemory> {
         // Read property metadata under a shared payload borrow, then
         // build the descriptor outside the borrow so the heap remains
         // mutable for `native_builtin_descriptor`'s string alloc.
@@ -763,7 +773,7 @@ impl NativeFunction {
                         length: body.length,
                         metadata: body.metadata,
                     });
-                native_builtin_descriptor(&body_snapshot, heap, key).map(Some)
+                native_builtin_descriptor(&body_snapshot, heap, key, external_visit).map(Some)
             }
             Slot::Deleted => Ok(None),
             Slot::Overridden(d) => Ok(Some(d)),
@@ -827,10 +837,10 @@ impl NativeFunction {
         })
     }
 
-    /// Define or redefine one of the native function object's own
-    /// metadata properties. This slice supports `name` / `length`;
-    /// arbitrary expando properties still belong to the broader
-    /// function-object property-bag work.
+    /// Define or redefine one of the native function object's own properties.
+    ///
+    /// The target and descriptor are traced while materializing the built-in
+    /// `name` descriptor, whose string allocation can move either value.
     ///
     /// `pub` because the `couch!` macro expands generated `install`
     /// bodies to pin static methods on the constructor through this
@@ -842,10 +852,64 @@ impl NativeFunction {
         key: &str,
         descriptor: PropertyDescriptor,
     ) -> bool {
-        let existing = match self.own_property_descriptor(heap, key) {
+        let mut target = Value::native_function(*self);
+        let mut descriptor = descriptor;
+        let native = target
+            .as_native_function()
+            .expect("native function value must decode");
+        let existing = match {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                target.trace_value_slot_mut(visitor);
+                crate::pelt::PeltField::pelt_trace(&mut descriptor, visitor);
+            };
+            native.own_property_descriptor_with_roots(heap, key, &mut external_visit)
+        } {
             Ok(existing) => existing,
             Err(_) => return false,
         };
+        let native = target
+            .as_native_function()
+            .expect("rooted native function value must decode");
+        native.define_own_property_with_current(heap, key, existing, descriptor)
+    }
+
+    /// Rooted partial-descriptor entry used by the VM's
+    /// `[[DefineOwnProperty]]` dispatcher.
+    pub(crate) fn define_own_property_partial(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        key: &str,
+        descriptor: PartialPropertyDescriptor,
+    ) -> Result<bool, otter_gc::OutOfMemory> {
+        let mut target = Value::native_function(*self);
+        let mut descriptor = descriptor;
+        let native = target
+            .as_native_function()
+            .expect("native function value must decode");
+        let existing = {
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                target.trace_value_slot_mut(visitor);
+                crate::pelt::PeltField::pelt_trace(&mut descriptor, visitor);
+            };
+            native.own_property_descriptor_with_roots(heap, key, &mut external_visit)?
+        };
+        let completed = match existing.as_ref() {
+            Some(current) => descriptor.complete_against_current(current),
+            None => descriptor.complete_for_new_property(),
+        };
+        let native = target
+            .as_native_function()
+            .expect("rooted native function value must decode");
+        Ok(native.define_own_property_with_current(heap, key, existing, completed))
+    }
+
+    fn define_own_property_with_current(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        key: &str,
+        existing: Option<PropertyDescriptor>,
+        descriptor: PropertyDescriptor,
+    ) -> bool {
         let descriptor = match existing {
             Some(existing) => {
                 match crate::object::validate_descriptor_update(&existing, &descriptor, heap) {
@@ -1194,9 +1258,14 @@ fn native_builtin_descriptor(
     body: &NativeFunctionBodySnapshot,
     heap: &mut otter_gc::GcHeap,
     key: &str,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<PropertyDescriptor, otter_gc::OutOfMemory> {
     let value = match key {
-        "name" => Value::string(JsString::from_str(body.name, heap)?),
+        "name" => Value::string(JsString::from_str_with_roots(
+            body.name,
+            heap,
+            external_visit,
+        )?),
         "length" => Value::number(crate::number::NumberValue::from_i32(body.length as i32)),
         _ => Value::undefined(),
     };

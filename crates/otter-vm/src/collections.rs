@@ -22,6 +22,9 @@
 //!   its mutators are invoked through `%Set.prototype%` directly.
 //! - Two `JsMap` handles cloned from the same heap object share
 //!   storage — both observe subsequent mutations.
+//! - A capacity reservation may run moving GC. Map/Set insertion roots mutable
+//!   key/value slots and derives `MapKey` plus write-barrier operands only
+//!   after that reservation returns.
 //! - `JsWeakMap` / `JsWeakSet` reject values that cannot be held weakly with
 //!   [`CollectionError::NonObjectKey`].
 //!
@@ -452,21 +455,27 @@ pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
 pub fn map_set(
     mut map: JsMap,
     heap: &mut otter_gc::GcHeap,
-    key: Value,
-    value: Value,
+    mut key: Value,
+    mut value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let barrier_key = key;
-    let barrier_value = value;
-    let k = MapKey::from_value(&key, heap);
-    let existing_idx = heap.read_payload(map, |body| map_find_entry(body, &k, heap));
-    if existing_idx.is_none() {
+    let lookup_key = MapKey::from_value(&key, heap);
+    let needs_insert = heap.read_payload(map, |body| {
+        map_find_entry(body, &lookup_key, heap).is_none()
+    });
+    if needs_insert {
         let target_len = heap.read_payload(map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            key.trace_value_slots(visitor);
-            value.trace_value_slots(visitor);
+            key.trace_value_slot_mut(visitor);
+            value.trace_value_slot_mut(visitor);
         };
         reserve_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
     }
+
+    // Reserving external collection storage can run a moving collection. Both
+    // values above are real mutable root slots, so rebuild every derived key
+    // and barrier operand only after the reserve returns.
+    let k = MapKey::from_value(&key, heap);
+    let existing_idx = heap.read_payload(map, |body| map_find_entry(body, &k, heap));
     let exists = existing_idx.is_some();
     heap.with_payload(map, |body| match existing_idx {
         Some(idx) => body.entries[idx].value = Some(value),
@@ -477,9 +486,9 @@ pub fn map_set(
         }
     });
     if !exists {
-        heap.record_write(map, &barrier_key);
+        heap.record_write(map, &key);
     }
-    heap.record_write(map, &barrier_value);
+    heap.record_write(map, &value);
     Ok(())
 }
 
@@ -487,23 +496,26 @@ pub fn map_set(
 pub(crate) fn map_set_with_roots(
     map: &mut JsMap,
     heap: &mut otter_gc::GcHeap,
-    key: Value,
-    value: Value,
+    mut key: Value,
+    mut value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let barrier_key = key;
-    let barrier_value = value;
-    let k = MapKey::from_value(&key, heap);
-    let existing_idx = heap.read_payload(*map, |body| map_find_entry(body, &k, heap));
-    if existing_idx.is_none() {
+    let lookup_key = MapKey::from_value(&key, heap);
+    let needs_insert = heap.read_payload(*map, |body| {
+        map_find_entry(body, &lookup_key, heap).is_none()
+    });
+    if needs_insert {
         let target_len = heap.read_payload(*map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
-            key.trace_value_slots(visitor);
-            value.trace_value_slots(visitor);
+            key.trace_value_slot_mut(visitor);
+            value.trace_value_slot_mut(visitor);
         };
         reserve_map_for_target_len_with_roots(map, heap, target_len, &mut reserve_roots)?;
     }
+
+    let k = MapKey::from_value(&key, heap);
+    let existing_idx = heap.read_payload(*map, |body| map_find_entry(body, &k, heap));
     let exists = existing_idx.is_some();
     heap.with_payload(*map, |body| match existing_idx {
         Some(idx) => body.entries[idx].value = Some(value),
@@ -514,9 +526,9 @@ pub(crate) fn map_set_with_roots(
         }
     });
     if !exists {
-        heap.record_write(*map, &barrier_key);
+        heap.record_write(*map, &key);
     }
-    heap.record_write(*map, &barrier_value);
+    heap.record_write(*map, &value);
     Ok(())
 }
 
@@ -783,28 +795,32 @@ pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
 pub fn set_add(
     mut set: JsSet,
     heap: &mut otter_gc::GcHeap,
-    value: Value,
+    mut value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
     if set_is_readonly(set, heap) {
         return Ok(());
     }
-    let barrier_value = value;
-    let k = MapKey::from_value(&value, heap);
-    let exists = heap.read_payload(set, |body| set_find_entry(body, &k, heap).is_some());
-    if !exists {
+    let lookup_key = MapKey::from_value(&value, heap);
+    let needs_insert = heap.read_payload(set, |body| {
+        set_find_entry(body, &lookup_key, heap).is_none()
+    });
+    if needs_insert {
         let target_len = heap.read_payload(set, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            value.trace_value_slots(visitor);
+            value.trace_value_slot_mut(visitor);
         };
         reserve_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
     }
+
+    let k = MapKey::from_value(&value, heap);
+    let exists = heap.read_payload(set, |body| set_find_entry(body, &k, heap).is_some());
     if !exists {
         heap.with_payload(set, |body| {
             let new_idx = body.entries.len();
             set_index_insert(body, &k, new_idx);
             body.entries.push(SetEntry::live(k, value));
         });
-        heap.record_write(set, &barrier_value);
+        heap.record_write(set, &value);
     }
     Ok(())
 }
@@ -813,30 +829,34 @@ pub fn set_add(
 pub(crate) fn set_add_with_roots(
     set: &mut JsSet,
     heap: &mut otter_gc::GcHeap,
-    value: Value,
+    mut value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     if set_is_readonly(*set, heap) {
         return Ok(());
     }
-    let barrier_value = value;
-    let k = MapKey::from_value(&value, heap);
-    let exists = heap.read_payload(*set, |body| set_find_entry(body, &k, heap).is_some());
-    if !exists {
+    let lookup_key = MapKey::from_value(&value, heap);
+    let needs_insert = heap.read_payload(*set, |body| {
+        set_find_entry(body, &lookup_key, heap).is_none()
+    });
+    if needs_insert {
         let target_len = heap.read_payload(*set, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
-            value.trace_value_slots(visitor);
+            value.trace_value_slot_mut(visitor);
         };
         reserve_set_for_target_len_with_roots(set, heap, target_len, &mut reserve_roots)?;
     }
+
+    let k = MapKey::from_value(&value, heap);
+    let exists = heap.read_payload(*set, |body| set_find_entry(body, &k, heap).is_some());
     if !exists {
         heap.with_payload(*set, |body| {
             let new_idx = body.entries.len();
             set_index_insert(body, &k, new_idx);
             body.entries.push(SetEntry::live(k, value));
         });
-        heap.record_write(*set, &barrier_value);
+        heap.record_write(*set, &value);
     }
     Ok(())
 }

@@ -75,13 +75,13 @@ impl Interpreter {
                 callee,
             )
         };
-        let anchor_base = self.module_root_depth();
+        let elements_len = elements.len();
         let callee_anchor = self.push_iteration_anchor(callee) - 1;
-        let elements_start = self.module_root_depth();
+        let anchor_base = callee_anchor;
+        let elements_start = callee_anchor + 1;
         for value in elements {
             self.push_iteration_anchor(value);
         }
-        let elements_len = self.module_root_depth() - elements_start;
 
         let collect = |interp: &mut Self| {
             let iterator_method = crate::object::get(interp.global_this, &interp.gc_heap, "Array")
@@ -190,14 +190,14 @@ impl Interpreter {
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
-        let anchor_base = self.module_root_depth();
+        let args_len = args.len();
         let callee_anchor = self.push_iteration_anchor(callee) - 1;
+        let anchor_base = callee_anchor;
         let this_anchor = self.push_iteration_anchor(this_value) - 1;
-        let args_start = self.module_root_depth();
+        let args_start = this_anchor + 1;
         for value in args {
             self.push_iteration_anchor(value);
         }
-        let args_len = self.module_root_depth() - args_start;
         let run = |interp: &mut Self, stack: &mut ActivationStack| {
             let callee = interp.iteration_anchor(callee_anchor);
             let this_value = interp.iteration_anchor(this_anchor);
@@ -220,14 +220,14 @@ impl Interpreter {
         new_target: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
-        let anchor_base = self.module_root_depth();
+        let args_len = args.len();
         let callee_anchor = self.push_iteration_anchor(callee) - 1;
+        let anchor_base = callee_anchor;
         let new_target_anchor = self.push_iteration_anchor(new_target) - 1;
-        let args_start = self.module_root_depth();
+        let args_start = new_target_anchor + 1;
         for value in args {
             self.push_iteration_anchor(value);
         }
-        let args_len = self.module_root_depth() - args_start;
         let run = |interp: &mut Self, stack: &mut ActivationStack| {
             let callee = interp.iteration_anchor(callee_anchor);
             let new_target = interp.iteration_anchor(new_target_anchor);

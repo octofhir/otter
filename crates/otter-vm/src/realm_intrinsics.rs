@@ -8,8 +8,9 @@
 //!
 //! # Contents
 //! - [`RealmIntrinsics`] — typed slots for `%Object.prototype%`,
-//!   `%Function.prototype%`, `%Array.prototype%`, and
-//!   `%Promise.prototype%`. Native-function-shaped constructors that
+//!   `%Function.prototype%`, `%Array.prototype%`, `%Promise.prototype%`,
+//!   and other runtime brands used by non-observable internal builders.
+//!   Native-function-shaped constructors that
 //!   are not on hot object-dispatch paths still resolve through
 //!   `NativeFunction::own_property_descriptor`.
 //!
@@ -66,6 +67,9 @@ pub(crate) struct RealmIntrinsics {
     /// step 3a) can return `undefined` instead of throwing when invoked
     /// with the prototype itself as the `this` value.
     pub regexp_prototype: Option<JsObject>,
+    /// `%Date.prototype%`. Internal clone/materialization paths use this
+    /// canonical slot instead of consulting a mutable global constructor.
+    pub date_prototype: Option<JsObject>,
     /// `%String.prototype%`. Lets a primitive-string method call resolve its
     /// builtin method through the shape-guarded own-data IC on this object
     /// instead of re-walking the constructor → prototype chain every call.
@@ -90,6 +94,7 @@ impl RealmIntrinsics {
         self.array_prototype = resolve_prototype(global, heap, "Array");
         self.promise_prototype = resolve_prototype(global, heap, "Promise");
         self.regexp_prototype = resolve_prototype(global, heap, "RegExp");
+        self.date_prototype = resolve_prototype(global, heap, "Date");
         self.string_prototype = resolve_prototype(global, heap, "String");
         self.number_prototype = resolve_prototype(global, heap, "Number");
         self.map_prototype = resolve_prototype(global, heap, "Map");
@@ -104,6 +109,7 @@ impl RealmIntrinsics {
             &self.array_prototype,
             &self.promise_prototype,
             &self.regexp_prototype,
+            &self.date_prototype,
             &self.string_prototype,
             &self.number_prototype,
             &self.map_prototype,

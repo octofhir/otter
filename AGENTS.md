@@ -330,6 +330,21 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   - The shipped step trace is versioned text and records
     interpreter-dispatched opcodes only. A `.json` extension does not change
     its format, and native JIT bodies do not currently emit step events.
+- Structured JIT events:
+  - Default artifact path:
+    `cargo run -p otter-cli -- --jit-events --jit-tier=template run <file>`
+  - Explicit path:
+    `cargo run -p otter-cli -- --jit-events=/tmp/otter-jit-events.json --jit-tier=production-tiered run <file>`
+  - `--jit-events=-` writes the JSON report to stderr. Prefer a file when the
+    program itself uses stderr or when `--json` is active.
+  - The `otterJitDebugSchemaVersion: 1` report contains typed compile,
+    inlining, bail, and inline-deopt events. Capture is default-off and bounded
+    to 16,384 events per top-level run; `truncated` and `droppedEvents` report
+    overflow without constructing further payloads.
+  - Abrupt VM completion (for example, a thrown exception after tier-up) still
+    writes the partial report. The original execution error remains primary if
+    writing that report also fails. A host command timeout can precede isolate
+    report delivery; no empty artifact is fabricated in that case.
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run`

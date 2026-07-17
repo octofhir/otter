@@ -65,6 +65,8 @@ pub struct JitExceptionRegion {
 pub struct JitCompileRequest {
     /// Code and feedback snapshot to compile.
     pub snapshot: JitCompileSnapshot,
+    /// Default-off diagnostics requested by the owning isolate.
+    pub debug: crate::jit_debug::JitDebugRequest,
     /// Loop-header logical PC for an OSR-target compile. `None` means normal
     /// function-entry compilation.
     pub osr_pc: Option<u32>,

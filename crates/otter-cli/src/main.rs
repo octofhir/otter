@@ -5,9 +5,9 @@
 //! [the public runtime architecture](../../../docs/book/src/engine/architecture.md):
 //! `run`, `<file>` shorthand, multi-file shell-style loading, `eval`,
 //! `-e`, `-p`, `check`, `test`,
-//! `install`, `add`, `remove`, `outdated`, `init`, `info`, `--dump-bytecode[=json]`. Slice tasks `09`+ extend
-//! behavior; this binary owns the argument parsing and exit-code
-//! mapping.
+//! `install`, `add`, `remove`, `outdated`, `init`, `info`,
+//! `--dump-bytecode[=json]`, and default-off structured JIT event capture.
+//! This binary owns argument parsing, artifact I/O, and exit-code mapping.
 //!
 //! # Contents
 //! - [`Cli`] — top-level [`clap`] derive struct.
@@ -33,7 +33,10 @@ use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission, SourceInput};
+use otter_runtime::{
+    CapabilitySet, DiagnosticCode, ExecutionAttempt, JitDebugReport, OtterError, Permission,
+    SourceInput,
+};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
 
@@ -96,6 +99,18 @@ struct Cli {
         global = true,
     )]
     trace: Option<String>,
+
+    /// Emit structured, schema-versioned JIT events to
+    /// `otter-jit-events.json` (or to the explicit path). `-` writes stderr.
+    #[arg(
+        long = "jit-events",
+        value_name = "path",
+        num_args = 0..=1,
+        default_missing_value = "otter-jit-events.json",
+        require_equals = true,
+        global = true,
+    )]
+    jit_events: Option<String>,
 
     /// Select the execution tiers used by runtime-backed commands.
     #[arg(long = "jit-tier", value_enum, global = true)]
@@ -483,7 +498,12 @@ async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse();
     startup_timer.mark("parse_args");
-    let execution = CliExecutionConfig::new(cli.timeout_secs, cli.trace.clone(), cli.jit_tier);
+    let execution = CliExecutionConfig::new(
+        cli.timeout_secs,
+        cli.trace.clone(),
+        cli.jit_tier,
+        cli.jit_events.clone(),
+    );
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();
@@ -694,7 +714,8 @@ async fn run_file_with_cwd(
     }
     let otter = builder.build()?;
     startup_timer.mark("runtime_build");
-    let result = otter.run_file(path).await?;
+    let attempt = otter.run_file_with_diagnostics(path).await;
+    let result = finish_jit_debug_attempt(execution, attempt)?;
     startup_timer.mark("runtime_run_file");
     emit_otter_stats_if_requested(&result);
     if json {
@@ -746,7 +767,8 @@ async fn run_file_with_cpu_profile(
     let mut runtime = builder.build()?;
     startup_timer.mark("runtime_build");
     runtime.enable_cpu_profiler(profile_options.interval);
-    let result = runtime.run_file(path)?;
+    let attempt = runtime.run_file_with_diagnostics(path);
+    let result = finish_jit_debug_attempt(execution, attempt)?;
     startup_timer.mark("runtime_run_file");
     let profile = runtime
         .take_cpu_profile()
@@ -964,6 +986,83 @@ fn emit_otter_stats_if_requested(result: &otter_runtime::ExecutionResult) {
     eprintln!("{payload}");
 }
 
+fn finish_jit_debug_attempt(
+    execution: &CliExecutionConfig,
+    attempt: ExecutionAttempt,
+) -> Result<otter_runtime::ExecutionResult, OtterError> {
+    let (result, report) = attempt.into_parts();
+    match result {
+        Ok(result) => {
+            write_jit_debug_report_if_requested(execution, report)?;
+            Ok(result)
+        }
+        Err(error) => {
+            // The execution error remains primary if persisting its partial
+            // diagnostics also fails.
+            if report.is_some() {
+                let _ = write_jit_debug_report_if_requested(execution, report);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn finish_aggregated_jit_debug_attempt(
+    execution: &CliExecutionConfig,
+    attempt: ExecutionAttempt,
+    aggregate: &mut Option<JitDebugReport>,
+) -> Result<otter_runtime::ExecutionResult, OtterError> {
+    let (result, report) = attempt.into_parts();
+    if execution.jit_events_enabled()
+        && let Some(report) = report
+    {
+        *aggregate = Some(match aggregate.take() {
+            Some(existing) => existing.merged(report),
+            None => report,
+        });
+    }
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) => Err(flush_aggregated_jit_debug_on_error(
+            execution, aggregate, error,
+        )),
+    }
+}
+
+fn flush_aggregated_jit_debug_on_error(
+    execution: &CliExecutionConfig,
+    aggregate: &mut Option<JitDebugReport>,
+    error: OtterError,
+) -> OtterError {
+    // A later timeout, queue failure, or local input error may have no isolate
+    // report of its own. Earlier completed commands still produced valid
+    // diagnostics, so retain them while keeping the execution error primary.
+    if aggregate.is_some() {
+        let _ = write_jit_debug_report_if_requested(execution, aggregate.take());
+    }
+    error
+}
+
+fn write_jit_debug_report_if_requested(
+    execution: &CliExecutionConfig,
+    report: Option<JitDebugReport>,
+) -> Result<(), OtterError> {
+    if !execution.jit_events_enabled() {
+        return Ok(());
+    }
+    let report = report.unwrap_or_else(|| JitDebugReport::from_events(Vec::new()));
+    execution
+        .write_jit_debug_report(&report)
+        .map_err(jit_debug_write_error)
+}
+
+fn jit_debug_write_error(err: std::io::Error) -> OtterError {
+    OtterError::Internal {
+        code: "JIT_DEBUG_WRITE".to_string(),
+        message: err.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunScriptInvocation {
     path: PathBuf,
@@ -1171,10 +1270,16 @@ async fn run_script_file_sequence(
     startup_timer.mark("runtime_build");
 
     let mut final_result = None;
+    let mut jit_report = None;
     for path in paths {
-        let source = SourceInput::from_path(path)?;
+        let source = SourceInput::from_path(path).map_err(|error| {
+            flush_aggregated_jit_debug_on_error(execution, &mut jit_report, error)
+        })?;
         let specifier = path.to_string_lossy().to_string();
-        let result = otter.run_script_source(source, &specifier).await?;
+        let attempt = otter
+            .run_script_source_with_diagnostics(source, &specifier)
+            .await;
+        let result = finish_aggregated_jit_debug_attempt(execution, attempt, &mut jit_report)?;
         startup_timer.mark("runtime_run_script_file");
         emit_otter_stats_if_requested(&result);
         let exit_code = result.exit_code();
@@ -1185,6 +1290,7 @@ async fn run_script_file_sequence(
     }
 
     let result = final_result.expect("non-empty sequence produced a result");
+    write_jit_debug_report_if_requested(execution, jit_report)?;
     if json {
         println!(
             "{}",
@@ -1528,7 +1634,8 @@ async fn run_eval(
 ) -> Result<ExitCode, OtterError> {
     let otter = cli_otter_builder(caps, execution).build()?;
     startup_timer.mark("runtime_build");
-    let result = otter.eval(source).await?;
+    let attempt = otter.eval_with_diagnostics(source).await;
+    let result = finish_jit_debug_attempt(execution, attempt)?;
     startup_timer.mark("runtime_eval");
     if print {
         println!("{}", result.completion_string());
@@ -1687,13 +1794,18 @@ async fn run_node_tests(
     }
 
     let mut failed = false;
+    let mut jit_report = None;
     for file in files {
         let otter = cli_otter_builder(caps, execution)
             .process_argv(process_argv_for_file(&file, &[]))
             .module_loader(cli_loader_config_for_entry(&file).await)
-            .build()?;
+            .build()
+            .map_err(|error| {
+                flush_aggregated_jit_debug_on_error(execution, &mut jit_report, error)
+            })?;
         startup_timer.mark("runtime_build");
-        let result = otter.run_file(&file).await?;
+        let attempt = otter.run_file_with_diagnostics(&file).await;
+        let result = finish_aggregated_jit_debug_attempt(execution, attempt, &mut jit_report)?;
         startup_timer.mark("runtime_run_file");
         let exit_code = result.exit_code();
         if exit_code != 0 {
@@ -1710,6 +1822,7 @@ async fn run_node_tests(
             );
         }
     }
+    write_jit_debug_report_if_requested(execution, jit_report)?;
 
     Ok(if failed {
         ExitCode::from(1)

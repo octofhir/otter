@@ -18,12 +18,16 @@
 //! - Command replies carry only owned public data.
 //! - Dropping a waiting future does not drop the isolate mid-turn; the
 //!   runner observes the cancelled reply channel at the completion point.
+//! - Public commands never execute recursively. Commands received while the
+//!   current turn drains Ref'd work are deferred in FIFO order, and the shared
+//!   queue bound accounts for both channel-resident and deferred commands.
 //!
 //! # See also
 //!
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 //! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -41,8 +45,8 @@ use crate::runtime_activity::{
     RuntimeActivityAccounting, RuntimeKeepAlive, RuntimeTask, RuntimeTaskQueue, RuntimeTaskSpawner,
 };
 use crate::{
-    DiagnosticCode, DynamicImportBegin, ExecutionResult, OtterError, Runtime, RuntimeConfig,
-    SourceInput, TimerFireOutcome,
+    DiagnosticCode, DynamicImportBegin, ExecutionAttempt, ExecutionResult, OtterError, Runtime,
+    RuntimeConfig, SourceInput, TimerFireOutcome,
 };
 use otter_vm::{DynamicImportLoader, TimerScheduler};
 
@@ -51,7 +55,7 @@ use crate::promise_registry::{HostSettleOutcome, PromiseId};
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
 const ISOLATE_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-type RunReply = oneshot::Sender<Result<ExecutionResult, OtterError>>;
+type RunReply = oneshot::Sender<ExecutionAttempt>;
 type CheckReply = oneshot::Sender<Result<(), OtterError>>;
 
 type CommandId = u64;
@@ -133,6 +137,7 @@ struct RuntimeHandleInner {
     event_loop: TokioEventLoop,
     interrupt: otter_vm::InterruptFlag,
     command_timeout: Duration,
+    command_capacity: usize,
     counters: Arc<RuntimeCounters>,
 }
 
@@ -398,6 +403,7 @@ impl RuntimeHandle {
             event_loop,
             interrupt,
             command_timeout,
+            command_capacity: capacity,
             counters,
         });
         Ok(Self { inner })
@@ -408,13 +414,20 @@ impl RuntimeHandle {
     /// # Errors
     /// See [`OtterError`].
     pub async fn run_file(&self, path: impl Into<PathBuf>) -> Result<ExecutionResult, OtterError> {
+        self.run_file_with_diagnostics(path).await.into_result()
+    }
+
+    /// Run a file and retain partial JIT diagnostics on abrupt failure.
+    pub async fn run_file_with_diagnostics(&self, path: impl Into<PathBuf>) -> ExecutionAttempt {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        self.submit(RuntimeMessage::Command(RuntimeCommand::RunFile {
+        if let Err(error) = self.submit(RuntimeCommand::RunFile {
             id,
             path: path.into(),
             reply,
-        }))?;
+        }) {
+            return ExecutionAttempt::from_result(Err(error), None);
+        }
         self.await_run_reply(rx).await
     }
 
@@ -426,11 +439,11 @@ impl RuntimeHandle {
     pub async fn check_file(&self, path: impl Into<PathBuf>) -> Result<(), OtterError> {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        self.submit(RuntimeMessage::Command(RuntimeCommand::CheckFile {
+        self.submit(RuntimeCommand::CheckFile {
             id,
             path: path.into(),
             reply,
-        }))?;
+        })?;
         self.await_check_reply(rx).await
     }
 
@@ -444,14 +457,27 @@ impl RuntimeHandle {
         source: SourceInput,
         specifier: impl Into<String>,
     ) -> Result<ExecutionResult, OtterError> {
+        self.run_script_with_diagnostics(source, specifier)
+            .await
+            .into_result()
+    }
+
+    /// Run a source bundle and retain partial JIT diagnostics on failure.
+    pub async fn run_script_with_diagnostics(
+        &self,
+        source: SourceInput,
+        specifier: impl Into<String>,
+    ) -> ExecutionAttempt {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        self.submit(RuntimeMessage::Command(RuntimeCommand::RunScript {
+        if let Err(error) = self.submit(RuntimeCommand::RunScript {
             id,
             source,
             specifier: specifier.into(),
             reply,
-        }))?;
+        }) {
+            return ExecutionAttempt::from_result(Err(error), None);
+        }
         self.await_run_reply(rx).await
     }
 
@@ -463,13 +489,20 @@ impl RuntimeHandle {
         &self,
         path: impl Into<PathBuf>,
     ) -> Result<ExecutionResult, OtterError> {
+        self.run_module_with_diagnostics(path).await.into_result()
+    }
+
+    /// Run a module and retain partial JIT diagnostics on abrupt failure.
+    pub async fn run_module_with_diagnostics(&self, path: impl Into<PathBuf>) -> ExecutionAttempt {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        self.submit(RuntimeMessage::Command(RuntimeCommand::RunModule {
+        if let Err(error) = self.submit(RuntimeCommand::RunModule {
             id,
             path: path.into(),
             reply,
-        }))?;
+        }) {
+            return ExecutionAttempt::from_result(Err(error), None);
+        }
         self.await_run_reply(rx).await
     }
 
@@ -478,13 +511,16 @@ impl RuntimeHandle {
     /// # Errors
     /// See [`OtterError`].
     pub async fn eval(&self, source: SourceInput) -> Result<ExecutionResult, OtterError> {
+        self.eval_with_diagnostics(source).await.into_result()
+    }
+
+    /// Evaluate a source bundle and retain partial JIT diagnostics on failure.
+    pub async fn eval_with_diagnostics(&self, source: SourceInput) -> ExecutionAttempt {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
-        self.submit(RuntimeMessage::Command(RuntimeCommand::Eval {
-            id,
-            source,
-            reply,
-        }))?;
+        if let Err(error) = self.submit(RuntimeCommand::Eval { id, source, reply }) {
+            return ExecutionAttempt::from_result(Err(error), None);
+        }
         self.await_run_reply(rx).await
     }
 
@@ -782,19 +818,33 @@ impl RuntimeHandle {
         self.inner.event_loop.block_on(future)
     }
 
-    fn submit(&self, msg: RuntimeMessage) -> Result<(), OtterError> {
+    fn submit(&self, command: RuntimeCommand) -> Result<(), OtterError> {
         if self.inner.counters.shutdown.load(Ordering::Relaxed) {
             return Err(OtterError::Internal {
                 code: DiagnosticCode::RuntimeShutdown.as_str().to_string(),
                 message: "runtime handle is shut down".to_string(),
             });
         }
-        match self.inner.tx.try_send(msg) {
+        if self
+            .inner
+            .counters
+            .queued_commands
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                (queued < self.inner.command_capacity).then_some(queued + 1)
+            })
+            .is_err()
+        {
+            self.inner
+                .counters
+                .backpressure_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(OtterError::Internal {
+                code: DiagnosticCode::RuntimeBackpressure.as_str().to_string(),
+                message: "runtime command queue is full".to_string(),
+            });
+        }
+        match self.inner.tx.try_send(RuntimeMessage::Command(command)) {
             Ok(()) => {
-                self.inner
-                    .counters
-                    .queued_commands
-                    .fetch_add(1, Ordering::Relaxed);
                 self.inner
                     .counters
                     .submitted_commands
@@ -804,6 +854,10 @@ impl RuntimeHandle {
             Err(TrySendError::Full(_)) => {
                 self.inner
                     .counters
+                    .queued_commands
+                    .fetch_sub(1, Ordering::Relaxed);
+                self.inner
+                    .counters
                     .backpressure_rejections
                     .fetch_add(1, Ordering::Relaxed);
                 Err(OtterError::Internal {
@@ -811,17 +865,20 @@ impl RuntimeHandle {
                     message: "runtime command queue is full".to_string(),
                 })
             }
-            Err(TrySendError::Disconnected(_)) => Err(OtterError::Internal {
-                code: DiagnosticCode::RuntimeClosed.as_str().to_string(),
-                message: "runtime isolate has stopped".to_string(),
-            }),
+            Err(TrySendError::Disconnected(_)) => {
+                self.inner
+                    .counters
+                    .queued_commands
+                    .fetch_sub(1, Ordering::Relaxed);
+                Err(OtterError::Internal {
+                    code: DiagnosticCode::RuntimeClosed.as_str().to_string(),
+                    message: "runtime isolate has stopped".to_string(),
+                })
+            }
         }
     }
 
-    async fn await_run_reply(
-        &self,
-        rx: oneshot::Receiver<Result<ExecutionResult, OtterError>>,
-    ) -> Result<ExecutionResult, OtterError> {
+    async fn await_run_reply(&self, rx: oneshot::Receiver<ExecutionAttempt>) -> ExecutionAttempt {
         let timeout = self.inner.command_timeout;
         let outcome = if timeout == Duration::ZERO {
             rx.await
@@ -838,29 +895,35 @@ impl RuntimeHandle {
                         .failed_commands
                         .fetch_add(1, Ordering::Relaxed);
                     self.interrupt();
-                    return Err(OtterError::timeout_after(timeout));
+                    return ExecutionAttempt::from_result(
+                        Err(OtterError::timeout_after(timeout)),
+                        None,
+                    );
                 }
             }
         };
         match outcome {
-            Ok(Ok(result)) => {
-                self.inner
-                    .counters
-                    .completed_commands
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(result)
+            Ok(attempt) => {
+                if attempt.result().is_ok() {
+                    self.inner
+                        .counters
+                        .completed_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.inner
+                        .counters
+                        .failed_commands
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                attempt
             }
-            Ok(Err(err)) => {
-                self.inner
-                    .counters
-                    .failed_commands
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(err)
-            }
-            Err(_) => Err(OtterError::Internal {
-                code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
-                message: "runtime isolate dropped command reply".to_string(),
-            }),
+            Err(_) => ExecutionAttempt::from_result(
+                Err(OtterError::Internal {
+                    code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
+                    message: "runtime isolate dropped command reply".to_string(),
+                }),
+                None,
+            ),
         }
     }
 
@@ -970,6 +1033,7 @@ fn run_isolate(
         tx: scheduler_tx,
         counters,
         https_module_fetcher,
+        deferred_commands: VecDeque::new(),
         shutdown: false,
     };
     runner.run_until_idle();
@@ -1215,6 +1279,7 @@ struct IsolateRunner {
     tx: SyncSender<RuntimeMessage>,
     counters: Arc<RuntimeCounters>,
     https_module_fetcher: HttpsModuleFetcherHandle,
+    deferred_commands: VecDeque<RuntimeCommand>,
     shutdown: bool,
 }
 
@@ -1226,6 +1291,9 @@ enum TickOutcome {
 
 impl IsolateRunner {
     fn poll_one_tick(&mut self) -> TickOutcome {
+        if let Some(command) = self.deferred_commands.pop_front() {
+            return self.process_message(RuntimeMessage::Command(command));
+        }
         let msg = match self.rx.try_recv() {
             Ok(msg) => msg,
             Err(std::sync::mpsc::TryRecvError::Empty) => return TickOutcome::Idle,
@@ -1275,6 +1343,9 @@ impl IsolateRunner {
                 let id = command.id();
                 self.run_command(command);
                 self.record_microtask_snapshot();
+                if self.shutdown {
+                    return TickOutcome::Shutdown;
+                }
                 if id == 0 {
                     return TickOutcome::Idle;
                 }
@@ -1446,7 +1517,8 @@ impl IsolateRunner {
             RuntimeCommand::RunFile { path, reply, .. } => {
                 let result = self.runtime.run_file(path);
                 let result = self.drive_event_loop_to_idle(result);
-                send_run_reply(reply, result, &self.counters);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::RunScript {
                 source,
@@ -1456,17 +1528,20 @@ impl IsolateRunner {
             } => {
                 let result = self.runtime.run_script(source, &specifier);
                 let result = self.drive_event_loop_to_idle(result);
-                send_run_reply(reply, result, &self.counters);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::RunModule { path, reply, .. } => {
                 let result = self.runtime.run_module(path);
                 let result = self.drive_event_loop_to_idle(result);
-                send_run_reply(reply, result, &self.counters);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
             }
             RuntimeCommand::Eval { source, reply, .. } => {
                 let result = self.runtime.eval(source);
                 let result = self.drive_event_loop_to_idle(result);
-                send_run_reply(reply, result, &self.counters);
+                let attempt = self.runtime.finish_jit_debug_attempt(result);
+                send_run_reply(reply, attempt, &self.counters);
             }
         }
         self.counters
@@ -1503,12 +1578,19 @@ impl IsolateRunner {
             if pending_ref_timers == 0 && pending_ref_host_ops == 0 {
                 return initial;
             }
-            // Block on the next inbox item — TimerFired /
-            // HostOpCompleted / a follow-up Command. Bailing on
-            // Shutdown short-circuits the loop.
+            // Block on the next inbox item. A later public command is deferred
+            // until this command's Ref'd work finishes: recursively running it
+            // would interleave isolate state and diagnostics batches.
             let msg = match self.rx.recv() {
                 Ok(msg) => msg,
                 Err(_) => return initial,
+            };
+            let msg = match msg {
+                RuntimeMessage::Command(command) => {
+                    self.deferred_commands.push_back(command);
+                    continue;
+                }
+                other => other,
             };
             if matches!(self.process_message(msg), TickOutcome::Shutdown) {
                 return initial;
@@ -1539,11 +1621,7 @@ impl RuntimeCommand {
     }
 }
 
-fn send_run_reply(
-    reply: RunReply,
-    result: Result<ExecutionResult, OtterError>,
-    counters: &RuntimeCounters,
-) {
+fn send_run_reply(reply: RunReply, result: ExecutionAttempt, counters: &RuntimeCounters) {
     if reply.send(result).is_err() {
         counters.cancelled_waiters.fetch_add(1, Ordering::Relaxed);
     }
@@ -1580,4 +1658,47 @@ fn decrement_liveness(
         RuntimeLiveness::Unref => unref_counter,
     };
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_last_handle_during_referenced_work_does_not_deadlock() {
+        let handle = RuntimeHandle::spawn(RuntimeConfig::default()).expect("runtime handle");
+        let _timer = handle.schedule_timer(TimerRequest {
+            delay: Duration::from_secs(60),
+            repeat: None,
+        });
+        let (reply, reply_rx) = oneshot::channel();
+        let id = handle.next_command_id();
+        handle
+            .submit(RuntimeCommand::RunScript {
+                id,
+                source: SourceInput::from_javascript("1;"),
+                specifier: "<shutdown-with-ref-work>".to_string(),
+                reply,
+            })
+            .expect("submit command");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !handle.activity_stats().running_command {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command never entered the isolate"
+            );
+            std::thread::yield_now();
+        }
+        drop(reply_rx);
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(handle);
+            let _ = dropped_tx.send(());
+        });
+        dropped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("last handle drop must join the isolate without deadlocking");
+    }
 }

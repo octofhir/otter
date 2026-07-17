@@ -113,6 +113,7 @@ mod jit_class_ops;
 mod jit_class_value_ops;
 mod jit_construct_ops;
 mod jit_control_ops;
+pub mod jit_debug;
 mod jit_delete_ops;
 mod jit_exception_ops;
 /// Compatibility path for JIT consumers while feedback ownership migrates to
@@ -244,6 +245,10 @@ pub use jit::{
     JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
     JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
     JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
+};
+pub use jit_debug::{
+    JIT_DEBUG_EVENT_LIMIT, JIT_DEBUG_SCHEMA_VERSION, JitDebugCompileOutcome, JitDebugEvent,
+    JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitInlineRejectionReason,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,
@@ -889,6 +894,9 @@ pub struct Interpreter {
     /// `Some` is also the tier-up gate: with no hook installed, all tier-up
     /// bookkeeping below stays untouched and execution is interpreter-only.
     jit_hook: Option<std::sync::Arc<dyn jit::JitCompilerHook>>,
+    /// Owned, default-off JIT diagnostics. Enabled state retains only plain
+    /// serializable data and never participates in the GC root graph.
+    jit_debug: jit_debug::JitDebugState,
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,

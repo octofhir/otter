@@ -2,10 +2,10 @@
 title: "Step Trace"
 ---
 
-Otter ships a per-instruction execution trace. Every dispatched
-opcode produces one canonical line of text. Embedders install the
-tracer once; the dispatch loop pays a single `Option` discriminant
-check per instruction when no tracer is installed.
+Otter ships a per-instruction interpreter execution trace. Every opcode
+dispatched by the bytecode interpreter produces one canonical line of text.
+Embedders install the tracer once; each dispatch run probes for its presence
+once and uses a hoisted boolean gate at each bytecode instruction.
 
 ## CLI
 
@@ -15,11 +15,11 @@ otter --trace=trace.log run path/to/script.ts
 otter --trace=- path/to/script.ts        # shorthand form
 ```
 
-`--trace` writes to stderr; `--trace=<path>` opens the file
-truncating any existing contents. The flag is available on every
-subcommand because the trace gate lives on the runtime; the same
-flag works for `run`, the positional shorthand, and `eval` /
-`-e` / `-p`.
+`--trace` writes to stderr; `--trace=<path>` opens the file truncating any
+existing contents. The flag is global syntactically and affects execution
+paths that construct the runtime: `run`, the positional shorthand, and
+`eval` / `-e` / `-p`, plus files executed by `test`. Package-management and
+information commands do not execute bytecode and therefore emit no step trace.
 
 ## Format
 
@@ -74,12 +74,28 @@ directly — useful for in-process collectors, structured-logging
 adapters, or debugger UIs. The factory runs once on the isolate
 runner thread immediately after the interpreter is constructed.
 
+## JIT Visibility
+
+The step trace is an interpreter trace, not a native instruction trace.
+Template and optimizing JIT bodies do not emit one event per native
+instruction. A hot function may therefore show its interpreter warmup, then
+an otherwise unexplained gap while its native body executes, until control
+returns to the interpreter.
+
+Use the trace to establish bytecode order and the last interpreter-visible
+PC. It cannot yet explain native instruction selection, register allocation,
+safepoints, or the exact JIT offset of a deopt. Versioned JIT artifact bundles
+and annotated ARM64 assembly are tracked in
+`DEBUG_TRACE_PROFILING_PLAN.md`; they will be documented here only after the
+CLI surface exists.
+
 ## Performance
 
-When no tracer is installed the dispatch loop executes a single
-`Option::is_some` branch per instruction. Branch prediction keeps
-the off-path effectively free; benchmark suites under
-`crates/otter-vm/benches/` are unchanged.
+When no tracer is installed a dispatch run performs one hoisted tracer
+presence probe and its loop executes one false boolean gate per interpreter
+instruction. The tracer does not format events or call a sink on that path.
+Its exact overhead must still be measured on the release benchmark baseline
+rather than assumed.
 
 When a tracer is installed the per-instruction work is one
 `StepEvent` build (stack-only) plus one `on_step` virtual call.

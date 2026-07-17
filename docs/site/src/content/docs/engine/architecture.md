@@ -118,16 +118,24 @@ allocation deltas, duplicate-name validation, and per-entry timing.
 
 ## Debug Workflows
 
-Use the existing machine-readable trace and profiling outputs when
-debugging engine behavior:
+The shipped engine diagnostics are deliberately default-off:
 
-- VM instruction trace for stuck bytecode loops;
-- timeout dumps for hangs;
-- Chrome/Perfetto async trace for host-op scheduling;
-- Chrome/V8 `.cpuprofile` plus folded stacks for CPU work.
+- text or JSON bytecode disassembly for compiler output;
+- a versioned text [step trace](/otter/engine/step-trace/) for
+  interpreter-dispatched bytecode;
+- Chrome/V8 `.cpuprofile` plus folded stacks from the bytecode-dispatch
+  sampler;
+- embedder snapshots for inline caches, shapes, frames, heap summaries, and
+  Chrome `.heapsnapshot` output.
 
-New debug/profiling features should stay default-off and should use
-standard output formats where possible.
+The current step trace and CPU sampler do not observe instructions executing
+inside native JIT bodies. JIT artifact bundles, annotated assembly,
+Chrome/Perfetto async traces, and timeout ring-buffer dumps are roadmap work,
+not shipped CLI features.
+
+New debug/profiling features must stay default-off and use standard output
+formats where possible. The implementation order and artifact contract live
+in the repository root `DEBUG_TRACE_PROFILING_PLAN.md`.
 
 Documentation for stable contributor workflows belongs in this book.
 Historical task and ADR files are not part of the living contributor docs.

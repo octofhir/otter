@@ -315,64 +315,51 @@ Pure Rust implementation - no external JavaScript engine dependencies.
 
 ## Debugging
 
-- Logs: CLI uses `tracing`; try `RUST_LOG=debug cargo run -p otter-cli -- run examples/basic.ts`.
 - Long-running scripts/servers: use `--timeout 0` (disables the timeout).
 - When editing embedded JS shims: they are compiled in via `include_str!` and passed through `CString::new(...)` (no `\0` bytes).
-- VM instruction trace for a script (full trace to file):
-  - `cargo run -p otter-cli -- run <file> --trace --trace-file otter-trace.txt`
-  - Optional: `--trace-filter "<regex>" --trace-timing`
-  - Use `.json` extension for Chrome Trace format: `--trace-file otter-trace.json`
-  - CI/E2E compatibility check: `cargo test -p otter-cli trace_e2e_generates_chrome_perfetto_compatible_json`
+- Bytecode disassembly (compile and exit):
+  - Text: `cargo run -p otter-cli -- --dump-bytecode <file>`
+  - JSON: `cargo run -p otter-cli -- --dump-bytecode=json <file>`
+- VM step trace for a script:
+  - Stderr: `cargo run -p otter-cli -- --trace=- run <file>`
+  - File: `cargo run -p otter-cli -- --trace=otter-trace.txt run <file>`
+  - The shipped step trace is versioned text and records
+    interpreter-dispatched opcodes only. A `.json` extension does not change
+    its format, and native JIT bodies do not currently emit step events.
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run`
   - Produces both `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph.pl).
-  - Stack samples are captured by an opt-in VM dispatch sampler from live VM frames; `--cpu-prof-interval` is bytecode dispatch ticks between sample attempts.
+  - Stack samples are captured by an opt-in bytecode-dispatch sampler from live
+    VM frames. Native JIT execution is currently a sampling blind spot.
   - Baseline overhead sanity check (`cpu-prof` should stay opt-in): compare `/usr/bin/time -p target/release/otter run <file>` vs `/usr/bin/time -p target/release/otter run --cpu-prof --cpu-prof-dir /tmp/otter-prof <file>` and watch `real` / `sys` delta.
   - Script args are forwarded to `process.argv`: `cargo run -p otter-cli -- run benchmarks/cpu/flamegraph.ts math 2`
   - Shorthand mode also forwards args: `cargo run -p otter-cli -- benchmarks/cpu/flamegraph.ts json 1`
-- Async/op trace (Chrome/Perfetto compatible):
-  - `cargo run -p otter-cli -- run <file> --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
-  - Produces `.trace.json` with `traceEvents` and categories (`timers`, `fetch`, `fs`, `net`, `jobs`, `modules`, `ops`).
-  - Async op hops are linked via `args.parentId`/`args.spanId` (dispatch span on VM thread, worker span on async task).
-- Combined profiling run (CPU + async trace):
-  - `cargo run -p otter-cli -- run <file> --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
-  - Use `--timeout 0` for long benchmarks to avoid default CLI timeout truncating profiles.
-- Timeout-focused debug dump (ring buffer snapshot):
-  - `cargo run -p otter-cli -- run <file> --timeout 20 --dump-on-timeout --dump-file timeout-dump.txt --dump-buffer-size 100`
-  - For heavy JSON/object workloads, start with `--dump-buffer-size 10` to keep timeout diagnostics responsive.
-  - Trace modified-register values are preview-capped (160 chars) to avoid oversized timeout dumps.
-  - Reproducibility guard (stable opcode sequence across repeated interrupted runs): `cargo test -p otter-cli timeout_dump_is_reproducible_for_immediate_interrupt`
-- Test262 trace workflow:
-  - Full trace: `cargo run -p otter-test262 -- run --filter "<pattern>" --trace`
-  - Save trace only on failures: `cargo run -p otter-test262 -- run --filter "<pattern>" --trace --trace-failures-only`
-  - Save trace only on timeouts: `cargo run -p otter-test262 -- run --filter "<pattern>" --trace --trace-timeouts-only`
-- Test262 watchdog dumps (for hangs):
-  - Run: `cargo run -p otter-test262 -- --filter <pattern> --verbose --timeout 20`
-  - On timeout the runner prints `WATCHDOG: ...` with `stack_depth`, `try_stack_depth`, `pc`, `instruction`, `function_index`, `function_name`, and `module_url`.
-  - `module_url=setup-<extension>-<idx>.js` means the hang is in extension JS (e.g., `setup-builtins-1.js` → `builtins.js`, `setup-test262-1.js` → `assert.js`).
-  - `module_url=main.js` is the test body.
-  - `instruction=` is the bytecode at the current `pc` and helps pinpoint loops or stuck ops.
-- Trace schema fields:
-  - VM instruction trace JSON includes `otterTraceSchemaVersion` + `traceEvents`.
-  - Async trace JSON includes `otterAsyncTraceSchemaVersion` + `traceEvents`.
-  - Async trace parent/count validation: run the relevant runtime profiling tests when that coverage changes.
+- Test262 timeout triage:
+  - `cargo run -p otter-test262 -- run --filter "<pattern>" --timeout 20000`
+  - `--timeout` is milliseconds (maximum 30000). Timeouts are recorded in the
+    result; failure/timeout trace capture is planned but not yet implemented.
+- Embedder-only inspector APIs currently expose IC, shape-transition, frame,
+  heap-summary, and Chrome `.heapsnapshot` snapshots. See the docs-site
+  [Step Trace](docs/site/src/content/docs/engine/step-trace.md) page.
 
 ### Debug Workflows (engine improvement)
 
 - Timeout/hang triage:
-  - First run timeout dump: `cargo run -p otter-cli -- run <file> --timeout 20 --dump-on-timeout --dump-file timeout-dump.txt --dump-buffer-size 100`
-  - If workload includes large JSON/string values, retry with `--dump-buffer-size 10` before increasing it.
-  - Then narrow with filtered full trace: `cargo run -p otter-cli -- run <file> --trace --trace-file otter-trace.json --trace-filter "<module|function>"`
-  - Focus on `pc`, `instruction`, and `module_url` to identify VM loop vs extension/bootstrap lockup.
+  - Bound the run with `--timeout <seconds>`.
+  - Capture the current text step trace with `--trace=<path>`.
+  - Correlate the final `pc`/opcode with `--dump-bytecode`.
+  - Timeout ring-buffer dumps and trace filtering are roadmap items, not
+    current CLI flags.
 - CPU hotspot triage:
   - Capture profile: `cargo run -p otter-cli -- run benchmarks/cpu/flamegraph.ts <mode> <scale> --timeout 0 --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Inspect `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph).
-  - Compare hottest frames before/after optimization patches; do not rely only on total runtime.
-- Async latency/scheduling triage:
-  - Capture async trace: `cargo run -p otter-cli -- run <file> --timeout 0 --async-trace --async-trace-file /tmp/otter-prof/run.trace.json`
-  - Validate category distribution (`timers`, `jobs`, `fs`, `net`, `fetch`, `modules`, `ops`) and span closure behavior.
-  - Use combined run (`--cpu-prof` + `--async-trace`) when stall source is unclear.
+  - Treat JIT-heavy profiles as incomplete until native code-range
+    symbolization lands; compare counters and wall time as supporting evidence.
+  - Compare hottest frames before/after optimization patches; do not rely only
+    on total runtime.
+- Async/host-op tracing is not implemented yet. Do not document planned flags
+  as available commands.
 
 ### Debug/Profiling Roadmap Rules
 
@@ -383,7 +370,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
   3. `DEBUG_TRACE_PROFILING_PLAN.md` status checkboxes
   4. This `AGENTS.md` section when developer workflow changes
 - Keep tooling default-off (minimal overhead unless explicitly enabled).
-- Prefer machine-readable outputs (`.trace.json`, `.cpuprofile`, `.heapsnapshot`, `.folded`) over ad-hoc text when adding new tooling.
+- Prefer machine-readable outputs (`.trace.json`, `.cpuprofile`,
+  `.heapsnapshot`, `.folded`) over ad-hoc text when adding new tooling.
 - Output compatibility is mandatory:
   - `*.trace.json` must follow Chrome Trace Event format (`traceEvents`) for DevTools/Perfetto.
   - `*.cpuprofile` must follow Chrome/V8 profile schema for DevTools/Speedscope.

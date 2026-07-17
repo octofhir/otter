@@ -32,8 +32,10 @@ pub fn url_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:url", SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:url", SHIM, module, require)
 }
 
 /// Named ESM surface used by ecosystem loaders.

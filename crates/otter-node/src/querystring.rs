@@ -10,9 +10,10 @@ const SHIM: &str = include_str!("querystring.js");
 /// CommonJS export: the `querystring` namespace.
 pub fn querystring_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:querystring", SHIM, &[("buffer", buffer)])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:querystring", SHIM, module, require)
 }

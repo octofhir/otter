@@ -2048,6 +2048,35 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::define"))
     }
 
+    /// Remove an own data property only while it still holds `expected`.
+    ///
+    /// Runtime loaders use this identity-guarded operation to roll back their
+    /// own partially published cache record without deleting a replacement
+    /// installed by re-entrant JavaScript. A matching data property is removed
+    /// even if JavaScript made it non-configurable after publication; accessors
+    /// never match or run.
+    pub fn delete_if_same(
+        &mut self,
+        object: Local<'_>,
+        key: &str,
+        expected: Local<'_>,
+    ) -> Result<bool, NativeError> {
+        let object = self
+            .raw(object)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::delete_if_same",
+                reason: "expected an ordinary object".to_string(),
+            })?;
+        let expected = self.raw(expected);
+        Ok(object::delete_if_same_data(
+            object,
+            self.ctx.heap_mut(),
+            key,
+            expected,
+        ))
+    }
+
     /// Define a symbol-keyed data property with explicit descriptor flags.
     pub fn define_symbol(
         &mut self,
@@ -2415,6 +2444,32 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         let args: smallvec::SmallVec<[Value; 8]> =
             args.iter().map(|value| self.raw(*value)).collect();
         let result = self.ctx.construct_owned(target, args)?;
+        Ok(self.value(result))
+    }
+
+    /// Run one synchronous foreign-ABI bridge against the active native
+    /// context while `input` remains rooted, then root the returned value back
+    /// in this scope.
+    ///
+    /// This deliberately narrow escape hatch exists for C ABIs such as
+    /// Node-API whose environment temporarily stores the active
+    /// [`NativeCtx`] pointer and immediately converts `input` into its own
+    /// persistent handle before any VM allocation. Ordinary Rust extensions
+    /// should use the scoped APIs directly.
+    ///
+    /// # Safety
+    /// The callback must persist or otherwise re-read `input` from a traced
+    /// root before any operation that can allocate or collect. Its returned
+    /// [`Value`] must likewise be read from a traced root after the callback's
+    /// final possible collection. The callback must not retain the context
+    /// reference or either raw value after returning.
+    pub unsafe fn with_ffi_value(
+        &mut self,
+        input: Local<'_>,
+        callback: impl FnOnce(&mut NativeCtx<'rt>, Value) -> Result<Value, NativeError>,
+    ) -> Result<Local<'scope>, NativeError> {
+        let input = self.raw(input);
+        let result = callback(self.ctx, input)?;
         Ok(self.value(result))
     }
 

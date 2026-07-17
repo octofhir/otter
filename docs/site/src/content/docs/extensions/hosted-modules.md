@@ -73,11 +73,25 @@ Rust futures.
 
 Hosted namespace installers receive the runtime's existing
 `RuntimeNativeScope`, capability set, and optional task spawner. They allocate
-the null-prototype namespace with `scope.bare_object()`, create static exports with
-`scope.native_method()` (or captured exports with `scope.native_closure()`),
-define them on the rooted namespace, and return its `RuntimeLocal`. The ESM
-loader installs, caches, and registers that namespace before closing the same
-scope; there is no second builder-owned root boundary.
+the null-prototype namespace with `scope.bare_object()`, create static exports
+with `scope.native_method()` (or captured exports with
+`scope.native_closure()`), define them on the rooted namespace, and return its
+`RuntimeLocal`. The ESM loader installs, caches, and registers that namespace
+before closing the same scope; there is no second builder-owned root boundary.
+
+A dedicated CommonJS installer uses `HostedCommonJsInstall`. It receives the
+same scope, capabilities, and task spawner plus the rooted `module` record and
+the module-local `require` function. Embedded JavaScript shims must run with
+those values instead of constructing a private dependency table. Consequently,
+every dependency uses the same canonical resolver and `require.cache`.
+
+`require.cache` is a null-prototype object whose values are live module records,
+not snapshots of `module.exports`. Each record contains `id`, `filename`,
+`exports`, and `loaded`; it is published before evaluation for circular
+dependencies. Cache hits read the record's current `exports`, so replacing
+`module.exports` before a circular back-edge is observable. Any abrupt exit
+during installation or evaluation removes the partial record, allowing a later
+`require` to retry.
 
 Receiver-backed resource objects should be created with
 `scope.host_object(data)`. Define their methods with rooted
@@ -153,6 +167,9 @@ and cross-thread `napi_threadsafe_function` delivery uses the runtime's owned
 task inbox: workers carry only owned data and persistent-root ids, then
 reacquire JS callbacks on the isolate thread. This path is exercised by a real
 pthread C fixture and `@parcel/watcher` snapshot, event, and unsubscribe flows.
+The addon loader itself runs in the CommonJS loader's existing
+`RuntimeNativeScope` and returns a rooted `RuntimeLocal`; it does not publish a
+raw moving value or open a parallel module-root boundary.
 
 Node and napi-rs themselves are not embedded. An addon must use Node-API; a
 binary linked directly against V8 or private Node internals is a different ABI

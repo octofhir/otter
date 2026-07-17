@@ -55,6 +55,7 @@ use otter_runtime::{HostedModule, OtterBuilder, RuntimeBuilder};
 pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::new_with_cjs_value("node:fs", fs::install_fs_module, fs::fs_cjs_value),
     HostedModule::new_with_cjs_value("fs", fs::install_fs_module, fs::fs_cjs_value),
+    HostedModule::cjs_only("__fsnative", fs::fs_native_cjs_value),
     HostedModule::cjs_only("node:fs/promises", fs::fs_promises_cjs_value),
     HostedModule::cjs_only("fs/promises", fs::fs_promises_cjs_value),
     HostedModule::cjs_only("node:assert", assert::assert_cjs_value),
@@ -62,6 +63,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("node:assert/strict", assert::assert_strict_cjs_value),
     HostedModule::cjs_only("assert/strict", assert::assert_strict_cjs_value),
     HostedModule::cjs_only("internal/assert/myers_diff", assert::myers_diff_cjs_value),
+    HostedModule::cjs_only("internal/assert/calltracker", assert::calltracker_cjs_value),
     HostedModule::cjs_only("internal/util", misc_modules::internal_util_cjs_value),
     HostedModule::cjs_only(
         "internal/event_target",
@@ -107,8 +109,10 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("cluster", misc_modules::cluster_cjs_value),
     HostedModule::cjs_only("node:crypto", crypto::crypto_cjs_value),
     HostedModule::cjs_only("crypto", crypto::crypto_cjs_value),
+    HostedModule::cjs_only("__cryptonative", crypto::crypto_native_cjs_value),
     HostedModule::cjs_only("node:zlib", zlib::zlib_cjs_value),
     HostedModule::cjs_only("zlib", zlib::zlib_cjs_value),
+    HostedModule::cjs_only("__zlibnative", zlib::zlib_native_cjs_value),
     HostedModule::cjs_only("node:perf_hooks", misc_modules::perf_hooks_cjs_value),
     HostedModule::cjs_only("perf_hooks", misc_modules::perf_hooks_cjs_value),
     HostedModule::cjs_only("node:v8", misc_modules::v8_cjs_value),
@@ -147,6 +151,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::new_with_cjs_value("url", url::install_url_module, url::url_cjs_value),
     HostedModule::cjs_only("node:child_process", child_process::child_process_cjs_value),
     HostedModule::cjs_only("child_process", child_process::child_process_cjs_value),
+    HostedModule::cjs_only("__cpnative", child_process::child_process_native_cjs_value),
 ];
 
 /// Return active Node hosted module installers.

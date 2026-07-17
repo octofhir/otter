@@ -9,9 +9,10 @@ const SHIM: &str = include_str!("readline.js");
 /// CommonJS export: the `readline` namespace.
 pub fn readline_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:readline", SHIM, &[("events", events)])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:readline", SHIM, module, require)
 }

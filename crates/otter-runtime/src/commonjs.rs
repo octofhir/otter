@@ -10,15 +10,19 @@
 //! # Contents
 //! - [`CjsConfig`] - capability snapshot + hosted-module list shared by all
 //!   `require` closures in a run.
-//! - [`cjs_instantiate_file`] - compile + execute one CommonJS file.
-//! - `cjs_load` - resolve builtins, files, `node_modules` packages, and native
-//!   addons, then cache and load their exports.
+//! - [`cjs_instantiate_file`] - compile + execute one CommonJS entry file.
+//! - `resolve_module` - canonical hosted/file resolution and cache keys.
+//! - `cjs_load` - load hosted modules, files, and native addons through the
+//!   shared module-record cache.
 //!
 //! # Invariants
-//! - The require cache is a plain JS object (`require.cache`), so cached
-//!   `module.exports` values stay rooted by GC. A module is inserted into the
-//!   cache *before* its body runs so circular `require` returns the partial
-//!   exports (Node behaviour).
+//! - The require cache is one null-prototype JS object exposed as
+//!   `require.cache`. Its values are live module records, never export
+//!   snapshots. Every hit, including a circular back-edge, reads the record's
+//!   current `module.exports`.
+//! - A record is inserted with `loaded = false` before evaluation. Every
+//!   abrupt completion removes that partial record before propagating the
+//!   original error, so a later `require` retries installation.
 //! - A file module or value-style hosted module is built in one
 //!   [`NativeScope`] arena. Its cache, module record, exports, dependency
 //!   values, require closure, and wrapper stay collector-rewritten until the
@@ -40,7 +44,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use otter_vm::{Local, NativeCtx, NativeScope, Value, object};
+use otter_vm::{Attr, Local, NativeCtx, NativeScope, Value, object};
 
 use crate::{
     CapabilitySet, CommonJsAddonLoader, HostedModule, RuntimeNativeError as NativeError,
@@ -63,9 +67,11 @@ pub(crate) struct CjsConfig {
 ///
 /// The shim runs through the same wrapper as a file module
 /// (`(function (exports, require, module, __filename, __dirname) { ... })`).
-/// `require` resolves only the explicitly supplied `deps` (name → value);
-/// anything else throws `Cannot find module`. `__filename`/`__dirname` are the
-/// module name (diagnostics only). Pass `&[]` for a dependency-free shim.
+/// The supplied `module` is the live record already present in the shared
+/// cache and `require` is the importing module's canonical resolver. A shim's
+/// dependency loads and `module.exports` replacements therefore participate in
+/// exactly the same singleton and circular-loading semantics as file modules.
+/// `__filename`/`__dirname` use `name` for diagnostics.
 ///
 /// # Errors
 /// Returns a native error on allocation, compile, or runtime failure.
@@ -73,18 +79,10 @@ pub fn run_builtin_cjs_shim<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     name: &str,
     source: &str,
-    deps: &[(&str, Local<'_>)],
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let exports = scope.bare_object()?;
-    let module = scope.bare_object()?;
-    scope.set(module, "exports", exports)?;
-
-    let id = scope.string(name)?;
-    scope.set(module, "id", id)?;
-    let loaded = scope.boolean(false);
-    scope.set(module, "loaded", loaded)?;
-
-    let require = make_shim_require(scope, deps)?;
+    let exports = scope.get(module, "exports")?;
     let module_name = scope.string(name)?;
     let wrapper = scope.commonjs_wrapper(name, source)?;
     scope.call(
@@ -92,67 +90,67 @@ pub fn run_builtin_cjs_shim<'scope>(
         exports,
         &[exports, require, module, module_name, module_name],
     )?;
-
-    let loaded = scope.boolean(true);
-    scope.set(module, "loaded", loaded)?;
     scope.get(module, "exports")
 }
 
-/// Build a `require` for a shim that resolves only the supplied dependencies.
-/// The deps are stored on a plain JS object (which roots their values) captured
-/// by the closure; `require(spec)` returns `deps[spec]` or throws.
-fn make_shim_require<'scope>(
+/// Resolve one hosted-installer dependency through the supplied CommonJS
+/// `require` function.
+///
+/// This is the Rust-side counterpart of writing `require(specifier)` in an
+/// embedded shim. It deliberately invokes the rooted JavaScript resolver
+/// rather than calling another installer directly, so aliases, cycles,
+/// rollback, and singleton identity all use the shared canonical cache.
+pub fn require_commonjs_dependency<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    deps: &[(&str, Local<'_>)],
+    require: Local<'_>,
+    specifier: &str,
 ) -> Result<Local<'scope>, NativeError> {
-    let table = scope.bare_object()?;
-    for (specifier, value) in deps {
-        scope.set(table, specifier, *value)?;
-    }
-    let closure = move |ctx: &mut NativeCtx<'_>,
-                        args: &[Value],
-                        captures: &[Value]|
-          -> Result<Value, NativeError> {
-        let table = captures
-            .first()
-            .and_then(|value| value.as_object())
-            .ok_or_else(|| runtime_type_error("require", "missing shim dependency table"))?;
-        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
-        match object::get(table, ctx.heap(), &spec) {
-            Some(value) => Ok(value),
-            None => Err(runtime_type_error(
-                "require",
-                format!("Cannot find module '{spec}'"),
-            )),
-        }
-    };
-    scope.native_closure("require", 1, &[table], closure)
+    let specifier = scope.string(specifier)?;
+    let this_value = scope.undefined();
+    scope.call(require, this_value, &[specifier])
 }
 
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier
 /// directly (`fs`) or the `node:`-prefixed form (`node:fs`).
 fn resolve_builtin(cfg: &CjsConfig, spec: &str) -> Option<HostedModule> {
-    if let Some(hm) = cfg.hosted.iter().find(|h| h.specifier() == spec) {
-        return Some(*hm);
-    }
-    if !spec.starts_with('.') && !spec.contains('/') {
+    if !spec.starts_with("node:") && !spec.starts_with('.') && !Path::new(spec).is_absolute() {
         let prefixed = format!("node:{spec}");
         if let Some(hm) = cfg.hosted.iter().find(|h| h.specifier() == prefixed) {
             return Some(*hm);
         }
     }
-    None
+    cfg.hosted
+        .iter()
+        .find(|hosted| hosted.specifier() == spec)
+        .copied()
 }
 
-fn canonical_builtin_cache_key(cfg: &CjsConfig, spec: &str) -> String {
-    if spec.starts_with("node:") {
-        return spec.to_string();
-    }
-    let prefixed = format!("node:{spec}");
-    if cfg.hosted.iter().any(|h| h.specifier() == prefixed) {
-        prefixed
-    } else {
-        spec.to_string()
+#[derive(Debug)]
+enum CjsTarget {
+    Hosted(HostedModule),
+    File(PathBuf),
+}
+
+#[derive(Debug)]
+struct CjsResolution {
+    key: String,
+    filename: String,
+    dir: PathBuf,
+    target: CjsTarget,
+}
+
+impl CjsResolution {
+    fn file(path: PathBuf) -> Self {
+        let filename = path.to_string_lossy().into_owned();
+        let dir = path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        Self {
+            key: filename.clone(),
+            filename,
+            dir,
+            target: CjsTarget::File(path),
+        }
     }
 }
 
@@ -210,6 +208,26 @@ fn resolve_file(dir: &Path, spec: &str, capabilities: &CapabilitySet) -> Option<
     None
 }
 
+/// Resolve one specifier and derive its sole cache key.
+///
+/// The selected hosted row is authoritative for aliases, so both
+/// `fs/promises` and `node:fs/promises` use `node:fs/promises` when that is the
+/// registered specifier. Files use their canonical absolute path.
+fn resolve_module(cfg: &CjsConfig, dir: &Path, spec: &str) -> Result<CjsResolution, NativeError> {
+    if let Some(hosted) = resolve_builtin(cfg, spec) {
+        let key = hosted.specifier().to_string();
+        return Ok(CjsResolution {
+            filename: key.clone(),
+            key,
+            dir: dir.to_path_buf(),
+            target: CjsTarget::Hosted(hosted),
+        });
+    }
+    let path = resolve_file(dir, spec, &cfg.capabilities)
+        .ok_or_else(|| runtime_type_error("require", format!("Cannot find module '{spec}'")))?;
+    Ok(CjsResolution::file(path))
+}
+
 /// Build a per-module `require` native function bound to `dir`. The shared cache
 /// object is passed as a traced VM capture; the directory and config are moved
 /// into the Rust closure.
@@ -236,7 +254,169 @@ fn make_require<'scope>(
         }
         cjs_load(ctx, &cfg, cache, &dir, &spec)
     };
-    scope.native_closure("require", 1, &[cache], closure)
+    let require = scope.native_closure("require", 1, &[cache], closure)?;
+    scope.define(require, "cache", cache, Attr::data().to_flags())?;
+    Ok(require)
+}
+
+fn cached_exports<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cache: Local<'_>,
+    key: &str,
+) -> Result<Option<Local<'scope>>, NativeError> {
+    let module = scope.get(cache, key)?;
+    if scope.is_undefined(module) {
+        return Ok(None);
+    }
+    Ok(Some(scope.get(module, "exports")?))
+}
+
+struct ModuleRecord<'scope> {
+    module: Local<'scope>,
+    exports: Local<'scope>,
+    id: Local<'scope>,
+}
+
+/// Allocate and publish a partial module record. Publication is deliberately
+/// the final fallible operation so every later error belongs to the rollback
+/// transaction in `load_resolved_scoped`.
+fn begin_module_record<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cache: Local<'_>,
+    resolution: &CjsResolution,
+) -> Result<ModuleRecord<'scope>, NativeError> {
+    let exports = scope.object()?;
+    let module = scope.object()?;
+    scope.set(module, "exports", exports)?;
+    let id = scope.string(&resolution.filename)?;
+    scope.set(module, "id", id)?;
+    scope.set(module, "filename", id)?;
+    let loaded = scope.boolean(false);
+    scope.set(module, "loaded", loaded)?;
+    scope.set(cache, &resolution.key, module)?;
+    Ok(ModuleRecord {
+        module,
+        exports,
+        id,
+    })
+}
+
+fn finish_module<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    module: Local<'_>,
+    exports: Local<'_>,
+) -> Result<Local<'scope>, NativeError> {
+    scope.set(module, "exports", exports)?;
+    let loaded = scope.boolean(true);
+    scope.set(module, "loaded", loaded)?;
+    scope.get(module, "exports")
+}
+
+fn load_resolved_scoped<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cfg: &Arc<CjsConfig>,
+    cache: Local<'_>,
+    resolution: &CjsResolution,
+    entry_source: Option<&str>,
+) -> Result<Local<'scope>, NativeError> {
+    if let Some(exports) = cached_exports(scope, cache, &resolution.key)? {
+        return Ok(exports);
+    }
+
+    let record = begin_module_record(scope, cache, resolution)?;
+    let result = (|| {
+        let require = make_require(scope, cfg.clone(), cache, resolution.dir.clone())?;
+        match &resolution.target {
+            CjsTarget::Hosted(hosted) => {
+                let mut publish_namespace = false;
+                let exports = if let Some(install) = hosted.commonjs_value_install() {
+                    let installed = install(
+                        scope,
+                        &cfg.capabilities,
+                        cfg.runtime_task_spawner.clone(),
+                        record.module,
+                        require,
+                    )?;
+                    let current = scope.get(record.module, "exports")?;
+                    if scope.strict_equals(current, record.exports) {
+                        installed
+                    } else {
+                        current
+                    }
+                } else if let Some(namespace) = scope.cached_host_module_env(hosted.specifier()) {
+                    namespace
+                } else {
+                    let install = hosted
+                        .namespace_install()
+                        .expect("hosted module has a CommonJS installer");
+                    let namespace =
+                        install(scope, &cfg.capabilities, cfg.runtime_task_spawner.clone())?;
+                    publish_namespace = true;
+                    namespace
+                };
+                let exports = finish_module(scope, record.module, exports)?;
+                if publish_namespace {
+                    scope.cache_host_module_env(hosted.specifier(), exports)?;
+                }
+                Ok(exports)
+            }
+            CjsTarget::File(path) => {
+                if !cfg.capabilities.read.matches_path(path) {
+                    return Err(runtime_type_error(
+                        "require",
+                        format!("permission denied for '{}'", resolution.filename),
+                    ));
+                }
+                if path.extension().is_some_and(|ext| ext == "node") {
+                    let loader = cfg.addon_loader.ok_or_else(|| {
+                        runtime_type_error(
+                            "require",
+                            format!(
+                                "native addons are not enabled for '{}'",
+                                resolution.filename
+                            ),
+                        )
+                    })?;
+                    let exports = loader(
+                        scope,
+                        path,
+                        &cfg.capabilities,
+                        cfg.runtime_task_spawner.clone(),
+                    )?;
+                    return finish_module(scope, record.module, exports);
+                }
+                let owned_source;
+                let source = if let Some(source) = entry_source {
+                    source
+                } else {
+                    owned_source = std::fs::read_to_string(path).map_err(|err| {
+                        runtime_type_error(
+                            "require",
+                            format!("io error for '{}': {err}", resolution.filename),
+                        )
+                    })?;
+                    &owned_source
+                };
+                let dirname = scope.string(&resolution.dir.to_string_lossy())?;
+                let wrapper = scope.commonjs_wrapper(&resolution.filename, source)?;
+                scope.call(
+                    wrapper,
+                    record.exports,
+                    &[record.exports, require, record.module, record.id, dirname],
+                )?;
+                let exports = scope.get(record.module, "exports")?;
+                finish_module(scope, record.module, exports)
+            }
+        }
+    })();
+
+    match result {
+        Ok(exports) => Ok(exports),
+        Err(error) => {
+            let _ = scope.delete_if_same(cache, &resolution.key, record.module);
+            Err(error)
+        }
+    }
 }
 
 /// Resolve and load a module by specifier from `dir`. Returns the module's
@@ -248,129 +428,25 @@ pub(crate) fn cjs_load(
     dir: &Path,
     spec: &str,
 ) -> Result<Value, NativeError> {
-    // 1. Builtin (hosted) module.
-    if let Some(hm) = resolve_builtin(cfg, spec) {
-        let key = canonical_builtin_cache_key(cfg, hm.specifier());
-        if let Some(cached) = object::get(cache, ctx.heap(), &key) {
-            return Ok(cached);
-        }
-        return ctx.scope(|mut scope| {
-            let cache = scope.value(Value::object(cache));
-            let value = if hm.shares_namespace_with_commonjs() {
-                match scope.cached_host_module_env(hm.specifier()) {
-                    Some(namespace) => namespace,
-                    None => {
-                        let namespace = (hm.commonjs_install())(
-                            &mut scope,
-                            &cfg.capabilities,
-                            cfg.runtime_task_spawner.clone(),
-                        )?;
-                        scope.cache_host_module_env(hm.specifier(), namespace)?;
-                        namespace
-                    }
-                }
-            } else {
-                (hm.commonjs_install())(
-                    &mut scope,
-                    &cfg.capabilities,
-                    cfg.runtime_task_spawner.clone(),
-                )?
-            };
-            scope.set(cache, &key, value)?;
-            Ok(scope.finish(value))
-        });
-    }
-
-    // 2. File module.
-    let resolved = resolve_file(dir, spec, &cfg.capabilities)
-        .ok_or_else(|| runtime_type_error("require", format!("Cannot find module '{spec}'")))?;
-    let id = resolved.to_string_lossy().to_string();
-    if let Some(cached) = object::get(cache, ctx.heap(), &id) {
-        return Ok(cached);
-    }
-    if !cfg.capabilities.read.matches_path(&resolved) {
-        return Err(runtime_type_error(
-            "require",
-            format!("permission denied for '{id}'"),
-        ));
-    }
-    if resolved.extension().is_some_and(|ext| ext == "node") {
-        let loader = cfg.addon_loader.ok_or_else(|| {
-            runtime_type_error(
-                "require",
-                format!("native addons are not enabled for '{id}'"),
-            )
-        })?;
-        let root_base = ctx.interp_mut().module_root_depth();
-        let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
-        let result = (|| {
-            let value = loader(
-                ctx,
-                &resolved,
-                &cfg.capabilities,
-                cfg.runtime_task_spawner.clone(),
-            )?;
-            let cache = ctx
-                .interp_mut()
-                .module_root(cache_idx)
-                .as_object()
-                .expect("require cache survives addon registration");
-            ctx.scope(|mut scope| {
-                let cache = scope.value(Value::object(cache));
-                let value = scope.value(value);
-                scope.set(cache, &id, value)?;
-                Ok(scope.finish(value))
-            })
-        })();
-        ctx.interp_mut().pop_module_roots_to(root_base);
-        return result;
-    }
-    let source = std::fs::read_to_string(&resolved)
-        .map_err(|err| runtime_type_error("require", format!("io error for '{id}': {err}")))?;
-    cjs_instantiate_file(ctx, cfg, cache, &resolved, &source)
+    let resolution = resolve_module(cfg, dir, spec)?;
+    ctx.scope(|mut scope| {
+        let cache = scope.value(Value::object(cache));
+        let exports = load_resolved_scoped(&mut scope, cfg, cache, &resolution, None)?;
+        Ok(scope.finish(exports))
+    })
 }
 
 /// Compile and execute one CommonJS file, returning its `module.exports`.
 pub(crate) fn cjs_instantiate_file(
     ctx: &mut NativeCtx<'_>,
     cfg: &Arc<CjsConfig>,
-    cache: object::JsObject,
     abs: &Path,
     source: &str,
 ) -> Result<Value, NativeError> {
-    let id = abs.to_string_lossy().to_string();
-    let dir = abs
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-
+    let resolution = CjsResolution::file(abs.to_path_buf());
     ctx.scope(|mut scope| {
-        let cache = scope.value(Value::object(cache));
-        let exports = scope.object()?;
-        let module = scope.object()?;
-        scope.set(module, "exports", exports)?;
-        let id_value = scope.string(&id)?;
-        scope.set(module, "id", id_value)?;
-        scope.set(module, "filename", id_value)?;
-        let loaded = scope.boolean(false);
-        scope.set(module, "loaded", loaded)?;
-
-        // Circular-require guard: cache the partial exports before running.
-        scope.set(cache, &id, exports)?;
-
-        let require = make_require(&mut scope, cfg.clone(), cache, dir.clone())?;
-        let dirname = scope.string(&dir.to_string_lossy())?;
-        let wrapper = scope.commonjs_wrapper(&id, source)?;
-        scope.call(
-            wrapper,
-            exports,
-            &[exports, require, module, id_value, dirname],
-        )?;
-
-        // `module.exports` may have been reassigned by the module body.
-        let final_exports = scope.get(module, "exports")?;
-        let loaded = scope.boolean(true);
-        scope.set(module, "loaded", loaded)?;
-        scope.set(cache, &id, final_exports)?;
-        Ok(scope.finish(final_exports))
+        let cache = scope.bare_object()?;
+        let exports = load_resolved_scoped(&mut scope, cfg, cache, &resolution, Some(source))?;
+        Ok(scope.finish(exports))
     })
 }

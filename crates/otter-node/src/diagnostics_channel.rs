@@ -10,6 +10,8 @@ pub fn diagnostics_channel_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:diagnostics_channel", SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:diagnostics_channel", SHIM, module, require)
 }

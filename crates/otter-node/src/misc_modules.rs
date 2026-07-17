@@ -49,23 +49,27 @@ pub fn internal_event_target_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "internal/event_target",
         INTERNAL_EVENT_TARGET_SHIM,
-        &[],
+        module,
+        require,
     )
 }
 
 /// `node:cluster` — single-process stub (always primary, no workers).
 pub fn cluster_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:cluster", CLUSTER_SHIM, &[("events", events)])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:cluster", CLUSTER_SHIM, module, require)
 }
 
 /// `node:perf_hooks` — performance timeline subset.
@@ -73,18 +77,21 @@ pub fn perf_hooks_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:perf_hooks", PERF_HOOKS_SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:perf_hooks", PERF_HOOKS_SHIM, module, require)
 }
 
 /// `node:v8` — heap statistics + serialize/deserialize subset.
 pub fn v8_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:v8", V8_SHIM, &[("buffer", buffer)])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:v8", V8_SHIM, module, require)
 }
 
 /// `node:module` — builtin-module metadata + a minimal Module class.
@@ -92,8 +99,10 @@ pub fn module_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:module", MODULE_SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:module", MODULE_SHIM, module, require)
 }
 
 /// `node:process` / `process` — the exact `globalThis.process` object.
@@ -101,6 +110,8 @@ pub fn process_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    _require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
     scope
         .global("process")
@@ -113,8 +124,10 @@ pub fn internal_util_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "internal/util", INTERNAL_UTIL_SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "internal/util", INTERNAL_UTIL_SHIM, module, require)
 }
 
 /// `node:vm` — best-effort in-realm sandbox (with-scoped Proxy).
@@ -122,8 +135,10 @@ pub fn vm_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:vm", VM_SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:vm", VM_SHIM, module, require)
 }
 
 /// `internal/url` brand predicate used by Node's own URL tests.
@@ -131,6 +146,8 @@ pub fn internal_url_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "internal/url", INTERNAL_URL_SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "internal/url", INTERNAL_URL_SHIM, module, require)
 }

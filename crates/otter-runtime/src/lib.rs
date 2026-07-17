@@ -53,7 +53,7 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 mod commonjs;
-pub use commonjs::run_builtin_cjs_shim;
+pub use commonjs::{require_commonjs_dependency, run_builtin_cjs_shim};
 pub mod compiled_program;
 pub mod diagnostics;
 pub mod error;
@@ -153,17 +153,32 @@ pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
 };
 
-/// Runtime-hosted module installer.
+/// Runtime-hosted namespace installer.
 ///
-/// Installers allocate and publish one value inside the caller's existing
-/// native handle scope. Namespace and CommonJS value installers share this
-/// exact ABI, so neither loader opens a second root boundary or exposes raw VM
-/// handles to product crates.
+/// Installers allocate and publish one namespace value inside the caller's
+/// existing native handle scope, so the ESM loader never opens a second root
+/// boundary or exposes raw VM handles to product crates.
 pub type HostedModuleInstall =
     for<'scope, 'rt> fn(
         &mut RuntimeNativeScope<'scope, 'rt>,
         &CapabilitySet,
         Option<RuntimeTaskSpawner>,
+    ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>;
+
+/// Runtime-hosted CommonJS value installer.
+///
+/// `module` is the live record already published in `require.cache`, and
+/// `require` is the canonical resolver bound to the importing module. Passing
+/// both as rooted locals lets embedded shims participate in circular loading,
+/// replace `module.exports`, and resolve installer dependencies through the
+/// same cache without ambient runtime state.
+pub type HostedCommonJsInstall =
+    for<'scope, 'rt> fn(
+        &mut RuntimeNativeScope<'scope, 'rt>,
+        &CapabilitySet,
+        Option<RuntimeTaskSpawner>,
+        RuntimeLocal<'scope>,
+        RuntimeLocal<'scope>,
     ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>;
 
 /// Load one CommonJS native addon (`.node`) after module resolution and the
@@ -174,12 +189,13 @@ pub type HostedModuleInstall =
 /// Implementations must enforce the separate `ffi` capability before opening
 /// the library. The optional task spawner is the owned, sendable route for
 /// addon worker callbacks to re-enter a handle-backed isolate.
-pub type CommonJsAddonLoader = for<'rt> fn(
-    &mut otter_vm::NativeCtx<'rt>,
-    &Path,
-    &CapabilitySet,
-    Option<RuntimeTaskSpawner>,
-) -> Result<otter_vm::Value, otter_vm::NativeError>;
+pub type CommonJsAddonLoader =
+    for<'scope, 'rt> fn(
+        &mut RuntimeNativeScope<'scope, 'rt>,
+        &Path,
+        &CapabilitySet,
+        Option<RuntimeTaskSpawner>,
+    ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>;
 
 /// One runtime-hosted module.
 #[derive(Debug, Clone, Copy)]
@@ -190,7 +206,7 @@ pub struct HostedModule {
     install: Option<HostedModuleInstall>,
     /// Optional callable/value export used by `require()` in place of the
     /// object namespace. `None` => `require()` returns the namespace object.
-    cjs_value: Option<HostedModuleInstall>,
+    cjs_value: Option<HostedCommonJsInstall>,
 }
 
 impl HostedModule {
@@ -210,7 +226,7 @@ impl HostedModule {
     pub const fn new_with_cjs_value(
         specifier: &'static str,
         install: HostedModuleInstall,
-        cjs_value: HostedModuleInstall,
+        cjs_value: HostedCommonJsInstall,
     ) -> Self {
         Self {
             specifier,
@@ -225,7 +241,7 @@ impl HostedModule {
     /// set, so an `import` cannot synthesize a fake namespace from a callable
     /// or otherwise non-object `module.exports`.
     #[must_use]
-    pub const fn cjs_only(specifier: &'static str, cjs_value: HostedModuleInstall) -> Self {
+    pub const fn cjs_only(specifier: &'static str, cjs_value: HostedCommonJsInstall) -> Self {
         Self {
             specifier,
             install: None,
@@ -251,23 +267,10 @@ impl HostedModule {
         self.install
     }
 
-    /// Installer used by CommonJS. A module without a dedicated CJS value
-    /// returns its ESM namespace object.
+    /// Dedicated CommonJS value installer, when one is registered.
     #[must_use]
-    pub(crate) const fn commonjs_install(self) -> HostedModuleInstall {
-        match self.cjs_value {
-            Some(install) => install,
-            None => match self.install {
-                Some(install) => install,
-                None => panic!("HostedModule requires at least one installer"),
-            },
-        }
-    }
-
-    /// Whether CommonJS uses the same namespace object as ESM.
-    #[must_use]
-    pub(crate) const fn shares_namespace_with_commonjs(self) -> bool {
-        self.install.is_some() && self.cjs_value.is_none()
+    pub(crate) const fn commonjs_value_install(self) -> Option<HostedCommonJsInstall> {
+        self.cjs_value
     }
 }
 
@@ -1439,13 +1442,6 @@ impl Default for RuntimeConfig {
 impl RuntimeConfig {
     pub(crate) fn timeout(&self) -> Duration {
         self.timeout
-    }
-}
-
-fn gc_oom_to_error(oom: otter_gc::OutOfMemory) -> OtterError {
-    OtterError::OutOfMemory {
-        requested_bytes: oom.requested_bytes(),
-        heap_limit_bytes: oom.heap_limit_bytes(),
     }
 }
 
@@ -3867,8 +3863,7 @@ impl Runtime {
             otter_vm::NativeCallInfo::default_call(),
             Some(&context),
             |ctx| -> Result<Option<u8>, OtterError> {
-                let cache = ctx.alloc_object().map_err(gc_oom_to_error)?;
-                match commonjs::cjs_instantiate_file(ctx, &cfg, cache, &abs, &source.text) {
+                match commonjs::cjs_instantiate_file(ctx, &cfg, &abs, &source.text) {
                     Ok(_) => Ok(None),
                     Err(otter_vm::NativeError::Exit { code }) => Ok(Some(code)),
                     Err(err) => Err(commonjs_native_to_error(err)),

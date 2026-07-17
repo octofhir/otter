@@ -2,8 +2,8 @@
 //!
 //! A practical subset of Node streams (Readable/Writable/Duplex/Transform/
 //! PassThrough + finished/pipeline), implemented as a JS shim on top of the
-//! `events` and `buffer` shims (injected as dependencies). It is the keystone
-//! dependency of fs/net/http/zlib/readline.
+//! `events` and `buffer` shims resolved through the shared CommonJS loader. It
+//! is the keystone dependency of fs/net/http/zlib/readline.
 
 use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
@@ -17,17 +17,12 @@ const PROMISES_SHIM: &str = include_str!("stream_promises.js");
 /// classes and helpers attached).
 pub fn stream_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner.clone())?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:stream",
-        SHIM,
-        &[("events", events), ("buffer", buffer)],
-    )
+    otter_runtime::run_builtin_cjs_shim(scope, "node:stream", SHIM, module, require)
 }
 
 /// CommonJS export: the WHATWG `stream/web` namespace.
@@ -35,36 +30,42 @@ pub fn stream_web_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:stream/web", WEB_SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:stream/web", WEB_SHIM, module, require)
 }
 
 /// CommonJS export: `stream/consumers` (collect a stream into a value).
 pub fn stream_consumers_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:stream/consumers",
         CONSUMERS_SHIM,
-        &[("buffer", buffer)],
+        module,
+        require,
     )
 }
 
 /// CommonJS export: `stream/promises` (promise-returning finished/pipeline).
 pub fn stream_promises_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let stream = stream_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:stream/promises",
         PROMISES_SHIM,
-        &[("stream", stream)],
+        module,
+        require,
     )
 }

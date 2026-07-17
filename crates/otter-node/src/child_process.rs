@@ -25,24 +25,23 @@ const SHIM: &str = include_str!("child_process.js");
 /// CommonJS export: the `child_process` namespace built by `child_process.js`.
 pub fn child_process_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let native = native_value(scope, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
-    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner.clone())?;
-    let stream = crate::stream::stream_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:child_process",
-        SHIM,
-        &[
-            ("__cpnative", native),
-            ("buffer", buffer),
-            ("events", events),
-            ("stream", stream),
-        ],
-    )
+    otter_runtime::run_builtin_cjs_shim(scope, "node:child_process", SHIM, module, require)
+}
+
+/// Hidden CommonJS row supplying the capability-gated spawn primitive.
+pub fn child_process_native_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    _require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    native_value(scope, caps)
 }
 
 fn native_value<'scope>(

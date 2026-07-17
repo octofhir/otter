@@ -17,22 +17,23 @@ const SHIM: &str = include_str!("crypto.js");
 /// CommonJS export: the `crypto` namespace built by `crypto.js`.
 pub fn crypto_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let native = native_value(scope)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
-    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:crypto",
-        SHIM,
-        &[
-            ("__cryptonative", native),
-            ("buffer", buffer),
-            ("events", events),
-        ],
-    )
+    otter_runtime::run_builtin_cjs_shim(scope, "node:crypto", SHIM, module, require)
+}
+
+/// Hidden CommonJS row supplying the pure native crypto primitives.
+pub fn crypto_native_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    _require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    native_value(scope)
 }
 
 fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'scope>, NativeError> {

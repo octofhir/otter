@@ -22,7 +22,6 @@ use otter_vm::{Attr, NativeCtx, NativeError, Value};
 
 /// Embedded `util` implementation.
 const SHIM: &str = include_str!("util.js");
-const UTIL_EXPORT_CACHE_KEY: &str = "otter-internal:node-util-export";
 
 /// Native backing for `util.getCallSites`: capture the live JS call
 /// stack as a JSON array of call-site records. `args[0]` is the number
@@ -144,11 +143,10 @@ pub fn util_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    if let Some(cached) = scope.cached_host_module_env(UTIL_EXPORT_CACHE_KEY) {
-        return Ok(cached);
-    }
-    let export = otter_runtime::run_builtin_cjs_shim(scope, "node:util", SHIM, &[])?;
+    let export = otter_runtime::run_builtin_cjs_shim(scope, "node:util", SHIM, module, require)?;
     let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
     let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
     let flags = Attr {
@@ -159,7 +157,6 @@ pub fn util_cjs_value<'scope>(
     .to_flags();
     scope.define(export, "__otterCaptureCallSites", callsites, flags)?;
     scope.define(export, "__otterTypedArraysEqual", typed_arrays_equal, flags)?;
-    scope.cache_host_module_env(UTIL_EXPORT_CACHE_KEY, export)?;
     Ok(export)
 }
 
@@ -167,9 +164,11 @@ pub fn util_cjs_value<'scope>(
 /// `require('util').types`.
 pub fn util_types_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let util = util_cjs_value(scope, caps, runtime_task_spawner)?;
+    let util = otter_runtime::require_commonjs_dependency(scope, require, "util")?;
     scope.get(util, "types")
 }

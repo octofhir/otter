@@ -22,6 +22,8 @@ pub fn events_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    otter_runtime::run_builtin_cjs_shim(scope, "node:events", SHIM, &[])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:events", SHIM, module, require)
 }

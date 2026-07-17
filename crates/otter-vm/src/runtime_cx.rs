@@ -32,6 +32,10 @@
 //!   observable `new.target.prototype` lookup.
 //! - Neither context crosses `.await` or escapes the mutator turn.
 //! - Heap allocation and mutation stay rooted through `NativeCtx`/`NativeScope`.
+//! - A persistent root entering a native scope is removed directly into a
+//!   [`Local`] before any later allocation can expose a stale raw value.
+//! - Scoped promise settlement records rejection tracking and enqueues every
+//!   reaction before returning to the runtime drain boundary.
 //!
 //! # See also
 //!
@@ -1661,6 +1665,18 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         self.ctx.cx.interp.scoped_value(self.token, value)
     }
 
+    /// Remove a persistent root and immediately park its value in this scope.
+    ///
+    /// No allocating operation occurs between the interpreter-owned root-table
+    /// read and the scoped handle insertion. Host registries can therefore
+    /// hand long-lived values back to native code without exposing a raw
+    /// moving-GC handle to the runtime layer.
+    #[must_use]
+    pub fn take_persistent_root(&mut self, id: crate::PersistentRootId) -> Option<Local<'scope>> {
+        let value = self.ctx.cx.interp.persistent_root_remove(id)?;
+        Some(self.value(value))
+    }
+
     /// Root argument `index`; a missing argument becomes `undefined`.
     #[must_use]
     #[inline]
@@ -1768,6 +1784,58 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .interp
             .scoped_promise_rejected(self.token, reason);
         result.map_err(|error| self.vm_error(error, "NativeScope::promise_rejected"))
+    }
+
+    /// Fulfil an existing rooted Promise and enqueue its reaction jobs.
+    ///
+    /// Both the Promise and payload are re-read from collector-traced handle
+    /// slots at the settlement boundary. Microtask draining remains the
+    /// enclosing runtime turn's responsibility.
+    pub fn fulfill_promise(
+        &mut self,
+        promise: Local<'_>,
+        value: Local<'_>,
+    ) -> Result<(), NativeError> {
+        self.settle_promise(promise, value, false, "NativeScope::fulfill_promise")
+    }
+
+    /// Reject an existing rooted Promise, track a newly-unhandled rejection,
+    /// and enqueue its reaction jobs.
+    ///
+    /// Microtask draining remains the enclosing runtime turn's responsibility.
+    pub fn reject_promise(
+        &mut self,
+        promise: Local<'_>,
+        reason: Local<'_>,
+    ) -> Result<(), NativeError> {
+        self.settle_promise(promise, reason, true, "NativeScope::reject_promise")
+    }
+
+    fn settle_promise(
+        &mut self,
+        promise: Local<'_>,
+        payload: Local<'_>,
+        reject: bool,
+        operation: &'static str,
+    ) -> Result<(), NativeError> {
+        let promise = self
+            .raw(promise)
+            .as_promise()
+            .ok_or_else(|| NativeError::TypeError {
+                name: operation,
+                reason: "value is not a Promise".to_string(),
+            })?;
+        let payload = self.raw(payload);
+        let jobs = if reject {
+            promise.reject(self.ctx.cx.interp.gc_heap_mut(), payload)
+        } else {
+            promise.fulfill(self.ctx.cx.interp.gc_heap_mut(), payload)
+        };
+        self.ctx.cx.interp.note_settle_rejection(&jobs);
+        for job in jobs.jobs {
+            self.ctx.cx.interp.microtasks_mut().enqueue(job);
+        }
+        Ok(())
     }
 
     /// Rewrap shared backing storage as a rooted `SharedArrayBuffer`.

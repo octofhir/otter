@@ -1,37 +1,33 @@
-//! P2.2 Slice C regression coverage: cross-thread JS promise
-//! settlement primitive.
+//! Cross-thread JavaScript-promise settlement invariants.
 //!
-//! ENGINE_REFACTOR_EXECUTION_PLAN §P2.2 requires that promise
-//! settlement always hops through runtime job delivery so a host
-//! async op never touches `Interpreter` / `Value` / `Local`
-//! directly. The primitive is:
+//! # Contents
 //!
-//! 1. The script registers a fresh pending promise via a
-//!    runner-side API ([`otter_runtime::Runtime::register_pending_promise`])
-//!    and returns the matching [`otter_vm::Value::Promise`] to JS.
-//! 2. The embedder posts the outcome through
-//!    [`otter_runtime::RuntimeHandle::settle_promise`] from any
-//!    Tokio worker, holding only the
-//!    [`otter_runtime::PromiseId`] token + an owned host payload.
-//! 3. The isolate runner's inbox hop resolves / rejects the
-//!    matching [`otter_vm::JsPromiseHandle`] on the runner thread,
-//!    enqueues reactions onto the per-isolate microtask queue,
-//!    and drains.
+//! - Programmatic resolve, reject, and one-shot settlement.
+//! - Full-GC retention while the runtime registry is the only owner.
+//! - Abrupt payload allocation with deterministic root cleanup.
+//! - Template-JIT reaction delivery after full-GC relocation.
+//! - Cross-thread inbox delivery for unknown tokens.
 //!
-//! This file pins the primitive end-to-end without relying on the
-//! JS-visible binding layer (which is the next consumer slice).
-//! It uses the public Runtime API directly so the contract stays
-//! visible to embedders.
+//! # Invariants
 //!
-//! Spec:
-//! - <https://tc39.es/ecma262/#sec-promise-objects> (§27.2)
-//! - <https://tc39.es/ecma262/#sec-jobs-and-job-queues> (§9.4)
+//! - Host work carries only [`otter_runtime::PromiseId`] and owned data.
+//! - A pending registry entry remains a collector-visible root until consumed.
+//! - Settlement parks the promise before allocating a host payload.
+//! - Taking an entry is one-shot even when payload allocation exits abruptly.
+//! - Reaction jobs preserve values across full GC and nested JIT re-entry.
+//!
+//! # See also
+//!
+//! - [Promise objects](https://tc39.es/ecma262/#sec-promise-objects)
+//! - [Jobs and job queues](https://tc39.es/ecma262/#sec-jobs-and-job-queues)
 
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
-    ConsoleLevel, ConsoleSink, HostSettleOutcome, OtterError, Runtime, RuntimeBuilder, SourceInput,
+    ConsoleLevel, ConsoleSink, HostSettleOutcome, JitSelection, NativeCtx, NativeError, OtterError,
+    Runtime, RuntimeBuilder, RuntimeExecutionStats, SourceInput, Value,
 };
+use otter_vm::promise::PURE_PROMISE_BODY_TYPE_TAG;
 
 #[derive(Debug, Default)]
 struct LogCapture {
@@ -60,8 +56,7 @@ impl ConsoleSink for LogCapture {
     }
 }
 
-/// Helper: build a Layer-A runtime, exposes the pending-promise
-/// helper as a global `__pendingPromise()` for the test scripts.
+/// Build a Layer-A runtime with a captured console sink.
 fn build_runtime_with_helper() -> (Runtime, Arc<LogCapture>) {
     let capture = LogCapture::new();
     let runtime = RuntimeBuilder::default()
@@ -69,6 +64,213 @@ fn build_runtime_with_helper() -> (Runtime, Arc<LogCapture>) {
         .build()
         .expect("runtime");
     (runtime, capture)
+}
+
+fn invoke_rooted_callback(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    ctx.scope(|mut scope| {
+        let callback = scope.argument(args, 0);
+        let argument = scope.argument(args, 1);
+        let receiver = scope.undefined();
+        let result = scope.call(callback, receiver, &[argument])?;
+        Ok(scope.finish(result))
+    })
+}
+
+#[test]
+fn registry_only_pending_promise_survives_full_gc_and_settles() {
+    let (mut runtime, capture) = build_runtime_with_helper();
+    runtime.force_gc().expect("baseline full GC");
+    let promise_type = PURE_PROMISE_BODY_TYPE_TAG as usize;
+    let baseline = runtime.heap_stats().by_type[promise_type].live_bytes;
+
+    let (id, promise_value) = runtime
+        .register_pending_promise()
+        .expect("register pending promise");
+    runtime.set_global("__pending", promise_value);
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                    globalThis.__pending.then(
+                        (value) => console.log("registry:" + value)
+                    );
+                    delete globalThis.__pending;
+                "#,
+            ),
+            "<attach-and-release>",
+        )
+        .expect("attach reaction and release JS root");
+
+    let cycles_before = runtime.heap_stats().gc_cycles;
+    runtime.force_gc().expect("registry-owned full GC");
+    assert!(
+        runtime.heap_stats().gc_cycles > cycles_before,
+        "fixture must execute a full collection"
+    );
+    assert!(
+        runtime.heap_stats().by_type[promise_type].live_bytes > baseline,
+        "the registry must retain the pending promise and its reaction graph"
+    );
+
+    assert!(
+        runtime
+            .settle_pending_promise(id, HostSettleOutcome::ResolveNumber(42.0))
+            .expect("settle registry-owned promise")
+    );
+    assert_eq!(capture.snapshot(), vec!["registry:42".to_string()]);
+
+    runtime.force_gc().expect("post-settlement full GC");
+    assert_eq!(
+        runtime.heap_stats().by_type[promise_type].live_bytes,
+        baseline,
+        "consuming the registry root must release the settled promise graph"
+    );
+}
+
+#[test]
+fn abrupt_payload_allocation_consumes_root_and_leaves_runtime_reusable() {
+    let mut runtime = Runtime::builder()
+        .max_heap_bytes(2 * 1024 * 1024)
+        .build()
+        .expect("runtime");
+    runtime.force_gc().expect("baseline full GC");
+    let promise_type = PURE_PROMISE_BODY_TYPE_TAG as usize;
+    let baseline = runtime.heap_stats().by_type[promise_type].live_bytes;
+
+    let (id, _promise_value) = runtime
+        .register_pending_promise()
+        .expect("register pending promise");
+    runtime
+        .settle_pending_promise(
+            id,
+            HostSettleOutcome::ResolveString("x".repeat(4 * 1024 * 1024)),
+        )
+        .expect_err("oversized host string must exceed the runtime heap cap");
+    assert!(
+        !runtime
+            .settle_pending_promise(id, HostSettleOutcome::ResolveUndefined)
+            .expect("duplicate settle after allocation failure"),
+        "an abrupt first settlement must still consume the registry entry"
+    );
+
+    runtime.force_gc().expect("post-failure full GC");
+    assert_eq!(
+        runtime.heap_stats().by_type[promise_type].live_bytes,
+        baseline,
+        "the failed settlement must not leak its consumed promise root"
+    );
+    let result = runtime
+        .run_script(SourceInput::from_javascript("6 * 7;"), "<reuse>")
+        .expect("runtime remains reusable after abrupt settlement");
+    assert_eq!(result.completion_string(), "42");
+}
+
+struct GcJitPromiseResult {
+    completion: String,
+    warm_stats: RuntimeExecutionStats,
+    settled_stats: RuntimeExecutionStats,
+}
+
+fn run_gc_jit_promise_fixture(selection: JitSelection) -> GcJitPromiseResult {
+    let mut runtime = Runtime::builder()
+        .jit_selection(selection)
+        .jit_osr_threshold(u32::MAX)
+        .build()
+        .expect("promise JIT runtime");
+    runtime
+        .install_native_global("__nativeInvoke", 2, invoke_rooted_callback)
+        .expect("install rooted callback native");
+    let (id, promise_value) = runtime
+        .register_pending_promise()
+        .expect("register pending promise");
+    runtime.set_global("__pending", promise_value);
+    runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                    function leaf(value) {
+                        return value * 2;
+                    }
+                    function reaction(value) {
+                        return __nativeInvoke(leaf, value);
+                    }
+
+                    let checksum = 0;
+                    for (let index = 0; index < 600; index++) {
+                        checksum += reaction(index);
+                    }
+                    globalThis.__promiseJitChecksum = checksum;
+                    globalThis.__promiseJitResult = "pending";
+                    globalThis.__pending
+                        .then((value) => reaction(value))
+                        .then((value) => {
+                            globalThis.__promiseJitResult = value;
+                        });
+                    delete globalThis.__pending;
+                "#,
+            ),
+            "<promise-jit-attach>",
+        )
+        .expect("attach reaction from hot path");
+
+    let warm_stats = runtime.execution_stats();
+    let cycles_before = runtime.heap_stats().gc_cycles;
+    runtime.force_gc().expect("promise JIT full GC");
+    assert!(
+        runtime.heap_stats().gc_cycles > cycles_before,
+        "fixture must execute a full collection"
+    );
+    assert!(
+        runtime
+            .settle_pending_promise(id, HostSettleOutcome::ResolveNumber(21.0))
+            .expect("settle promise after full GC")
+    );
+    let settled_stats = runtime.execution_stats();
+    let completion = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "JSON.stringify([globalThis.__promiseJitChecksum, globalThis.__promiseJitResult]);",
+            ),
+            "<promise-jit-probe>",
+        )
+        .expect("read promise JIT result")
+        .completion_string()
+        .to_owned();
+    GcJitPromiseResult {
+        completion,
+        warm_stats,
+        settled_stats,
+    }
+}
+
+#[test]
+fn full_gc_reaction_nested_reentry_matches_template_jit() {
+    let oracle = run_gc_jit_promise_fixture(JitSelection::InterpreterOnly);
+    let compiled = run_gc_jit_promise_fixture(JitSelection::Template);
+
+    assert_eq!(compiled.completion, oracle.completion);
+    assert_eq!(compiled.completion, "[359400,42]");
+    assert!(
+        compiled.warm_stats.jit_compile_attempts > 0,
+        "fixture must compile the promise reaction and nested callback"
+    );
+    assert_eq!(
+        compiled.warm_stats.jit_osr_attempts, 0,
+        "fixture must exercise whole-function JIT entry"
+    );
+    assert!(
+        compiled.settled_stats.jit_runtime_calls > compiled.warm_stats.jit_runtime_calls,
+        "settlement must execute the compiled reaction: runtime calls {} -> {}",
+        compiled.warm_stats.jit_runtime_calls,
+        compiled.settled_stats.jit_runtime_calls
+    );
+    assert!(
+        compiled.settled_stats.jit_reentrant_stub_transitions
+            > compiled.warm_stats.jit_reentrant_stub_transitions,
+        "the settled reaction must re-enter compiled code through NativeScope::call: {} -> {}",
+        compiled.warm_stats.jit_reentrant_stub_transitions,
+        compiled.settled_stats.jit_reentrant_stub_transitions
+    );
 }
 
 /// Programmatic: register a pending promise, settle it

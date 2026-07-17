@@ -1452,6 +1452,13 @@ fn string_oom_to_error(err: otter_gc::OutOfMemory) -> OtterError {
     }
 }
 
+fn promise_settle_string_to_error(err: otter_vm::NativeError) -> OtterError {
+    OtterError::Internal {
+        code: DiagnosticCode::StringAlloc.as_str().to_string(),
+        message: err.to_string(),
+    }
+}
+
 /// Map a CommonJS loader error into the runtime error type, rendering the
 /// carried context once at this outermost boundary (a thrown JS value is
 /// preserved intact through nested `require`s and only stringified here).
@@ -2053,10 +2060,10 @@ pub struct Runtime {
     /// loader at spawn, so this queue stays empty under Layer B.
     layer_a_dynamic_imports: LayerADynamicImportQueue,
     /// Per-isolate map from runtime-issued `PromiseId` to the
-    /// pending [`otter_vm::JsPromiseHandle`] a host async op is
-    /// expected to settle. Embedders register a fresh promise
-    /// inside a native function (VM thread), then post the
-    /// matching settle outcome through
+    /// persistent root of the pending Promise a host async op is
+    /// expected to settle. Embedders register a fresh promise inside
+    /// a native function (VM thread), then post the matching settle
+    /// outcome through
     /// [`crate::RuntimeHandle::settle_promise`] (host thread).
     /// The isolate runner pops the entry on the inbox hop and
     /// resolves / rejects it through the standard promise
@@ -2829,8 +2836,10 @@ impl Runtime {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
-        let id = self.promise_registry.register(handle);
-        Ok((id, otter_vm::Value::promise(handle)))
+        let promise = otter_vm::Value::promise(handle);
+        let root = self.interp.persistent_root_insert(promise);
+        let id = self.promise_registry.register(root);
+        Ok((id, promise))
     }
 
     /// Settle the promise registered under `id` with `outcome` and
@@ -2847,73 +2856,68 @@ impl Runtime {
         id: promise_registry::PromiseId,
         outcome: promise_registry::HostSettleOutcome,
     ) -> Result<bool, OtterError> {
-        let handle = match self.promise_registry.take(id) {
-            Some(handle) => handle,
+        let root = match self.promise_registry.take(id) {
+            Some(root) => root,
             None => return Ok(false),
         };
-        // Convert the owned host payload into a `Value` on the
-        // runner thread. String allocations land against the
-        // per-runtime string heap so the result honours the heap
-        // cap.
-        use promise_registry::HostSettleOutcome;
-        let (jobs, _was_resolve) = match outcome {
-            HostSettleOutcome::ResolveUndefined => (
-                otter_vm::JsPromise::fulfill(
-                    &handle,
-                    self.interp.gc_heap_mut(),
-                    otter_vm::Value::undefined(),
-                ),
-                true,
-            ),
-            HostSettleOutcome::ResolveNull => (
-                otter_vm::JsPromise::fulfill(
-                    &handle,
-                    self.interp.gc_heap_mut(),
-                    otter_vm::Value::null(),
-                ),
-                true,
-            ),
-            HostSettleOutcome::ResolveBoolean(b) => (
-                otter_vm::JsPromise::fulfill(
-                    &handle,
-                    self.interp.gc_heap_mut(),
-                    otter_vm::Value::boolean(b),
-                ),
-                true,
-            ),
-            HostSettleOutcome::ResolveNumber(n) => (
-                otter_vm::JsPromise::fulfill(
-                    &handle,
-                    self.interp.gc_heap_mut(),
-                    otter_vm::Value::number(otter_vm::NumberValue::from_f64(n)),
-                ),
-                true,
-            ),
-            HostSettleOutcome::ResolveString(s) => {
-                let str_val = self.alloc_string(&s)?;
-                (
-                    otter_vm::JsPromise::fulfill(
-                        &handle,
-                        self.interp.gc_heap_mut(),
-                        otter_vm::Value::string(str_val),
-                    ),
-                    true,
-                )
-            }
-            HostSettleOutcome::RejectString(s) => {
-                let str_val = self.alloc_string(&s)?;
-                (
-                    otter_vm::JsPromise::reject(
-                        &handle,
-                        self.interp.gc_heap_mut(),
-                        otter_vm::Value::string(str_val),
-                    ),
-                    false,
-                )
-            }
-        };
-        for job in jobs.jobs {
-            self.interp.microtasks_mut().enqueue(job);
+        // Take the persistent root directly into a handle scope before
+        // materializing the host payload. String allocation may trigger a
+        // moving collection, so both the Promise and payload stay `Local`
+        // through settlement.
+        let settled = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::default_call(),
+            None,
+            |ctx| {
+                ctx.scope(|mut scope| -> Result<bool, OtterError> {
+                    let Some(promise) = scope.take_persistent_root(root) else {
+                        return Ok(false);
+                    };
+                    use promise_registry::HostSettleOutcome;
+                    let (payload, reject) = match outcome {
+                        HostSettleOutcome::ResolveUndefined => {
+                            (scope.value(otter_vm::Value::undefined()), false)
+                        }
+                        HostSettleOutcome::ResolveNull => {
+                            (scope.value(otter_vm::Value::null()), false)
+                        }
+                        HostSettleOutcome::ResolveBoolean(value) => {
+                            (scope.value(otter_vm::Value::boolean(value)), false)
+                        }
+                        HostSettleOutcome::ResolveNumber(value) => (
+                            scope.value(otter_vm::Value::number(otter_vm::NumberValue::from_f64(
+                                value,
+                            ))),
+                            false,
+                        ),
+                        HostSettleOutcome::ResolveString(value) => (
+                            scope
+                                .string(&value)
+                                .map_err(promise_settle_string_to_error)?,
+                            false,
+                        ),
+                        HostSettleOutcome::RejectString(reason) => (
+                            scope
+                                .string(&reason)
+                                .map_err(promise_settle_string_to_error)?,
+                            true,
+                        ),
+                    };
+                    if reject {
+                        scope
+                            .reject_promise(promise, payload)
+                            .map_err(map_native_error)?;
+                    } else {
+                        scope
+                            .fulfill_promise(promise, payload)
+                            .map_err(map_native_error)?;
+                    }
+                    Ok(true)
+                })
+            },
+        )?;
+        if !settled {
+            return Ok(false);
         }
         if let Err(err) = self.interp.drain_microtasks_with_default(None) {
             return Err(enrich_runtime_diagnostic_with_cause(
@@ -2922,15 +2926,6 @@ impl Runtime {
             ));
         }
         Ok(true)
-    }
-
-    fn alloc_string(&mut self, s: &str) -> Result<otter_vm::JsString, OtterError> {
-        otter_vm::JsString::from_str(s, self.interp.gc_heap_mut()).map_err(|err| {
-            OtterError::Internal {
-                code: DiagnosticCode::StringAlloc.as_str().to_string(),
-                message: err.to_string(),
-            }
-        })
     }
 
     /// Fire the timer identified by `token`. Routes through

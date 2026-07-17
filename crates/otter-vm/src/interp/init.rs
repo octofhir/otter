@@ -215,6 +215,7 @@ impl Interpreter {
             feedback_directory: crate::interp::FeedbackDirectory::default(),
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
+            jit_artifacts: crate::jit_artifact::JitArtifactState::default(),
             jit_call_counts: rustc_hash::FxHashMap::default(),
             optimizing_tier_policy: tier_policy::TierPolicy::default(),
             jit_entry_bail_counts: rustc_hash::FxHashMap::default(),

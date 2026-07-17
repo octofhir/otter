@@ -109,6 +109,7 @@ pub mod intrinsics;
 mod iterator_ops;
 pub mod iterator_state;
 pub mod jit;
+pub mod jit_artifact;
 mod jit_class_ops;
 mod jit_class_value_ops;
 mod jit_construct_ops;
@@ -245,6 +246,11 @@ pub use jit::{
     JitCompileRequest, JitCompileSnapshot, JitCompileStatus, JitCompilerHook, JitExecOutcome,
     JitFunctionCode, JitInlineCallee, JitInlineMethod, JitInstructionMetadata,
     JitPrimitiveMethodGuard, JitRuntimeStubBinding, JitStringLayout, VmRuntimeActivation,
+};
+pub use jit_artifact::{
+    JIT_ARTIFACT_BUNDLE_LIMIT, JIT_ARTIFACT_BYTE_LIMIT, JIT_ARTIFACT_SCHEMA_VERSION,
+    JitArtifactBatch, JitArtifactBuildError, JitArtifactBundle, JitArtifactFile,
+    JitArtifactFileName, JitArtifactIdentity, JitArtifactManifest, JitArtifactMetadata,
 };
 pub use jit_debug::{
     JIT_DEBUG_EVENT_LIMIT, JIT_DEBUG_SCHEMA_VERSION, JitDebugCompileOutcome, JitDebugEvent,
@@ -897,6 +903,9 @@ pub struct Interpreter {
     /// Owned, default-off JIT diagnostics. Enabled state retains only plain
     /// serializable data and never participates in the GC root graph.
     jit_debug: jit_debug::JitDebugState,
+    /// Owned, bounded compile artifacts kept separate from hot installed code.
+    /// Disabled state owns no bundle buffer.
+    jit_artifacts: jit_artifact::JitArtifactState,
     /// Per-function call counter driving function-entry tier-up. Only mutated
     /// when a JIT hook is installed.
     jit_call_counts: rustc_hash::FxHashMap<u32, u32>,

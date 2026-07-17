@@ -1,0 +1,148 @@
+---
+title: "JIT Debugging"
+---
+
+Otter can capture two independent, default-off JIT diagnostic channels:
+
+- structured events explain when and why compilation, inlining, OSR, side
+  exits, and deoptimization happened;
+- artifact bundles preserve the exact compiler input and native output of each
+  successful compile.
+
+Neither channel writes from the VM or JIT compiler. The engine returns bounded,
+owned data to the outer runtime, and the CLI performs filesystem I/O only when
+the corresponding flag is present.
+
+## Capture a run
+
+Build the release CLI, then run a reproducible tier:
+
+```sh
+cargo build --release -p otter-cli
+
+target/release/otter \
+  --jit-tier=template \
+  --jit-events=jit-events.json \
+  --jit-artifacts=jit-artifacts \
+  run benchmarks/scripts/prop-access.js
+```
+
+Use `--jit-tier=template` to isolate template lowering,
+`--jit-tier=production-tiered` to include the optimizing tier, and
+`--jit-tier=interpreter` as the no-native-code oracle. A diagnostics target is
+never implied by the tier.
+
+`--jit-events` without a value defaults to `otter-jit-events.json`.
+`--jit-artifacts` without a value defaults to `otter-jit-artifacts`. Both flags
+also accept an explicit value with `=`. The artifact target must name a
+directory that does not exist. Under the cooperative single-writer contract,
+Otter writes a private sibling and renames the complete root into place. This
+is atomic visibility, not crash-durable storage or cross-process locking.
+
+On a JavaScript exception, Otter keeps the original runtime error primary and
+best-effort persists every successful compile already captured. A host timeout
+that fires before the isolate replies may have no partial batch to write.
+
+## Directory layout
+
+The root contains a versioned index plus one directory per retained successful
+compile:
+
+```text
+jit-artifacts/
+  index.json
+  jit-0000-template-f7-c11/
+    manifest.json
+    bytecode.txt
+    template-plan.txt
+    code.bin
+    code-map.json
+    safepoints.json
+  jit-0001-optimizing-f9-c12/
+    manifest.json
+    bytecode.txt
+    optimized-ir.txt
+    code.bin
+    code-map.json
+    deopt.json
+    safepoints.json
+```
+
+The suffixes identify capture order, tier, VM function id, and isolate-local
+code-object id. `index.json` also reports retained bytes, dropped bundles,
+dropped bytes, and whether the hard count or byte bound truncated the capture.
+
+Every `manifest.json` uses `otterJitArtifactSchemaVersion`. It records the Rust
+target triple, architecture, operating system, tier, function and module
+identity, entry kind, bytecode size, code size, and explicit `filesPresent` /
+`filesAbsent` inventories.
+
+## Payloads
+
+| File | Meaning |
+| --- | --- |
+| `bytecode.txt` | Deterministic logical-PC and encoded-byte-PC listing. |
+| `template-plan.txt` | The already-built template lowering plan and its decoded operand side buffers. |
+| `optimized-ir.txt` | The already-built optimizing unit in deterministic reverse-postorder. |
+| `code.bin` | Exact finalized executable bytes for this runtime process. |
+| `code-map.json` | Native offset ranges correlated with bytecode/tier operations, structural regions, and OSR entries. |
+| `deopt.json` | Optimizer frame reconstruction metadata; omitted for template code. |
+| `safepoints.json` | Tagged frame/register/spill locations known to moving GC. |
+
+`code.bin` is intentionally marked runtime-local. It can contain baked process
+addresses and can differ across identical runs because of ASLR. Do not use it
+as a portable golden file. Symbolic `relocations.json`,
+`code-normalized.bin`, and annotated `asm.txt` are not emitted yet; manifests
+list them as absent until those follow-up slices land.
+
+All native locations are offsets into the matching `code.bin`, never absolute
+executable addresses. A range must satisfy
+`0 <= startOffset <= endOffset <= manifest.codeBytes`.
+
+## Correlate an execution
+
+Use this order when a hot function produces a wrong result or unexpected
+fallback:
+
+1. Re-run with `--jit-tier=interpreter` to establish the bytecode oracle.
+2. Capture `--jit-events` and find the function's `compilePrepared`,
+   `compileFinished`, OSR, bail, or deopt records.
+3. Join a successful `compileFinished` to `manifest.json` by `codeObjectId`.
+4. Read `bytecode.txt` and the tier input to identify the logical operation.
+5. Use `code-map.json` to map its logical PC and encoded byte PC to the exact
+   native byte range.
+6. Inspect `deopt.json` and `safepoints.json` when the range crosses a deopt or
+   allocation boundary.
+
+The interpreter [step trace](/otter/engine/step-trace/) complements this
+capture: it shows the warmup and the last interpreter-visible PC, while the
+artifact bundle explains the native body entered after that point.
+
+## Embedding
+
+Embedders request either channel explicitly:
+
+```rust
+use otter_runtime::{JitDebugRequest, Runtime, SourceInput};
+
+let request = JitDebugRequest::disabled()
+    .with_events(true)
+    .with_artifacts(true);
+let mut runtime = Runtime::builder()
+    .jit_debug(request)
+    .build()?;
+
+let mut result = runtime.run_script(
+    SourceInput::from_javascript("function hot() { return 42; } hot();"),
+    "main.js",
+)?;
+let events = result.take_jit_debug_report();
+let artifacts = result.take_jit_artifacts();
+```
+
+For abrupt completion, use `run_script_with_diagnostics` and inspect
+`ExecutionAttempt::jit_debug_report()` plus
+`ExecutionAttempt::jit_artifacts()`. Returned reports and bundles own all
+strings and bytes; they contain no GC handle, executable pointer, isolate
+borrow, lock, TLS state, or runtime registry reference, so they remain valid
+after full GC and later JIT compilation.

@@ -34,8 +34,8 @@ use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
 use otter_runtime::{
-    CapabilitySet, DiagnosticCode, ExecutionAttempt, JitDebugReport, OtterError, Permission,
-    SourceInput,
+    CapabilitySet, DiagnosticCode, ExecutionAttempt, JitArtifactBatch, JitDebugReport, OtterError,
+    Permission, SourceInput,
 };
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
@@ -111,6 +111,18 @@ struct Cli {
         global = true,
     )]
     jit_events: Option<String>,
+
+    /// Persist one versioned directory per successful native compile under
+    /// `otter-jit-artifacts` (or the explicit directory). Off when omitted.
+    #[arg(
+        long = "jit-artifacts",
+        value_name = "directory",
+        num_args = 0..=1,
+        default_missing_value = "otter-jit-artifacts",
+        require_equals = true,
+        global = true,
+    )]
+    jit_artifacts: Option<String>,
 
     /// Select the execution tiers used by runtime-backed commands.
     #[arg(long = "jit-tier", value_enum, global = true)]
@@ -503,6 +515,7 @@ async fn main() -> ExitCode {
         cli.trace.clone(),
         cli.jit_tier,
         cli.jit_events.clone(),
+        cli.jit_artifacts.clone(),
     );
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
@@ -990,10 +1003,13 @@ fn finish_jit_debug_attempt(
     execution: &CliExecutionConfig,
     attempt: ExecutionAttempt,
 ) -> Result<otter_runtime::ExecutionResult, OtterError> {
-    let (result, report) = attempt.into_parts();
+    let (result, report, artifacts) = attempt.into_diagnostic_parts();
     match result {
         Ok(result) => {
-            write_jit_debug_report_if_requested(execution, report)?;
+            let event_write = write_jit_debug_report_if_requested(execution, report);
+            let artifact_write = write_jit_artifacts_if_requested(execution, artifacts);
+            event_write?;
+            artifact_write?;
             Ok(result)
         }
         Err(error) => {
@@ -1001,6 +1017,9 @@ fn finish_jit_debug_attempt(
             // diagnostics also fails.
             if report.is_some() {
                 let _ = write_jit_debug_report_if_requested(execution, report);
+            }
+            if artifacts.is_some() {
+                let _ = write_jit_artifacts_if_requested(execution, artifacts);
             }
             Err(error)
         }
@@ -1011,8 +1030,9 @@ fn finish_aggregated_jit_debug_attempt(
     execution: &CliExecutionConfig,
     attempt: ExecutionAttempt,
     aggregate: &mut Option<JitDebugReport>,
+    artifact_aggregate: &mut Option<JitArtifactBatch>,
 ) -> Result<otter_runtime::ExecutionResult, OtterError> {
-    let (result, report) = attempt.into_parts();
+    let (result, report, artifacts) = attempt.into_diagnostic_parts();
     if execution.jit_events_enabled()
         && let Some(report) = report
     {
@@ -1021,10 +1041,21 @@ fn finish_aggregated_jit_debug_attempt(
             None => report,
         });
     }
+    if execution.jit_artifacts_enabled()
+        && let Some(artifacts) = artifacts
+    {
+        *artifact_aggregate = Some(match artifact_aggregate.take() {
+            Some(existing) => existing.merged(artifacts),
+            None => artifacts,
+        });
+    }
     match result {
         Ok(result) => Ok(result),
         Err(error) => Err(flush_aggregated_jit_debug_on_error(
-            execution, aggregate, error,
+            execution,
+            aggregate,
+            artifact_aggregate,
+            error,
         )),
     }
 }
@@ -1032,6 +1063,7 @@ fn finish_aggregated_jit_debug_attempt(
 fn flush_aggregated_jit_debug_on_error(
     execution: &CliExecutionConfig,
     aggregate: &mut Option<JitDebugReport>,
+    artifact_aggregate: &mut Option<JitArtifactBatch>,
     error: OtterError,
 ) -> OtterError {
     // A later timeout, queue failure, or local input error may have no isolate
@@ -1039,6 +1071,9 @@ fn flush_aggregated_jit_debug_on_error(
     // diagnostics, so retain them while keeping the execution error primary.
     if aggregate.is_some() {
         let _ = write_jit_debug_report_if_requested(execution, aggregate.take());
+    }
+    if artifact_aggregate.is_some() {
+        let _ = write_jit_artifacts_if_requested(execution, artifact_aggregate.take());
     }
     error
 }
@@ -1059,6 +1094,28 @@ fn write_jit_debug_report_if_requested(
 fn jit_debug_write_error(err: std::io::Error) -> OtterError {
     OtterError::Internal {
         code: "JIT_DEBUG_WRITE".to_string(),
+        message: err.to_string(),
+    }
+}
+
+fn write_jit_artifacts_if_requested(
+    execution: &CliExecutionConfig,
+    artifacts: Option<JitArtifactBatch>,
+) -> Result<(), OtterError> {
+    if !execution.jit_artifacts_enabled() {
+        return Ok(());
+    }
+    let Some(artifacts) = artifacts else {
+        return Ok(());
+    };
+    execution
+        .write_jit_artifacts(&artifacts)
+        .map_err(jit_artifact_write_error)
+}
+
+fn jit_artifact_write_error(err: std::io::Error) -> OtterError {
+    OtterError::Internal {
+        code: "JIT_ARTIFACT_WRITE".to_string(),
         message: err.to_string(),
     }
 }
@@ -1271,15 +1328,26 @@ async fn run_script_file_sequence(
 
     let mut final_result = None;
     let mut jit_report = None;
+    let mut jit_artifacts = None;
     for path in paths {
         let source = SourceInput::from_path(path).map_err(|error| {
-            flush_aggregated_jit_debug_on_error(execution, &mut jit_report, error)
+            flush_aggregated_jit_debug_on_error(
+                execution,
+                &mut jit_report,
+                &mut jit_artifacts,
+                error,
+            )
         })?;
         let specifier = path.to_string_lossy().to_string();
         let attempt = otter
             .run_script_source_with_diagnostics(source, &specifier)
             .await;
-        let result = finish_aggregated_jit_debug_attempt(execution, attempt, &mut jit_report)?;
+        let result = finish_aggregated_jit_debug_attempt(
+            execution,
+            attempt,
+            &mut jit_report,
+            &mut jit_artifacts,
+        )?;
         startup_timer.mark("runtime_run_script_file");
         emit_otter_stats_if_requested(&result);
         let exit_code = result.exit_code();
@@ -1290,7 +1358,10 @@ async fn run_script_file_sequence(
     }
 
     let result = final_result.expect("non-empty sequence produced a result");
-    write_jit_debug_report_if_requested(execution, jit_report)?;
+    let event_write = write_jit_debug_report_if_requested(execution, jit_report);
+    let artifact_write = write_jit_artifacts_if_requested(execution, jit_artifacts);
+    event_write?;
+    artifact_write?;
     if json {
         println!(
             "{}",
@@ -1795,17 +1866,28 @@ async fn run_node_tests(
 
     let mut failed = false;
     let mut jit_report = None;
+    let mut jit_artifacts = None;
     for file in files {
         let otter = cli_otter_builder(caps, execution)
             .process_argv(process_argv_for_file(&file, &[]))
             .module_loader(cli_loader_config_for_entry(&file).await)
             .build()
             .map_err(|error| {
-                flush_aggregated_jit_debug_on_error(execution, &mut jit_report, error)
+                flush_aggregated_jit_debug_on_error(
+                    execution,
+                    &mut jit_report,
+                    &mut jit_artifacts,
+                    error,
+                )
             })?;
         startup_timer.mark("runtime_build");
         let attempt = otter.run_file_with_diagnostics(&file).await;
-        let result = finish_aggregated_jit_debug_attempt(execution, attempt, &mut jit_report)?;
+        let result = finish_aggregated_jit_debug_attempt(
+            execution,
+            attempt,
+            &mut jit_report,
+            &mut jit_artifacts,
+        )?;
         startup_timer.mark("runtime_run_file");
         let exit_code = result.exit_code();
         if exit_code != 0 {
@@ -1822,7 +1904,10 @@ async fn run_node_tests(
             );
         }
     }
-    write_jit_debug_report_if_requested(execution, jit_report)?;
+    let event_write = write_jit_debug_report_if_requested(execution, jit_report);
+    let artifact_write = write_jit_artifacts_if_requested(execution, jit_artifacts);
+    event_write?;
+    artifact_write?;
 
     Ok(if failed {
         ExitCode::from(1)

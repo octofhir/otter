@@ -79,6 +79,7 @@ use otter_vm::{JitCompileSnapshot, closure::JS_CLOSURE_BODY_TYPE_TAG};
 
 use super::{
     OptimizedCode, OptimizedMetadata,
+    artifact::render_optimized_unit,
     pipeline::{
         OptimizationError, OptimizationPipeline, total_spill_slots as analyzed_spill_slot_count,
     },
@@ -86,6 +87,7 @@ use super::{
 use crate::{
     CompiledCode,
     arm64::CallTrampoline,
+    artifact::{ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle},
     entry::{
         CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, IC_WAYS, MAX_METHOD_ARGS, NATIVE_FRAME_OFFSET,
         NATIVE_FRAME_PC_OFFSET, NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_THIS_OFFSET,
@@ -239,6 +241,7 @@ struct EmissionPlan<'a> {
 struct OptimizedEmission {
     code: CompiledCode,
     osr_entries: BTreeMap<u32, usize>,
+    code_map: Option<CodeMapCapture>,
 }
 
 #[cfg(test)]
@@ -262,6 +265,17 @@ pub(super) fn compile_with_trampoline(
     transitions: &TransitionTable,
     call_trampoline: Arc<CallTrampoline>,
 ) -> Result<OptimizedCode, Unsupported> {
+    compile_with_trampoline_artifacts(view, code_object_id, transitions, call_trampoline, None)
+        .map(|output| output.code)
+}
+
+pub(super) fn compile_with_trampoline_artifacts(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+    call_trampoline: Arc<CallTrampoline>,
+    artifact_request: Option<ArtifactRequest>,
+) -> Result<NativeCompileOutput<OptimizedCode>, Unsupported> {
     // The unit is the root function plus every callee body the inline tree
     // splices into it, from the VM-baked monomorphic candidates. Only bodies
     // this backend lowers entirely into machine registers are spliced: a
@@ -303,7 +317,7 @@ pub(super) fn compile_with_trampoline(
         .count();
     let mut store_ic_cells =
         vec![crate::entry::WhiskerIcCell::default(); store_property_sites].into_boxed_slice();
-    let emission = emit(
+    let mut emission = emit(
         view,
         &unit.cfg,
         unit.dom.reverse_postorder(),
@@ -338,6 +352,7 @@ pub(super) fn compile_with_trampoline(
             transitions,
             function_id: u64::from(view.code_block.id),
         },
+        artifact_request.is_some(),
     )?;
     let frame_maps = eligibility
         .element_transitions
@@ -361,7 +376,26 @@ pub(super) fn compile_with_trampoline(
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
-    Ok(OptimizedCode::new(
+    let tier_input = artifact_request
+        .as_ref()
+        .map(|_| render_optimized_unit(&unit));
+    let artifact = artifact_request.and_then(|request| {
+        build_bundle(
+            request,
+            view,
+            code_object_id,
+            &emission.code,
+            otter_vm::JitArtifactFileName::OptimizedIr,
+            tier_input.expect("requested artifact has tier input"),
+            emission
+                .code_map
+                .take()
+                .expect("requested artifact has code map"),
+            Some(unit.deopt.table()),
+            &safepoint_records,
+        )
+    });
+    let code = OptimizedCode::new(
         emission.code,
         call_trampoline,
         unit.deopt.table().clone(),
@@ -388,7 +422,8 @@ pub(super) fn compile_with_trampoline(
             linear_scan_spill_slot_count: unit.linear_scan_spill_slot_count,
             spill_slot_count: unit.spill_slot_count,
         },
-    ))
+    );
+    Ok(NativeCompileOutput { code, artifact })
 }
 
 /// `true` when every instruction of `callee` lowers into machine registers.
@@ -1616,6 +1651,7 @@ fn emit(
     load_ic_cells: &mut [WhiskerIcCell],
     store_ic_cells: &mut [WhiskerIcCell],
     plan: EmissionPlan<'_>,
+    capture_artifacts: bool,
 ) -> Result<OptimizedEmission, Unsupported> {
     let EmissionPlan {
         reprs,
@@ -1646,6 +1682,7 @@ fn emit(
         function_id,
     } = plan;
     let spill_frame_bytes = aligned_spill_bytes(total_spill_slots(allocation)?)?;
+    let mut code_map = capture_artifacts.then(CodeMapCapture::default);
     let mut next_load_ic = 0usize;
     let mut next_store_ic = 0usize;
     let mut ops = Assembler::new()
@@ -1689,9 +1726,18 @@ fn emit(
             | ValueDef::Op { .. } => {}
         }
     }
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "entryPrelude",
+            entry.0,
+            ops.offset().0,
+        ));
+    }
 
+    let mut operation_index = 0u32;
     for block_id in rpo.iter().copied() {
         let block = &cfg.blocks[block_id.0 as usize];
+        let block_prelude_start = ops.offset().0;
         let label = block_labels[block_id.0 as usize];
         dynasm!(ops ; .arch aarch64 ; =>label);
         emit_initialize_dead_phis(
@@ -1712,7 +1758,16 @@ fn emit(
                 }
             }
         }
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record(CodeRegion::block(
+                "blockPrelude",
+                block_prelude_start,
+                ops.offset().0,
+                block_id.0,
+            ));
+        }
         for instruction in &ssa.blocks[block_id.0 as usize].instrs {
+            let instruction_start = ops.offset().0;
             if eligibility
                 .insufficient_feedback
                 .contains(&(instruction.inline, instruction.pc))
@@ -1726,6 +1781,21 @@ fn emit(
                     instruction.pc,
                 ));
                 dynasm!(ops ; .arch aarch64 ; b =>deopt);
+                if let Some(code_map) = code_map.as_mut() {
+                    let frame = &tree.frames[instruction.inline.0 as usize];
+                    code_map.record(CodeRegion::instruction(
+                        instruction_start,
+                        ops.offset().0,
+                        Some(block_id.0),
+                        Some(instruction.inline.0),
+                        frame.function_id,
+                        instruction.pc,
+                        frame.instructions[instruction.pc as usize].byte_pc(),
+                        Some(operation_index),
+                        format!("{:?}", instruction.op),
+                    ));
+                }
+                operation_index = operation_index.saturating_add(1);
                 continue;
             }
             let guard_deopt = match eligibility
@@ -3480,6 +3550,22 @@ fn emit(
                 }
                 _ => return Err(Unsupported::Opcode(instruction.op)),
             }
+            if let Some(code_map) = code_map.as_mut() {
+                let frame = &tree.frames[instruction.inline.0 as usize];
+                let byte_pc = frame.instructions[instruction.pc as usize].byte_pc();
+                code_map.record(CodeRegion::instruction(
+                    instruction_start,
+                    ops.offset().0,
+                    Some(block_id.0),
+                    Some(instruction.inline.0),
+                    frame.function_id,
+                    instruction.pc,
+                    byte_pc,
+                    Some(operation_index),
+                    format!("{:?}", instruction.op),
+                ));
+            }
+            operation_index = operation_index.saturating_add(1);
         }
 
         if matches!(
@@ -3488,6 +3574,7 @@ fn emit(
                 | Terminator::InlineCall { .. }
                 | Terminator::InlineReturn { .. }
         ) {
+            let edge_start = ops.offset().0;
             let target = block.normal_succs[0];
             emit_cfg_edge(
                 &mut ops,
@@ -3499,9 +3586,19 @@ fn emit(
                 block_id,
                 target,
             )?;
+            if let Some(code_map) = code_map.as_mut() {
+                code_map.record(CodeRegion::edge(
+                    "fallthroughEdge",
+                    edge_start,
+                    ops.offset().0,
+                    block_id.0,
+                    target.0,
+                ));
+            }
         }
     }
 
+    let threw_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
         ; =>threw
@@ -3509,14 +3606,32 @@ fn emit(
         ; movz x1, STATUS_THREW as u32
     );
     emit_epilogue(&mut ops, spill_frame_bytes);
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "throwEpilogue",
+            threw_start,
+            ops.offset().0,
+        ));
+    }
 
+    let boxed_slow_start = ops.offset().0;
     crate::template::arm64::values::emit_boxed_slot_slow_paths(
         &mut ops,
         view,
         boxed_slot_slow_paths,
     );
+    if let Some(code_map) = code_map.as_mut()
+        && ops.offset().0 != boxed_slow_start
+    {
+        code_map.record(CodeRegion::structural(
+            "boxedSlotSlowPaths",
+            boxed_slow_start,
+            ops.offset().0,
+        ));
+    }
 
     for (label, exit, resume_pc) in deopt_exits {
+        let deopt_start = ops.offset().0;
         dynasm!(ops ; .arch aarch64 ; =>label);
         let frame_state = deopt_table.lookup(exit).ok_or(Unsupported::OperandShape(
             "optimizing deopt exit missing frame state",
@@ -3534,6 +3649,14 @@ fn emit(
                 ; movz x1, STATUS_BAILED as u32
             );
             emit_epilogue(&mut ops, spill_frame_bytes);
+            if let Some(code_map) = code_map.as_mut() {
+                code_map.record(CodeRegion::deopt(
+                    deopt_start,
+                    ops.offset().0,
+                    exit.0,
+                    resume_pc,
+                ));
+            }
             continue;
         }
 
@@ -3570,6 +3693,14 @@ fn emit(
             ; movz x1, STATUS_BAILED as u32
         );
         emit_epilogue(&mut ops, spill_frame_bytes);
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record(CodeRegion::deopt(
+                deopt_start,
+                ops.offset().0,
+                exit.0,
+                resume_pc,
+            ));
+        }
     }
 
     let mut osr_entries = BTreeMap::new();
@@ -3595,6 +3726,9 @@ fn emit(
             ; movz x1, STATUS_BAILED as u32
         );
         emit_epilogue(&mut ops, spill_frame_bytes);
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record_osr(site.logical_pc, offset, ops.offset().0);
+        }
         osr_entries.insert(site.logical_pc, offset);
     }
 
@@ -3604,6 +3738,7 @@ fn emit(
     Ok(OptimizedEmission {
         code: CompiledCode::new(buffer, entry),
         osr_entries,
+        code_map,
     })
 }
 

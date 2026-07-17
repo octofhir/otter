@@ -426,7 +426,7 @@ impl RuntimeHandle {
             path: path.into(),
             reply,
         }) {
-            return ExecutionAttempt::from_result(Err(error), None);
+            return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
     }
@@ -476,7 +476,7 @@ impl RuntimeHandle {
             specifier: specifier.into(),
             reply,
         }) {
-            return ExecutionAttempt::from_result(Err(error), None);
+            return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
     }
@@ -501,7 +501,7 @@ impl RuntimeHandle {
             path: path.into(),
             reply,
         }) {
-            return ExecutionAttempt::from_result(Err(error), None);
+            return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
     }
@@ -519,7 +519,7 @@ impl RuntimeHandle {
         let (reply, rx) = oneshot::channel();
         let id = self.next_command_id();
         if let Err(error) = self.submit(RuntimeCommand::Eval { id, source, reply }) {
-            return ExecutionAttempt::from_result(Err(error), None);
+            return ExecutionAttempt::from_result(Err(error), None, None);
         }
         self.await_run_reply(rx).await
     }
@@ -898,6 +898,7 @@ impl RuntimeHandle {
                     return ExecutionAttempt::from_result(
                         Err(OtterError::timeout_after(timeout)),
                         None,
+                        None,
                     );
                 }
             }
@@ -922,6 +923,7 @@ impl RuntimeHandle {
                     code: DiagnosticCode::RuntimeReplyDropped.as_str().to_string(),
                     message: "runtime isolate dropped command reply".to_string(),
                 }),
+                None,
                 None,
             ),
         }

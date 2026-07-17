@@ -21,6 +21,8 @@ all = { level = "deny", priority = -1 }
 otter-bytecode = { workspace = true }
 otter-vm = { workspace = true }
 rustc-hash = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 # Template macro-assembler chosen by the §3.2 prototype gate (M1/M2 confirmed
 # toolchain + latency + codegen on arm64). x86_64 emitter follows arm64.

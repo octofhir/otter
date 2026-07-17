@@ -83,11 +83,10 @@ an otherwise unexplained gap while its native body executes, until control
 returns to the interpreter.
 
 Use the trace to establish bytecode order and the last interpreter-visible
-PC. It cannot yet explain native instruction selection, register allocation,
-safepoints, or the exact JIT offset of a deopt. Versioned JIT artifact bundles
-and annotated ARM64 assembly are tracked in
-`DEBUG_TRACE_PROFILING_PLAN.md`; they will be documented here only after the
-CLI surface exists.
+PC. To correlate a compiled function with its bytecode, tier input, exact
+machine-code offsets, safepoints, or deopt exits, capture a
+[JIT artifact bundle](/otter/engine/jit-debugging/). Annotated ARM64 assembly
+and symbolic relocation normalization remain tracked follow-ups.
 
 ## Performance
 

@@ -125,13 +125,17 @@ The shipped engine diagnostics are deliberately default-off:
   interpreter-dispatched bytecode;
 - Chrome/V8 `.cpuprofile` plus folded stacks from the bytecode-dispatch
   sampler;
+- versioned [JIT events and compile artifacts](/otter/engine/jit-debugging/)
+  for bytecode, tier input, exact native bytes, native offset maps,
+  safepoints, and deopt metadata;
 - embedder snapshots for inline caches, shapes, frames, heap summaries, and
   Chrome `.heapsnapshot` output.
 
 The current step trace and CPU sampler do not observe instructions executing
-inside native JIT bodies. JIT artifact bundles, annotated assembly,
-Chrome/Perfetto async traces, and timeout ring-buffer dumps are roadmap work,
-not shipped CLI features.
+inside native JIT bodies. Artifact bundles expose the compiled representation
+but do not sample live execution. Annotated assembly, JIT-aware sampling,
+Chrome/Perfetto async traces, and timeout ring-buffer dumps remain roadmap
+work.
 
 New debug/profiling features must stay default-off and use standard output
 formats where possible. The implementation order and artifact contract live

@@ -77,4 +77,18 @@ impl CompiledCode {
     pub fn is_empty(&self) -> bool {
         self.buf.len() == 0
     }
+
+    /// Borrow the exact finalized machine-code bytes.
+    ///
+    /// Artifact capture clones this slice only when explicitly requested.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Main entry offset within the finalized mapping.
+    #[must_use]
+    pub const fn entry_offset(&self) -> usize {
+        self.entry
+    }
 }

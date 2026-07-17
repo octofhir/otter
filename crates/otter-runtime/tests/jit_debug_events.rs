@@ -111,7 +111,9 @@ fn jit_debug_reports_are_default_off() {
 
     assert_eq!(result.completion_string(), "4560");
     assert!(result.jit_debug_report().is_none());
+    assert!(result.jit_artifacts().is_none());
     assert!(runtime.take_jit_debug_report().is_none());
+    assert!(runtime.take_jit_artifacts().is_none());
 }
 
 #[test]

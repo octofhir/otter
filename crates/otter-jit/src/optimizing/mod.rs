@@ -57,6 +57,8 @@ use crate::{
 
 #[cfg(target_arch = "aarch64")]
 mod arm64;
+#[cfg(target_arch = "aarch64")]
+mod artifact;
 pub(crate) mod pipeline;
 pub(crate) mod unit;
 
@@ -124,7 +126,7 @@ impl OptimizedCode {
         let code_metadata = CodeObjectMetadata {
             id: metadata.code_object_id,
             code_block_id: metadata.function_id,
-            entry_offset: 0,
+            entry_offset: code.entry_offset() as u32,
             code_size: code.len() as u32,
             safepoint_count: safepoint_records.len() as u32,
             frame_map_count: frame_maps.len() as u32,
@@ -289,13 +291,20 @@ pub fn compile_optimized(
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn compile_optimized_with_transitions(
+pub(crate) fn compile_optimized_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
     call_trampoline: std::sync::Arc<CallTrampoline>,
-) -> Result<OptimizedCode, Unsupported> {
-    arm64::compile_with_trampoline(view, code_object_id, transitions, call_trampoline)
+    artifact_request: Option<crate::artifact::ArtifactRequest>,
+) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
+    arm64::compile_with_trampoline_artifacts(
+        view,
+        code_object_id,
+        transitions,
+        call_trampoline,
+        artifact_request,
+    )
 }
 
 /// Non-arm64 stub: the first optimizing backend is arm64-only.

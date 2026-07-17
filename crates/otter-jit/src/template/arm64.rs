@@ -72,6 +72,9 @@ use self::values::{
 };
 use super::{TemplateCode, TemplateOp, TemplatePlan};
 use crate::CompiledCode;
+use crate::artifact::{
+    ArtifactRequest, CodeMapCapture, CodeRegion, NativeCompileOutput, build_bundle,
+};
 use crate::entry::{
     CANONICAL_NAN_HI16, DOUBLE_OFFSET_HI16, NATIVE_FRAME_OFFSET, NATIVE_FRAME_PC_OFFSET,
     NATIVE_FRAME_REGISTER_BASE_OFFSET, NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET,
@@ -93,8 +96,10 @@ pub(super) fn compile(
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
     call_trampoline: Arc<crate::arm64::CallTrampoline>,
-) -> Result<TemplateCode, Unsupported> {
+    artifact_request: Option<ArtifactRequest>,
+) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
     let plan = TemplatePlan::build(view)?;
+    let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let code_block_id = view.code_block.id;
     // Self-patching property IC cells: allocated address-stable before any
@@ -122,7 +127,15 @@ pub(super) fn compile(
 
     let entry = ops.offset();
     emit_prologue(&mut ops);
-    for instr in &plan.instructions {
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "entryPrologue",
+            entry.0,
+            ops.offset().0,
+        ));
+    }
+    for (operation_index, instr) in plan.instructions.iter().enumerate() {
+        let instruction_start = ops.offset().0;
         let label = labels[&instr.pc];
         dynasm!(ops ; .arch aarch64 ; =>label);
         // Publish this op's logical PC before any observable work; the
@@ -1009,6 +1022,19 @@ pub(super) fn compile(
                 dynasm!(ops ; .arch aarch64 ; b =>bail);
             }
         }
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record(CodeRegion::instruction(
+                instruction_start,
+                ops.offset().0,
+                None,
+                None,
+                view.code_block.id,
+                instr.pc,
+                instr.byte_pc,
+                Some(u32::try_from(operation_index).unwrap_or(u32::MAX)),
+                format!("{:?}", instr.op),
+            ));
+        }
     }
 
     // Preserve the old end-of-stream exact exit while keeping cold
@@ -1018,22 +1044,39 @@ pub(super) fn compile(
         || !coercion_slow_paths.is_empty()
         || !numeric_slow_paths.is_empty()
     {
+        let slow_paths_start = ops.offset().0;
         dynasm!(ops ; .arch aarch64 ; b =>bail);
         emit_boxed_slot_slow_paths(&mut ops, view, boxed_slot_slow_paths);
         emit_numeric_slow_paths(&mut ops, transitions, numeric_slow_paths, bail, threw);
         emit_coercion_slow_paths(&mut ops, transitions, coercion_slow_paths, threw);
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record(CodeRegion::structural(
+                "outlinedSlowPaths",
+                slow_paths_start,
+                ops.offset().0,
+            ));
+        }
     }
 
     // Shared normal-return epilogue. `x0` already carries the boxed value.
+    let returned_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
         ; =>returned
         ; movz x1, STATUS_RETURNED as u32
     );
     emit_epilogue(&mut ops);
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "returnEpilogue",
+            returned_start,
+            ops.offset().0,
+        ));
+    }
 
     // Shared exact-side-exit epilogue: status = bailed, value = 0. The frame
     // PC stamped at the exiting instruction names the uncommitted opcode.
+    let bail_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
         ; =>bail
@@ -1041,12 +1084,20 @@ pub(super) fn compile(
         ; movz x1, STATUS_BAILED as u32
     );
     emit_epilogue(&mut ops);
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "bailEpilogue",
+            bail_start,
+            ops.offset().0,
+        ));
+    }
     // Shared throw epilogue: a transition parked the error in the context.
     // Before propagating, deliver it to this frame's own structured-exception
     // handlers so a `try` in the same compiled function catches a
     // property/element/global/loose-equality/coercion throw. The resolver bails
     // to the published catch/finally PC when a local handler takes it, and
     // otherwise re-parks the error for the propagating throw.
+    let threw_start = ops.offset().0;
     dynasm!(ops
         ; .arch aarch64
         ; =>threw
@@ -1062,6 +1113,13 @@ pub(super) fn compile(
         ; movz x1, STATUS_THREW as u32
     );
     emit_epilogue(&mut ops);
+    if let Some(code_map) = code_map.as_mut() {
+        code_map.record(CodeRegion::structural(
+            "throwEpilogue",
+            threw_start,
+            ops.offset().0,
+        ));
+    }
 
     assert_eq!(next_load_ic, load_ic_cells.len(), "LoadProperty IC count");
     assert_eq!(
@@ -1082,12 +1140,16 @@ pub(super) fn compile(
         let offset = ops.offset().0;
         emit_prologue(&mut ops);
         dynasm!(ops ; .arch aarch64 ; b =>target);
+        if let Some(code_map) = code_map.as_mut() {
+            code_map.record_osr(header_pc, offset, ops.offset().0);
+        }
         osr_entries.insert(header_pc, offset);
     }
 
     let buf = ops
         .finalize()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::Finalization))?;
+    let tier_input = artifact_request.as_ref().map(|_| plan.render_artifact());
     let TemplatePlan {
         register_count,
         register_operands,
@@ -1097,8 +1159,22 @@ pub(super) fn compile(
         ..
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
-    Ok(TemplateCode::from_emission(
-        CompiledCode::new(buf, entry),
+    let compiled_code = CompiledCode::new(buf, entry);
+    let artifact = artifact_request.and_then(|request| {
+        build_bundle(
+            request,
+            view,
+            code_object_id,
+            &compiled_code,
+            otter_vm::JitArtifactFileName::TemplatePlan,
+            tier_input.expect("requested artifact has tier input"),
+            code_map.expect("requested artifact has code map"),
+            None,
+            &safepoint_records,
+        )
+    });
+    let code = TemplateCode::from_emission(
+        compiled_code,
         call_trampoline,
         code_object_id,
         view.code_block.id,
@@ -1110,7 +1186,8 @@ pub(super) fn compile(
         safepoint_records.into_boxed_slice(),
         osr_entries,
         osr_only,
-    ))
+    );
+    Ok(NativeCompileOutput { code, artifact })
 }
 
 /// Emit the function prologue: save fp/lr + callee-saved bases, then set

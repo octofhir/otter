@@ -83,7 +83,7 @@ impl TemplateCode {
         let metadata = CodeObjectMetadata {
             id: code_object_id,
             code_block_id: function_id,
-            entry_offset: 0,
+            entry_offset: code.entry_offset() as u32,
             code_size: code.len() as u32,
             safepoint_count: safepoint_records.len() as u32,
             frame_map_count: safepoint_records.len() as u32,

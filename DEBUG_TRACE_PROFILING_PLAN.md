@@ -47,11 +47,18 @@ needed to optimize the VM and JIT safely.
   `--jit-events[=<path>]`: compile preparation/results, inline candidates,
   side exits, and inline-frame materialization. Capture is bounded, survives
   abrupt completion, and includes JIT work performed by event-loop callbacks.
+- [x] Owned, schema-versioned JIT compile bundles through
+  `--jit-artifacts[=<directory>]`: exact runtime-local code, bytecode,
+  template plan or optimized IR, native offset maps, deopt metadata, and
+  safepoints. The CLI writes a new root atomically under a cooperative
+  single-writer contract and never intentionally merges with an existing
+  target.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
-ring-buffer dumps, Test262 failure traces, IR dumps, machine-code dumps, and
-annotated assembly are not shipped yet. Structured JIT events are an Otter
-diagnostic schema, not a replacement for the planned Chrome/Perfetto timeline.
+ring-buffer dumps, Test262 failure traces, portable normalized machine-code
+dumps, symbolic relocations, and annotated assembly are not shipped yet.
+Structured JIT events and artifact manifests are Otter diagnostic schemas, not
+replacements for the planned Chrome/Perfetto timeline.
 
 ## Known Debt
 
@@ -65,12 +72,14 @@ diagnostic schema, not a replacement for the planned Chrome/Perfetto timeline.
   JIT event report. In that case the CLI preserves the timeout error and does
   not write a misleading empty artifact; bounded timeout snapshots remain a
   later slice.
-- Compiled code retains executable bytes and runtime metadata but exposes no
-  stable artifact bundle or code-offset map to tooling.
-- There is no standard way to correlate bytecode PC, tier plan/IR, native code
-  offset, safepoint, deopt exit, and runtime entry/deopt counts.
-- JIT events identify functions, tiers, entry targets, and logical PCs but do
-  not yet carry the artifact/code-offset correlation needed for disassembly.
+- Exact native bytes and native-offset maps are available, but address
+  immediates are not yet described by symbolic relocation records and there is
+  no portable normalized code stream.
+- Bytecode PC, tier plan/IR, native code offsets, OSR entries, and deopt exits
+  can be correlated. Safepoint-to-native-return offsets and annotated
+  disassembly remain open.
+- Successful JIT compile events join to artifact manifests by `codeObjectId`.
+  Native entry, side-exit, and deopt execution counters remain open.
 
 ## Ordered Implementation Slices
 
@@ -89,20 +98,25 @@ diagnostic schema, not a replacement for the planned Chrome/Perfetto timeline.
 
 ### 2. Versioned JIT artifact bundle
 
-- [ ] Return an optional owned bundle with each successful template or
+- [x] Return an optional owned bundle with each successful template or
   optimizing compile.
-- [ ] Let the CLI/embedder persist bundles into one directory per compile.
-- [ ] Publish a versioned `manifest.json` containing target, architecture,
+- [x] Let the CLI/embedder persist bundles into one directory per compile.
+- [x] Publish a versioned `manifest.json` containing target, architecture,
   tier, function identity, module, entry kind, bytecode/code sizes, and the
   files present.
 - [ ] Emit exact runtime-local `code.bin`, deterministic `code-map.json`, and
   symbolic `relocations.json`. Portable byte comparisons use a normalized view
   with relocation immediates redacted, not the exact executable bytes.
-- [ ] Emit tier input from the already-owned compiler representation:
+- [x] Emit tier input from the already-owned compiler representation:
   template plan for the template tier and optimized unit/IR for the optimizing
   tier.
 - [ ] Cover multiple functions, recompilation, OSR entry, abrupt compile
   failure, nested JIT re-entry, and full-GC relocation.
+
+Multiple functions, template and optimizing OSR, abrupt execution, nested JIT
+re-entry, and full-GC ownership are covered. Recompilation, abrupt compiler
+failure, typed relocations, and normalized code remain follow-ups in this
+roadmap item.
 
 Planned bundle shape:
 

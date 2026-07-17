@@ -25,6 +25,7 @@
 
 use otter_bytecode::Op;
 use otter_vm::{JitCompileSnapshot, SafepointId, SafepointRecord, Value};
+use std::fmt::Write as _;
 
 use crate::entry::{BaselinePlan, MAX_METHOD_ARGS, Unsupported, pack_method_arg_regs, value_tag};
 
@@ -496,6 +497,7 @@ pub(crate) struct TemplateTail {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TemplateInstr {
     pub(crate) pc: u32,
+    pub(crate) byte_pc: u32,
     pub(crate) op: TemplateOp,
 }
 
@@ -533,6 +535,34 @@ fn pack_or_spill_arg_regs(arguments: &[u16], register_operands: &mut Vec<u16>) -
 }
 
 impl TemplatePlan {
+    /// Deterministic text view of the already-built plan for artifact capture.
+    pub(crate) fn render_artifact(&self) -> String {
+        let mut out = String::from("; otter template plan v1\n");
+        writeln!(
+            out,
+            "; registers={} register-operands={} index-operands={} safepoints={} osr-only={}",
+            self.register_count,
+            self.register_operands.len(),
+            self.index_operands.len(),
+            self.safepoint_records.len(),
+            self.osr_only
+        )
+        .expect("writing to String cannot fail");
+        writeln!(out, "; register-operands={:?}", self.register_operands)
+            .expect("writing to String cannot fail");
+        writeln!(out, "; index-operands={:?}", self.index_operands)
+            .expect("writing to String cannot fail");
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            writeln!(
+                out,
+                "{index:04} pc={:04} byte={:04} {:?}",
+                instruction.pc, instruction.byte_pc, instruction.op
+            )
+            .expect("writing to String cannot fail");
+        }
+        out
+    }
+
     pub(crate) fn register_tail(&self, tail: TemplateTail) -> &[u16] {
         &self.register_operands[tail.start..tail.start + tail.len]
     }
@@ -878,6 +908,7 @@ impl TemplatePlan {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
+                            byte_pc: lowered.byte_pc,
                             op: TemplateOp::UnsupportedBail,
                         });
                         continue;
@@ -954,6 +985,7 @@ impl TemplatePlan {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
+                            byte_pc: lowered.byte_pc,
                             op: TemplateOp::UnsupportedBail,
                         });
                         continue;
@@ -1186,6 +1218,7 @@ impl TemplatePlan {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
+                            byte_pc: lowered.byte_pc,
                             op: TemplateOp::UnsupportedBail,
                         });
                         continue;
@@ -1207,6 +1240,7 @@ impl TemplatePlan {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
+                            byte_pc: lowered.byte_pc,
                             op: TemplateOp::UnsupportedBail,
                         });
                         continue;
@@ -1246,6 +1280,7 @@ impl TemplatePlan {
                         osr_only = true;
                         instructions.push(TemplateInstr {
                             pc,
+                            byte_pc: lowered.byte_pc,
                             op: TemplateOp::UnsupportedBail,
                         });
                         continue;
@@ -1501,7 +1536,11 @@ impl TemplatePlan {
                     TemplateOp::UnsupportedBail
                 }
             };
-            instructions.push(TemplateInstr { pc, op });
+            instructions.push(TemplateInstr {
+                pc,
+                byte_pc: lowered.byte_pc,
+                op,
+            });
         }
         Ok(Self {
             instructions,

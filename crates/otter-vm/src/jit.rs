@@ -67,6 +67,11 @@ pub struct JitCompileRequest {
     pub snapshot: JitCompileSnapshot,
     /// Default-off diagnostics requested by the owning isolate.
     pub debug: crate::jit_debug::JitDebugRequest,
+    /// Owned source identity present only when artifact capture is requested.
+    ///
+    /// Keeping this optional avoids cloning names and module URLs on the
+    /// ordinary default-off compilation path.
+    pub artifact_identity: Option<crate::jit_artifact::JitArtifactIdentity>,
     /// Loop-header logical PC for an OSR-target compile. `None` means normal
     /// function-entry compilation.
     pub osr_pc: Option<u32>,
@@ -754,6 +759,12 @@ impl JitInstructionMetadata {
         self.resolve(code_block).instruction_pc
     }
 
+    /// Cold serialized byte PC retained by the immutable compile snapshot.
+    #[must_use]
+    pub const fn byte_pc(&self) -> u32 {
+        self.byte_pc
+    }
+
     /// Dense property IC site from the authoritative CodeBlock instruction.
     #[must_use]
     pub fn property_ic_site(&self, code_block: &CodeBlock) -> Option<usize> {
@@ -1094,6 +1105,9 @@ pub enum JitCompileStatus {
     Compiled {
         /// Type-erased native-code handle.
         code: Arc<dyn JitFunctionCode>,
+        /// Optional owned debug sidecar returned independently of installed
+        /// executable code.
+        artifact: Option<Box<crate::jit_artifact::JitArtifactBundle>>,
     },
 }
 

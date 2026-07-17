@@ -114,7 +114,9 @@ pub use otter_compiler::{
 pub use otter_gc;
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{
-    AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JIT_DEBUG_EVENT_LIMIT,
+    AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JIT_ARTIFACT_BUNDLE_LIMIT,
+    JIT_ARTIFACT_BYTE_LIMIT, JIT_ARTIFACT_SCHEMA_VERSION, JIT_DEBUG_EVENT_LIMIT, JitArtifactBatch,
+    JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactManifest,
     JitDebugCompileOutcome, JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget,
     JitDebugTier, JitInlineRejectionReason, JsObject, JsSurfaceError, MethodSpec, NativeCall,
     ObjectBuilder, Value, array, bootstrap, intrinsic_install, object, rooting,
@@ -531,6 +533,8 @@ pub struct ExecutionResult {
     stats: Box<RuntimeExecutionStats>,
     /// Owned, opt-in JIT diagnostics for this top-level run.
     jit_debug_report: Option<Box<JitDebugReport>>,
+    /// Owned, opt-in successful compile artifacts for this top-level run.
+    jit_artifacts: Option<Box<JitArtifactBatch>>,
 }
 
 impl ExecutionResult {
@@ -547,6 +551,7 @@ impl ExecutionResult {
             duration,
             stats: Box::default(),
             jit_debug_report: None,
+            jit_artifacts: None,
         }
     }
 
@@ -559,6 +564,7 @@ impl ExecutionResult {
             duration,
             stats: Box::default(),
             jit_debug_report: None,
+            jit_artifacts: None,
         }
     }
 
@@ -574,6 +580,15 @@ impl ExecutionResult {
             None => Box::new(report),
         };
         self.jit_debug_report = Some(report);
+        self
+    }
+
+    fn with_jit_artifacts(mut self, artifacts: JitArtifactBatch) -> Self {
+        let artifacts = match self.jit_artifacts.take() {
+            Some(existing) => Box::new((*existing).merged(artifacts)),
+            None => Box::new(artifacts),
+        };
+        self.jit_artifacts = Some(artifacts);
         self
     }
 
@@ -615,35 +630,59 @@ impl ExecutionResult {
     pub fn take_jit_debug_report(&mut self) -> Option<JitDebugReport> {
         self.jit_debug_report.take().map(|report| *report)
     }
+
+    /// Successful compile artifacts captured for this top-level run.
+    #[must_use]
+    pub fn jit_artifacts(&self) -> Option<&JitArtifactBatch> {
+        self.jit_artifacts.as_deref()
+    }
+
+    /// Take the owned artifact batch without cloning code or text payloads.
+    #[must_use]
+    pub fn take_jit_artifacts(&mut self) -> Option<JitArtifactBatch> {
+        self.jit_artifacts.take().map(|artifacts| *artifacts)
+    }
 }
 
 /// One top-level execution plus diagnostics retained on abrupt failure.
 ///
 /// Ordinary runtime APIs keep returning `Result<ExecutionResult, OtterError>`.
 /// Diagnostic-aware callers use this non-error envelope when they must persist
-/// partial JIT events even though execution did not produce a result.
+/// partial JIT events and successful compile artifacts even though execution
+/// did not produce a result.
 #[derive(Debug)]
 pub struct ExecutionAttempt {
     result: Result<ExecutionResult, OtterError>,
     failure_jit_debug_report: Option<Box<JitDebugReport>>,
+    failure_jit_artifacts: Option<Box<JitArtifactBatch>>,
 }
 
 impl ExecutionAttempt {
     fn from_result(
         result: Result<ExecutionResult, OtterError>,
         report: Option<JitDebugReport>,
+        artifacts: Option<JitArtifactBatch>,
     ) -> Self {
         match result {
-            Ok(result) => Self {
-                result: Ok(match report {
+            Ok(result) => {
+                let result = match report {
                     Some(report) => result.with_jit_debug_report(report),
                     None => result,
-                }),
-                failure_jit_debug_report: None,
-            },
+                };
+                let result = match artifacts {
+                    Some(artifacts) => result.with_jit_artifacts(artifacts),
+                    None => result,
+                };
+                Self {
+                    result: Ok(result),
+                    failure_jit_debug_report: None,
+                    failure_jit_artifacts: None,
+                }
+            }
             Err(error) => Self {
                 result: Err(error),
                 failure_jit_debug_report: report.map(Box::new),
+                failure_jit_artifacts: artifacts.map(Box::new),
             },
         }
     }
@@ -662,12 +701,25 @@ impl ExecutionAttempt {
         }
     }
 
+    /// Borrow complete or partial successful compile artifacts.
+    #[must_use]
+    pub fn jit_artifacts(&self) -> Option<&JitArtifactBatch> {
+        match &self.result {
+            Ok(result) => result.jit_artifacts(),
+            Err(_) => self.failure_jit_artifacts.as_deref(),
+        }
+    }
+
     /// Discard failure-only diagnostics and recover the established API result.
     pub fn into_result(self) -> Result<ExecutionResult, OtterError> {
         self.result
     }
 
-    /// Split execution from its owned complete or partial JIT report.
+    /// Split execution from its owned complete or partial JIT event report.
+    ///
+    /// Successful-result artifacts remain attached to the returned
+    /// [`ExecutionResult`]. Use [`Self::into_diagnostic_parts`] when a host
+    /// needs to persist both diagnostic channels after abrupt failure.
     pub fn into_parts(self) -> (Result<ExecutionResult, OtterError>, Option<JitDebugReport>) {
         match self.result {
             Ok(mut result) => {
@@ -677,6 +729,28 @@ impl ExecutionAttempt {
             Err(error) => (
                 Err(error),
                 self.failure_jit_debug_report.map(|report| *report),
+            ),
+        }
+    }
+
+    /// Split execution from both owned complete or partial JIT channels.
+    pub fn into_diagnostic_parts(
+        self,
+    ) -> (
+        Result<ExecutionResult, OtterError>,
+        Option<JitDebugReport>,
+        Option<JitArtifactBatch>,
+    ) {
+        match self.result {
+            Ok(mut result) => {
+                let report = result.take_jit_debug_report();
+                let artifacts = result.take_jit_artifacts();
+                (Ok(result), report, artifacts)
+            }
+            Err(error) => (
+                Err(error),
+                self.failure_jit_debug_report.map(|report| *report),
+                self.failure_jit_artifacts.map(|artifacts| *artifacts),
             ),
         }
     }
@@ -3226,8 +3300,12 @@ impl Runtime {
     }
 
     pub(crate) fn attach_jit_debug_report(&mut self, result: ExecutionResult) -> ExecutionResult {
-        match self.interp.take_jit_debug_report() {
+        let result = match self.interp.take_jit_debug_report() {
             Some(report) => result.with_jit_debug_report(report),
+            None => result,
+        };
+        match self.interp.take_jit_artifacts() {
+            Some(artifacts) => result.with_jit_artifacts(artifacts),
             None => result,
         }
     }
@@ -3236,7 +3314,11 @@ impl Runtime {
         &mut self,
         result: Result<ExecutionResult, OtterError>,
     ) -> ExecutionAttempt {
-        ExecutionAttempt::from_result(result, self.interp.take_jit_debug_report())
+        ExecutionAttempt::from_result(
+            result,
+            self.interp.take_jit_debug_report(),
+            self.interp.take_jit_artifacts(),
+        )
     }
 
     /// Drain the current structured JIT diagnostics batch.
@@ -3246,6 +3328,15 @@ impl Runtime {
     #[must_use]
     pub fn take_jit_debug_report(&mut self) -> Option<JitDebugReport> {
         self.interp.take_jit_debug_report()
+    }
+
+    /// Drain the current successful compile artifact batch.
+    ///
+    /// This remains available after abrupt execution and is independent from
+    /// structured event capture.
+    #[must_use]
+    pub fn take_jit_artifacts(&mut self) -> Option<JitArtifactBatch> {
+        self.interp.take_jit_artifacts()
     }
 
     /// Reset VM runtime budget/resource counters.

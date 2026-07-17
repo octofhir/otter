@@ -4,6 +4,7 @@
 //! - Explicit execution-tier selection through the public CLI.
 //! - Shared trace and CPU-profiler configuration on the synchronous runtime path.
 //! - Structured JIT event capture through an explicit default-off target.
+//! - Atomic, versioned JIT artifact bundle persistence.
 //!
 //! # Invariants
 //! - Tests invoke the built binary instead of private configuration helpers.
@@ -55,6 +56,10 @@ fn explicit_jit_tier_modes_are_accepted() {
     assert!(
         !tmp.path().join("otter-jit-events.json").exists(),
         "default-off runs must not create a diagnostics artifact"
+    );
+    assert!(
+        !tmp.path().join("otter-jit-artifacts").exists(),
+        "default-off runs must not create a JIT artifact directory"
     );
 }
 
@@ -213,6 +218,252 @@ fn late_input_error_preserves_earlier_file_jit_events() {
             .iter()
             .any(|event| event["type"] == "compileFinished")),
         "the first file's compile events survive a later pre-execution input error"
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn jit_artifacts_are_versioned_complete_and_offset_consistent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let artifacts_path = tmp.path().join("artifacts");
+    let output = otter_command(tmp.path())
+        .env("OTTER_JIT_OSR_THRESHOLD", "1")
+        .arg(format!("--jit-artifacts={}", artifacts_path.display()))
+        .arg("--jit-tier=template")
+        .arg("--print")
+        .arg(
+            "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
+             { s = s + i; } return s; } hot(40)",
+        )
+        .output()
+        .expect("run with JIT artifact capture");
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "780");
+
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifacts_path.join("index.json")).expect("read artifact index"),
+    )
+    .expect("valid artifact index");
+    assert_eq!(index["otterJitArtifactIndexSchemaVersion"], 1);
+    assert_eq!(index["droppedBundles"], 0);
+    assert_eq!(index["droppedBytes"], 0);
+    assert_eq!(index["truncated"], false);
+    assert!(
+        index["retainedBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    let directories = index["bundles"].as_array().expect("bundle directories");
+    assert!(!directories.is_empty(), "at least one native compile");
+    let directory_name = directories[0].as_str().expect("directory name");
+    assert!(directory_name.starts_with("jit-0000-template-f"));
+    assert!(directory_name.contains("-c"));
+    let directory = artifacts_path.join(directory_name);
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("manifest.json")).expect("read artifact manifest"),
+    )
+    .expect("valid artifact manifest");
+    assert_eq!(manifest["otterJitArtifactSchemaVersion"], 1);
+    assert_eq!(manifest["tier"], "template");
+    assert_eq!(manifest["entry"]["kind"], "osr");
+    assert_eq!(manifest["module"], "<eval>");
+    assert!(manifest["functionId"].is_u64());
+    assert!(manifest["codeObjectId"].is_u64());
+    assert!(
+        manifest["bytecodeBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    let code_bytes = manifest["codeBytes"].as_u64().expect("native code size");
+    assert!(code_bytes > 0);
+    assert_eq!(manifest["exactCodeIsRuntimeLocal"], true);
+
+    let present = manifest["filesPresent"].as_array().expect("present files");
+    for name in [
+        "manifest.json",
+        "bytecode.txt",
+        "template-plan.txt",
+        "code.bin",
+        "code-map.json",
+        "safepoints.json",
+    ] {
+        assert!(
+            present.iter().any(|value| value == name),
+            "missing present inventory entry {name}"
+        );
+        assert!(directory.join(name).is_file(), "missing payload {name}");
+    }
+    let absent = manifest["filesAbsent"].as_array().expect("absent files");
+    for name in [
+        "optimized-ir.txt",
+        "code-normalized.bin",
+        "asm.txt",
+        "relocations.json",
+        "deopt.json",
+    ] {
+        assert!(
+            absent.iter().any(|value| value == name),
+            "missing absent inventory entry {name}"
+        );
+        assert!(!directory.join(name).exists(), "unexpected payload {name}");
+    }
+
+    let code = std::fs::read(directory.join("code.bin")).expect("read code.bin");
+    assert_eq!(code.len() as u64, code_bytes);
+    assert!(
+        std::fs::read_to_string(directory.join("bytecode.txt"))
+            .expect("read bytecode")
+            .starts_with("; otter bytecode v1\n")
+    );
+    assert!(
+        std::fs::read_to_string(directory.join("template-plan.txt"))
+            .expect("read template plan")
+            .starts_with("; otter template plan v1\n")
+    );
+
+    let code_map: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("code-map.json")).expect("read code map"),
+    )
+    .expect("valid code map");
+    assert_eq!(code_map["otterJitCodeMapSchemaVersion"], 1);
+    let regions = code_map["regions"].as_array().expect("code-map regions");
+    assert!(!regions.is_empty());
+    for region in regions {
+        let start = region["startOffset"].as_u64().expect("region start");
+        let end = region["endOffset"].as_u64().expect("region end");
+        assert!(start <= end && end <= code_bytes, "invalid region {region}");
+    }
+    let osr_pc = manifest["entry"]["pc"].as_u64().expect("manifest OSR PC");
+    assert!(
+        code_map["osrEntries"]
+            .as_array()
+            .is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry["logicalPc"].as_u64() == Some(osr_pc))),
+        "code map must contain the manifest OSR entry"
+    );
+
+    let safepoints: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("safepoints.json")).expect("read safepoints"),
+    )
+    .expect("valid safepoints");
+    assert_eq!(safepoints["otterJitSafepointSchemaVersion"], 1);
+    assert!(safepoints["safepoints"].is_array());
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn abrupt_failure_still_writes_partial_jit_artifacts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let artifacts_path = tmp.path().join("abrupt-artifacts");
+    let output = otter_command(tmp.path())
+        .env("OTTER_JIT_OSR_THRESHOLD", "1")
+        .arg(format!("--jit-artifacts={}", artifacts_path.display()))
+        .arg("--jit-tier=template")
+        .arg("--eval")
+        .arg(
+            "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
+             { s = s + i; } return s; } hot(40); throw new Error('expected-artifact-error');",
+        )
+        .output()
+        .expect("run abrupt artifact capture");
+
+    assert!(!output.status.success(), "fixture must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expected-artifact-error"),
+        "original runtime error must remain primary: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifacts_path.join("index.json")).expect("read partial artifact index"),
+    )
+    .expect("valid partial artifact index");
+    assert!(
+        index["bundles"]
+            .as_array()
+            .is_some_and(|bundles| !bundles.is_empty()),
+        "partial artifact batch retains successful compiles"
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn existing_artifact_target_is_not_overwritten() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let artifacts_path = tmp.path().join("existing-artifacts");
+    std::fs::create_dir(&artifacts_path).expect("create existing target");
+    let sentinel = artifacts_path.join("sentinel.txt");
+    std::fs::write(&sentinel, "keep").expect("write sentinel");
+
+    let output = otter_command(tmp.path())
+        .env("OTTER_JIT_OSR_THRESHOLD", "1")
+        .arg(format!("--jit-artifacts={}", artifacts_path.display()))
+        .arg("--jit-tier=template")
+        .arg("--print")
+        .arg(
+            "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
+             { s = s + i; } return s; } hot(40)",
+        )
+        .output()
+        .expect("run against existing artifact target");
+
+    assert!(!output.status.success(), "existing target must fail closed");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("read sentinel"),
+        "keep"
+    );
+    assert_eq!(
+        std::fs::read_dir(&artifacts_path)
+            .expect("read existing target")
+            .count(),
+        1,
+        "writer must not add files to an existing target"
+    );
+    assert!(
+        std::fs::read_dir(tmp.path())
+            .expect("read parent")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".existing-artifacts.tmp-")),
+        "writer must not leave a temporary directory"
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn artifact_persistence_still_runs_when_event_write_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let invalid_events_target = tmp.path().join("events-directory");
+    let artifacts_path = tmp.path().join("artifacts-after-event-error");
+    std::fs::create_dir(&invalid_events_target).expect("create invalid event target");
+
+    let output = otter_command(tmp.path())
+        .env("OTTER_JIT_OSR_THRESHOLD", "1")
+        .arg(format!("--jit-events={}", invalid_events_target.display()))
+        .arg(format!("--jit-artifacts={}", artifacts_path.display()))
+        .arg("--jit-tier=template")
+        .arg("--print")
+        .arg(
+            "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
+             { s = s + i; } return s; } hot(40)",
+        )
+        .output()
+        .expect("run independent diagnostic writes");
+
+    assert!(!output.status.success(), "invalid event target must fail");
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(artifacts_path.join("index.json"))
+            .expect("artifact channel still writes its index"),
+    )
+    .expect("valid artifact index");
+    assert!(
+        index["bundles"]
+            .as_array()
+            .is_some_and(|bundles| !bundles.is_empty()),
+        "event persistence failure must not suppress artifact persistence"
     );
 }
 

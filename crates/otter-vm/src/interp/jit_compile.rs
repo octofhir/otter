@@ -123,7 +123,7 @@ impl Interpreter {
             return;
         }
         let outcome = match status {
-            Ok(jit::JitCompileStatus::Compiled { code }) => {
+            Ok(jit::JitCompileStatus::Compiled { code, .. }) => {
                 jit_debug::JitDebugCompileOutcome::Compiled {
                     code_object_id,
                     code_bytes: u64::try_from(code.code_len()).unwrap_or(u64::MAX),
@@ -173,6 +173,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         fid: u32,
+        osr_pc: Option<u32>,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         if !self
             .jit_hook
@@ -195,31 +196,49 @@ impl Interpreter {
             fid,
             jit_debug::JitDebugTier::Optimizing,
         );
+        let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
+            jit_debug::JitDebugTarget::Osr { pc }
+        });
         self.record_jit_compile_prepared(
             context,
             fid,
             jit_debug::JitDebugTier::Optimizing,
-            jit_debug::JitDebugTarget::Entry,
+            target,
             &snapshot,
         );
+        let artifact_identity =
+            self.jit_debug
+                .request()
+                .artifacts_enabled()
+                .then(|| crate::JitArtifactIdentity {
+                    function_name: context
+                        .function(fid)
+                        .map(|function| function.name.clone())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    module: snapshot.code_block.module_url().to_string(),
+                });
         let function = snapshot.code_block.clone();
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_optimized_function(jit::JitCompileRequest {
             snapshot,
             debug: self.jit_debug.request(),
-            osr_pc: None,
+            artifact_identity,
+            osr_pc,
             code_object_id,
         });
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Optimizing,
-            jit_debug::JitDebugTarget::Entry,
+            target,
             code_object_id,
             &status,
         );
         match status {
-            Ok(jit::JitCompileStatus::Compiled { code }) => {
+            Ok(jit::JitCompileStatus::Compiled { code, artifact }) => {
+                if let Some(artifact) = artifact {
+                    self.record_jit_artifact(*artifact);
+                }
                 self.jit_next_code_object_id += 1;
                 self.jit_code_registry.retire_unreferenced();
                 self.jit_code_registry
@@ -242,6 +261,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         fid: u32,
+        osr_pc: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         if !self
             .jit_hook
@@ -267,7 +287,7 @@ impl Interpreter {
         {
             return None;
         }
-        match self.compile_optimized_jit_function(context, fid) {
+        match self.compile_optimized_jit_function(context, fid, Some(osr_pc)) {
             Some(compiled) => {
                 self.jit_optimized_code.insert(fid, Some(compiled.clone()));
                 self.jit_optimized_declined_epoch.remove(&fid);
@@ -314,9 +334,21 @@ impl Interpreter {
         let function = view.code_block.clone();
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
+        let artifact_identity =
+            self.jit_debug
+                .request()
+                .artifacts_enabled()
+                .then(|| crate::JitArtifactIdentity {
+                    function_name: context
+                        .function(fid)
+                        .map(|function| function.name.clone())
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    module: view.code_block.module_url().to_string(),
+                });
         let status = hook.compile_function(jit::JitCompileRequest {
             snapshot: view,
             debug: self.jit_debug.request(),
+            artifact_identity,
             osr_pc,
             code_object_id,
         });
@@ -328,7 +360,10 @@ impl Interpreter {
             &status,
         );
         match status {
-            Ok(jit::JitCompileStatus::Compiled { code }) => {
+            Ok(jit::JitCompileStatus::Compiled { code, artifact }) => {
+                if let Some(artifact) = artifact {
+                    self.record_jit_artifact(*artifact);
+                }
                 self.jit_next_code_object_id += 1;
                 // Sweep before registering: cached/installed users hold an
                 // `Arc`, while executing native generations hold an entry-cell

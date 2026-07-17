@@ -41,7 +41,10 @@ pub(crate) mod code_block_cfg;
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, FunctionCode,
     FunctionCodeBuilder, Op, Operand, SpanEntry, WordInstruction,
-    encoding::{FunctionLayout, layout_wordcode_function, translate_spans_to_byte_pcs},
+    encoding::{
+        FunctionLayout, layout_wordcode_function, measure_wordcode_function,
+        translate_spans_to_byte_pcs,
+    },
 };
 use std::sync::Arc;
 
@@ -81,14 +84,15 @@ impl ExecutableModuleBuilder {
             next_property_ic_site: property_ic_base,
         };
         for function in &module.functions {
-            builder.push_function(function);
+            builder.push_function(function, &module.module);
         }
         builder
     }
 
-    fn push_function(&mut self, function: &Function) {
+    fn push_function(&mut self, function: &Function, module_url: &str) {
         let function = Arc::new(CodeBlock::from_bytecode(
             function,
+            module_url,
             &mut self.next_property_ic_site,
         ));
         self.functions.push(function);
@@ -315,6 +319,9 @@ impl CodeBlock {
             wordcode_builder.push(instr.op, &instr.operands);
         }
         let wordcode = wordcode_builder.finish();
+        let bytecode_byte_len = measure_wordcode_function(&wordcode)
+            .expect("test bytecode size fits the schema")
+            .total_bytes;
         let byte_pcs: Vec<_> = instructions.iter().map(|instr| instr.byte_pc).collect();
         let code: Vec<_> = instructions
             .iter()
@@ -356,6 +363,7 @@ impl CodeBlock {
             contains_direct_eval: false,
             code: code.into_boxed_slice(),
             wordcode,
+            bytecode_byte_len,
             control_flow,
             feedback,
             byte_pcs: byte_pcs.into_boxed_slice(),
@@ -450,6 +458,18 @@ impl CodeBlock {
     #[must_use]
     pub fn op_at(&self, index: usize) -> Option<Op> {
         self.wordcode.get(index).map(|instruction| instruction.op)
+    }
+
+    /// Exact encoded byte length of this function's bytecode stream.
+    #[must_use]
+    pub const fn bytecode_byte_len(&self) -> u32 {
+        self.bytecode_byte_len
+    }
+
+    /// Source module URL carried by this function.
+    #[must_use]
+    pub fn module_url(&self) -> &str {
+        &self.module_url
     }
 
     /// Sorted logical PCs beginning basic blocks in this function.
@@ -742,6 +762,8 @@ pub struct CodeBlock {
     pub code: Box<[CodeBlockInstruction]>,
     /// Authoritative schema-typed execution wordcode shared by VM and JIT.
     wordcode: FunctionCode,
+    /// Exact encoded byte length computed with the authoritative layout.
+    bytecode_byte_len: u32,
     /// Precomputed logical-PC block, loop, and exception-region tables.
     control_flow: CodeBlockControlFlow,
     /// Tier-neutral advisory feedback parallel to `code`, including its single
@@ -780,6 +802,7 @@ impl Clone for CodeBlock {
             contains_direct_eval: self.contains_direct_eval,
             code: self.code.clone(),
             wordcode: self.wordcode.clone(),
+            bytecode_byte_len: self.bytecode_byte_len,
             control_flow: self.control_flow.clone(),
             feedback: self.feedback.clone(),
             byte_pcs: self.byte_pcs.clone(),
@@ -789,7 +812,11 @@ impl Clone for CodeBlock {
 }
 
 impl CodeBlock {
-    fn from_bytecode(function: &Function, next_property_ic_site: &mut u32) -> Self {
+    fn from_bytecode(
+        function: &Function,
+        module_url: &str,
+        next_property_ic_site: &mut u32,
+    ) -> Self {
         let register_count = function
             .param_count
             .saturating_add(function.locals)
@@ -879,7 +906,11 @@ impl CodeBlock {
             arguments_object_kind: function.arguments_object_kind,
             mapped_argument_bindings,
             is_module: function.is_module,
-            module_url: function.module_url.clone().into_boxed_str(),
+            module_url: if function.module_url.is_empty() {
+                module_url.into()
+            } else {
+                function.module_url.clone().into_boxed_str()
+            },
             direct_eval_bindings: function
                 .direct_eval_bindings
                 .iter()
@@ -895,6 +926,7 @@ impl CodeBlock {
             contains_direct_eval: function.contains_direct_eval,
             code,
             wordcode,
+            bytecode_byte_len: code_byte_len,
             control_flow,
             feedback,
             byte_pcs: instr_to_byte_pc,

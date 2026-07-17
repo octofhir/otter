@@ -6,8 +6,10 @@
 //! Active VM dispatch executes schema-typed CodeBlock words instead. Logical
 //! instruction-index DTOs are verified directly before encoding; decoding a
 //! serialized stream independently validates byte-boundary branch and handler
-//! targets. Bytecode is never persisted across incompatible versions, so no
-//! wire-format version is carried in the stream.
+//! targets. Negative compiler/backend fixtures may measure canonical wordcode
+//! size without validating their deliberately malformed targets. Bytecode is
+//! never persisted across incompatible versions, so no wire-format version is
+//! carried in the stream.
 //!
 //! # Wire format (per instruction)
 //!
@@ -366,6 +368,20 @@ pub fn layout_function(instructions: &[Instruction]) -> Result<FunctionLayout, V
 /// Returns [`VerifyError`] for invalid wordcode or u32 metadata overflow.
 pub fn layout_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, VerifyError> {
     verify_wordcode_function(code)?;
+    measure_wordcode_function(code)
+}
+
+/// Calculate a wordcode function's serialized byte-PC layout without
+/// validating control-flow targets.
+///
+/// Production loading should use [`layout_wordcode_function`]. This narrower
+/// operation exists for compiler/backend negative-test fixtures that
+/// deliberately carry malformed targets but still need the canonical encoded
+/// size before the intended validation stage.
+///
+/// # Errors
+/// Returns [`VerifyError::FunctionTooLarge`] on u32 metadata overflow.
+pub fn measure_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, VerifyError> {
     let mut byte_pc = 0_u32;
     let mut instr_to_byte_pc = Vec::with_capacity(code.len());
     for instruction in code {

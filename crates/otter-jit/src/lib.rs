@@ -14,6 +14,8 @@
 //! - [`ir`] — backend-independent analysis structures for optimizing compilers.
 //! - [`optimizing`] — the production-wired reducible numeric/element tier with
 //!   function and loop-header OSR entries.
+//! - Default-off owned artifact sidecars containing tier input, exact code,
+//!   code maps, deopt metadata, and safepoints for outer-host persistence.
 //!
 //! # Invariants
 //! - **`unsafe` is contained here.** This crate lifts the workspace
@@ -32,6 +34,9 @@
 //! - **JIT is runtime-optional.** When executable memory cannot be obtained
 //!   (missing macOS `allow-jit` entitlement, locked sandbox, etc.) the engine
 //!   falls back to the interpreter; the JIT never hard-fails execution.
+//! - **Diagnostics stay cold and owned.** Disabled compilation does not build
+//!   maps, format tier input, or clone code. Enabled sidecars contain no GC
+//!   handles, executable pointers, runtime borrows, locks, or sinks.
 //!
 //! # See also
 //! - `JIT_DESIGN.md` — full design, phasing, and the §3.2 backend decision.
@@ -40,6 +45,7 @@
 
 #[cfg(target_arch = "aarch64")]
 mod arm64;
+mod artifact;
 mod code;
 mod entry;
 pub mod ir;
@@ -135,25 +141,48 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
         let fid = request.snapshot.code_block.id;
+        let artifact_request = request
+            .debug
+            .artifacts_enabled()
+            .then_some(request.artifact_identity)
+            .flatten()
+            .map(|identity| artifact::ArtifactRequest {
+                identity,
+                tier: otter_vm::JitDebugTier::Template,
+                entry: request
+                    .osr_pc
+                    .map_or(otter_vm::JitDebugTarget::Entry, |pc| {
+                        otter_vm::JitDebugTarget::Osr { pc }
+                    }),
+            });
         #[cfg(target_arch = "aarch64")]
         let compiled = self
             .call_trampoline
             .as_ref()
             .map_err(Clone::clone)
             .and_then(|call_trampoline| {
-                template::compile_with_trampoline(
+                template::compile_with_trampoline_artifacts(
                     &request.snapshot,
                     request.code_object_id,
                     &self.transitions,
                     std::sync::Arc::clone(call_trampoline),
+                    artifact_request,
                 )
             });
         #[cfg(not(target_arch = "aarch64"))]
-        let compiled =
-            template::compile(&request.snapshot, request.code_object_id, &self.transitions);
+        let compiled = {
+            let _ = artifact_request;
+            template::compile(&request.snapshot, request.code_object_id, &self.transitions).map(
+                |code| artifact::NativeCompileOutput {
+                    code,
+                    artifact: None,
+                },
+            )
+        };
         match compiled {
-            Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
-                code: std::sync::Arc::new(code),
+            Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
+                code: std::sync::Arc::new(output.code),
+                artifact: output.artifact,
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in template subset: {reason:?}"),
@@ -169,28 +198,51 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             return Ok(otter_vm::JitCompileStatus::Unavailable);
         }
         let fid = request.snapshot.code_block.id;
+        let artifact_request = request
+            .debug
+            .artifacts_enabled()
+            .then_some(request.artifact_identity)
+            .flatten()
+            .map(|identity| artifact::ArtifactRequest {
+                identity,
+                tier: otter_vm::JitDebugTier::Optimizing,
+                entry: request
+                    .osr_pc
+                    .map_or(otter_vm::JitDebugTarget::Entry, |pc| {
+                        otter_vm::JitDebugTarget::Osr { pc }
+                    }),
+            });
         #[cfg(target_arch = "aarch64")]
         let compiled = self
             .call_trampoline
             .as_ref()
             .map_err(Clone::clone)
             .and_then(|call_trampoline| {
-                optimizing::compile_optimized_with_transitions(
+                optimizing::compile_optimized_with_artifacts(
                     &request.snapshot,
                     request.code_object_id,
                     &self.transitions,
                     std::sync::Arc::clone(call_trampoline),
+                    artifact_request,
                 )
             });
         #[cfg(not(target_arch = "aarch64"))]
-        let compiled = optimizing::compile_optimized_with_transitions(
-            &request.snapshot,
-            request.code_object_id,
-            &self.transitions,
-        );
+        let compiled = {
+            let _ = artifact_request;
+            optimizing::compile_optimized_with_transitions(
+                &request.snapshot,
+                request.code_object_id,
+                &self.transitions,
+            )
+            .map(|code| artifact::NativeCompileOutput {
+                code,
+                artifact: None,
+            })
+        };
         match compiled {
-            Ok(code) => Ok(otter_vm::JitCompileStatus::Compiled {
-                code: std::sync::Arc::new(code),
+            Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
+                code: std::sync::Arc::new(output.code),
+                artifact: output.artifact,
             }),
             Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
                 reason: format!("function {fid} not in optimizing subset: {reason:?}"),

@@ -260,7 +260,7 @@ impl Interpreter {
         let resolved = context.for_function(fid).ok_or(VmError::InvalidOperand)?;
         let activation = jit::VmRuntimeActivation::new(self, stack, &resolved, top_idx);
         let optimized_outcome = self
-            .resolve_optimized_osr_code(context, fid)
+            .resolve_optimized_osr_code(context, fid, osr_pc)
             .filter(|code| self.jit_code_registry.is_current_for_entry(code.as_ref()))
             .and_then(|code| code.run_optimized_osr_entry(activation, osr_pc));
         let (outcome, optimized) = if let Some(outcome) = optimized_outcome {
@@ -595,7 +595,7 @@ impl Interpreter {
             }
             self.jit_runtime_stats.compile_attempts =
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
-            let compiled = self.compile_optimized_jit_function(context, fid);
+            let compiled = self.compile_optimized_jit_function(context, fid, None);
             self.jit_optimized_code.insert(fid, compiled.clone());
             self.jit_optimized_code_cache = None;
             compiled

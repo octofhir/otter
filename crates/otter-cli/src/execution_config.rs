@@ -17,11 +17,13 @@
 //!   owns their optional filesystem/stderr serialization.
 
 use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::ValueEnum;
 use otter_runtime::{
-    JitDebugReport, JitDebugRequest, JitSelection, OtterBuilder, RuntimeBuilder, TracerFactory,
+    JitArtifactBatch, JitDebugReport, JitDebugRequest, JitDebugTier, JitSelection, OtterBuilder,
+    RuntimeBuilder, TracerFactory,
 };
 
 /// User-facing execution-tier selection.
@@ -51,6 +53,7 @@ pub(crate) struct CliExecutionConfig {
     timeout: Option<Duration>,
     trace_target: Option<String>,
     jit_events_target: Option<String>,
+    jit_artifacts_target: Option<String>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
 }
@@ -61,6 +64,7 @@ impl Default for CliExecutionConfig {
             timeout: None,
             trace_target: None,
             jit_events_target: None,
+            jit_artifacts_target: None,
             jit_selection: JitSelection::ProductionTiered,
             jit_osr_threshold: None,
         }
@@ -74,6 +78,7 @@ impl CliExecutionConfig {
         trace_target: Option<String>,
         jit_tier: Option<CliJitTier>,
         jit_events_target: Option<String>,
+        jit_artifacts_target: Option<String>,
     ) -> Self {
         let jit_selection = jit_tier
             .map(JitSelection::from)
@@ -82,6 +87,7 @@ impl CliExecutionConfig {
             timeout: timeout_secs.map(Duration::from_secs),
             trace_target,
             jit_events_target,
+            jit_artifacts_target,
             jit_selection,
             jit_osr_threshold: legacy_jit_osr_threshold(),
         }
@@ -143,6 +149,11 @@ impl CliExecutionConfig {
         self.jit_events_target.is_some()
     }
 
+    /// Return whether the CLI must persist successful compile bundles.
+    pub(crate) const fn jit_artifacts_enabled(&self) -> bool {
+        self.jit_artifacts_target.is_some()
+    }
+
     /// Serialize one complete JIT report to the configured target.
     ///
     /// `-` writes to stderr; a path is created or truncated exactly once by the
@@ -161,13 +172,134 @@ impl CliExecutionConfig {
         writer.flush()
     }
 
-    const fn jit_debug_request(&self) -> JitDebugRequest {
-        if self.jit_events_target.is_some() {
-            JitDebugRequest::events()
-        } else {
-            JitDebugRequest::disabled()
+    /// Make one bounded artifact batch atomically visible.
+    ///
+    /// The final root must not exist. All compile directories are written to a
+    /// private sibling first, then the complete root is renamed into place.
+    /// This is a cooperative single-writer contract, not crash-durable storage
+    /// or a cross-process no-clobber primitive.
+    pub(crate) fn write_jit_artifacts(&self, batch: &JitArtifactBatch) -> io::Result<()> {
+        let Some(target) = &self.jit_artifacts_target else {
+            return Ok(());
+        };
+        if target == "-" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--jit-artifacts requires a directory path",
+            ));
         }
+        let target = PathBuf::from(target);
+        if target.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("JIT artifact target already exists: {}", target.display()),
+            ));
+        }
+        let parent = target
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let file_name = target.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "JIT artifact target must name a directory",
+            )
+        })?;
+        let temp = parent.join(format!(
+            ".{}.tmp-{}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        if temp.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "JIT artifact temporary target already exists: {}",
+                    temp.display()
+                ),
+            ));
+        }
+        std::fs::create_dir(&temp)?;
+
+        let write_result = (|| {
+            let mut directory_names = Vec::with_capacity(batch.bundles().len());
+            for (ordinal, bundle) in batch.bundles().iter().enumerate() {
+                let manifest = bundle.manifest();
+                let tier = match manifest.tier() {
+                    JitDebugTier::Template => "template",
+                    JitDebugTier::Optimizing => "optimizing",
+                };
+                let directory_name = format!(
+                    "jit-{ordinal:04}-{tier}-f{}-c{}",
+                    manifest.function_id(),
+                    manifest.code_object_id()
+                );
+                let directory = temp.join(&directory_name);
+                std::fs::create_dir(&directory)?;
+                write_json_file(&directory.join("manifest.json"), manifest)?;
+                for file in bundle.files() {
+                    let path = directory.join(file.name().as_str());
+                    let mut writer = BufWriter::new(std::fs::File::create(path)?);
+                    writer.write_all(file.contents())?;
+                    writer.flush()?;
+                }
+                directory_names.push(directory_name);
+            }
+
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Index<'a> {
+                #[serde(rename = "otterJitArtifactIndexSchemaVersion")]
+                schema_version: u32,
+                bundles: &'a [String],
+                retained_bytes: u64,
+                dropped_bundles: u64,
+                dropped_bytes: u64,
+                truncated: bool,
+            }
+
+            write_json_file(
+                &temp.join("index.json"),
+                &Index {
+                    schema_version: 1,
+                    bundles: &directory_names,
+                    retained_bytes: u64::try_from(batch.retained_bytes()).unwrap_or(u64::MAX),
+                    dropped_bundles: batch.dropped_bundles(),
+                    dropped_bytes: batch.dropped_bytes(),
+                    truncated: batch.truncated(),
+                },
+            )?;
+            if target.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "JIT artifact target appeared while writing: {}",
+                        target.display()
+                    ),
+                ));
+            }
+            std::fs::rename(&temp, &target)
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+        write_result
     }
+
+    const fn jit_debug_request(&self) -> JitDebugRequest {
+        JitDebugRequest::disabled()
+            .with_events(self.jit_events_target.is_some())
+            .with_artifacts(self.jit_artifacts_target.is_some())
+    }
+}
+
+fn write_json_file(path: &Path, value: &impl serde::Serialize) -> io::Result<()> {
+    let mut writer = BufWriter::new(std::fs::File::create(path)?);
+    serde_json::to_writer_pretty(&mut writer, value).map_err(io::Error::other)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 fn legacy_jit_selection() -> JitSelection {
@@ -233,6 +365,7 @@ mod tests {
             timeout: None,
             trace_target: None,
             jit_events_target: None,
+            jit_artifacts_target: None,
             jit_selection: JitSelection::InterpreterOnly,
             jit_osr_threshold: None,
         };
@@ -250,6 +383,7 @@ mod tests {
             timeout: None,
             trace_target: Some(target.clone()),
             jit_events_target: None,
+            jit_artifacts_target: None,
             jit_selection: JitSelection::InterpreterOnly,
             jit_osr_threshold: None,
         };
@@ -260,6 +394,7 @@ mod tests {
     #[test]
     fn jit_events_are_default_off_and_owned_when_enabled() {
         assert!(!CliExecutionConfig::default().jit_events_enabled());
+        assert!(!CliExecutionConfig::default().jit_artifacts_enabled());
         assert_eq!(
             CliExecutionConfig::default().jit_debug_request(),
             JitDebugRequest::disabled()
@@ -270,6 +405,7 @@ mod tests {
             timeout: None,
             trace_target: None,
             jit_events_target: Some(target.clone()),
+            jit_artifacts_target: None,
             jit_selection: JitSelection::Template,
             jit_osr_threshold: Some(1),
         };
@@ -277,5 +413,28 @@ mod tests {
         assert!(config.jit_events_enabled());
         assert_eq!(config.jit_events_target.as_deref(), Some("jit-events.json"));
         assert_eq!(config.jit_debug_request(), JitDebugRequest::events());
+
+        let artifacts = CliExecutionConfig {
+            timeout: None,
+            trace_target: None,
+            jit_events_target: None,
+            jit_artifacts_target: Some("jit-artifacts".to_string()),
+            jit_selection: JitSelection::Template,
+            jit_osr_threshold: Some(1),
+        };
+        assert!(artifacts.jit_artifacts_enabled());
+        assert!(!artifacts.jit_events_enabled());
+        assert_eq!(artifacts.jit_debug_request(), JitDebugRequest::artifacts());
+
+        let both = CliExecutionConfig {
+            jit_events_target: Some("jit-events.json".to_string()),
+            ..artifacts
+        };
+        assert_eq!(
+            both.jit_debug_request(),
+            JitDebugRequest::disabled()
+                .with_events(true)
+                .with_artifacts(true)
+        );
     }
 }

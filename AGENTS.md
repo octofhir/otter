@@ -345,6 +345,25 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     writes the partial report. The original execution error remains primary if
     writing that report also fails. A host command timeout can precede isolate
     report delivery; no empty artifact is fabricated in that case.
+- JIT compile artifacts:
+  - Default directory:
+    `cargo run -p otter-cli -- --jit-artifacts --jit-tier=template run <file>`
+  - Explicit directory:
+    `cargo run -p otter-cli -- --jit-artifacts=/tmp/otter-jit-artifacts --jit-tier=production-tiered run <file>`
+  - Combine `--jit-events=<path>` and `--jit-artifacts=<directory>`;
+    `codeObjectId` joins a successful compile event to its bundle manifest.
+  - The artifact target must not already exist. Under the cooperative
+    single-writer contract, the CLI writes a private sibling and atomically
+    renames the complete root into view. This is not crash-durable storage or
+    a cross-process no-clobber primitive.
+  - Each compile directory contains exact runtime-local `code.bin`,
+    `bytecode.txt`, tier input, `code-map.json`, `safepoints.json`, and
+    optimizer `deopt.json` when applicable.
+  - Exact code may contain process addresses. Portable normalized code,
+    symbolic relocations, and annotated `asm.txt` are tracked follow-ups;
+    absent files are listed explicitly in `manifest.json`.
+  - Full workflow and schema notes:
+    `docs/site/src/content/docs/engine/jit-debugging.md`.
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
   - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run`

@@ -44,6 +44,7 @@ export default defineConfig({
 						{ label: 'GC API', slug: 'engine/gc-api' },
 						{ label: 'Native Call ABI', slug: 'engine/native-call-abi' },
 						{ label: 'Step Trace', slug: 'engine/step-trace' },
+						{ label: 'JIT Debugging', slug: 'engine/jit-debugging' },
 					],
 				},
 				{

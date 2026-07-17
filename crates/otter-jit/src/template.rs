@@ -67,7 +67,26 @@ pub(crate) fn compile_with_trampoline(
     transitions: &TransitionTable,
     call_trampoline: std::sync::Arc<crate::arm64::CallTrampoline>,
 ) -> Result<TemplateCode, Unsupported> {
-    arm64::compile(view, code_object_id, transitions, call_trampoline)
+    arm64::compile(view, code_object_id, transitions, call_trampoline, None)
+        .map(|output| output.code)
+}
+
+/// Compile with an optional default-off artifact sidecar.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn compile_with_trampoline_artifacts(
+    view: &JitCompileSnapshot,
+    code_object_id: u64,
+    transitions: &TransitionTable,
+    call_trampoline: std::sync::Arc<crate::arm64::CallTrampoline>,
+    artifact_request: Option<crate::artifact::ArtifactRequest>,
+) -> Result<crate::artifact::NativeCompileOutput<TemplateCode>, Unsupported> {
+    arm64::compile(
+        view,
+        code_object_id,
+        transitions,
+        call_trampoline,
+        artifact_request,
+    )
 }
 
 /// Non-arm64 stub: the template backend is arm64-only for now.

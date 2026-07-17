@@ -43,6 +43,8 @@ pub const JIT_DEBUG_EVENT_LIMIT: usize = 16_384;
 pub struct JitDebugRequest {
     #[serde(default)]
     capture_events: bool,
+    #[serde(default)]
+    capture_artifacts: bool,
 }
 
 impl JitDebugRequest {
@@ -51,6 +53,7 @@ impl JitDebugRequest {
     pub const fn disabled() -> Self {
         Self {
             capture_events: false,
+            capture_artifacts: false,
         }
     }
 
@@ -59,13 +62,43 @@ impl JitDebugRequest {
     pub const fn events() -> Self {
         Self {
             capture_events: true,
+            capture_artifacts: false,
         }
+    }
+
+    /// Construct a request that captures owned compile artifact bundles.
+    #[must_use]
+    pub const fn artifacts() -> Self {
+        Self {
+            capture_events: false,
+            capture_artifacts: true,
+        }
+    }
+
+    /// Enable or disable structured event capture on this request.
+    #[must_use]
+    pub const fn with_events(mut self, enabled: bool) -> Self {
+        self.capture_events = enabled;
+        self
+    }
+
+    /// Enable or disable compile artifact capture on this request.
+    #[must_use]
+    pub const fn with_artifacts(mut self, enabled: bool) -> Self {
+        self.capture_artifacts = enabled;
+        self
     }
 
     /// Return whether structured event capture is enabled.
     #[must_use]
     pub const fn events_enabled(self) -> bool {
         self.capture_events
+    }
+
+    /// Return whether owned compile artifact capture is enabled.
+    #[must_use]
+    pub const fn artifacts_enabled(self) -> bool {
+        self.capture_artifacts
     }
 }
 
@@ -440,6 +473,7 @@ impl crate::Interpreter {
     /// Install an explicit default-off JIT diagnostics request.
     pub fn set_jit_debug_request(&mut self, request: JitDebugRequest) {
         self.jit_debug.set_request(request);
+        self.jit_artifacts.set_request(request);
     }
 
     /// Return the diagnostics request copied into compiler-hook invocations.
@@ -451,6 +485,7 @@ impl crate::Interpreter {
     /// Start a fresh top-level JIT diagnostics batch.
     pub fn begin_jit_debug_capture(&mut self) {
         self.jit_debug.begin_batch();
+        self.jit_artifacts.begin_batch();
     }
 
     /// Record an owned event without constructing its payload while disabled.
@@ -472,6 +507,20 @@ impl crate::Interpreter {
     #[must_use]
     pub fn take_jit_debug_report(&mut self) -> Option<JitDebugReport> {
         self.jit_debug.take_report()
+    }
+
+    /// Retain one successful compile artifact in the current bounded batch.
+    pub(crate) fn record_jit_artifact(&mut self, artifact: crate::JitArtifactBundle) {
+        self.jit_artifacts.record(artifact);
+    }
+
+    /// Drain the current compile artifact batch.
+    ///
+    /// Disabled state returns `None`. Enabled state returns `Some`, including
+    /// when no successful native compile occurred.
+    #[must_use]
+    pub fn take_jit_artifacts(&mut self) -> Option<crate::JitArtifactBatch> {
+        self.jit_artifacts.take_batch()
     }
 }
 
@@ -498,7 +547,20 @@ mod tests {
     fn request_is_disabled_by_default() {
         assert_eq!(JitDebugRequest::default(), JitDebugRequest::disabled());
         assert!(!JitDebugRequest::default().events_enabled());
+        assert!(!JitDebugRequest::default().artifacts_enabled());
         assert!(JitDebugRequest::events().events_enabled());
+        assert!(!JitDebugRequest::events().artifacts_enabled());
+        assert!(JitDebugRequest::artifacts().artifacts_enabled());
+        assert!(!JitDebugRequest::artifacts().events_enabled());
+        assert_eq!(
+            JitDebugRequest::disabled()
+                .with_events(true)
+                .with_artifacts(true),
+            JitDebugRequest {
+                capture_events: true,
+                capture_artifacts: true,
+            }
+        );
     }
 
     #[test]

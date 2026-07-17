@@ -17,6 +17,8 @@
 //!   dispatch; state is snapshotted first.
 //! - Iterator records are reloaded from traced anchors after every property
 //!   lookup or callback that may move the young generation.
+//! - IteratorClose holds its iterator and discovered `return` method in
+//!   canonical handles, reloading the receiver after accessor/call re-entry.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -1267,38 +1269,52 @@ impl Interpreter {
         context: &ExecutionContext,
         iterator: &Value,
     ) -> Result<(), VmError> {
-        let return_method = match self.ordinary_get_value(
-            stack,
-            context,
-            *iterator,
-            *iterator,
-            &VmPropertyKey::String("return"),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync_rooted(stack, context, &getter, *iterator, SmallVec::new())?
+        self.with_handle_scope(|interp, scope| {
+            let iterator = interp.scoped_value(scope, *iterator);
+            let current = interp.escape_scoped(iterator);
+            let return_method = match interp.ordinary_get_value(
+                stack,
+                context,
+                current,
+                current,
+                &VmPropertyKey::String("return"),
+                0,
+            )? {
+                VmGetOutcome::Value(value) => interp.scoped_value(scope, value),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let getter = interp.scoped_value(scope, getter);
+                    let value = interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &interp.escape_scoped(getter),
+                        interp.escape_scoped(iterator),
+                        SmallVec::new(),
+                    )?;
+                    interp.scoped_value(scope, value)
+                }
+            };
+            let return_value = interp.escape_scoped(return_method);
+            if return_value.is_undefined() || return_value.is_null() {
+                return Ok(());
             }
-        };
-        if return_method.is_undefined() || return_method.is_null() {
-            return Ok(());
-        }
-        if !self.is_callable_runtime(&return_method) {
-            return Err(self.err_type(("iterator `return` is not callable".to_string()).into()));
-        }
-        let result = self.run_callable_sync_rooted(
-            stack,
-            context,
-            &return_method,
-            *iterator,
-            SmallVec::new(),
-        )?;
-        if !result.is_object() && !result.is_proxy() {
-            return Err(
-                self.err_type(("iterator `return` did not yield an object".to_string()).into())
-            );
-        }
-        Ok(())
+            if !interp.is_callable_runtime(&return_value) {
+                return Err(
+                    interp.err_type(("iterator `return` is not callable".to_string()).into())
+                );
+            }
+            let result = interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &interp.escape_scoped(return_method),
+                interp.escape_scoped(iterator),
+                SmallVec::new(),
+            )?;
+            if !result.is_object() && !result.is_proxy() {
+                return Err(interp
+                    .err_type(("iterator `return` did not yield an object".to_string()).into()));
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn iterator_close_value_sync(

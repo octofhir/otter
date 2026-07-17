@@ -1746,120 +1746,160 @@ fn string_replace_spec(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let name: &'static str = if replace_all { "replaceAll" } else { "replace" };
-    let this = *ctx.this_value();
-    if this.is_nullish() {
-        return Err(type_error(name, "called on null or undefined"));
-    }
-    let search = args.first().copied().unwrap_or_else(Value::undefined);
-    let replace_value = args.get(1).copied().unwrap_or_else(Value::undefined);
+    ctx.scope(|mut scope| {
+        let this = scope.this();
+        if scope.raw(this).is_nullish() {
+            return Err(type_error(name, "called on null or undefined"));
+        }
+        let search = scope.argument(args, 0);
+        let replace_value = scope.argument(args, 1);
 
-    // §22.1.3.19 step 2 — only an Object searchValue is probed for
-    // `@@replace`; a primitive never has its `@@replace` accessed.
-    if search.is_object_type() {
-        if replace_all && is_reg_exp(ctx, search, name)? {
-            let flags = get_value(ctx, search, &VmPropertyKey::String("flags"), name)?;
-            if flags.is_nullish() {
-                return Err(type_error(name, "flags is null or undefined"));
+        // §22.1.3.19 step 2 — only an Object searchValue is probed for
+        // `@@replace`; a primitive never has its `@@replace` accessed.
+        if scope.raw(search).is_object_type() {
+            if replace_all {
+                let search_value = scope.raw(search);
+                if is_reg_exp(scope.context(), search_value, name)? {
+                    let search_value = scope.raw(search);
+                    let flags_value = get_value(
+                        scope.context(),
+                        search_value,
+                        &VmPropertyKey::String("flags"),
+                        name,
+                    )?;
+                    let flags = scope.value(flags_value);
+                    if scope.raw(flags).is_nullish() {
+                        return Err(type_error(name, "flags is null or undefined"));
+                    }
+                    let flags_value = scope.raw(flags);
+                    let flags_str = value_to_string(scope.context(), flags_value, name)?;
+                    if !flags_str
+                        .to_lossy_string(scope.context().heap())
+                        .contains('g')
+                    {
+                        return Err(type_error(
+                            name,
+                            "replaceAll must be called with a global RegExp",
+                        ));
+                    }
+                }
             }
-            let flags_str = value_to_string(ctx, flags, name)?;
-            if !flags_str.to_lossy_string(ctx.heap()).contains('g') {
-                return Err(type_error(
-                    name,
-                    "replaceAll must be called with a global RegExp",
-                ));
+            let search_value = scope.raw(search);
+            if let Some(method_value) =
+                get_symbol_method(scope.context(), search_value, WellKnown::Replace, name)?
+            {
+                let method = scope.value(method_value);
+                let result = match scope.call_vm(method, search, &[this, replace_value]) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(vm_err(scope.context().interp_mut(), error, name));
+                    }
+                };
+                return Ok(scope.finish(result));
             }
         }
-        if let Some(method) = get_symbol_method(ctx, search, WellKnown::Replace, name)? {
-            let exec = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| type_error(name, "missing execution context"))?;
-            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this, replace_value];
-            let interp = ctx.interp_mut();
-            return match interp.run_callable_sync(&exec, &method, search, cb_args) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(vm_err(interp, e, name)),
-            };
-        }
-    }
 
-    // String search path.
-    let string = value_to_string(ctx, this, name)?;
-    let search_str = value_to_string(ctx, search, name)?;
-    let functional = replace_value.is_callable();
-    let replace_template = if functional {
-        None
-    } else {
-        Some(value_to_string(ctx, replace_value, name)?)
-    };
-
-    let string_units = string.to_utf16_vec(ctx.heap());
-    let search_units = search_str.to_utf16_vec(ctx.heap());
-    let template_units = replace_template
-        .as_ref()
-        .map(|s| s.to_utf16_vec(ctx.heap()));
-
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| type_error(name, "missing execution context"))?;
-
-    let search_len = search_units.len();
-    let mut out: Vec<u16> = Vec::with_capacity(string_units.len());
-    let mut cursor = 0usize;
-    let mut position = find_substr(&string_units, &search_units, 0);
-    while let Some(pos) = position {
-        out.extend_from_slice(&string_units[cursor..pos]);
-        let replacement = if functional {
-            let matched = JsString::from_utf16_units(&search_units, ctx.heap_mut())?;
-            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                Value::string(matched),
-                Value::number_f64(pos as f64),
-                Value::string(string),
-            ];
-            let interp = ctx.interp_mut();
-            let raw = match interp.run_callable_sync(
-                &exec,
-                &replace_value,
-                Value::undefined(),
-                cb_args,
-            ) {
-                Ok(v) => v,
-                Err(e) => return Err(vm_err(interp, e, name)),
-            };
-            value_to_string(ctx, raw, name)?.to_utf16_vec(ctx.heap())
+        // String search path. Keep every GC value in the scope; the UTF-16
+        // copies are deliberately owned because they span repeated callback
+        // re-entry and form the output builder's stable source.
+        let this_value = scope.raw(this);
+        let string_value = Value::string(value_to_string(scope.context(), this_value, name)?);
+        let string = scope.value(string_value);
+        let search_value = scope.raw(search);
+        let search_string_value =
+            Value::string(value_to_string(scope.context(), search_value, name)?);
+        let search_string = scope.value(search_string_value);
+        let functional = scope.is_callable(replace_value);
+        let replace_template = if functional {
+            None
         } else {
-            get_substitution(
-                &search_units,
-                &string_units,
-                pos,
-                template_units
-                    .as_ref()
-                    .expect("non-functional has template"),
-            )
+            let replace_value = scope.raw(replace_value);
+            let template = Value::string(value_to_string(scope.context(), replace_value, name)?);
+            Some(scope.value(template))
         };
-        out.extend_from_slice(&replacement);
-        cursor = pos + search_len;
-        if !replace_all {
-            break;
+
+        let string_units = scope
+            .raw(string)
+            .as_string(scope.context().heap())
+            .expect("ToString result")
+            .to_utf16_vec(scope.context().heap());
+        let search_units = scope
+            .raw(search_string)
+            .as_string(scope.context().heap())
+            .expect("ToString result")
+            .to_utf16_vec(scope.context().heap());
+        let template_units = replace_template.map(|template| {
+            scope
+                .raw(template)
+                .as_string(scope.context().heap())
+                .expect("ToString result")
+                .to_utf16_vec(scope.context().heap())
+        });
+
+        let search_len = search_units.len();
+        let mut out: Vec<u16> = Vec::with_capacity(string_units.len());
+        let mut cursor = 0usize;
+        let mut position = find_substr(&string_units, &search_units, 0);
+        while let Some(pos) = position {
+            out.extend_from_slice(&string_units[cursor..pos]);
+            let replacement = if functional {
+                scope.scope(|mut callback_scope| {
+                    let matched = JsString::from_utf16_units(
+                        &search_units,
+                        callback_scope.context().heap_mut(),
+                    )?;
+                    let matched = callback_scope.value(Value::string(matched));
+                    let position = callback_scope.value(Value::number_f64(pos as f64));
+                    let undefined = callback_scope.value(Value::undefined());
+                    let result = match callback_scope.call_vm(
+                        replace_value,
+                        undefined,
+                        &[matched, position, string],
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return Err(vm_err(callback_scope.context().interp_mut(), error, name));
+                        }
+                    };
+                    let result_value = callback_scope.raw(result);
+                    let replacement =
+                        value_to_string(callback_scope.context(), result_value, name)?;
+                    Ok::<Vec<u16>, NativeError>(
+                        replacement.to_utf16_vec(callback_scope.context().heap()),
+                    )
+                })?
+            } else {
+                get_substitution(
+                    &search_units,
+                    &string_units,
+                    pos,
+                    template_units
+                        .as_ref()
+                        .expect("non-functional has template"),
+                )
+            };
+            out.extend_from_slice(&replacement);
+            cursor = pos + search_len;
+            if !replace_all {
+                break;
+            }
+            // Advance by at least one unit for an empty search string so an
+            // empty match cannot loop forever.
+            let next_from = if search_len == 0 { pos + 1 } else { cursor };
+            if next_from > string_units.len() {
+                break;
+            }
+            if search_len == 0 && pos < string_units.len() {
+                out.push(string_units[pos]);
+                cursor = next_from;
+            }
+            position = find_substr(&string_units, &search_units, next_from);
         }
-        // Advance by at least one unit for an empty search string so an
-        // empty match cannot loop forever.
-        let next_from = if search_len == 0 { pos + 1 } else { cursor };
-        if next_from > string_units.len() {
-            break;
-        }
-        if search_len == 0 && pos < string_units.len() {
-            out.push(string_units[pos]);
-            cursor = next_from;
-        }
-        position = find_substr(&string_units, &search_units, next_from);
-    }
-    out.extend_from_slice(&string_units[cursor.min(string_units.len())..]);
-    Ok(Value::string(JsString::from_utf16_units(
-        &out,
-        ctx.heap_mut(),
-    )?))
+        out.extend_from_slice(&string_units[cursor.min(string_units.len())..]);
+        let result = JsString::from_utf16_units(&out, scope.context().heap_mut())?;
+        let result = scope.value(Value::string(result));
+        Ok(scope.finish(result))
+    })
 }
 
 fn impl_replace(
@@ -2271,23 +2311,15 @@ fn impl_match(
     // then the result is `Invoke(rx, @@match, « S »)` — so a
     // user-overridden `RegExp.prototype[@@match]` is observed instead of
     // an inlined matcher.
-    const NAME: &str = "String.prototype.match";
-    let s = receiver_string(ctx, receiver)?;
-    let arg = args.first().copied().unwrap_or_else(Value::undefined);
-    let rx = coerce_pattern_to_regexp(&arg, "", ctx.heap_mut())?;
-    let rx_value = Value::regexp(rx);
-    let method = get_symbol_method(ctx, rx_value, WellKnown::Match, NAME)?
-        .ok_or_else(|| type_error(NAME, "RegExp has no @@match method"))?;
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| type_error(NAME, "missing execution context"))?;
-    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
-    let interp = ctx.interp_mut();
-    match interp.run_callable_sync(&exec, &method, rx_value, cb_args) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(vm_err(interp, e, NAME)),
-    }
+    invoke_regexp_string_fallback(
+        ctx,
+        receiver,
+        args,
+        "",
+        WellKnown::Match,
+        "String.prototype.match",
+        "RegExp has no @@match method",
+    )
 }
 
 fn impl_match_all(
@@ -2303,23 +2335,15 @@ fn impl_match_all(
     // matcher and `Invoke(rx, @@matchAll, « S »)`, so a user-overridden
     // `RegExp.prototype[@@matchAll]` is observed instead of an inlined
     // iterator.
-    const NAME: &str = "String.prototype.matchAll";
-    let s = receiver_string(ctx, receiver)?;
-    let arg = args.first().copied().unwrap_or_else(Value::undefined);
-    let rx = coerce_pattern_to_regexp(&arg, "g", ctx.heap_mut())?;
-    let rx_value = Value::regexp(rx);
-    let method = get_symbol_method(ctx, rx_value, WellKnown::MatchAll, NAME)?
-        .ok_or_else(|| type_error(NAME, "RegExp has no @@matchAll method"))?;
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| type_error(NAME, "missing execution context"))?;
-    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
-    let interp = ctx.interp_mut();
-    match interp.run_callable_sync(&exec, &method, rx_value, cb_args) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(vm_err(interp, e, NAME)),
-    }
+    invoke_regexp_string_fallback(
+        ctx,
+        receiver,
+        args,
+        "g",
+        WellKnown::MatchAll,
+        "String.prototype.matchAll",
+        "RegExp has no @@matchAll method",
+    )
 }
 
 fn impl_search(
@@ -2331,23 +2355,47 @@ fn impl_search(
     // `RegExpCreate(regexp, undefined)`, then `Invoke(rx, @@search, « S »)`,
     // so a user-overridden `RegExp.prototype[@@search]` runs rather than an
     // inlined search.
-    const NAME: &str = "String.prototype.search";
-    let s = receiver_string(ctx, receiver)?;
-    let arg = args.first().copied().unwrap_or_else(Value::undefined);
-    let rx = coerce_pattern_to_regexp(&arg, "", ctx.heap_mut())?;
-    let rx_value = Value::regexp(rx);
-    let method = get_symbol_method(ctx, rx_value, WellKnown::Search, NAME)?
-        .ok_or_else(|| type_error(NAME, "RegExp has no @@search method"))?;
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| type_error(NAME, "missing execution context"))?;
-    let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::string(s)];
-    let interp = ctx.interp_mut();
-    match interp.run_callable_sync(&exec, &method, rx_value, cb_args) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(vm_err(interp, e, NAME)),
-    }
+    invoke_regexp_string_fallback(
+        ctx,
+        receiver,
+        args,
+        "",
+        WellKnown::Search,
+        "String.prototype.search",
+        "RegExp has no @@search method",
+    )
+}
+
+fn invoke_regexp_string_fallback(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    args: &[Value],
+    flags: &str,
+    method_symbol: WellKnown,
+    name: &'static str,
+    missing_method: &'static str,
+) -> Result<Value, NativeError> {
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(*receiver);
+        let receiver_value = scope.raw(receiver);
+        let string = receiver_string(scope.context(), &receiver_value)?;
+        let string = scope.value(Value::string(string));
+        let arg = scope.argument(args, 0);
+        let arg_value = scope.raw(arg);
+        let rx = coerce_pattern_to_regexp(&arg_value, flags, scope.context().heap_mut())?;
+        let rx = scope.value(Value::regexp(rx));
+        let rx_value = scope.raw(rx);
+        let method_value = get_symbol_method(scope.context(), rx_value, method_symbol, name)?
+            .ok_or_else(|| type_error(name, missing_method))?;
+        let method = scope.value(method_value);
+        let result = match scope.call_vm(method, rx, &[string]) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(vm_err(scope.context().interp_mut(), error, name));
+            }
+        };
+        Ok(scope.finish(result))
+    })
 }
 
 type StringNativeFn = fn(&mut NativeCtx<'_>, &Value, &[Value]) -> Result<Value, NativeError>;

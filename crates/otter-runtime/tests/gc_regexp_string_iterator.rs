@@ -5,6 +5,8 @@
 //!   `lastIndex` accessors allocate while `%RegExpStringIterator%.next` runs.
 //! - A functional `@@replace` callback whose arguments and coerced result must
 //!   remain live across nested allocations.
+//! - String search replacement and fallback `@@match` / `@@matchAll` /
+//!   `@@search` dispatch on the native call's shared runtime turn.
 //! - A custom `@@split` species whose constructor, flags, `exec`, and
 //!   `lastIndex` accessors all re-enter JavaScript.
 //! - Proxy-backed `flags`, `exec`, `lastIndex`, and `Symbol.species` ladders,
@@ -173,6 +175,110 @@ fn functional_replace_callback_survives_moving_gc() {
     );
 
     assert_eq!(completion, "AB|2|0");
+}
+
+#[test]
+fn string_protocol_fallbacks_survive_moving_gc() {
+    let completion = run(
+        r#"
+        let calls = 0;
+
+        function churn(seed) {
+            let tail = null;
+            for (let i = 0; i < 16; i++) {
+                tail = { seed, i, text: "string-protocol-" + seed + "-" + i, tail };
+            }
+            return tail;
+        }
+
+        function replacement(match, position, whole) {
+            const heldMatch = match;
+            const heldWhole = whole;
+            const allocated = churn(20 + calls);
+            if (
+                heldMatch !== "a" ||
+                heldWhole !== "aba" ||
+                allocated.seed !== 20 + calls
+            ) {
+                throw new Error("string replacement roots");
+            }
+            calls++;
+            return {
+                toString() {
+                    const held = heldWhole;
+                    churn(40 + position);
+                    if (held !== "aba") throw new Error("replacement result roots");
+                    return "X";
+                }
+            };
+        }
+
+        const search = {
+            [Symbol.replace](whole, callback) {
+                const heldThis = this;
+                const heldWhole = whole;
+                const heldCallback = callback;
+                const allocated = churn(10);
+                if (
+                    heldThis !== search ||
+                    heldWhole !== "abc" ||
+                    heldCallback !== replacement ||
+                    allocated.seed !== 10
+                ) {
+                    throw new Error("custom replace roots");
+                }
+                calls++;
+                return "protocol";
+            }
+        };
+
+        const protocol = "abc".replace(search, replacement);
+        const functional = "aba".replaceAll("a", replacement);
+
+        const originalMatch = RegExp.prototype[Symbol.match];
+        const originalMatchAll = RegExp.prototype[Symbol.matchAll];
+        const originalSearch = RegExp.prototype[Symbol.search];
+        RegExp.prototype[Symbol.match] = function(input) {
+            const held = this;
+            churn(60);
+            if (!(held instanceof RegExp) || input !== "aba") {
+                throw new Error("match fallback roots");
+            }
+            calls++;
+            return "match:" + input;
+        };
+        RegExp.prototype[Symbol.matchAll] = function(input) {
+            const held = this;
+            churn(70);
+            if (!(held instanceof RegExp) || input !== "aba") {
+                throw new Error("matchAll fallback roots");
+            }
+            calls++;
+            return { tag: "matchAll:" + input };
+        };
+        RegExp.prototype[Symbol.search] = function(input) {
+            const held = this;
+            churn(80);
+            if (!(held instanceof RegExp) || input !== "aba") {
+                throw new Error("search fallback roots");
+            }
+            calls++;
+            return 17;
+        };
+
+        const match = "aba".match("a");
+        const matchAll = "aba".matchAll("a");
+        const searchResult = "aba".search("a");
+        RegExp.prototype[Symbol.match] = originalMatch;
+        RegExp.prototype[Symbol.matchAll] = originalMatchAll;
+        RegExp.prototype[Symbol.search] = originalSearch;
+
+        [protocol, functional, match, matchAll.tag, searchResult, calls].join("|");
+        "#,
+        "<gc-string-protocol-fallbacks>",
+    );
+
+    assert_eq!(completion, "protocol|XbX|match:aba|matchAll:aba|17|6");
 }
 
 #[test]

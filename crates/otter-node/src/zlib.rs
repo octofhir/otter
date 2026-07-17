@@ -19,30 +19,31 @@
 //!
 //! # See also
 //! - `zlib.js` — the JS surface (classes, async wrappers, constants, codes).
-//! - `crypto.rs` — same latin1 bridge + `RuntimeObjectBuilder` dynamic-method
-//!   pattern.
+//! - `crypto.rs` — same latin1 bridge and rooted native-scope builder pattern.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
 
 use flate2::Compression;
 use flate2::read::{DeflateDecoder, GzDecoder, MultiGzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use otter_runtime::{
-    CapabilitySet, RuntimeAttr, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder, RuntimeValue as Value, runtime_alloc_object, runtime_arg_to_string,
-    runtime_native_dynamic,
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeValue as Value,
+    runtime_arg_to_string,
 };
 
 const SHIM: &str = include_str!("zlib.js");
 
 /// CommonJS export: the `zlib` namespace built by `zlib.js`.
-pub fn zlib_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let native = native_value(ctx)?;
-    let buffer = crate::buffer::buffer_cjs_value(ctx, caps)?;
-    let stream = crate::stream::stream_cjs_value(ctx, caps)?;
+pub fn zlib_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let native = native_value(scope)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    let stream = crate::stream::stream_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:zlib",
         SHIM,
         &[
@@ -58,22 +59,16 @@ pub fn install_zlib_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Res
     Ok(())
 }
 
-fn native_value(ctx: &mut NativeCtx<'_>) -> Result<Value, String> {
-    let object = runtime_alloc_object(ctx).map_err(|e| e.to_string())?;
-    let mut builder = RuntimeObjectBuilder::from_object(ctx, object);
-
+fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'scope>, String> {
+    let object = scope.object().map_err(|error| error.to_string())?;
     macro_rules! m {
         ($name:literal, $len:expr, $f:ident) => {
-            builder
-                .method(
-                    $name,
-                    $len,
-                    runtime_native_dynamic(Arc::new(
-                        |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| $f(ctx, args),
-                    )),
-                    RuntimeAttr::builtin_function(),
-                )
-                .map_err(|e| e.to_string())?;
+            let method = scope
+                .native_method($name, $len, $f)
+                .map_err(|error| error.to_string())?;
+            scope
+                .set(object, $name, method)
+                .map_err(|error| error.to_string())?;
         };
     }
 
@@ -86,7 +81,7 @@ fn native_value(ctx: &mut NativeCtx<'_>) -> Result<Value, String> {
     m!("unzip", 1, unzip);
     m!("crc32", 2, crc32);
 
-    Ok(Value::object(builder.build()))
+    Ok(object)
 }
 
 fn bytes_to_latin1(bytes: &[u8]) -> String {

@@ -256,11 +256,11 @@ impl Interpreter {
         self.iteration_anchors[index]
     }
 
-    /// Root a value for the duration of an out-of-crate builder (e.g. the
-    /// runtime's module `ModuleScope`). Backed by the iteration-anchor stack,
-    /// which the GC traces and rewrites in place, so the rooted value survives a
-    /// moving scavenge triggered by a later allocation. Returns the new depth;
-    /// pass it (minus one) to read the value back via [`Self::module_root`].
+    /// Root a value for the duration of a legacy out-of-crate runtime builder.
+    /// Backed by the iteration-anchor stack, which the GC traces and rewrites
+    /// in place, so the rooted value survives a moving scavenge triggered by a
+    /// later allocation. Returns the new depth; pass it (minus one) to read the
+    /// value back via [`Self::module_root`].
     ///
     /// Because the GC moves, a `Value` copy held across an allocation is stale —
     /// re-read it with [`Self::module_root`] after any allocation, and balance
@@ -288,11 +288,6 @@ impl Interpreter {
     #[must_use]
     pub fn module_root(&self, index: usize) -> Value {
         self.iteration_anchor(index)
-    }
-
-    /// Overwrite a module-root slot (for a value mutated across allocations).
-    pub fn set_module_root(&mut self, index: usize, value: Value) {
-        self.set_iteration_anchor(index, value);
     }
 
     /// Consume the pending uncaught-throw payload, if any. Embedder

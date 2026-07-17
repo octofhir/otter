@@ -64,7 +64,6 @@ mod host_services;
 pub mod module_graph;
 pub mod module_loader;
 mod module_records;
-pub mod module_scope;
 mod package_graph_resolver;
 mod process;
 mod process_env;
@@ -325,8 +324,10 @@ impl HostedModuleInstall {
 /// `assert(cond)` as well as via `assert.strictEqual`). The object-namespace
 /// [`HostedModuleInstall`] path cannot represent a callable, so a builtin that
 /// needs one supplies this instead; `require()` returns its result verbatim.
-pub type HostedModuleValueInstall =
-    for<'rt> fn(&mut otter_vm::NativeCtx<'rt>, &CapabilitySet) -> Result<otter_vm::Value, String>;
+pub type HostedModuleValueInstall = for<'scope, 'rt> fn(
+    &mut otter_vm::NativeScope<'scope, 'rt>,
+    &CapabilitySet,
+) -> Result<otter_vm::Local<'scope>, String>;
 
 /// Load one CommonJS native addon (`.node`) after module resolution and the
 /// filesystem capability check have completed.

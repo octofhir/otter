@@ -17,15 +17,18 @@
 //!   the process exit code, so all-pass leaves it at 0.
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_vm::{Local, NativeScope};
 
 /// Embedded `node:test` runner implementation.
 const SHIM: &str = include_str!("node_test.js");
 
 /// CommonJS export: the `test` function with `it`/`describe`/`suite`/hooks.
-pub fn node_test_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let assert_value = crate::assert::assert_cjs_value(ctx, caps)?;
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:test", SHIM, &[("assert", assert_value)])
+pub fn node_test_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let assert_value = crate::assert::assert_cjs_value(scope, caps)?;
+    otter_runtime::run_builtin_cjs_shim(scope, "node:test", SHIM, &[("assert", assert_value)])
 }
 
 /// ESM namespace install — no eager members; CommonJS is the supported surface.

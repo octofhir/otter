@@ -730,17 +730,24 @@ impl Interpreter {
         flags: crate::object::PropertyFlags,
     ) -> Result<(), VmError> {
         let receiver = self.handle_arena.get(obj.index());
+        let stored = self.handle_arena.get(value.index());
+        let descriptor = crate::object::PropertyDescriptor {
+            kind: crate::object::DescriptorKind::Data { value: stored },
+            flags,
+        };
+        if let Some(native) = receiver.as_native_function() {
+            return if native.define_own_property(&mut self.gc_heap, key, descriptor) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
+        }
         let object = if let Some(object) = receiver.as_object() {
             object
         } else if let Some(set) = receiver.as_set() {
             crate::property_dispatch::set_ensure_expando_pub(&mut self.gc_heap, set)?
         } else {
             return Err(VmError::TypeMismatch);
-        };
-        let stored = self.handle_arena.get(value.index());
-        let descriptor = crate::object::PropertyDescriptor {
-            kind: crate::object::DescriptorKind::Data { value: stored },
-            flags,
         };
         if crate::object::define_own_property(object, &mut self.gc_heap, key, descriptor) {
             Ok(())

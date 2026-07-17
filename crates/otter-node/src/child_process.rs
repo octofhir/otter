@@ -12,29 +12,27 @@
 //! - No VM state is retained across the spawn.
 
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 
-use otter_runtime::module_scope::{ModuleScope, Rooted};
 use otter_runtime::{
-    CapabilitySet, RuntimeAttr, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder, RuntimeValue as Value, runtime_alloc_object, runtime_arg_to_string,
-    runtime_native_dynamic,
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeValue as Value,
+    runtime_arg_to_string,
 };
 use otter_vm::object;
 
 const SHIM: &str = include_str!("child_process.js");
 
 /// CommonJS export: the `child_process` namespace built by `child_process.js`.
-pub fn child_process_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn child_process_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Value, String> {
-    let native = native_value(ctx, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(ctx, caps)?;
-    let events = crate::events::events_cjs_value(ctx, caps)?;
-    let stream = crate::stream::stream_cjs_value(ctx, caps)?;
+) -> Result<Local<'scope>, String> {
+    let native = native_value(scope, caps)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    let events = crate::events::events_cjs_value(scope, caps)?;
+    let stream = crate::stream::stream_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:child_process",
         SHIM,
         &[
@@ -53,23 +51,26 @@ pub fn install_child_process_module(
     Ok(())
 }
 
-fn native_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let object = runtime_alloc_object(ctx).map_err(|e| e.to_string())?;
-    let mut builder = RuntimeObjectBuilder::from_object(ctx, object);
+fn native_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let object = scope.object().map_err(|error| error.to_string())?;
     let caps = caps.clone();
-    builder
-        .method(
+    let method = scope
+        .native_closure(
             "spawnSyncRaw",
             3,
-            runtime_native_dynamic(Arc::new(
-                move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
-                    spawn_sync_raw(ctx, args, &caps)
-                },
-            )),
-            RuntimeAttr::builtin_function(),
+            &[],
+            move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+                spawn_sync_raw(ctx, args, &caps)
+            },
         )
-        .map_err(|e| e.to_string())?;
-    Ok(Value::object(builder.build()))
+        .map_err(|error| error.to_string())?;
+    scope
+        .set(object, "spawnSyncRaw", method)
+        .map_err(|error| error.to_string())?;
+    Ok(object)
 }
 
 fn bytes_to_latin1(bytes: &[u8]) -> String {
@@ -221,21 +222,27 @@ fn spawn_sync_raw(
     let stdout = bytes_to_latin1(&output.stdout);
     let stderr = bytes_to_latin1(&output.stderr);
 
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(oom)?;
-    scope.set_number(obj, "pid", f64::from(pid));
-    match status_code {
-        Some(code) => scope.set_number(obj, "status", f64::from(code)),
-        None => set_null(&mut scope, obj, "status"),
-    }
-    match signal {
-        Some(sig) => scope.set_string(obj, "signal", &sig).map_err(oom)?,
-        None => set_null(&mut scope, obj, "signal"),
-    }
-    scope.set_string(obj, "stdout", &stdout).map_err(oom)?;
-    scope.set_string(obj, "stderr", &stderr).map_err(oom)?;
-    set_null(&mut scope, obj, "error");
-    Ok(scope.finish(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        set_number(&mut scope, object, "pid", f64::from(pid))?;
+        match status_code {
+            Some(code) => set_number(&mut scope, object, "status", f64::from(code))?,
+            None => set_null(&mut scope, object, "status")?,
+        }
+        match signal {
+            Some(signal) => {
+                let signal = scope.string(&signal)?;
+                scope.set(object, "signal", signal)?;
+            }
+            None => set_null(&mut scope, object, "signal")?,
+        }
+        let stdout = scope.string(&stdout)?;
+        scope.set(object, "stdout", stdout)?;
+        let stderr = scope.string(&stderr)?;
+        scope.set(object, "stderr", stderr)?;
+        set_null(&mut scope, object, "error")?;
+        Ok(scope.finish(object))
+    })
 }
 
 fn spawn_error_result(
@@ -249,16 +256,21 @@ fn spawn_error_result(
         "EIO"
     };
     let message = format!("{code}: spawn {command} {err}");
-    let mut scope = ModuleScope::new(ctx);
-    let obj = scope.object().map_err(oom)?;
-    set_null(&mut scope, obj, "pid");
-    set_null(&mut scope, obj, "status");
-    set_null(&mut scope, obj, "signal");
-    scope.set_string(obj, "stdout", "").map_err(oom)?;
-    scope.set_string(obj, "stderr", "").map_err(oom)?;
-    scope.set_string(obj, "error", &message).map_err(oom)?;
-    scope.set_string(obj, "errorCode", code).map_err(oom)?;
-    Ok(scope.finish(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        set_null(&mut scope, object, "pid")?;
+        set_null(&mut scope, object, "status")?;
+        set_null(&mut scope, object, "signal")?;
+        let stdout = scope.string("")?;
+        scope.set(object, "stdout", stdout)?;
+        let stderr = scope.string("")?;
+        scope.set(object, "stderr", stderr)?;
+        let error = scope.string(&message)?;
+        scope.set(object, "error", error)?;
+        let error_code = scope.string(code)?;
+        scope.set(object, "errorCode", error_code)?;
+        Ok(scope.finish(object))
+    })
 }
 
 #[cfg(unix)]
@@ -288,11 +300,21 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
-fn set_null(scope: &mut ModuleScope<'_, '_>, obj: Rooted, key: &str) {
-    let v = scope.null();
-    scope.set(obj, key, v);
+fn set_null(
+    scope: &mut NativeScope<'_, '_>,
+    object: Local<'_>,
+    key: &str,
+) -> Result<(), NativeError> {
+    let value = scope.null();
+    scope.set(object, key, value)
 }
 
-fn oom(err: String) -> NativeError {
-    crate::type_error("child_process", err)
+fn set_number(
+    scope: &mut NativeScope<'_, '_>,
+    object: Local<'_>,
+    key: &str,
+    value: f64,
+) -> Result<(), NativeError> {
+    let value = scope.number(value);
+    scope.set(object, key, value)
 }

@@ -2,14 +2,17 @@
 //! line-oriented Interface over input/output streams (JS shim over `events`).
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("readline.js");
 
 /// CommonJS export: the `readline` namespace.
-pub fn readline_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let events = crate::events::events_cjs_value(ctx, caps)?;
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:readline", SHIM, &[("events", events)])
+pub fn readline_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let events = crate::events::events_cjs_value(scope, caps)?;
+    otter_runtime::run_builtin_cjs_shim(scope, "node:readline", SHIM, &[("events", events)])
 }
 
 /// ESM namespace install — CommonJS is the supported surface for now.

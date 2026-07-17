@@ -6,7 +6,7 @@
 //! dependency of fs/net/http/zlib/readline.
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("stream.js");
 const WEB_SHIM: &str = include_str!("stream_web.js");
@@ -15,11 +15,14 @@ const PROMISES_SHIM: &str = include_str!("stream_promises.js");
 
 /// CommonJS export: the `stream` namespace (the `Stream` base with the stream
 /// classes and helpers attached).
-pub fn stream_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result<Value, String> {
-    let events = crate::events::events_cjs_value(ctx, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(ctx, caps)?;
+pub fn stream_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    let events = crate::events::events_cjs_value(scope, caps)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:stream",
         SHIM,
         &[("events", events), ("buffer", buffer)],
@@ -27,21 +30,21 @@ pub fn stream_cjs_value(ctx: &mut NativeCtx<'_>, caps: &CapabilitySet) -> Result
 }
 
 /// CommonJS export: the WHATWG `stream/web` namespace.
-pub fn stream_web_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn stream_web_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Value, String> {
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:stream/web", WEB_SHIM, &[])
+) -> Result<Local<'scope>, String> {
+    otter_runtime::run_builtin_cjs_shim(scope, "node:stream/web", WEB_SHIM, &[])
 }
 
 /// CommonJS export: `stream/consumers` (collect a stream into a value).
-pub fn stream_consumers_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn stream_consumers_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Value, String> {
-    let buffer = crate::buffer::buffer_cjs_value(ctx, caps)?;
+) -> Result<Local<'scope>, String> {
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:stream/consumers",
         CONSUMERS_SHIM,
         &[("buffer", buffer)],
@@ -49,13 +52,13 @@ pub fn stream_consumers_cjs_value(
 }
 
 /// CommonJS export: `stream/promises` (promise-returning finished/pipeline).
-pub fn stream_promises_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn stream_promises_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Value, String> {
-    let stream = stream_cjs_value(ctx, caps)?;
+) -> Result<Local<'scope>, String> {
+    let stream = stream_cjs_value(scope, caps)?;
     otter_runtime::run_builtin_cjs_shim(
-        ctx,
+        scope,
         "node:stream/promises",
         PROMISES_SHIM,
         &[("stream", stream)],

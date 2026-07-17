@@ -22,14 +22,17 @@
 use std::path::{Path, PathBuf};
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, NativeError, Value};
+use otter_vm::{Local, NativeCtx, NativeError, NativeScope, Value};
 
 const SHIM: &str = concat!(include_str!("url.js"), "\n", include_str!("url_legacy.js"));
 
 /// CommonJS export containing WHATWG constructors, legacy helpers, and file
 /// URL conversion functions.
-pub fn url_cjs_value(ctx: &mut NativeCtx<'_>, _caps: &CapabilitySet) -> Result<Value, String> {
-    otter_runtime::run_builtin_cjs_shim(ctx, "node:url", SHIM, &[])
+pub fn url_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+) -> Result<Local<'scope>, String> {
+    otter_runtime::run_builtin_cjs_shim(scope, "node:url", SHIM, &[])
 }
 
 /// Named ESM surface used by ecosystem loaders.
@@ -127,19 +130,9 @@ fn file_url_input(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<String, Nat
             "The \"path\" argument must be of type string or URL. Received an object",
         ));
     }
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: "fileURLToPath",
-        reason: "missing execution context".to_string(),
-    })?;
-    let href = interp
-        .get_property(&exec, value, "href")
-        .map_err(|err| NativeError::TypeError {
-            name: "fileURLToPath",
-            reason: err.to_string(),
-        })?;
-    href.as_string(interp.gc_heap())
-        .map(|string| string.to_lossy_string(interp.gc_heap()))
+    let href = ctx.get_value_property(value, "href")?;
+    href.as_string(ctx.heap())
+        .map(|string| string.to_lossy_string(ctx.heap()))
         .ok_or_else(|| {
             crate::invalid_arg_type(
                 "The \"path\" argument must be of type string or URL. Received an object",

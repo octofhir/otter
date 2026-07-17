@@ -14,7 +14,7 @@
 //! - `internal_test_binding.js`
 
 use otter_runtime::CapabilitySet;
-use otter_vm::{NativeCtx, Value};
+use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("internal_test_binding.js");
 
@@ -24,9 +24,9 @@ pub fn install_internal_test_binding_module(
     Ok(())
 }
 
-pub fn internal_test_binding_cjs_value(
-    ctx: &mut NativeCtx<'_>,
+pub fn internal_test_binding_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Value, String> {
-    otter_runtime::run_builtin_cjs_shim(ctx, "internal/test/binding", SHIM, &[])
+) -> Result<Local<'scope>, String> {
+    otter_runtime::run_builtin_cjs_shim(scope, "internal/test/binding", SHIM, &[])
 }

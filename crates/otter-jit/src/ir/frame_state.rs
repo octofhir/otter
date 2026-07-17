@@ -294,10 +294,9 @@ impl FrameStateTable {
                                         register_count: frame_registers,
                                     }
                                 })?;
-                                let value = stacks
-                                    [variable(ssa, call_site.parent, argument)]
-                                .last()
-                                .copied();
+                                let value = stacks[variable(ssa, call_site.parent, argument)]
+                                    .last()
+                                    .copied();
                                 if let Some(value) = value {
                                     let slot = variable(ssa, inline, parameter);
                                     stacks[slot].push(value);
@@ -333,8 +332,7 @@ impl FrameStateTable {
                                 inline,
                                 pc: instruction.pc,
                                 block,
-                                registers: stacks
-                                    [base..base + usize::from(frame_registers)]
+                                registers: stacks[base..base + usize::from(frame_registers)]
                                     .iter()
                                     .map(|stack| stack.last().copied())
                                     .collect::<Vec<_>>()
@@ -391,9 +389,7 @@ impl FrameStateTable {
             };
             let caller = states
                 .iter()
-                .position(|state| {
-                    state.inline == call_site.parent && state.pc == call_site.call_pc
-                })
+                .position(|state| state.inline == call_site.parent && state.pc == call_site.call_pc)
                 .ok_or(FrameStateError::ResultRegisterMismatch {
                     pc: call_site.call_pc,
                 })?;
@@ -681,7 +677,9 @@ mod tests {
         // caller's state at the call PC.
         assert!(root_states.iter().all(|state| state.caller.is_none()));
         assert_eq!(callee_states.len(), 1);
-        let caller = callee_states[0].caller.expect("a spliced state has a caller");
+        let caller = callee_states[0]
+            .caller
+            .expect("a spliced state has a caller");
         let caller = &table.states()[caller];
         assert_eq!(caller.inline, InlineId::ROOT);
         assert_eq!(caller.pc, 0, "the caller is paused at its call");

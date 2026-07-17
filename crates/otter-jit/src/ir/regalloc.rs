@@ -1518,9 +1518,7 @@ mod tests {
             .expect("liveness verifies");
         let tree = crate::ir::inline::InlineTree::trivial(&snapshot);
         let reprs = ReprMap::compute(&tree, &ssa);
-        reprs
-            .verify(&tree, &ssa)
-            .expect("representations verify");
+        reprs.verify(&tree, &ssa).expect("representations verify");
         (cfg, ssa, liveness, reprs)
     }
 

@@ -28,7 +28,7 @@ pub struct TemplateCode {
     code: CompiledCode,
     /// Shared executable call lifecycle whose entry address is baked into this
     /// mapping. Installed code can outlive the compiler hook, so ownership is
-    /// retained here as well as by [`crate::BaselineJitCompiler`].
+    /// retained here as well as by [`crate::OtterJitCompiler`].
     #[cfg(target_arch = "aarch64")]
     _call_trampoline: std::sync::Arc<CallTrampoline>,
     /// Frozen VM-owned metadata validated before every entry selection.

@@ -1219,8 +1219,8 @@ pub(crate) struct RuntimeConfig {
 pub enum JitSelection {
     /// Interpreter plus the production optimizing and template tiers.
     #[default]
-    Baseline,
-    /// Explicit production-tier selection; equivalent to the default.
+    ProductionTiered,
+    /// Interpreter plus the template tier, without optimizing compilation.
     Template,
     /// Interpreter only — the semantic oracle for differential runs.
     InterpreterOnly,
@@ -1962,21 +1962,23 @@ impl Runtime {
                             .map_err(|e| format!("compile error: {e:?}"))
                         });
                     interp.set_eval_hook(Some(hook));
-                    // The JIT is the default execution path: functions start in the
-                    // interpreter and tier up through the configured compiler.
-                    // `OTTER_JIT=0` drops to interpreter-only (debugging escape hatch).
+                    // Functions start in the interpreter and tier up through the
+                    // explicitly configured compiler policy.
                     if let Some(threshold) = config.jit_osr_threshold {
                         interp.set_jit_osr_threshold(threshold);
                     }
-                    if std::env::var("OTTER_JIT").map_or(true, |v| v != "0") {
-                        match config.jit_selection {
-                            JitSelection::Baseline | JitSelection::Template => {
-                                interp.set_jit_compiler(Some(std::sync::Arc::new(
-                                    otter_jit::BaselineJitCompiler::new(),
-                                )));
-                            }
-                            JitSelection::InterpreterOnly => {}
+                    match config.jit_selection {
+                        JitSelection::ProductionTiered => {
+                            interp.set_jit_compiler(Some(std::sync::Arc::new(
+                                otter_jit::OtterJitCompiler::production_tiered(),
+                            )));
                         }
+                        JitSelection::Template => {
+                            interp.set_jit_compiler(Some(std::sync::Arc::new(
+                                otter_jit::OtterJitCompiler::template_only(),
+                            )));
+                        }
+                        JitSelection::InterpreterOnly => {}
                     }
                     if let Some(factory) = &config.tracer_factory {
                         interp.set_tracer(Some(factory.build()));
@@ -4883,6 +4885,11 @@ mod tests {
     use crate::event_loop::{TimerRequest, TimerToken};
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn default_jit_selection_is_production_tiered() {
+        assert_eq!(JitSelection::default(), JitSelection::ProductionTiered);
+    }
 
     #[test]
     fn public_handle_types_are_send_sync() {

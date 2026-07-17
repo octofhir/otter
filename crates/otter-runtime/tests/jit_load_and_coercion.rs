@@ -390,7 +390,7 @@ fn boxed_property_loads_recover_exact_values_through_cold_path_after_gc_churn() 
     let (oracle, _) = run_boxed_properties(JitSelection::InterpreterOnly);
     assert_eq!(oracle, "[0.5,true,true,2147483647,true]");
 
-    let (compiled, stats) = run_boxed_properties(JitSelection::Template);
+    let (compiled, stats) = run_boxed_properties(JitSelection::ProductionTiered);
     assert_eq!(compiled, oracle);
     assert!(
         stats.jit_osr_attempts > 0,

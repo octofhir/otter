@@ -74,7 +74,7 @@ fn write_test(corpus: &CorpusPaths, rel: &str, source: &str) -> std::path::PathB
 
 fn driver_config() -> ExecConfig {
     ExecConfig {
-        jit_selection: otter_runtime::JitSelection::Baseline,
+        jit_selection: otter_runtime::JitSelection::ProductionTiered,
         timeout: Duration::from_millis(5_000),
         max_heap_bytes: 256 * 1024 * 1024,
         config: Test262Config::default(),
@@ -291,7 +291,7 @@ fn skipped_outcome_for_skip_feature() {
     );
     let mut harness = HarnessCache::new(&corpus.harness_dir);
     let cfg = ExecConfig {
-        jit_selection: otter_runtime::JitSelection::Baseline,
+        jit_selection: otter_runtime::JitSelection::ProductionTiered,
         timeout: Duration::from_millis(5_000),
         max_heap_bytes: 256 * 1024 * 1024,
         config: {
@@ -318,7 +318,7 @@ fn skipped_outcome_for_no_strict_only_test() {
     );
     let mut harness = HarnessCache::new(&corpus.harness_dir);
     let cfg = ExecConfig {
-        jit_selection: otter_runtime::JitSelection::Baseline,
+        jit_selection: otter_runtime::JitSelection::ProductionTiered,
         timeout: Duration::from_millis(5_000),
         max_heap_bytes: 256 * 1024 * 1024,
         config: {
@@ -345,7 +345,7 @@ fn skipped_outcome_for_known_panic() {
     );
     let mut harness = HarnessCache::new(&corpus.harness_dir);
     let cfg = ExecConfig {
-        jit_selection: otter_runtime::JitSelection::Baseline,
+        jit_selection: otter_runtime::JitSelection::ProductionTiered,
         timeout: Duration::from_millis(5_000),
         max_heap_bytes: 256 * 1024 * 1024,
         config: {
@@ -372,7 +372,7 @@ fn skipped_outcome_for_ignored_path() {
     );
     let mut harness = HarnessCache::new(&corpus.harness_dir);
     let cfg = ExecConfig {
-        jit_selection: otter_runtime::JitSelection::Baseline,
+        jit_selection: otter_runtime::JitSelection::ProductionTiered,
         timeout: Duration::from_millis(5_000),
         max_heap_bytes: 256 * 1024 * 1024,
         config: {
@@ -400,7 +400,7 @@ fn timeout_outcome_when_busy_loop_exceeds_budget() {
     let mut harness = HarnessCache::new(&corpus.harness_dir);
     // Short, deliberate budget so the test finishes quickly.
     let cfg = ExecConfig {
-        jit_selection: otter_runtime::JitSelection::Baseline,
+        jit_selection: otter_runtime::JitSelection::ProductionTiered,
         timeout: Duration::from_millis(500),
         max_heap_bytes: 256 * 1024 * 1024,
         config: Test262Config::default(),

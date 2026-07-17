@@ -220,11 +220,7 @@ impl Interpreter {
             jit_entry_reopt_counts: rustc_hash::FxHashMap::default(),
             jit_osr_disabled: rustc_hash::FxHashSet::default(),
             jit_osr_counts: rustc_hash::FxHashMap::default(),
-            jit_osr_threshold: std::env::var("OTTER_JIT_OSR_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|&t| t > 0)
-                .unwrap_or(Self::JIT_OSR_THRESHOLD),
+            jit_osr_threshold: Self::JIT_OSR_THRESHOLD,
             jit_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
@@ -941,10 +937,9 @@ impl Interpreter {
 
     /// Override the back-edge count at which a hot loop tiers up via OSR.
     ///
-    /// Structured counterpart of the `OTTER_JIT_OSR_THRESHOLD` conformance
-    /// knob for embedders and differential harnesses that must force loop
-    /// tier-up without touching the process environment. Zero is rejected;
-    /// the current threshold is kept.
+    /// Embedders and differential harnesses use this to force loop tier-up
+    /// without ambient process configuration. Zero is rejected; the current
+    /// threshold is kept.
     pub fn set_jit_osr_threshold(&mut self, threshold: u32) {
         if threshold > 0 {
             self.jit_osr_threshold = threshold;

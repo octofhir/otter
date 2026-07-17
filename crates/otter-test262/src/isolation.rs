@@ -190,7 +190,7 @@ mod tests {
             Duration::from_secs(5),
             64 * 1024 * 1024,
             false,
-            JitSelection::Baseline,
+            JitSelection::ProductionTiered,
         )
         .unwrap();
         let outcome = run_with_watchdog(&mut rt, Duration::from_secs(5), |rt| {
@@ -205,7 +205,7 @@ mod tests {
             Duration::ZERO,
             64 * 1024 * 1024,
             false,
-            JitSelection::Baseline,
+            JitSelection::ProductionTiered,
         )
         .unwrap();
         let outcome = run_with_watchdog(&mut rt, Duration::ZERO, |_| {
@@ -225,7 +225,7 @@ mod tests {
             Duration::ZERO,
             64 * 1024 * 1024,
             false,
-            JitSelection::Baseline,
+            JitSelection::ProductionTiered,
         )
         .unwrap();
         let outcome = run_with_watchdog(&mut rt, Duration::ZERO, |rt| {
@@ -240,7 +240,7 @@ mod tests {
             Duration::ZERO,
             64 * 1024 * 1024,
             false,
-            JitSelection::Baseline,
+            JitSelection::ProductionTiered,
         )
         .unwrap();
         let process = rt

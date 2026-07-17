@@ -132,7 +132,7 @@ fn run(selection: JitSelection) -> (String, Vec<(u64, u64)>) {
 #[test]
 fn optimized_element_stores_match_interpreter() {
     let (oracle, _) = run(JitSelection::InterpreterOnly);
-    let (tiered, deltas) = run(JitSelection::Baseline);
+    let (tiered, deltas) = run(JitSelection::ProductionTiered);
 
     assert_eq!(tiered, oracle);
     assert_eq!(

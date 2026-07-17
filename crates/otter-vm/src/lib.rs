@@ -930,8 +930,8 @@ pub struct Interpreter {
     /// handful of loop headers currently warming up.
     jit_osr_counts: rustc_hash::FxHashMap<(u32, u32), u32>,
     /// Back-edge count at which a hot loop tiers up via OSR. Defaults to
-    /// [`Self::JIT_OSR_THRESHOLD`]; overridable via `OTTER_JIT_OSR_THRESHOLD`
-    /// for tuning and to force OSR coverage in conformance runs (set to 1).
+    /// [`Self::JIT_OSR_THRESHOLD`]; embedders can override it explicitly through
+    /// [`Self::set_jit_osr_threshold`].
     jit_osr_threshold: u32,
     /// Compiled-code cache keyed by global function id. `Some(code)` is an
     /// installed baseline body; `None` records a function the emitter could not

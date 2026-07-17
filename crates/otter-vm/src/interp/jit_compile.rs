@@ -71,6 +71,13 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if !self
+            .jit_hook
+            .as_ref()
+            .is_some_and(|hook| hook.optimizing_tier_enabled())
+        {
+            return None;
+        }
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         self.publish_property_feedback_for_view(&snapshot);
         // The optimizing tier consumes the same baked compile inputs as the
@@ -113,6 +120,13 @@ impl Interpreter {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
+        if !self
+            .jit_hook
+            .as_ref()
+            .is_some_and(|hook| hook.optimizing_tier_enabled())
+        {
+            return None;
+        }
         if let Some(Some(code)) = self.jit_optimized_code.get(&fid) {
             return self
                 .jit_code_registry

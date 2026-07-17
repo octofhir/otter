@@ -180,16 +180,16 @@ struct RunArgs {
     worker_soft_rss_bytes: Option<u64>,
 
     /// Execution tier installed in every per-test runtime.
-    #[arg(long, value_enum, default_value_t = JitTierArg::Baseline)]
+    #[arg(long, value_enum, default_value_t = JitTierArg::ProductionTiered)]
     jit_tier: JitTierArg,
 }
 
 /// Execution-tier selection forwarded to every per-test runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JitTierArg {
-    /// Interpreter plus the production compiler (the template tier).
-    Baseline,
-    /// Interpreter plus the template compiler (explicit; same as baseline).
+    /// Interpreter plus the production optimizing and template tiers.
+    ProductionTiered,
+    /// Interpreter plus the template compiler only.
     Template,
     /// Interpreter only.
     Interpreter,
@@ -198,7 +198,7 @@ enum JitTierArg {
 impl JitTierArg {
     fn selection(self) -> otter_runtime::JitSelection {
         match self {
-            Self::Baseline => otter_runtime::JitSelection::Baseline,
+            Self::ProductionTiered => otter_runtime::JitSelection::ProductionTiered,
             Self::Template => otter_runtime::JitSelection::Template,
             Self::Interpreter => otter_runtime::JitSelection::InterpreterOnly,
         }
@@ -206,7 +206,7 @@ impl JitTierArg {
 
     fn as_arg(self) -> &'static str {
         match self {
-            Self::Baseline => "baseline",
+            Self::ProductionTiered => "production-tiered",
             Self::Template => "template",
             Self::Interpreter => "interpreter",
         }
@@ -248,7 +248,7 @@ struct WorkerArgs {
     worker_soft_rss_bytes: u64,
 
     /// Execution tier installed in every per-test runtime.
-    #[arg(long, value_enum, default_value_t = JitTierArg::Baseline)]
+    #[arg(long, value_enum, default_value_t = JitTierArg::ProductionTiered)]
     jit_tier: JitTierArg,
 }
 

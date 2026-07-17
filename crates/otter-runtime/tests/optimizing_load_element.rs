@@ -26,7 +26,7 @@ use std::sync::Arc;
 use otter_bytecode::{
     BytecodeModule, Constant, Function, FunctionCodeBuilder, Op, Operand, SourceKind,
 };
-use otter_jit::BaselineJitCompiler;
+use otter_jit::OtterJitCompiler;
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 use otter_vm::{ExecutionContext, Interpreter, JitRuntimeStats, Value};
 use smallvec::{SmallVec, smallvec};
@@ -240,7 +240,7 @@ fn call(
 fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, JitRuntimeStats) {
     let mut interp = Interpreter::new();
     if !matches!(selection, JitSelection::InterpreterOnly) {
-        interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+        interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     }
     let context = interp.link_module(fixture_module());
     let array = Value::array(
@@ -392,7 +392,7 @@ fn optimized_element_values_and_throw_match_interpreter() {
     let (oracle_load, oracle_sum, oracle_float, oracle_many, oracle_throw, _) =
         run(JitSelection::InterpreterOnly);
     let (tiered_load, tiered_sum, tiered_float, tiered_many, tiered_throw, stats) =
-        run(JitSelection::Baseline);
+        run(JitSelection::ProductionTiered);
 
     assert_eq!(oracle_load.to_bits(), Value::number_i32(4).to_bits());
     assert_eq!(oracle_sum.to_bits(), Value::number_i32(10).to_bits());
@@ -419,7 +419,7 @@ fn optimized_element_values_and_throw_match_interpreter() {
 #[test]
 fn float_array_loop_enters_optimized_code() {
     let mut interp = Interpreter::new();
-    interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+    interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp.link_module(fixture_module());
     let array = Value::array(
         interp
@@ -458,7 +458,7 @@ fn float_array_loop_enters_optimized_code() {
 #[test]
 fn several_live_arrays_enter_optimized_code() {
     let mut interp = Interpreter::new();
-    interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+    interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp.link_module(fixture_module());
     let arrays = [[1, 2, 3, 4], [10, 20, 30, 40], [2, 4, 6, 8], [1, 2, 3, 4]].map(|elements| {
         Value::array(
@@ -496,7 +496,7 @@ fn several_live_arrays_enter_optimized_code() {
 #[test]
 fn source_element_load_enters_optimized_code() {
     let mut runtime = Runtime::builder()
-        .jit_selection(JitSelection::Baseline)
+        .jit_selection(JitSelection::ProductionTiered)
         .build()
         .expect("runtime");
     runtime
@@ -540,7 +540,7 @@ fn source_element_load_enters_optimized_code() {
 #[test]
 fn source_tagged_array_chain_enters_optimized_code() {
     let mut runtime = Runtime::builder()
-        .jit_selection(JitSelection::Baseline)
+        .jit_selection(JitSelection::ProductionTiered)
         .build()
         .expect("runtime");
     runtime

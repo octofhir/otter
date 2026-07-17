@@ -17,7 +17,7 @@
 use std::{sync::Arc, time::Duration};
 
 use otter_bytecode::{BytecodeModule, Function, FunctionCodeBuilder, Op, Operand, SourceKind};
-use otter_jit::BaselineJitCompiler;
+use otter_jit::OtterJitCompiler;
 use otter_runtime::JitSelection;
 use otter_vm::{Interpreter, JitRuntimeStats, Value};
 use smallvec::{SmallVec, smallvec};
@@ -244,8 +244,14 @@ fn call_int(
 
 fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntimeStats) {
     let mut interp = Interpreter::new();
-    if !matches!(selection, JitSelection::InterpreterOnly) {
-        interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+    match selection {
+        JitSelection::ProductionTiered => {
+            interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
+        }
+        JitSelection::Template => {
+            interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::template_only())));
+        }
+        JitSelection::InterpreterOnly => {}
     }
     let context = interp.link_module(fixture_module());
     for _ in 0..4010 {
@@ -312,11 +318,26 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, Value, JitRuntim
 }
 
 #[test]
+fn template_selection_never_enters_optimizer() {
+    let (_, _, _, _, _, stats) = run(JitSelection::Template);
+    assert!(
+        stats.compile_attempts > 0,
+        "template tier must compile the hot fixture: {stats:?}"
+    );
+    assert_eq!(
+        stats.optimized_entries, 0,
+        "template-only policy must not enter optimizing code: {stats:?}"
+    );
+    assert_eq!(stats.optimized_osr_entries, 0);
+    assert_eq!(stats.optimized_deopts, 0);
+}
+
+#[test]
 fn optimized_return_and_deopt_match_interpreter() {
     let (oracle_return, oracle_deopt, oracle_max_left, oracle_max_right, oracle_sum, _) =
         run(JitSelection::InterpreterOnly);
     let (tiered_return, tiered_deopt, tiered_max_left, tiered_max_right, tiered_sum, stats) =
-        run(JitSelection::Baseline);
+        run(JitSelection::ProductionTiered);
 
     assert_eq!(oracle_return.as_i32(), Some(16));
     assert_eq!(tiered_return.to_bits(), oracle_return.to_bits());
@@ -343,7 +364,7 @@ fn optimized_float_function_matches_interpreter_bits() {
     let run_float = |selection| {
         let mut interp = Interpreter::new();
         if !matches!(selection, JitSelection::InterpreterOnly) {
-            interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+            interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
         }
         let context = interp.link_module(fixture_module());
         for _ in 0..4010 {
@@ -357,7 +378,7 @@ fn optimized_float_function_matches_interpreter_bits() {
     };
 
     let (oracle, _) = run_float(JitSelection::InterpreterOnly);
-    let (tiered, stats) = run_float(JitSelection::Baseline);
+    let (tiered, stats) = run_float(JitSelection::ProductionTiered);
     assert_eq!(oracle.to_bits(), Value::number_f64(-4.25).to_bits());
     assert_eq!(tiered.to_bits(), oracle.to_bits());
     assert!(
@@ -369,7 +390,7 @@ fn optimized_float_function_matches_interpreter_bits() {
 #[test]
 fn optimized_long_loop_interrupts_without_materializing_a_frame() {
     let mut interp = Interpreter::new();
-    interp.set_jit_compiler(Some(Arc::new(BaselineJitCompiler::new())));
+    interp.set_jit_compiler(Some(Arc::new(OtterJitCompiler::production_tiered())));
     let context = interp.link_module(fixture_module());
     for _ in 0..4010 {
         assert_eq!(

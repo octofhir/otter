@@ -4,10 +4,10 @@
 //! `node:test` (`const { test } = require('node:test')`). The runner itself is
 //! naturally expressed in JavaScript, so it ships as an embedded CommonJS shim
 //! ([`SHIM`]) executed through [`otter_runtime::run_builtin_cjs_shim`]. The shim
-//! depends only on `assert`, which is resolved natively and injected.
+//! depends only on `assert`, resolved through the shared CommonJS loader.
 //!
 //! # Contents
-//! - [`node_test_cjs_value`] - build `assert`, then run the shim with it.
+//! - [`node_test_cjs_value`] - run the shim with the canonical `require`.
 //!
 //! # Invariants
 //! - A failing test sets `process.exitCode = 1`; the conformance harness reads
@@ -22,9 +22,10 @@ const SHIM: &str = include_str!("node_test.js");
 /// CommonJS export: the `test` function with `it`/`describe`/`suite`/hooks.
 pub fn node_test_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let assert_value = crate::assert::assert_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:test", SHIM, &[("assert", assert_value)])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:test", SHIM, module, require)
 }

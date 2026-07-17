@@ -37,22 +37,23 @@ const SHIM: &str = include_str!("zlib.js");
 /// CommonJS export: the `zlib` namespace built by `zlib.js`.
 pub fn zlib_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let native = native_value(scope)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
-    let stream = crate::stream::stream_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:zlib",
-        SHIM,
-        &[
-            ("__zlibnative", native),
-            ("buffer", buffer),
-            ("stream", stream),
-        ],
-    )
+    otter_runtime::run_builtin_cjs_shim(scope, "node:zlib", SHIM, module, require)
+}
+
+/// Hidden CommonJS row supplying the pure native compression primitives.
+pub fn zlib_native_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    _require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    native_value(scope)
 }
 
 fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'scope>, NativeError> {

@@ -48,6 +48,9 @@
 //!   reused as a discriminator (always `false`).
 //! - Hidden-class ICs may cache only [`ShapeCacheMode::Fast`] objects;
 //!   string-keyed delete moves an object to dictionary-compatible mode.
+//! - Runtime transaction rollback may force-remove only the own data slot that
+//!   still holds its expected published value; it never invokes an accessor or
+//!   removes a replacement installed by re-entrant code.
 //! - GC shape bodies are immutable after allocation; transition tables and
 //!   offset maps live in interpreter-owned side caches.
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
@@ -3175,6 +3178,63 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
     })
 }
 
+/// Force-remove an own data property only while it still holds `expected`.
+///
+/// Runtime publication transactions use this after an abrupt completion. The
+/// identity guard prevents rollback from deleting a replacement installed by
+/// re-entrant JavaScript. When the guarded slot is still present, removal
+/// deliberately bypasses `configurable`: JavaScript may have tightened the
+/// descriptor after publication, but that must not pin a failed transaction in
+/// an internal cache.
+///
+/// Accessor properties never match, so rollback does not invoke user code.
+pub(crate) fn delete_if_same_data(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    expected: Value,
+) -> bool {
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let Some(offset) = existing_offset else {
+        return false;
+    };
+
+    materialize_slots(obj, heap);
+    let matches_expected = heap.read_payload(obj, |body| {
+        let offset = offset as usize;
+        !body.slots()[offset].is_accessor
+            && crate::abstract_ops::is_strictly_equal(
+                &body.data_value(heap, offset),
+                &expected,
+                heap,
+            )
+    });
+    if !matches_expected {
+        return false;
+    }
+
+    let replacement_keys = heap.read_payload(obj, |body| {
+        let mut keys = string_keys_in_shape_order(heap, body);
+        let offset = offset as usize;
+        if offset < keys.len() {
+            keys.remove(offset);
+        }
+        keys
+    });
+    heap.with_payload(obj, |body| {
+        body.remove_slot(offset as usize);
+        body.dictionary_shape_id = next_shape_id();
+        dict_set_keys(body, replacement_keys);
+        body.shape = ShapeHandle::null();
+        shape_cache::invalidate_fast_shape_assumptions(
+            body,
+            ShapeCacheInvalidation::DeleteOwnProperty,
+        );
+        remove_mapped_argument(body, key);
+    });
+    true
+}
+
 /// Set or overwrite a symbol-keyed own data property through the
 /// same descriptor-aware `[[Set]]` data-write core as string keys.
 ///
@@ -5251,6 +5311,39 @@ mod tests {
         );
         assert!(!delete(o, &mut heap, "x"));
         assert!(get(o, &heap, "x").is_some());
+    }
+
+    #[test]
+    fn transactional_delete_is_identity_guarded_and_ignores_configurable() {
+        let mut heap = fresh_heap();
+        let mut cache = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let record = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let replacement = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let record_value = Value::object(record);
+        let replacement_value = Value::object(replacement);
+
+        define_own_property(
+            cache,
+            &mut heap,
+            "module",
+            PropertyDescriptor::data(record_value, true, true, false),
+        );
+        assert!(delete_if_same_data(
+            cache,
+            &mut heap,
+            "module",
+            record_value
+        ));
+        assert!(get(cache, &heap, "module").is_none());
+
+        set(&mut cache, &mut heap, "module", replacement_value);
+        assert!(!delete_if_same_data(
+            cache,
+            &mut heap,
+            "module",
+            record_value
+        ));
+        assert_eq!(get(cache, &heap, "module"), Some(replacement_value));
     }
 
     #[test]

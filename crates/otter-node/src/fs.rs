@@ -130,32 +130,40 @@ const FS_PROMISES_SHIM: &str = "'use strict';\nmodule.exports = require('fs').pr
 /// CommonJS export: the full `fs` namespace, built by `fs.js` on the native core.
 pub fn fs_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let native = fs_native_value(scope, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
-    let stream = crate::stream::stream_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(
-        scope,
-        "node:fs",
-        FS_SHIM,
-        &[
-            ("__fsnative", native),
-            ("buffer", buffer),
-            ("stream", stream),
-        ],
-    )
+    otter_runtime::run_builtin_cjs_shim(scope, "node:fs", FS_SHIM, module, require)
 }
 
 /// CommonJS export: `fs/promises` (= `require('fs').promises`).
 pub fn fs_promises_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let fs = fs_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:fs/promises", FS_PROMISES_SHIM, &[("fs", fs)])
+    otter_runtime::run_builtin_cjs_shim(
+        scope,
+        "node:fs/promises",
+        FS_PROMISES_SHIM,
+        module,
+        require,
+    )
+}
+
+/// Hidden CommonJS row that supplies the capability-gated native `fs` core.
+pub fn fs_native_cjs_value<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    _require: Local<'scope>,
+) -> Result<Local<'scope>, NativeError> {
+    fs_native_value(scope, caps)
 }
 
 /// Build the raw synchronous core as a value: `{ readRaw, writeRaw, stat, … }`.

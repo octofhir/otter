@@ -1,19 +1,14 @@
 'use strict';
-// `node:assert` — JS surface. Deep-equality and value rendering come from `util`
-// (injected); CallTracker and the Myers diff live in injected internal modules
-// (internal/assert/calltracker, internal/assert/myers_diff). A real
+// `node:assert` — JS surface. Deep-equality and value rendering come from
+// `util`; CallTracker and the Myers diff are resolved through the shared
+// CommonJS loader (internal/assert/calltracker,
+// internal/assert/myers_diff). A real
 // `AssertionError` class carries the correct name/code/actual/expected/operator
 // so matcher checks observe it; the `Assert` class is the constructible form.
 
 const util = require('util');
 const { isDeepStrictEqual, isDeepEqual, inspect, getCallSites } = util;
 const makeCallTracker = require('internal/assert/calltracker');
-const kAssertCache = Symbol.for('otter.node.assert.exports');
-
-if (typeof globalThis !== 'undefined' && globalThis[kAssertCache]) {
-  module.exports = globalThis[kAssertCache];
-  return;
-}
 
 function inspectValue(v) {
   return inspect(v, { depth: null, breakLength: Infinity, compact: 3 });
@@ -1110,6 +1105,5 @@ strict.CallTracker = CallTracker;
 strict.Assert = Assert;
 strict.strict = strict;
 assert.strict = strict;
-if (typeof globalThis !== 'undefined') globalThis[kAssertCache] = assert;
 
 module.exports = assert;

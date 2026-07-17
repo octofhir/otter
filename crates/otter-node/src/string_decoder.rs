@@ -9,9 +9,10 @@ const SHIM: &str = include_str!("string_decoder.js");
 /// CommonJS export: the `string_decoder` namespace (`StringDecoder`).
 pub fn string_decoder_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    caps: &CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    module: Local<'scope>,
+    require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
-    otter_runtime::run_builtin_cjs_shim(scope, "node:string_decoder", SHIM, &[("buffer", buffer)])
+    otter_runtime::run_builtin_cjs_shim(scope, "node:string_decoder", SHIM, module, require)
 }

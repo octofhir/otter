@@ -59,7 +59,7 @@ use otter_runtime::{
     CapabilitySet, RuntimeExecutionContext, RuntimeKeepAlive, RuntimeLiveness, RuntimeTask,
     RuntimeTaskSpawner,
 };
-use otter_vm::{NativeCall, NativeCtx, NativeError, PersistentRootId, Value};
+use otter_vm::{Local, NativeCall, NativeCtx, NativeError, NativeScope, PersistentRootId, Value};
 
 pub type napi_env = *mut NapiEnv;
 pub type napi_value = *mut c_void;
@@ -380,9 +380,9 @@ pub struct NapiEnv {
 }
 
 impl NapiEnv {
-    fn new(ctx: &mut NativeCtx<'_>, state: Weak<NapiState>) -> Self {
+    fn new(state: Weak<NapiState>) -> Self {
         Self {
-            ctx: (ctx as *mut NativeCtx<'_>).cast(),
+            ctx: ptr::null_mut(),
             handles: Vec::new(),
             scopes: Vec::new(),
             pending: None,
@@ -400,7 +400,7 @@ impl NapiEnv {
     ///
     /// # Safety
     /// `self.ctx` is live only while the synchronous registration/callback
-    /// frame that constructed this environment remains on the Rust stack.
+    /// frame that installed it remains on the Rust stack.
     unsafe fn ctx(&mut self) -> &mut NativeCtx<'static> {
         assert!(!self.ctx.is_null(), "napi_env used outside an isolate turn");
         unsafe { &mut *self.ctx.cast::<NativeCtx<'static>>() }
@@ -444,8 +444,8 @@ impl NapiEnv {
     }
 }
 
-fn install_stable_env(ctx: &mut NativeCtx<'_>, state: &Arc<NapiState>) {
-    let env = Box::new(NapiEnv::new(ctx, Arc::downgrade(state)));
+fn install_stable_env(state: &Arc<NapiState>) {
+    let env = Box::new(NapiEnv::new(Arc::downgrade(state)));
     let previous = state
         .env_ptr
         .swap(Box::into_raw(env) as usize, Ordering::AcqRel);
@@ -582,12 +582,12 @@ fn invoke_addon_callback(
 }
 
 /// Load and initialize a Node-API addon selected by CommonJS resolution.
-pub fn load_addon(
-    ctx: &mut NativeCtx<'_>,
+pub fn load_addon<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     path: &Path,
     capabilities: &CapabilitySet,
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
-) -> Result<Value, NativeError> {
+) -> Result<Local<'scope>, NativeError> {
     if !capabilities.ffi.matches_path(path) {
         return Err(invalid(
             "require",
@@ -634,26 +634,34 @@ pub fn load_addon(
         )
     })?;
 
-    let exports = ctx.scope(|mut scope| {
-        let exports = scope.object()?;
-        Ok::<Value, NativeError>(scope.finish(exports))
-    })?;
-    let state = Arc::new(NapiState::new(
-        library.clone(),
-        runtime_task_spawner,
-        ctx.execution_context().cloned(),
-    ));
-    install_stable_env(ctx, &state);
-    with_stable_env(ctx, &state, |env| {
-        let exports_handle = env.root(exports);
-        let returned = unsafe { register(env, exports_handle) };
-        if let Some(error) = env.pending.take() {
-            return Err(error);
-        }
-        unsafe { env.value(returned) }
-            .or_else(|| unsafe { env.value(exports_handle) })
-            .ok_or_else(|| invalid("require", "native addon returned an invalid handle"))
-    })
+    let exports = scope.object()?;
+    let register_addon = |ctx: &mut NativeCtx<'_>, exports: Value| {
+        let state = Arc::new(NapiState::new(
+            library.clone(),
+            runtime_task_spawner,
+            ctx.execution_context().cloned(),
+        ));
+        install_stable_env(&state);
+        with_stable_env(ctx, &state, |env| {
+            // Persist the rooted scope input before invoking addon code: C
+            // registration may allocate and trigger a moving collection.
+            let exports_handle = env.root(exports);
+            let returned = unsafe { register(env, exports_handle) };
+            if let Some(error) = env.pending.take() {
+                return Err(error);
+            }
+            unsafe { env.value(returned) }
+                .or_else(|| unsafe { env.value(exports_handle) })
+                .ok_or_else(|| invalid("require", "native addon returned an invalid handle"))
+        })
+    };
+    // SAFETY: the callback's first operation involving `exports` is
+    // `env.root(exports)`, which installs a persistent traced handle before
+    // addon registration can allocate or collect. The returned value is then
+    // reread from one of those persistent handles after registration's final
+    // allocation. Neither raw value nor the temporary context escapes this
+    // synchronous registration turn.
+    unsafe { scope.with_ffi_value(exports, register_addon) }
 }
 
 /// Capture the deprecated constructor-based registration callback while the

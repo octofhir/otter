@@ -46,6 +46,8 @@ pub fn path_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
     _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    _module: Local<'scope>,
+    _require: Local<'scope>,
 ) -> Result<Local<'scope>, NativeError> {
     let posix = scope.object()?;
     for (name, len, f) in PATH_METHODS {

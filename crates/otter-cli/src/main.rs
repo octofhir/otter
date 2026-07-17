@@ -33,15 +33,15 @@ use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_pm_lockfile::Lockfile;
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest, PackageType};
-use otter_runtime::{
-    CapabilitySet, DiagnosticCode, JitSelection, OtterError, Permission, SourceInput,
-};
+use otter_runtime::{CapabilitySet, DiagnosticCode, OtterError, Permission, SourceInput};
 use otter_web::WebApiBuilderExt;
 use semver::{Version, VersionReq};
 
 mod error_render;
+mod execution_config;
 
 use error_render::emit_error;
+use execution_config::{CliExecutionConfig, CliJitTier};
 
 /// Otter — JS/TS engine (foundation phase).
 #[derive(Debug, Parser)]
@@ -96,6 +96,10 @@ struct Cli {
         global = true,
     )]
     trace: Option<String>,
+
+    /// Select the execution tiers used by runtime-backed commands.
+    #[arg(long = "jit-tier", value_enum, global = true)]
+    jit_tier: Option<CliJitTier>,
 
     /// Capability flags (Deno-style).
     #[command(flatten)]
@@ -479,8 +483,7 @@ async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse();
     startup_timer.mark("parse_args");
-    install_cli_trace_target(cli.trace.clone());
-    install_cli_timeout_secs(cli.timeout_secs);
+    let execution = CliExecutionConfig::new(cli.timeout_secs, cli.trace.clone(), cli.jit_tier);
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();
@@ -503,7 +506,7 @@ async fn main() -> ExitCode {
             (None, Some(source)) => (source, true),
             _ => unreachable!("checked conflicting inline eval modes above"),
         };
-        let result = run_eval(source, print, json, &caps, &startup_timer).await;
+        let result = run_eval(source, print, json, &caps, &execution, &startup_timer).await;
         startup_timer.finish();
         return exit_from_result(result, json);
     }
@@ -511,7 +514,15 @@ async fn main() -> ExitCode {
     let result = match (cli.command, cli.args.first().cloned()) {
         // Explicit subcommand.
         (Some(Command::Run(args)), _) => {
-            run_target(args, json, dump_mode.as_deref(), &caps, &startup_timer).await
+            run_target(
+                args,
+                json,
+                dump_mode.as_deref(),
+                &caps,
+                &execution,
+                &startup_timer,
+            )
+            .await
         }
         (Some(Command::Install(args)), _) => run_pm_install(&args.root, json).await,
         (Some(Command::Add(args)), _) => run_pm_add(args, json).await,
@@ -519,11 +530,21 @@ async fn main() -> ExitCode {
         (Some(Command::Outdated(args)), _) => run_pm_outdated(args, json).await,
         (Some(Command::Init(args)), _) => run_pm_init(args, json).await,
         (Some(Command::Eval(args)), _) => {
-            run_eval(&args.expression, args.print, json, &caps, &startup_timer).await
+            run_eval(
+                &args.expression,
+                args.print,
+                json,
+                &caps,
+                &execution,
+                &startup_timer,
+            )
+            .await
         }
-        (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps).await,
-        (Some(Command::Test(args)), _) => run_node_tests(args, json, &caps, &startup_timer).await,
-        (Some(Command::Info), _) => run_info(json),
+        (Some(Command::Check(args)), _) => run_check(&args.file, json, &caps, &execution).await,
+        (Some(Command::Test(args)), _) => {
+            run_node_tests(args, json, &caps, &execution, &startup_timer).await
+        }
+        (Some(Command::Info), _) => run_info(json, &execution),
         // Shorthand: `otter <file> [args...]`, routed through
         // the same resolver/session path as `otter run`.
         (None, Some(positional)) => {
@@ -543,6 +564,7 @@ async fn main() -> ExitCode {
                 json,
                 dump_mode.as_deref(),
                 &caps,
+                &execution,
                 &startup_timer,
             )
             .await
@@ -601,6 +623,7 @@ async fn run_file(
     json: bool,
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
     cpu_profile: Option<&CpuProfileOptions>,
     max_heap_bytes: Option<u64>,
@@ -612,6 +635,7 @@ async fn run_file(
         json,
         dump_mode,
         caps,
+        execution,
         startup_timer,
         cpu_profile,
         max_heap_bytes,
@@ -627,6 +651,7 @@ async fn run_file_with_cwd(
     json: bool,
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
     cpu_profile: Option<&CpuProfileOptions>,
     max_heap_bytes: Option<u64>,
@@ -651,13 +676,14 @@ async fn run_file_with_cwd(
             process_cwd,
             json,
             caps,
+            execution,
             startup_timer,
             profile,
             max_heap_bytes,
         )
         .await;
     }
-    let mut builder = cli_otter_builder(caps)
+    let mut builder = cli_otter_builder(caps, execution)
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
     if let Some(bytes) = max_heap_bytes {
@@ -698,21 +724,19 @@ async fn run_file_with_cpu_profile(
     process_cwd: Option<&Path>,
     json: bool,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
     profile_options: &CpuProfileOptions,
     max_heap_bytes: Option<u64>,
 ) -> Result<ExitCode, OtterError> {
-    let mut builder = otter_runtime::Runtime::builder()
+    let builder = otter_runtime::Runtime::builder()
         .capabilities(caps.clone())
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
-        .jit_selection(cli_jit_selection())
         .process_argv(process_argv_for_file(path, args))
         .module_loader(cli_loader_config_for_entry(path).await);
-    if let Some(threshold) = cli_jit_osr_threshold() {
-        builder = builder.jit_osr_threshold(threshold);
-    }
+    let mut builder = execution.apply_runtime_builder(builder);
     if let Some(bytes) = max_heap_bytes {
         builder = builder.max_heap_bytes(bytes);
     }
@@ -975,6 +999,7 @@ async fn run_target(
     json: bool,
     dump_mode: Option<&str>,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
     let project_root = std::env::current_dir().map_err(|err| pm_config_error(err.to_string()))?;
@@ -1005,6 +1030,7 @@ async fn run_target(
                     None,
                     json,
                     caps,
+                    execution,
                     startup_timer,
                     max_heap_bytes,
                 )
@@ -1016,6 +1042,7 @@ async fn run_target(
                     json,
                     dump_mode,
                     caps,
+                    execution,
                     startup_timer,
                     cpu_profile.as_ref(),
                     max_heap_bytes,
@@ -1039,6 +1066,7 @@ async fn run_target(
                 &target_args,
                 json,
                 caps,
+                execution,
                 startup_timer,
                 cpu_profile.as_ref(),
             )
@@ -1051,6 +1079,7 @@ async fn run_target(
                 json,
                 dump_mode,
                 caps,
+                execution,
                 startup_timer,
                 cpu_profile.as_ref(),
                 max_heap_bytes,
@@ -1123,12 +1152,13 @@ async fn run_script_file_sequence(
     process_cwd: Option<&Path>,
     json: bool,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
     max_heap_bytes: Option<u64>,
 ) -> Result<ExitCode, OtterError> {
     debug_assert!(!paths.is_empty());
     let first = &paths[0];
-    let mut builder = cli_otter_builder(caps)
+    let mut builder = cli_otter_builder(caps, execution)
         .process_argv(process_argv_for_file_sequence(paths, args))
         .module_loader(cli_loader_config_for_entry(first).await);
     if let Some(bytes) = max_heap_bytes {
@@ -1331,6 +1361,7 @@ async fn run_package_script(
     args: &[String],
     json: bool,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
     cpu_profile: Option<&CpuProfileOptions>,
 ) -> Result<ExitCode, OtterError> {
@@ -1342,6 +1373,7 @@ async fn run_package_script(
         json,
         None,
         caps,
+        execution,
         startup_timer,
         cpu_profile,
         None,
@@ -1491,9 +1523,10 @@ async fn run_eval(
     print: bool,
     json: bool,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
-    let otter = cli_otter_builder(caps).build()?;
+    let otter = cli_otter_builder(caps, execution).build()?;
     startup_timer.mark("runtime_build");
     let result = otter.eval(source).await?;
     startup_timer.mark("runtime_eval");
@@ -1511,98 +1544,16 @@ async fn run_eval(
     Ok(ExitCode::from(result.exit_code()))
 }
 
-fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
-    let mut builder = otter_runtime::Otter::builder()
+fn cli_otter_builder(
+    caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
+) -> otter_runtime::OtterBuilder {
+    let builder = otter_runtime::Otter::builder()
         .capabilities(caps.clone())
         .with_node_apis()
         .with_otter_modules()
-        .with_web_apis()
-        .jit_selection(cli_jit_selection());
-    if let Some(threshold) = cli_jit_osr_threshold() {
-        builder = builder.jit_osr_threshold(threshold);
-    }
-    if let Some(secs) = cli_timeout_secs() {
-        builder = builder.timeout(std::time::Duration::from_secs(secs));
-    }
-    if let Some(target) = cli_trace_target() {
-        builder = builder.tracer_factory(Some(trace_factory_for_target(&target)));
-    }
-    builder
-}
-
-/// Translate legacy process knobs at the CLI boundary. Runtime and VM builders
-/// remain deterministic and use only their explicit structured configuration.
-fn cli_jit_selection() -> JitSelection {
-    if std::env::var("OTTER_JIT").as_deref() == Ok("0") {
-        JitSelection::InterpreterOnly
-    } else {
-        JitSelection::ProductionTiered
-    }
-}
-
-fn cli_jit_osr_threshold() -> Option<u32> {
-    std::env::var("OTTER_JIT_OSR_THRESHOLD")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|threshold| *threshold > 0)
-}
-
-/// Top-level `--timeout <secs>` installed by [`main`]. `None` keeps
-/// the runtime default; `Some(0)` disables the timeout
-/// (`Duration::ZERO` semantics in the runtime config).
-static CLI_TIMEOUT_SECS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
-
-fn install_cli_timeout_secs(secs: Option<u64>) {
-    let encoded = secs.and_then(|s| i64::try_from(s).ok()).unwrap_or(-1);
-    CLI_TIMEOUT_SECS.store(encoded, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn cli_timeout_secs() -> Option<u64> {
-    let raw = CLI_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
-    u64::try_from(raw).ok()
-}
-
-/// Top-level `--trace[=<path>]` target installed by [`main`].
-/// `None` disables tracing. `Some("-")` writes to stderr.
-static CLI_TRACE_TARGET: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-fn install_cli_trace_target(target: Option<String>) {
-    *CLI_TRACE_TARGET
-        .lock()
-        .expect("CLI trace target mutex poisoned") = target;
-}
-
-fn cli_trace_target() -> Option<String> {
-    CLI_TRACE_TARGET
-        .lock()
-        .expect("CLI trace target mutex poisoned")
-        .clone()
-}
-
-/// Build a [`otter_runtime::TracerFactory`] that emits the
-/// VM-level step trace to the chosen sink. `-` writes to stderr;
-/// any other string is treated as a file path that the factory
-/// opens (truncating any existing contents) on the isolate thread
-/// the first time the tracer is constructed.
-fn trace_factory_for_target(target: &str) -> otter_runtime::TracerFactory {
-    let target = target.to_string();
-    otter_runtime::TracerFactory::new(move || -> Box<dyn otter_runtime::inspect::StepTracer> {
-        let writer: Box<dyn io::Write> = if target == "-" {
-            Box::new(io::BufWriter::new(io::stderr()))
-        } else {
-            match std::fs::File::create(&target) {
-                Ok(file) => Box::new(io::BufWriter::new(file)),
-                Err(err) => {
-                    eprintln!(
-                        "warning: --trace cannot open {target}: {err}; falling back to stderr"
-                    );
-                    Box::new(io::BufWriter::new(io::stderr()))
-                }
-            }
-        };
-        Box::new(otter_runtime::inspect::WriterTracer::new(writer))
-    })
+        .with_web_apis();
+    execution.apply_otter_builder(builder)
 }
 
 async fn cli_loader_config_for_entry(path: &Path) -> otter_runtime::module_loader::LoaderConfig {
@@ -1705,8 +1656,9 @@ async fn run_check(
     path: &std::path::Path,
     json: bool,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
 ) -> Result<ExitCode, OtterError> {
-    let otter = cli_otter_builder(caps)
+    let otter = cli_otter_builder(caps, execution)
         .module_loader(cli_loader_config_for_entry(path).await)
         .build()?;
     otter.check_file(path).await?;
@@ -1720,6 +1672,7 @@ async fn run_node_tests(
     args: TestArgs,
     json: bool,
     caps: &CapabilitySet,
+    execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
     let files = discover_node_test_files(&args.paths)?;
@@ -1735,7 +1688,7 @@ async fn run_node_tests(
 
     let mut failed = false;
     for file in files {
-        let otter = cli_otter_builder(caps)
+        let otter = cli_otter_builder(caps, execution)
             .process_argv(process_argv_for_file(&file, &[]))
             .module_loader(cli_loader_config_for_entry(&file).await)
             .build()?;
@@ -2550,20 +2503,22 @@ fn pm_config_error(message: impl Into<String>) -> OtterError {
     }
 }
 
-fn run_info(json: bool) -> Result<ExitCode, OtterError> {
+fn run_info(json: bool, execution: &CliExecutionConfig) -> Result<ExitCode, OtterError> {
     if json {
         let info = serde_json::json!({
             "name": "otter",
             "version": env!("CARGO_PKG_VERSION"),
             "phase": "foundation",
-            "interpreter_only": true,
+            "jit_tier": execution.jit_tier_name(),
+            "interpreter_only": execution.interpreter_only(),
             "rust_edition": "2024",
         });
         println!("{}", serde_json::to_string(&info).unwrap());
     } else {
         println!(
-            "otter v{} (foundation, interpreter-only)",
-            env!("CARGO_PKG_VERSION")
+            "otter v{} (foundation, {})",
+            env!("CARGO_PKG_VERSION"),
+            execution.jit_tier_name(),
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -2572,6 +2527,15 @@ fn run_info(json: bool) -> Result<ExitCode, OtterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn run_check(
+        path: &Path,
+        json: bool,
+        caps: &CapabilitySet,
+    ) -> Result<ExitCode, OtterError> {
+        let execution = CliExecutionConfig::default();
+        super::run_check(path, json, caps, &execution).await
+    }
 
     #[test]
     fn top_level_eval_flag_parses_node_style() {
@@ -3080,6 +3044,7 @@ if (value !== 53) fail();
             false,
             None,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &startup_timer,
             None,
             None,
@@ -3111,6 +3076,7 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
             false,
             None,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &startup_timer,
             None,
             None,
@@ -3135,6 +3101,7 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
             false,
             None,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &startup_timer,
             None,
             None,
@@ -3181,6 +3148,7 @@ if (process.argv[3] !== "from-cli") fail();
             &["from-cli".to_string()],
             false,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &startup_timer,
             None,
         )
@@ -3228,6 +3196,7 @@ if (process.argv[3] !== "from-cli") fail();
             &["from-cli".to_string()],
             false,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &startup_timer,
             None,
         )
@@ -3249,6 +3218,7 @@ if (process.argv[3] !== "from-cli") fail();
             &[],
             false,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &CliStartupTimer::from_env(),
             None,
         )
@@ -3945,6 +3915,7 @@ export let value = inner;
             false,
             None,
             &CapabilitySet::default(),
+            &CliExecutionConfig::default(),
             &startup_timer,
             None,
             None,

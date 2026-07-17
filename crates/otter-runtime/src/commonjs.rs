@@ -23,9 +23,9 @@
 //!   [`NativeScope`] arena. Its cache, module record, exports, dependency
 //!   values, require closure, and wrapper stay collector-rewritten until the
 //!   result is published, and the arena is released on every exit.
-//! - Interpreter-facing namespace and native-addon installers keep the cache
-//!   on the traced iteration-anchor stack across their legacy callback
-//!   boundary. Their scoped ABI migration is a separate hard cut.
+//! - Hosted namespace and CommonJS-value installers run directly in the
+//!   loader's existing handle scope. Namespace cache publication and
+//!   `require.cache` publication happen before that scope closes.
 //! - Filesystem capabilities are checked before any module or package manifest
 //!   is read; native addons additionally pass through the configured loader's
 //!   FFI capability check.
@@ -68,48 +68,34 @@ pub(crate) struct CjsConfig {
 /// module name (diagnostics only). Pass `&[]` for a dependency-free shim.
 ///
 /// # Errors
-/// Returns a string on compile or runtime failure of the shim.
+/// Returns a native error on allocation, compile, or runtime failure.
 pub fn run_builtin_cjs_shim<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     name: &str,
     source: &str,
     deps: &[(&str, Local<'_>)],
-) -> Result<Local<'scope>, String> {
-    let exports = scope.bare_object().map_err(|error| error.to_string())?;
-    let module = scope.bare_object().map_err(|error| error.to_string())?;
-    scope
-        .set(module, "exports", exports)
-        .map_err(|error| error.to_string())?;
+) -> Result<Local<'scope>, NativeError> {
+    let exports = scope.bare_object()?;
+    let module = scope.bare_object()?;
+    scope.set(module, "exports", exports)?;
 
-    let id = scope.string(name).map_err(|error| error.to_string())?;
-    scope
-        .set(module, "id", id)
-        .map_err(|error| error.to_string())?;
+    let id = scope.string(name)?;
+    scope.set(module, "id", id)?;
     let loaded = scope.boolean(false);
-    scope
-        .set(module, "loaded", loaded)
-        .map_err(|error| error.to_string())?;
+    scope.set(module, "loaded", loaded)?;
 
     let require = make_shim_require(scope, deps)?;
-    let module_name = scope.string(name).map_err(|error| error.to_string())?;
-    let wrapper = scope
-        .commonjs_wrapper(name, source)
-        .map_err(|error| error.to_string())?;
-    scope
-        .call(
-            wrapper,
-            exports,
-            &[exports, require, module, module_name, module_name],
-        )
-        .map_err(|error| error.to_string())?;
+    let module_name = scope.string(name)?;
+    let wrapper = scope.commonjs_wrapper(name, source)?;
+    scope.call(
+        wrapper,
+        exports,
+        &[exports, require, module, module_name, module_name],
+    )?;
 
     let loaded = scope.boolean(true);
-    scope
-        .set(module, "loaded", loaded)
-        .map_err(|error| error.to_string())?;
-    scope
-        .get(module, "exports")
-        .map_err(|error| error.to_string())
+    scope.set(module, "loaded", loaded)?;
+    scope.get(module, "exports")
 }
 
 /// Build a `require` for a shim that resolves only the supplied dependencies.
@@ -118,12 +104,10 @@ pub fn run_builtin_cjs_shim<'scope>(
 fn make_shim_require<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     deps: &[(&str, Local<'_>)],
-) -> Result<Local<'scope>, String> {
-    let table = scope.bare_object().map_err(|error| error.to_string())?;
+) -> Result<Local<'scope>, NativeError> {
+    let table = scope.bare_object()?;
     for (specifier, value) in deps {
-        scope
-            .set(table, specifier, *value)
-            .map_err(|error| error.to_string())?;
+        scope.set(table, specifier, *value)?;
     }
     let closure = move |ctx: &mut NativeCtx<'_>,
                         args: &[Value],
@@ -142,9 +126,7 @@ fn make_shim_require<'scope>(
             )),
         }
     };
-    scope
-        .native_closure("require", 1, &[table], closure)
-        .map_err(|error| error.to_string())
+    scope.native_closure("require", 1, &[table], closure)
 }
 
 /// Resolve a builtin (hosted) module by specifier. Matches the bare specifier
@@ -272,49 +254,31 @@ pub(crate) fn cjs_load(
         if let Some(cached) = object::get(cache, ctx.heap(), &key) {
             return Ok(cached);
         }
-        if let Some(value_install) = hm.cjs_value() {
-            return ctx.scope(|mut scope| {
-                let cache = scope.value(Value::object(cache));
-                let value = value_install(&mut scope, &cfg.capabilities)
-                    .map_err(|error| runtime_type_error("require", error))?;
-                scope.set(cache, &key, value)?;
-                Ok(scope.finish(value))
-            });
-        }
-
-        // Hosted namespace installers still use the interpreter-facing builder
-        // ABI. Keep the cache rooted across that legacy boundary until the
-        // namespace ABI is migrated in its own hard cut.
-        let root_base = ctx.interp_mut().module_root_depth();
-        let cache_idx = ctx.interp_mut().push_module_root(Value::object(cache)) - 1;
-        let result = (|| {
-            let namespace = {
-                let interp = ctx.interp_mut();
-                match interp.host_module_env_cached(hm.specifier()) {
-                    Some(env) => env,
+        return ctx.scope(|mut scope| {
+            let cache = scope.value(Value::object(cache));
+            let value = if hm.shares_namespace_with_commonjs() {
+                match scope.cached_host_module_env(hm.specifier()) {
+                    Some(namespace) => namespace,
                     None => {
-                        let env = hm
-                            .install(interp, &cfg.capabilities, cfg.runtime_task_spawner.clone())
-                            .map_err(|error| runtime_type_error("require", error))?;
-                        interp.cache_host_module_env(Arc::from(hm.specifier()), env);
-                        env
+                        let namespace = (hm.commonjs_install())(
+                            &mut scope,
+                            &cfg.capabilities,
+                            cfg.runtime_task_spawner.clone(),
+                        )?;
+                        scope.cache_host_module_env(hm.specifier(), namespace)?;
+                        namespace
                     }
                 }
+            } else {
+                (hm.commonjs_install())(
+                    &mut scope,
+                    &cfg.capabilities,
+                    cfg.runtime_task_spawner.clone(),
+                )?
             };
-            let cache = ctx
-                .interp_mut()
-                .module_root(cache_idx)
-                .as_object()
-                .expect("require cache survives hosted module installation");
-            ctx.scope(|mut scope| {
-                let cache = scope.value(Value::object(cache));
-                let value = scope.value(Value::object(namespace));
-                scope.set(cache, &key, value)?;
-                Ok(scope.finish(value))
-            })
-        })();
-        ctx.interp_mut().pop_module_roots_to(root_base);
-        return result;
+            scope.set(cache, &key, value)?;
+            Ok(scope.finish(value))
+        });
     }
 
     // 2. File module.

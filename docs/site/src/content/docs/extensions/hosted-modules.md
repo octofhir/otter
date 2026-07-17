@@ -71,28 +71,32 @@ Rust futures.
 
 ## Bootstrap And Builders
 
-The production builder/spec flow handles namespace installation. Hosted
-modules should use runtime-owned specs such as `RuntimeNamespaceSpec` or the
-`HostedModuleCtx` / `RuntimeObjectBuilder` API when their surface needs
-capability-aware installation. Keep module registration centralized and easy
-to audit. If capability enforcement or bootstrap order is delicate, prefer
-explicit manual code over hiding control flow behind a macro.
+Hosted namespace installers receive the runtime's existing
+`RuntimeNativeScope`, capability set, and optional task spawner. They allocate
+the null-prototype namespace with `scope.bare_object()`, create static exports with
+`scope.native_method()` (or captured exports with `scope.native_closure()`),
+define them on the rooted namespace, and return its `RuntimeLocal`. The ESM
+loader installs, caches, and registers that namespace before closing the same
+scope; there is no second builder-owned root boundary.
 
-Module namespaces that need runtime capabilities install through
-`HostedModuleCtx::method` with `HostedNativeCall::dynamic(...)` closures that
-capture owned, `Send + Sync` host data such as a cloned `CapabilitySet`.
-Plain namespace exports should use `HostedModuleCtx::builtin_method`,
-`HostedModuleCtx::property`, and `HostedModuleCtx::readonly_property`.
 Receiver-backed resource objects should be created with
-`RuntimeObjectBuilder::from_host_data(ctx, data)` and accessed through
-`runtime_with_host_data` / `runtime_with_host_data_mut`. This is still a static
+`scope.host_object(data)`. Define their methods with rooted
+`scope.native_method()` values and access Rust-owned receiver state through
+`scope.with_host_data` / `scope.with_host_data_mut` while already in a native
+scope. Existing low-level callbacks may use `runtime_with_host_data` /
+`runtime_with_host_data_mut` through `RuntimeNativeCtx`. This remains a static
 registration path: the module specifier list is fixed, resolution is
 centralized, and no per-call metadata parser or hot-path dynamic registry is
 introduced.
 
+Modules whose only meaningful surface is a CommonJS `module.exports` value use
+`HostedModule::cjs_only`. They are intentionally absent from ESM hosted
+resolution instead of publishing an empty compatibility namespace.
+
 Macros are appropriate when they generate the same static specs and builder
-calls a manual implementation would write. If a module surface needs new macro
-ergonomics, add the macro over the builder API rather than bypassing it.
+calls a manual implementation would write. `lodge!` and `#[js_module]` emit the
+same scoped installer ABI; if a module surface needs new macro ergonomics, add
+it over `RuntimeNativeScope` rather than bypassing the rooted path.
 
 ## Active Modules
 

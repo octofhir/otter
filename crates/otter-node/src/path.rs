@@ -19,17 +19,25 @@
 //! # See also
 //! - Node v24 `lib/path.js` (the reference implementation this mirrors).
 
-use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
+use otter_runtime::{
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+};
 use otter_vm::{NativeCtx, NativeError, Value};
 
 use crate::{invalid_arg_type, string_value};
 
-/// ESM namespace install (methods only; `sep`/`delimiter` are on the CJS value).
-pub fn install_path_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
+/// Build the ESM namespace (methods only; `sep`/`delimiter` are on the CJS value).
+pub fn install_path_module<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
     for (name, len, f) in PATH_METHODS {
-        ctx.builtin_method(name, *len, *f)?;
+        let method = scope.native_method(name, *len, *f)?;
+        scope.set(namespace, name, method)?;
     }
-    Ok(())
+    Ok(namespace)
 }
 
 /// CommonJS export: the default (posix) `path` namespace with `.posix` and
@@ -37,60 +45,37 @@ pub fn install_path_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Resu
 pub fn path_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let posix = scope.object().map_err(|error| error.to_string())?;
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let posix = scope.object()?;
     for (name, len, f) in PATH_METHODS {
         scope.scope(|mut method_scope| {
-            let method = method_scope
-                .native_method(name, *len, *f)
-                .map_err(|error| error.to_string())?;
-            method_scope
-                .set(posix, name, method)
-                .map_err(|error| error.to_string())
+            let method = method_scope.native_method(name, *len, *f)?;
+            method_scope.set(posix, name, method)
         })?;
     }
-    let separator = scope.string("/").map_err(|error| error.to_string())?;
-    scope
-        .set(posix, "sep", separator)
-        .map_err(|error| error.to_string())?;
-    let delimiter = scope.string(":").map_err(|error| error.to_string())?;
-    scope
-        .set(posix, "delimiter", delimiter)
-        .map_err(|error| error.to_string())?;
+    let separator = scope.string("/")?;
+    scope.set(posix, "sep", separator)?;
+    let delimiter = scope.string(":")?;
+    scope.set(posix, "delimiter", delimiter)?;
 
-    let win32 = scope.object().map_err(|error| error.to_string())?;
+    let win32 = scope.object()?;
     for (name, len, f) in WIN32_METHODS {
         scope.scope(|mut method_scope| {
-            let method = method_scope
-                .native_method(name, *len, *f)
-                .map_err(|error| error.to_string())?;
-            method_scope
-                .set(win32, name, method)
-                .map_err(|error| error.to_string())
+            let method = method_scope.native_method(name, *len, *f)?;
+            method_scope.set(win32, name, method)
         })?;
     }
-    let separator = scope.string("\\").map_err(|error| error.to_string())?;
-    scope
-        .set(win32, "sep", separator)
-        .map_err(|error| error.to_string())?;
-    let delimiter = scope.string(";").map_err(|error| error.to_string())?;
-    scope
-        .set(win32, "delimiter", delimiter)
-        .map_err(|error| error.to_string())?;
+    let separator = scope.string("\\")?;
+    scope.set(win32, "sep", separator)?;
+    let delimiter = scope.string(";")?;
+    scope.set(win32, "delimiter", delimiter)?;
 
     // Cross-links: each flavor exposes both, like Node.
-    scope
-        .set(posix, "posix", posix)
-        .map_err(|error| error.to_string())?;
-    scope
-        .set(posix, "win32", win32)
-        .map_err(|error| error.to_string())?;
-    scope
-        .set(win32, "posix", posix)
-        .map_err(|error| error.to_string())?;
-    scope
-        .set(win32, "win32", win32)
-        .map_err(|error| error.to_string())?;
+    scope.set(posix, "posix", posix)?;
+    scope.set(posix, "win32", win32)?;
+    scope.set(win32, "posix", posix)?;
+    scope.set(win32, "win32", win32)?;
 
     // Default export is the posix implementation.
     Ok(posix)

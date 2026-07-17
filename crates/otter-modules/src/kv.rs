@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 
 use otter_runtime::CapabilitySet;
 use otter_runtime::{
-    RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
-    RuntimeValue as Value, runtime_this_object, runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeAttr as Attr, RuntimeHostObjectError, RuntimeJsObject as JsObject,
+    RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNativeScope as NativeScope, RuntimeValue as Value, runtime_this_object,
+    runtime_with_host_data, runtime_with_host_data_mut,
 };
 use serde_json::Value as JsonValue;
 
@@ -188,26 +189,30 @@ fn open_kv(
         KvStore::open(&path, capabilities)
             .map_err(|err| crate::type_error("openKv", err.to_string()))?
     };
-    let object = build_store_object(ctx, store)?;
-    Ok(Value::object(object))
+    ctx.scope(|mut scope| {
+        let object = build_store_object(&mut scope, store)?;
+        Ok(scope.finish(object))
+    })
 }
 
-fn build_store_object(ctx: &mut NativeCtx<'_>, store: KvStore) -> Result<JsObject, NativeError> {
-    let mut builder = ObjectBuilder::from_host_data(ctx, store)?;
-    builder
-        .builtin_method("set", 2, method_set)
-        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
-        .builtin_method("get", 1, method_get)
-        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
-        .builtin_method("has", 1, method_has)
-        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
-        .builtin_method("delete", 1, method_delete)
-        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
-        .builtin_method("keys", 0, method_keys)
-        .map_err(|err| crate::type_error("KvStore", err.to_string()))?
-        .builtin_method("clear", 0, method_clear)
-        .map_err(|err| crate::type_error("KvStore", err.to_string()))?;
-    Ok(builder.build())
+fn build_store_object<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    store: KvStore,
+) -> Result<Local<'scope>, NativeError> {
+    let object = scope.host_object(store)?;
+    let attrs = Attr::builtin_function().to_flags();
+    for (name, length, call) in [
+        ("set", 2, method_set as otter_runtime::RuntimeNativeFastFn),
+        ("get", 1, method_get),
+        ("has", 1, method_has),
+        ("delete", 1, method_delete),
+        ("keys", 0, method_keys),
+        ("clear", 0, method_clear),
+    ] {
+        let method = scope.native_method(name, length, call)?;
+        scope.define(object, name, method, attrs)?;
+    }
+    Ok(object)
 }
 
 fn store_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {

@@ -10,7 +10,7 @@
 //! - [`events_cjs_value`] - run the shim; export is the `EventEmitter`
 //!   constructor with the `once`/`on`/`getEventListeners`/… statics attached.
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
 
 /// Embedded `EventEmitter` implementation.
@@ -21,11 +21,7 @@ const SHIM: &str = include_str!("events.js");
 pub fn events_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:events", SHIM, &[])
-}
-
-/// ESM namespace install — CommonJS is the supported surface for now.
-pub fn install_events_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
 }

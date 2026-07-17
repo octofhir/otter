@@ -53,12 +53,20 @@ static MATH_SPEC: NamespaceSpec = runtime_namespace(
 );
 ```
 
-Builders are lifetime-bound to the current mutator turn:
+Dynamic native values are built inside a handle scope:
 
 ```rust,ignore
-let mut object = otter_runtime::RuntimeObjectBuilder::new(ctx)?;
-object.builtin_method("abs", 1, math_abs)?;
-let namespace = object.build();
+ctx.scope(|mut scope| {
+    let namespace = scope.object()?;
+    let abs = scope.native_method("abs", 1, math_abs)?;
+    scope.define(
+        namespace,
+        "abs",
+        abs,
+        otter_runtime::RuntimeAttr::builtin_function().to_flags(),
+    )?;
+    Ok::<_, otter_runtime::RuntimeNativeError>(scope.finish(namespace))
+})
 ```
 
 Do not store builders, contexts, `Value`, `Gc<T>`, `Local<'gc, T>`, or VM
@@ -110,11 +118,11 @@ pub enum RuntimeNativeCall {
 ```
 
 Spec-declared builtins and macro-generated builtins should use
-`runtime_method(...)`, `RuntimeObjectBuilder::builtin_method(...)`, or
-`runtime_native_static(...)` by default. Use dynamic closures only when the
-embedder needs captured Rust state, and keep traced JS captures explicit.
-Crate-internal VM helpers may still use local unchecked constructors for
-audited isolate-local payloads.
+`runtime_method(...)`, `RuntimeNativeScope::native_method(...)`, or
+`runtime_native_static(...)` by default. Use `scope.native_closure(...)` only
+when the embedder needs captured Rust state, and keep traced JS captures
+explicit. Crate-internal VM helpers may still use local unchecked constructors
+for audited isolate-local payloads.
 
 ## Current Migration
 
@@ -134,9 +142,9 @@ The first migrated namespaces are `Math`, `JSON`, `Atomics`, and
   specs;
 - `console` output is routed through an embedder-overridable
   `ConsoleSink`; the default sink writes with `println!` / `eprintln!`.
-- Active Web API classes use `runtime_class`, `runtime_constructor`,
-  `runtime_method`, and `RuntimeObjectBuilder::from_host_data` from
-  `otter_runtime`. Embedders can enable the active Web globals with
+- Active Web API classes use `runtime_class`, `runtime_constructor`, and
+  `runtime_method` from `otter_runtime`; scoped receiver-backed values use
+  `RuntimeNativeScope::host_object`. Embedders can enable the active Web globals with
   `otter_web::WebApiBuilderExt::with_web_apis`; the CLI enables that preset by
   default while keeping `otter-runtime` independent of `otter-web`.
 

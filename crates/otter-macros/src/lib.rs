@@ -351,16 +351,17 @@ pub fn js_module(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 /// for the naming theme. The macro emits:
 ///
-/// - `pub fn install_<name>_module(&mut HostedModuleCtx) -> Result<(), String>`
+/// - `pub fn install_<name>_module(scope, capabilities, task_spawner)
+///   -> Result<RuntimeLocal<'scope>, RuntimeNativeError>`
 /// - `pub static <UPPER>_HOSTED_MODULE: HostedModule`
 ///
 /// Two export shapes are supported. Plain exports are static
 /// `fn(ctx, args) -> Result<Value, NativeError>` pointers
-/// registered through `HostedModuleCtx::builtin_method`.
+/// installed through `RuntimeNativeScope::native_method`.
 /// Capability-aware exports (set `capabilities = true`) take a
 /// `&CapabilitySet` snapshot captured at install time and are
-/// registered through `HostedNativeCall::dynamic` with the
-/// snapshot in the closure capture.
+/// installed through `RuntimeNativeScope::native_closure` with
+/// the snapshot in the closure capture.
 ///
 /// ```rust,ignore
 /// otter_macros::lodge! {

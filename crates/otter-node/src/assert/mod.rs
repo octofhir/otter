@@ -17,7 +17,10 @@
 //! # See also
 //! - `assert/assert.js`, `assert/calltracker.js`, `assert/myers_diff.js`.
 
-use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
+use otter_runtime::{
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeError as NativeError,
+    RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+};
 
 /// Embedded `assert` surface.
 const ASSERT_JS: &str = include_str!("assert.js");
@@ -30,8 +33,9 @@ const MYERS_DIFF_JS: &str = include_str!("myers_diff.js");
 pub fn assert_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let util = crate::util::util_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let util = crate::util::util_cjs_value(scope, caps, runtime_task_spawner)?;
     let calltracker = otter_runtime::run_builtin_cjs_shim(
         scope,
         "internal/assert/calltracker",
@@ -60,29 +64,17 @@ pub fn assert_cjs_value<'scope>(
 pub fn assert_strict_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let assert = assert_cjs_value(scope, caps)?;
-    scope
-        .get(assert, "strict")
-        .map_err(|error| error.to_string())
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let assert = assert_cjs_value(scope, caps, runtime_task_spawner)?;
+    scope.get(assert, "strict")
 }
 
 /// CommonJS export for `internal/assert/myers_diff` (`--expose-internals`).
 pub fn myers_diff_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "internal/assert/myers_diff", MYERS_DIFF_JS, &[])
-}
-
-/// ESM namespace install — CommonJS is the supported surface for now.
-pub fn install_assert_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
-}
-
-/// ESM namespace install for the internal myers-diff module.
-pub fn install_myers_diff_module(
-    _ctx: &mut otter_runtime::HostedModuleCtx<'_>,
-) -> Result<(), String> {
-    Ok(())
 }

@@ -142,192 +142,29 @@ pub use surface::{
     RuntimeConstructorSpec, RuntimeHostObjectData, RuntimeHostObjectError, RuntimeJsObject,
     RuntimeJsString, RuntimeLocal, RuntimeMethodSpec, RuntimeNamespaceSpec, RuntimeNativeCall,
     RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeFastFn, RuntimeNativeFn, RuntimeNativeScope,
-    RuntimeNumberValue, RuntimeObjectBuilder, RuntimePropertySpec, RuntimeSurfaceError,
-    RuntimeValue, runtime_accessor, runtime_alloc_object, runtime_arg_to_string,
-    runtime_array_from_elements, runtime_class, runtime_constant, runtime_constructor,
-    runtime_getter, runtime_method, runtime_method_with_attrs, runtime_namespace,
-    runtime_native_dynamic, runtime_native_static, runtime_optional_arg_to_string,
-    runtime_property, runtime_set_property, runtime_string_value, runtime_this_object,
-    runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeNumberValue, RuntimePropertySpec, RuntimeSurfaceError, RuntimeValue, runtime_accessor,
+    runtime_alloc_object, runtime_arg_to_string, runtime_array_from_elements, runtime_class,
+    runtime_constant, runtime_constructor, runtime_getter, runtime_method,
+    runtime_method_with_attrs, runtime_namespace, runtime_native_dynamic, runtime_native_static,
+    runtime_optional_arg_to_string, runtime_property, runtime_set_property, runtime_string_value,
+    runtime_this_object, runtime_type_error, runtime_with_host_data, runtime_with_host_data_mut,
 };
 pub use worker::{
     OtterPool, OtterPoolBuilder, Worker, WorkerBuilder, WorkerId, WorkerShutdownReport,
 };
 
-/// Runtime-owned hosted module installation context.
-///
-/// Installers use this context to populate the hosted module namespace during a
-/// single runtime mutator turn. The context owns the namespace object builder
-/// and exposes configured capabilities for boundary checks.
-pub struct HostedModuleCtx<'rt> {
-    builder: RuntimeObjectBuilder<'rt>,
-    capabilities: &'rt CapabilitySet,
-    runtime_task_spawner: Option<RuntimeTaskSpawner>,
-}
-
-impl<'rt> HostedModuleCtx<'rt> {
-    fn new(
-        interp: &'rt mut Interpreter,
-        capabilities: &'rt CapabilitySet,
-        runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        Ok(Self {
-            builder: RuntimeObjectBuilder::new_in_interpreter(interp)?,
-            capabilities,
-            runtime_task_spawner,
-        })
-    }
-
-    /// Return the configured capability set for this runtime.
-    #[must_use]
-    pub const fn capabilities(&self) -> &CapabilitySet {
-        self.capabilities
-    }
-
-    /// Return the runtime event-loop task spawner, when this runtime has one.
-    #[must_use]
-    pub fn runtime_task_spawner(&self) -> Option<RuntimeTaskSpawner> {
-        self.runtime_task_spawner.clone()
-    }
-
-    /// Define a native method on the module namespace object.
-    ///
-    /// This is a temporary low-level method while the stable hosted module
-    /// builder API is being expanded. It routes through the same static VM
-    /// builder backend as other JS-visible surfaces.
-    pub fn method(
-        &mut self,
-        name: &'static str,
-        length: u8,
-        call: HostedNativeCall,
-    ) -> Result<&mut Self, String> {
-        self.builder
-            .method(
-                name,
-                length,
-                call.into_runtime(),
-                RuntimeAttr::builtin_function(),
-            )
-            .map_err(|err| err.to_string())?;
-        Ok(self)
-    }
-
-    /// Define a static builtin method on the module namespace object.
-    pub fn builtin_method(
-        &mut self,
-        name: &'static str,
-        length: u8,
-        call: RuntimeNativeFastFn,
-    ) -> Result<&mut Self, String> {
-        self.method(name, length, HostedNativeCall::static_fn(call))
-    }
-
-    /// Define an ordinary data property on the module namespace object.
-    pub fn property(
-        &mut self,
-        name: &'static str,
-        value: RuntimeValue,
-    ) -> Result<&mut Self, String> {
-        self.builder
-            .data_property(name, value)
-            .map_err(|err| err.to_string())?;
-        Ok(self)
-    }
-
-    /// Define a read-only data property on the module namespace object.
-    pub fn readonly_property(
-        &mut self,
-        name: &'static str,
-        value: RuntimeValue,
-    ) -> Result<&mut Self, String> {
-        self.builder
-            .readonly_property(name, value)
-            .map_err(|err| err.to_string())?;
-        Ok(self)
-    }
-
-    fn build(self) -> JsObject {
-        self.builder.build()
-    }
-}
-
-/// Runtime-owned hosted module installer callback.
-pub type HostedModuleBuilderInstall = for<'rt> fn(&mut HostedModuleCtx<'rt>) -> Result<(), String>;
-
-/// Opaque native call target for hosted module builders.
-///
-/// This is the runtime-facing call handle used by [`HostedModuleCtx`]. The
-/// current implementation still adapts to the native call backend, but the
-/// hosted module builder API no longer exposes that VM enum in its method
-/// signatures.
-#[derive(Debug, Clone)]
-pub struct HostedNativeCall {
-    raw: RuntimeNativeCall,
-}
-
-impl HostedNativeCall {
-    /// Build a hosted native call from a static function pointer.
-    #[must_use]
-    pub const fn static_fn(raw: RuntimeNativeFastFn) -> Self {
-        Self {
-            raw: RuntimeNativeCall::Static(raw),
-        }
-    }
-
-    /// Build a hosted native call from a captured-state dynamic native
-    /// function. Use this only where the hosted module needs immutable
-    /// runtime-owned captures such as capability snapshots.
-    #[must_use]
-    pub fn dynamic(raw: Arc<RuntimeNativeFn>) -> Self {
-        Self {
-            raw: RuntimeNativeCall::Dynamic(raw),
-        }
-    }
-
-    fn into_runtime(self) -> RuntimeNativeCall {
-        self.raw
-    }
-}
-
 /// Runtime-hosted module installer.
 ///
-/// This is an opaque runtime-owned handle. Product crates should construct it
-/// through runtime APIs instead of exposing VM installer details as part of
-/// their public surface.
-#[derive(Debug, Clone, Copy)]
-pub struct HostedModuleInstall {
-    raw: HostedModuleBuilderInstall,
-}
-
-impl HostedModuleInstall {
-    /// Build an installer from a runtime-owned hosted module context callback.
-    #[must_use]
-    pub const fn new(raw: HostedModuleBuilderInstall) -> Self {
-        Self { raw }
-    }
-
-    fn install(
-        self,
-        interp: &mut Interpreter,
-        capabilities: &CapabilitySet,
-        runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    ) -> Result<JsObject, String> {
-        let mut ctx = HostedModuleCtx::new(interp, capabilities, runtime_task_spawner)
-            .map_err(|err| format!("out of memory: {err}"))?;
-        (self.raw)(&mut ctx)?;
-        Ok(ctx.build())
-    }
-}
-
-/// Produces the full CommonJS export value for a hosted module — used when the
-/// export must be a callable (for example `assert`, invoked directly as
-/// `assert(cond)` as well as via `assert.strictEqual`). The object-namespace
-/// [`HostedModuleInstall`] path cannot represent a callable, so a builtin that
-/// needs one supplies this instead; `require()` returns its result verbatim.
-pub type HostedModuleValueInstall = for<'scope, 'rt> fn(
-    &mut otter_vm::NativeScope<'scope, 'rt>,
-    &CapabilitySet,
-) -> Result<otter_vm::Local<'scope>, String>;
+/// Installers allocate and publish one value inside the caller's existing
+/// native handle scope. Namespace and CommonJS value installers share this
+/// exact ABI, so neither loader opens a second root boundary or exposes raw VM
+/// handles to product crates.
+pub type HostedModuleInstall =
+    for<'scope, 'rt> fn(
+        &mut RuntimeNativeScope<'scope, 'rt>,
+        &CapabilitySet,
+        Option<RuntimeTaskSpawner>,
+    ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>;
 
 /// Load one CommonJS native addon (`.node`) after module resolution and the
 /// filesystem capability check have completed.
@@ -349,20 +186,20 @@ pub type CommonJsAddonLoader = for<'rt> fn(
 pub struct HostedModule {
     /// Module specifier, for example `otter:kv`.
     specifier: &'static str,
-    /// Namespace installer (object export). Also used as the ESM module env.
-    install: HostedModuleInstall,
+    /// Namespace installer (object export), when the module supports ESM.
+    install: Option<HostedModuleInstall>,
     /// Optional callable/value export used by `require()` in place of the
     /// object namespace. `None` => `require()` returns the namespace object.
-    cjs_value: Option<HostedModuleValueInstall>,
+    cjs_value: Option<HostedModuleInstall>,
 }
 
 impl HostedModule {
-    /// Create a hosted module spec from an opaque runtime installer.
+    /// Create a hosted module with one namespace shared by ESM and CommonJS.
     #[must_use]
     pub const fn new(specifier: &'static str, install: HostedModuleInstall) -> Self {
         Self {
             specifier,
-            install,
+            install: Some(install),
             cjs_value: None,
         }
     }
@@ -373,11 +210,25 @@ impl HostedModule {
     pub const fn new_with_cjs_value(
         specifier: &'static str,
         install: HostedModuleInstall,
-        cjs_value: HostedModuleValueInstall,
+        cjs_value: HostedModuleInstall,
     ) -> Self {
         Self {
             specifier,
-            install,
+            install: Some(install),
+            cjs_value: Some(cjs_value),
+        }
+    }
+
+    /// Create a hosted module that is available only through CommonJS.
+    ///
+    /// CJS-only rows are deliberately omitted from the ESM hosted-specifier
+    /// set, so an `import` cannot synthesize a fake namespace from a callable
+    /// or otherwise non-object `module.exports`.
+    #[must_use]
+    pub const fn cjs_only(specifier: &'static str, cjs_value: HostedModuleInstall) -> Self {
+        Self {
+            specifier,
+            install: None,
             cjs_value: Some(cjs_value),
         }
     }
@@ -388,20 +239,35 @@ impl HostedModule {
         self.specifier
     }
 
-    /// The optional CommonJS value-export installer, if any.
+    /// Whether this module exposes a namespace to the ESM loader.
     #[must_use]
-    pub(crate) const fn cjs_value(self) -> Option<HostedModuleValueInstall> {
-        self.cjs_value
+    pub const fn supports_esm(self) -> bool {
+        self.install.is_some()
     }
 
-    fn install(
-        self,
-        interp: &mut Interpreter,
-        capabilities: &CapabilitySet,
-        runtime_task_spawner: Option<RuntimeTaskSpawner>,
-    ) -> Result<JsObject, String> {
+    /// Namespace installer used by the ESM loader.
+    #[must_use]
+    pub(crate) const fn namespace_install(self) -> Option<HostedModuleInstall> {
         self.install
-            .install(interp, capabilities, runtime_task_spawner)
+    }
+
+    /// Installer used by CommonJS. A module without a dedicated CJS value
+    /// returns its ESM namespace object.
+    #[must_use]
+    pub(crate) const fn commonjs_install(self) -> HostedModuleInstall {
+        match self.cjs_value {
+            Some(install) => install,
+            None => match self.install {
+                Some(install) => install,
+                None => panic!("HostedModule requires at least one installer"),
+            },
+        }
+    }
+
+    /// Whether CommonJS uses the same namespace object as ESM.
+    #[must_use]
+    pub(crate) const fn shares_namespace_with_commonjs(self) -> bool {
+        self.install.is_some() && self.cjs_value.is_none()
     }
 }
 
@@ -1384,8 +1250,13 @@ impl RuntimeModuleLoaderState {
                 module_loader::LoaderConfig::new(base_dir)
             }
         };
-        cfg.hosted_specifiers
-            .extend(hosted_modules.iter().map(|m| m.specifier().to_string()));
+        cfg.hosted_specifiers.extend(
+            hosted_modules
+                .iter()
+                .copied()
+                .filter(|module| module.supports_esm())
+                .map(|module| module.specifier().to_string()),
+        );
         package_manager.apply_to_loader_config(&mut cfg);
         // Propagate the runtime's capability state so the loader
         // can reject `http:` / `https:` specifiers (and future
@@ -3723,33 +3594,32 @@ impl Runtime {
         // state); registering earlier would be wiped by that reset.
         self.register_resolved_exports(&linked.metadata);
         self.register_module_sources(&linked.module_sources);
-        self.module_records
-            .for_each_record(|url, _function_id, _env| {
-                // Self-loop edge: <entry>'s referrer is the entry's URL
-                // (the synthesized <entry> function carries empty
-                // module_url, so the dispatcher uses an empty string;
-                // we add edges keyed on both shapes).
-                module
-                    .module_resolutions
-                    .push(otter_bytecode::ModuleResolution {
-                        referrer: entry_url.clone(),
-                        specifier: url.to_string(),
-                        target: url.to_string(),
-                        deferred: false,
-                        dynamic: false,
-                        synthetic: true,
-                    });
-                module
-                    .module_resolutions
-                    .push(otter_bytecode::ModuleResolution {
-                        referrer: String::new(),
-                        specifier: url.to_string(),
-                        target: url.to_string(),
-                        deferred: false,
-                        dynamic: false,
-                        synthetic: true,
-                    });
-            });
+        self.module_records.for_each_record(|url, _function_id| {
+            // Self-loop edge: <entry>'s referrer is the entry's URL
+            // (the synthesized <entry> function carries empty
+            // module_url, so the dispatcher uses an empty string;
+            // we add edges keyed on both shapes).
+            module
+                .module_resolutions
+                .push(otter_bytecode::ModuleResolution {
+                    referrer: entry_url.clone(),
+                    specifier: url.to_string(),
+                    target: url.to_string(),
+                    deferred: false,
+                    dynamic: false,
+                    synthetic: true,
+                });
+            module
+                .module_resolutions
+                .push(otter_bytecode::ModuleResolution {
+                    referrer: String::new(),
+                    specifier: url.to_string(),
+                    target: url.to_string(),
+                    deferred: false,
+                    dynamic: false,
+                    synthetic: true,
+                });
+        });
 
         self.module_records.mark_evaluating();
         if let (Some(timings), Some(started)) = (timings.as_deref_mut(), runtime_link_started) {
@@ -5180,9 +5050,7 @@ mod tests {
             runtime.module_records.state(&dep_url),
             Some(module_records::RuntimeModuleRecordState::Evaluated)
         );
-        assert!(runtime.module_records.env(&entry_url).is_some());
         assert!(runtime.interp.module_env(&entry_url).is_some());
-        assert!(runtime.module_records.env(&dep_url).is_some());
         assert!(runtime.interp.module_env(&dep_url).is_some());
     }
 

@@ -10,7 +10,10 @@
 //! - Capability-bearing behavior remains in the Rust implementation that owns
 //!   the underlying global/module.
 
-use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
+use otter_runtime::{
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeError as NativeError,
+    RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+};
 
 const PERF_HOOKS_SHIM: &str = include_str!("perf_hooks.js");
 const V8_SHIM: &str = include_str!("v8.js");
@@ -45,7 +48,8 @@ module.exports = {
 pub fn internal_event_target_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "internal/event_target",
@@ -58,8 +62,9 @@ pub fn internal_event_target_cjs_value<'scope>(
 pub fn cluster_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let events = crate::events::events_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(scope, "node:cluster", CLUSTER_SHIM, &[("events", events)])
 }
 
@@ -67,7 +72,8 @@ pub fn cluster_cjs_value<'scope>(
 pub fn perf_hooks_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:perf_hooks", PERF_HOOKS_SHIM, &[])
 }
 
@@ -75,8 +81,9 @@ pub fn perf_hooks_cjs_value<'scope>(
 pub fn v8_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(scope, "node:v8", V8_SHIM, &[("buffer", buffer)])
 }
 
@@ -84,7 +91,8 @@ pub fn v8_cjs_value<'scope>(
 pub fn module_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:module", MODULE_SHIM, &[])
 }
 
@@ -92,10 +100,11 @@ pub fn module_cjs_value<'scope>(
 pub fn process_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     scope
         .global("process")
-        .ok_or_else(|| "process global is not installed".to_string())
+        .ok_or_else(|| crate::type_error("process", "process global is not installed"))
 }
 
 /// `internal/util` — the `--expose-internals` subset (sleep,
@@ -103,7 +112,8 @@ pub fn process_cjs_value<'scope>(
 pub fn internal_util_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "internal/util", INTERNAL_UTIL_SHIM, &[])
 }
 
@@ -111,7 +121,8 @@ pub fn internal_util_cjs_value<'scope>(
 pub fn vm_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:vm", VM_SHIM, &[])
 }
 
@@ -119,11 +130,7 @@ pub fn vm_cjs_value<'scope>(
 pub fn internal_url_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "internal/url", INTERNAL_URL_SHIM, &[])
-}
-
-/// ESM namespace install — CommonJS is the supported surface for now.
-pub fn install_noop(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
 }

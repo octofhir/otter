@@ -7,8 +7,8 @@
 
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeValue as Value,
-    runtime_arg_to_string,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+    RuntimeValue as Value, runtime_arg_to_string,
 };
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 
@@ -18,10 +18,11 @@ const SHIM: &str = include_str!("crypto.js");
 pub fn crypto_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     let native = native_value(scope)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
-    let events = crate::events::events_cjs_value(scope, caps)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
+    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:crypto",
@@ -34,21 +35,12 @@ pub fn crypto_cjs_value<'scope>(
     )
 }
 
-/// ESM namespace install — CommonJS is the supported surface.
-pub fn install_crypto_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
-}
-
-fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'scope>, String> {
-    let object = scope.object().map_err(|error| error.to_string())?;
+fn native_value<'scope>(scope: &mut NativeScope<'scope, '_>) -> Result<Local<'scope>, NativeError> {
+    let object = scope.object()?;
     macro_rules! m {
         ($name:literal, $len:expr, $f:ident) => {
-            let method = scope
-                .native_method($name, $len, $f)
-                .map_err(|error| error.to_string())?;
-            scope
-                .set(object, $name, method)
-                .map_err(|error| error.to_string())?;
+            let method = scope.native_method($name, $len, $f)?;
+            scope.set(object, $name, method)?;
         };
     }
 

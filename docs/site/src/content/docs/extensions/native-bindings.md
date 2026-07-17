@@ -23,16 +23,18 @@ The current safe path is:
 
 Specs/builders expose functions, classes, namespaces, and accessors.
 Production builtins should use runtime-owned helpers such as
-`runtime_method(...)`, `RuntimeObjectBuilder::builtin_method(...)`, or
+`runtime_method(...)`, `RuntimeNativeScope::native_method(...)`, or
 `runtime_native_static(...)` by default. Dynamic closures are reserved for
 embedder cases that need captured Rust state and can still trace explicit JS
 captures.
 
-Hosted module namespace installers should use `HostedModuleCtx` and attach
-long-lived Rust state to receiver objects through the runtime host-object
-primitive. Namespace-level closures may capture owned configuration such as a
-cloned capability set, but per-instance state should live on the JS object and
-be reached through `runtime_this_object(...)` plus
+Hosted module namespace installers receive the caller's
+`RuntimeNativeScope`, capability set, and optional task spawner. Build and
+return the namespace as a `RuntimeLocal`; create receiver-backed resources with
+`scope.host_object(data)`. Namespace-level closures may capture owned
+configuration such as a cloned capability set, but per-instance state should
+live on the JS object and be reached through `scope.with_host_data(_mut)` or,
+in a low-level callback, `runtime_this_object(...)` plus
 `runtime_with_host_data(_mut)`. Closures must not capture
 `RuntimeCx`, `NativeCtx`, `Value`, `Gc<T>`, `Local<'gc, T>`, frames, or handle
 scopes.

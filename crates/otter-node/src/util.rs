@@ -14,7 +14,9 @@
 //! # See also
 //! - [`otter_vm::runtime_cx`] — runtime-turn and rooted native APIs.
 
-use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
+use otter_runtime::{
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+};
 use otter_vm::binary::TypedArrayKind;
 use otter_vm::{Attr, NativeCtx, NativeError, Value};
 
@@ -141,32 +143,23 @@ fn float16_is_nan(bits: u16) -> bool {
 pub fn util_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     if let Some(cached) = scope.cached_host_module_env(UTIL_EXPORT_CACHE_KEY) {
         return Ok(cached);
     }
     let export = otter_runtime::run_builtin_cjs_shim(scope, "node:util", SHIM, &[])?;
-    let callsites = scope
-        .native_method("captureCallSites", 2, capture_call_sites)
-        .map_err(|error| error.to_string())?;
-    let typed_arrays_equal = scope
-        .native_method("typedArraysEqual", 2, typed_arrays_equal)
-        .map_err(|error| error.to_string())?;
+    let callsites = scope.native_method("captureCallSites", 2, capture_call_sites)?;
+    let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
     let flags = Attr {
         writable: false,
         enumerable: false,
         configurable: false,
     }
     .to_flags();
-    scope
-        .define(export, "__otterCaptureCallSites", callsites, flags)
-        .map_err(|error| error.to_string())?;
-    scope
-        .define(export, "__otterTypedArraysEqual", typed_arrays_equal, flags)
-        .map_err(|error| error.to_string())?;
-    scope
-        .cache_host_module_env(UTIL_EXPORT_CACHE_KEY, export)
-        .map_err(|error| error.to_string())?;
+    scope.define(export, "__otterCaptureCallSites", callsites, flags)?;
+    scope.define(export, "__otterTypedArraysEqual", typed_arrays_equal, flags)?;
+    scope.cache_host_module_env(UTIL_EXPORT_CACHE_KEY, export)?;
     Ok(export)
 }
 
@@ -175,12 +168,8 @@ pub fn util_cjs_value<'scope>(
 pub fn util_types_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let util = util_cjs_value(scope, caps)?;
-    scope.get(util, "types").map_err(|error| error.to_string())
-}
-
-/// ESM namespace install — CommonJS is the supported surface for now.
-pub fn install_util_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let util = util_cjs_value(scope, caps, runtime_task_spawner)?;
+    scope.get(util, "types")
 }

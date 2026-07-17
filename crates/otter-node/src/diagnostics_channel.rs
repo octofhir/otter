@@ -1,6 +1,6 @@
 //! `node:diagnostics_channel` hosted module — named pub/sub channels (JS shim).
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("diagnostics_channel.js");
@@ -9,13 +9,7 @@ const SHIM: &str = include_str!("diagnostics_channel.js");
 pub fn diagnostics_channel_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:diagnostics_channel", SHIM, &[])
-}
-
-/// ESM namespace install — CommonJS is the supported surface for now.
-pub fn install_diagnostics_channel_module(
-    _ctx: &mut otter_runtime::HostedModuleCtx<'_>,
-) -> Result<(), String> {
-    Ok(())
 }

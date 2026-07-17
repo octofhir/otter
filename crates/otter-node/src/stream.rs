@@ -5,7 +5,7 @@
 //! `events` and `buffer` shims (injected as dependencies). It is the keystone
 //! dependency of fs/net/http/zlib/readline.
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("stream.js");
@@ -18,9 +18,10 @@ const PROMISES_SHIM: &str = include_str!("stream_promises.js");
 pub fn stream_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let events = crate::events::events_cjs_value(scope, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner.clone())?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:stream",
@@ -33,7 +34,8 @@ pub fn stream_cjs_value<'scope>(
 pub fn stream_web_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:stream/web", WEB_SHIM, &[])
 }
 
@@ -41,8 +43,9 @@ pub fn stream_web_cjs_value<'scope>(
 pub fn stream_consumers_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:stream/consumers",
@@ -55,17 +58,13 @@ pub fn stream_consumers_cjs_value<'scope>(
 pub fn stream_promises_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let stream = stream_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let stream = stream_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:stream/promises",
         PROMISES_SHIM,
         &[("stream", stream)],
     )
-}
-
-/// ESM namespace install — CommonJS is the supported surface for now.
-pub fn install_stream_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
 }

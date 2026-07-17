@@ -8,15 +8,12 @@
 //!
 //! # Contents
 //! - [`node_test_cjs_value`] - build `assert`, then run the shim with it.
-//! - [`install_node_test_module`] - ESM namespace install (delegates to the CJS
-//!   value's own keys would require an interpreter; ESM consumers are rare for
-//!   the test runner, so the namespace is left empty for now).
 //!
 //! # Invariants
 //! - A failing test sets `process.exitCode = 1`; the conformance harness reads
 //!   the process exit code, so all-pass leaves it at 0.
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
 
 /// Embedded `node:test` runner implementation.
@@ -26,14 +23,8 @@ const SHIM: &str = include_str!("node_test.js");
 pub fn node_test_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let assert_value = crate::assert::assert_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let assert_value = crate::assert::assert_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(scope, "node:test", SHIM, &[("assert", assert_value)])
-}
-
-/// ESM namespace install — no eager members; CommonJS is the supported surface.
-pub fn install_node_test_module(
-    _ctx: &mut otter_runtime::HostedModuleCtx<'_>,
-) -> Result<(), String> {
-    Ok(())
 }

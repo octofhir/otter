@@ -29,10 +29,10 @@ use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::TokioIo;
 use otter_runtime::{
-    CapabilitySet, HostedModule, HostedModuleInstall, HostedNativeCall, OtterError, Runtime,
-    RuntimeAttr as Attr, RuntimeGlobalInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeLocal,
-    RuntimeNativeCall, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeFn, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
+    CapabilitySet, HostedModule, OtterError, Runtime, RuntimeAttr as Attr, RuntimeGlobalInstaller,
+    RuntimeKeepAlive, RuntimeLiveness, RuntimeLocal, RuntimeNativeCall,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
+    RuntimeNativeScope, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
     RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
 };
 use smallvec::SmallVec;
@@ -74,17 +74,26 @@ impl ReplyRegistry {
 }
 
 /// Static hosted module row for `import { serve } from "otter"`.
-pub static OTTER_HOSTED_MODULE: HostedModule =
-    HostedModule::new("otter", HostedModuleInstall::new(install_otter_module));
+pub static OTTER_HOSTED_MODULE: HostedModule = HostedModule::new("otter", install_otter_module);
 
 /// Install the bare `"otter"` hosted module.
-pub fn install_otter_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    let capabilities = ctx.capabilities().clone();
-    let task_spawner = ctx.runtime_task_spawner();
-    let serve_call: Arc<RuntimeNativeFn> =
-        Arc::new(move |ctx, args, _captures| serve(ctx, args, &capabilities, task_spawner.clone()));
-    ctx.method("serve", 1, HostedNativeCall::dynamic(serve_call))?;
-    Ok(())
+pub fn install_otter_module<'scope, 'rt>(
+    scope: &mut RuntimeNativeScope<'scope, 'rt>,
+    capabilities: &CapabilitySet,
+    task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<RuntimeLocal<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
+    let capabilities = capabilities.clone();
+    let serve_call = scope.native_closure("serve", 1, &[], move |ctx, args, _captures| {
+        serve(ctx, args, &capabilities, task_spawner.clone())
+    })?;
+    scope.define(
+        namespace,
+        "serve",
+        serve_call,
+        Attr::builtin_function().to_flags(),
+    )?;
+    Ok(namespace)
 }
 
 /// Installer for the global `Otter` namespace.

@@ -16,10 +16,9 @@
 //!   `Unresolved → Resolved → Compiled → Instantiated → Evaluating →
 //!   Evaluated|Errored`. The transition methods enforce that ordering;
 //!   skipping a phase or going backwards is a programmer bug.
-//! - The VM module-env registry is populated from these records, not from
-//!   ad-hoc allocations elsewhere.
-//! - Records are runtime-owned and never expose raw VM handles through
-//!   public embedding APIs.
+//! - The VM module-env registry is the sole owner/root of allocated
+//!   environments. Runtime records contain lifecycle metadata only and never
+//!   retain raw VM handles.
 //! - Cycle support: a module that the loader has already started
 //!   instantiating is in [`RuntimeModuleRecordState::Instantiated`] (or
 //!   later) by the time a back-edge revisits it. The host treats the
@@ -32,11 +31,9 @@
 //! - <https://tc39.es/ecma262/#sec-cyclic-module-records>
 //! - <https://tc39.es/ecma262/#sec-InnerModuleEvaluation>
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
 use otter_bytecode::ModuleInit;
-use otter_vm::{Interpreter, JsObject};
+use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, NativeError};
+use std::collections::BTreeMap;
 
 use crate::{CapabilitySet, HostedModule, OtterError, RuntimeTaskSpawner};
 
@@ -81,8 +78,6 @@ pub(crate) enum RuntimeModuleRecordState {
 pub(crate) struct RuntimeModuleRecord {
     /// Function id of this module's `<module-init>` inside linked bytecode.
     pub(crate) function_id: u32,
-    /// Allocated module namespace/environment object.
-    pub(crate) env: JsObject,
     /// Current lifecycle state.
     pub(crate) state: RuntimeModuleRecordState,
 }
@@ -105,8 +100,9 @@ impl RuntimeModuleRecords {
     /// authoritative either way.
     ///
     /// This also resets and repopulates the VM registry used by
-    /// `Op::ImportNamespace`, so the VM reads the environment
-    /// objects owned by these records during evaluation.
+    /// `Op::ImportNamespace`. Every allocation, hosted installer, cache
+    /// publication, and registry publication runs in one native handle scope;
+    /// after registration the VM registry is the environment's sole root.
     pub(crate) fn allocate_for_module_inits(
         &mut self,
         interp: &mut Interpreter,
@@ -117,47 +113,62 @@ impl RuntimeModuleRecords {
     ) -> Result<(), OtterError> {
         self.records.clear();
         interp.reset_module_state();
-        for init in module_inits {
-            let env = if let Some(hosted) = hosted_modules
-                .iter()
-                .find(|hosted| hosted.specifier() == init.url)
-            {
-                // One namespace per specifier per isolate: the installer's
-                // side effects (opening host resources, spawning tasks) must
-                // run once, and the CommonJS loader shares the same cache so
-                // `import` and `require` of one builtin observe the identical
-                // object.
-                match interp.host_module_env_cached(init.url.as_str()) {
-                    Some(env) => env,
-                    None => {
-                        let env = hosted
-                            .install(interp, capabilities, runtime_task_spawner.clone())
-                            .map_err(|message| OtterError::HostedModule {
-                                specifier: init.url.clone(),
-                                message,
-                            })?;
-                        interp.cache_host_module_env(Arc::from(init.url.as_str()), env);
-                        env
-                    }
+        let records = &mut self.records;
+        NativeCtx::with_host_context(interp, NativeCallInfo::default_call(), None, |ctx| {
+            ctx.scope(|mut scope| {
+                for init in module_inits {
+                    let env = if let Some(hosted) = hosted_modules
+                        .iter()
+                        .copied()
+                        .find(|hosted| hosted.specifier() == init.url)
+                    {
+                        // One namespace per specifier per isolate: the
+                        // installer's side effects must run once, and a
+                        // namespace-only CommonJS load shares this object.
+                        match scope.cached_host_module_env(init.url.as_str()) {
+                            Some(env) => env,
+                            None => {
+                                let install = hosted.namespace_install().ok_or_else(|| {
+                                    OtterError::HostedModule {
+                                        specifier: init.url.clone(),
+                                        message: "module does not expose an ESM namespace"
+                                            .to_string(),
+                                    }
+                                })?;
+                                let env =
+                                    install(&mut scope, capabilities, runtime_task_spawner.clone())
+                                        .map_err(|error| OtterError::HostedModule {
+                                            specifier: init.url.clone(),
+                                            message: error.to_string(),
+                                        })?;
+                                scope
+                                    .cache_host_module_env(init.url.as_str(), env)
+                                    .map_err(|error| OtterError::HostedModule {
+                                        specifier: init.url.clone(),
+                                        message: error.to_string(),
+                                    })?;
+                                env
+                            }
+                        }
+                    } else {
+                        scope.bare_object().map_err(module_allocation_error)?
+                    };
+                    scope
+                        .register_module_env(init.url.as_str(), env)
+                        .map_err(module_allocation_error)?;
+                    // The graph load + linker pipeline has already done
+                    // resolve + compile + linking by the time we get here.
+                    records.insert(
+                        init.url.clone(),
+                        RuntimeModuleRecord {
+                            function_id: init.function_id,
+                            state: RuntimeModuleRecordState::Instantiated,
+                        },
+                    );
                 }
-            } else {
-                interp.alloc_host_object_with_roots(&[], &[])?
-            };
-            interp.register_module_env(Arc::from(init.url.as_str()), env);
-            // The graph load + linker pipeline has already done
-            // resolve + compile + linking by the time we get
-            // here, so each record advances directly into
-            // `Instantiated` ready for evaluation.
-            self.records.insert(
-                init.url.clone(),
-                RuntimeModuleRecord {
-                    function_id: init.function_id,
-                    env,
-                    state: RuntimeModuleRecordState::Instantiated,
-                },
-            );
-        }
-        Ok(())
+                Ok(())
+            })
+        })
     }
 
     /// Mark all instantiated records as evaluating. Called once
@@ -186,9 +197,9 @@ impl RuntimeModuleRecords {
     }
 
     /// Visit allocated records in deterministic URL order.
-    pub(crate) fn for_each_record(&self, mut f: impl FnMut(&str, u32, JsObject)) {
+    pub(crate) fn for_each_record(&self, mut f: impl FnMut(&str, u32)) {
         for (url, record) in &self.records {
-            f(url, record.function_id, record.env);
+            f(url, record.function_id);
         }
     }
 
@@ -201,10 +212,22 @@ impl RuntimeModuleRecords {
     pub(crate) fn state(&self, url: &str) -> Option<RuntimeModuleRecordState> {
         self.records.get(url).map(|record| record.state)
     }
+}
 
-    #[cfg(test)]
-    pub(crate) fn env(&self, url: &str) -> Option<JsObject> {
-        self.records.get(url).map(|record| record.env)
+fn module_allocation_error(error: NativeError) -> OtterError {
+    match error {
+        NativeError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+            ..
+        } => OtterError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        error => OtterError::Internal {
+            code: "MODULE_ENV_INSTALL".to_string(),
+            message: error.to_string(),
+        },
     }
 }
 

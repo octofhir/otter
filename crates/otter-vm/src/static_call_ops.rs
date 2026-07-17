@@ -13,6 +13,9 @@
 //!   supported static-call opcodes.
 //! - Variadic argument operands are executable operands, not bytecode DTO
 //!   vectors cloned per dispatch.
+//! - Result objects that remain live across iterator protocol calls, callback
+//!   re-entry, coercion, or allocation are held in canonical scope handles;
+//!   builders never continue mutating a copied pre-collection receiver.
 //!
 //! # See also
 //! - [`crate::executable`]
@@ -862,73 +865,117 @@ impl Interpreter {
                             .into(),
                     ));
                 }
-                // §20.1.2.7 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
-                let object_proto = self.constructor_prototype_value("Object").ok();
-                let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
-                if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
-                    object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
-                }
+                self.with_handle_scope(|interp, scope| {
+                    let iterable = interp.scoped_value(scope, iter);
+                    // §20.1.2.7 step 2 — OrdinaryObjectCreate(%Object.prototype%).
+                    let result = interp.scoped_object(scope)?;
+                    let (iterator, next_method) = interp.get_iterator_sync(
+                        stack,
+                        context,
+                        &interp.escape_scoped(iterable),
+                    )?;
+                    let iterator = interp.scoped_value(scope, iterator);
+                    let next_method = interp.scoped_value(scope, next_method);
 
-                let (iterator, next_method) = self.get_iterator_sync(stack, context, &iter)?;
+                    loop {
+                        let has_entry = interp.with_handle_scope(
+                            |interp, item_scope| -> Result<bool, VmError> {
+                                // IteratorStepValue abrupt completions propagate directly:
+                                // IteratorClose is reserved for abrupt work performed after a
+                                // successful step by AddEntriesFromIterable.
+                                let stepped = interp.iterator_step_sync(
+                                    stack,
+                                    context,
+                                    &interp.escape_scoped(iterator),
+                                    &interp.escape_scoped(next_method),
+                                )?;
+                                let Some(entry) = stepped else {
+                                    return Ok(false);
+                                };
+                                let entry = interp.scoped_value(item_scope, entry);
 
-                loop {
-                    let stepped =
-                        self.iterator_step_sync(stack, context, &iterator, &next_method)?;
-                    let Some(entry) = stepped else {
-                        break;
-                    };
+                                if !interp.escape_scoped(entry).is_object_type() {
+                                    let err = interp.err_type(
+                                        ("Object.fromEntries: iterator value is not an entry object"
+                                            .to_string())
+                                        .into(),
+                                    );
+                                    return close_scoped_iterator_preserving_abrupt(
+                                        interp, item_scope, stack, context, iterator, err,
+                                    );
+                                }
 
-                    if !entry.is_object_type() {
-                        let _ = self.iterator_close_sync(stack, context, &iterator);
-                        return Err(self.err_type(
-                            ("Object.fromEntries: iterator value is not an entry object"
-                                .to_string())
-                            .into(),
-                        ));
+                                let key = match read_indexed_entry(
+                                    interp, item_scope, stack, context, entry, "0",
+                                ) {
+                                    Ok(key) => interp.scoped_value(item_scope, key),
+                                    Err(err) => {
+                                        return close_scoped_iterator_preserving_abrupt(
+                                            interp, item_scope, stack, context, iterator, err,
+                                        );
+                                    }
+                                };
+                                let value = match read_indexed_entry(
+                                    interp, item_scope, stack, context, entry, "1",
+                                ) {
+                                    Ok(value) => interp.scoped_value(item_scope, value),
+                                    Err(err) => {
+                                        return close_scoped_iterator_preserving_abrupt(
+                                            interp, item_scope, stack, context, iterator, err,
+                                        );
+                                    }
+                                };
+
+                                let key = match interp.to_property_key_sync(
+                                    stack,
+                                    context,
+                                    interp.escape_scoped(key),
+                                ) {
+                                    Ok(key) => key,
+                                    Err(err) => {
+                                        return close_scoped_iterator_preserving_abrupt(
+                                            interp, item_scope, stack, context, iterator, err,
+                                        );
+                                    }
+                                };
+                                let define = match key {
+                                    VmPropertyKey::Symbol(symbol) => {
+                                        // The symbol itself is GC-managed; park it before the
+                                        // descriptor write can allocate or collect.
+                                        let key =
+                                            interp.scoped_value(item_scope, Value::symbol(symbol));
+                                        interp.scoped_define_symbol(
+                                            item_scope,
+                                            result,
+                                            key,
+                                            value,
+                                            object::PropertyFlags::data_default(),
+                                        )
+                                    }
+                                    key => interp.scoped_define_data(
+                                        item_scope,
+                                        result,
+                                        key.string_name()
+                                            .expect("non-symbol property key has string spelling"),
+                                        value,
+                                        object::PropertyFlags::data_default(),
+                                    ),
+                                };
+                                if let Err(err) = define {
+                                    return close_scoped_iterator_preserving_abrupt(
+                                        interp, item_scope, stack, context, iterator, err,
+                                    );
+                                }
+                                Ok(true)
+                            },
+                        )?;
+                        if !has_entry {
+                            break;
+                        }
                     }
 
-                    let key = match read_indexed_entry(self, stack, context, &entry, "0") {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = self.iterator_close_sync(stack, context, &iterator);
-                            return Err(e);
-                        }
-                    };
-                    let value = match read_indexed_entry(self, stack, context, &entry, "1") {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = self.iterator_close_sync(stack, context, &iterator);
-                            return Err(e);
-                        }
-                    };
-
-                    let key_pk = match self.to_property_key_sync(stack, context, key) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = self.iterator_close_sync(stack, context, &iterator);
-                            return Err(e);
-                        }
-                    };
-                    let set_result = match &key_pk {
-                        VmPropertyKey::Symbol(sym) => {
-                            object::set_symbol(result, &mut self.gc_heap, *sym, value);
-                            Ok(())
-                        }
-                        _ => {
-                            let k = key_pk
-                                .string_name()
-                                .expect("non-symbol property key has string spelling")
-                                .to_owned();
-                            self.set_property(result, &k, value)
-                        }
-                    };
-                    if let Err(e) = set_result {
-                        let _ = self.iterator_close_sync(stack, context, &iterator);
-                        return Err(e);
-                    }
-                }
-
-                Ok(Some(Value::object(result)))
+                    Ok(Some(interp.escape_scoped(result)))
+                })
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
@@ -1278,94 +1325,167 @@ impl Interpreter {
                 self.err_type(("Object.groupBy: callback must be a function".to_string()).into())
             );
         }
-        let items_snapshot = self.iterator_to_list_sync(context, stack, &items)?;
-        let result =
-            self.alloc_stack_rooted_object_with_extra_roots(stack, &[&items, &callback])?;
-        object::set_prototype(result, &mut self.gc_heap, None);
+        self.with_handle_scope(|interp, scope| {
+            let items = interp.scoped_value(scope, items);
+            let callback = interp.scoped_value(scope, callback);
+            let (iterator, next_method) =
+                interp.get_iterator_sync(stack, context, &interp.escape_scoped(items))?;
+            let iterator = interp.scoped_value(scope, iterator);
+            let next_method = interp.scoped_value(scope, next_method);
+            let result = interp.scoped_object_bare(scope)?;
+            let mut index = 0_u64;
 
-        for (idx, item) in items_snapshot.iter().enumerate() {
-            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-            cb_args.push(*item);
-            cb_args.push(Value::number(crate::number::NumberValue::from_f64(
-                idx as f64,
-            )));
-            let key = self.run_callable_sync_rooted(
-                stack,
-                context,
-                &callback,
-                Value::undefined(),
-                cb_args,
-            )?;
-            let key_pk = self.to_property_key_sync(stack, context, key)?;
-            let key_str = match key_pk {
-                crate::VmPropertyKey::Symbol(sym) => {
-                    let existing = crate::object::get_symbol(result, &self.gc_heap, sym);
-                    let group = match existing {
-                        Some(v) if v.is_array() => v.as_array().expect("guarded"),
-                        _ => {
-                            let arr = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                                stack,
-                                Vec::new(),
-                                &[&Value::object(result), item],
-                                &[args],
-                            )?;
-                            crate::object::set_symbol(
-                                result,
-                                &mut self.gc_heap,
-                                sym,
-                                Value::array(arr),
+            loop {
+                let has_item =
+                    interp.with_handle_scope(|interp, item_scope| -> Result<bool, VmError> {
+                        // A failure produced by IteratorStepValue itself does not run
+                        // IteratorClose. Once an item exists, every abrupt callback,
+                        // coercion, or result mutation closes the iterator exactly once.
+                        let stepped = interp.iterator_step_sync(
+                            stack,
+                            context,
+                            &interp.escape_scoped(iterator),
+                            &interp.escape_scoped(next_method),
+                        )?;
+                        let Some(item) = stepped else {
+                            return Ok(false);
+                        };
+                        let item = interp.scoped_value(item_scope, item);
+                        if index >= 9_007_199_254_740_991 {
+                            let err = interp.err_type(
+                                ("Object.groupBy: iterable contains too many values".to_string())
+                                    .into(),
                             );
-                            arr
+                            return close_scoped_iterator_preserving_abrupt(
+                                interp, item_scope, stack, context, iterator, err,
+                            );
                         }
-                    };
-                    let value_root = *item;
-                    let arr_value = Value::array(group);
-                    let res_root = Value::object(result);
-                    let roots = [&value_root, &arr_value, &res_root];
-                    let mut external_visit =
-                        |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                            for v in &roots {
-                                v.trace_value_slots(visitor);
+                        let callback_args = smallvec::smallvec![
+                            interp.escape_scoped(item),
+                            Value::number(crate::number::NumberValue::from_f64(index as f64)),
+                        ];
+                        let key = match interp.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &interp.escape_scoped(callback),
+                            Value::undefined(),
+                            callback_args,
+                        ) {
+                            Ok(key) => interp.scoped_value(item_scope, key),
+                            Err(err) => {
+                                return close_scoped_iterator_preserving_abrupt(
+                                    interp, item_scope, stack, context, iterator, err,
+                                );
                             }
                         };
-                    crate::array::push_with_roots(
-                        group,
-                        &mut self.gc_heap,
-                        *item,
-                        &mut external_visit,
-                    )?;
-                    continue;
+                        let key = match interp.to_property_key_sync(
+                            stack,
+                            context,
+                            interp.escape_scoped(key),
+                        ) {
+                            Ok(key) => key,
+                            Err(err) => {
+                                return close_scoped_iterator_preserving_abrupt(
+                                    interp, item_scope, stack, context, iterator, err,
+                                );
+                            }
+                        };
+
+                        let group = match key {
+                            VmPropertyKey::Symbol(symbol) => {
+                                let symbol = interp.scoped_value(item_scope, Value::symbol(symbol));
+                                let existing =
+                                    interp.escape_scoped(result).as_object().and_then(|result| {
+                                        let symbol = interp
+                                            .escape_scoped(symbol)
+                                            .as_symbol(interp.gc_heap())?;
+                                        object::get_symbol(result, interp.gc_heap(), symbol)
+                                    });
+                                if let Some(group) = existing.filter(|value| value.is_array()) {
+                                    interp.scoped_value(item_scope, group)
+                                } else {
+                                    let group = match interp.scoped_array(item_scope, 0) {
+                                        Ok(group) => group,
+                                        Err(err) => {
+                                            return close_scoped_iterator_preserving_abrupt(
+                                                interp, item_scope, stack, context, iterator, err,
+                                            );
+                                        }
+                                    };
+                                    if let Err(err) = interp.scoped_define_symbol(
+                                        item_scope,
+                                        result,
+                                        symbol,
+                                        group,
+                                        object::PropertyFlags::data_default(),
+                                    ) {
+                                        return close_scoped_iterator_preserving_abrupt(
+                                            interp, item_scope, stack, context, iterator, err,
+                                        );
+                                    }
+                                    group
+                                }
+                            }
+                            key => {
+                                let name = key
+                                    .string_name()
+                                    .expect("non-symbol property key has string spelling");
+                                let existing = interp
+                                    .escape_scoped(result)
+                                    .as_object()
+                                    .and_then(|result| object::get(result, interp.gc_heap(), name));
+                                if let Some(group) = existing.filter(|value| value.is_array()) {
+                                    interp.scoped_value(item_scope, group)
+                                } else {
+                                    let group = match interp.scoped_array(item_scope, 0) {
+                                        Ok(group) => group,
+                                        Err(err) => {
+                                            return close_scoped_iterator_preserving_abrupt(
+                                                interp, item_scope, stack, context, iterator, err,
+                                            );
+                                        }
+                                    };
+                                    if let Err(err) = interp.scoped_define_data(
+                                        item_scope,
+                                        result,
+                                        name,
+                                        group,
+                                        object::PropertyFlags::data_default(),
+                                    ) {
+                                        return close_scoped_iterator_preserving_abrupt(
+                                            interp, item_scope, stack, context, iterator, err,
+                                        );
+                                    }
+                                    group
+                                }
+                            }
+                        };
+
+                        let group_len = match interp.scoped_array_length(group) {
+                            Ok(len) => len,
+                            Err(err) => {
+                                return close_scoped_iterator_preserving_abrupt(
+                                    interp, item_scope, stack, context, iterator, err,
+                                );
+                            }
+                        };
+                        if let Err(err) =
+                            interp.scoped_set_index(item_scope, group, group_len, item)
+                        {
+                            return close_scoped_iterator_preserving_abrupt(
+                                interp, item_scope, stack, context, iterator, err,
+                            );
+                        }
+                        Ok(true)
+                    })?;
+                if !has_item {
+                    break;
                 }
-                crate::VmPropertyKey::Atom(a) => a.name().to_string(),
-                crate::VmPropertyKey::String(s) => s.to_string(),
-                crate::VmPropertyKey::OwnedString(s) => s,
-            };
-            let existing = crate::object::get(result, &self.gc_heap, &key_str);
-            let group = match existing {
-                Some(v) if v.is_array() => v.as_array().expect("guarded"),
-                _ => {
-                    let arr = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                        stack,
-                        Vec::new(),
-                        &[&Value::object(result), item],
-                        &[args],
-                    )?;
-                    self.set_property(result, &key_str, Value::array(arr))?;
-                    arr
-                }
-            };
-            let value_root = *item;
-            let arr_value = Value::array(group);
-            let res_root = Value::object(result);
-            let roots = [&value_root, &arr_value, &res_root];
-            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for v in &roots {
-                    v.trace_value_slots(visitor);
-                }
-            };
-            crate::array::push_with_roots(group, &mut self.gc_heap, *item, &mut external_visit)?;
-        }
-        Ok(Value::object(result))
+                index += 1;
+            }
+
+            Ok(interp.escape_scoped(result))
+        })
     }
 
     fn descriptor_to_object_stack_rooted(
@@ -1827,23 +1947,62 @@ fn assign_set_symbol(
 /// `ordinary_get_value` outcome ladder.
 fn read_indexed_entry(
     interp: &mut Interpreter,
+    scope: &crate::handles::HandleScope,
     stack: &mut ActivationStack,
     context: &ExecutionContext,
-    target: &Value,
+    target: Local<'_>,
     name: &str,
 ) -> Result<Value, VmError> {
+    let target_value = interp.escape_scoped(target);
     let outcome = interp.ordinary_get_value(
         stack,
         context,
-        *target,
-        *target,
+        target_value,
+        target_value,
         &VmPropertyKey::String(name),
         0,
     )?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync_rooted(stack, context, &getter, *target, SmallVec::new())
+            let getter = interp.scoped_value(scope, getter);
+            interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &interp.escape_scoped(getter),
+                interp.escape_scoped(target),
+                SmallVec::new(),
+            )
         }
     }
+}
+
+/// Close a successfully-stepped iterator after later work completes abruptly,
+/// while keeping the original thrown value canonical and dominant over any
+/// error produced by the iterator's `return` method.
+fn close_scoped_iterator_preserving_abrupt<T>(
+    interp: &mut Interpreter,
+    scope: &crate::handles::HandleScope,
+    stack: &mut ActivationStack,
+    context: &ExecutionContext,
+    iterator: Local<'_>,
+    err: VmError,
+) -> Result<T, VmError> {
+    let original_throw = interp
+        .take_pending_uncaught_throw()
+        .map(|value| interp.scoped_value(scope, value));
+    let original_detail = interp.take_error_detail();
+    let _ = interp.iterator_close_sync(stack, context, &interp.escape_scoped(iterator));
+    // A throwing `return` completion never replaces the original abrupt
+    // completion. Discard it, then reinstall the original from its traced
+    // handle so a collection during close cannot leave a stale pending value.
+    let _ = interp.take_pending_uncaught_throw();
+    let _ = interp.take_error_detail();
+    if let Some(original_throw) = original_throw {
+        interp.set_pending_uncaught_throw(interp.escape_scoped(original_throw));
+    }
+    Err(match original_detail {
+        Some(detail) => interp.raise(detail, err),
+        None => err,
+    })
 }

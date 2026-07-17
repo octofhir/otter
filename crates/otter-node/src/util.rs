@@ -5,10 +5,18 @@
 //! (the suite's single most-used helper) and `format` are the focus, alongside
 //! `types`, `promisify`, `inherits`, `isDeepStrictEqual`, `deprecate`, dotenv
 //! parsing, USV-string normalization, and the ANSI/style helpers.
+//!
+//! # Invariants
+//! - Live call sites are captured through [`NativeCtx`]'s explicit runtime
+//!   turn; the Node adapter never borrows interpreter frame internals.
+//! - Native results are allocated through rooted scope operations.
+//!
+//! # See also
+//! - [`otter_vm::runtime_cx`] — runtime-turn and rooted native APIs.
 
 use otter_runtime::CapabilitySet;
 use otter_vm::binary::TypedArrayKind;
-use otter_vm::{Attr, JsString, NativeCtx, NativeError, Value};
+use otter_vm::{Attr, NativeCtx, NativeError, Value};
 
 /// Embedded `util` implementation.
 const SHIM: &str = include_str!("util.js");
@@ -32,17 +40,17 @@ fn capture_call_sites(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         .filter(|n| n.is_finite() && *n >= 0.0)
         .map(|n| n as usize)
         .unwrap_or(10);
-    let (interp, context) = ctx.interp_mut_and_context();
-    let context = context.ok_or_else(|| NativeError::TypeError {
-        name: "util.getCallSites",
-        reason: "missing execution context".to_string(),
-    })?;
-    let json = interp.capture_call_sites_json(&context, skip, count);
-    let s = JsString::from_str(&json, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
-        name: "util.getCallSites",
-        reason: err.to_string(),
-    })?;
-    Ok(Value::string(s))
+    let context = ctx
+        .execution_context()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "util.getCallSites",
+            reason: "missing execution context".to_string(),
+        })?;
+    let json = ctx.capture_call_sites_json(&context, skip, count);
+    ctx.scope(|mut scope| {
+        let json = scope.string(&json)?;
+        Ok(scope.finish(json))
+    })
 }
 
 fn typed_arrays_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

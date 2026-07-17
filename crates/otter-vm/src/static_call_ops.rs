@@ -642,26 +642,10 @@ impl Interpreter {
         Ok(target_value)
     }
 
-    /// No-stack entry point for callers without an active dispatcher
-    /// frame stack (typically natives invoked through ordinary
-    /// dynamic dispatch). Uses an empty frame stack — alloc helpers
-    /// then route through `collect_allocation_roots(empty)` which is
-    /// equivalent to runtime-rooted alloc, and args are always passed
-    /// via `slice_roots` so they remain reachable across allocations.
-    pub(crate) fn object_static_call_no_stack(
-        &mut self,
-        context: &ExecutionContext,
-        method: method_id::ObjectMethod,
-        args: &[Value],
-    ) -> Result<Option<Value>, VmError> {
-        let stack: ActivationStack = ActivationStack::new();
-        self.object_static_call_stack_rooted(context, &stack, method, args)
-    }
-
     pub(crate) fn object_static_call_stack_rooted(
         &mut self,
         context: &ExecutionContext,
-        stack: &ActivationStack,
+        stack: &mut ActivationStack,
         method: method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -1273,7 +1257,7 @@ impl Interpreter {
     fn do_object_group_by(
         &mut self,
         context: &ExecutionContext,
-        stack: &ActivationStack,
+        stack: &mut ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let items = args.first().cloned().unwrap_or(Value::undefined());
@@ -1288,7 +1272,7 @@ impl Interpreter {
                 self.err_type(("Object.groupBy: callback must be a function".to_string()).into())
             );
         }
-        let items_snapshot = self.iterator_to_list_sync(context, &items)?;
+        let items_snapshot = self.iterator_to_list_sync(context, stack, &items)?;
         let result =
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[&items, &callback])?;
         object::set_prototype(result, &mut self.gc_heap, None);

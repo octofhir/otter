@@ -14,13 +14,16 @@
 //! - No reference or pointer to a `Frame` survives an operation that can push.
 //! - Register windows remain stable independently of frame-vector growth.
 //! - GC tracing visits every live frame exactly once, in push order.
+//! - A rooted runtime turn marks the exact stack published through
+//!   `RawFrameRoots`; nested dispatch cannot borrow rootedness from another
+//!   activation stack.
 //!
 //! # See also
 //! - [`crate::frame_state::Frame`] — the frame payload and `trace_frame_slots`.
 //! - [`crate::cold_frame`] — cold side records traced separately from hot frame
 //!   state.
 
-use crate::frame_state::Frame;
+use crate::{Interpreter, frame_state::Frame, runtime_cx::RuntimeTurn};
 use otter_gc::raw::RawGc;
 
 /// Growable stack of materialized interpreter call [`Frame`]s.
@@ -31,6 +34,36 @@ use otter_gc::raw::RawGc;
 #[derive(Debug)]
 pub struct ActivationStack {
     frames: Vec<Frame>,
+    runtime_root_owner: Option<usize>,
+}
+
+/// Panic-safe lexical marker for the exact stack published to the collector.
+///
+/// Construction is private to this module, where
+/// [`Interpreter::with_runtime_turn`] also installs the matching
+/// `RawFrameRoots`. Other VM modules can inspect the marker but cannot forge
+/// it by merely observing that some unrelated frame provider exists.
+struct RuntimeRootedStack<'a> {
+    stack: &'a mut ActivationStack,
+}
+
+impl RuntimeRootedStack<'_> {
+    #[inline]
+    fn as_ptr(&self) -> *const ActivationStack {
+        self.stack as *const ActivationStack
+    }
+
+    #[inline]
+    fn as_mut(&mut self) -> &mut ActivationStack {
+        self.stack
+    }
+}
+
+impl Drop for RuntimeRootedStack<'_> {
+    fn drop(&mut self) {
+        debug_assert!(self.stack.runtime_root_owner.is_some());
+        self.stack.runtime_root_owner = None;
+    }
 }
 
 /// Immutable lower bound of one nested execution region.
@@ -64,7 +97,32 @@ impl ActivationStack {
     /// A new empty stack. Capacity grows only with observed call depth.
     #[must_use]
     pub fn new() -> Self {
-        Self { frames: Vec::new() }
+        Self {
+            frames: Vec::new(),
+            runtime_root_owner: None,
+        }
+    }
+
+    #[inline]
+    fn enter_runtime_rooted(&mut self, owner: usize) -> RuntimeRootedStack<'_> {
+        assert!(
+            self.runtime_root_owner.is_none(),
+            "the same ActivationStack cannot publish duplicate RawFrameRoots"
+        );
+        self.runtime_root_owner = Some(owner);
+        RuntimeRootedStack { stack: self }
+    }
+
+    /// Whether this exact stack is rooted by `interp`'s collector.
+    ///
+    /// The address is used only as an opaque lexical identity token; it is
+    /// never dereferenced and is cleared before the `&mut Interpreter` borrow
+    /// ends. This prevents safe crate code from pairing a stack published by
+    /// one isolate with another isolate's heap.
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_runtime_rooted_by(&self, interp: &Interpreter) -> bool {
+        self.runtime_root_owner == Some(interp as *const Interpreter as usize)
     }
 
     /// Mark the current absolute depth as the lower bound of nested execution.
@@ -216,6 +274,39 @@ impl ActivationStack {
             frame.trace_frame_slots(visitor);
         }
         cold_frames.trace_all(visitor);
+    }
+}
+
+impl Interpreter {
+    /// Run `body` inside one explicit mutator turn rooted by `stack`.
+    ///
+    /// The exact stack is marked before its `RawFrameRoots` provider becomes
+    /// visible and unmarked only after both collector registrations leave
+    /// scope. The private marker makes a [`RuntimeTurn`] impossible to create
+    /// for an unrelated or unregistered activation stack.
+    pub(crate) fn with_runtime_turn<R>(
+        &mut self,
+        stack: &mut ActivationStack,
+        body: impl FnOnce(RuntimeTurn<'_>) -> R,
+    ) -> R {
+        let owner = self as *const Interpreter as usize;
+        let cold_frames = &self.cold_frames as *const crate::cold_frame::ColdFramePool;
+        let mut rooted = stack.enter_runtime_rooted(owner);
+        let frame_roots = otter_gc::RawFrameRoots::new(
+            rooted.as_ptr(),
+            cold_frames,
+            ActivationStack::trace_roots,
+        );
+        let provider: &dyn otter_gc::FrameRoots = &frame_roots;
+        let frame_roots_guard = self
+            .gc_heap
+            .register_frame_roots(provider as *const dyn otter_gc::FrameRoots);
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
+        let result = body(RuntimeTurn::from_rooted_parts(self, rooted.as_mut()));
+        drop(extra_roots_guard);
+        drop(frame_roots_guard);
+        result
     }
 }
 

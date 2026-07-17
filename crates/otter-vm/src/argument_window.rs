@@ -64,28 +64,6 @@ impl<'frame, 'code> BytecodeArgumentWindow<'frame, 'code> {
         read_register(self.caller, register)
     }
 
-    pub(crate) fn contiguous_slice(&self) -> Result<Option<&'frame [Value]>, VmError> {
-        if self.len == 0 {
-            return Ok(Some(&self.caller.registers[0..0]));
-        }
-        let first = register_operand(self.operands.get(self.first_arg_operand))? as usize;
-        let end = first.checked_add(self.len).ok_or(VmError::InvalidOperand)?;
-        if end > self.caller.registers.len() {
-            return Err(VmError::InvalidOperand);
-        }
-        for index in 1..self.len {
-            let operand_index = self
-                .first_arg_operand
-                .checked_add(index)
-                .ok_or(VmError::InvalidOperand)?;
-            let register = register_operand(self.operands.get(operand_index))? as usize;
-            if register != first + index {
-                return Ok(None);
-            }
-        }
-        Ok(Some(&self.caller.registers[first..end]))
-    }
-
     pub(crate) fn to_smallvec8(&self) -> Result<SmallVec<[Value; 8]>, VmError> {
         let mut args = SmallVec::with_capacity(self.len);
         for index in 0..self.len {

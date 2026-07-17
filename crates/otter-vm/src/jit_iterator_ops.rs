@@ -75,7 +75,7 @@ impl Interpreter {
                 }
 
                 let (value, done) = match iterator.as_iterator() {
-                    Some(handle) => self.iterator_next_full(context, &handle),
+                    Some(handle) => self.iterator_next_full(context, stack, &handle),
                     None => Err(VmError::TypeMismatch),
                 }?;
                 if was_registered && !done {

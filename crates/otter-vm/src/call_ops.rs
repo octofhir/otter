@@ -34,8 +34,8 @@ use crate::{
     AsyncFrameState, CodeBlock, ExecutionContext, Frame, Interpreter, JsObject, NativeCallInfo,
     NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     argument_window::BytecodeArgumentWindow, executable::OperandView, frame_state::UpvalueSpine,
-    is_constructor_runtime, native_to_vm_error, operand_decode::register_operand, promise_dispatch,
-    read_register, write_register,
+    is_constructor_runtime, native_to_vm_error_with_stack, operand_decode::register_operand,
+    promise_dispatch, read_register, write_register,
 };
 
 struct SyncNativeCallRoots<'a> {
@@ -215,6 +215,7 @@ impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
 
 fn invoke_native_call_with_roots(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     call: crate::native_function::NativeCallTarget,
     realm_global: Option<JsObject>,
@@ -235,17 +236,19 @@ fn invoke_native_call_with_roots(
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
     let call_info = NativeCallInfo::call(this_root);
+    debug_assert!(interp.gc_heap.has_frame_root_providers());
     if let Some(global) = realm_global {
         interp.with_host_realm_global(global, |interp| {
-            let mut ctx =
-                NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
+            let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
+            let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
             let raw = call.invoke(&mut ctx, args);
-            raw.map_err(|e| native_to_vm_error(interp, e))
+            raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
         })
     } else {
-        let mut ctx = NativeCtx::new_with_call_info_and_context(interp, call_info, Some(context));
+        let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
+        let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
-        raw.map_err(|e| native_to_vm_error(interp, e))
+        raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
     }
 }
 
@@ -741,6 +744,24 @@ impl Interpreter {
         new_target: &Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
+        let mut activations = ActivationStack::new();
+        self.with_runtime_turn(&mut activations, |turn| {
+            let (interp, stack) = turn.into_parts();
+            interp.invoke_native_construct_rooted(
+                stack, context, native, this_value, new_target, args,
+            )
+        })
+    }
+
+    fn invoke_native_construct_rooted(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        native: NativeFunction,
+        this_value: &Value,
+        new_target: &Value,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         let call = native.call_target(&self.gc_heap);
         let call_info = NativeCallInfo::construct(*this_value, Some(*new_target));
         self.record_runtime_native_call();
@@ -760,9 +781,11 @@ impl Interpreter {
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let mut ctx = NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
+        let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(self, stack);
+        let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
-        let result = raw.map_err(|e| native_to_vm_error(self, e))?;
+        let (interp, stack) = ctx.cx.into_parts();
+        let result = raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))?;
         Ok(if result.is_object_type() {
             result
         } else {
@@ -883,7 +906,7 @@ impl Interpreter {
                 }
                 let prologue_floor = stack.floor();
                 stack.push(frame);
-                let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
+                let prologue = self.dispatch_loop_above_rooted(context, stack, prologue_floor);
                 self.release_frames_above(stack, prologue_floor);
                 prologue?;
                 self.resolve_generator_prototype_stack_rooted(
@@ -1040,7 +1063,7 @@ impl Interpreter {
                 }
                 let prologue_floor = stack.floor();
                 stack.push(frame);
-                let prologue = self.dispatch_loop_above(context, stack, prologue_floor);
+                let prologue = self.dispatch_loop_above_rooted(context, stack, prologue_floor);
                 self.release_frames_above(stack, prologue_floor);
                 prologue?;
                 self.resolve_generator_prototype_stack_rooted(
@@ -1155,10 +1178,7 @@ impl Interpreter {
         let args = {
             let caller = &stack[top_idx];
             let window = BytecodeArgumentWindow::new(caller, operands, first_arg_operand, argc);
-            let Some(args) = window.contiguous_slice()? else {
-                return Ok(false);
-            };
-            args
+            window.to_smallvec8()?
         };
 
         if let Some(obj) = callee.as_object()
@@ -1173,12 +1193,13 @@ impl Interpreter {
             let realm_global = native.realm_global(&self.gc_heap);
             let result = invoke_native_call_with_roots(
                 self,
+                stack,
                 context,
                 call,
                 realm_global,
                 this_value,
                 &[callee],
-                args,
+                args.as_slice(),
             )?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
@@ -1193,12 +1214,13 @@ impl Interpreter {
             let realm_global = native.realm_global(&self.gc_heap);
             let result = invoke_native_call_with_roots(
                 self,
+                stack,
                 context,
                 call,
                 realm_global,
                 this_value,
                 &[callee],
-                args,
+                args.as_slice(),
             )?;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(true);
@@ -1418,6 +1440,7 @@ impl Interpreter {
             let realm_global = native.realm_global(&self.gc_heap);
             let result = invoke_native_call_with_roots(
                 self,
+                stack,
                 context,
                 call,
                 realm_global,
@@ -1442,6 +1465,7 @@ impl Interpreter {
             let realm_global = native.realm_global(&self.gc_heap);
             let result = invoke_native_call_with_roots(
                 self,
+                stack,
                 context,
                 call,
                 realm_global,
@@ -1897,7 +1921,8 @@ impl Interpreter {
             return Ok(());
         }
         if let Some(native) = self.native_promise_constructor(&callee) {
-            let constructed = self.invoke_native_construct(
+            let constructed = self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &Value::undefined(),
@@ -1944,7 +1969,8 @@ impl Interpreter {
             && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
                 .and_then(|v| v.as_native_function())
         {
-            let constructed = self.invoke_native_construct(
+            let constructed = self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &this_value,
@@ -1961,7 +1987,8 @@ impl Interpreter {
         // `NativeCtx::is_construct_call()` to differentiate the
         // call shape.
         if let Some(native) = callee.as_native_function() {
-            let constructed = self.invoke_native_construct(
+            let constructed = self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &this_value,
@@ -1975,7 +2002,8 @@ impl Interpreter {
         if let Some(class) = callee.as_class_constructor()
             && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
         {
-            let constructed = self.invoke_native_construct(
+            let constructed = self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &this_value,
@@ -2406,15 +2434,20 @@ impl Interpreter {
             let current = roots.current.get();
             let receiver = roots.receiver.get();
             let args = roots.take_args();
-            return invoke_native_call_with_roots(
-                self,
-                context,
-                call,
-                realm_global,
-                receiver,
-                &[&current],
-                args.as_slice(),
-            );
+            let mut activations = ActivationStack::new();
+            return self.with_runtime_turn(&mut activations, |turn| {
+                let (interp, stack) = turn.into_parts();
+                invoke_native_call_with_roots(
+                    interp,
+                    stack,
+                    context,
+                    call,
+                    realm_global,
+                    receiver,
+                    &[&current],
+                    args.as_slice(),
+                )
+            });
         }
         if let Some(native) = roots.current.get().as_native_function() {
             let native = &native;
@@ -2429,15 +2462,20 @@ impl Interpreter {
             let current = roots.current.get();
             let receiver = roots.receiver.get();
             let args = roots.take_args();
-            return invoke_native_call_with_roots(
-                self,
-                context,
-                call,
-                realm_global,
-                receiver,
-                &[&current],
-                args.as_slice(),
-            );
+            let mut activations = ActivationStack::new();
+            return self.with_runtime_turn(&mut activations, |turn| {
+                let (interp, stack) = turn.into_parts();
+                invoke_native_call_with_roots(
+                    interp,
+                    stack,
+                    context,
+                    call,
+                    realm_global,
+                    receiver,
+                    &[&current],
+                    args.as_slice(),
+                )
+            });
         }
         let mut inner = self.take_reentry_stack();
         let current = roots.current.get();
@@ -2722,6 +2760,7 @@ impl Interpreter {
         // frame may tier up and run compiled, and a compiled callee appends its
         // frame directly onto this stack, so it must never reallocate. The frame
         // is popped on every completion path, leaving `inner` empty + reusable.
+        let entry_floor = inner.floor();
         inner.push(new_frame);
         if let Some(result_promise) = async_result_promise {
             // The async frame runs to its first `await` (which parks it off
@@ -2731,23 +2770,26 @@ impl Interpreter {
             // loop's terminal frame value. A suspending frame must never take
             // the compiled sync-entry path, whose fast tier assumes the entry
             // frame cannot suspend.
-            self.dispatch_loop(context, inner)?;
+            self.dispatch_loop_above(context, inner, entry_floor)?;
             return Ok(Value::promise(result_promise));
         }
         // Tier-up the entry frame itself: a synchronously-entered callee reaches
         // `dispatch_loop` directly (no `Op::Call`), so without this hook the
         // entry level would always interpret while only its sub-calls JIT. This
         // lets a hot recursion run compiled→compiled with no interpreted levels.
-        if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
-            // The compiled entry frame ran to completion and is terminal
-            // (the integer subset cannot suspend or escape its frame), so
-            // return its spilled register window to the pool.
-            if let Some(mut done) = inner.pop() {
-                self.reclaim_registers(&mut done);
+        self.with_runtime_turn(inner, |turn| {
+            let (interp, inner) = turn.into_parts();
+            if let Some(value) = interp.dispatch_jit_sync_entry(inner, context)? {
+                // The compiled entry frame ran to completion and is terminal
+                // (the integer subset cannot suspend or escape its frame), so
+                // return its spilled register window to the pool.
+                if let Some(mut done) = inner.pop() {
+                    interp.reclaim_registers(&mut done);
+                }
+                return Ok(value);
             }
-            return Ok(value);
-        }
-        self.dispatch_loop(context, inner)
+            interp.dispatch_loop_above_rooted(context, inner, entry_floor)
+        })
     }
 
     pub(crate) fn run_bytecode_callable_committed_lean_args(
@@ -2883,50 +2925,42 @@ impl Interpreter {
             self.reclaim_registers(&mut frame);
             return Err(error);
         }
+        let entry_floor = state.stack.floor();
         state.stack.push(frame);
-        let top_idx = state.stack.len() - 1;
-        if let Some(outcome) = self.run_optimized_frame(&mut state.stack, context, top_idx) {
+        let stack = &mut state.stack;
+        let reuse_frame = &mut state.reuse_frame;
+        self.with_runtime_turn(stack, |turn| {
+            let (interp, stack) = turn.into_parts();
+            let top_idx = stack.len() - 1;
+            let outcome = interp
+                .run_optimized_frame(stack, context, top_idx)
+                .unwrap_or_else(|| interp.run_compiled_frame(stack, context, top_idx, code));
             match outcome {
                 crate::jit::JitExecOutcome::Returned(value) => {
-                    state.reuse_frame = state.stack.pop();
+                    // The body ran to completion and left its frame on the
+                    // stack; recycle that frame (window + shell) for the next
+                    // element.
+                    *reuse_frame = stack.pop();
                     window_rollback.commit();
-                    return Ok(value);
+                    Ok(value)
                 }
                 crate::jit::JitExecOutcome::Bailed(pc) => {
-                    state.stack[top_idx].pc = pc;
-                    return self.dispatch_loop(context, &mut state.stack);
+                    // Finish the partially-run frame in the interpreter, which
+                    // pops it on return; the next element rebuilds a fresh
+                    // recycled frame.
+                    stack[top_idx].pc = pc;
+                    let result = interp.dispatch_loop_above_rooted(context, stack, entry_floor);
+                    if result.is_err() {
+                        interp.release_frames_above(stack, entry_floor);
+                    }
+                    result
                 }
                 crate::jit::JitExecOutcome::Threw(err) => {
-                    if let Some(mut frame) = state.stack.pop() {
-                        self.frame_release_cold(&mut frame);
-                        self.reclaim_registers(&mut frame);
-                    }
-                    return Err(err);
+                    interp.release_frames_above(stack, entry_floor);
+                    Err(err)
                 }
             }
-        }
-        match self.run_compiled_frame(&mut state.stack, context, top_idx, code) {
-            crate::jit::JitExecOutcome::Returned(value) => {
-                // The body ran to completion and left its frame on the stack;
-                // recycle that frame (window + shell) for the next element.
-                state.reuse_frame = state.stack.pop();
-                window_rollback.commit();
-                Ok(value)
-            }
-            crate::jit::JitExecOutcome::Bailed(pc) => {
-                // Finish the partially-run frame in the interpreter, which pops
-                // it on return; the next element rebuilds a fresh recycled frame.
-                state.stack[top_idx].pc = pc;
-                self.dispatch_loop(context, &mut state.stack)
-            }
-            crate::jit::JitExecOutcome::Threw(err) => {
-                if let Some(mut frame) = state.stack.pop() {
-                    self.frame_release_cold(&mut frame);
-                    self.reclaim_registers(&mut frame);
-                }
-                Err(err)
-            }
-        }
+        })
     }
 
     /// Build a fresh callee frame for one lean-callback element. `probe` drives
@@ -3031,14 +3065,29 @@ impl Interpreter {
         }
         self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
         Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        let entry_floor = state.stack.floor();
         state.stack.push(new_frame);
-        if probe && let Some(value) = self.dispatch_jit_sync_entry(&mut state.stack, context)? {
-            if let Some(mut done) = state.stack.pop() {
-                self.reclaim_registers(&mut done);
+        self.with_runtime_turn(&mut state.stack, |turn| {
+            let (interp, stack) = turn.into_parts();
+            if probe {
+                match interp.dispatch_jit_sync_entry(stack, context) {
+                    Ok(Some(value)) => {
+                        interp.release_frames_above(stack, entry_floor);
+                        return Ok(value);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        interp.release_frames_above(stack, entry_floor);
+                        return Err(err);
+                    }
+                }
             }
-            return Ok(value);
-        }
-        self.dispatch_loop(context, &mut state.stack)
+            let result = interp.dispatch_loop_above_rooted(context, stack, entry_floor);
+            if result.is_err() {
+                interp.release_frames_above(stack, entry_floor);
+            }
+            result
+        })
     }
 
     /// Synchronously perform `Construct(target, args, newTarget)`.

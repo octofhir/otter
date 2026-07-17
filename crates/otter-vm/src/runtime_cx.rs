@@ -1,34 +1,32 @@
-//! Explicit runtime context for VM dispatch and native bindings.
+//! Explicit runtime-turn context for VM dispatch and native bindings.
 //!
-//! [`RuntimeCx<'rt>`] is the internal context handed to VM dispatch
-//! and built-in helpers; it bundles the borrow set every algorithm
-//! needs (`&mut RuntimeState`, `&mut GcHeap`, intrinsics) so callers
-//! never reach for thread-local heap lookup. [`NativeCtx<'rt>`] is
-//! the public-to-native binding view used by `holt!` / `couch!` /
-//! `#[dive]` style entry points.
+//! [`RuntimeTurn<'rt>`] owns the two mutable reborrows that define one
+//! synchronous VM turn: the isolate [`Interpreter`] and its current
+//! [`ActivationStack`]. [`NativeCtx<'rt>`] is the safe binding view handed to
+//! native functions. Keeping both borrows in one value makes live-frame
+//! diagnostics and nested execution use the caller's real activation stack
+//! instead of an interpreter-held raw-pointer bridge.
 //!
-//! Both types are `!Send + !Sync` (enforced by static assertions in
+//! Both context types are `!Send + !Sync` (enforced by static assertions in
 //! [`crate::lib`]) and never cross `.await` — the lifetime parameter
 //! `'rt` is what the borrow checker uses to keep the context tied
 //! to a single mutator turn.
 //!
-//! # Why explicit context?
+//! # Contents
 //!
-//! The GC heap used to be reachable through a thread-default escape hatch on
-//! `GcHeap`. That helper could not prove which isolate owns a handle once
-//! Tokio worker migration enters the picture, and it hid borrow boundaries from
-//! the type system. Every read / write / write-barrier path must know which
-//! isolate owns the object. The explicit-context types are the type-level
-//! expression of that rule.
+//! - [`RuntimeTurn`] — explicit interpreter + activation-stack ownership.
+//! - [`NativeCtx`] — high-level native binding API for the current turn.
+//! - [`NativeScope`] — allocation-safe handle scope for native builders.
 //!
-//! # Status
+//! # Invariants
 //!
-//! The thread-default escape hatch on `GcHeap` was removed; every caller now
-//! threads `&GcHeap` / `&mut GcHeap` (or
-//! `&NativeCtx<'_>` / `&mut NativeCtx<'_>` for native bindings)
-//! explicitly.
+//! - A runtime turn refers to exactly one interpreter and one activation stack.
+//! - Native code never discovers live frames through TLS, globals, locks, or a
+//!   diagnostic raw pointer; it receives the current stack through the turn.
+//! - Neither context crosses `.await` or escapes the mutator turn.
+//! - Heap allocation and mutation stay rooted through `NativeCtx`/`NativeScope`.
 //!
-//! # Spec
+//! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-agents> (one mutator per agent).
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md).
@@ -39,8 +37,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Interpreter, IteratorHandle, IteratorState, Local, NativeError, Value,
-    VmError, array,
+    ActivationStack, ExecutionContext, Interpreter, IteratorHandle, IteratorState, Local,
+    NativeError, Value, VmError, array,
     binary::array_buffer::JsArrayBuffer,
     collections,
     handles::HandleScope,
@@ -49,49 +47,92 @@ use crate::{
     weak_refs,
 };
 
-/// Internal VM context. Carried explicitly through the dispatch
-/// loop and built-in helper signatures so every algorithm sees the
-/// `&mut GcHeap` it allocates against and the `&mut Interpreter`
-/// it reads / mutates.
+/// Explicit owner of one synchronous VM/runtime turn.
+///
+/// The interpreter and activation stack are disjoint allocations, but runtime
+/// algorithms almost always need them together. Bundling their reborrows here
+/// prevents native bindings and nested execution from inventing an ambient
+/// route back to the currently executing frames.
 ///
 /// # Lifetime contract
 ///
 /// `'rt` is the lifetime of the enclosing mutator turn — the
 /// dispatch loop's `&mut self` borrow. The borrow checker prevents
-/// `RuntimeCx` from crossing `.await`, escaping into a
+/// `RuntimeTurn` from crossing `.await`, escaping into a
 /// `'static + Send` future, or being captured by `tokio::spawn`
 /// (see compile-fail tests under
 /// `crates/otter-vm/tests/compile_fail/`).
 ///
 /// # Construction
 ///
-/// `RuntimeCx` is `pub(crate)` — only the dispatch loop and a
-/// small set of internal helpers may build one. Native bindings
-/// receive [`NativeCtx<'rt>`] (a public view) instead.
+/// `RuntimeTurn` is `pub(crate)`, but construction additionally requires that
+/// the exact [`ActivationStack`] is inside
+/// [`Interpreter::with_runtime_turn`]. Seeing an unrelated collector provider
+/// is not sufficient. Native bindings receive [`NativeCtx<'rt>`] (a public
+/// view) instead.
 ///
-pub(crate) struct RuntimeCx<'rt> {
+pub(crate) struct RuntimeTurn<'rt> {
     /// The interpreter owns the GC heap and every other isolate
     /// resource (string heap, microtask queue, intrinsic
     /// registries). One isolate has one mutator (ECMA-262 §16.6),
     /// so `&mut Interpreter` is the right shape for the context.
     pub(crate) interp: &'rt mut Interpreter,
+    /// The single materialized activation stack for this turn. Nested
+    /// execution opens an [`crate::ActivationFloor`] on this same stack.
+    activations: &'rt mut ActivationStack,
     /// PhantomData carries the `'rt` lifetime so callers cannot
     /// store the context past the mutator turn even if `interp`
     /// is later split out.
     _marker: PhantomData<&'rt mut ()>,
 }
 
-impl<'rt> RuntimeCx<'rt> {
-    /// Build a fresh context from an interpreter borrow.
+impl<'rt> RuntimeTurn<'rt> {
+    /// Reborrow a turn from the exact stack published at the lexical runtime
+    /// boundary.
     ///
-    /// `pub(crate)` — only the dispatch loop / internal helpers
-    /// build a [`RuntimeCx`].
+    /// The stack marker is private to `activation_stack.rs`; callers cannot
+    /// manufacture it from `GcHeap::has_frame_root_providers()` or borrow
+    /// rootedness from a different stack.
     #[must_use]
-    pub(crate) fn new(interp: &'rt mut Interpreter) -> Self {
+    pub(crate) fn from_rooted_parts(
+        interp: &'rt mut Interpreter,
+        activations: &'rt mut ActivationStack,
+    ) -> Self {
+        assert!(
+            activations.is_runtime_rooted_by(interp),
+            "RuntimeTurn requires this exact ActivationStack to be rooted by this Interpreter"
+        );
         Self {
             interp,
+            activations,
             _marker: PhantomData,
         }
+    }
+
+    /// Borrow the owning interpreter.
+    #[must_use]
+    pub(crate) fn interp(&self) -> &Interpreter {
+        self.interp
+    }
+
+    /// Borrow the current materialized activation stack.
+    #[must_use]
+    pub(crate) fn activations(&self) -> &ActivationStack {
+        self.activations
+    }
+
+    /// Consume the turn and return its original disjoint borrows.
+    pub(crate) fn into_parts(self) -> (&'rt mut Interpreter, &'rt mut ActivationStack) {
+        (self.interp, self.activations)
+    }
+
+    /// Reborrow the disjoint interpreter and activation fields without losing
+    /// the lexical turn boundary.
+    pub(crate) fn with_parts<R>(
+        &mut self,
+        body: impl FnOnce(&mut Interpreter, &mut ActivationStack) -> R,
+    ) -> R {
+        body(&mut *self.interp, &mut *self.activations)
     }
 
     /// Borrow the GC heap immutably.
@@ -150,9 +191,9 @@ impl NativeCallInfo {
 ///
 /// `NativeCtx<'rt>` is `!Send + !Sync` and never crosses `.await`.
 /// The lifetime `'rt` is the mutator turn — the same constraint
-/// that applies to [`RuntimeCx<'rt>`].
+/// that applies to [`RuntimeTurn<'rt>`].
 pub struct NativeCtx<'rt> {
-    pub(crate) cx: RuntimeCx<'rt>,
+    pub(crate) cx: RuntimeTurn<'rt>,
     call_info: NativeCallInfo,
     // Borrowed, not owned: the caller's execution context outlives the native
     // call, so the per-call path takes a reference instead of cloning four
@@ -180,39 +221,49 @@ pub struct NativeScope<'scope, 'rt> {
 }
 
 impl<'rt> NativeCtx<'rt> {
-    /// Build a native context from an interpreter borrow.
+    /// Build a native binding view from the explicit current runtime turn.
+    ///
+    /// `pub(crate)` keeps the raw activation-stack borrow out of the host ABI;
+    /// VM call boundaries construct the turn and native callbacks receive only
+    /// the high-level context.
     #[must_use]
-    #[cfg(test)]
-    pub(crate) fn new(interp: &'rt mut Interpreter) -> Self {
-        Self::new_with_call_info(interp, NativeCallInfo::default_call())
-    }
-
-    /// Build a native context with explicit call-site metadata.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn new_with_call_info(
-        interp: &'rt mut Interpreter,
-        call_info: NativeCallInfo,
-    ) -> Self {
-        Self::new_with_call_info_and_context(interp, call_info, None)
-    }
-
-    /// Build a native context with explicit call-site metadata and
-    /// execution context. Builtins that need to re-enter JS
-    /// observable algorithms (for example Proxy traps) use the
-    /// context to invoke callbacks with the same function table as
-    /// the caller.
-    #[must_use]
-    pub fn new_with_call_info_and_context(
-        interp: &'rt mut Interpreter,
+    pub(crate) fn from_runtime_turn(
+        cx: RuntimeTurn<'rt>,
         call_info: NativeCallInfo,
         context: Option<&'rt ExecutionContext>,
     ) -> Self {
         Self {
-            cx: RuntimeCx::new(interp),
+            cx,
             call_info,
             context,
         }
+    }
+
+    /// Convert a native error while this context's exact activation stack is
+    /// still published to the collector.
+    pub(crate) fn native_error_to_vm(&mut self, error: crate::NativeError) -> crate::VmError {
+        self.cx.with_parts(|interp, activations| {
+            crate::native_to_vm_error_with_stack(interp, activations, error)
+        })
+    }
+
+    /// Run host-side native work in a fresh empty activation turn.
+    ///
+    /// This is the public replacement for constructing a `NativeCtx` from a
+    /// bare interpreter. The higher-ranked callback prevents the context (and
+    /// its local activation stack) from escaping. JavaScript re-entry opened
+    /// from the callback uses the context's normal rooted APIs.
+    pub fn with_host_context<R>(
+        interp: &mut Interpreter,
+        call_info: NativeCallInfo,
+        context: Option<&ExecutionContext>,
+        body: impl for<'turn> FnOnce(&mut NativeCtx<'turn>) -> R,
+    ) -> R {
+        let mut activations = ActivationStack::new();
+        interp.with_runtime_turn(&mut activations, |turn| {
+            let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, context);
+            body(&mut ctx)
+        })
     }
 
     /// Return the execution context active for this native call, when present.
@@ -228,6 +279,81 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub(crate) fn context_ref(&self) -> Option<&'rt ExecutionContext> {
         self.context
+    }
+
+    /// Snapshot the current JavaScript activation stack, top frame first.
+    ///
+    /// The activation borrow comes from this context's [`RuntimeTurn`], so the
+    /// operation is safe during inline native execution and needs no ambient
+    /// pointer back into the interpreter.
+    pub(crate) fn capture_active_frames(
+        &self,
+        context: &ExecutionContext,
+    ) -> Vec<crate::StackFrameSnapshot> {
+        crate::error_ops::snapshot_frames(context, self.cx.activations())
+    }
+
+    /// Capture the current JavaScript stack as Node-compatible call-site JSON.
+    ///
+    /// `skip` drops frames from the top and `count` caps the result. Source
+    /// resolution is isolate-local, while the frame walk is driven directly by
+    /// the explicit activation stack owned by this turn.
+    pub fn capture_call_sites_json(
+        &self,
+        context: &ExecutionContext,
+        skip: usize,
+        count: usize,
+    ) -> String {
+        let mut frames = self.capture_active_frames(context);
+        let skip = skip.min(frames.len());
+        frames.drain(0..skip);
+        if frames.len() > count {
+            frames.truncate(count);
+        }
+        let sites: Vec<crate::CallSiteInfo> = frames
+            .into_iter()
+            .map(|frame| {
+                let (line, column) = self
+                    .cx
+                    .interp()
+                    .source_line_col(&frame.module, frame.span.0)
+                    .unwrap_or((0, 0));
+                let source_line = self
+                    .cx
+                    .interp()
+                    .source_line_text(&frame.module, line)
+                    .map(ToOwned::to_owned);
+                let source_line_before = line
+                    .checked_sub(1)
+                    .and_then(|line| self.cx.interp().source_line_text(&frame.module, line))
+                    .map(ToOwned::to_owned);
+                let source_line_after = self
+                    .cx
+                    .interp()
+                    .source_line_text(&frame.module, line.saturating_add(1))
+                    .map(ToOwned::to_owned);
+                let source_lines_after = (1..=8)
+                    .filter_map(|offset| {
+                        self.cx
+                            .interp()
+                            .source_line_text(&frame.module, line.saturating_add(offset))
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect::<Vec<_>>();
+                crate::CallSiteInfo {
+                    function_name: frame.function_name,
+                    script_name: frame.module,
+                    line_number: line,
+                    column_number: column,
+                    column,
+                    source_line,
+                    source_line_before,
+                    source_line_after,
+                    source_lines_after,
+                }
+            })
+            .collect();
+        serde_json::to_string(&sites).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// Borrow the owning interpreter together with the current
@@ -1199,6 +1325,15 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp
     }
 
+    /// Reborrow the current interpreter and exact rooted activation stack for
+    /// an internal high-level operation that can synchronously re-enter JS.
+    pub(crate) fn with_turn_parts<R>(
+        &mut self,
+        body: impl FnOnce(&mut Interpreter, &mut ActivationStack) -> R,
+    ) -> R {
+        self.cx.with_parts(body)
+    }
+
     pub(crate) fn collect_native_roots(&self) -> Vec<*mut RawGc> {
         self.cx.interp.collect_runtime_roots()
     }
@@ -1374,21 +1509,20 @@ impl<'rt> NativeCtx<'rt> {
     /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx, Value};
     ///
     /// let mut interp = Interpreter::new();
-    /// let mut ctx = NativeCtx::new_with_call_info_and_context(
+    /// let port: u16 = 8080;
+    /// let object_value = NativeCtx::with_host_context(
     ///     &mut interp,
     ///     NativeCallInfo::default_call(),
     ///     None,
-    /// );
-    ///
-    /// let port: u16 = 8080;
-    /// let object_value = ctx.scope(|mut scope| {
-    ///     let obj = scope.object()?;
-    ///     let href = scope.string("http://localhost:8080/")?;
-    ///     scope.set(obj, "href", href)?;
-    ///     let port_value = scope.number(f64::from(port));
-    ///     scope.set(obj, "port", port_value)?;
-    ///     Ok::<Value, otter_vm::NativeError>(scope.finish(obj))
-    /// })?;
+    ///     |ctx| ctx.scope(|mut scope| {
+    ///         let obj = scope.object()?;
+    ///         let href = scope.string("http://localhost:8080/")?;
+    ///         scope.set(obj, "href", href)?;
+    ///         let port_value = scope.number(f64::from(port));
+    ///         scope.set(obj, "port", port_value)?;
+    ///         Ok::<Value, otter_vm::NativeError>(scope.finish(obj))
+    ///     }),
+    /// )?;
     /// # let _ = object_value;
     /// # Ok(())
     /// # }
@@ -1412,6 +1546,13 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     #[inline]
     pub(crate) fn raw(&self, value: Local<'_>) -> Value {
         self.ctx.cx.interp.escape_scoped(value)
+    }
+
+    pub(crate) fn with_turn_parts<R>(
+        &mut self,
+        body: impl FnOnce(&mut Interpreter, &mut ActivationStack) -> R,
+    ) -> R {
+        self.ctx.cx.with_parts(body)
     }
 
     /// Open a nested handle range. Values stored into an outer rooted object
@@ -2048,14 +2189,28 @@ mod tests {
     use super::{NativeCallInfo, NativeCtx};
     use crate::{Interpreter, NativeError, Value, error_classes::ErrorKind, native_value_static};
 
+    fn with_ctx<R>(
+        interp: &mut Interpreter,
+        call_info: NativeCallInfo,
+        body: impl for<'turn> FnOnce(&mut NativeCtx<'turn>) -> R,
+    ) -> R {
+        NativeCtx::with_host_context(interp, call_info, None, body)
+    }
+
+    fn with_default_ctx<R>(
+        interp: &mut Interpreter,
+        body: impl for<'turn> FnOnce(&mut NativeCtx<'turn>) -> R,
+    ) -> R {
+        with_ctx(interp, NativeCallInfo::call(Value::undefined()), body)
+    }
+
     #[test]
     fn native_ctx_object_allocation_uses_young_space() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        {
-            let mut ctx = NativeCtx::new(&mut interp);
+        with_default_ctx(&mut interp, |ctx| {
             let _object = ctx.alloc_object().expect("native object allocation");
-        }
+        });
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
@@ -2067,17 +2222,17 @@ mod tests {
     fn native_ctx_array_allocation_uses_young_space() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        {
-            let mut ctx = NativeCtx::new_with_call_info(
-                &mut interp,
-                NativeCallInfo::call(Value::number_i32(7)),
-            );
-            let array = ctx
-                .array_from_elements([Value::number_i32(1)])
-                .expect("native array allocation");
-            ctx.array_push(array, Value::number_i32(2))
-                .expect("native array growth");
-        }
+        with_ctx(
+            &mut interp,
+            NativeCallInfo::call(Value::number_i32(7)),
+            |ctx| {
+                let array = ctx
+                    .array_from_elements([Value::number_i32(1)])
+                    .expect("native array allocation");
+                ctx.array_push(array, Value::number_i32(2))
+                    .expect("native array growth");
+            },
+        );
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
@@ -2089,26 +2244,26 @@ mod tests {
     fn native_ctx_collection_allocation_uses_young_space() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        {
-            let mut ctx = NativeCtx::new_with_call_info(
-                &mut interp,
-                NativeCallInfo::construct(Value::undefined(), Some(Value::number_i32(1))),
-            );
-            let mut map = ctx.alloc_map().expect("native map allocation");
-            ctx.map_set(&mut map, Value::number_i32(1), Value::number_i32(2))
-                .expect("native map insert");
-            let mut set = ctx.alloc_set().expect("native set allocation");
-            ctx.set_add(&mut set, Value::number_i32(3))
-                .expect("native set insert");
-            let weak_key = Value::object(ctx.alloc_object().expect("native weak key"));
-            let weak_value = Value::object(ctx.alloc_object().expect("native weak value"));
-            let mut weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
-            ctx.weak_map_set(&mut weak_map, weak_key, weak_value)
-                .expect("native weak map insert");
-            let mut weak_set = ctx.alloc_weak_set().expect("native weak set allocation");
-            ctx.weak_set_add(&mut weak_set, weak_key)
-                .expect("native weak set insert");
-        }
+        with_ctx(
+            &mut interp,
+            NativeCallInfo::construct(Value::undefined(), Some(Value::number_i32(1))),
+            |ctx| {
+                let mut map = ctx.alloc_map().expect("native map allocation");
+                ctx.map_set(&mut map, Value::number_i32(1), Value::number_i32(2))
+                    .expect("native map insert");
+                let mut set = ctx.alloc_set().expect("native set allocation");
+                ctx.set_add(&mut set, Value::number_i32(3))
+                    .expect("native set insert");
+                let weak_key = Value::object(ctx.alloc_object().expect("native weak key"));
+                let weak_value = Value::object(ctx.alloc_object().expect("native weak value"));
+                let mut weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
+                ctx.weak_map_set(&mut weak_map, weak_key, weak_value)
+                    .expect("native weak map insert");
+                let mut weak_set = ctx.alloc_weak_set().expect("native weak set allocation");
+                ctx.weak_set_add(&mut weak_set, weak_key)
+                    .expect("native weak set insert");
+            },
+        );
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
@@ -2126,19 +2281,19 @@ mod tests {
         let cleanup =
             native_value_static(interp.gc_heap_mut(), "cleanup", 0, cleanup).expect("cleanup");
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        {
-            let mut ctx = NativeCtx::new_with_call_info(
-                &mut interp,
-                NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
-            );
-            let target = Value::object(ctx.alloc_object().expect("target"));
-            let _weak_ref = ctx
-                .alloc_weak_ref(&target, &[], &[])
-                .expect("native weak ref allocation");
-            let _registry = ctx
-                .alloc_finalization_registry(cleanup, None, &[], &[])
-                .expect("native finalization registry allocation");
-        }
+        with_ctx(
+            &mut interp,
+            NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
+            |ctx| {
+                let target = Value::object(ctx.alloc_object().expect("target"));
+                let _weak_ref = ctx
+                    .alloc_weak_ref(&target, &[], &[])
+                    .expect("native weak ref allocation");
+                let _registry = ctx
+                    .alloc_finalization_registry(cleanup, None, &[], &[])
+                    .expect("native finalization registry allocation");
+            },
+        );
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
@@ -2150,19 +2305,19 @@ mod tests {
     fn native_ctx_error_allocation_uses_young_space() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        {
-            let mut ctx = NativeCtx::new_with_call_info(
-                &mut interp,
-                NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
-            );
-            let registry = ctx.interp_mut().error_classes_clone();
-            let error = registry
-                .make_instance_native_rooted(&mut ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
-                .expect("native error allocation");
-            assert!(
-                crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string())
-            );
-        }
+        with_ctx(
+            &mut interp,
+            NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
+            |ctx| {
+                let registry = ctx.interp_mut().error_classes_clone();
+                let error = registry
+                    .make_instance_native_rooted(ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
+                    .expect("native error allocation");
+                assert!(
+                    crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string())
+                );
+            },
+        );
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
@@ -2174,24 +2329,26 @@ mod tests {
     fn native_ctx_aggregate_error_allocation_roots_errors_array() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        {
-            let mut ctx = NativeCtx::new_with_call_info(
-                &mut interp,
-                NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
-            );
-            let registry = ctx.interp_mut().error_classes_clone();
-            let errors = [Value::number_i32(1)];
-            let error = registry
-                .make_aggregate_instance_native_rooted(
-                    &mut ctx,
-                    errors.as_slice(),
-                    Some("all rejected"),
-                    &[],
-                    &[],
-                )
-                .expect("native aggregate error allocation");
-            assert!(crate::object::get(error, ctx.heap(), "errors").is_some_and(|v| v.is_array()));
-        }
+        with_ctx(
+            &mut interp,
+            NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
+            |ctx| {
+                let registry = ctx.interp_mut().error_classes_clone();
+                let errors = [Value::number_i32(1)];
+                let error = registry
+                    .make_aggregate_instance_native_rooted(
+                        ctx,
+                        errors.as_slice(),
+                        Some("all rejected"),
+                        &[],
+                        &[],
+                    )
+                    .expect("native aggregate error allocation");
+                assert!(
+                    crate::object::get(error, ctx.heap(), "errors").is_some_and(|v| v.is_array())
+                );
+            },
+        );
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
@@ -2208,31 +2365,32 @@ mod tests {
         }
 
         let mut interp = Interpreter::new();
-        let mut ctx = NativeCtx::new(&mut interp);
-        ctx.scope(|mut scope| {
-            let host = scope
-                .host_object(HostState {
-                    label: "otter".to_string(),
-                    count: 1,
-                })
-                .expect("host object");
+        with_default_ctx(&mut interp, |ctx| {
+            ctx.scope(|mut scope| {
+                let host = scope
+                    .host_object(HostState {
+                        label: "otter".to_string(),
+                        count: 1,
+                    })
+                    .expect("host object");
 
-            let before = scope
-                .with_host_data::<HostState, _>(host, Clone::clone)
-                .expect("host data read");
-            scope
-                .with_host_data_mut::<HostState, _>(host, |state| state.count += 1)
-                .expect("host data mutation");
-            let after = scope
-                .with_host_data::<HostState, _>(host, Clone::clone)
-                .expect("host data read after mutation");
+                let before = scope
+                    .with_host_data::<HostState, _>(host, Clone::clone)
+                    .expect("host data read");
+                scope
+                    .with_host_data_mut::<HostState, _>(host, |state| state.count += 1)
+                    .expect("host data mutation");
+                let after = scope
+                    .with_host_data::<HostState, _>(host, Clone::clone)
+                    .expect("host data read after mutation");
 
-            // The callbacks have ended before this allocation. Their owned
-            // snapshots do not retain a GC-payload borrow.
-            let _allocation_after_borrow = scope.string("allocation is now safe").unwrap();
-            assert_eq!(before.count, 1);
-            assert_eq!(after.count, 2);
-            assert_eq!(after.label, "otter");
+                // The callbacks have ended before this allocation. Their owned
+                // snapshots do not retain a GC-payload borrow.
+                let _allocation_after_borrow = scope.string("allocation is now safe").unwrap();
+                assert_eq!(before.count, 1);
+                assert_eq!(after.count, 2);
+                assert_eq!(after.label, "otter");
+            });
         });
     }
 
@@ -2241,32 +2399,33 @@ mod tests {
         use crate::binary::typed_array::{JsTypedArray, TypedArrayKind};
 
         let mut interp = Interpreter::new();
-        let mut ctx = NativeCtx::new(&mut interp);
-        let buffer = ctx
-            .array_buffer_from_bytes(vec![1, 2, 3, 4])
-            .expect("array buffer");
-        let view = JsTypedArray::new(ctx.heap_mut(), buffer, TypedArrayKind::Uint8, 1, 2)
-            .expect("typed array view");
-        ctx.scope(|mut scope| {
-            let view = scope.value(Value::typed_array(view));
-            let observed = scope
-                .with_buffer_source_bytes(view, |bytes| {
-                    (bytes.len(), bytes.first().copied(), bytes.last().copied())
-                })
-                .expect("buffer source byte borrow");
-            assert_eq!(observed, (2, Some(2), Some(3)));
+        with_default_ctx(&mut interp, |ctx| {
+            let buffer = ctx
+                .array_buffer_from_bytes(vec![1, 2, 3, 4])
+                .expect("array buffer");
+            let view = JsTypedArray::new(ctx.heap_mut(), buffer, TypedArrayKind::Uint8, 1, 2)
+                .expect("typed array view");
+            ctx.scope(|mut scope| {
+                let view = scope.value(Value::typed_array(view));
+                let observed = scope
+                    .with_buffer_source_bytes(view, |bytes| {
+                        (bytes.len(), bytes.first().copied(), bytes.last().copied())
+                    })
+                    .expect("buffer source byte borrow");
+                assert_eq!(observed, (2, Some(2), Some(3)));
 
-            let copied = scope
-                .buffer_source_bytes(view)
-                .expect("buffer source bytes");
+                let copied = scope
+                    .buffer_source_bytes(view)
+                    .expect("buffer source bytes");
 
-            // A later VM allocation cannot invalidate the returned Rust-owned
-            // copy because no slice into the GC payload escaped the read.
-            let _allocation_after_copy = scope.string("later allocation").unwrap();
-            assert_eq!(copied, [2, 3]);
+                // A later VM allocation cannot invalidate the returned Rust-owned
+                // copy because no slice into the GC payload escaped the read.
+                let _allocation_after_copy = scope.string("later allocation").unwrap();
+                assert_eq!(copied, [2, 3]);
 
-            let number = scope.number(1.0);
-            assert!(scope.buffer_source_bytes(number).is_none());
+                let number = scope.number(1.0);
+                assert!(scope.buffer_source_bytes(number).is_none());
+            });
         });
     }
 
@@ -2279,72 +2438,73 @@ mod tests {
     #[test]
     fn native_ctx_scope_builds_nested_value_across_minor_gc() {
         let mut interp = Interpreter::new();
-        let mut ctx = NativeCtx::new(&mut interp);
-        let ok = ctx.scope(|mut scope| {
-            let obj = scope.object().unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
+        let ok = with_default_ctx(&mut interp, |ctx| {
+            ctx.scope(|mut scope| {
+                let obj = scope.object().unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
 
-            let name = scope.string("otter").unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
-            scope.set(obj, "name", name).unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
+                let name = scope.string("otter").unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
+                scope.set(obj, "name", name).unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
 
-            let count = scope.number(42.0);
-            scope.set(obj, "count", count).unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
+                let count = scope.number(42.0);
+                scope.set(obj, "count", count).unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
 
-            let arr = scope.array(0).unwrap();
-            let e0 = scope.number(1.0);
-            scope.set_index(arr, 0, e0).unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
-            let e1 = scope.string("two").unwrap();
-            scope.set_index(arr, 1, e1).unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
-            scope.set(obj, "items", arr).unwrap();
-            scope
-                .context()
-                .cx
-                .interp
-                .collect_minor_tracing_runtime_roots();
+                let arr = scope.array(0).unwrap();
+                let e0 = scope.number(1.0);
+                scope.set_index(arr, 0, e0).unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
+                let e1 = scope.string("two").unwrap();
+                scope.set_index(arr, 1, e1).unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
+                scope.set(obj, "items", arr).unwrap();
+                scope
+                    .context()
+                    .cx
+                    .interp
+                    .collect_minor_tracing_runtime_roots();
 
-            // Read every field back through the relocated object handle.
-            let name_read = scope.get(obj, "name").unwrap();
-            assert_eq!(scope.string_value(name_read).unwrap(), "otter");
+                // Read every field back through the relocated object handle.
+                let name_read = scope.get(obj, "name").unwrap();
+                assert_eq!(scope.string_value(name_read).unwrap(), "otter");
 
-            let count_read = scope.get(obj, "count").unwrap();
-            assert_eq!(scope.number_value(count_read).unwrap(), 42.0);
+                let count_read = scope.get(obj, "count").unwrap();
+                assert_eq!(scope.number_value(count_read).unwrap(), 42.0);
 
-            let items_read = scope.get(obj, "items").unwrap();
-            assert_eq!(scope.array_length(items_read).unwrap(), 2);
-            let first = scope.index(items_read, 0).unwrap();
-            let second = scope.index(items_read, 1).unwrap();
-            assert_eq!(scope.number_value(first).unwrap(), 1.0);
-            assert_eq!(scope.string_value(second).unwrap(), "two");
-            true
+                let items_read = scope.get(obj, "items").unwrap();
+                assert_eq!(scope.array_length(items_read).unwrap(), 2);
+                let first = scope.index(items_read, 0).unwrap();
+                let second = scope.index(items_read, 1).unwrap();
+                assert_eq!(scope.number_value(first).unwrap(), 1.0);
+                assert_eq!(scope.string_value(second).unwrap(), "two");
+                true
+            })
         });
         assert!(ok);
     }
@@ -2357,9 +2517,9 @@ mod tests {
     #[test]
     fn native_ctx_scoped_object_relocates_under_minor_gc() {
         let mut interp = Interpreter::new();
-        let mut ctx = NativeCtx::new(&mut interp);
-        let (moved, content) = ctx.scope(|mut scope| {
-            let obj = scope.object().unwrap();
+        let (moved, content) = with_default_ctx(&mut interp, |ctx| {
+            ctx.scope(|mut scope| {
+                let obj = scope.object().unwrap();
             let value = scope.string("payload").unwrap();
             scope.set(obj, "k", value).unwrap();
             let before = scope.raw(obj).as_raw_gc().expect("object is a heap cell").0;
@@ -2396,14 +2556,15 @@ mod tests {
             let content = scope
                 .string_value(read_back)
                 .expect("property still a string");
-            (moved, content)
+                (moved, content)
+            })
         });
         assert!(moved);
         assert_eq!(content, "payload");
     }
 }
 
-// `RuntimeCx` and `NativeCtx` are `!Send + !Sync` because they
-// hold a `&mut Interpreter` (which is `!Send + !Sync` by virtue
-// of holding a `GcHeap`, and reinforced by the static_assertions
-// in `lib.rs`).
+// `RuntimeTurn` and `NativeCtx` are `!Send + !Sync` because they hold a
+// `&mut Interpreter` (which is `!Send + !Sync` by virtue of holding a
+// `GcHeap`) plus the turn-local activation borrow. `lib.rs` reinforces this
+// contract with static assertions.

@@ -13,36 +13,6 @@
 #![allow(unused_imports)]
 use crate::*;
 
-/// Panic-safe publication of the local activation stack used by diagnostics.
-///
-/// The slot remains a temporary compatibility bridge until activations become
-/// interpreter-owned. It is allocation-free and restores a nested parent's
-/// pointer even when dispatch unwinds through a panic.
-struct ActiveFrameStackPublication {
-    slot: *mut Option<std::ptr::NonNull<ActivationStack>>,
-    previous: Option<std::ptr::NonNull<ActivationStack>>,
-}
-
-impl ActiveFrameStackPublication {
-    fn publish(
-        slot: &mut Option<std::ptr::NonNull<ActivationStack>>,
-        stack: &mut ActivationStack,
-    ) -> Self {
-        let previous = *slot;
-        *slot = Some(std::ptr::NonNull::from(&mut *stack));
-        Self { slot, previous }
-    }
-}
-
-impl Drop for ActiveFrameStackPublication {
-    fn drop(&mut self) {
-        // SAFETY: `publish` receives the Interpreter-owned slot, and this guard
-        // never escapes `dispatch_loop`; the owning interpreter remains live
-        // and stationary for the complete call.
-        unsafe { *self.slot = self.previous };
-    }
-}
-
 impl Interpreter {
     /// Borrow the per-isolate GC heap (read-only).
     #[must_use]
@@ -56,10 +26,10 @@ impl Interpreter {
         &mut self.gc_heap
     }
 
-    /// `pub(crate)` alias used by [`crate::runtime_cx::RuntimeCx`]
+    /// `pub(crate)` alias used by [`crate::runtime_cx::RuntimeTurn`]
     /// to forward the heap borrow without rebinding through a
     /// public method. Tracks the explicit-context migration in
-    /// task 76A.
+    /// runtime-turn boundary.
     #[must_use]
     pub(crate) fn gc_heap_for_cx(&self) -> &otter_gc::GcHeap {
         &self.gc_heap
@@ -372,12 +342,14 @@ impl Interpreter {
         let _locals_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&locals_root));
+        let mut stack = ActivationStack::new();
         self.invoke_microtask_rooted(
             context,
             &mut result_capability,
             &mut current,
             &mut effective_this,
             &mut effective_args,
+            &mut stack,
         )
     }
 
@@ -393,6 +365,7 @@ impl Interpreter {
         current: &mut Value,
         effective_this: &mut Value,
         effective_args: &mut SmallVec<[Value; 8]>,
+        stack: &mut ActivationStack,
     ) -> Result<(), RunError> {
         let mut hops: u32 = 0;
         loop {
@@ -463,14 +436,18 @@ impl Interpreter {
             }
             let call_info = NativeCallInfo::call(*effective_this);
             self.record_runtime_native_call();
-            let mut ctx = NativeCtx::new_with_call_info_and_context(self, call_info, Some(context));
-            return match call.invoke(&mut ctx, effective_args.as_slice()) {
+            let raw = self.with_runtime_turn(stack, |turn| {
+                let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
+                let result = call.invoke(&mut ctx, effective_args.as_slice());
+                let (interp, stack) = ctx.cx.into_parts();
+                result.map_err(|err| native_to_vm_error_with_stack(interp, stack, err))
+            });
+            return match raw {
                 Ok(value) => {
                     self.settle_microtask_capability(context, result_capability.take(), Ok(value));
                     Ok(())
                 }
-                Err(err) => {
-                    let vm_err = native_to_vm_error(self, err);
+                Err(vm_err) => {
                     if result_capability.is_some() {
                         // Reaction-mode: route the error into the
                         // downstream promise as a rejection rather
@@ -575,7 +552,6 @@ impl Interpreter {
                 frames: Vec::new(),
                 detail: self.take_error_detail(),
             })?;
-        let mut stack: ActivationStack = ActivationStack::new();
         stack.push(new_frame);
         // An `async` handler invoked as a reaction is a top-level call with no
         // caller frame, so — exactly like the async entry frame in `run_inner`
@@ -585,7 +561,7 @@ impl Interpreter {
         // result promise, so it settles when the handler ultimately completes.
         let async_result = if function.is_async && !function.is_generator {
             let result = match promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_stack_rooted(self, &stack, &[], &[])
+                .pending_stack_rooted(self, stack, &[], &[])
             {
                 Ok(result) => result,
                 Err(oom) => {
@@ -607,7 +583,7 @@ impl Interpreter {
         } else {
             None
         };
-        match self.dispatch_loop(context, &mut stack) {
+        match self.dispatch_loop(context, stack) {
             Ok(value) => {
                 // Reaction job: settle the downstream promise with
                 // the handler's return value (spec §27.2.5.4). For an async
@@ -646,7 +622,7 @@ impl Interpreter {
                     );
                     Ok(())
                 } else {
-                    let frames = snapshot_frames(context, &stack);
+                    let frames = snapshot_frames(context, stack);
                     Err(RunError {
                         error,
                         frames,
@@ -782,54 +758,7 @@ impl Interpreter {
         }
     }
 
-    /// Run `body` while `stack` is the single published activation/root source.
-    ///
-    /// Nested execution on the same stack reuses the existing provider; a
-    /// genuinely different nested stack publishes its own lexical provider and
-    /// restores the parent on exit. Async resume uses this boundary before it
-    /// injects a rejected await, so pre-dispatch unwind and bytecode dispatch
-    /// share one root walk instead of registering the same stack twice.
-    pub(crate) fn with_activation_stack_roots<R>(
-        &mut self,
-        stack: &mut ActivationStack,
-        body: impl FnOnce(&mut Self, &mut ActivationStack) -> R,
-    ) -> R {
-        let stack_ptr = std::ptr::NonNull::from(&mut *stack);
-        let already_published = self.active_frame_stack == Some(stack_ptr);
-        let active_stack =
-            ActiveFrameStackPublication::publish(&mut self.active_frame_stack, stack);
-        let frame_roots = otter_gc::RawFrameRoots::new(
-            stack as *const ActivationStack,
-            &self.cold_frames as *const cold_frame::ColdFramePool,
-            ActivationStack::trace_roots,
-        );
-        let frame_roots_guard = if already_published {
-            None
-        } else {
-            let provider: &dyn otter_gc::FrameRoots = &frame_roots;
-            Some(
-                self.gc_heap
-                    .register_frame_roots(provider as *const dyn otter_gc::FrameRoots),
-            )
-        };
-        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard =
-            (!already_published).then(|| self.gc_heap.register_extra_roots(extra_roots));
-        let result = body(self, stack);
-        drop(extra_roots_guard);
-        drop(frame_roots_guard);
-        drop(active_stack);
-        result
-    }
-
-    /// Thin wrapper around [`Self::dispatch_loop_rooted`] that publishes
-    /// `stack` as the interpreter's [`Self::active_frame_stack`] for the
-    /// duration of the loop, restoring the parent pointer on exit. This
-    /// is how inline native calls (the `Error` constructor,
-    /// `Error.captureStackTrace`) reach the live JS call stack — the
-    /// same role V8's isolate-owned `StackFrameIterator` plays. Nested
-    /// dispatch loops (sync callbacks, generator drives) save/restore so
-    /// the pointer always names the innermost executing stack.
+    /// Open a rooted runtime turn and drive the complete activation stack.
     pub(crate) fn dispatch_loop(
         &mut self,
         context: &ExecutionContext,
@@ -860,9 +789,29 @@ impl Interpreter {
         // that frame returned here), the cursor is already below `saved` and
         // raising it back would re-leak that window on every `run_callable_sync`.
         let register_checkpoint = self.register_stack.checkpoint();
-        let result = self.with_activation_stack_roots(stack, |interp, stack| {
+        let result = self.with_runtime_turn(stack, |turn| {
+            let (interp, stack) = turn.into_parts();
             interp.dispatch_loop_rooted(context, stack, floor)
         });
+        self.register_stack.restore(register_checkpoint);
+        result
+    }
+
+    /// Drive a nested region of the stack already owned by a runtime turn.
+    ///
+    /// This is deliberately separate from [`Self::dispatch_loop_above`]: it
+    /// cannot register a second [`otter_gc::RawFrameRoots`] for the same stack.
+    pub(crate) fn dispatch_loop_above_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        floor: ActivationFloor,
+    ) -> Result<Value, VmError> {
+        if floor.depth() > stack.len() || !stack.is_runtime_rooted_by(self) {
+            return Err(VmError::InvalidOperand);
+        }
+        let register_checkpoint = self.register_stack.checkpoint();
+        let result = self.dispatch_loop_rooted(context, stack, floor);
         self.register_stack.restore(register_checkpoint);
         result
     }
@@ -886,12 +835,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         floor: ActivationFloor,
     ) -> Result<Value, VmError> {
-        debug_assert_eq!(
-            self.active_frame_stack,
-            Some(std::ptr::NonNull::from(&mut *stack)),
-            "rooted dispatch must use the published activation stack",
-        );
-        debug_assert!(self.gc_heap.has_frame_root_providers());
+        debug_assert!(stack.is_runtime_rooted_by(self));
         self.ensure_property_ic_capacity(context);
         self.begin_runtime_budget_turn();
         let result = (|| -> Result<Value, VmError> {

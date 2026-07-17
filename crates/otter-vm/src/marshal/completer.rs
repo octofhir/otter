@@ -119,43 +119,45 @@ fn settle_from_root<R: IntoJs>(
     if promise_value.as_promise().is_none() {
         return;
     }
-    let mut ctx = NativeCtx::new_with_call_info_and_context(
+    NativeCtx::with_host_context(
         interp,
         NativeCallInfo::default_call(),
         context.as_ref(),
+        |ctx| {
+            ctx.scope(|scope| {
+                let mut cx = MarshalCx::new(scope);
+                // The promise handle must survive the conversion allocations.
+                let promise_handle = cx.park(promise_value);
+                let settled = match result {
+                    Ok(value) => value.into_js(&mut cx).map(|out| (out, true)),
+                    Err(error) => reject_reason(&mut cx, &error).map(|out| (out, false)),
+                };
+                let (out, fulfil) = match settled {
+                    Ok(pair) => pair,
+                    Err(error) => match reject_reason(&mut cx, &error) {
+                        Ok(out) => (out, false),
+                        // Conversion of the failure itself failed (OOM-class);
+                        // leave the promise unsettled rather than lie.
+                        Err(_) => return,
+                    },
+                };
+                let raw_out = cx.escape(out);
+                let Some(promise) = cx.escape(promise_handle).as_promise() else {
+                    return;
+                };
+                let jobs = if fulfil {
+                    promise.fulfill(cx.heap_mut(), raw_out)
+                } else {
+                    promise.reject(cx.heap_mut(), raw_out)
+                };
+                let interp = cx.ctx().interp_mut();
+                interp.note_settle_rejection(&jobs);
+                for job in jobs.jobs {
+                    interp.microtasks_mut().enqueue(job);
+                }
+            });
+        },
     );
-    ctx.scope(|scope| {
-        let mut cx = MarshalCx::new(scope);
-        // The promise handle must survive the conversion allocations.
-        let promise_handle = cx.park(promise_value);
-        let settled = match result {
-            Ok(value) => value.into_js(&mut cx).map(|out| (out, true)),
-            Err(error) => reject_reason(&mut cx, &error).map(|out| (out, false)),
-        };
-        let (out, fulfil) = match settled {
-            Ok(pair) => pair,
-            Err(error) => match reject_reason(&mut cx, &error) {
-                Ok(out) => (out, false),
-                // Conversion of the failure itself failed (OOM-class);
-                // leave the promise unsettled rather than lie.
-                Err(_) => return,
-            },
-        };
-        let raw_out = cx.escape(out);
-        let Some(promise) = cx.escape(promise_handle).as_promise() else {
-            return;
-        };
-        let jobs = if fulfil {
-            promise.fulfill(cx.heap_mut(), raw_out)
-        } else {
-            promise.reject(cx.heap_mut(), raw_out)
-        };
-        let interp = cx.ctx().interp_mut();
-        interp.note_settle_rejection(&jobs);
-        for job in jobs.jobs {
-            interp.microtasks_mut().enqueue(job);
-        }
-    });
     // Drain with the settling context as the fallback: the reactions this
     // settlement unblocks can queue further microtasks of their own (an async
     // reaction that `await`s again — e.g. `(await fetch(...)).text()`), and

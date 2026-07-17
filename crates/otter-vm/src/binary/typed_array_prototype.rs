@@ -1145,11 +1145,12 @@ mod tests {
         };
         let before = interp.gc_heap().stats().old_allocated_bytes;
 
-        let result = {
-            let mut ctx =
-                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(receiver));
-            impl_entries(&mut ctx, &[]).expect("entries")
-        };
+        let result = NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(receiver),
+            None,
+            |ctx| impl_entries(ctx, &[]).expect("entries"),
+        );
 
         let after = interp.gc_heap().stats().old_allocated_bytes;
         assert!(
@@ -1172,11 +1173,12 @@ mod tests {
             Value::typed_array(source)
         };
 
-        let result = {
-            let mut ctx =
-                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(receiver));
-            impl_slice(&mut ctx, &[]).expect("slice")
-        };
+        let result = NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(receiver),
+            None,
+            |ctx| impl_slice(ctx, &[]).expect("slice"),
+        );
 
         assert!(result.is_typed_array());
         let result_view = result

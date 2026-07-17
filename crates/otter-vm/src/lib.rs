@@ -220,7 +220,8 @@ use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
 pub(crate) use error_ops::{
-    native_to_vm_error, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
+    native_to_vm_error, native_to_vm_error_with_stack, snapshot_frames, symbol_to_vm_error,
+    vm_err_to_value,
 };
 pub use executable::code_block_cfg::{CodeBlockControlFlowView, CodeBlockExceptionRegion};
 pub use executable::{CodeBlock, CodeBlockInstruction, OperandView};
@@ -362,16 +363,16 @@ use otter_gc::raw::RawGc;
 // interpreter, every GC handle, and every borrowed-context type must
 // be `!Send + !Sync` so compile-fail tests reject any future edit
 // that accidentally moves a VM handle into `tokio::spawn` or holds a
-// `&mut RuntimeCx` across `.await`.
+// `&mut RuntimeTurn` across `.await`.
 //
 // Spec:
 // - <https://tc39.es/ecma262/#sec-agents>
 // ---------------------------------------------------------------------------
 static_assertions::assert_not_impl_any!(Interpreter: Send, Sync);
 static_assertions::assert_not_impl_any!(crate::runtime_cx::NativeCtx<'static>: Send, Sync);
-// `RuntimeCx<'_>` is `pub(crate)` so we cannot name it directly in
+// `RuntimeTurn<'_>` is `pub(crate)` so we cannot name it directly in
 // a `pub`-visible macro. The bound is enforced transitively because
-// `RuntimeCx<'rt>` holds `&'rt mut Interpreter`, and `Interpreter`
+// `RuntimeTurn<'rt>` holds `&'rt mut Interpreter`, and `Interpreter`
 // is `!Send + !Sync` per the assertion above.
 
 pub(crate) enum VmPropertyKey<'a> {
@@ -1109,21 +1110,6 @@ pub struct Interpreter {
     /// `Error.prototype.stack` and `util.getCallSites` without reaching
     /// back into the runtime layer.
     module_sources: source_registry::SourceRegistry,
-    /// Read-only diagnostic pointer to the [`ActivationStack`] currently being driven by
-    /// [`Self::dispatch_loop`]. Lets inline native calls (e.g. the
-    /// `Error` constructor, `Error.captureStackTrace`) snapshot the live
-    /// JS call stack for `Error.prototype.stack` without threading the
-    /// stack through every native ABI.
-    ///
-    /// # Invariants
-    /// - `Some` only while a `dispatch_loop` frame is on the Rust stack;
-    ///   a panic-safe publication guard restores the parent pointer for nested
-    ///   dispatch and unwinding.
-    /// - Dereferenced as `&ActivationStack` ONLY from inside an inline native
-    ///   call, where the owning `&mut ActivationStack` in `dispatch_loop` is
-    ///   dormant (the loop is paused on the native). Never written
-    ///   through.
-    active_frame_stack: Option<std::ptr::NonNull<activation_stack::ActivationStack>>,
     /// Per-function user-property bag (§20.2.4 Function-instance
     /// properties + ordinary [[Set]] semantics for callables).
     /// `function_id` → `JsObject` carrying anything the user wrote

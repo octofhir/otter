@@ -258,10 +258,9 @@ fn native_call(
     // so the alloc helpers fall back to runtime-rooted allocation
     // and `args` survives via slice_roots.
     if let Some(context) = context.as_ref() {
-        let static_result = ctx
-            .cx
-            .interp
-            .object_static_call_no_stack(context, method, args);
+        let static_result = ctx.cx.with_parts(|interp, stack| {
+            interp.object_static_call_stack_rooted(context, stack, method, args)
+        });
         if let Some(result) =
             static_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
         {

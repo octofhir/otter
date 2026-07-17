@@ -339,7 +339,7 @@ impl Interpreter {
         // nested dispatch from executing or consuming them.
         let floor = stack.floor();
         stack.push(entry);
-        let result = self.dispatch_loop_above(&context, stack, floor);
+        let result = self.dispatch_loop_above_rooted(&context, stack, floor);
 
         // Successful return and throw-unwind normally consume the complete
         // nested region themselves. Non-language VM failures may leave one or
@@ -767,36 +767,40 @@ mod tests {
         let mut stack = ActivationStack::new();
         stack.push(caller);
 
-        let ok = source_value(&mut interp, "ok");
-        assert_eq!(
-            interp
-                .run_direct_eval(&ok, direct_options(), &[], false, &mut stack)
-                .expect("direct eval succeeds"),
-            Value::number_i32(42)
-        );
-        assert_caller_only(&interp, &stack);
+        interp.with_runtime_turn(&mut stack, |turn| {
+            let (interp, stack) = turn.into_parts();
 
-        let thrown_source = source_value(&mut interp, "throw");
-        let thrown = interp
-            .run_direct_eval(&thrown_source, direct_options(), &[], false, &mut stack)
-            .expect_err("eval throw escapes its activation floor");
-        assert!(matches!(thrown, VmError::Uncaught));
-        assert_eq!(
-            interp.take_pending_uncaught_throw(),
-            Some(Value::number_i32(91))
-        );
-        assert_caller_only(&interp, &stack);
+            let ok = source_value(interp, "ok");
+            assert_eq!(
+                interp
+                    .run_direct_eval(&ok, direct_options(), &[], false, stack)
+                    .expect("direct eval succeeds"),
+                Value::number_i32(42)
+            );
+            assert_caller_only(interp, stack);
 
-        let invalid = source_value(&mut interp, "invalid");
-        let error = interp
-            .run_direct_eval(&invalid, direct_options(), &[], false, &mut stack)
-            .expect_err("invalid bytecode leaves cleanup to the eval boundary");
-        assert!(matches!(error, VmError::InvalidOperand));
-        assert_caller_only(&interp, &stack);
+            let thrown_source = source_value(interp, "throw");
+            let thrown = interp
+                .run_direct_eval(&thrown_source, direct_options(), &[], false, stack)
+                .expect_err("eval throw escapes its activation floor");
+            assert!(matches!(thrown, VmError::Uncaught));
+            assert_eq!(
+                interp.take_pending_uncaught_throw(),
+                Some(Value::number_i32(91))
+            );
+            assert_caller_only(interp, stack);
 
-        let mut caller = stack.pop().expect("caller retained");
-        interp.reclaim_registers(&mut caller);
-        assert_eq!(interp.register_stack.checkpoint(), 0);
+            let invalid = source_value(interp, "invalid");
+            let error = interp
+                .run_direct_eval(&invalid, direct_options(), &[], false, stack)
+                .expect_err("invalid bytecode leaves cleanup to the eval boundary");
+            assert!(matches!(error, VmError::InvalidOperand));
+            assert_caller_only(interp, stack);
+
+            let mut caller = stack.pop().expect("caller retained");
+            interp.reclaim_registers(&mut caller);
+            assert_eq!(interp.register_stack.checkpoint(), 0);
+        });
     }
 
     fn assert_caller_only(interp: &Interpreter, stack: &ActivationStack) {

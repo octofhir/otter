@@ -5,7 +5,7 @@
 //!
 //! - capturing `Gc<T>` in `tokio::spawn`;
 //! - capturing `Local<'gc, T>` in `tokio::spawn`;
-//! - holding a `RuntimeCx<'_>` / `NativeCtx<'_>` across `.await`;
+//! - holding a `RuntimeTurn<'_>` / `NativeCtx<'_>` across `.await`;
 //! - returning an internal `Value` from a `Send + 'static` future.
 //!
 //! Each fixture under `tests/compile_fail/` is a `.rs` snippet

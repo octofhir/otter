@@ -442,8 +442,9 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
     pub fn iterate_to_handles(&mut self, v: Local<'_>) -> Result<Vec<Local<'s>>, JsError> {
         let context = self.context();
         let scope = self.scope;
-        let interp = self.ctx.interp_mut();
-        let handles = interp.scoped_iterate_to_handles(scope, context, v);
+        let handles = self.ctx.with_turn_parts(|interp, stack| {
+            interp.scoped_iterate_to_handles(stack, scope, context, v)
+        });
         handles.map_err(|err| self.vm_err(err))
     }
 

@@ -9,7 +9,7 @@
 
 use crate::binary::typed_array::TypedArrayKind;
 use crate::promise::{JsPromise, PromiseState};
-use crate::{Interpreter, NativeCtx, Value};
+use crate::{Interpreter, NativeCallInfo, NativeCtx, Value};
 
 use super::{
     ArrayBuffer, BufferSource, DOMString, FromJs, HostRef, IntoJs, JsError, MarshalCx, Sequence,
@@ -18,11 +18,17 @@ use super::{
 
 fn with_cx<R>(f: impl FnOnce(&mut MarshalCx<'_, '_, '_>) -> R) -> R {
     let mut interp = Interpreter::new();
-    let mut ctx = NativeCtx::new(&mut interp);
-    ctx.scope(|scope| {
-        let mut cx = MarshalCx::new(scope);
-        f(&mut cx)
-    })
+    NativeCtx::with_host_context(
+        &mut interp,
+        NativeCallInfo::call(Value::undefined()),
+        None,
+        |ctx| {
+            ctx.scope(|scope| {
+                let mut cx = MarshalCx::new(scope);
+                f(&mut cx)
+            })
+        },
+    )
 }
 
 #[test]

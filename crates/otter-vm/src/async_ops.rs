@@ -215,7 +215,8 @@ impl Interpreter {
         // injection and nested bytecode dispatch.
         let value_anchor = self.push_iteration_anchor(value) - 1;
         let owner_anchor = self.push_iteration_anchor(Value::generator(owner)) - 1;
-        let result = self.with_activation_stack_roots(&mut stack, |interp, stack| {
+        let result = self.with_runtime_turn(&mut stack, |turn| {
+            let (interp, stack) = turn.into_parts();
             let result = (|| -> Result<(), RunError> {
                 let value = interp.iteration_anchor(value_anchor);
                 let owner = interp
@@ -279,7 +280,7 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
-                match interp.dispatch_loop_above(context, stack, floor) {
+                match interp.dispatch_loop_above_rooted(context, stack, floor) {
                     Ok(value) => {
                         let yielded_already = owner.has_yielded(&interp.gc_heap);
                         if yielded_already {
@@ -382,7 +383,8 @@ impl Interpreter {
         let floor = stack.floor();
         stack.push(frame);
         let value_anchor = self.push_iteration_anchor(value) - 1;
-        let result = self.with_activation_stack_roots(&mut stack, |interp, stack| {
+        let result = self.with_runtime_turn(&mut stack, |turn| {
+            let (interp, stack) = turn.into_parts();
             let result = (|| -> Result<(), RunError> {
                 let value = interp.iteration_anchor(value_anchor);
                 if fulfilled {
@@ -419,7 +421,7 @@ impl Interpreter {
                         return Ok(());
                     }
                 }
-                match interp.dispatch_loop_above(context, stack, floor) {
+                match interp.dispatch_loop_above_rooted(context, stack, floor) {
                     Ok(_) => Ok(()),
                     Err(error) => {
                         let frames = snapshot_frames(context, stack);

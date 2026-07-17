@@ -3568,11 +3568,14 @@ mod tests {
         let errors = vec![Value::number_i32(2)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
-        let result = {
-            let mut ctx = NativeCtx::new(&mut interp);
-            make_aggregate_error_native_rooted(&mut ctx, &registry, errors)
-                .expect("aggregate error")
-        };
+        let result = NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(Value::undefined()),
+            None,
+            |ctx| {
+                make_aggregate_error_native_rooted(ctx, &registry, errors).expect("aggregate error")
+            },
+        );
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
@@ -3644,18 +3647,19 @@ mod tests {
         let executor = Value::number_i32(17);
         let args = vec![executor];
 
-        let (handle, resolve, reject) = {
-            let mut ctx = NativeCtx::new_with_call_info(
-                &mut interp,
-                NativeCallInfo::construct(
-                    Value::number(NumberValue::from_i32(1)),
-                    Some(Value::number(NumberValue::from_i32(2))),
-                ),
-            );
-            PromiseBuilder::new()
-                .construct_native_rooted(&mut ctx, &[&executor], &[args.as_slice()])
-                .expect("native-rooted promise constructor plumbing")
-        };
+        let (handle, resolve, reject) = NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::construct(
+                Value::number(NumberValue::from_i32(1)),
+                Some(Value::number(NumberValue::from_i32(2))),
+            ),
+            None,
+            |ctx| {
+                PromiseBuilder::new()
+                    .construct_native_rooted(ctx, &[&executor], &[args.as_slice()])
+                    .expect("native-rooted promise constructor plumbing")
+            },
+        );
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(

@@ -162,6 +162,7 @@ impl Interpreter {
     /// call on a non-array reports a `TypeError` instead of guessing.
     pub(crate) fn scoped_iterate_to_handles<'s>(
         &mut self,
+        stack: &mut crate::ActivationStack,
         scope: &'s HandleScope,
         context: Option<&ExecutionContext>,
         iterable: Local<'_>,
@@ -170,7 +171,7 @@ impl Interpreter {
         let elements = if let Some(array) = value.as_array() {
             crate::array::with_elements(array, &self.gc_heap, <[Value]>::to_vec)
         } else if let Some(context) = context {
-            self.iterator_to_list_sync(context, &value)?
+            self.iterator_to_list_sync(context, stack, &value)?
         } else {
             return Err(self.err_type(
                 "cannot iterate a non-array iterable without an execution context"

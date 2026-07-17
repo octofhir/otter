@@ -122,7 +122,7 @@ impl Interpreter {
         }
         let floor = stack.floor();
         stack.push(frame);
-        let result = self.dispatch_loop_above(context, stack, floor);
+        let result = self.dispatch_loop_above_rooted(context, stack, floor);
         self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result

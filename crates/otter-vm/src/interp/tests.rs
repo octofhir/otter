@@ -66,6 +66,43 @@ fn module_with(code: Vec<Instruction>, scratch: u16) -> BytecodeModule {
     }
 }
 
+fn with_test_runtime_turn<R>(
+    interp: &mut Interpreter,
+    stack: &mut ActivationStack,
+    body: impl FnOnce(&mut Interpreter, &mut ActivationStack) -> R,
+) -> R {
+    interp.with_runtime_turn(stack, |turn| {
+        let (interp, stack) = turn.into_parts();
+        body(interp, stack)
+    })
+}
+
+#[test]
+fn rooted_dispatch_rejects_a_different_activation_stack() {
+    let module = module_with(Vec::new(), 1);
+    let context = ExecutionContext::from_module(module);
+    let mut interp = Interpreter::new();
+    let mut other_interp = Interpreter::new();
+    let mut published = ActivationStack::new();
+    let mut unrelated = ActivationStack::new();
+
+    interp.with_runtime_turn(&mut published, |turn| {
+        let (interp, published) = turn.into_parts();
+        assert!(published.is_runtime_rooted_by(interp));
+        assert!(!unrelated.is_runtime_rooted_by(interp));
+        assert!(matches!(
+            interp.dispatch_loop_above_rooted(&context, &mut unrelated, ActivationFloor::ROOT,),
+            Err(VmError::InvalidOperand)
+        ));
+        assert!(matches!(
+            other_interp.dispatch_loop_above_rooted(&context, published, ActivationFloor::ROOT,),
+            Err(VmError::InvalidOperand)
+        ));
+    });
+
+    assert!(!published.is_runtime_rooted_by(&interp));
+}
+
 fn jit_instr(
     op: Op,
     instruction_pc: u32,
@@ -971,9 +1008,9 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
     stack.push(frame);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
-    interp
-        .do_call_method_value(
-            &mut stack,
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.do_call_method_value(
+            stack,
             &context,
             &[
                 Operand::Register(2),
@@ -983,7 +1020,8 @@ fn array_callback_map_uses_stack_rooted_result_allocation() {
                 Operand::Register(1),
             ],
         )
-        .expect("array map");
+    })
+    .expect("array map");
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -1206,17 +1244,19 @@ fn call_char_code_at(interp: &mut Interpreter, recv: Value) -> Result<Activation
     frame.registers[0] = recv;
     frame.registers[1] = Value::number_i32(1);
     stack.push(frame);
-    interp.do_call_method_value(
-        &mut stack,
-        &context,
-        &[
-            Operand::Register(2),
-            Operand::Register(0),
-            Operand::ConstIndex(0),
-            Operand::ConstIndex(1),
-            Operand::Register(1),
-        ],
-    )?;
+    with_test_runtime_turn(interp, &mut stack, |interp, stack| {
+        interp.do_call_method_value(
+            stack,
+            &context,
+            &[
+                Operand::Register(2),
+                Operand::Register(0),
+                Operand::ConstIndex(0),
+                Operand::ConstIndex(1),
+                Operand::Register(1),
+            ],
+        )
+    })?;
     Ok(stack)
 }
 
@@ -1368,7 +1408,9 @@ fn call_number_to_string(
             Operand::Register(1),
         ]
     };
-    interp.do_call_method_value(&mut stack, &context, &operands)?;
+    with_test_runtime_turn(interp, &mut stack, |interp, stack| {
+        interp.do_call_method_value(stack, &context, &operands)
+    })?;
     Ok(stack)
 }
 
@@ -3002,9 +3044,9 @@ fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
     let call = native.call_target(interp.gc_heap());
     let before = interp.gc_heap_mut().stats().old_allocated_bytes;
     let call_info = NativeCallInfo::call(Value::undefined());
-    let mut ctx = NativeCtx::new_with_call_info_and_context(&mut interp, call_info, Some(&context));
-
-    let result = call.invoke(&mut ctx, &[]).expect("invoke iterator factory");
+    let result = NativeCtx::with_host_context(&mut interp, call_info, Some(&context), |ctx| {
+        call.invoke(ctx, &[]).expect("invoke iterator factory")
+    });
 
     let after = interp.gc_heap_mut().stats().old_allocated_bytes;
     assert!(
@@ -3038,9 +3080,11 @@ fn iterator_to_list_map_pairs_use_runtime_rooted_array_allocation() {
     let map_value = Value::map(map);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
-    let entries = interp
-        .iterator_to_list_sync(&context, &map_value)
-        .expect("map entries");
+    let mut stack = ActivationStack::new();
+    let entries = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.iterator_to_list_sync(&context, stack, &map_value)
+    })
+    .expect("map entries");
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -3676,9 +3720,10 @@ fn promise_new_uses_stack_rooted_capability_allocation() {
     ];
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
-    interp
-        .run_promise_new_operands(&context, &mut stack, operands.as_slice())
-        .expect("PromiseNew");
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.run_promise_new_operands(&context, stack, operands.as_slice())
+    })
+    .expect("PromiseNew");
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4485,11 +4530,66 @@ fn native_call_context_receives_method_receiver() {
     );
     let context = ExecutionContext::from_module(module.clone());
 
-    interp
-        .invoke(&mut stack, &context, &callee, receiver, SmallVec::new(), 0)
-        .unwrap();
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.invoke(stack, &context, &callee, receiver, SmallVec::new(), 0)
+    })
+    .unwrap();
 
     assert_eq!(stack[0].registers[0], receiver);
+}
+
+#[test]
+fn native_construct_context_walks_the_live_caller_stack() {
+    fn record_depth(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+        let context = ctx
+            .execution_context()
+            .cloned()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "recordDepth",
+                reason: "missing execution context".to_string(),
+            })?;
+        let depth = i32::try_from(ctx.capture_active_frames(&context).len()).unwrap_or(i32::MAX);
+        let receiver = *ctx.this_value();
+        ctx.set_value_property(receiver, "callerDepth", Value::number_i32(depth))?;
+        Ok(Value::undefined())
+    }
+
+    let module = module_with(vec![], 2);
+    let mut interp = Interpreter::new();
+    let callee = Value::native_function(
+        NativeFunction::new_constructor_static(
+            interp.gc_heap_mut(),
+            "recordDepth",
+            0,
+            record_depth,
+        )
+        .expect("native constructor"),
+    );
+    let mut stack = ActivationStack::new();
+    let mut frame = interp
+        .test_frame_for_function(&module.functions[0])
+        .expect("caller frame");
+    frame.registers[0] = callee;
+    stack.push(frame);
+    let context = ExecutionContext::from_module(module);
+    let operands = vec![
+        Operand::Register(1),
+        Operand::Register(0),
+        Operand::ConstIndex(0),
+    ];
+
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.do_construct(stack, &context, &operands)
+    })
+    .expect("native construct");
+
+    let receiver = stack[0].registers[1]
+        .as_object()
+        .expect("constructor returns its receiver");
+    assert_eq!(
+        object::get(receiver, interp.gc_heap(), "callerDepth"),
+        Some(Value::number_i32(1)),
+    );
 }
 
 #[test]
@@ -4530,7 +4630,10 @@ fn direct_native_call_uses_contiguous_argument_window() {
         Operand::Register(2),
     ];
 
-    interp.do_call(&mut stack, &context, &operands).unwrap();
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.do_call(stack, &context, &operands)
+    })
+    .unwrap();
 
     assert_eq!(stack[0].registers[3], Value::number(NumberValue::Smi(21)));
 }

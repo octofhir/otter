@@ -5,6 +5,16 @@
 //! microtask queue accessors, stack-depth limit, eval hook, tracer,
 //! CPU profiler, IC/shape/heap snapshots, interrupt handle, and
 //! `global_this`/`set_global`, plus rooted host-construction scopes.
+//!
+//! # Invariants
+//! - Interpreter services here are isolate-owned and never discover the active
+//!   execution stack through TLS or raw pointers.
+//! - Live-frame diagnostics belong to [`NativeCtx`](crate::NativeCtx), whose
+//!   [`RuntimeTurn`](crate::runtime_cx::RuntimeTurn) carries the explicit
+//!   activation-stack borrow.
+//!
+//! # See also
+//! - [`crate::runtime_cx`] — explicit runtime-turn and native binding context.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -234,84 +244,6 @@ impl Interpreter {
                 _ => 0,
             },
         }
-    }
-
-    /// Snapshot the live JS call stack currently driven by
-    /// [`Self::dispatch_loop`], top-of-stack first. Returns an empty
-    /// vector when no dispatch loop is active (e.g. a native invoked
-    /// outside interpretation). Used by the `Error` constructor and
-    /// `Error.captureStackTrace` to record the construction-site stack
-    /// for `Error.prototype.stack`.
-    pub(crate) fn capture_active_frames(
-        &self,
-        context: &ExecutionContext,
-    ) -> Vec<StackFrameSnapshot> {
-        let Some(stack) = self.active_frame_stack else {
-            return Vec::new();
-        };
-        // SAFETY: `active_frame_stack` is set by `dispatch_loop` to the
-        // `&mut ActivationStack` it is driving and cleared on exit, so it is
-        // non-null only while that stack is alive on the Rust call
-        // stack. This read happens from an inline native call, where the
-        // owning `&mut` borrow in `dispatch_loop_inner` is dormant (the
-        // loop is paused on the native), so no aliasing access races the
-        // shared read. The pointer is never written through.
-        let stack = unsafe { stack.as_ref() };
-        error_ops::snapshot_frames(context, stack)
-    }
-
-    /// Capture the live JS call stack as a JSON array of call-site
-    /// records for `util.getCallSites`. `skip` drops that many frames
-    /// from the top (so a JS wrapper can hide its own frame) and `count`
-    /// caps how many remain. Each record carries Node's property shape
-    /// (`functionName`, `scriptName`, `lineNumber`, `column`,
-    /// `columnNumber`); the caller `JSON.parse`s it into plain objects.
-    pub fn capture_call_sites_json(
-        &self,
-        context: &ExecutionContext,
-        skip: usize,
-        count: usize,
-    ) -> String {
-        let mut frames = self.capture_active_frames(context);
-        let skip = skip.min(frames.len());
-        frames.drain(0..skip);
-        if frames.len() > count {
-            frames.truncate(count);
-        }
-        let sites: Vec<CallSiteInfo> = frames
-            .into_iter()
-            .map(|f| {
-                let (line, column) = self.source_line_col(&f.module, f.span.0).unwrap_or((0, 0));
-                let source_line = self
-                    .source_line_text(&f.module, line)
-                    .map(ToOwned::to_owned);
-                let source_line_before = line
-                    .checked_sub(1)
-                    .and_then(|line| self.source_line_text(&f.module, line))
-                    .map(ToOwned::to_owned);
-                let source_line_after = self
-                    .source_line_text(&f.module, line.saturating_add(1))
-                    .map(ToOwned::to_owned);
-                let source_lines_after = (1..=8)
-                    .filter_map(|offset| {
-                        self.source_line_text(&f.module, line.saturating_add(offset))
-                            .map(ToOwned::to_owned)
-                    })
-                    .collect::<Vec<_>>();
-                CallSiteInfo {
-                    function_name: f.function_name,
-                    script_name: f.module,
-                    line_number: line,
-                    column_number: column,
-                    column,
-                    source_line,
-                    source_line_before,
-                    source_line_after,
-                    source_lines_after,
-                }
-            })
-            .collect();
-        serde_json::to_string(&sites).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// Enable the VM stack profiler, sampling every `interval` bytecode ticks.

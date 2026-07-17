@@ -1467,6 +1467,7 @@ pub fn vm_to_native_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NativeCallInfo;
 
     #[test]
     fn native_value_dispatches() {
@@ -1477,9 +1478,15 @@ mod tests {
         .expect("native");
         let native = f.as_native_function().expect("expected NativeFunction");
         let call = native.call_target(interp.gc_heap());
-        let mut ctx = NativeCtx::new(&mut interp);
-        let r = call.invoke(&mut ctx, &[Value::number_i32(7)]).unwrap();
-        assert_eq!(r.display_string(ctx.heap()), "7");
+        NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(Value::undefined()),
+            None,
+            |ctx| {
+                let r = call.invoke(ctx, &[Value::number_i32(7)]).unwrap();
+                assert_eq!(r.display_string(ctx.heap()), "7");
+            },
+        );
     }
 
     #[test]
@@ -1501,9 +1508,15 @@ mod tests {
         .expect("native");
         let native = f.as_native_function().expect("NativeFunction");
         let call = native.call_target(interp.gc_heap());
-        let mut ctx = NativeCtx::new(&mut interp);
-        let err = call.invoke(&mut ctx, &[]).unwrap_err();
-        assert!(matches!(err, NativeError::TypeError { .. }));
+        NativeCtx::with_host_context(
+            &mut interp,
+            NativeCallInfo::call(Value::undefined()),
+            None,
+            |ctx| {
+                let err = call.invoke(ctx, &[]).unwrap_err();
+                assert!(matches!(err, NativeError::TypeError { .. }));
+            },
+        );
     }
 
     #[test]

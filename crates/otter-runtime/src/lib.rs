@@ -2812,50 +2812,74 @@ impl Runtime {
         F: FnOnce(&mut otter_vm::NativeCtx<'_>) -> Result<otter_vm::Value, otter_vm::NativeError>,
     {
         let global = *self.interp.global_this();
-        let handler = otter_vm::object::get(global, self.interp.gc_heap(), "onmessage")
-            .unwrap_or_else(otter_vm::Value::undefined);
-        if !handler.is_callable() {
-            return Ok(());
-        }
-
         let global_value = otter_vm::Value::object(global);
-        let event_value = {
-            let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
-                &mut self.interp,
-                otter_vm::NativeCallInfo::call(global_value),
-                Some(context),
-            );
-            let data = materialize_data(&mut ctx)
-                .map_err(map_native_error)
-                .map_err(MessageEventDispatchError::Materialize)?;
-            let mut event = ctx
-                .alloc_object()
-                .map_err(|err| OtterError::OutOfMemory {
-                    requested_bytes: err.requested_bytes(),
-                    heap_limit_bytes: err.heap_limit_bytes(),
-                })
-                .map_err(MessageEventDispatchError::Materialize)?;
-            let ty = otter_vm::Value::string(
-                otter_vm::JsString::from_str("message", ctx.heap_mut())
-                    .map_err(|err| OtterError::OutOfMemory {
-                        requested_bytes: err.requested_bytes(),
-                        heap_limit_bytes: err.heap_limit_bytes(),
-                    })
-                    .map_err(MessageEventDispatchError::Materialize)?,
-            );
-            otter_vm::object::set(&mut event, ctx.heap_mut(), "type", ty);
-            otter_vm::object::set(&mut event, ctx.heap_mut(), "data", data);
-            otter_vm::Value::object(event)
-        };
+        otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::call(global_value),
+            Some(context),
+            |ctx| {
+                let global = ctx
+                    .this_value()
+                    .as_object()
+                    .expect("worker event receiver is globalThis");
+                let handler = otter_vm::object::get(global, ctx.heap(), "onmessage")
+                    .unwrap_or_else(otter_vm::Value::undefined);
+                if !handler.is_callable() {
+                    return Ok(());
+                }
 
-        self.interp
-            .run_callable_sync(
-                context,
-                &handler,
-                global_value,
-                smallvec::smallvec![event_value],
-            )
-            .map_err(|err| MessageEventDispatchError::Handler(self.map_reentry_error(err)))?;
+                // The handler must survive payload materialization, which can
+                // move the young generation before the call starts.
+                let handler_root = ctx.persistent_root_insert(handler);
+                let data = match materialize_data(ctx) {
+                    Ok(data) => data,
+                    Err(err) => {
+                        ctx.persistent_root_remove(handler_root);
+                        return Err(MessageEventDispatchError::Materialize(map_native_error(
+                            err,
+                        )));
+                    }
+                };
+                let data_root = ctx.persistent_root_insert(data);
+                let handler = ctx
+                    .persistent_root_get(handler_root)
+                    .expect("fresh worker handler root");
+                let data = ctx
+                    .persistent_root_get(data_root)
+                    .expect("fresh worker message data root");
+
+                let dispatch = ctx.scope(|mut scope| {
+                    let global = scope.this();
+                    let handler = scope.value(handler);
+                    let data = scope.value(data);
+                    let event = scope
+                        .object()
+                        .map_err(map_native_error)
+                        .map_err(MessageEventDispatchError::Materialize)?;
+                    let ty = scope
+                        .string("message")
+                        .map_err(map_native_error)
+                        .map_err(MessageEventDispatchError::Materialize)?;
+                    scope
+                        .set(event, "type", ty)
+                        .map_err(map_native_error)
+                        .map_err(MessageEventDispatchError::Materialize)?;
+                    scope
+                        .set(event, "data", data)
+                        .map_err(map_native_error)
+                        .map_err(MessageEventDispatchError::Materialize)?;
+                    scope
+                        .call(handler, global, &[event])
+                        .map_err(map_native_error)
+                        .map_err(MessageEventDispatchError::Handler)?;
+                    Ok(())
+                });
+
+                ctx.persistent_root_remove(data_root);
+                ctx.persistent_root_remove(handler_root);
+                dispatch
+            },
+        )?;
         self.interp.drain_microtasks(context).map_err(|err| {
             MessageEventDispatchError::Handler(enrich_runtime_diagnostic_with_cause(
                 &mut self.interp,
@@ -2877,29 +2901,28 @@ impl Runtime {
         &mut self,
         context: &ExecutionContext,
         run: F,
-    ) -> Result<otter_vm::Value, OtterError>
+    ) -> Result<(), OtterError>
     where
         F: FnOnce(&mut otter_vm::NativeCtx<'_>) -> Result<otter_vm::Value, otter_vm::NativeError>,
     {
         let global = *self.interp.global_this();
         let global_value = otter_vm::Value::object(global);
-        let value = {
-            let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
-                &mut self.interp,
-                otter_vm::NativeCallInfo::call(global_value),
-                Some(context),
-            );
-            run(&mut ctx).map_err(map_native_error)?
-        };
-        self.interp.drain_microtasks(context).map_err(|err| {
+        let result_root = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::call(global_value),
+            Some(context),
+            |ctx| {
+                run(ctx)
+                    .map(|value| ctx.persistent_root_insert(value))
+                    .map_err(map_native_error)
+            },
+        )?;
+        let drain = self.interp.drain_microtasks(context).map_err(|err| {
             enrich_runtime_diagnostic_with_cause(&mut self.interp, map_vm_error(err))
-        })?;
-        Ok(value)
-    }
-
-    fn map_reentry_error(&mut self, err: otter_vm::VmError) -> OtterError {
-        let mapped = map_vm_error(otter_vm::RunError::bare(err));
-        enrich_runtime_diagnostic_with_cause(&mut self.interp, mapped)
+        });
+        self.interp.persistent_root_remove(result_root);
+        drain?;
+        Ok(())
     }
 
     /// `true` when the per-isolate `TimerCallbacks` table has any
@@ -3962,24 +3985,29 @@ impl Runtime {
         let empty = compile_script_source("", SourceKind::JavaScript, "<commonjs-root>")
             .map_err(|err| map_compile_error(err, "<commonjs-root>"))?;
         let context = self.interp.link_module(empty);
-        let load = {
-            let mut ctx = otter_vm::NativeCtx::new_with_call_info_and_context(
-                &mut self.interp,
-                otter_vm::NativeCallInfo::default_call(),
-                Some(&context),
-            );
-            let cache = ctx.alloc_object().map_err(gc_oom_to_error)?;
-            commonjs::cjs_instantiate_file(&mut ctx, &cfg, cache, &abs, &source.text)
-        };
-        if let Err(err) = load {
-            // `process.exit(code)` during module evaluation (e.g. `common.skip`)
-            // is a clean process termination, not a load failure — surface the
-            // exit code instead of wrapping it as a COMMONJS_LOAD error.
-            if let otter_vm::NativeError::Exit { code } = err {
+        let load = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::default_call(),
+            Some(&context),
+            |ctx| -> Result<Option<u8>, OtterError> {
+                let cache = ctx.alloc_object().map_err(gc_oom_to_error)?;
+                match commonjs::cjs_instantiate_file(ctx, &cfg, cache, &abs, &source.text) {
+                    Ok(_) => Ok(None),
+                    Err(otter_vm::NativeError::Exit { code }) => Ok(Some(code)),
+                    Err(err) => Err(commonjs_native_to_error(err)),
+                }
+            },
+        );
+        match load {
+            Ok(Some(code)) => {
+                // `process.exit(code)` during module evaluation (e.g. `common.skip`)
+                // is a clean process termination, not a load failure — surface the
+                // exit code instead of wrapping it as a COMMONJS_LOAD error.
                 let result = ExecutionResult::from_exit_code(code, start.elapsed());
                 return Ok((self.attach_execution_stats(result), context));
             }
-            return Err(commonjs_native_to_error(err));
+            Err(err) => return Err(err),
+            Ok(None) => {}
         }
         // Drain microtasks queued during module execution.
         self.interp.drain_microtasks(&context).map_err(|err| {

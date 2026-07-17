@@ -199,14 +199,14 @@ impl Drop for HandleScopeFrame {
 /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx};
 ///
 /// let mut interp = Interpreter::new();
-/// let mut ctx = NativeCtx::new_with_call_info_and_context(
+/// let escaped = NativeCtx::with_host_context(
 ///     &mut interp,
 ///     NativeCallInfo::default_call(),
 ///     None,
+///     |ctx| ctx.scope(|mut scope| scope.object().unwrap()),
 /// );
 /// // Returning the handle from the closure fails to compile: `scope`'s result
 /// // type is fixed and cannot capture the scope's lifetime.
-/// let escaped = ctx.scope(|mut scope| scope.object().unwrap());
 /// let _ = escaped;
 /// ```
 ///
@@ -216,17 +216,19 @@ impl Drop for HandleScopeFrame {
 /// use otter_vm::{Interpreter, NativeCallInfo, NativeCtx};
 ///
 /// let mut interp = Interpreter::new();
-/// let mut ctx = NativeCtx::new_with_call_info_and_context(
+/// let mut leaked = None;
+/// NativeCtx::with_host_context(
 ///     &mut interp,
 ///     NativeCallInfo::default_call(),
 ///     None,
+///     |ctx| {
+///         ctx.scope(|mut scope| {
+///             // Storing the handle into a binding declared outside the scope would let
+///             // it outlive the arena range it indexes — the borrow checker rejects it.
+///             leaked = Some(scope.object().unwrap());
+///         });
+///     },
 /// );
-/// let mut leaked = None;
-/// ctx.scope(|mut scope| {
-///     // Storing the handle into a binding declared outside the scope would let
-///     // it outlive the arena range it indexes — the borrow checker rejects it.
-///     leaked = Some(scope.object().unwrap());
-/// });
 /// let _ = leaked;
 /// ```
 #[derive(Debug, Clone, Copy)]

@@ -46,11 +46,18 @@ fn main() -> Result<()> {
     options.timeout_secs = cli.timeout_secs;
     options.otter_bin = cli.otter_bin;
 
+    let full_corpus = options.is_full_corpus();
     let report = otter_node_compat::run(options)?;
     println!(
         "node-compat: {}/{} passed ({:.1}%)",
         report.summary.passed, report.summary.total, report.summary.pass_rate
     );
+    if !full_corpus {
+        println!(
+            "note: partial run — NODE_CONFORMANCE.md and the site dashboard keep \
+             the last full-corpus baseline"
+        );
+    }
     let failures: Vec<_> = report
         .results
         .iter()

@@ -1,20 +1,46 @@
 ---
-// Interactive test262 conformance dashboard.
+// Interactive conformance dashboard, shared by every suite Otter tracks.
 //
-// Renders client-side from /conformance/data.json (the latest merged
-// baseline produced by `otter-test262 merge`; refreshed by
-// `just test262-site` / scripts/test262-full-run.sh). Drill-down group
-// tree with stacked pass/fail bars, lazy failing-test tables with
-// reasons, live path filter, and per-test links into the pinned
-// tc39/test262 commit.
+// Renders client-side from a baseline JSON with `{totals, by_section,
+// failing_tests, engine_commit, ran_at}` plus the corpus commit named by
+// `commitField`: test262 (`otter-test262 merge`, refreshed by `just
+// test262-site`) and Node.js (`cargo run -p otter-node-compat`) both emit
+// that shape. Drill-down group tree with stacked pass/fail bars, lazy
+// failing-test tables with reasons, live path filter, and per-test links
+// into the pinned corpus commit.
+
+interface Props {
+  /** Baseline JSON, relative to the site base URL. */
+  dataPath: string;
+  /** Payload field holding the corpus commit, e.g. `test262_commit`. */
+  commitField: string;
+  /** Corpus repository, e.g. `tc39/test262`. */
+  repo: string;
+  /** Path inside the repo that a test's `path` is relative to. */
+  repoTestRoot: string;
+  /** Corpus name shown in the run metadata line. */
+  suiteLabel: string;
+  /** Example section shown in the filter box. */
+  filterHint: string;
+}
+
+const { dataPath, commitField, repo, repoTestRoot, suiteLabel, filterHint } =
+  Astro.props;
 ---
 
-<div class="conf-dash">
+<div
+  class="conf-dash"
+  data-path={dataPath}
+  data-commit-field={commitField}
+  data-repo={repo}
+  data-test-root={repoTestRoot}
+  data-suite-label={suiteLabel}
+>
   <div id="conf-hero"></div>
   <input
     id="conf-filter"
     type="search"
-    placeholder="Filter sections… (e.g. built-ins/Array)"
+    placeholder={`Filter sections… (e.g. ${filterHint})`}
     autocomplete="off"
   />
   <div id="conf-tree"><p class="conf-loading">Loading baseline…</p></div>
@@ -75,8 +101,18 @@
 </style>
 
 <script>
+  const dash = document.querySelector(".conf-dash") as HTMLElement;
+  const CFG = dash.dataset;
   const base = import.meta.env.BASE_URL.replace(/\/$/, "");
-  const resp = await fetch(`${base}/conformance/data.json`);
+  const resp = await fetch(`${base}${CFG.path}`);
+  if (!resp.ok) {
+    // No baseline is published until the suite has run over its full corpus.
+    // Say so instead of leaving the page on "Loading…" forever; the throw ends
+    // this module, leaving the notice as the rendered state.
+    document.getElementById("conf-tree")!.textContent =
+      "No baseline published yet — run the suite to generate it.";
+    throw new Error(`conformance baseline missing at ${CFG.path}`);
+  }
   const DATA = await resp.json();
 
   function emptyTotals() {
@@ -123,9 +159,10 @@
     mk("p", t.passed); mk("f", t.failed); mk("b", t.crashed + t.timed_out + t.oom); mk("s", t.skipped);
     return b;
   }
+  const corpusCommit = DATA[CFG.commitField!];
   function testUrl(path: string) {
-    const c = DATA.test262_commit && DATA.test262_commit !== "unknown" ? DATA.test262_commit : "main";
-    return `https://github.com/tc39/test262/blob/${c}/test/${path}`;
+    const c = corpusCommit && corpusCommit !== "unknown" ? corpusCommit : "main";
+    return `https://github.com/${CFG.repo}/blob/${c}/${CFG.testRoot}/${path}`;
   }
   function failTable(rows: any[]) {
     const tb = el("table", "fails");
@@ -199,7 +236,7 @@
   const meta = el("p", "conf-meta");
   meta.innerHTML =
     "Engine <code>" + String(DATA.engine_commit || "?").slice(0, 12) +
-    "</code> · test262 <code>" + String(DATA.test262_commit || "?").slice(0, 12) +
+    "</code> · " + CFG.suiteLabel + " <code>" + String(corpusCommit || "?").slice(0, 12) +
     "</code> · " + (DATA.ran_at || "");
   hero.appendChild(meta);
   const heroRow = el("div", "hero-row");

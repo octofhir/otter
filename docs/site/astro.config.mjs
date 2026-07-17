@@ -48,7 +48,10 @@ export default defineConfig({
 				},
 				{
 					label: 'Conformance',
-					items: [{ label: 'ECMAScript Conformance', slug: 'conformance' }],
+					items: [
+						{ label: 'ECMAScript Conformance', slug: 'conformance' },
+						{ label: 'Node.js Conformance', slug: 'conformance/nodejs' },
+					],
 				},
 				{
 					label: 'Package Manager',

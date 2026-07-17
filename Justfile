@@ -196,15 +196,12 @@ test262-next-safe *args:
 node-compat-fetch:
     bash scripts/fetch-node-tests.sh
 
-# Run the default Node.js compatibility baseline. With no arguments this covers
-# the implemented foundation modules; explicit arguments still select exactly
-# the requested modules/flags (for example `just node-compat process --limit 25`).
-# The runner rebuilds and tests target/release/otter by default.
+# Run the Node.js conformance corpus. With no arguments this runs every
+# official test in test/parallel and test/sequential; arguments narrow the run
+# to modules or flags (for example `just node-compat fs --limit 25`).
+# Refreshes NODE_CONFORMANCE.md and the documentation site dashboard, and
+# rebuilds and tests target/release/otter by default.
 node-compat *args:
-    if [ -z "{{args}}" ]; then cargo run -p otter-node-compat -- napi querystring url util path os buffer assert events process; else cargo run -p otter-node-compat -- {{args}}; fi
-
-# Run every configured module, including experimental node:test and node:net.
-node-compat-all *args:
     cargo run -p otter-node-compat -- {{args}}
 
 # Run Node.js compatibility tests with a substring filter.

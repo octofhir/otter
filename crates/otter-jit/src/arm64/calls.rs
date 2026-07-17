@@ -450,9 +450,43 @@ mod tests {
     use super::*;
     use crate::entry::{JitCtx, JitRet, STATUS_BAILED, STATUS_RETURNED, STATUS_THREW};
 
+    struct AbortProbe {
+        saw_caller_frame: AtomicBool,
+        owner_id: AtomicU64,
+    }
+
+    impl AbortProbe {
+        const fn new() -> Self {
+            Self {
+                saw_caller_frame: AtomicBool::new(false),
+                owner_id: AtomicU64::new(u64::MAX),
+            }
+        }
+
+        fn reset(&self) {
+            self.saw_caller_frame.store(false, Ordering::SeqCst);
+            self.owner_id.store(u64::MAX, Ordering::SeqCst);
+        }
+
+        fn observe(&self, ctx: *mut JitCtx, owner_id: u64) -> u64 {
+            // SAFETY: the failure path must pass the live outer context after
+            // restoring its stack reservation.
+            let ctx = unsafe { &mut *ctx };
+            // SAFETY: the fixture supplies a live thread for the emitted call.
+            let thread = unsafe { &*ctx.thread };
+            self.saw_caller_frame.store(
+                thread.current_frame == ctx.native_frame as u64,
+                Ordering::SeqCst,
+            );
+            self.owner_id.store(owner_id, Ordering::SeqCst);
+            0
+        }
+    }
+
     static PUSH_SAW_CALLEE_FRAME: AtomicBool = AtomicBool::new(false);
-    static ABORT_SAW_CALLER_FRAME: AtomicBool = AtomicBool::new(false);
-    static ABORT_OWNER_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+    static FAILED_PUSH_ABORT: AbortProbe = AbortProbe::new();
+    static UNLINKED_ENTRY_ABORT: AbortProbe = AbortProbe::new();
+    static SATURATED_ENTRY_ABORT: AbortProbe = AbortProbe::new();
     static RETURN_CALLEE_SAW_PUBLISHED_FRAME: AtomicBool = AtomicBool::new(false);
     static RETURN_CALLEE_SAW_NATIVE_OWNER: AtomicBool = AtomicBool::new(false);
     static RETURN_FINISH_SAW_CALLER_FRAME: AtomicBool = AtomicBool::new(false);
@@ -491,18 +525,16 @@ mod tests {
         1
     }
 
-    extern "C" fn observe_abort(ctx: *mut JitCtx, owner_id: u64) -> u64 {
-        // SAFETY: the failure path must pass the live outer context after
-        // restoring its stack reservation.
-        let ctx = unsafe { &mut *ctx };
-        // SAFETY: the fixture supplies a live thread for the emitted call.
-        let thread = unsafe { &*ctx.thread };
-        ABORT_SAW_CALLER_FRAME.store(
-            thread.current_frame == ctx.native_frame as u64,
-            Ordering::SeqCst,
-        );
-        ABORT_OWNER_ID.store(owner_id, Ordering::SeqCst);
-        0
+    extern "C" fn observe_failed_push_abort(ctx: *mut JitCtx, owner_id: u64) -> u64 {
+        FAILED_PUSH_ABORT.observe(ctx, owner_id)
+    }
+
+    extern "C" fn observe_unlinked_entry_abort(ctx: *mut JitCtx, owner_id: u64) -> u64 {
+        UNLINKED_ENTRY_ABORT.observe(ctx, owner_id)
+    }
+
+    extern "C" fn observe_saturated_entry_abort(ctx: *mut JitCtx, owner_id: u64) -> u64 {
+        SATURATED_ENTRY_ABORT.observe(ctx, owner_id)
     }
 
     extern "C" fn returning_callee(ctx: *mut JitCtx) -> JitRet {
@@ -802,8 +834,7 @@ mod tests {
     #[test]
     fn failed_activation_push_restores_caller_and_aborts_prepared_frame() {
         PUSH_SAW_CALLEE_FRAME.store(false, Ordering::SeqCst);
-        ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        ABORT_OWNER_ID.store(u64::MAX, Ordering::SeqCst);
+        FAILED_PUSH_ABORT.reset();
 
         let mut transitions = TransitionTable::resolve();
         transitions.replace_entry_for_test(
@@ -812,7 +843,7 @@ mod tests {
         );
         transitions.replace_entry_for_test(
             abi::STUB_JIT_ABORT_DIRECT_CALL,
-            observe_abort as *const () as usize,
+            observe_failed_push_abort as *const () as usize,
         );
 
         let trampoline = CallTrampoline::compile(&transitions).expect("call trampoline");
@@ -847,8 +878,8 @@ mod tests {
 
         assert_eq!(status, CALL_THREW);
         assert!(PUSH_SAW_CALLEE_FRAME.load(Ordering::SeqCst));
-        assert!(ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(ABORT_OWNER_ID.load(Ordering::SeqCst), 41);
+        assert!(FAILED_PUSH_ABORT.saw_caller_frame.load(Ordering::SeqCst));
+        assert_eq!(FAILED_PUSH_ABORT.owner_id.load(Ordering::SeqCst), 41);
         assert_eq!(
             thread.current_frame,
             std::ptr::addr_of!(caller_frame) as u64
@@ -860,14 +891,13 @@ mod tests {
 
     #[test]
     fn unlinked_entry_cell_aborts_prepared_frame_without_native_entry() {
-        ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        ABORT_OWNER_ID.store(u64::MAX, Ordering::SeqCst);
+        UNLINKED_ENTRY_ABORT.reset();
         UNLINKED_CALLEE_ENTERED.store(false, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
         transitions.replace_entry_for_test(
             abi::STUB_JIT_ABORT_DIRECT_CALL,
-            observe_abort as *const () as usize,
+            observe_unlinked_entry_abort as *const () as usize,
         );
         let entry_cell =
             CodeEntryCell::new(unlinked_probe_callee as *const () as usize, 17, 9, 0, 1, 0);
@@ -880,20 +910,19 @@ mod tests {
         assert!(outcome.caller_frame_restored);
         assert_eq!(outcome.activation_top, 0);
         assert!(!UNLINKED_CALLEE_ENTERED.load(Ordering::SeqCst));
-        assert!(ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(ABORT_OWNER_ID.load(Ordering::SeqCst), 41);
+        assert!(UNLINKED_ENTRY_ABORT.saw_caller_frame.load(Ordering::SeqCst));
+        assert_eq!(UNLINKED_ENTRY_ABORT.owner_id.load(Ordering::SeqCst), 41);
     }
 
     #[test]
     fn saturated_entry_cell_rejects_without_wrapping_activation_count() {
-        ABORT_SAW_CALLER_FRAME.store(false, Ordering::SeqCst);
-        ABORT_OWNER_ID.store(u64::MAX, Ordering::SeqCst);
+        SATURATED_ENTRY_ABORT.reset();
         SATURATED_CALLEE_ENTERED.store(false, Ordering::SeqCst);
 
         let mut transitions = TransitionTable::resolve();
         transitions.replace_entry_for_test(
             abi::STUB_JIT_ABORT_DIRECT_CALL,
-            observe_abort as *const () as usize,
+            observe_saturated_entry_abort as *const () as usize,
         );
         let entry_cell =
             CodeEntryCell::new(saturated_probe_callee as *const () as usize, 17, 9, 0, 1, 0);
@@ -906,7 +935,11 @@ mod tests {
         assert!(outcome.caller_frame_restored);
         assert_eq!(outcome.activation_top, 0);
         assert!(!SATURATED_CALLEE_ENTERED.load(Ordering::SeqCst));
-        assert!(ABORT_SAW_CALLER_FRAME.load(Ordering::SeqCst));
-        assert_eq!(ABORT_OWNER_ID.load(Ordering::SeqCst), 41);
+        assert!(
+            SATURATED_ENTRY_ABORT
+                .saw_caller_frame
+                .load(Ordering::SeqCst)
+        );
+        assert_eq!(SATURATED_ENTRY_ABORT.owner_id.load(Ordering::SeqCst), 41);
     }
 }

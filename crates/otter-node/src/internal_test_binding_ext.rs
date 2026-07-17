@@ -2,7 +2,6 @@
 //!
 //! # Contents
 //! - [`internal_test_binding_cjs_value`] returns the CommonJS test-binding shim.
-//! - [`install_internal_test_binding_module`] is the ESM installer placeholder.
 //!
 //! # Invariants
 //! - This module is harness-only. It exposes selected Node test hooks but is
@@ -13,20 +12,15 @@
 //! # See also
 //! - `internal_test_binding.js`
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("internal_test_binding.js");
 
-pub fn install_internal_test_binding_module(
-    _ctx: &mut otter_runtime::HostedModuleCtx<'_>,
-) -> Result<(), String> {
-    Ok(())
-}
-
 pub fn internal_test_binding_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, otter_vm::NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "internal/test/binding", SHIM, &[])
 }

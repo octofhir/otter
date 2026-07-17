@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeCtx, NativeError, NativeScope, Value};
 
 const SHIM: &str = concat!(include_str!("url.js"), "\n", include_str!("url_legacy.js"));
@@ -31,17 +31,32 @@ const SHIM: &str = concat!(include_str!("url.js"), "\n", include_str!("url_legac
 pub fn url_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:url", SHIM, &[])
 }
 
 /// Named ESM surface used by ecosystem loaders.
-pub fn install_url_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    ctx.builtin_method("pathToFileURL", 1, path_to_file_url)?;
-    ctx.builtin_method("fileURLToPath", 1, file_url_to_path)?;
-    ctx.builtin_method("domainToASCII", 1, domain_to_ascii)?;
-    ctx.builtin_method("domainToUnicode", 1, domain_to_unicode)?;
-    Ok(())
+pub fn install_url_module<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
+    for (name, length, call) in [
+        (
+            "pathToFileURL",
+            1,
+            path_to_file_url as fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+        ),
+        ("fileURLToPath", 1, file_url_to_path),
+        ("domainToASCII", 1, domain_to_ascii),
+        ("domainToUnicode", 1, domain_to_unicode),
+    ] {
+        let method = scope.native_method(name, length, call)?;
+        scope.set(namespace, name, method)?;
+    }
+    Ok(namespace)
 }
 
 fn path_to_file_url(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

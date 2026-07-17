@@ -5,7 +5,8 @@
 //! implementations land per-module as conformance needs them.
 
 use otter_runtime::{
-    HostedModuleCtx, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
     RuntimeValue as Value,
 };
 
@@ -19,14 +20,30 @@ fn not_implemented(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 /// `node:net` — placeholder namespace. The harness reads the default
 /// auto-select-family timeout at load, so those accessors are provided.
-pub fn install_net(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    ctx.builtin_method(
+pub fn install_net<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
+    let get_timeout = scope.native_method(
         "getDefaultAutoSelectFamilyAttemptTimeout",
         0,
         net_default_timeout,
     )?;
-    ctx.builtin_method("setDefaultAutoSelectFamilyAttemptTimeout", 1, net_noop)?;
-    Ok(())
+    scope.set(
+        namespace,
+        "getDefaultAutoSelectFamilyAttemptTimeout",
+        get_timeout,
+    )?;
+    let set_timeout =
+        scope.native_method("setDefaultAutoSelectFamilyAttemptTimeout", 1, net_noop)?;
+    scope.set(
+        namespace,
+        "setDefaultAutoSelectFamilyAttemptTimeout",
+        set_timeout,
+    )?;
+    Ok(namespace)
 }
 
 fn net_default_timeout(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -38,8 +55,15 @@ fn net_noop(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeEr
 }
 
 /// `node:worker_threads` — only `isMainThread` is consulted at harness load.
-pub fn install_worker_threads(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    ctx.property("isMainThread", Value::boolean(true))?;
-    ctx.builtin_method("Worker", 1, not_implemented)?;
-    Ok(())
+pub fn install_worker_threads<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
+    let is_main_thread = scope.boolean(true);
+    scope.set(namespace, "isMainThread", is_main_thread)?;
+    let worker = scope.native_method("Worker", 1, not_implemented)?;
+    scope.set(namespace, "Worker", worker)?;
+    Ok(namespace)
 }

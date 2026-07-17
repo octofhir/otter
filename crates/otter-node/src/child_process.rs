@@ -15,8 +15,8 @@ use std::process::{Command, Stdio};
 
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeValue as Value,
-    runtime_arg_to_string,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+    RuntimeValue as Value, runtime_arg_to_string,
 };
 use otter_vm::object;
 
@@ -26,11 +26,12 @@ const SHIM: &str = include_str!("child_process.js");
 pub fn child_process_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     let native = native_value(scope, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
-    let events = crate::events::events_cjs_value(scope, caps)?;
-    let stream = crate::stream::stream_cjs_value(scope, caps)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
+    let events = crate::events::events_cjs_value(scope, caps, runtime_task_spawner.clone())?;
+    let stream = crate::stream::stream_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:child_process",
@@ -44,32 +45,21 @@ pub fn child_process_cjs_value<'scope>(
     )
 }
 
-/// ESM namespace install — CommonJS is the supported surface.
-pub fn install_child_process_module(
-    _ctx: &mut otter_runtime::HostedModuleCtx<'_>,
-) -> Result<(), String> {
-    Ok(())
-}
-
 fn native_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let object = scope.object().map_err(|error| error.to_string())?;
+) -> Result<Local<'scope>, NativeError> {
+    let object = scope.object()?;
     let caps = caps.clone();
-    let method = scope
-        .native_closure(
-            "spawnSyncRaw",
-            3,
-            &[],
-            move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-                spawn_sync_raw(ctx, args, &caps)
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    scope
-        .set(object, "spawnSyncRaw", method)
-        .map_err(|error| error.to_string())?;
+    let method = scope.native_closure(
+        "spawnSyncRaw",
+        3,
+        &[],
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            spawn_sync_raw(ctx, args, &caps)
+        },
+    )?;
+    scope.set(object, "spawnSyncRaw", method)?;
     Ok(object)
 }
 

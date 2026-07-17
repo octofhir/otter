@@ -2224,6 +2224,31 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         Ok(())
     }
 
+    /// Register a rooted object as one ESM module environment.
+    ///
+    /// The interpreter registry becomes the long-lived GC root before this
+    /// method returns. Hosted installers and ordinary module allocation can
+    /// therefore share the caller's one handle scope without retaining raw
+    /// `JsObject` snapshots in runtime-side records.
+    pub fn register_module_env(
+        &mut self,
+        specifier: &str,
+        env: Local<'_>,
+    ) -> Result<(), NativeError> {
+        let env = self
+            .raw(env)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::register_module_env",
+                reason: "expected an object".to_string(),
+            })?;
+        self.ctx
+            .cx
+            .interp
+            .register_module_env(std::sync::Arc::from(specifier), env);
+        Ok(())
+    }
+
     /// Strictly read a JavaScript string into owned Rust text.
     pub fn string_value(&self, value: Local<'_>) -> Result<String, NativeError> {
         let raw = self.raw(value);

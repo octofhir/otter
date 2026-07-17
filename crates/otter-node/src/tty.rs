@@ -7,14 +7,13 @@
 //!
 //! # Contents
 //! - [`tty_cjs_value`] evaluates the small JS compatibility shim.
-//! - [`install_tty_module`] reserves the ESM namespace for future native I/O.
 //!
 //! # Invariants
 //! - No host file descriptor is opened or inspected.
 //! - Streams default to `isTTY = false`, making color output opt-in.
 //! - The module grants no filesystem or subprocess capability.
 
-use otter_runtime::CapabilitySet;
+use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeScope};
 
 const SHIM: &str = include_str!("tty.js");
@@ -23,11 +22,7 @@ const SHIM: &str = include_str!("tty.js");
 pub fn tty_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     otter_runtime::run_builtin_cjs_shim(scope, "node:tty", SHIM, &[])
-}
-
-/// ESM namespace install. CommonJS is the supported constructor surface.
-pub fn install_tty_module(_ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
-    Ok(())
 }

@@ -15,14 +15,12 @@
 //! - No VM state is retained across host I/O.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use otter_runtime::{
-    CapabilitySet, HostedModuleCtx, HostedNativeCall, RuntimeLocal as Local,
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNativeScope as NativeScope, RuntimeValue as Value, runtime_arg_to_string,
-    runtime_optional_arg_to_string,
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+    RuntimeValue as Value, runtime_arg_to_string, runtime_optional_arg_to_string,
 };
 
 /// Errors produced by the native `node:fs` core.
@@ -49,14 +47,21 @@ pub enum FsError {
 /// Result alias for `node:fs`.
 pub type FsResult<T> = Result<T, FsError>;
 
-/// Install the legacy `node:fs` / `fs` namespace (text sync helpers). Retained
-/// for the ESM install path; the CommonJS surface is built by `fs.js`.
-pub fn install_fs_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    let caps = ctx.capabilities().clone();
-    let read_file_sync = Arc::new(
+/// Build the legacy `node:fs` / `fs` ESM namespace (text sync helpers).
+pub fn install_fs_module<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
+    let read_caps = caps.clone();
+    let read_file_sync = scope.native_closure(
+        "readFileSync",
+        2,
+        &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
             let path = path_arg(ctx, args, 0, "fs.readFileSync")?;
-            require_read(&path, &caps).map_err(fs_error)?;
+            require_read(&path, &read_caps).map_err(fs_error)?;
             let encoding = runtime_optional_arg_to_string(args, 1, ctx.heap());
             let bytes = std::fs::read(&path).map_err(|e| fs_error(io_error(&path, &e)))?;
             if encoding.as_deref().is_some_and(|e| !e.is_empty()) {
@@ -65,31 +70,46 @@ pub fn install_fs_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
                 crate::string_value(ctx, &bytes_to_latin1(&bytes))
             }
         },
-    );
-    let caps = ctx.capabilities().clone();
-    let write_file_sync = Arc::new(
+    )?;
+    scope.set(namespace, "readFileSync", read_file_sync)?;
+
+    let write_caps = caps.clone();
+    let write_file_sync = scope.native_closure(
+        "writeFileSync",
+        3,
+        &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
             let path = path_arg(ctx, args, 0, "fs.writeFileSync")?;
-            require_write(&path, &caps).map_err(fs_error)?;
+            require_write(&path, &write_caps).map_err(fs_error)?;
             let data = runtime_arg_to_string(args, 1, ctx.heap());
             std::fs::write(&path, data.as_bytes()).map_err(|e| fs_error(io_error(&path, &e)))?;
             Ok(Value::undefined())
         },
-    );
-    let caps = ctx.capabilities().clone();
-    let exists_sync = Arc::new(
+    )?;
+    scope.set(namespace, "writeFileSync", write_file_sync)?;
+
+    let exists_caps = caps.clone();
+    let exists_sync = scope.native_closure(
+        "existsSync",
+        1,
+        &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
             let path = path_arg(ctx, args, 0, "fs.existsSync")?;
             Ok(Value::boolean(
-                caps.read.matches_path(&path) && path.exists(),
+                exists_caps.read.matches_path(&path) && path.exists(),
             ))
         },
-    );
-    let caps = ctx.capabilities().clone();
-    let mkdir_sync = Arc::new(
+    )?;
+    scope.set(namespace, "existsSync", exists_sync)?;
+
+    let mkdir_caps = caps.clone();
+    let mkdir_sync = scope.native_closure(
+        "mkdirSync",
+        2,
+        &[],
         move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
             let path = path_arg(ctx, args, 0, "fs.mkdirSync")?;
-            require_write(&path, &caps).map_err(fs_error)?;
+            require_write(&path, &mkdir_caps).map_err(fs_error)?;
             let recursive = args.get(1).is_some_and(truthy);
             let r = if recursive {
                 std::fs::create_dir_all(&path)
@@ -99,16 +119,9 @@ pub fn install_fs_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
             r.map_err(|e| fs_error(io_error(&path, &e)))?;
             Ok(Value::undefined())
         },
-    );
-    ctx.method("readFileSync", 2, HostedNativeCall::dynamic(read_file_sync))?
-        .method(
-            "writeFileSync",
-            3,
-            HostedNativeCall::dynamic(write_file_sync),
-        )?
-        .method("existsSync", 1, HostedNativeCall::dynamic(exists_sync))?
-        .method("mkdirSync", 2, HostedNativeCall::dynamic(mkdir_sync))?;
-    Ok(())
+    )?;
+    scope.set(namespace, "mkdirSync", mkdir_sync)?;
+    Ok(namespace)
 }
 
 const FS_SHIM: &str = include_str!("fs.js");
@@ -118,10 +131,11 @@ const FS_PROMISES_SHIM: &str = "'use strict';\nmodule.exports = require('fs').pr
 pub fn fs_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
     let native = fs_native_value(scope, caps)?;
-    let buffer = crate::buffer::buffer_cjs_value(scope, caps)?;
-    let stream = crate::stream::stream_cjs_value(scope, caps)?;
+    let buffer = crate::buffer::buffer_cjs_value(scope, caps, runtime_task_spawner.clone())?;
+    let stream = crate::stream::stream_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(
         scope,
         "node:fs",
@@ -138,8 +152,9 @@ pub fn fs_cjs_value<'scope>(
 pub fn fs_promises_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let fs = fs_cjs_value(scope, caps)?;
+    runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let fs = fs_cjs_value(scope, caps, runtime_task_spawner)?;
     otter_runtime::run_builtin_cjs_shim(scope, "node:fs/promises", FS_PROMISES_SHIM, &[("fs", fs)])
 }
 
@@ -148,24 +163,20 @@ pub fn fs_promises_cjs_value<'scope>(
 pub fn fs_native_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let object = scope.object().map_err(|error| error.to_string())?;
+) -> Result<Local<'scope>, NativeError> {
+    let object = scope.object()?;
     macro_rules! m {
         ($name:literal, $len:expr, $f:ident) => {{
             let caps = caps.clone();
-            let method = scope
-                .native_closure(
-                    $name,
-                    $len,
-                    &[],
-                    move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-                        $f(ctx, args, &caps)
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            scope
-                .set(object, $name, method)
-                .map_err(|error| error.to_string())?;
+            let method = scope.native_closure(
+                $name,
+                $len,
+                &[],
+                move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+                    $f(ctx, args, &caps)
+                },
+            )?;
+            scope.set(object, $name, method)?;
         }};
     }
 

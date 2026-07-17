@@ -241,13 +241,14 @@ embedder side.
 
 Hosted modules served via `otter:` (built-in), `node:`
 (compatibility shim), and user-defined prefixes. Each invocation
-emits a `pub fn install_<name>_module(&mut HostedModuleCtx<'_>) ->
-Result<(), String>` installer plus a `pub static
+emits a scoped `pub fn install_<name>_module(scope, capabilities,
+task_spawner) -> Result<RuntimeLocal<'scope>, RuntimeNativeError>`
+installer plus a `pub static
 <UPPER>_HOSTED_MODULE: HostedModule` row callers drop into their
 `HOSTED_MODULES` array.
 
 Plain exports — static `fn(ctx, args) -> Result<Value, NativeError>`
-pointers registered through `HostedModuleCtx::builtin_method`:
+pointers installed through `RuntimeNativeScope::native_method`:
 
 ```rust,ignore
 otter_macros::lodge! {
@@ -261,8 +262,8 @@ otter_macros::lodge! {
 ```
 
 Capability-aware exports — each export takes a borrowed
-`&CapabilitySet` snapshot captured at install time, registered as a
-`HostedNativeCall::dynamic` closure:
+`&CapabilitySet` snapshot captured at install time and is installed as a
+rooted `RuntimeNativeScope::native_closure`:
 
 ```rust,ignore
 otter_macros::lodge! {

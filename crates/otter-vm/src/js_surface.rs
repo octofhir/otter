@@ -327,7 +327,6 @@ pub struct ObjectBuilder<'rt> {
     object: RootedObject,
     raw_roots: Vec<*mut otter_gc::raw::RawGc>,
     value_roots: Vec<Value>,
-    _runtime_roots_guard: Option<otter_gc::ExtraRootsGuard>,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
@@ -340,26 +339,8 @@ impl<'rt> ObjectBuilder<'rt> {
             object: RootedObject::new(object),
             raw_roots: Vec::new(),
             value_roots: Vec::new(),
-            _runtime_roots_guard: None,
             _not_send_sync: PhantomData,
         })
-    }
-
-    /// Allocate a fresh host/runtime-owned object and keep the interpreter's
-    /// direct runtime-root provider active for the builder's lifetime.
-    pub fn new_runtime_rooted(
-        interp: &'rt mut crate::Interpreter,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        let runtime_roots_guard = interp.scope_runtime_roots_guard();
-        let object = interp.alloc_host_object_with_roots(&[], &[])?;
-        let mut builder = ObjectBuilder::<'rt>::from_object_with_raw_and_value_roots(
-            interp.gc_heap_mut(),
-            object,
-            Vec::new(),
-            Vec::new(),
-        );
-        builder._runtime_roots_guard = runtime_roots_guard;
-        Ok(builder)
     }
 
     /// Allocate a fresh object through a native context.
@@ -408,7 +389,6 @@ impl<'rt> ObjectBuilder<'rt> {
             object: RootedObject::new(object),
             raw_roots: Vec::new(),
             value_roots: Vec::new(),
-            _runtime_roots_guard: None,
             _not_send_sync: PhantomData,
         }
     }
@@ -426,7 +406,6 @@ impl<'rt> ObjectBuilder<'rt> {
             object: RootedObject::new(object),
             raw_roots: Vec::new(),
             value_roots,
-            _runtime_roots_guard: None,
             _not_send_sync: PhantomData,
         }
     }
@@ -445,7 +424,6 @@ impl<'rt> ObjectBuilder<'rt> {
             object: RootedObject::new(object),
             raw_roots,
             value_roots,
-            _runtime_roots_guard: None,
             _not_send_sync: PhantomData,
         }
     }

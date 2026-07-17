@@ -49,380 +49,104 @@ pub mod util;
 pub mod zlib;
 
 pub use otter_runtime::otter_gc;
-use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuilder};
+use otter_runtime::{HostedModule, OtterBuilder, RuntimeBuilder};
 
 /// Active Node-compatible hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[
-    HostedModule::new_with_cjs_value(
-        "node:fs",
-        HostedModuleInstall::new(fs::install_fs_module),
-        fs::fs_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "fs",
-        HostedModuleInstall::new(fs::install_fs_module),
-        fs::fs_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:fs/promises",
-        HostedModuleInstall::new(fs::install_fs_module),
-        fs::fs_promises_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "fs/promises",
-        HostedModuleInstall::new(fs::install_fs_module),
-        fs::fs_promises_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:assert",
-        HostedModuleInstall::new(assert::install_assert_module),
-        assert::assert_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "assert",
-        HostedModuleInstall::new(assert::install_assert_module),
-        assert::assert_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:assert/strict",
-        HostedModuleInstall::new(assert::install_assert_module),
-        assert::assert_strict_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "assert/strict",
-        HostedModuleInstall::new(assert::install_assert_module),
-        assert::assert_strict_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "internal/assert/myers_diff",
-        HostedModuleInstall::new(assert::install_myers_diff_module),
-        assert::myers_diff_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "internal/util",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::internal_util_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
+    HostedModule::new_with_cjs_value("node:fs", fs::install_fs_module, fs::fs_cjs_value),
+    HostedModule::new_with_cjs_value("fs", fs::install_fs_module, fs::fs_cjs_value),
+    HostedModule::cjs_only("node:fs/promises", fs::fs_promises_cjs_value),
+    HostedModule::cjs_only("fs/promises", fs::fs_promises_cjs_value),
+    HostedModule::cjs_only("node:assert", assert::assert_cjs_value),
+    HostedModule::cjs_only("assert", assert::assert_cjs_value),
+    HostedModule::cjs_only("node:assert/strict", assert::assert_strict_cjs_value),
+    HostedModule::cjs_only("assert/strict", assert::assert_strict_cjs_value),
+    HostedModule::cjs_only("internal/assert/myers_diff", assert::myers_diff_cjs_value),
+    HostedModule::cjs_only("internal/util", misc_modules::internal_util_cjs_value),
+    HostedModule::cjs_only(
         "internal/event_target",
-        HostedModuleInstall::new(misc_modules::install_noop),
         misc_modules::internal_event_target_cjs_value,
     ),
-    HostedModule::new_with_cjs_value(
-        "internal/url",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::internal_url_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
+    HostedModule::cjs_only("internal/url", misc_modules::internal_url_cjs_value),
+    HostedModule::cjs_only(
         "internal/errors",
-        HostedModuleInstall::new(internal_errors_ext::install_internal_errors_module),
         internal_errors_ext::internal_errors_cjs_value,
     ),
-    HostedModule::new_with_cjs_value(
+    HostedModule::cjs_only(
         "internal/test/binding",
-        HostedModuleInstall::new(internal_test_binding_ext::install_internal_test_binding_module),
         internal_test_binding_ext::internal_test_binding_cjs_value,
     ),
-    HostedModule::new_with_cjs_value(
-        "node:vm",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::vm_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "vm",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::vm_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:process",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::process_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "process",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::process_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:path",
-        HostedModuleInstall::new(path::install_path_module),
-        path::path_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "path",
-        HostedModuleInstall::new(path::install_path_module),
-        path::path_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:events",
-        HostedModuleInstall::new(events::install_events_module),
-        events::events_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "events",
-        HostedModuleInstall::new(events::install_events_module),
-        events::events_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:os",
-        HostedModuleInstall::new(os::install_os_module),
-        os::os_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "os",
-        HostedModuleInstall::new(os::install_os_module),
-        os::os_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:test",
-        HostedModuleInstall::new(node_test::install_node_test_module),
-        node_test::node_test_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "test",
-        HostedModuleInstall::new(node_test::install_node_test_module),
-        node_test::node_test_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:stream",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:stream/web",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_web_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "stream/web",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_web_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:stream/consumers",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_consumers_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "stream/consumers",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_consumers_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:stream/promises",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_promises_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "stream/promises",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_promises_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:timers",
-        HostedModuleInstall::new(timers::install_noop),
-        timers::timers_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "timers",
-        HostedModuleInstall::new(timers::install_noop),
-        timers::timers_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:timers/promises",
-        HostedModuleInstall::new(timers::install_noop),
-        timers::timers_promises_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "timers/promises",
-        HostedModuleInstall::new(timers::install_noop),
-        timers::timers_promises_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:readline",
-        HostedModuleInstall::new(readline::install_readline_module),
-        readline::readline_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "readline",
-        HostedModuleInstall::new(readline::install_readline_module),
-        readline::readline_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:readline/promises",
-        HostedModuleInstall::new(readline::install_readline_module),
-        readline::readline_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "readline/promises",
-        HostedModuleInstall::new(readline::install_readline_module),
-        readline::readline_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:cluster",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::cluster_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "cluster",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::cluster_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:crypto",
-        HostedModuleInstall::new(crypto::install_crypto_module),
-        crypto::crypto_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "crypto",
-        HostedModuleInstall::new(crypto::install_crypto_module),
-        crypto::crypto_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:zlib",
-        HostedModuleInstall::new(zlib::install_zlib_module),
-        zlib::zlib_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "zlib",
-        HostedModuleInstall::new(zlib::install_zlib_module),
-        zlib::zlib_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:perf_hooks",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::perf_hooks_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "perf_hooks",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::perf_hooks_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:v8",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::v8_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "v8",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::v8_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:module",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::module_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "module",
-        HostedModuleInstall::new(misc_modules::install_noop),
-        misc_modules::module_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
+    HostedModule::cjs_only("node:vm", misc_modules::vm_cjs_value),
+    HostedModule::cjs_only("vm", misc_modules::vm_cjs_value),
+    HostedModule::cjs_only("node:process", misc_modules::process_cjs_value),
+    HostedModule::cjs_only("process", misc_modules::process_cjs_value),
+    HostedModule::new_with_cjs_value("node:path", path::install_path_module, path::path_cjs_value),
+    HostedModule::new_with_cjs_value("path", path::install_path_module, path::path_cjs_value),
+    HostedModule::cjs_only("node:events", events::events_cjs_value),
+    HostedModule::cjs_only("events", events::events_cjs_value),
+    HostedModule::new_with_cjs_value("node:os", os::install_os_module, os::os_cjs_value),
+    HostedModule::new_with_cjs_value("os", os::install_os_module, os::os_cjs_value),
+    HostedModule::cjs_only("node:test", node_test::node_test_cjs_value),
+    HostedModule::cjs_only("test", node_test::node_test_cjs_value),
+    HostedModule::cjs_only("node:stream", stream::stream_cjs_value),
+    HostedModule::cjs_only("node:stream/web", stream::stream_web_cjs_value),
+    HostedModule::cjs_only("stream/web", stream::stream_web_cjs_value),
+    HostedModule::cjs_only("node:stream/consumers", stream::stream_consumers_cjs_value),
+    HostedModule::cjs_only("stream/consumers", stream::stream_consumers_cjs_value),
+    HostedModule::cjs_only("node:stream/promises", stream::stream_promises_cjs_value),
+    HostedModule::cjs_only("stream/promises", stream::stream_promises_cjs_value),
+    HostedModule::cjs_only("node:timers", timers::timers_cjs_value),
+    HostedModule::cjs_only("timers", timers::timers_cjs_value),
+    HostedModule::cjs_only("node:timers/promises", timers::timers_promises_cjs_value),
+    HostedModule::cjs_only("timers/promises", timers::timers_promises_cjs_value),
+    HostedModule::cjs_only("node:readline", readline::readline_cjs_value),
+    HostedModule::cjs_only("readline", readline::readline_cjs_value),
+    HostedModule::cjs_only("node:readline/promises", readline::readline_cjs_value),
+    HostedModule::cjs_only("readline/promises", readline::readline_cjs_value),
+    HostedModule::cjs_only("node:cluster", misc_modules::cluster_cjs_value),
+    HostedModule::cjs_only("cluster", misc_modules::cluster_cjs_value),
+    HostedModule::cjs_only("node:crypto", crypto::crypto_cjs_value),
+    HostedModule::cjs_only("crypto", crypto::crypto_cjs_value),
+    HostedModule::cjs_only("node:zlib", zlib::zlib_cjs_value),
+    HostedModule::cjs_only("zlib", zlib::zlib_cjs_value),
+    HostedModule::cjs_only("node:perf_hooks", misc_modules::perf_hooks_cjs_value),
+    HostedModule::cjs_only("perf_hooks", misc_modules::perf_hooks_cjs_value),
+    HostedModule::cjs_only("node:v8", misc_modules::v8_cjs_value),
+    HostedModule::cjs_only("v8", misc_modules::v8_cjs_value),
+    HostedModule::cjs_only("node:module", misc_modules::module_cjs_value),
+    HostedModule::cjs_only("module", misc_modules::module_cjs_value),
+    HostedModule::cjs_only(
         "node:diagnostics_channel",
-        HostedModuleInstall::new(diagnostics_channel::install_diagnostics_channel_module),
         diagnostics_channel::diagnostics_channel_cjs_value,
     ),
-    HostedModule::new_with_cjs_value(
+    HostedModule::cjs_only(
         "diagnostics_channel",
-        HostedModuleInstall::new(diagnostics_channel::install_diagnostics_channel_module),
         diagnostics_channel::diagnostics_channel_cjs_value,
     ),
-    HostedModule::new_with_cjs_value(
-        "stream",
-        HostedModuleInstall::new(stream::install_stream_module),
-        stream::stream_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:querystring",
-        HostedModuleInstall::new(querystring::install_querystring_module),
-        querystring::querystring_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "querystring",
-        HostedModuleInstall::new(querystring::install_querystring_module),
-        querystring::querystring_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
+    HostedModule::cjs_only("stream", stream::stream_cjs_value),
+    HostedModule::cjs_only("node:querystring", querystring::querystring_cjs_value),
+    HostedModule::cjs_only("querystring", querystring::querystring_cjs_value),
+    HostedModule::cjs_only(
         "node:string_decoder",
-        HostedModuleInstall::new(string_decoder::install_string_decoder_module),
         string_decoder::string_decoder_cjs_value,
     ),
-    HostedModule::new_with_cjs_value(
-        "string_decoder",
-        HostedModuleInstall::new(string_decoder::install_string_decoder_module),
-        string_decoder::string_decoder_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:util",
-        HostedModuleInstall::new(util::install_util_module),
-        util::util_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "util",
-        HostedModuleInstall::new(util::install_util_module),
-        util::util_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:util/types",
-        HostedModuleInstall::new(util::install_util_module),
-        util::util_types_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "util/types",
-        HostedModuleInstall::new(util::install_util_module),
-        util::util_types_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:tty",
-        HostedModuleInstall::new(tty::install_tty_module),
-        tty::tty_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "tty",
-        HostedModuleInstall::new(tty::install_tty_module),
-        tty::tty_cjs_value,
-    ),
-    HostedModule::new("node:net", HostedModuleInstall::new(stubs::install_net)),
-    HostedModule::new("net", HostedModuleInstall::new(stubs::install_net)),
-    HostedModule::new(
-        "node:worker_threads",
-        HostedModuleInstall::new(stubs::install_worker_threads),
-    ),
-    HostedModule::new(
-        "worker_threads",
-        HostedModuleInstall::new(stubs::install_worker_threads),
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:buffer",
-        HostedModuleInstall::new(buffer::install_buffer_module),
-        buffer::buffer_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "buffer",
-        HostedModuleInstall::new(buffer::install_buffer_module),
-        buffer::buffer_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:url",
-        HostedModuleInstall::new(url::install_url_module),
-        url::url_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "url",
-        HostedModuleInstall::new(url::install_url_module),
-        url::url_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "node:child_process",
-        HostedModuleInstall::new(child_process::install_child_process_module),
-        child_process::child_process_cjs_value,
-    ),
-    HostedModule::new_with_cjs_value(
-        "child_process",
-        HostedModuleInstall::new(child_process::install_child_process_module),
-        child_process::child_process_cjs_value,
-    ),
+    HostedModule::cjs_only("string_decoder", string_decoder::string_decoder_cjs_value),
+    HostedModule::cjs_only("node:util", util::util_cjs_value),
+    HostedModule::cjs_only("util", util::util_cjs_value),
+    HostedModule::cjs_only("node:util/types", util::util_types_cjs_value),
+    HostedModule::cjs_only("util/types", util::util_types_cjs_value),
+    HostedModule::cjs_only("node:tty", tty::tty_cjs_value),
+    HostedModule::cjs_only("tty", tty::tty_cjs_value),
+    HostedModule::new("node:net", stubs::install_net),
+    HostedModule::new("net", stubs::install_net),
+    HostedModule::new("node:worker_threads", stubs::install_worker_threads),
+    HostedModule::new("worker_threads", stubs::install_worker_threads),
+    HostedModule::cjs_only("node:buffer", buffer::buffer_cjs_value),
+    HostedModule::cjs_only("buffer", buffer::buffer_cjs_value),
+    HostedModule::new_with_cjs_value("node:url", url::install_url_module, url::url_cjs_value),
+    HostedModule::new_with_cjs_value("url", url::install_url_module, url::url_cjs_value),
+    HostedModule::cjs_only("node:child_process", child_process::child_process_cjs_value),
+    HostedModule::cjs_only("child_process", child_process::child_process_cjs_value),
 ];
 
 /// Return active Node hosted module installers.

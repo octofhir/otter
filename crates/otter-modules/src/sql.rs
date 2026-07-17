@@ -7,10 +7,9 @@ use std::path::{Path, PathBuf};
 
 use otter_runtime::CapabilitySet;
 use otter_runtime::{
-    RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeLocal,
+    RuntimeAttr as Attr, RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeLocal,
     RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeScope,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_this_object,
-    runtime_with_host_data_mut,
+    RuntimeValue as Value, runtime_this_object, runtime_with_host_data_mut,
 };
 use rusqlite::types::{ToSqlOutput, Value as SqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags};
@@ -206,23 +205,31 @@ fn open_sql(
         SqlDatabase::open(&path, capabilities)
             .map_err(|err| crate::type_error("openSql", err.to_string()))?
     };
-    let object = build_database_object(ctx, db)?;
-    Ok(Value::object(object))
+    ctx.scope(|mut scope| {
+        let object = build_database_object(&mut scope, db)?;
+        Ok(scope.finish(object))
+    })
 }
 
-fn build_database_object(
-    ctx: &mut NativeCtx<'_>,
+fn build_database_object<'scope>(
+    scope: &mut RuntimeNativeScope<'scope, '_>,
     db: SqlDatabase,
-) -> Result<JsObject, NativeError> {
-    let mut builder = ObjectBuilder::from_host_data(ctx, db)?;
-    builder
-        .builtin_method("execute", 1, method_execute)
-        .map_err(|err| crate::type_error("SqlDatabase", err.to_string()))?
-        .builtin_method("query", 1, method_query)
-        .map_err(|err| crate::type_error("SqlDatabase", err.to_string()))?
-        .builtin_method("queryOne", 1, method_query_one)
-        .map_err(|err| crate::type_error("SqlDatabase", err.to_string()))?;
-    Ok(builder.build())
+) -> Result<RuntimeLocal<'scope>, NativeError> {
+    let object = scope.host_object(db)?;
+    let attrs = Attr::builtin_function().to_flags();
+    for (name, length, call) in [
+        (
+            "execute",
+            1,
+            method_execute as otter_runtime::RuntimeNativeFastFn,
+        ),
+        ("query", 1, method_query),
+        ("queryOne", 1, method_query_one),
+    ] {
+        let method = scope.native_method(name, length, call)?;
+        scope.define(object, name, method, attrs)?;
+    }
+    Ok(object)
 }
 
 fn database_receiver(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsObject, NativeError> {

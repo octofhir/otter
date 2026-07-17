@@ -18,7 +18,9 @@
 //!   `process.env` proxy; they never read the host environment directly.
 //! - No VM values are retained across the FFI calls; results are copied out.
 
-use otter_runtime::{CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope};
+use otter_runtime::{
+    CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
+};
 use otter_vm::{ErrorKind, NativeCtx, NativeError, Value, object, object::PropertyFlags};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -81,15 +83,19 @@ const OS_METHODS: &[Method] = &[
     ("setPriority", 2, os_set_priority),
 ];
 
-/// ESM namespace install (methods only; `EOL`/`devNull`/`constants` are on the
-/// CJS value and are also set here for parity).
-pub fn install_os_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result<(), String> {
+/// ESM namespace install. Data-only `EOL`/`devNull`/`constants` remain on the
+/// richer CommonJS value.
+pub fn install_os_module<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    _caps: &CapabilitySet,
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let namespace = scope.bare_object()?;
     for (name, len, f) in OS_METHODS {
-        ctx.builtin_method(name, *len, *f)?;
+        let method = scope.native_method(name, *len, *f)?;
+        scope.set(namespace, name, method)?;
     }
-    // `EOL` / `devNull` / `constants` are string/object data the install ctx
-    // cannot allocate; they ride on the CommonJS export value instead.
-    Ok(())
+    Ok(namespace)
 }
 
 /// CommonJS export: the `os` namespace with methods + `EOL`/`devNull` +
@@ -97,59 +103,38 @@ pub fn install_os_module(ctx: &mut otter_runtime::HostedModuleCtx<'_>) -> Result
 pub fn os_cjs_value<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     _caps: &CapabilitySet,
-) -> Result<Local<'scope>, String> {
-    let os = scope.object().map_err(|error| error.to_string())?;
-    let coerce = scope
-        .native_method("toString", 0, os_method_to_primitive)
-        .map_err(|error| error.to_string())?;
+    _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+) -> Result<Local<'scope>, NativeError> {
+    let os = scope.object()?;
+    let coerce = scope.native_method("toString", 0, os_method_to_primitive)?;
     for (name, len, f) in OS_METHODS {
         scope.scope(|mut method_scope| {
-            let method = method_scope
-                .native_method(name, *len, *f)
-                .map_err(|error| error.to_string())?;
+            let method = method_scope.native_method(name, *len, *f)?;
             if os_method_is_primitive_coercible(name) {
                 let flags = PropertyFlags::new(true, false, true);
-                method_scope
-                    .define(method, "toString", coerce, flags)
-                    .map_err(|error| error.to_string())?;
-                method_scope
-                    .define(method, "valueOf", coerce, flags)
-                    .map_err(|error| error.to_string())?;
+                method_scope.define(method, "toString", coerce, flags)?;
+                method_scope.define(method, "valueOf", coerce, flags)?;
             }
-            method_scope
-                .set(os, name, method)
-                .map_err(|error| error.to_string())
+            method_scope.set(os, name, method)
         })?;
     }
 
     // EOL must throw on assignment (strict mode) yet stay redefinable.
-    let eol = scope.string(ctx_eol()).map_err(|error| error.to_string())?;
-    scope
-        .define(os, "EOL", eol, PropertyFlags::new(false, true, true))
-        .map_err(|error| error.to_string())?;
-    let dev_null = scope
-        .string(dev_null())
-        .map_err(|error| error.to_string())?;
-    scope
-        .set(os, "devNull", dev_null)
-        .map_err(|error| error.to_string())?;
+    let eol = scope.string(ctx_eol())?;
+    scope.define(os, "EOL", eol, PropertyFlags::new(false, true, true))?;
+    let dev_null = scope.string(dev_null())?;
+    scope.set(os, "devNull", dev_null)?;
 
-    let constants = scope.object().map_err(|error| error.to_string())?;
-    let priority = scope.object().map_err(|error| error.to_string())?;
+    let constants = scope.object()?;
+    let priority = scope.object()?;
     for (name, value) in PRIORITY {
         scope.scope(|mut field_scope| {
             let value = field_scope.number(*value);
-            field_scope
-                .set(priority, name, value)
-                .map_err(|error| error.to_string())
+            field_scope.set(priority, name, value)
         })?;
     }
-    scope
-        .set(constants, "priority", priority)
-        .map_err(|error| error.to_string())?;
-    scope
-        .set(os, "constants", constants)
-        .map_err(|error| error.to_string())?;
+    scope.set(constants, "priority", priority)?;
+    scope.set(os, "constants", constants)?;
 
     Ok(os)
 }

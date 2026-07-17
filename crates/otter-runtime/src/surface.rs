@@ -8,7 +8,6 @@
 //! - Runtime-owned aliases for native values, calls, attributes, and specs.
 //! - Helper constructors for methods, accessors, constants, classes, and
 //!   namespaces.
-//! - [`RuntimeObjectBuilder`] for mutator-bound object construction.
 //! - Host-object helper functions for Rust-owned receiver state.
 //!
 //! # Invariants
@@ -291,130 +290,6 @@ pub const fn runtime_namespace(
         accessors,
         constants,
         attrs,
-    }
-}
-
-/// Mutator-bound runtime object builder.
-pub struct RuntimeObjectBuilder<'rt> {
-    inner: otter_vm::ObjectBuilder<'rt>,
-}
-
-impl<'rt> RuntimeObjectBuilder<'rt> {
-    pub(crate) fn new_in_interpreter(
-        interp: &'rt mut otter_vm::Interpreter,
-    ) -> Result<Self, otter_gc::OutOfMemory> {
-        Ok(Self {
-            inner: otter_vm::ObjectBuilder::new_runtime_rooted(interp)?,
-        })
-    }
-
-    /// Allocate a fresh ordinary object through the current native context.
-    pub fn new<'a>(
-        ctx: &'a mut RuntimeNativeCtx<'_>,
-    ) -> Result<RuntimeObjectBuilder<'a>, otter_gc::OutOfMemory> {
-        Self::new_in_ctx(ctx)
-    }
-
-    /// Allocate a fresh object through the current native context.
-    pub fn new_in_ctx<'a>(
-        ctx: &'a mut RuntimeNativeCtx<'_>,
-    ) -> Result<RuntimeObjectBuilder<'a>, otter_gc::OutOfMemory> {
-        Ok(RuntimeObjectBuilder {
-            inner: otter_vm::ObjectBuilder::new_in_ctx(ctx)?,
-        })
-    }
-
-    /// Allocate a fresh object with Rust-owned host data and bind a builder to
-    /// it. Contributor code can use this to create receiver-backed objects
-    /// without touching VM heap/object internals.
-    pub fn from_host_data<'a, T: RuntimeHostObjectData>(
-        ctx: &'a mut RuntimeNativeCtx<'_>,
-        data: T,
-    ) -> Result<RuntimeObjectBuilder<'a>, otter_gc::OutOfMemory> {
-        let object = ctx.alloc_host_object(data)?;
-        Ok(Self::from_object(ctx, object))
-    }
-
-    /// Bind a builder to an existing object through the current native context.
-    #[must_use]
-    pub fn from_object<'a>(
-        ctx: &'a mut RuntimeNativeCtx<'_>,
-        object: RuntimeJsObject,
-    ) -> RuntimeObjectBuilder<'a> {
-        RuntimeObjectBuilder {
-            inner: otter_vm::ObjectBuilder::from_object_in_ctx(ctx, object),
-        }
-    }
-
-    /// Define a data property.
-    pub fn property(
-        &mut self,
-        name: &'static str,
-        value: RuntimeValue,
-        attrs: RuntimeAttr,
-    ) -> Result<&mut Self, RuntimeSurfaceError> {
-        self.inner.property(name, value, attrs)?;
-        Ok(self)
-    }
-
-    /// Define an ordinary data property.
-    pub fn data_property(
-        &mut self,
-        name: &'static str,
-        value: RuntimeValue,
-    ) -> Result<&mut Self, RuntimeSurfaceError> {
-        self.property(name, value, RuntimeAttr::data())
-    }
-
-    /// Define a read-only builtin data property.
-    pub fn readonly_property(
-        &mut self,
-        name: &'static str,
-        value: RuntimeValue,
-    ) -> Result<&mut Self, RuntimeSurfaceError> {
-        self.property(name, value, RuntimeAttr::read_only())
-    }
-
-    /// Define a native method.
-    pub fn method(
-        &mut self,
-        name: &'static str,
-        length: u8,
-        call: RuntimeNativeCall,
-        attrs: RuntimeAttr,
-    ) -> Result<&mut Self, RuntimeSurfaceError> {
-        self.inner.method(name, length, call, attrs)?;
-        Ok(self)
-    }
-
-    /// Define a builtin native method using the static function-pointer path.
-    pub fn builtin_method(
-        &mut self,
-        name: &'static str,
-        length: u8,
-        call: RuntimeNativeFastFn,
-    ) -> Result<&mut Self, RuntimeSurfaceError> {
-        self.method(
-            name,
-            length,
-            runtime_native_static(call),
-            RuntimeAttr::builtin_function(),
-        )
-    }
-
-    /// Define a method from a runtime method spec.
-    pub fn method_from_spec(
-        &mut self,
-        spec: &RuntimeMethodSpec,
-    ) -> Result<&mut Self, RuntimeSurfaceError> {
-        self.inner.method_from_spec(spec)?;
-        Ok(self)
-    }
-
-    /// Finish object construction.
-    #[must_use]
-    pub fn build(self) -> RuntimeJsObject {
-        self.inner.build()
     }
 }
 

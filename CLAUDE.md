@@ -156,8 +156,22 @@ every run — the O(N) walk over the slot table adds noticeable overhead.
 
 ### Node.js Compatibility
 
-`node-compat` is parked. Do not treat the old Node.js compatibility runner as
-an active workflow until it is rebuilt on top of `otter-runtime` + `otter-vm`.
+`crates/otter-node-compat` runs the official `nodejs/node@main` corpus
+(`test/parallel` + `test/sequential`) against the release binary. The corpus is
+never filtered: a test Otter cannot pass is a failure to fix, not a test to
+skip.
+
+```bash
+bash scripts/fetch-node-tests.sh   # refresh the vendored corpus from node main
+just node-compat                   # full corpus (slow); refreshes NODE_CONFORMANCE.md
+just node-compat fs                # one module (modules follow node's test-<module>-* naming)
+```
+
+Each run regenerates `NODE_CONFORMANCE.md` and the site dashboard data at
+`docs/site/public/node-conformance/data.json`.
+
+The parked surface is `crates-legacy/otter-node-compat`; do not add
+dependencies on it.
 
 ### Test-Driven Development Workflow
 When working on features with conformance tests:

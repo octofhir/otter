@@ -1,13 +1,16 @@
-//! Config-driven Node.js compatibility runner.
+//! Node.js compatibility runner over the official test corpus.
 //!
 //! # Contents
-//! - TOML selection of official JavaScript tests by module and filename glob.
+//! - Full-corpus execution of the vendored `test/parallel` and
+//!   `test/sequential` suites, grouped into modules by Node's own test naming.
 //! - Configured integration commands for compatibility surfaces that need
 //!   build fixtures, such as native Node-API addons.
-//! - Watchdog execution and generated JSON/Markdown conformance reports.
+//! - Watchdog execution and generated JSON/Markdown/dashboard conformance
+//!   reports.
 //!
 //! # Invariants
-//! - Only tests selected by `node_compat_config.toml` enter the report.
+//! - Every vendored test file runs; the corpus is never pre-filtered, so the
+//!   report always states the true number of unsupported behaviours.
 //! - The default tested Otter binary is always rebuilt in release mode.
 //! - Every child runs in its own process group and is terminated by the
 //!   external watchdog on timeout.
@@ -16,6 +19,7 @@
 //! # See also
 //! - `node_compat_config.toml`
 //! - `NODE_CONFORMANCE.md`
+//! - `docs/site/src/content/docs/conformance/nodejs.mdx`
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -32,17 +36,12 @@ use serde::{Deserialize, Serialize};
 pub struct NodeCompatConfig {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
-    pub modules: BTreeMap<String, NodeCompatModuleConfig>,
+    /// Per-module timeout overrides for modules whose tests are legitimately
+    /// slower than the global budget. Never used to exclude tests.
+    #[serde(default)]
+    pub module_timeouts: BTreeMap<String, u64>,
     #[serde(default)]
     pub integration_tests: Vec<NodeCompatIntegrationTest>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct NodeCompatModuleConfig {
-    pub patterns: Vec<String>,
-    #[serde(default)]
-    pub skip: Vec<String>,
-    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +66,13 @@ pub struct RunOptions {
 }
 
 impl RunOptions {
+    /// A run that narrows the corpus measures a slice, not conformance, so its
+    /// numbers must never reach the published baseline.
+    #[must_use]
+    pub fn is_full_corpus(&self) -> bool {
+        self.selected_modules.is_empty() && self.substring_filter.is_none() && self.limit.is_none()
+    }
+
     #[must_use]
     pub fn new(workspace_root: PathBuf) -> Self {
         Self {
@@ -86,6 +92,10 @@ pub struct RunReport {
     pub timestamp: DateTime<Utc>,
     pub otter_version: String,
     pub otter_binary: String,
+    /// `nodejs/node` commit the vendored corpus was checked out from; every
+    /// reported test links back to its source at this revision.
+    pub node_commit: String,
+    pub engine_commit: String,
     pub duration_secs: f64,
     pub summary: RunSummary,
     pub results: Vec<TestResult>,
@@ -153,8 +163,11 @@ enum PlannedTestKind {
     Command { program: String, args: Vec<String> },
 }
 
-const NODE_TEST_ROOT: &str = "tests/node-compat/node/test/parallel";
+const NODE_CHECKOUT: &str = "tests/node-compat/node";
+const NODE_TEST_ROOT: &str = "tests/node-compat/node/test";
+const NODE_SUITES: [&str; 2] = ["parallel", "sequential"];
 const REPORT_DIR: &str = "tests/node-compat/reports";
+const SITE_DATA: &str = "docs/site/public/node-conformance/data.json";
 const WATCHDOG_MIN_GRACE_SECS: u64 = 5;
 
 fn default_timeout_secs() -> u64 {
@@ -187,13 +200,35 @@ pub fn run(options: RunOptions) -> Result<RunReport> {
         timestamp: Utc::now(),
         otter_version: env!("CARGO_PKG_VERSION").to_string(),
         otter_binary: otter_bin.display().to_string(),
+        node_commit: git_commit(&options.workspace_root.join(NODE_CHECKOUT)),
+        engine_commit: git_commit(&options.workspace_root),
         duration_secs: started_at.elapsed().as_secs_f64(),
         summary: summarize_results(&results),
         results,
     };
     write_report(&options.workspace_root, &report)?;
-    write_conformance_markdown(&options.workspace_root, &report)?;
+    if options.is_full_corpus() {
+        write_conformance_markdown(&options.workspace_root, &report)?;
+        write_site_data(&options.workspace_root, &report)?;
+    }
     Ok(report)
+}
+
+/// Resolve the checked-out revision of a repository so every reported test can
+/// link to the exact source it ran against. Missing git metadata is reported as
+/// `unknown` rather than failing the run.
+fn git_commit(repo: &Path) -> String {
+    Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|commit| commit.trim().to_string())
+        .filter(|commit| !commit.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn load_config(path: &Path) -> Result<NodeCompatConfig> {
@@ -239,36 +274,33 @@ fn collect_tests(
     config: &NodeCompatConfig,
     options: &RunOptions,
 ) -> Result<Vec<PlannedTest>> {
-    let root = workspace_root.join(NODE_TEST_ROOT);
-    let files = std::fs::read_dir(&root)
-        .with_context(|| format!("failed to read Node test root '{}'", root.display()))?;
-
-    let available: Vec<_> = files
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("js"))
-        .collect();
-
     let selected: HashMap<&str, ()> = options
         .selected_modules
         .iter()
         .map(|m| (m.as_str(), ()))
         .collect();
     let mut planned = Vec::new();
-    for (module, module_config) in &config.modules {
-        if !selected.is_empty() && !selected.contains_key(module.as_str()) {
+
+    for suite in NODE_SUITES {
+        let root = workspace_root.join(NODE_TEST_ROOT).join(suite);
+        if !root.exists() {
             continue;
         }
-        for path in &available {
+        let files = std::fs::read_dir(&root)
+            .with_context(|| format!("failed to read Node test suite '{}'", root.display()))?;
+        for entry in files.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if !matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("js" | "mjs")
+            ) {
+                continue;
+            }
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if module_config.skip.iter().any(|skip| skip == file_name)
-                || !module_config
-                    .patterns
-                    .iter()
-                    .any(|pattern| wildcard_matches(pattern, file_name))
-            {
+            let module = module_of(file_name);
+            if !selected.is_empty() && !selected.contains_key(module.as_str()) {
                 continue;
             }
             if let Some(filter) = &options.substring_filter
@@ -277,10 +309,10 @@ fn collect_tests(
                 continue;
             }
             planned.push(PlannedTest {
-                display_path: format!("{module}/{file_name}"),
-                module: module.clone(),
+                display_path: format!("{suite}/{file_name}"),
+                timeout_secs: config.module_timeouts.get(&module).copied(),
+                module,
                 kind: PlannedTestKind::NodeJs(path.clone()),
-                timeout_secs: module_config.timeout_secs,
             });
         }
     }
@@ -312,36 +344,17 @@ fn collect_tests(
     Ok(planned)
 }
 
-/// Match the config's filename globs without parsing or transforming JS.
-/// Node test names are ASCII; `*` and `?` use the conventional glob meaning.
-fn wildcard_matches(pattern: &str, text: &str) -> bool {
-    let pattern = pattern.as_bytes();
-    let text = text.as_bytes();
-    let (mut pattern_index, mut text_index) = (0, 0);
-    let (mut star, mut star_text_index) = (None, 0);
-
-    while text_index < text.len() {
-        if pattern_index < pattern.len()
-            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
-        {
-            pattern_index += 1;
-            text_index += 1;
-        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-            star = Some(pattern_index);
-            pattern_index += 1;
-            star_text_index = text_index;
-        } else if let Some(star_index) = star {
-            pattern_index = star_index + 1;
-            star_text_index += 1;
-            text_index = star_text_index;
-        } else {
-            return false;
-        }
-    }
-    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
-        pattern_index += 1;
-    }
-    pattern_index == pattern.len()
+/// Group a test into a module the way Node names its own files: the segment
+/// after the `test-` prefix (`test-fs-read-stream.js` -> `fs`). Files that do
+/// not follow the convention keep their stem, so nothing is silently merged.
+fn module_of(file_name: &str) -> String {
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _extension)| stem);
+    let body = stem.strip_prefix("test-").unwrap_or(stem);
+    body.split_once('-')
+        .map_or(body, |(module, _rest)| module)
+        .to_string()
 }
 
 fn run_one_test(
@@ -606,6 +619,12 @@ fn write_conformance_markdown(workspace_root: &Path, report: &RunReport) -> Resu
     ));
     out.push_str(&format!("- Otter version: `{}`\n", report.otter_version));
     out.push_str(&format!("- Otter binary: `{}`\n", report.otter_binary));
+    out.push_str(&format!("- Otter commit: `{}`\n", report.engine_commit));
+    out.push_str(&format!(
+        "- Node corpus: [`nodejs/node@{}`](https://github.com/nodejs/node/tree/{}/test)\n",
+        short_commit(&report.node_commit),
+        report.node_commit
+    ));
     out.push_str(&format!("- Duration: {:.1}s\n\n", report.duration_secs));
 
     out.push_str("## Summary\n\n");
@@ -668,23 +687,143 @@ fn write_conformance_markdown(workspace_root: &Path, report: &RunReport) -> Resu
         out.push('\n');
     }
 
+    out.push_str(
+        "The interactive per-test breakdown, including every failure reason, \
+         lives on the documentation site under Conformance → Node.js.\n",
+    );
+
     std::fs::write(workspace_root.join("NODE_CONFORMANCE.md"), out)
         .context("failed to write NODE_CONFORMANCE.md")?;
     Ok(())
+}
+
+fn short_commit(commit: &str) -> &str {
+    if commit.len() >= 8 {
+        &commit[..8]
+    } else {
+        commit
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct SectionTotals {
+    total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    crashed: usize,
+    timed_out: usize,
+    oom: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FailingTest {
+    path: String,
+    outcome: &'static str,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SiteData {
+    node_commit: String,
+    engine_commit: String,
+    ran_at: DateTime<Utc>,
+    totals: SectionTotals,
+    by_section: BTreeMap<String, SectionTotals>,
+    failing_tests: Vec<FailingTest>,
+}
+
+/// Publish the dashboard payload consumed by the documentation site. The shape
+/// mirrors the Test262 baseline so both suites render through one component.
+fn write_site_data(workspace_root: &Path, report: &RunReport) -> Result<()> {
+    let mut data = SiteData {
+        node_commit: report.node_commit.clone(),
+        engine_commit: report.engine_commit.clone(),
+        ran_at: report.timestamp,
+        totals: SectionTotals::default(),
+        by_section: BTreeMap::new(),
+        failing_tests: Vec::new(),
+    };
+
+    for result in &report.results {
+        let suite = result
+            .path
+            .split_once('/')
+            .map_or("integration", |(suite, _file)| suite);
+        let section = format!("{suite}/{}", result.module);
+        let entry = data.by_section.entry(section).or_default();
+        for totals in [&mut data.totals, entry] {
+            totals.total += 1;
+            match result.outcome {
+                Outcome::Pass => totals.passed += 1,
+                Outcome::Fail => totals.failed += 1,
+                Outcome::Skipped => totals.skipped += 1,
+                Outcome::Timeout => totals.timed_out += 1,
+                Outcome::Crashed => totals.crashed += 1,
+            }
+        }
+
+        // Outcome names are the dashboard's badge classes, shared with the
+        // Test262 baseline.
+        let outcome = match result.outcome {
+            Outcome::Fail => "fail",
+            Outcome::Timeout => "timeout",
+            Outcome::Crashed => "crash",
+            Outcome::Pass | Outcome::Skipped => continue,
+        };
+        data.failing_tests.push(FailingTest {
+            path: result.path.clone(),
+            outcome,
+            reason: failure_reason(result),
+        });
+    }
+
+    let path = workspace_root.join(SITE_DATA);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create site data dir '{}'", parent.display()))?;
+    }
+    let json = serde_json::to_string(&data).context("failed to serialize site conformance data")?;
+    std::fs::write(&path, json)
+        .with_context(|| format!("failed to write site data '{}'", path.display()))?;
+    Ok(())
+}
+
+/// Condense a captured child's output into one dashboard-sized line. Node tests
+/// print full assertion dumps, so the first meaningful line carries the signal.
+fn failure_reason(result: &TestResult) -> String {
+    const MAX_REASON_CHARS: usize = 240;
+    let Some(error) = &result.error else {
+        return match result.outcome {
+            Outcome::Timeout => "timed out with no output".to_string(),
+            Outcome::Crashed => "crashed with no output".to_string(),
+            _ => "no output".to_string(),
+        };
+    };
+    let line = error
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output");
+    if line.chars().count() <= MAX_REASON_CHARS {
+        return line.to_string();
+    }
+    let truncated: String = line.chars().take(MAX_REASON_CHARS).collect();
+    format!("{truncated}…")
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-    use super::{Outcome, RunOptions, run, wildcard_matches};
+    use super::{Outcome, RunOptions, module_of, run};
 
     #[test]
-    fn config_filename_globs_match_expected_node_tests() {
-        assert!(wildcard_matches("test-util-*.js", "test-util-format.js"));
-        assert!(wildcard_matches("test-path.js", "test-path.js"));
-        assert!(!wildcard_matches("test-path.js", "test-path-extra.js"));
-        assert!(wildcard_matches("test-?-x.js", "test-a-x.js"));
+    fn modules_follow_node_test_naming() {
+        assert_eq!(module_of("test-util-format.js"), "util");
+        assert_eq!(module_of("test-path.js"), "path");
+        assert_eq!(module_of("test-fs-read-stream.mjs"), "fs");
+        assert_eq!(module_of("worker-metadata.js"), "worker");
     }
 
     #[test]
@@ -709,7 +848,7 @@ mod tests {
         let workspace = temp_test_root("timeout");
         std::fs::write(
             workspace.join("node_compat_config.toml"),
-            "timeout_secs = 1\n\n[modules.process]\npatterns = [\"test-process-hang.js\"]\nskip = []\n",
+            "timeout_secs = 1\n",
         )
         .expect("config should write");
         std::fs::write(
@@ -744,5 +883,56 @@ mod tests {
         assert_eq!(report.summary.timeout, 1);
         assert_eq!(report.results[0].outcome, Outcome::Timeout);
         assert!(started.elapsed().as_secs() < 10);
+        assert!(
+            !workspace.join("NODE_CONFORMANCE.md").exists(),
+            "a module-scoped run must not publish a conformance baseline"
+        );
+    }
+
+    #[test]
+    fn full_corpus_run_publishes_baseline_and_dashboard_data() {
+        let workspace = temp_test_root("baseline");
+        std::fs::write(
+            workspace.join("node_compat_config.toml"),
+            "timeout_secs = 1\n",
+        )
+        .expect("config should write");
+        std::fs::write(
+            workspace.join("tests/node-compat/node/test/parallel/test-fs-open.js"),
+            "// synthetic failing test\n",
+        )
+        .expect("test file should write");
+
+        let fake_otter = workspace.join("fake-otter.sh");
+        std::fs::write(&fake_otter, "#!/bin/sh\necho boom >&2\nexit 1\n")
+            .expect("fake otter should write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = std::fs::metadata(&fake_otter)
+                .expect("fake otter metadata should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_otter, permissions)
+                .expect("fake otter should be executable");
+        }
+
+        let mut options = RunOptions::new(workspace.clone());
+        options.otter_bin = Some(fake_otter);
+        let report = run(options).expect("node-compat run should complete");
+
+        assert_eq!(report.summary.failed, 1);
+        assert!(workspace.join("NODE_CONFORMANCE.md").exists());
+
+        let data = std::fs::read_to_string(workspace.join(super::SITE_DATA))
+            .expect("dashboard data should be published");
+        let data: serde_json::Value =
+            serde_json::from_str(&data).expect("dashboard data should be JSON");
+        assert_eq!(data["totals"]["failed"], 1);
+        assert_eq!(data["by_section"]["parallel/fs"]["total"], 1);
+        assert_eq!(data["failing_tests"][0]["path"], "parallel/test-fs-open.js");
+        assert_eq!(data["failing_tests"][0]["outcome"], "fail");
+        assert_eq!(data["failing_tests"][0]["reason"], "boom");
     }
 }

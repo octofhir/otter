@@ -1,0 +1,44 @@
+---
+title: Node.js Conformance
+tableOfContents: false
+---
+
+import ConformanceDashboard from '../../../components/ConformanceDashboard.astro';
+
+Otter tracks its Node.js compatibility against the official
+[nodejs/node](https://github.com/nodejs/node) test corpus, taken from the
+`main` branch. Every file in `test/parallel` and `test/sequential` runs —
+the corpus is never pre-filtered — so the numbers below are the real
+count of behaviours Otter does not yet implement. Tests are grouped into
+modules by Node's own naming (`test-fs-read-stream.js` → `fs`), and each
+failure links to its source in the pinned Node commit.
+
+A test passes when it exits zero, which is the same contract Node's own
+runner uses: the vendored `test/common` harness asserts inside the test
+process and fails the exit code.
+
+<ConformanceDashboard
+  dataPath="/node-conformance/data.json"
+  commitField="node_commit"
+  repo="nodejs/node"
+  repoTestRoot="test"
+  suiteLabel="nodejs/node"
+  filterHint="parallel/fs"
+/>
+
+## Regenerating
+
+```sh
+# Refresh the vendored corpus from nodejs/node@main.
+bash scripts/fetch-node-tests.sh
+
+# Run the full corpus; refreshes NODE_CONFORMANCE.md and this page's data.
+just node-compat
+
+# One module only, e.g. every test-fs-*.js.
+just node-compat fs
+```
+
+See `NODE_CONFORMANCE.md` at the repository root for the summary of the
+latest run, and the [ECMAScript conformance](/conformance/) dashboard for
+the language-level baseline.

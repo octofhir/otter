@@ -12,7 +12,14 @@ group to see per-section pass rates and the failing tests with their
 reasons. Each failing test links to its source in the pinned test262
 commit.
 
-<ConformanceDashboard />
+<ConformanceDashboard
+  dataPath="/conformance/data.json"
+  commitField="test262_commit"
+  repo="tc39/test262"
+  repoTestRoot="test"
+  suiteLabel="test262"
+  filterHint="built-ins/Array"
+/>
 
 ## Regenerating
 
@@ -26,4 +33,6 @@ just test262-site
 ```
 
 See `ES_CONFORMANCE.md` at the repository root for the measured
-baseline history and per-fix deltas.
+baseline history and per-fix deltas, and the [Node.js
+conformance](/conformance/nodejs/) dashboard for the runtime-level
+baseline against `nodejs/node`.

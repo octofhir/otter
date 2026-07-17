@@ -1,13 +1,21 @@
 //! `Intl.DateTimeFormat` — locale-aware date / time formatting.
 //!
-//! Foundation slice ships a narrow surface: the `format(date)`
-//! method accepts a JS `Number` (epoch milliseconds, the same
-//! `Date.now()` shape) or a `Temporal.PlainDateTime` and produces
-//! a string sized by the option bag (`year` / `month` / `day` /
-//! `hour` / `minute` / `second`). Locale-specific punctuation is
-//! deferred until ICU `FieldSetBuilder` integration lands; the
-//! foundation renders a stable ISO-like layout that matches the
-//! task's "returns a formatted string" criterion.
+//! The formatter resolves ECMA-402 options in observable order and
+//! renders epoch-millisecond and Temporal inputs through ICU4X, with
+//! stable fallbacks for field sets ICU cannot represent.
+//!
+//! # Contents
+//! - Date-time option parsing and resolved payload construction.
+//! - Number and Temporal input normalization.
+//! - `format`, `formatToParts`, `formatRange`, and `formatRangeToParts`.
+//! - `resolvedOptions` result construction.
+//!
+//! # Invariants
+//! - JS-visible part arrays and option objects are built in one
+//!   [`crate::NativeScope`]; every allocated value stays rooted until it is
+//!   stored in its rooted owner.
+//! - Part records are installed directly into their result array, so building
+//!   an N-part result performs no N-prefix raw-value snapshots.
 //!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-datetimeformat-objects>
@@ -988,24 +996,18 @@ pub(crate) fn date_time_format_format_to_parts(
     let parts = icu_format_segments(civil, &payload)
         .unwrap_or_else(|| vec![("literal", format_components(civil, &payload))]);
 
-    let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
-    for (ty, val) in &parts {
-        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
-        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
-        let snapshot = elements.clone();
-        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
+    ctx.scope(|mut scope| {
+        let result = scope.array(parts.len())?;
+        for (index, (ty, value)) in parts.iter().enumerate() {
+            let part = scope.object()?;
+            let ty = scope.string(ty)?;
+            scope.set(part, "type", ty)?;
+            let value = scope.string(value)?;
+            scope.set(part, "value", value)?;
+            scope.set_index(result, index, part)?;
         }
-    };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+        Ok(scope.finish(result))
+    })
 }
 
 /// CLDR-style separator joining the two endpoints of a non-collapsed
@@ -1106,43 +1108,46 @@ pub(crate) fn date_time_format_format_range_to_parts(
 
     let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
     let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();
-
-    // (type, value, source) triples in output order.
-    let mut triples: Vec<(&'static str, String, &'static str)> = Vec::new();
-    if start_str == end_str {
-        for (ty, val) in start_parts {
-            triples.push((ty, val, "shared"));
-        }
+    let collapsed = start_str == end_str;
+    let result_len = if collapsed {
+        start_parts.len()
     } else {
-        for (ty, val) in &start_parts {
-            triples.push((ty, val.clone(), "startRange"));
-        }
-        triples.push(("literal", RANGE_SEPARATOR.to_string(), "shared"));
-        for (ty, val) in &end_parts {
-            triples.push((ty, val.clone(), "endRange"));
-        }
-    }
-
-    let mut elements: Vec<Value> = Vec::with_capacity(triples.len());
-    for (ty, val, src) in &triples {
-        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
-        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
-        let src_s = Value::string(JsString::from_str(src, ctx.heap_mut())?);
-        let snapshot = elements.clone();
-        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
-        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "source", src_s);
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
-        }
+        start_parts.len() + 1 + end_parts.len()
     };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+
+    ctx.scope(|mut scope| {
+        let result = scope.array(result_len)?;
+        let mut index = 0usize;
+        let mut append = |ty: &str, value: &str, source: &str| -> Result<(), NativeError> {
+            let part = scope.object()?;
+            let ty = scope.string(ty)?;
+            scope.set(part, "type", ty)?;
+            let value = scope.string(value)?;
+            scope.set(part, "value", value)?;
+            let source = scope.string(source)?;
+            scope.set(part, "source", source)?;
+            scope.set_index(result, index, part)?;
+            index += 1;
+            Ok(())
+        };
+
+        if collapsed {
+            for (ty, value) in &start_parts {
+                append(ty, value, "shared")?;
+            }
+        } else {
+            for (ty, value) in &start_parts {
+                append(ty, value, "startRange")?;
+            }
+            append("literal", RANGE_SEPARATOR, "shared")?;
+            for (ty, value) in &end_parts {
+                append(ty, value, "endRange")?;
+            }
+        }
+
+        drop(append);
+        Ok(scope.finish(result))
+    })
 }
 
 /// §12.1.6 `Intl.DateTimeFormat.prototype.resolvedOptions()`.
@@ -1151,80 +1156,77 @@ pub(crate) fn date_time_format_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "resolvedOptions")?;
-    // Build (key, value) pairs in ECMA-402 §11.1.6 order. String values
-    // are allocated up front and all rooted across the object alloc.
-    let mut entries: Vec<(&'static str, Value)> = Vec::new();
-    macro_rules! str_entry {
-        ($key:expr, $s:expr) => {
-            entries.push(($key, Value::string(JsString::from_str($s, ctx.heap_mut())?)));
-        };
-    }
-    str_entry!("locale", &payload.locale);
-    str_entry!("calendar", &payload.calendar);
-    str_entry!("numberingSystem", &payload.numbering_system);
     let tz = payload
         .time_zone
         .clone()
         .unwrap_or_else(|| "UTC".to_string());
-    str_entry!("timeZone", &tz);
 
-    // §11.3.4 — hourCycle / hour12 are surfaced only when the [[Hour]]
-    // slot resolved (an explicit hour component or a timeStyle).
-    if payload.hour.is_some() || payload.time_style.is_some() {
-        let hc = payload.hour_cycle.unwrap_or(DtHourCycle::H23);
-        str_entry!("hourCycle", hour_cycle_str(hc));
-        entries.push((
-            "hour12",
-            Value::boolean(matches!(hc, DtHourCycle::H11 | DtHourCycle::H12)),
-        ));
-    }
-    if let Some(w) = payload.weekday {
-        str_entry!("weekday", text_width_str(w));
-    }
-    if let Some(w) = payload.era {
-        str_entry!("era", text_width_str(w));
-    }
-    if let Some(w) = payload.year {
-        str_entry!("year", num_width_str(w));
-    }
-    if let Some(w) = payload.month {
-        str_entry!("month", month_width_str(w));
-    }
-    if let Some(w) = payload.day {
-        str_entry!("day", num_width_str(w));
-    }
-    if let Some(w) = payload.day_period {
-        str_entry!("dayPeriod", text_width_str(w));
-    }
-    if let Some(w) = payload.hour {
-        str_entry!("hour", num_width_str(w));
-    }
-    if let Some(w) = payload.minute {
-        str_entry!("minute", num_width_str(w));
-    }
-    if let Some(w) = payload.second {
-        str_entry!("second", num_width_str(w));
-    }
-    if let Some(d) = payload.fractional_second_digits {
-        entries.push(("fractionalSecondDigits", Value::number_i32(i32::from(d))));
-    }
-    if let Some(w) = payload.time_zone_name {
-        str_entry!("timeZoneName", zone_name_str(w));
-    }
-    if let Some(s) = payload.date_style {
-        str_entry!("dateStyle", style_str(s));
-    }
-    if let Some(s) = payload.time_style {
-        str_entry!("timeStyle", style_str(s));
-    }
+    ctx.scope(|mut scope| {
+        let options = scope.object()?;
+        macro_rules! str_entry {
+            ($key:expr, $value:expr) => {{
+                let value = scope.string($value)?;
+                scope.set(options, $key, value)?;
+            }};
+        }
 
-    let roots: Vec<&Value> = entries.iter().map(|(_, v)| v).collect();
-    let mut obj = ctx.alloc_object_with_roots(&roots, &[])?;
-    let heap = ctx.heap_mut();
-    for (k, v) in &entries {
-        crate::object::set(&mut obj, heap, k, *v);
-    }
-    Ok(Value::object(obj))
+        // ECMA-402 §11.1.6 property order.
+        str_entry!("locale", &payload.locale);
+        str_entry!("calendar", &payload.calendar);
+        str_entry!("numberingSystem", &payload.numbering_system);
+        str_entry!("timeZone", &tz);
+
+        // §11.3.4 — hourCycle / hour12 are surfaced only when the [[Hour]]
+        // slot resolved (an explicit hour component or a timeStyle).
+        if payload.hour.is_some() || payload.time_style.is_some() {
+            let hc = payload.hour_cycle.unwrap_or(DtHourCycle::H23);
+            str_entry!("hourCycle", hour_cycle_str(hc));
+            let hour12 = scope.boolean(matches!(hc, DtHourCycle::H11 | DtHourCycle::H12));
+            scope.set(options, "hour12", hour12)?;
+        }
+        if let Some(w) = payload.weekday {
+            str_entry!("weekday", text_width_str(w));
+        }
+        if let Some(w) = payload.era {
+            str_entry!("era", text_width_str(w));
+        }
+        if let Some(w) = payload.year {
+            str_entry!("year", num_width_str(w));
+        }
+        if let Some(w) = payload.month {
+            str_entry!("month", month_width_str(w));
+        }
+        if let Some(w) = payload.day {
+            str_entry!("day", num_width_str(w));
+        }
+        if let Some(w) = payload.day_period {
+            str_entry!("dayPeriod", text_width_str(w));
+        }
+        if let Some(w) = payload.hour {
+            str_entry!("hour", num_width_str(w));
+        }
+        if let Some(w) = payload.minute {
+            str_entry!("minute", num_width_str(w));
+        }
+        if let Some(w) = payload.second {
+            str_entry!("second", num_width_str(w));
+        }
+        if let Some(d) = payload.fractional_second_digits {
+            let digits = scope.number(f64::from(d));
+            scope.set(options, "fractionalSecondDigits", digits)?;
+        }
+        if let Some(w) = payload.time_zone_name {
+            str_entry!("timeZoneName", zone_name_str(w));
+        }
+        if let Some(s) = payload.date_style {
+            str_entry!("dateStyle", style_str(s));
+        }
+        if let Some(s) = payload.time_style {
+            str_entry!("timeStyle", style_str(s));
+        }
+
+        Ok(scope.finish(options))
+    })
 }
 
 /// Render a `(year, month, day, hour, minute, second)` tuple per

@@ -5,6 +5,18 @@
 //! CLDR-backed [`CurrencyFormatter`] (correct symbol + placement for
 //! every ISO-4217 code and locale); percent appends the sign.
 //!
+//! # Contents
+//!
+//! - Option resolution and locale-aware number rendering.
+//! - Number/range partitioning for `formatToParts` surfaces.
+//! - Rooted builders for parts arrays and `resolvedOptions`.
+//!
+//! # Invariants
+//!
+//! - Every GC value retained across an allocation lives in a [`Local`].
+//! - Parts arrays are allocated once and filled in place; builders never clone
+//!   accumulated GC values or materialize root snapshots.
+//!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-numberformat-objects>
 
@@ -26,8 +38,7 @@ use tinystr::TinyAsciiStr;
 use crate::intl::helpers::DEFAULT_LOCALE;
 use crate::intl::payload::{IntlPayload, NumberFormatPayload};
 use crate::string::JsString;
-use crate::{NativeCtx, NativeError, Value};
-use otter_gc::raw::RawGc;
+use crate::{Local, NativeCtx, NativeError, NativeScope, Value};
 
 const CLASS: &str = "NumberFormat";
 
@@ -568,26 +579,38 @@ pub(crate) fn number_format_format_to_parts(
     let payload = require_number_format(ctx, "formatToParts")?;
     let n = coerce_format_arg(ctx, args.first())?;
     let parts = partition_number(n, &payload);
-    let type_lit = |t: &str, ctx: &mut NativeCtx<'_>| JsString::from_str(t, ctx.heap_mut());
 
-    let mut elements: Vec<Value> = Vec::with_capacity(parts.len());
-    for (ty, val) in &parts {
-        let ty_s = Value::string(type_lit(ty, ctx)?);
-        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
-        let snapshot = elements.clone();
-        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s], &[&snapshot])?;
-        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
+    ctx.scope(|mut scope| {
+        let result = scope.array(parts.len())?;
+        for (index, (ty, value)) in parts.iter().enumerate() {
+            scope.scope(|mut part_scope| {
+                set_number_part(&mut part_scope, result, index, ty, value, None)
+            })?;
         }
-    };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+        Ok(scope.finish(result))
+    })
+}
+
+/// Fill one already-rooted parts-array slot without retaining transient
+/// handles after the caller's child scope closes.
+fn set_number_part(
+    scope: &mut NativeScope<'_, '_>,
+    result: Local<'_>,
+    index: usize,
+    ty: &str,
+    value: &str,
+    source: Option<&str>,
+) -> Result<(), NativeError> {
+    let part = scope.object()?;
+    let ty = scope.string(ty)?;
+    scope.set(part, "type", ty)?;
+    let value = scope.string(value)?;
+    scope.set(part, "value", value)?;
+    if let Some(source) = source {
+        let source = scope.string(source)?;
+        scope.set(part, "source", source)?;
+    }
+    scope.set_index(result, index, part)
 }
 
 /// CLDR-style separator joining the two endpoints of a non-collapsed
@@ -666,44 +689,60 @@ pub(crate) fn number_format_format_range_to_parts(
     let (x, y) = range_args(ctx, args, "formatRangeToParts")?;
     let start_parts = partition_number(x, &payload);
     let end_parts = partition_number(y, &payload);
-    let start_str: String = start_parts.iter().map(|(_, v)| v.as_str()).collect();
-    let end_str: String = end_parts.iter().map(|(_, v)| v.as_str()).collect();
-
-    let mut triples: Vec<(&'static str, String, &'static str)> = Vec::new();
-    if start_str == end_str {
-        for (ty, val) in start_parts {
-            triples.push((ty, val, "shared"));
-        }
+    let same_rendering = start_parts
+        .iter()
+        .flat_map(|(_, value)| value.chars())
+        .eq(end_parts.iter().flat_map(|(_, value)| value.chars()));
+    let result_len = if same_rendering {
+        start_parts.len()
     } else {
-        for (ty, val) in &start_parts {
-            triples.push((ty, val.clone(), "startRange"));
-        }
-        triples.push(("literal", RANGE_SEPARATOR.to_string(), "shared"));
-        for (ty, val) in &end_parts {
-            triples.push((ty, val.clone(), "endRange"));
-        }
-    }
-
-    let mut elements: Vec<Value> = Vec::with_capacity(triples.len());
-    for (ty, val, src) in &triples {
-        let ty_s = Value::string(JsString::from_str(ty, ctx.heap_mut())?);
-        let val_s = Value::string(JsString::from_str(val, ctx.heap_mut())?);
-        let src_s = Value::string(JsString::from_str(src, ctx.heap_mut())?);
-        let snapshot = elements.clone();
-        let mut obj = ctx.alloc_object_with_roots(&[&ty_s, &val_s, &src_s], &[&snapshot])?;
-        crate::object::set(&mut obj, ctx.heap_mut(), "type", ty_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "value", val_s);
-        crate::object::set(&mut obj, ctx.heap_mut(), "source", src_s);
-        elements.push(Value::object(obj));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
-        }
+        start_parts.len() + 1 + end_parts.len()
     };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+
+    ctx.scope(|mut scope| {
+        let result = scope.array(result_len)?;
+        let mut index = 0;
+        if same_rendering {
+            for (ty, value) in &start_parts {
+                scope.scope(|mut part_scope| {
+                    set_number_part(&mut part_scope, result, index, ty, value, Some("shared"))
+                })?;
+                index += 1;
+            }
+        } else {
+            for (ty, value) in &start_parts {
+                scope.scope(|mut part_scope| {
+                    set_number_part(
+                        &mut part_scope,
+                        result,
+                        index,
+                        ty,
+                        value,
+                        Some("startRange"),
+                    )
+                })?;
+                index += 1;
+            }
+            scope.scope(|mut part_scope| {
+                set_number_part(
+                    &mut part_scope,
+                    result,
+                    index,
+                    "literal",
+                    RANGE_SEPARATOR,
+                    Some("shared"),
+                )
+            })?;
+            index += 1;
+            for (ty, value) in &end_parts {
+                scope.scope(|mut part_scope| {
+                    set_number_part(&mut part_scope, result, index, ty, value, Some("endRange"))
+                })?;
+                index += 1;
+            }
+        }
+        Ok(scope.finish(result))
+    })
 }
 
 /// Partition a formatted number into `{type, value}` components for
@@ -910,141 +949,68 @@ pub(crate) fn number_format_resolved_options(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "resolvedOptions")?;
-    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
-    let numbering_system = Value::string(JsString::from_str(
-        &payload.numbering_system,
-        ctx.heap_mut(),
-    )?);
-    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
-    let currency_val = match &payload.currency {
-        Some(c) => Some(Value::string(JsString::from_str(c, ctx.heap_mut())?)),
-        None => None,
-    };
-    // currencyDisplay / currencySign are only reported for currency style.
-    let (currency_display_val, currency_sign_val) = if payload.style == "currency" {
-        (
-            Some(Value::string(JsString::from_str(
-                &payload.currency_display,
-                ctx.heap_mut(),
-            )?)),
-            Some(Value::string(JsString::from_str(
-                &payload.currency_sign,
-                ctx.heap_mut(),
-            )?)),
-        )
-    } else {
-        (None, None)
-    };
-    // unit / unitDisplay are only reported for unit style.
-    let (unit_val, unit_display_val) = match (&payload.unit, payload.style.as_str()) {
-        (Some(u), "unit") => (
-            Some(Value::string(JsString::from_str(u, ctx.heap_mut())?)),
-            Some(Value::string(JsString::from_str(
-                &payload.unit_display,
-                ctx.heap_mut(),
-            )?)),
-        ),
-        _ => (None, None),
-    };
-    let min_fd = payload.minimum_fraction_digits as i32;
-    let max_fd = payload.maximum_fraction_digits as i32;
-    let use_grouping = payload.use_grouping;
-    let sign_display = Value::string(JsString::from_str(&payload.sign_display, ctx.heap_mut())?);
-    let notation = Value::string(JsString::from_str(&payload.notation, ctx.heap_mut())?);
-    let compact_display_val = if payload.notation == "compact" {
-        Some(Value::string(JsString::from_str(
-            &payload.compact_display,
-            ctx.heap_mut(),
-        )?))
-    } else {
-        None
-    };
-    let mut value_roots = vec![&locale, &numbering_system, &style, &sign_display, &notation];
-    if let Some(c) = &compact_display_val {
-        value_roots.push(c);
-    }
-    if let Some(c) = &currency_val {
-        value_roots.push(c);
-    }
-    if let Some(c) = &currency_display_val {
-        value_roots.push(c);
-    }
-    if let Some(c) = &currency_sign_val {
-        value_roots.push(c);
-    }
-    if let Some(u) = &unit_val {
-        value_roots.push(u);
-    }
-    if let Some(u) = &unit_display_val {
-        value_roots.push(u);
-    }
-    let mut obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
-    let heap = ctx.heap_mut();
-    crate::object::set(&mut obj, heap, "locale", locale);
-    crate::object::set(&mut obj, heap, "numberingSystem", numbering_system);
-    crate::object::set(&mut obj, heap, "style", style);
-    if let Some(c) = currency_val {
-        crate::object::set(&mut obj, heap, "currency", c);
-    }
-    if let Some(c) = currency_display_val {
-        crate::object::set(&mut obj, heap, "currencyDisplay", c);
-    }
-    if let Some(c) = currency_sign_val {
-        crate::object::set(&mut obj, heap, "currencySign", c);
-    }
-    if let Some(u) = unit_val {
-        crate::object::set(&mut obj, heap, "unit", u);
-    }
-    if let Some(u) = unit_display_val {
-        crate::object::set(&mut obj, heap, "unitDisplay", u);
-    }
-    crate::object::set(
-        &mut obj,
-        heap,
-        "minimumIntegerDigits",
-        Value::number_i32(i32::from(payload.minimum_integer_digits)),
-    );
-    // Significant-digit rounding (roundingPriority "auto" with a
-    // significant option present) reports the significant-digit pair and
-    // omits the inert fraction-digit pair, matching the spec's internal
-    // slots.
-    if let (Some(mn), Some(mx)) = (
-        payload.minimum_significant_digits,
-        payload.maximum_significant_digits,
-    ) {
-        crate::object::set(
-            &mut obj,
-            heap,
-            "minimumSignificantDigits",
-            Value::number_i32(i32::from(mn)),
-        );
-        crate::object::set(
-            &mut obj,
-            heap,
-            "maximumSignificantDigits",
-            Value::number_i32(i32::from(mx)),
-        );
-    } else {
-        crate::object::set(
-            &mut obj,
-            heap,
-            "minimumFractionDigits",
-            Value::number_i32(min_fd),
-        );
-        crate::object::set(
-            &mut obj,
-            heap,
-            "maximumFractionDigits",
-            Value::number_i32(max_fd),
-        );
-    }
-    crate::object::set(&mut obj, heap, "useGrouping", Value::boolean(use_grouping));
-    crate::object::set(&mut obj, heap, "notation", notation);
-    if let Some(compact_display) = compact_display_val {
-        crate::object::set(&mut obj, heap, "compactDisplay", compact_display);
-    }
-    crate::object::set(&mut obj, heap, "signDisplay", sign_display);
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let result = scope.object()?;
+
+        let locale = scope.string(&payload.locale)?;
+        scope.set(result, "locale", locale)?;
+        let numbering_system = scope.string(&payload.numbering_system)?;
+        scope.set(result, "numberingSystem", numbering_system)?;
+        let style = scope.string(&payload.style)?;
+        scope.set(result, "style", style)?;
+
+        if let Some(currency) = &payload.currency {
+            let currency = scope.string(currency)?;
+            scope.set(result, "currency", currency)?;
+        }
+        // currencyDisplay / currencySign are only reported for currency style.
+        if payload.style == "currency" {
+            let display = scope.string(&payload.currency_display)?;
+            scope.set(result, "currencyDisplay", display)?;
+            let sign = scope.string(&payload.currency_sign)?;
+            scope.set(result, "currencySign", sign)?;
+        }
+        // unit / unitDisplay are only reported for unit style.
+        if let (Some(unit), "unit") = (&payload.unit, payload.style.as_str()) {
+            let unit = scope.string(unit)?;
+            scope.set(result, "unit", unit)?;
+            let display = scope.string(&payload.unit_display)?;
+            scope.set(result, "unitDisplay", display)?;
+        }
+
+        let minimum_integer_digits = scope.number(f64::from(payload.minimum_integer_digits));
+        scope.set(result, "minimumIntegerDigits", minimum_integer_digits)?;
+        // Significant-digit rounding (roundingPriority "auto" with a
+        // significant option present) reports the significant-digit pair and
+        // omits the inert fraction-digit pair, matching the spec's internal
+        // slots.
+        if let (Some(minimum), Some(maximum)) = (
+            payload.minimum_significant_digits,
+            payload.maximum_significant_digits,
+        ) {
+            let minimum = scope.number(f64::from(minimum));
+            scope.set(result, "minimumSignificantDigits", minimum)?;
+            let maximum = scope.number(f64::from(maximum));
+            scope.set(result, "maximumSignificantDigits", maximum)?;
+        } else {
+            let minimum = scope.number(f64::from(payload.minimum_fraction_digits));
+            scope.set(result, "minimumFractionDigits", minimum)?;
+            let maximum = scope.number(f64::from(payload.maximum_fraction_digits));
+            scope.set(result, "maximumFractionDigits", maximum)?;
+        }
+        let use_grouping = scope.boolean(payload.use_grouping);
+        scope.set(result, "useGrouping", use_grouping)?;
+        let notation = scope.string(&payload.notation)?;
+        scope.set(result, "notation", notation)?;
+        if payload.notation == "compact" {
+            let compact_display = scope.string(&payload.compact_display)?;
+            scope.set(result, "compactDisplay", compact_display)?;
+        }
+        let sign_display = scope.string(&payload.sign_display)?;
+        scope.set(result, "signDisplay", sign_display)?;
+
+        Ok(scope.finish(result))
+    })
 }
 
 /// Render `n` per the resolved option bag.

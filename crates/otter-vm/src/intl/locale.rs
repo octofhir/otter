@@ -14,6 +14,11 @@
 //!   `baseName`, `calendar`, `collation`, `hourCycle`, `caseFirst`,
 //!   `numeric`, `numberingSystem`).
 //! - `maximize` / `minimize` / `toString`.
+//! - Locale-info array/object methods backed by scoped rooted builders.
+//!
+//! # Invariants
+//! - Every locale-info result is built inside one [`crate::NativeScope`];
+//!   no raw `Value` or copied root snapshot spans an allocation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma402/#locale-objects>
@@ -535,21 +540,16 @@ pub(crate) fn to_string(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, 
 // Locale-info methods (Intl Locale Info proposal)
 // ---------------------------------------------------------------------------
 
-/// Build a JS `Array` of strings. Mirrors the rooting pattern used by
-/// the other `Intl.*` array builders.
+/// Build a JS `Array` of strings on one scoped handle range.
 fn string_array(ctx: &mut NativeCtx<'_>, items: &[String]) -> Result<Value, NativeError> {
-    let mut elements: Vec<Value> = Vec::with_capacity(items.len());
-    for it in items {
-        elements.push(Value::string(JsString::from_str(it, ctx.heap_mut())?));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
+    ctx.scope(|mut scope| {
+        let array = scope.array(items.len())?;
+        for (index, item) in items.iter().enumerate() {
+            let value = scope.string(item)?;
+            scope.set_index(array, index, value)?;
         }
-    };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+        Ok(scope.finish(array))
+    })
 }
 
 pub(crate) fn get_calendars(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
@@ -607,13 +607,12 @@ pub(crate) fn get_text_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
     let mut id = loc.id.clone();
     LocaleExpander::new_extended().maximize(&mut id);
     let rtl = id.script.is_some_and(|s| is_rtl_script(s.as_str()));
-    let direction = Value::string(JsString::from_str(
-        if rtl { "rtl" } else { "ltr" },
-        ctx.heap_mut(),
-    )?);
-    let mut obj = ordinary_object(ctx, &[&direction])?;
-    crate::object::set(&mut obj, ctx.heap_mut(), "direction", direction);
-    Ok(Value::object(obj))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let direction = scope.string(if rtl { "rtl" } else { "ltr" })?;
+        scope.set(object, "direction", direction)?;
+        Ok(scope.finish(object))
+    })
 }
 
 pub(crate) fn get_week_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
@@ -628,34 +627,18 @@ pub(crate) fn get_week_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
         Some("sun") => 7,
         _ => 7,
     };
-    let weekend = string_array_i32(ctx, &[6, 7])?;
-    let first_day_v = Value::number_i32(first_day);
-    let mut obj = ordinary_object(ctx, &[&first_day_v, &weekend])?;
-    crate::object::set(&mut obj, ctx.heap_mut(), "firstDay", first_day_v);
-    crate::object::set(&mut obj, ctx.heap_mut(), "weekend", weekend);
-    Ok(Value::object(obj))
-}
-
-/// Allocate an ordinary object whose `[[Prototype]]` is
-/// `%Object.prototype%` (the bare `alloc_object_with_roots` produces a
-/// null-prototype object).
-fn ordinary_object(
-    ctx: &mut NativeCtx<'_>,
-    value_roots: &[&Value],
-) -> Result<crate::object::JsObject, NativeError> {
-    let obj = ctx.alloc_object_with_roots(value_roots, &[])?;
-    let proto = ctx.cx.interp.object_prototype_object_opt();
-    if let Some(proto) = proto {
-        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
-    }
-    Ok(obj)
-}
-
-fn string_array_i32(ctx: &mut NativeCtx<'_>, items: &[i32]) -> Result<Value, NativeError> {
-    let elements: Vec<Value> = items.iter().map(|n| Value::number_i32(*n)).collect();
-    let mut noop = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut noop)?;
-    Ok(Value::array(arr))
+    ctx.scope(|mut scope| {
+        let object = scope.object()?;
+        let first_day = scope.number(f64::from(first_day));
+        let weekend = scope.array(2)?;
+        let saturday = scope.number(6.0);
+        scope.set_index(weekend, 0, saturday)?;
+        let sunday = scope.number(7.0);
+        scope.set_index(weekend, 1, sunday)?;
+        scope.set(object, "firstDay", first_day)?;
+        scope.set(object, "weekend", weekend)?;
+        Ok(scope.finish(object))
+    })
 }
 
 /// Right-to-left Unicode scripts (UAX-9 / CLDR `scriptMetadata`).

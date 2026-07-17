@@ -128,4 +128,29 @@ mod tests {
         assert!(result.is_err());
         assert!(!heap.has_extra_roots());
     }
+
+    #[test]
+    fn exact_source_query_distinguishes_unrelated_providers() {
+        struct OtherSource(u8);
+
+        impl ExtraRootSource for OtherSource {
+            fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {
+                let _ = self.0;
+            }
+        }
+
+        let mut heap = GcHeap::new().expect("heap");
+        let registered = OtherSource(1);
+        let unrelated = OtherSource(2);
+        let registered_roots = ExtraRoots::new(&registered);
+        let unrelated_roots = ExtraRoots::new(&unrelated);
+
+        assert!(!heap.has_extra_root_source(registered_roots));
+        assert!(!heap.has_extra_root_source(unrelated_roots));
+        let guard = heap.register_extra_roots(registered_roots);
+        assert!(heap.has_extra_root_source(registered_roots));
+        assert!(!heap.has_extra_root_source(unrelated_roots));
+        drop(guard);
+        assert!(!heap.has_extra_root_source(registered_roots));
+    }
 }

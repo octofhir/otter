@@ -9,6 +9,13 @@
 //! - [`canonicalize_locale_list`] — §9.2.1, shared with future
 //!   locale-arg coercion work.
 //! - [`supported_locales_of`] — the static `couch!` binding.
+//! - `supported_values_of` — static ECMA-402 identifier tables.
+//!
+//! # Invariants
+//! - Result arrays are allocated and filled through one native handle scope;
+//!   no copied raw-value snapshot is used as a moving-GC root.
+//! - `Intl.supportedValuesOf` tables are sorted and duplicate-free, avoiding
+//!   per-call metadata allocation and sorting.
 //!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-supportedlocales>
@@ -16,7 +23,6 @@
 use icu_locale::{Locale, LocaleCanonicalizer, LocaleExpander};
 
 use crate::intl::payload::IntlPayload;
-use crate::string::JsString;
 use crate::temporal::helpers::get_option_value;
 use crate::{NativeCtx, NativeError, Value};
 
@@ -248,21 +254,21 @@ pub(crate) fn is_supported(tag: &str) -> bool {
     id.script.is_some()
 }
 
-/// Build a JS `Array` of strings (rooting the elements during the
-/// array-body allocation).
-fn string_array(ctx: &mut NativeCtx<'_>, items: &[String]) -> Result<Value, NativeError> {
-    let mut elements: Vec<Value> = Vec::with_capacity(items.len());
-    for it in items {
-        elements.push(Value::string(JsString::from_str(it, ctx.heap_mut())?));
-    }
-    let element_roots = elements.clone();
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for v in &element_roots {
-            v.trace_value_slots(visitor);
+/// Build a JS `Array` of strings through one moving-GC-safe handle arena.
+fn string_array<'a, I>(ctx: &mut NativeCtx<'_>, items: I) -> Result<Value, NativeError>
+where
+    I: IntoIterator<Item = &'a str>,
+    I::IntoIter: ExactSizeIterator,
+{
+    ctx.scope(|mut scope| {
+        let items = items.into_iter();
+        let result = scope.array(items.len())?;
+        for (index, item) in items.enumerate() {
+            let item = scope.string(item)?;
+            scope.set_index(result, index, item)?;
         }
-    };
-    let arr = crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut visit)?;
-    Ok(Value::array(arr))
+        Ok(scope.finish(result))
+    })
 }
 
 /// `Intl.getCanonicalLocales(locales)` — §9.2.1 CanonicalizeLocaleList
@@ -273,7 +279,7 @@ pub(crate) fn get_canonical_locales(
 ) -> Result<Value, NativeError> {
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let list = canonicalize_locale_list(ctx, locales)?;
-    string_array(ctx, &list)
+    string_array(ctx, list.iter().map(String::as_str))
 }
 
 /// `Intl.<Class>.supportedLocalesOf(locales, options)` — shared by
@@ -289,44 +295,70 @@ pub(crate) fn supported_locales_of(
     // throws (ToObject), an object is used directly, and a primitive is
     // boxed to its wrapper so a `localeMatcher` getter on the prototype
     // chain still fires.
-    let options = args.get(1).copied().unwrap_or_else(Value::undefined);
-    let options_obj: Option<Value> = if options.is_undefined() {
-        None
-    } else if options.is_null() {
-        return Err(type_err("options argument cannot be null"));
-    } else if options.is_object_type() {
-        Some(options)
-    } else {
-        let boxed = ctx
-            .cx
-            .interp
-            .box_sloppy_this_primitive_runtime_rooted(options, &[])
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, CLASS))?;
-        Some(boxed)
-    };
-    if let Some(o) = options_obj {
-        let lm = get_option_value(ctx, o, "localeMatcher", CLASS)?;
-        if !lm.is_undefined() {
-            // §GetOption ToString — `null` stringifies to `"null"` (a
-            // RangeError on the enum check), not a TypeError.
-            let exec = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| type_err("missing execution context"))?;
-            let string = ctx.with_turn_parts(|interp, stack| {
-                crate::coerce::to_string_or_throw(interp, stack, &exec, &lm)
-            });
-            let s = string.map_err(|error| {
-                crate::native_function::vm_to_native_error(ctx.interp_mut(), error, CLASS)
-            })?;
-            if s != "lookup" && s != "best fit" {
-                return Err(range_err("invalid localeMatcher option"));
+    ctx.scope(|mut scope| {
+        let options = scope.argument(args, 1);
+        let options_obj = if scope.is_undefined(options) {
+            None
+        } else if scope.is_null(options) {
+            return Err(type_err("options argument cannot be null"));
+        } else if scope.is_object(options) {
+            Some(options)
+        } else {
+            let options = scope.raw(options);
+            let boxed = scope
+                .context()
+                .interp_mut()
+                .box_sloppy_this_primitive_runtime_rooted(options, &[])
+                .map_err(|error| {
+                    crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        CLASS,
+                    )
+                })?;
+            Some(scope.value(boxed))
+        };
+        if let Some(options) = options_obj {
+            // `GetOption` is observable: Proxy traps and accessors must run.
+            // Keep the receiver in the handle arena while the internal `Get`
+            // re-enters JavaScript, then root its result before coercion.
+            let options = scope.raw(options);
+            let locale_matcher =
+                get_option_value(scope.context(), options, "localeMatcher", CLASS)?;
+            let locale_matcher = scope.value(locale_matcher);
+            if !scope.is_undefined(locale_matcher) {
+                // §GetOption ToString — `null` stringifies to `"null"` (a
+                // RangeError on the enum check), not a TypeError.
+                let exec = scope
+                    .context()
+                    .execution_context()
+                    .cloned()
+                    .ok_or_else(|| type_err("missing execution context"))?;
+                let locale_matcher = scope.raw(locale_matcher);
+                let string = scope.with_turn_parts(|interp, stack| {
+                    crate::coerce::to_string_or_throw(interp, stack, &exec, &locale_matcher)
+                });
+                let string = string.map_err(|error| {
+                    crate::native_function::vm_to_native_error(
+                        scope.context().interp_mut(),
+                        error,
+                        CLASS,
+                    )
+                })?;
+                if string != "lookup" && string != "best fit" {
+                    return Err(range_err("invalid localeMatcher option"));
+                }
             }
         }
-    }
 
-    let supported: Vec<String> = requested.into_iter().filter(|t| is_supported(t)).collect();
-    string_array(ctx, &supported)
+        let supported = requested.iter().filter(|tag| is_supported(tag));
+        let result = scope.array(supported.clone().count())?;
+        for (index, tag) in supported.enumerate() {
+            let tag = scope.string(tag)?;
+            scope.set_index(result, index, tag)?;
+        }
+        Ok(scope.finish(result))
+    })
 }
 
 // ECMA-402 §6.x sanctioned identifier lists backing
@@ -474,15 +506,10 @@ const TIME_ZONES: &[&str] = &[
     "Atlantic/Azores",
     "Australia/Perth",
     "Australia/Sydney",
-    "Europe/Berlin",
-    "Europe/Dublin",
-    "Europe/Istanbul",
-    "Europe/London",
-    "Europe/Madrid",
-    "Europe/Moscow",
-    "Europe/Paris",
-    "Europe/Rome",
     "Etc/GMT+1",
+    "Etc/GMT+10",
+    "Etc/GMT+11",
+    "Etc/GMT+12",
     "Etc/GMT+2",
     "Etc/GMT+3",
     "Etc/GMT+4",
@@ -491,10 +518,12 @@ const TIME_ZONES: &[&str] = &[
     "Etc/GMT+7",
     "Etc/GMT+8",
     "Etc/GMT+9",
-    "Etc/GMT+10",
-    "Etc/GMT+11",
-    "Etc/GMT+12",
     "Etc/GMT-1",
+    "Etc/GMT-10",
+    "Etc/GMT-11",
+    "Etc/GMT-12",
+    "Etc/GMT-13",
+    "Etc/GMT-14",
     "Etc/GMT-2",
     "Etc/GMT-3",
     "Etc/GMT-4",
@@ -503,11 +532,14 @@ const TIME_ZONES: &[&str] = &[
     "Etc/GMT-7",
     "Etc/GMT-8",
     "Etc/GMT-9",
-    "Etc/GMT-10",
-    "Etc/GMT-11",
-    "Etc/GMT-12",
-    "Etc/GMT-13",
-    "Etc/GMT-14",
+    "Europe/Berlin",
+    "Europe/Dublin",
+    "Europe/Istanbul",
+    "Europe/London",
+    "Europe/Madrid",
+    "Europe/Moscow",
+    "Europe/Paris",
+    "Europe/Rome",
     "Pacific/Auckland",
     "Pacific/Honolulu",
     "UTC",
@@ -582,8 +614,6 @@ pub(crate) fn supported_values_of(
         "unit" => UNITS,
         _ => return Err(range_err(format!("invalid key: {key}"))),
     };
-    let mut items: Vec<String> = list.iter().map(|s| (*s).to_string()).collect();
-    items.sort_unstable();
-    items.dedup();
-    string_array(ctx, &items)
+    debug_assert!(list.windows(2).all(|pair| pair[0] < pair[1]));
+    string_array(ctx, list.iter().copied())
 }

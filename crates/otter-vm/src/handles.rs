@@ -39,12 +39,12 @@
 //!   through [`HandleArena::get`], which the collector keeps live.
 //! - A scoped write may box a wide number inside the callee (`object::set` and
 //!   its symbol/define variants), and that box allocation traces only the
-//!   receiver it is handed. On the host-side path no dispatch provider is
-//!   registered, so a scope installs the interpreter's runtime-root provider
-//!   for its lifetime (see [`Interpreter::scope_runtime_roots_guard`]) — the
-//!   arena is then traced by any collection the box drives, so sibling handles
-//!   never go stale. The registration is gated on there being no provider
-//!   already, so the dispatch hot path pays nothing.
+//!   receiver it is handed. When the interpreter's runtime-root source is not
+//!   registered, a scope installs that exact source for its lifetime (see
+//!   [`Interpreter::scope_runtime_roots_guard`]) — an unrelated native-call
+//!   provider is not accepted as a substitute. The arena is then traced by any
+//!   collection the box drives, while the dispatch hot path pays nothing
+//!   because its matching source is already present.
 //!
 //! # See also
 //!
@@ -296,18 +296,20 @@ impl Interpreter {
     /// that hole for *every* scoped op uniformly, without threading a root
     /// snapshot through each write.
     ///
-    /// Gated on [`otter_gc::GcHeap::has_extra_roots`] so the dispatch hot path
-    /// pays nothing: it already has a provider, so this is a no-op there. Returns
-    /// an RAII registration, or `None` when a provider was already present.
+    /// Gated on [`otter_gc::GcHeap::has_extra_root_source`] so the dispatch hot
+    /// path pays nothing: it already has this interpreter's provider, so this
+    /// is a no-op there. A narrower native-call source does not suppress the
+    /// registration. Returns an RAII registration, or `None` when the exact
+    /// provider was already present.
     pub(crate) fn scope_runtime_roots_guard(&mut self) -> Option<otter_gc::ExtraRootsGuard> {
-        if self.gc_heap.has_extra_roots() {
+        let extra = otter_gc::ExtraRoots::new(self as &Interpreter);
+        if self.gc_heap.has_extra_root_source(extra) {
             return None;
         }
         // `ExtraRoots::new` records a raw pointer to `self`; the registration
         // lives only until the paired pop below, and the interpreter outlives
         // it, so the closure's `&mut self` reborrow is sound (mirrors
         // `Interpreter::run_callable_sync`).
-        let extra = otter_gc::ExtraRoots::new(self as &Interpreter);
         Some(self.gc_heap.register_extra_roots(extra))
     }
 
@@ -1079,6 +1081,48 @@ mod tests {
                 .to_lossy_string(interp.gc_heap())
         });
         assert_eq!(content, "outer");
+    }
+
+    #[test]
+    fn unrelated_extra_roots_do_not_suppress_handle_arena_provider() {
+        let mut interp = Interpreter::new();
+        let unrelated = crate::NativeCallInfo::default_call();
+        let unrelated_roots = otter_gc::ExtraRoots::new(&unrelated);
+        let unrelated_guard = interp.gc_heap.register_extra_roots(unrelated_roots);
+        assert!(interp.gc_heap.has_extra_roots());
+        assert!(
+            !interp
+                .gc_heap
+                .has_extra_root_source(otter_gc::ExtraRoots::new(&interp)),
+            "the fixture must begin with only the narrow call-local provider",
+        );
+
+        let content = interp.with_handle_scope(|interp, scope| {
+            assert!(
+                interp
+                    .gc_heap
+                    .has_extra_root_source(otter_gc::ExtraRoots::new(interp as &Interpreter)),
+                "a handle scope must publish this interpreter's complete runtime roots",
+            );
+            let array = interp.scoped_array(scope, 1).unwrap();
+            let value = interp.scoped_string(scope, "rooted element").unwrap();
+            interp.scoped_set_index(scope, array, 0, value).unwrap();
+
+            let _churn = interp.scoped_object(scope).unwrap();
+            interp.collect_minor_tracing_runtime_roots();
+
+            let value = interp.scoped_get_index(scope, array, 0).unwrap();
+            interp
+                .escape_scoped(value)
+                .as_string(interp.gc_heap())
+                .expect("array element remains a string")
+                .to_lossy_string(interp.gc_heap())
+        });
+
+        assert_eq!(content, "rooted element");
+        assert!(interp.gc_heap.has_extra_root_source(unrelated_roots));
+        drop(unrelated_guard);
+        assert!(!interp.gc_heap.has_extra_roots());
     }
 
     #[test]

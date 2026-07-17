@@ -21,13 +21,12 @@
 //! - [`super::repr`] for selected SSA value representations.
 //! - [`otter_vm::deopt`] for the concrete VM deoptimization schema.
 
-
 use otter_bytecode::Op;
 use otter_vm::{
     JitCompileSnapshot,
     deopt::{
-        DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable,
-        DeoptVerifyError, DeoptVerifyLimits, FrameState,
+        DeoptExitId, DeoptFrame, DeoptLocation, DeoptRepr, DeoptSlot, DeoptTable, DeoptVerifyError,
+        DeoptVerifyLimits, FrameState,
     },
 };
 
@@ -329,9 +328,9 @@ impl DeoptLowering {
                     })?;
                 let is_caller = depth + 1 < frames.len();
                 if is_caller {
-                    let call = resume.checked_sub(1).and_then(|index| {
-                        body.instructions.get(index)
-                    });
+                    let call = resume
+                        .checked_sub(1)
+                        .and_then(|index| body.instructions.get(index));
                     let is_call = call.is_some_and(|instruction| {
                         instruction.op(body.code_block.as_ref()) == Op::Call
                     });
@@ -347,13 +346,12 @@ impl DeoptLowering {
 
         for (exit, state) in frame_states.states().iter().enumerate() {
             let byte_pc = byte_pc(view, state.pc)?;
-            let concrete = self
-                .table
-                .lookup(DeoptExitId(exit as u32))
-                .ok_or(DeoptLoweringError::MissingConcreteState {
+            let concrete = self.table.lookup(DeoptExitId(exit as u32)).ok_or(
+                DeoptLoweringError::MissingConcreteState {
                     pc: state.pc,
                     byte_pc,
-                })?;
+                },
+            )?;
             let concrete = concrete.innermost();
             let expected_width = usize::from(ssa.frame_registers(state.inline));
             if concrete.slots.len() != expected_width {
@@ -1115,7 +1113,6 @@ mod tests {
                 actual: DeoptRepr::Tagged,
             })
         );
-
     }
 
     #[test]
@@ -1204,7 +1201,10 @@ mod tests {
         let lowering = lower(&pipeline);
 
         // Every abstract state gets its own exit, in state order.
-        assert_eq!(lowering.table().entries().len(), pipeline.frame_states.states().len());
+        assert_eq!(
+            lowering.table().entries().len(),
+            pipeline.frame_states.states().len()
+        );
         for (index, state) in pipeline.frame_states.states().iter().enumerate() {
             assert_eq!(
                 DeoptLowering::exit_at(&pipeline.frame_states, state.inline, state.pc),

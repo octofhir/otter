@@ -24,13 +24,19 @@ outer(function () {
 
 fn run(sel: JitSelection) -> String {
     let mut rt = Runtime::builder().jit_selection(sel).build().expect("rt");
-    rt.run_script(SourceInput::from_javascript(SOURCE.to_string()), "nested.js")
-        .expect("run")
-        .completion_string()
-        .to_string()
+    rt.run_script(
+        SourceInput::from_javascript(SOURCE.to_string()),
+        "nested.js",
+    )
+    .expect("run")
+    .completion_string()
+    .to_string()
 }
 
 #[test]
 fn nested_compiled_catch_prefers_innermost_handler() {
-    assert_eq!(run(JitSelection::Template), run(JitSelection::InterpreterOnly));
+    assert_eq!(
+        run(JitSelection::Template),
+        run(JitSelection::InterpreterOnly)
+    );
 }

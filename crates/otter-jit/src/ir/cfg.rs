@@ -290,11 +290,12 @@ impl ControlFlowGraph {
                 continue;
             };
             let parent = &frames[call_site.parent.0 as usize];
-            let call_block = parent.block_ending_at(call_site.call_pc).ok_or(
-                CfgError::MissingTargetBlock {
-                    target_pc: call_site.call_pc,
-                },
-            )?;
+            let call_block =
+                parent
+                    .block_ending_at(call_site.call_pc)
+                    .ok_or(CfgError::MissingTargetBlock {
+                        target_pc: call_site.call_pc,
+                    })?;
             let continuation = parent.block_starting_at(call_site.call_pc + 1).ok_or(
                 CfgError::MissingTargetBlock {
                     target_pc: call_site.call_pc + 1,
@@ -1030,7 +1031,12 @@ mod tests {
             (Op::ReturnValue, vec![Operand::Register(0)]),
         ]);
         assert_eq!(graph.frame_entries, vec![BlockId(0)]);
-        assert!(graph.blocks.iter().all(|block| block.inline == InlineId::ROOT));
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .all(|block| block.inline == InlineId::ROOT)
+        );
         // Nothing splits the body: the call keeps its schema fallthrough inside
         // one block that ends at the return.
         assert_eq!(graph.blocks.len(), 1);

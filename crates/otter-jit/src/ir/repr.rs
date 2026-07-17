@@ -50,7 +50,10 @@ fn feedback_at(tree: &InlineTree, inline: InlineId, pc: u32) -> ArithFeedback {
     tree.frames[inline.0 as usize]
         .instructions
         .get(pc as usize)
-        .map_or_else(ArithFeedback::default, JitInstructionMetadata::arith_feedback)
+        .map_or_else(
+            ArithFeedback::default,
+            JitInstructionMetadata::arith_feedback,
+        )
 }
 
 /// Machine representation selected for one SSA value.
@@ -251,7 +254,10 @@ impl ReprMap {
                         .expect("local moves have one SSA result")
                         .0 as usize]
                 } else {
-                    selected_input_representation(instruction.op, feedback_at(tree, instruction.inline, instruction.pc))
+                    selected_input_representation(
+                        instruction.op,
+                        feedback_at(tree, instruction.inline, instruction.pc),
+                    )
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let from = reprs[value.0 as usize];
@@ -272,7 +278,11 @@ impl ReprMap {
         }
         // A PC is canonical only within its frame, so a use is named by both.
         conversions.sort_by_key(|conversion| {
-            (conversion.inline, conversion.at_pc, conversion.operand_index)
+            (
+                conversion.inline,
+                conversion.at_pc,
+                conversion.operand_index,
+            )
         });
 
         Self {
@@ -370,7 +380,10 @@ impl ReprMap {
                         instruction.result.expect("local moves have one SSA result"),
                     )
                 } else {
-                    verified_input_representation(instruction.op, feedback_at(tree, instruction.inline, instruction.pc))
+                    verified_input_representation(
+                        instruction.op,
+                        feedback_at(tree, instruction.inline, instruction.pc),
+                    )
                 };
                 for (operand_index, &value) in instruction.inputs.iter().enumerate() {
                     let key = (instruction.inline, instruction.pc, operand_index);
@@ -461,8 +474,9 @@ fn selected_non_phi_representation(tree: &InlineTree, def: &ValueDef) -> Represe
             pc,
             op: Op::LoadNumber,
             ..
-        } => load_number_at(tree, inline, pc)
-            .map_or(Representation::Float64, number_representation),
+        } => {
+            load_number_at(tree, inline, pc).map_or(Representation::Float64, number_representation)
+        }
         ValueDef::Op { inline, pc, op, .. } => {
             selected_result_representation(op, feedback_at(tree, inline, pc))
         }
@@ -700,7 +714,11 @@ fn verified_conversion_kind(
 }
 
 fn conversion_key(conversion: &Conversion) -> (InlineId, u32, usize) {
-    (conversion.inline, conversion.at_pc, conversion.operand_index)
+    (
+        conversion.inline,
+        conversion.at_pc,
+        conversion.operand_index,
+    )
 }
 
 #[cfg(test)]
@@ -794,7 +812,12 @@ mod tests {
             1,
             4,
             vec![
-                JitTestInstruction::new(Op::LoadInt32, 0, 0, vec![Operand::Register(1), Operand::Imm32(7)]),
+                JitTestInstruction::new(
+                    Op::LoadInt32,
+                    0,
+                    0,
+                    vec![Operand::Register(1), Operand::Imm32(7)],
+                ),
                 JitTestInstruction::new(Op::ReturnValue, 1, 8, vec![Operand::Register(1)]),
             ],
         );

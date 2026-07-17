@@ -490,15 +490,16 @@ impl UnitLayout {
 }
 
 /// `true` when any block of `frame` returns without a value operand.
-fn frame_has_valueless_return(cfg: &ControlFlowGraph, frame: &crate::ir::inline::InlineFrame) -> bool {
+fn frame_has_valueless_return(
+    cfg: &ControlFlowGraph,
+    frame: &crate::ir::inline::InlineFrame,
+) -> bool {
     cfg.blocks.iter().any(|block| {
         block.inline == frame.id
             && matches!(block.terminator, Terminator::InlineReturn { .. })
-            && block
-                .instr_pcs
-                .last()
-                .is_some_and(|&pc| frame.instructions[pc as usize].op(frame.code_block.as_ref())
-                    != Op::ReturnValue)
+            && block.instr_pcs.last().is_some_and(|&pc| {
+                frame.instructions[pc as usize].op(frame.code_block.as_ref()) != Op::ReturnValue
+            })
     })
 }
 
@@ -698,8 +699,7 @@ impl SsaFunction {
                     if inline != InlineId::ROOT && register < frame.code_block.param_count {
                         continue;
                     }
-                    let def = if inline == InlineId::ROOT
-                        && register < frame.code_block.param_count
+                    let def = if inline == InlineId::ROOT && register < frame.code_block.param_count
                     {
                         ValueDef::Param {
                             register,
@@ -858,15 +858,14 @@ impl SsaFunction {
                                         register_count: layout.register_count(inline),
                                     }
                                 })?;
-                                let value = stacks
-                                    [layout.variable(call_site.parent, argument)]
-                                .last()
-                                .copied()
-                                .ok_or(SsaError::MissingReachingDefinition {
-                                    block: block_id,
-                                    pc: None,
-                                    register: argument,
-                                })?;
+                                let value = stacks[layout.variable(call_site.parent, argument)]
+                                    .last()
+                                    .copied()
+                                    .ok_or(SsaError::MissingReachingDefinition {
+                                        block: block_id,
+                                        pc: None,
+                                        register: argument,
+                                    })?;
                                 let variable = layout.variable(inline, parameter);
                                 stacks[variable].push(value);
                                 pushed.push(variable);
@@ -1564,7 +1563,9 @@ mod tests {
     }
 
     /// Splice a one-parameter callee into `r0 = r1(r2); return r0`.
-    fn spliced(callee_body: Vec<(Op, Vec<Operand>)>) -> (ControlFlowGraph, SsaFunction, InlineTree) {
+    fn spliced(
+        callee_body: Vec<(Op, Vec<Operand>)>,
+    ) -> (ControlFlowGraph, SsaFunction, InlineTree) {
         let mut view = snapshot(
             1,
             8,
@@ -1629,10 +1630,10 @@ mod tests {
         let callee_entry = cfg.frame_entries[1];
         let callee_block = &ssa.blocks[callee_entry.0 as usize];
         assert!(
-            callee_block.phis.iter().all(|&value| !matches!(
-                ssa.values[value.0 as usize].def,
-                ValueDef::Param { .. }
-            )),
+            callee_block
+                .phis
+                .iter()
+                .all(|&value| !matches!(ssa.values[value.0 as usize].def, ValueDef::Param { .. })),
             "a spliced frame defines no parameters of its own",
         );
         let ret = callee_block.instrs.last().expect("the callee returns");
@@ -1658,7 +1659,12 @@ mod tests {
             .phis
             .iter()
             .copied()
-            .find(|&value| matches!(ssa.values[value.0 as usize].def, ValueDef::InlineResult { .. }))
+            .find(|&value| {
+                matches!(
+                    ssa.values[value.0 as usize].def,
+                    ValueDef::InlineResult { .. }
+                )
+            })
             .expect("the continuation merges the call result");
         let ValueDef::InlineResult {
             register, inputs, ..
@@ -1670,7 +1676,11 @@ mod tests {
 
         // Its only input is what the callee returned.
         let callee_return = &ssa.blocks[cfg.frame_entries[1].0 as usize];
-        let returned = callee_return.instrs.last().expect("the callee returns").inputs[0];
+        let returned = callee_return
+            .instrs
+            .last()
+            .expect("the callee returns")
+            .inputs[0];
         assert_eq!(inputs.as_ref(), [returned]);
 
         // The caller's own `return r0` then reads the merge, not its stale r0.
@@ -1705,7 +1715,12 @@ mod tests {
             .phis
             .iter()
             .copied()
-            .find(|&value| matches!(ssa.values[value.0 as usize].def, ValueDef::InlineResult { .. }))
+            .find(|&value| {
+                matches!(
+                    ssa.values[value.0 as usize].def,
+                    ValueDef::InlineResult { .. }
+                )
+            })
             .expect("the continuation merges the call result");
         let ValueDef::InlineResult { inputs, .. } = &ssa.values[merge.0 as usize].def else {
             unreachable!()
@@ -1733,7 +1748,10 @@ mod tests {
             .iter()
             .copied()
             .find(|&value| {
-                matches!(ssa.values[value.0 as usize].def, ValueDef::Param { register: 0, .. })
+                matches!(
+                    ssa.values[value.0 as usize].def,
+                    ValueDef::Param { register: 0, .. }
+                )
             })
             .expect("the root's r0 is its parameter");
         assert_ne!(

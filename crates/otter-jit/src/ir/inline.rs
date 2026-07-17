@@ -428,7 +428,10 @@ impl InlineTree {
             }
             let depth = frame.depth(self);
             if depth > MAX_INLINE_DEPTH {
-                return Err(InlineError::TooDeep { id: frame.id, depth });
+                return Err(InlineError::TooDeep {
+                    id: frame.id,
+                    depth,
+                });
             }
         }
         Ok(())
@@ -458,7 +461,11 @@ mod tests {
         JitCompileSnapshot::without_feedback(fid, 0, 8, instructions)
     }
 
-    fn callee(fid: u32, param_count: u16, instructions: Vec<JitTestInstruction>) -> otter_vm::JitInlineCallee {
+    fn callee(
+        fid: u32,
+        param_count: u16,
+        instructions: Vec<JitTestInstruction>,
+    ) -> otter_vm::JitInlineCallee {
         let view = JitCompileSnapshot::without_feedback(fid, param_count, 8, instructions);
         otter_vm::JitInlineCallee {
             code_block: Arc::clone(&view.code_block),
@@ -523,7 +530,10 @@ mod tests {
         let frame = &tree.frames[1];
         assert_eq!(frame.id, InlineId(1));
         assert_eq!(frame.function_id, 9);
-        let call_site = frame.call_site.as_ref().expect("a spliced frame replaces a call");
+        let call_site = frame
+            .call_site
+            .as_ref()
+            .expect("a spliced frame replaces a call");
         assert_eq!(call_site.parent, InlineId::ROOT);
         assert_eq!(call_site.call_pc, 0);
         assert_eq!(call_site.result_register, 0);
@@ -542,7 +552,8 @@ mod tests {
 
         let tree = InlineTree::build(&view);
         assert!(tree.is_trivial());
-        tree.verify().expect("declining to splice stays well formed");
+        tree.verify()
+            .expect("declining to splice stays well formed");
     }
 
     #[test]

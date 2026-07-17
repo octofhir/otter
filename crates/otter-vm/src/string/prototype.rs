@@ -1582,20 +1582,40 @@ fn get_value(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error(name, "missing execution context"))?;
-    let interp = ctx.interp_mut();
-    let outcome = match interp.ordinary_get_value(&exec, value, value, key, 0) {
-        Ok(v) => v,
-        Err(e) => return Err(vm_err(interp, e, name)),
-    };
-    match outcome {
-        VmGetOutcome::Value(v) => Ok(v),
-        VmGetOutcome::InvokeGetter { getter } => {
-            match interp.run_callable_sync(&exec, &getter, value, SmallVec::new()) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(vm_err(interp, e, name)),
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(value);
+        let receiver_value = scope.raw(receiver);
+        let outcome = scope.with_turn_parts(|interp, stack| {
+            interp.ordinary_get_value(stack, &exec, receiver_value, receiver_value, key, 0)
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(vm_err(scope.context().interp_mut(), error, name)),
+        };
+        let result = match outcome {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                let getter = scope.value(getter);
+                let getter_value = scope.raw(getter);
+                let receiver_value = scope.raw(receiver);
+                let result = scope.with_turn_parts(|interp, stack| {
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        &exec,
+                        &getter_value,
+                        receiver_value,
+                        SmallVec::new(),
+                    )
+                });
+                match result {
+                    Ok(value) => value,
+                    Err(error) => return Err(vm_err(scope.context().interp_mut(), error, name)),
+                }
             }
-        }
-    }
+        };
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
 }
 
 /// §7.3.11 GetMethod for a well-known symbol: returns `None` when the
@@ -1625,15 +1645,30 @@ fn is_reg_exp(
     value: Value,
     name: &'static str,
 ) -> Result<bool, NativeError> {
-    if !value.is_object_type() {
-        return Ok(false);
-    }
-    let sym = ctx.interp_mut().well_known_symbols().get(WellKnown::Match);
-    let matcher = get_value(ctx, value, &VmPropertyKey::Symbol(sym), name)?;
-    if !matcher.is_undefined() {
-        return Ok(matcher.to_boolean(ctx.heap()));
-    }
-    Ok(value.as_regexp().is_some())
+    ctx.scope(|mut scope| {
+        let value = scope.value(value);
+        if !scope.raw(value).is_object_type() {
+            return Ok(false);
+        }
+        let sym = scope
+            .context()
+            .interp_mut()
+            .well_known_symbols()
+            .get(WellKnown::Match);
+        let current_value = scope.raw(value);
+        let matcher = get_value(
+            scope.context(),
+            current_value,
+            &VmPropertyKey::Symbol(sym),
+            name,
+        )?;
+        let matcher = scope.value(matcher);
+        let matcher_value = scope.raw(matcher);
+        if !matcher_value.is_undefined() {
+            return Ok(matcher_value.to_boolean(scope.context().heap()));
+        }
+        Ok(scope.raw(value).as_regexp().is_some())
+    })
 }
 
 /// Coerce a single value with the §7.1.17 `ToString` ladder (user
@@ -1651,12 +1686,10 @@ fn value_to_string(
         .execution_context()
         .cloned()
         .ok_or_else(|| type_error(name, "missing execution context"))?;
-    let interp = ctx.interp_mut();
-    let text = match interp.coerce_to_string(&exec, &value) {
-        Ok(t) => t,
-        Err(e) => return Err(vm_err(interp, e, name)),
-    };
-    JsString::from_str(&text, ctx.heap_mut()).map_err(NativeError::from)
+    let string = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_js_string_or_throw(interp, stack, &exec, &value)
+    });
+    string.map_err(|error| vm_err(ctx.interp_mut(), error, name))
 }
 
 /// §22.1.3.17.1 GetSubstitution over UTF-16 units for a string-search
@@ -2546,25 +2579,52 @@ fn native_string_method(
     // §22.1.3.23 `split` — an Object separator delegates to `@@split`
     // (RegExp and user objects) with the un-stringified receiver.
     if name == "split" {
-        let this = *ctx.this_value();
-        if this.is_nullish() {
-            return Err(type_error("split", "called on null or undefined"));
-        }
-        let separator = args.first().copied().unwrap_or_else(Value::undefined);
-        if separator.is_object_type()
-            && let Some(splitter) = get_symbol_method(ctx, separator, WellKnown::Split, "split")?
-        {
-            let exec = ctx
+        let dispatch = ctx.scope(|mut scope| {
+            let this = scope.this();
+            if scope.raw(this).is_nullish() {
+                return Err(type_error("split", "called on null or undefined"));
+            }
+            let separator = scope.argument(args, 0);
+            if !scope.raw(separator).is_object_type() {
+                return Ok(None);
+            }
+            let separator_value = scope.raw(separator);
+            let Some(splitter_value) =
+                get_symbol_method(scope.context(), separator_value, WellKnown::Split, "split")?
+            else {
+                return Ok(None);
+            };
+            let splitter = scope.value(splitter_value);
+            let limit = scope.argument(args, 1);
+            let exec = scope
+                .context()
                 .execution_context()
                 .cloned()
                 .ok_or_else(|| type_error("split", "missing execution context"))?;
-            let limit = args.get(1).copied().unwrap_or_else(Value::undefined);
-            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this, limit];
-            let interp = ctx.interp_mut();
-            return match interp.run_callable_sync(&exec, &splitter, separator, cb_args) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(vm_err(interp, e, "split")),
+            let splitter_value = scope.raw(splitter);
+            let separator_value = scope.raw(separator);
+            let cb_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![scope.raw(this), scope.raw(limit)];
+            let result = scope.with_turn_parts(|interp, stack| {
+                interp.run_callable_sync_rooted(
+                    stack,
+                    &exec,
+                    &splitter_value,
+                    separator_value,
+                    cb_args,
+                )
+            });
+            let result = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    return Err(vm_err(scope.context().interp_mut(), error, "split"));
+                }
             };
+            let result = scope.value(result);
+            Ok(Some(scope.finish(result)))
+        })?;
+        if let Some(result) = dispatch {
+            return Ok(result);
         }
     }
     // §22.1.3.{11,13,14} `match` / `search` / `matchAll` — an Object
@@ -2575,106 +2635,128 @@ fn native_string_method(
         "matchAll" => Some(WellKnown::MatchAll),
         _ => None,
     } {
-        let this = *ctx.this_value();
-        if this.is_nullish() {
-            return Err(type_error(name, "called on null or undefined"));
-        }
-        let arg = args.first().copied().unwrap_or_else(Value::undefined);
-        if arg.is_object_type() {
+        let dispatch = ctx.scope(|mut scope| {
+            let this = scope.this();
+            if scope.raw(this).is_nullish() {
+                return Err(type_error(name, "called on null or undefined"));
+            }
+            let arg = scope.argument(args, 0);
+            if !scope.raw(arg).is_object_type() {
+                return Ok(None);
+            }
             // §22.1.3.14 step 5.b — `matchAll` requires a global RegExp.
-            if name == "matchAll" && is_reg_exp(ctx, arg, name)? {
-                let flags = get_value(ctx, arg, &VmPropertyKey::String("flags"), name)?;
-                if flags.is_nullish() {
-                    return Err(type_error(name, "flags is null or undefined"));
-                }
-                let flags_str = value_to_string(ctx, flags, name)?;
-                if !flags_str.to_lossy_string(ctx.heap()).contains('g') {
-                    return Err(type_error(name, "matchAll must use a global RegExp"));
+            if name == "matchAll" {
+                let arg_value = scope.raw(arg);
+                if is_reg_exp(scope.context(), arg_value, name)? {
+                    let arg_value = scope.raw(arg);
+                    let flags_value = get_value(
+                        scope.context(),
+                        arg_value,
+                        &VmPropertyKey::String("flags"),
+                        name,
+                    )?;
+                    let flags = scope.value(flags_value);
+                    if scope.raw(flags).is_nullish() {
+                        return Err(type_error(name, "flags is null or undefined"));
+                    }
+                    let flags_value = scope.raw(flags);
+                    let flags_string = value_to_string(scope.context(), flags_value, name)?;
+                    if !flags_string
+                        .to_lossy_string(scope.context().heap())
+                        .contains('g')
+                    {
+                        return Err(type_error(name, "matchAll must use a global RegExp"));
+                    }
                 }
             }
-            if let Some(method) = get_symbol_method(ctx, arg, wk, name)? {
-                let exec = ctx
+            let arg_value = scope.raw(arg);
+            let Some(method_value) = get_symbol_method(scope.context(), arg_value, wk, name)?
+            else {
+                return Ok(None);
+            };
+            let method = scope.value(method_value);
+            let exec = scope
+                .context()
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| type_error(name, "missing execution context"))?;
+            let method_value = scope.raw(method);
+            let arg_value = scope.raw(arg);
+            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![scope.raw(this)];
+            let result = scope.with_turn_parts(|interp, stack| {
+                interp.run_callable_sync_rooted(stack, &exec, &method_value, arg_value, cb_args)
+            });
+            let result = match result {
+                Ok(value) => value,
+                Err(error) => return Err(vm_err(scope.context().interp_mut(), error, name)),
+            };
+            let result = scope.value(result);
+            Ok(Some(scope.finish(result)))
+        })?;
+        if let Some(result) = dispatch {
+            return Ok(result);
+        }
+    }
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        // §22.1.3 — every `String.prototype` method (other than
+        // `toString` / `valueOf`, which use `thisStringValue`) opens with
+        // `RequireObjectCoercible(this)` then `S = ? ToString(this)`.
+        let coerce_receiver = !matches!(name, "toString" | "valueOf");
+        let receiver = if coerce_receiver {
+            let receiver_value = scope.raw(receiver);
+            if receiver_value.is_nullish() {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "Cannot convert undefined or null to object".to_string(),
+                });
+            }
+            if !crate::abstract_ops::is_primitive(&receiver_value) {
+                let exec = scope
+                    .context()
                     .execution_context()
                     .cloned()
                     .ok_or_else(|| type_error(name, "missing execution context"))?;
-                let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![this];
-                let interp = ctx.interp_mut();
-                return match interp.run_callable_sync(&exec, &method, arg, cb_args) {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(vm_err(interp, e, name)),
+                let string = scope.with_turn_parts(|interp, stack| {
+                    crate::coerce::to_js_string_or_throw(interp, stack, &exec, &receiver_value)
+                });
+                let string = match string {
+                    Ok(string) => string,
+                    Err(error) => {
+                        return Err(vm_err(scope.context().interp_mut(), error, name));
+                    }
                 };
+                scope.value(Value::string(string))
+            } else {
+                receiver
             }
-        }
-    }
-    let receiver = *ctx.this_value();
-    // §22.1.3 — every `String.prototype` method (other than
-    // `toString` / `valueOf`, which use `thisStringValue`) opens with
-    // `RequireObjectCoercible(this)` then `S = ? ToString(this)`. The
-    // old receiver-only helper inspected internal slots, so a
-    // non-wrapper Object receiver with a user `toString` (or one that
-    // throws / returns a Symbol) silently fell back to
-    // `"[object Object]"`. Coerce the receiver here, uniformly, so the
-    // spec `ToString` ladder fires for `.call` / `.apply` on any
-    // receiver and user `toString` / `@@toPrimitive` / abrupt
-    // completions are observed.
-    let coerce_receiver = !matches!(name, "toString" | "valueOf");
-    let receiver = if coerce_receiver {
-        let needs_coerce = receiver.is_object()
-            || receiver.is_array()
-            || receiver.is_function()
-            || receiver.is_closure()
-            || receiver.is_native_function()
-            || receiver.is_bound_function()
-            || receiver.is_class_constructor()
-            || receiver.is_proxy()
-            || receiver.is_regexp()
-            || receiver.is_promise()
-            || receiver.is_map()
-            || receiver.is_set();
-        if receiver.is_nullish() {
-            return Err(NativeError::TypeError {
-                name,
-                reason: "Cannot convert undefined or null to object".to_string(),
-            });
-        }
-        if needs_coerce && let Some(exec) = ctx.execution_context().cloned() {
-            let interp = ctx.interp_mut();
-            let s = match interp.coerce_to_string(&exec, &receiver) {
-                Ok(s) => s,
-                Err(e) => return Err(vm_err(interp, e, name)),
-            };
-
-            Value::string(JsString::from_str(&s, ctx.heap_mut()).map_err(|_| {
-                NativeError::TypeError {
-                    name,
-                    reason: "out of memory".to_string(),
-                }
-            })?)
         } else {
             receiver
+        };
+        // §22.1.3.* String.prototype.* int / string argument coercion —
+        // run the SAME shared routine as the `Op::CallMethodValue` String
+        // arm (`Interpreter::coerce_string_method_args`) so `.call(...)` /
+        // `.apply(...)` and `"s".m(...)` coerce identically.
+        let mut coerced_args: smallvec::SmallVec<[Value; 4]> = args.iter().copied().collect();
+        if let Some(exec) = scope.context().execution_context().cloned() {
+            let result = scope.with_turn_parts(|interp, stack| {
+                interp.coerce_string_method_args(stack, &exec, name, &mut coerced_args)
+            });
+            if let Err(error) = result {
+                return Err(crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    error,
+                    name,
+                ));
+            }
         }
-    } else {
-        receiver
-    };
-    // §22.1.3.* String.prototype.* int / string argument coercion —
-    // run the SAME shared routine as the `Op::CallMethodValue` String
-    // arm (`Interpreter::coerce_string_method_args`) so `.call(...)` /
-    // `.apply(...)` and `"s".m(...)` coerce identically (index-like
-    // operands via full `ToNumber`, string operands via
-    // `ToPrimitive(String)`), observing user `@@toPrimitive` /
-    // `valueOf` / `toString`.
-    let mut coerced_args: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    if let Some(exec) = ctx.execution_context().cloned() {
-        let interp = ctx.interp_mut();
-        interp
-            .coerce_string_method_args(&exec, name, &mut coerced_args)
-            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
-    }
-    let impl_fn = intrinsic_impl(name).ok_or_else(|| NativeError::TypeError {
-        name,
-        reason: "unknown String.prototype method".to_string(),
-    })?;
-    impl_fn(ctx, &receiver, &coerced_args)
+        let impl_fn = intrinsic_impl(name).ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "unknown String.prototype method".to_string(),
+        })?;
+        let receiver_value = scope.raw(receiver);
+        impl_fn(scope.context(), &receiver_value, &coerced_args)
+    })
 }
 
 /// Generate a per-method trampoline + spec-table entry. The

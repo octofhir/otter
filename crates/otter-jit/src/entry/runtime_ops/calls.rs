@@ -262,10 +262,12 @@ pub(crate) extern "C" fn jit_call_generic_stub(
         return 2;
     };
     let vm = unsafe { &mut *activation.vm_ptr() };
+    let stack = unsafe { &mut *activation.stack_ptr() };
     let context = unsafe { &*activation.context_ptr() };
     let mut inline_args = [0u16; crate::entry::MAX_METHOD_ARGS];
     let args = crate::entry::decode_packed_arg_regs(argc as usize, packed_args, &mut inline_args);
-    match vm.jit_runtime_call_in_place(context, dst as u16, callee as u16, args, caller_regs) {
+    match vm.jit_runtime_call_in_place(context, stack, dst as u16, callee as u16, args, caller_regs)
+    {
         Ok(true) => 0,
         Ok(false) => 2,
         Err(err) => match try_resume_caller_throw(ctx, matches!(err, VmError::Uncaught)) {

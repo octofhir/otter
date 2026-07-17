@@ -56,8 +56,12 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let value = *read_register(&stack[top_idx], src)?;
-        let primitive =
-            self.evaluate_to_primitive(context, &value, abstract_ops::ToPrimitiveHint::String)?;
+        let primitive = self.evaluate_to_primitive(
+            stack,
+            context,
+            &value,
+            abstract_ops::ToPrimitiveHint::String,
+        )?;
         let key = if primitive.as_symbol(&self.gc_heap).is_some()
             || primitive.as_string(&self.gc_heap).is_some()
         {

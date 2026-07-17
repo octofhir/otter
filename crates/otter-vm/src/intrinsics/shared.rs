@@ -6,8 +6,6 @@
 //! compose. They live here (not in `bootstrap.rs`) so the registry
 //! file stays focused on entry-list bookkeeping.
 
-use smallvec::SmallVec;
-
 use crate::js_surface::{Attr, JsSurfaceError};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::rooting::RootScopeExt;
@@ -133,62 +131,55 @@ pub(crate) fn native_new_target_prototype(
     let Some(new_target) = ctx.new_target().cloned() else {
         return Ok(None);
     };
-    let proto = if let Some(exec) = ctx.execution_context().cloned() {
-        let key = VmPropertyKey::String("prototype");
-        let (interp, _) = ctx.interp_mut_and_context();
-        match interp
-            .ordinary_get_value(&exec, new_target, new_target, &key, 0)
-            .map_err(|err| NativeError::TypeError {
-                name,
-                reason: err.to_string(),
-            })? {
-            VmGetOutcome::Value(value) => Some(value),
-            VmGetOutcome::InvokeGetter { getter } => Some(
-                match interp.run_callable_sync(&exec, &getter, new_target, SmallVec::new()) {
-                    Ok(v) => v,
-                    Err(err) => return Err(native_new_target_error(interp, name, err)),
-                },
-            ),
-        }
-    } else if let Some(class) = new_target.as_class_constructor() {
-        Some(Value::object(class.prototype(ctx.heap())))
-    } else if let Some(obj) = new_target.as_object() {
-        object::get(obj, ctx.heap(), "prototype")
-    } else if let Some(native) = new_target.as_native_function() {
-        native
-            .own_property_descriptor(ctx.heap_mut(), "prototype")
-            .map_err(|err| NativeError::TypeError {
-                name,
-                reason: err.to_string(),
-            })?
-            .map(|descriptor| descriptor_value(&descriptor))
-    } else {
-        None
-    };
-    Ok(proto.filter(|value| value.is_object_type() || value.is_proxy()))
-}
-
-fn native_new_target_error(
-    interp: &crate::Interpreter,
-    name: &'static str,
-    err: crate::VmError,
-) -> NativeError {
-    match err {
-        crate::VmError::Uncaught => {
-            let value = match interp.take_error_detail() {
-                Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                _ => Default::default(),
-            };
-            NativeError::Thrown {
-                name,
-                message: value.into(),
+    let exec = ctx.execution_context().cloned();
+    ctx.scope(|mut scope| {
+        let new_target = scope.value(new_target);
+        let proto = if let Some(exec) = exec {
+            let key = VmPropertyKey::String("prototype");
+            let receiver = scope.raw(new_target);
+            match scope
+                .with_turn_parts(|interp, stack| {
+                    interp.ordinary_get_value(stack, &exec, receiver, receiver, &key, 0)
+                })
+                .map_err(|err| NativeError::TypeError {
+                    name,
+                    reason: err.to_string(),
+                })? {
+                VmGetOutcome::Value(value) => Some(scope.value(value)),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let getter = scope.value(getter);
+                    let result = scope.call(getter, new_target, &[])?;
+                    Some(result)
+                }
             }
-        }
-        other => NativeError::TypeError {
-            name,
-            reason: other.to_string(),
-        },
-    }
+        } else {
+            let new_target_raw = scope.raw(new_target);
+            let value = if let Some(class) = new_target_raw.as_class_constructor() {
+                Some(Value::object(class.prototype(scope.context().heap())))
+            } else if let Some(obj) = new_target_raw.as_object() {
+                object::get(obj, scope.context().heap(), "prototype")
+            } else if let Some(native) = new_target_raw.as_native_function() {
+                native
+                    .own_property_descriptor(scope.context().heap_mut(), "prototype")
+                    .map_err(|err| NativeError::TypeError {
+                        name,
+                        reason: err.to_string(),
+                    })?
+                    .map(|descriptor| descriptor_value(&descriptor))
+            } else {
+                None
+            };
+            value.map(|value| scope.value(value))
+        };
+        let Some(proto) = proto else {
+            return Ok(None);
+        };
+        let proto = scope.finish(proto);
+        Ok(proto
+            .is_object_type()
+            .then_some(proto)
+            .or_else(|| proto.is_proxy().then_some(proto)))
+    })
 }
 
 /// Install an empty `<name>` global with a fresh prototype slot.

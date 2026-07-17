@@ -17,17 +17,17 @@
 //!   read and update `lastIndex`.
 //! - `lastIndex` is clamped to `[0, len]` before any match attempt
 //!   so a manual `re.lastIndex = -1` doesn't underflow.
+//! - Observable getters, setters, `exec`, species construction, and iterator
+//!   advancement run on the current activation stack; every receiver and
+//!   intermediate result is re-read from a traced anchor after re-entry.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
-use otter_gc::raw::RawGc;
-
-use crate::array::JsArray;
 use crate::regexp::JsRegExp;
-use crate::runtime_cx::NativeCtx;
+use crate::runtime_cx::{NativeCtx, NativeScope};
 use crate::string::JsString;
-use crate::{NativeError, Value, VmError};
+use crate::{Local, NativeError, Value};
 
 const REGEXP_EXEC_NAME: &str = "RegExp.prototype.exec";
 
@@ -35,21 +35,6 @@ fn native_type_error(name: &'static str, reason: impl Into<String>) -> NativeErr
     NativeError::TypeError {
         name,
         reason: reason.into(),
-    }
-}
-
-fn vm_shape_error_to_native(err: VmError) -> NativeError {
-    match err {
-        VmError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => native_type_error(
-            REGEXP_EXEC_NAME,
-            format!(
-                "out of memory: requested {requested_bytes} bytes with heap limit {heap_limit_bytes} bytes"
-            ),
-        ),
-        _ => native_type_error(REGEXP_EXEC_NAME, "property shape update failed"),
     }
 }
 
@@ -63,85 +48,112 @@ fn vm_shape_error_to_native(err: VmError) -> NativeError {
 /// `indices` companion array (§22.2.7.7
 /// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
 pub(crate) fn exec_once_native(
-    re: &JsRegExp,
     receiver: &Value,
     text: JsString,
     ctx: &mut NativeCtx<'_>,
-    slice_roots: &[&[Value]],
 ) -> Result<Value, NativeError> {
-    let len = text.len() as usize;
-    // §22.2.7.2 step 3 — `lastIndex = ? ToLength(? Get(R, "lastIndex"))`.
-    // The read is observable (a user `lastIndex` getter fires) even
-    // when the regex is neither global nor sticky.
-    let last_index_val = get_property_runtime(ctx, receiver, "lastIndex", REGEXP_EXEC_NAME)?;
-    let mut start = to_length_runtime(ctx, &last_index_val, REGEXP_EXEC_NAME)? as usize;
-    // §22.2.7.2 step 4 — `flags = R.[[OriginalFlags]]`, read *after*
-    // `lastIndex`: a `lastIndex` getter may `re.compile(...)` and change
-    // the global/sticky flags, which the subsequent steps must observe.
-    let flags = re.flags(ctx.heap());
-    // step 8 — a non-global, non-sticky match always starts at 0.
-    if !flags.global && !flags.sticky {
-        start = 0;
-    } else if start > len {
-        // step 12.a.i — out-of-range start resets `lastIndex` (the
-        // observable `Set` throws on a non-writable `lastIndex`).
-        set_property_runtime(
-            ctx,
-            receiver,
-            "lastIndex",
-            Value::number_i32(0),
-            REGEXP_EXEC_NAME,
-        )?;
-        return Ok(Value::null());
-    }
-    // Match over a borrow of the subject's cached UTF-16 units — no
-    // per-`exec` re-materialisation of the whole subject. The matcher does
-    // not allocate on the heap, so borrowing across it is sound.
-    let heap = ctx.heap();
-    let m = text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
-    let m = match m {
-        Some(m) => m,
-        None => {
-            if flags.global || flags.sticky {
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(*receiver);
+        let input = scope.value(Value::string(text));
+
+        let result = (|| -> Result<Local<'_>, NativeError> {
+            let len = scope
+                .raw(input)
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?
+                .len() as usize;
+
+            // §22.2.7.2 step 3 — the observable lastIndex read and coercion
+            // may run arbitrary JS. Receiver, subject, and the returned value
+            // all live in the handle arena before either step starts.
+            let receiver_value = scope.raw(receiver);
+            let last_index = get_property_runtime(
+                scope.context(),
+                &receiver_value,
+                "lastIndex",
+                REGEXP_EXEC_NAME,
+            )?;
+            let last_index = scope.value(last_index);
+            let last_index_value = scope.raw(last_index);
+            let mut start =
+                to_length_runtime(scope.context(), &last_index_value, REGEXP_EXEC_NAME)? as usize;
+
+            // A lastIndex getter may recompile the RegExp. Re-read the
+            // authoritative receiver slot only after that getter/coercion
+            // ladder completes; never retain the incoming raw JsRegExp handle.
+            let receiver_value = scope.raw(receiver);
+            let re = receiver_value
+                .as_regexp()
+                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "this is not a RegExp"))?;
+            let flags = re.flags(scope.context().heap());
+            if !flags.global && !flags.sticky {
+                start = 0;
+            } else if start > len {
+                let receiver_value = scope.raw(receiver);
                 set_property_runtime(
-                    ctx,
-                    receiver,
+                    scope.context(),
+                    &receiver_value,
                     "lastIndex",
                     Value::number_i32(0),
                     REGEXP_EXEC_NAME,
                 )?;
+                return Ok(scope.null());
             }
-            return Ok(Value::null());
-        }
-    };
-    if flags.sticky && m.range.start != start {
-        set_property_runtime(
-            ctx,
-            receiver,
-            "lastIndex",
-            Value::number_i32(0),
-            REGEXP_EXEC_NAME,
-        )?;
-        return Ok(Value::null());
-    }
-    if flags.global || flags.sticky {
-        set_property_runtime(
-            ctx,
-            receiver,
-            "lastIndex",
-            Value::number_f64(m.range.end as f64),
-            REGEXP_EXEC_NAME,
-        )?;
-    }
 
-    Ok(Value::array(build_match_result_native(
-        &m,
-        text,
-        flags.has_indices,
-        ctx,
-        &[],
-        slice_roots,
-    )?))
+            // Matching itself is non-allocating. Resolve both raw handles from
+            // their Locals immediately before the shared heap borrow.
+            let receiver_value = scope.raw(receiver);
+            let re = receiver_value
+                .as_regexp()
+                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "this is not a RegExp"))?;
+            let input_value = scope.raw(input);
+            let text = input_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input is not a string"))?;
+            let heap = scope.context().heap();
+            let matched = text.with_utf16(heap, |units| re.find_one_from_utf16(heap, units, start));
+            let matched = match matched {
+                Some(matched) => matched,
+                None => {
+                    if flags.global || flags.sticky {
+                        let receiver_value = scope.raw(receiver);
+                        set_property_runtime(
+                            scope.context(),
+                            &receiver_value,
+                            "lastIndex",
+                            Value::number_i32(0),
+                            REGEXP_EXEC_NAME,
+                        )?;
+                    }
+                    return Ok(scope.null());
+                }
+            };
+            if flags.sticky && matched.range.start != start {
+                let receiver_value = scope.raw(receiver);
+                set_property_runtime(
+                    scope.context(),
+                    &receiver_value,
+                    "lastIndex",
+                    Value::number_i32(0),
+                    REGEXP_EXEC_NAME,
+                )?;
+                return Ok(scope.null());
+            }
+            if flags.global || flags.sticky {
+                let receiver_value = scope.raw(receiver);
+                set_property_runtime(
+                    scope.context(),
+                    &receiver_value,
+                    "lastIndex",
+                    Value::number_f64(matched.range.end as f64),
+                    REGEXP_EXEC_NAME,
+                )?;
+            }
+
+            build_match_result_native(&matched, input, flags.has_indices, &mut scope)
+        })()?;
+        Ok(scope.finish(result))
+    })
 }
 
 /// §22.2.7.2 steps 26–32 — build the JS-visible match-result array
@@ -153,236 +165,143 @@ pub(crate) fn exec_once_native(
 /// substring. Copies the (small) range out under a shared borrow before the
 /// allocation, so the widened subject buffer is never held live across a
 /// heap mutation that could move it.
-fn slice_subject_string(
-    input: JsString,
+fn slice_subject_string<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    input: Local<'_>,
     range: std::ops::Range<usize>,
-    ctx: &mut NativeCtx<'_>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<JsString, NativeError> {
-    let units = input.with_utf16(ctx.heap(), |u| u[range].to_vec());
-    // Root the caller's live handles (the subject `input`, the accumulated
-    // result parts) across the substring alloc: they are young strings once
-    // string bodies live in the nursery, and this alloc can scavenge.
-    let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for v in value_roots {
-            v.trace_value_slots(visitor);
-        }
-        for slice in slice_roots {
-            for v in *slice {
-                v.trace_value_slots(visitor);
-            }
-        }
-    };
-    Ok(JsString::from_utf16_units_with_roots(
-        &units,
-        ctx.heap_mut(),
-        &mut visit,
-    )?)
+) -> Result<Local<'scope>, NativeError> {
+    let input_value = scope.raw(input);
+    let input = input_value
+        .as_string(scope.context().heap())
+        .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "input root is not a string"))?;
+    let units = input.with_utf16(scope.context().heap(), |units| units[range].to_vec());
+    let string = JsString::from_utf16_units(&units, scope.context().heap_mut())?;
+    Ok(scope.value(Value::string(string)))
 }
 
-pub(crate) fn build_match_result_native(
+fn build_match_result_native<'scope>(
     m: &crate::regexp::engine::Match,
-    input: JsString,
+    input: Local<'_>,
     has_indices: bool,
-    ctx: &mut NativeCtx<'_>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<JsArray, NativeError> {
-    // Keep the subject rooted across every substring alloc (it is a young
-    // string that a scavenge can relocate); re-derive the live handle each
-    // time, and root the accumulated parts too.
-    let input_value = Value::string(input);
-    let full = slice_subject_string(input, m.range.clone(), ctx, &[&input_value], &[])?;
-    let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-    out.push(Value::string(full));
-    for cap in &m.captures {
-        match cap {
-            Some(r) => {
-                let cur_input = input_value
-                    .as_string(ctx.heap())
-                    .expect("subject is a string");
-                let s = slice_subject_string(
-                    cur_input,
-                    r.clone(),
-                    ctx,
-                    &[&input_value],
-                    &[out.as_slice()],
-                )?;
-                out.push(Value::string(s));
-            }
-            None => out.push(Value::undefined()),
-        }
-    }
-    let mut roots = Vec::with_capacity(value_roots.len() + 1);
-    roots.push(&input_value);
-    roots.extend_from_slice(value_roots);
-    let mut slices = Vec::with_capacity(slice_roots.len() + 1);
-    slices.push(out.as_slice());
-    slices.extend_from_slice(slice_roots);
-    let arr = ctx.array_from_elements_with_roots(out.iter().cloned(), &roots, &slices)?;
-
-    // Build the `groups` value first (the named-group object build must root
-    // `arr`), then install `index` / `input` / `groups` in a single payload
-    // write — the three fixed match-result properties.
-    let index_value = Value::number_i32(m.range.start as i32);
-    let mut named_iter = m.named_groups();
-    let first_named = named_iter.next();
-    let groups_value = if let Some((name, range)) = first_named {
-        let arr_value = Value::array(arr);
-        let mut roots = Vec::with_capacity(value_roots.len() + 2);
-        roots.push(&input_value);
-        roots.push(&arr_value);
-        roots.extend_from_slice(value_roots);
-        let groups_obj = ctx.alloc_object_with_roots(&roots, &slices)?;
-        crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
-        let value = match range {
-            Some(r) => {
-                let cur_input = input_value
-                    .as_string(ctx.heap())
-                    .expect("subject is a string");
-                Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
-            }
-            None => Value::undefined(),
+    scope: &mut NativeScope<'scope, '_>,
+) -> Result<Local<'scope>, NativeError> {
+    let result = scope.array(1 + m.captures.len())?;
+    let full = slice_subject_string(scope, input, m.range.clone())?;
+    scope.set_index(result, 0, full)?;
+    for (index, capture) in m.captures.iter().enumerate() {
+        let value = match capture {
+            Some(range) => slice_subject_string(scope, input, range.clone())?,
+            None => scope.undefined(),
         };
-        ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
-            .map_err(vm_shape_error_to_native)?;
-        for (name, range) in named_iter {
+        scope.set_index(result, index + 1, value)?;
+    }
+
+    let mut named = m.named_groups();
+    let groups = if let Some((name, range)) = named.next() {
+        let groups = scope.bare_object()?;
+        let value = match range {
+            Some(range) => slice_subject_string(scope, input, range)?,
+            None => scope.undefined(),
+        };
+        scope.set(groups, name, value)?;
+        for (name, range) in named {
             let value = match range {
-                Some(r) => {
-                    let cur_input = input_value
-                        .as_string(ctx.heap())
-                        .expect("subject is a string");
-                    Value::string(slice_subject_string(cur_input, r, ctx, &roots, &slices)?)
-                }
-                None => Value::undefined(),
+                Some(range) => slice_subject_string(scope, input, range)?,
+                None => scope.undefined(),
             };
-            ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
-                .map_err(vm_shape_error_to_native)?;
+            scope.set(groups, name, value)?;
         }
-        Value::object(groups_obj)
+        groups
     } else {
-        Value::undefined()
+        scope.undefined()
     };
+
+    // Re-read the array and every stored value only after all group
+    // allocations. The arena is the sole authority; no raw JsArray/JsObject
+    // survives a collection point.
+    let result_array = scope
+        .raw(result)
+        .as_array()
+        .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "result root is not an array"))?;
+    let input_value = scope.raw(input);
+    let groups_value = scope.raw(groups);
     crate::array::set_match_result_props(
-        arr,
-        ctx.heap_mut(),
-        index_value,
+        result_array,
+        scope.context().heap_mut(),
+        Value::number_i32(m.range.start as i32),
         input_value,
         groups_value,
     )?;
 
     if has_indices {
-        let arr_value = Value::array(arr);
-        let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-        indices_elems.push(pair_array_native(
-            m.range.start,
-            m.range.end,
-            ctx,
-            &[&input_value, &arr_value],
-            &[out.as_slice()],
-        )?);
-        for cap in &m.captures {
-            match cap {
-                Some(r) => indices_elems.push(pair_array_native(
-                    r.start,
-                    r.end,
-                    ctx,
-                    &[&input_value, &arr_value],
-                    &[out.as_slice(), indices_elems.as_slice()],
-                )?),
-                None => indices_elems.push(Value::undefined()),
-            }
-        }
-        let mut roots = Vec::with_capacity(value_roots.len() + 2);
-        roots.push(&input_value);
-        roots.push(&arr_value);
-        roots.extend_from_slice(value_roots);
-        let mut index_slices = Vec::with_capacity(slice_roots.len() + 2);
-        index_slices.push(out.as_slice());
-        index_slices.push(indices_elems.as_slice());
-        index_slices.extend_from_slice(slice_roots);
-        let indices_arr = ctx.array_from_elements_with_roots(
-            indices_elems.iter().cloned(),
-            &roots,
-            &index_slices,
-        )?;
-        let mut named_iter = m.named_groups();
-        let first_named = named_iter.next();
-        if let Some((name, range)) = first_named {
-            let indices_value = Value::array(indices_arr);
-            let mut roots = Vec::with_capacity(value_roots.len() + 3);
-            roots.push(&input_value);
-            roots.push(&arr_value);
-            roots.push(&indices_value);
-            roots.extend_from_slice(value_roots);
-            let g_obj = ctx.alloc_object_with_roots(&roots, &index_slices)?;
-            crate::object::set_prototype(g_obj, ctx.heap_mut(), None);
-            let v = match range {
-                Some(r) => pair_array_native(
-                    r.start,
-                    r.end,
-                    ctx,
-                    &roots,
-                    &[out.as_slice(), indices_elems.as_slice()],
-                )?,
-                None => Value::undefined(),
+        let indices = scope.array(1 + m.captures.len())?;
+        let pair = pair_array_native(scope, m.range.start, m.range.end)?;
+        scope.set_index(indices, 0, pair)?;
+        for (index, capture) in m.captures.iter().enumerate() {
+            let value = match capture {
+                Some(range) => pair_array_native(scope, range.start, range.end)?,
+                None => scope.undefined(),
             };
-            ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
-                .map_err(vm_shape_error_to_native)?;
-            for (name, range) in named_iter {
-                let v = match range {
-                    Some(r) => pair_array_native(
-                        r.start,
-                        r.end,
-                        ctx,
-                        &roots,
-                        &[out.as_slice(), indices_elems.as_slice()],
-                    )?,
-                    None => Value::undefined(),
-                };
-                ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
-                    .map_err(vm_shape_error_to_native)?;
-            }
-            crate::array::set_named_property(
-                indices_arr,
-                ctx.heap_mut(),
-                "groups",
-                Value::object(g_obj),
-            )?;
-        } else {
-            crate::array::set_named_property(
-                indices_arr,
-                ctx.heap_mut(),
-                "groups",
-                Value::undefined(),
-            )?;
+            scope.set_index(indices, index + 1, value)?;
         }
+
+        let mut named = m.named_groups();
+        let index_groups = if let Some((name, range)) = named.next() {
+            let groups = scope.bare_object()?;
+            let value = match range {
+                Some(range) => pair_array_native(scope, range.start, range.end)?,
+                None => scope.undefined(),
+            };
+            scope.set(groups, name, value)?;
+            for (name, range) in named {
+                let value = match range {
+                    Some(range) => pair_array_native(scope, range.start, range.end)?,
+                    None => scope.undefined(),
+                };
+                scope.set(groups, name, value)?;
+            }
+            groups
+        } else {
+            scope.undefined()
+        };
+
+        let indices_array = scope
+            .raw(indices)
+            .as_array()
+            .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "indices root is not an array"))?;
+        let index_groups = scope.raw(index_groups);
         crate::array::set_named_property(
-            arr,
-            ctx.heap_mut(),
+            indices_array,
+            scope.context().heap_mut(),
+            "groups",
+            index_groups,
+        )?;
+        let result_array = scope
+            .raw(result)
+            .as_array()
+            .ok_or_else(|| native_type_error(REGEXP_EXEC_NAME, "result root is not an array"))?;
+        let indices = scope.raw(indices);
+        crate::array::set_named_property(
+            result_array,
+            scope.context().heap_mut(),
             "indices",
-            Value::array(indices_arr),
+            indices,
         )?;
     }
-    Ok(arr)
+    Ok(result)
 }
 
-fn pair_array_native(
+fn pair_array_native<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
     start: usize,
     end: usize,
-    ctx: &mut NativeCtx<'_>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::array(ctx.array_from_elements_with_roots(
-        [
-            Value::number_i32(start as i32),
-            Value::number_i32(end as i32),
-        ],
-        value_roots,
-        slice_roots,
-    )?))
+) -> Result<Local<'scope>, NativeError> {
+    let pair = scope.array(2)?;
+    let start = scope.number(start as f64);
+    let end = scope.number(end as f64);
+    scope.set_index(pair, 0, start)?;
+    scope.set_index(pair, 1, end)?;
+    Ok(pair)
 }
 
 /// §22.2.6.8 `RegExp.prototype[@@match](string)` — invoked by
@@ -409,129 +328,168 @@ pub fn native_regexp_symbol_match(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    let name = "RegExp.prototype[@@match]";
-    let receiver = *ctx.this_value();
-    // §22.2.6.8 step 1 — the receiver need only be an Object; the
-    // matching itself flows through the observable `exec` protocol.
-    if !receiver.is_object_type() {
-        return Err(crate::NativeError::TypeError {
-            name,
-            reason: "called on a non-object receiver".to_string(),
-        });
-    }
-    // Step 3 — S = ? ToString(string).
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
-    let text = coerce_to_jsstring_runtime(ctx, &arg, name)?;
-    // Step 4-5 — flags = ? ToString(? Get(rx, "flags")); global = "g".
-    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
-    let global = flags_str.contains('g');
-    if !global {
-        // Step 6 — RegExpExec(rx, S).
-        return regexp_exec_runtime(ctx, &receiver, text, name);
-    }
-    // Step 7 — global: reset lastIndex, then loop RegExpExec.
-    let full_unicode = flags_str.contains('u') || flags_str.contains('v');
-    set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
-    let text_units = text.to_utf16_vec(ctx.heap());
-    // Fast path: a real RegExp whose `exec` is still the native intrinsic. The
-    // observable per-match protocol would build a full result object, read its
-    // `"0"` element back out, and round-trip `lastIndex` through the property
-    // machinery for every match — none of which is observable for a native
-    // RegExp (`exec` unmodified, `lastIndex` a non-configurable data slot). So
-    // collect the leftmost non-overlapping matches in one pass (which already
-    // applies the global / empty-match advancement) and slice the substrings
-    // directly. `flags` was read above (preserving that observable) and
-    // `lastIndex` stays 0, exactly as the terminal null-returning exec leaves it.
-    //
-    // Guard order matters: test `as_regexp()` (no observable side effect)
-    // before reading `exec`, so a non-RegExp receiver with an instrumented
-    // `exec` getter is left entirely to the observable slow path. Sticky (`y`)
-    // is excluded — the one-pass leftmost scan does not enforce the
-    // anchored-at-`lastIndex` semantics sticky requires.
-    if let Some(re) = receiver.as_regexp()
-        && !flags_str.contains('y')
-    {
-        let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
-        if let Some(native) = exec_fn.as_native_function()
-            && native.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec)
-        {
-            let found = re.find_from_utf16(ctx.heap(), &text_units, 0);
-            if found.is_empty() {
-                return Ok(Value::null());
-            }
-            let text_value = Value::string(text);
-            let mut out: Vec<Value> = Vec::with_capacity(found.len());
-            for m in &found {
-                let slice = &text_units[m.range.start..m.range.end];
-                let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    for val in &out {
-                        val.trace_value_slots(visitor);
-                    }
-                    receiver.trace_value_slots(visitor);
-                    text_value.trace_value_slots(visitor);
-                };
-                let mstr = JsString::from_utf16_units_with_roots(slice, ctx.heap_mut(), &mut visit)
-                    .map_err(|_| crate::NativeError::TypeError {
-                        name,
-                        reason: "out of memory".to_string(),
-                    })?;
-                out.push(Value::string(mstr));
-            }
-            let arr = ctx
-                .array_from_elements_with_roots(
-                    out.iter().cloned(),
-                    &[&receiver, &text_value],
-                    &[out.as_slice()],
+    const NAME: &str = "RegExp.prototype[@@match]";
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        if !scope.raw(receiver).is_object_type() {
+            return Err(crate::NativeError::TypeError {
+                name: NAME,
+                reason: "called on a non-object receiver".to_string(),
+            });
+        }
+        let input_arg = scope.argument(args, 0);
+        let input_arg_value = scope.raw(input_arg);
+        let input = coerce_to_jsstring_runtime(scope.context(), &input_arg_value, NAME)?;
+        let input = scope.value(Value::string(input));
+
+        let receiver_value = scope.raw(receiver);
+        let flags = get_property_runtime(scope.context(), &receiver_value, "flags", NAME)?;
+        let flags = scope.value(flags);
+        let flags_value = scope.raw(flags);
+        let flags = coerce_to_jsstring_runtime(scope.context(), &flags_value, NAME)?;
+        let flags = scope.value(Value::string(flags));
+        let flags_value = scope.raw(flags);
+        let flags_string = flags_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| native_type_error(NAME, "flags root is not a string"))?;
+        let (global, full_unicode, sticky) =
+            flags_string.with_utf16(scope.context().heap(), |units| {
+                (
+                    units.contains(&(b'g' as u16)),
+                    units.contains(&(b'u' as u16)) || units.contains(&(b'v' as u16)),
+                    units.contains(&(b'y' as u16)),
                 )
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "array allocation failed".to_string(),
-                })?;
-            return Ok(Value::array(arr));
+            });
+
+        if !global {
+            let receiver_value = scope.raw(receiver);
+            let input_value = scope.raw(input);
+            let input_string = input_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(NAME, "input root is not a string"))?;
+            let result = regexp_exec_runtime(scope.context(), &receiver_value, input_string, NAME)?;
+            let result = scope.value(result);
+            return Ok(scope.finish(result));
         }
-    }
-    let mut matches_out: Vec<Value> = Vec::new();
-    loop {
-        let result = regexp_exec_runtime(ctx, &receiver, text, name)?;
-        if result.is_null() {
-            break;
+
+        let receiver_value = scope.raw(receiver);
+        set_property_runtime(
+            scope.context(),
+            &receiver_value,
+            "lastIndex",
+            Value::number_i32(0),
+            NAME,
+        )?;
+        let input_value = scope.raw(input);
+        let input_string = input_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| native_type_error(NAME, "input root is not a string"))?;
+        let input_units = input_string.to_utf16_vec(scope.context().heap());
+
+        // Keep the allocation-free builtin fast path, but treat the arena as
+        // authoritative after the observable `exec` lookup. An accessor can
+        // allocate, relocate, or even recompile the receiver before returning
+        // the builtin function.
+        if scope.raw(receiver).as_regexp().is_some() && !sticky {
+            let receiver_value = scope.raw(receiver);
+            let exec = get_property_runtime(scope.context(), &receiver_value, "exec", NAME)?;
+            let exec = scope.value(exec);
+            let exec_value = scope.raw(exec);
+            if exec_value.as_native_function().is_some_and(|native| {
+                native.is_static_native(scope.context().heap(), crate::bootstrap_regexp::proto_exec)
+            }) {
+                let receiver_value = scope.raw(receiver);
+                let re = receiver_value
+                    .as_regexp()
+                    .ok_or_else(|| native_type_error(NAME, "receiver root is not a RegExp"))?;
+                // A custom exec getter may have recompiled the RegExp into
+                // another mode or changed lastIndex. The one-pass scan models
+                // only an unmodified global builtin starting from zero.
+                let current_flags = re.flags(scope.context().heap());
+                let current_last_index = re.last_index_value(scope.context().heap());
+                if current_flags.global
+                    && !current_flags.sticky
+                    && crate::abstract_ops::same_value(
+                        &current_last_index,
+                        &Value::number_i32(0),
+                        scope.context().heap(),
+                    )
+                {
+                    let found = re.find_from_utf16(scope.context().heap(), &input_units, 0);
+                    if found.is_empty() {
+                        return Ok(Value::null());
+                    }
+                    let mut output = Vec::with_capacity(found.len());
+                    for matched in &found {
+                        output.push(slice_subject_string(
+                            &mut scope,
+                            input,
+                            matched.range.clone(),
+                        )?);
+                    }
+                    let array = scope.array(output.len())?;
+                    for (index, value) in output.iter().copied().enumerate() {
+                        scope.set_index(array, index, value)?;
+                    }
+                    return Ok(scope.finish(array));
+                }
+            }
         }
-        // matchStr = ? ToString(? Get(result, "0")).
-        let match_val = get_property_runtime(ctx, &result, "0", name)?;
-        let match_str = coerce_to_jsstring_runtime(ctx, &match_val, name)?;
-        let is_empty = match_str.is_empty();
-        matches_out.push(Value::string(match_str));
-        if is_empty {
-            // Empty match — AdvanceStringIndex via the observable
-            // lastIndex so a custom `exec` / accessor sees the write.
-            let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
-            let this_index = to_length_runtime(ctx, &last_index_val, name)? as usize;
-            let next_index = advance_string_index(&text_units, this_index, full_unicode);
-            set_property_runtime(
-                ctx,
-                &receiver,
-                "lastIndex",
-                Value::number_f64(next_index as f64),
-                name,
-            )?;
+
+        let mut output: Vec<Local<'_>> = Vec::new();
+        loop {
+            let receiver_value = scope.raw(receiver);
+            let input_value = scope.raw(input);
+            let input_string = input_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(NAME, "input root is not a string"))?;
+            let result = regexp_exec_runtime(scope.context(), &receiver_value, input_string, NAME)?;
+            let result = scope.value(result);
+            if scope.is_null(result) {
+                break;
+            }
+
+            let result_value = scope.raw(result);
+            let matched = get_property_runtime(scope.context(), &result_value, "0", NAME)?;
+            let matched = scope.value(matched);
+            let matched_value = scope.raw(matched);
+            let matched = coerce_to_jsstring_runtime(scope.context(), &matched_value, NAME)?;
+            let matched = scope.value(Value::string(matched));
+            let matched_value = scope.raw(matched);
+            let is_empty = matched_value
+                .as_string(scope.context().heap())
+                .ok_or_else(|| native_type_error(NAME, "match root is not a string"))?
+                .is_empty();
+            output.push(matched);
+
+            if is_empty {
+                let receiver_value = scope.raw(receiver);
+                let last_index =
+                    get_property_runtime(scope.context(), &receiver_value, "lastIndex", NAME)?;
+                let last_index = scope.value(last_index);
+                let last_index_value = scope.raw(last_index);
+                let this_index =
+                    to_length_runtime(scope.context(), &last_index_value, NAME)? as usize;
+                let next_index = advance_string_index(&input_units, this_index, full_unicode);
+                let receiver_value = scope.raw(receiver);
+                set_property_runtime(
+                    scope.context(),
+                    &receiver_value,
+                    "lastIndex",
+                    Value::number_f64(next_index as f64),
+                    NAME,
+                )?;
+            }
         }
-    }
-    if matches_out.is_empty() {
-        return Ok(Value::null());
-    }
-    let text_value = Value::string(text);
-    let arr = ctx
-        .array_from_elements_with_roots(
-            matches_out.iter().cloned(),
-            &[&receiver, &text_value],
-            &[matches_out.as_slice()],
-        )
-        .map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "array allocation failed".to_string(),
-        })?;
-    Ok(Value::array(arr))
+        if output.is_empty() {
+            return Ok(Value::null());
+        }
+        let array = scope.array(output.len())?;
+        for (index, value) in output.iter().copied().enumerate() {
+            scope.set_index(array, index, value)?;
+        }
+        Ok(scope.finish(array))
+    })
 }
 
 /// §22.2.6.10 `RegExp.prototype[@@search](string)` — returns the
@@ -544,36 +502,64 @@ pub fn native_regexp_symbol_search(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    let name = "RegExp.prototype[@@search]";
-    let receiver = *ctx.this_value();
-    // §22.2.6.10 step 1 — any Object receiver; matching flows through
-    // the observable `exec` protocol and preserves `lastIndex`.
-    if !receiver.is_object_type() {
-        return Err(crate::NativeError::TypeError {
-            name,
-            reason: "called on a non-object receiver".to_string(),
-        });
-    }
-    let arg = args.first().cloned().unwrap_or(Value::undefined());
-    let text = coerce_to_jsstring_runtime(ctx, &arg, name)?;
-    // Steps 4-5 — save `lastIndex`, reset to 0 only if it differs.
-    let previous = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
-    let zero = Value::number_i32(0);
-    if !crate::abstract_ops::same_value(&previous, &zero, ctx.heap()) {
-        set_property_runtime(ctx, &receiver, "lastIndex", zero, name)?;
-    }
-    // Step 6 — RegExpExec(rx, S).
-    let result = regexp_exec_runtime(ctx, &receiver, text, name)?;
-    // Steps 7-8 — restore `lastIndex` if the exec changed it.
-    let current = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
-    if !crate::abstract_ops::same_value(&current, &previous, ctx.heap()) {
-        set_property_runtime(ctx, &receiver, "lastIndex", previous, name)?;
-    }
-    // Steps 9-10 — null → -1, else Get(result, "index").
-    if result.is_null() {
-        return Ok(Value::number_i32(-1));
-    }
-    get_property_runtime(ctx, &result, "index", name)
+    const NAME: &str = "RegExp.prototype[@@search]";
+    ctx.scope(|mut scope| {
+        let receiver = scope.this();
+        if !scope.raw(receiver).is_object_type() {
+            return Err(crate::NativeError::TypeError {
+                name: NAME,
+                reason: "called on a non-object receiver".to_string(),
+            });
+        }
+        let input_arg = scope.argument(args, 0);
+        let input_arg_value = scope.raw(input_arg);
+        let input = coerce_to_jsstring_runtime(scope.context(), &input_arg_value, NAME)?;
+        let input = scope.value(Value::string(input));
+
+        let receiver_value = scope.raw(receiver);
+        let previous = get_property_runtime(scope.context(), &receiver_value, "lastIndex", NAME)?;
+        let previous = scope.value(previous);
+        let zero = Value::number_i32(0);
+        if !crate::abstract_ops::same_value(&scope.raw(previous), &zero, scope.context().heap()) {
+            let receiver_value = scope.raw(receiver);
+            set_property_runtime(scope.context(), &receiver_value, "lastIndex", zero, NAME)?;
+        }
+
+        let receiver_value = scope.raw(receiver);
+        let input_value = scope.raw(input);
+        let input_string = input_value
+            .as_string(scope.context().heap())
+            .ok_or_else(|| native_type_error(NAME, "input root is not a string"))?;
+        let result = regexp_exec_runtime(scope.context(), &receiver_value, input_string, NAME)?;
+        let result = scope.value(result);
+
+        let receiver_value = scope.raw(receiver);
+        let current = get_property_runtime(scope.context(), &receiver_value, "lastIndex", NAME)?;
+        let current = scope.value(current);
+        if !crate::abstract_ops::same_value(
+            &scope.raw(current),
+            &scope.raw(previous),
+            scope.context().heap(),
+        ) {
+            let receiver_value = scope.raw(receiver);
+            let previous_value = scope.raw(previous);
+            set_property_runtime(
+                scope.context(),
+                &receiver_value,
+                "lastIndex",
+                previous_value,
+                NAME,
+            )?;
+        }
+
+        if scope.is_null(result) {
+            return Ok(Value::number_i32(-1));
+        }
+        let result_value = scope.raw(result);
+        let index = get_property_runtime(scope.context(), &result_value, "index", NAME)?;
+        let index = scope.value(index);
+        Ok(scope.finish(index))
+    })
 }
 
 /// §22.2.7.3 `AdvanceStringIndex(S, index, unicode)`. When `unicode`
@@ -654,29 +640,52 @@ pub(crate) fn get_property_runtime(
     key: &str,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
-    let outcome = interp
-        .ordinary_get_value(
-            &exec,
-            *receiver,
-            *receiver,
-            &crate::VmPropertyKey::String(key),
-            0,
-        )
-        .map_err(vm_err_to_native(interp, name))?;
-    match outcome {
-        crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+    const RECEIVER: usize = 0;
+    const RESULT: usize = 1;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(*receiver);
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+
+    let result = (|| -> Result<Value, crate::NativeError> {
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let exec =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+        let outcome = ctx.with_turn_parts(|interp, stack| {
             interp
-                .run_callable_sync(&exec, &getter, *receiver, args)
+                .ordinary_get_value(
+                    stack,
+                    &exec,
+                    receiver,
+                    receiver,
+                    &crate::VmPropertyKey::String(key),
+                    0,
+                )
                 .map_err(vm_err_to_native(interp, name))
+        })?;
+        match outcome {
+            crate::VmGetOutcome::Value(value) => {
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + RESULT, value);
+            }
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + RESULT, getter);
+                let getter = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
+                let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                let value = ctx.call(getter, receiver, &[])?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + RESULT, value);
+            }
         }
-    }
+        Ok(ctx.interp_mut().iteration_anchor(anchor_base + RESULT))
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// `? Set(value, key, v, true)` driven through `ordinary_set_data_value`
@@ -689,51 +698,74 @@ fn set_property_runtime(
     value: Value,
     name: &'static str,
 ) -> Result<(), crate::NativeError> {
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
-    // Resolve accessor setters along the prototype chain first so a
-    // custom `set lastIndex` (e.g. a `@@split` splitter) fires; only
-    // ordinary data targets fall through to the data write.
-    if let Some(obj) = receiver.as_object() {
-        match crate::object::resolve_set(obj, interp.gc_heap(), key) {
-            crate::object::SetOutcome::InvokeSetter { setter } => {
-                if !interp.is_callable_runtime(&setter) {
+    const RECEIVER: usize = 0;
+    const VALUE: usize = 1;
+    const SETTER: usize = 2;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(*receiver);
+    ctx.interp_mut().push_iteration_anchor(value);
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+
+    let result = (|| -> Result<(), crate::NativeError> {
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        // Resolve accessor setters along the prototype chain first so a
+        // custom `set lastIndex` (e.g. a `@@split` splitter) fires; only
+        // ordinary data targets fall through to the data write.
+        if let Some(obj) = receiver.as_object() {
+            match crate::object::resolve_set(obj, ctx.heap(), key) {
+                crate::object::SetOutcome::InvokeSetter { setter } => {
+                    if !ctx.interp_mut().is_callable_runtime(&setter) {
+                        return Err(read_only_set_error(name, key));
+                    }
+                    ctx.interp_mut()
+                        .set_iteration_anchor(anchor_base + SETTER, setter);
+                    let setter = ctx.interp_mut().iteration_anchor(anchor_base + SETTER);
+                    let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                    let value = ctx.interp_mut().iteration_anchor(anchor_base + VALUE);
+                    ctx.call(setter, receiver, &[value])?;
+                    return Ok(());
+                }
+                crate::object::SetOutcome::Reject { .. } => {
                     return Err(read_only_set_error(name, key));
                 }
-                let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                interp
-                    .run_callable_sync(&exec, &setter, *receiver, args)
-                    .map_err(vm_err_to_native(interp, name))?;
-                return Ok(());
+                crate::object::SetOutcome::AssignData => {}
+                // The value-level funnel below dispatches exotic
+                // [[Set]] overrides itself.
+                crate::object::SetOutcome::ExoticParent { .. } => {}
             }
-            crate::object::SetOutcome::Reject { .. } => {
-                return Err(read_only_set_error(name, key));
-            }
-            crate::object::SetOutcome::AssignData => {}
-            // The value-level funnel below dispatches exotic
-            // [[Set]] overrides itself.
-            crate::object::SetOutcome::ExoticParent { .. } => {}
         }
-    }
-    let ok = interp
-        .ordinary_set_data_value(
-            &exec,
-            *receiver,
-            &crate::VmPropertyKey::String(key),
-            value,
-            *receiver,
-            0,
-        )
-        .map_err(vm_err_to_native(interp, name))?;
-    // `Set(O, P, V, true)` — a `[[Set]]` returning false (e.g. a
-    // non-writable `lastIndex`) is a TypeError, not a silent no-op.
-    if !ok {
-        return Err(read_only_set_error(name, key));
-    }
-    Ok(())
+
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let value = ctx.interp_mut().iteration_anchor(anchor_base + VALUE);
+        let exec =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+        let ok = ctx.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_set_data_value(
+                    stack,
+                    &exec,
+                    receiver,
+                    &crate::VmPropertyKey::String(key),
+                    value,
+                    receiver,
+                    0,
+                )
+                .map_err(vm_err_to_native(interp, name))
+        })?;
+        // `Set(O, P, V, true)` — a `[[Set]]` returning false (e.g. a
+        // non-writable `lastIndex`) is a TypeError, not a silent no-op.
+        if !ok {
+            return Err(read_only_set_error(name, key));
+        }
+        Ok(())
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// The §10.1.9.2 / §7.3.4 `Set(O, P, V, true)` failure: a rejected
@@ -754,33 +786,48 @@ pub(crate) fn coerce_to_jsstring_runtime(
     value: &Value,
     name: &'static str,
 ) -> Result<JsString, crate::NativeError> {
-    if value.is_symbol() {
-        return Err(crate::NativeError::TypeError {
-            name,
-            reason: "cannot convert a Symbol to a string".to_string(),
-        });
-    }
-    if let Some(s) = value.as_string(ctx.heap()) {
-        return Ok(s);
-    }
-    let primitive = if crate::abstract_ops::is_primitive(value) {
-        *value
-    } else {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-        interp
-            .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::String)
-            .map_err(vm_err_to_native(interp, name))?
-    };
-
-    crate::conversion::to_js_string_primitive(&primitive, ctx.heap_mut()).map_err(|e| {
-        crate::NativeError::TypeError {
-            name,
-            reason: format!("ToString failed: {e:?}"),
+    ctx.scope(|mut scope| {
+        let value = scope.value(*value);
+        let current = scope.raw(value);
+        if current.is_symbol() {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "cannot convert a Symbol to a string".to_string(),
+            });
         }
+        if let Some(string) = current.as_string(scope.context().heap()) {
+            return Ok(string);
+        }
+        let primitive = if crate::abstract_ops::is_primitive(&current) {
+            current
+        } else {
+            let exec = scope
+                .context()
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+            scope.with_turn_parts(|interp, stack| {
+                interp
+                    .evaluate_to_primitive(
+                        stack,
+                        &exec,
+                        &current,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )
+                    .map_err(vm_err_to_native(interp, name))
+            })?
+        };
+        let primitive = scope.value(primitive);
+        let primitive = scope.raw(primitive);
+        crate::conversion::to_js_string_primitive(&primitive, scope.context().heap_mut()).map_err(
+            |error| crate::NativeError::TypeError {
+                name,
+                reason: format!("ToString failed: {error:?}"),
+            },
+        )
     })
 }
 
@@ -796,25 +843,49 @@ fn to_length_runtime(
     // [0, 2^53-1]. ToNumber throws for a Symbol / BigInt and runs (and so
     // can re-throw from) a `valueOf`, so the fallible coercion is required —
     // an infallible NaN cast would silently swallow those abrupt completions.
-    let exec = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-    let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, value)
-        .map_err(vm_err_to_native(ctx.cx.interp, name))?
-        .as_f64();
-    if n.is_nan() || n <= 0.0 {
-        return Ok(0);
-    }
-    if n.is_infinite() {
-        return Ok(9_007_199_254_740_991);
-    }
-    let trunc = n.trunc();
-    let clamped = trunc.min(9_007_199_254_740_991.0);
-    Ok(clamped as u64)
+    ctx.scope(|mut scope| {
+        let value = scope.value(*value);
+        let current = scope.raw(value);
+        let primitive = if crate::abstract_ops::is_primitive(&current) {
+            current
+        } else {
+            let exec = scope
+                .context()
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+            scope.with_turn_parts(|interp, stack| {
+                interp
+                    .evaluate_to_primitive(
+                        stack,
+                        &exec,
+                        &current,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(vm_err_to_native(interp, name))
+            })?
+        };
+        let primitive = scope.value(primitive);
+        let primitive = scope.raw(primitive);
+        let n = scope
+            .with_turn_parts(|interp, _| {
+                crate::coerce::primitive_to_number(interp, &primitive)
+                    .map_err(vm_err_to_native(interp, name))
+            })?
+            .as_f64();
+        if n.is_nan() || n <= 0.0 {
+            return Ok(0);
+        }
+        if n.is_infinite() {
+            return Ok(9_007_199_254_740_991);
+        }
+        let trunc = n.trunc();
+        let clamped = trunc.min(9_007_199_254_740_991.0);
+        Ok(clamped as u64)
+    })
 }
 
 /// §7.1.5 `ToIntegerOrInfinity`. `NaN` / `+0` / `-0` → 0; ±Infinity
@@ -824,29 +895,47 @@ fn to_integer_or_infinity_runtime(
     value: &Value,
     name: &'static str,
 ) -> Result<f64, crate::NativeError> {
-    let primitive = if crate::abstract_ops::is_primitive(value) {
-        *value
-    } else {
-        let (interp, exec) = ctx.interp_mut_and_context();
-        let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-        interp
-            .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::Number)
-            .map_err(vm_err_to_native(interp, name))?
-    };
-    let n = crate::number::to_number_value(&primitive, ctx.heap());
-    if n.is_nan() {
-        return Ok(0.0);
-    }
-    if n == 0.0 {
-        return Ok(0.0);
-    }
-    if n.is_infinite() {
-        return Ok(n);
-    }
-    Ok(n.trunc())
+    ctx.scope(|mut scope| {
+        let value = scope.value(*value);
+        let current = scope.raw(value);
+        let primitive = if crate::abstract_ops::is_primitive(&current) {
+            current
+        } else {
+            let exec = scope
+                .context()
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+            scope.with_turn_parts(|interp, stack| {
+                interp
+                    .evaluate_to_primitive(
+                        stack,
+                        &exec,
+                        &current,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(vm_err_to_native(interp, name))
+            })?
+        };
+        let primitive = scope.value(primitive);
+        let primitive = scope.raw(primitive);
+        let n = scope
+            .with_turn_parts(|interp, _| {
+                crate::coerce::primitive_to_number(interp, &primitive)
+                    .map_err(vm_err_to_native(interp, name))
+            })?
+            .as_f64();
+        if n.is_nan() || n == 0.0 {
+            return Ok(0.0);
+        }
+        if n.is_infinite() {
+            return Ok(n);
+        }
+        Ok(n.trunc())
+    })
 }
 
 /// §22.2.7.1 `RegExpExec(R, S)`. Dispatches through
@@ -859,35 +948,61 @@ pub(crate) fn regexp_exec_runtime(
     s: JsString,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
-    let exec_fn = get_property_runtime(ctx, rx, "exec", name)?;
-    let is_callable = ctx.cx.interp.is_callable_runtime(&exec_fn);
-    if is_callable {
-        let (interp, exec_ctx) = ctx.interp_mut_and_context();
-        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        })?;
-        let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        args.push(Value::string(s));
-        let result = interp
-            .run_callable_sync(&exec_ctx, &exec_fn, *rx, args)
-            .map_err(vm_err_to_native(interp, name))?;
-        if !result.is_null() && !result.is_object_type() {
-            return Err(crate::NativeError::TypeError {
-                name,
-                reason: "exec did not return an Object or null".to_string(),
-            });
+    const RECEIVER: usize = 0;
+    const INPUT: usize = 1;
+    const EXEC: usize = 2;
+    const RESULT: usize = 3;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(*rx);
+    ctx.interp_mut().push_iteration_anchor(Value::string(s));
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+
+    let outcome = (|| -> Result<Value, crate::NativeError> {
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + EXEC, exec_fn);
+        let exec_fn = ctx.interp_mut().iteration_anchor(anchor_base + EXEC);
+        if ctx.interp_mut().is_callable_runtime(&exec_fn) {
+            let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let result = ctx.call(exec_fn, receiver, &[input])?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + RESULT, result);
+            let result = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
+            if !result.is_null() && !result.is_object_type() {
+                return Err(crate::NativeError::TypeError {
+                    name,
+                    reason: "exec did not return an Object or null".to_string(),
+                });
+            }
+            return Ok(result);
         }
-        return Ok(result);
-    }
-    // Fall back to builtin exec only when `rx` is actually a RegExp.
-    if let Some(re) = rx.as_regexp() {
-        return exec_once_native(&re, rx, s, ctx, &[]);
-    }
-    Err(crate::NativeError::TypeError {
-        name,
-        reason: "exec is not callable and receiver is not a RegExp".to_string(),
-    })
+
+        // Fall back to builtin exec only when `rx` is actually a RegExp.
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        if receiver.as_regexp().is_some() {
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let input =
+                input
+                    .as_string(ctx.heap())
+                    .ok_or_else(|| crate::NativeError::TypeError {
+                        name,
+                        reason: "RegExpExec input root is not a string".to_string(),
+                    })?;
+            let result = exec_once_native(&receiver, input, ctx)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + RESULT, result);
+            return Ok(ctx.interp_mut().iteration_anchor(anchor_base + RESULT));
+        }
+        Err(crate::NativeError::TypeError {
+            name,
+            reason: "exec is not callable and receiver is not a RegExp".to_string(),
+        })
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    outcome
 }
 
 /// Advance a lazy RegExp String Iterator one step.
@@ -908,38 +1023,92 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     full_unicode: bool,
 ) -> Result<Option<Value>, crate::VmError> {
     let name = "RegExp String Iterator.next";
-    let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
-    let mut ctx =
-        NativeCtx::from_runtime_turn(turn, crate::NativeCallInfo::call(*matcher), Some(context));
-    let ctx = &mut ctx;
-    let result =
-        regexp_exec_runtime(ctx, matcher, input, name).map_err(|e| ctx.native_error_to_vm(e))?;
-    if result.is_null() {
-        return Ok(None);
-    }
-    if global {
-        let matched_val =
-            get_property_runtime(ctx, &result, "0", name).map_err(|e| ctx.native_error_to_vm(e))?;
-        let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)
-            .map_err(|e| ctx.native_error_to_vm(e))?;
-        if matched_str.is_empty() {
-            let li_val = get_property_runtime(ctx, matcher, "lastIndex", name)
+    const MATCHER: usize = 0;
+    const INPUT: usize = 1;
+    const RESULT: usize = 2;
+    const INTERMEDIATE: usize = 3;
+    let anchor_base = interp.iteration_anchors_for_trace().len();
+    interp.push_iteration_anchor(*matcher);
+    interp.push_iteration_anchor(Value::string(input));
+    interp.push_iteration_anchor(Value::undefined());
+    interp.push_iteration_anchor(Value::undefined());
+
+    let outcome = {
+        let rooted_matcher = interp.iteration_anchor(anchor_base + MATCHER);
+        let call_info = crate::NativeCallInfo::call(rooted_matcher);
+        let roots = crate::runtime_cx::NativeCallRoots::new(&call_info, &[], &[]);
+        let _call_roots = interp
+            .gc_heap
+            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+        let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
+        let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
+        let ctx = &mut ctx;
+
+        (|| -> Result<Option<Value>, crate::VmError> {
+            let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let input = input
+                .as_string(ctx.heap())
+                .ok_or(crate::VmError::InvalidOperand)?;
+            let result = regexp_exec_runtime(ctx, &matcher, input, name)
                 .map_err(|e| ctx.native_error_to_vm(e))?;
-            let this_index = to_length_runtime(ctx, &li_val, name)
-                .map_err(|e| ctx.native_error_to_vm(e))? as usize;
-            let input_units = input.to_utf16_vec(ctx.heap());
-            let next_index = advance_string_index(&input_units, this_index, full_unicode);
-            set_property_runtime(
-                ctx,
-                matcher,
-                "lastIndex",
-                Value::number_f64(next_index as f64),
-                name,
-            )
-            .map_err(|e| ctx.native_error_to_vm(e))?;
-        }
-    }
-    Ok(Some(result))
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + RESULT, result);
+            if ctx
+                .interp_mut()
+                .iteration_anchor(anchor_base + RESULT)
+                .is_null()
+            {
+                return Ok(None);
+            }
+            if global {
+                let result = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
+                let matched = get_property_runtime(ctx, &result, "0", name)
+                    .map_err(|e| ctx.native_error_to_vm(e))?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + INTERMEDIATE, matched);
+                let matched = ctx
+                    .interp_mut()
+                    .iteration_anchor(anchor_base + INTERMEDIATE);
+                let matched_str = coerce_to_jsstring_runtime(ctx, &matched, name)
+                    .map_err(|e| ctx.native_error_to_vm(e))?;
+                if matched_str.is_empty() {
+                    let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
+                    let last_index = get_property_runtime(ctx, &matcher, "lastIndex", name)
+                        .map_err(|e| ctx.native_error_to_vm(e))?;
+                    ctx.interp_mut()
+                        .set_iteration_anchor(anchor_base + INTERMEDIATE, last_index);
+                    let last_index = ctx
+                        .interp_mut()
+                        .iteration_anchor(anchor_base + INTERMEDIATE);
+                    let this_index = to_length_runtime(ctx, &last_index, name)
+                        .map_err(|e| ctx.native_error_to_vm(e))?
+                        as usize;
+                    let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+                    let input = input
+                        .as_string(ctx.heap())
+                        .ok_or(crate::VmError::InvalidOperand)?;
+                    let next_index = input.with_utf16(ctx.heap(), |units| {
+                        advance_string_index(units, this_index, full_unicode)
+                    });
+                    let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
+                    set_property_runtime(
+                        ctx,
+                        &matcher,
+                        "lastIndex",
+                        Value::number_f64(next_index as f64),
+                        name,
+                    )
+                    .map_err(|e| ctx.native_error_to_vm(e))?;
+                }
+            }
+            Ok(Some(
+                ctx.interp_mut().iteration_anchor(anchor_base + RESULT),
+            ))
+        })()
+    };
+    interp.pop_iteration_anchors_to(anchor_base);
+    outcome
 }
 
 /// Engine cap on string length in UTF-16 units (1 GiB of u16 —
@@ -976,257 +1145,357 @@ pub fn native_regexp_symbol_replace(
 
     let string_arg = args.first().cloned().unwrap_or(Value::undefined());
     let replace_value_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-
-    // Step 3 — S = ? ToString(string).
-    let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
-    let s_units = s.to_utf16_vec(ctx.heap());
-    let length_s = s_units.len();
-
-    // Step 4 — functionalReplace = IsCallable(replaceValue).
-    let functional_replace = ctx.cx.interp.is_callable_runtime(&replace_value_arg);
-
-    // Step 5 — non-callable replacements are ToString-coerced once.
-    let replacement_template = if functional_replace {
-        None
-    } else {
-        Some(coerce_to_jsstring_runtime(ctx, &replace_value_arg, name)?)
-    };
-
-    // Step 6 — flags = ? ToString(? Get(rx, "flags")).
-    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
-    let global = flags_str.contains('g');
-    let full_unicode = flags_str.contains('u') || flags_str.contains('v');
-
-    // Step 9 — if global, Set(rx, "lastIndex", 0, true).
-    if global {
-        set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
+    const RECEIVER: usize = 0;
+    const INPUT: usize = 1;
+    const REPLACER: usize = 2;
+    const TEMPLATE: usize = 3;
+    const FLAGS: usize = 4;
+    const MATCHED: usize = 5;
+    const NAMED: usize = 6;
+    const TEMP: usize = 7;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(receiver);
+    ctx.interp_mut().push_iteration_anchor(string_arg);
+    ctx.interp_mut().push_iteration_anchor(replace_value_arg);
+    for _ in TEMPLATE..=TEMP {
+        ctx.interp_mut().push_iteration_anchor(Value::undefined());
     }
 
-    // Fast path: a global, non-sticky, pristine RegExp with the native `exec`
-    // and a literal (`$`-free) string replacement. The replacement reads neither
-    // the matched text nor captures, and `lastIndex` was just reset to a plain
-    // `0`, so the per-match exec protocol and substitution machinery have no
-    // observable effect: collect the matches in one engine pass and stitch the
-    // source segments and literal template directly. Restricted to global so a
-    // non-global `lastIndex` read (its `ToLength` may fire a `valueOf`) stays
-    // observable, and to a regex with no own-property expando so an overridden
-    // `unicode` / `flags` cannot change the empty-match advancement the engine
-    // pass bakes in from the compiled flags. The whole loop runs on host
-    // buffers; only the final string allocation touches the GC.
-    if global
-        && let Some(re) = receiver.as_regexp()
-        && !flags_str.contains('y')
-        && !functional_replace
-        && re.expando(ctx.heap()).is_none()
-    {
-        let template = replacement_template.expect("non-functional path has a template");
-        let template_units = template.to_utf16_vec(ctx.heap());
-        if !template_units.contains(&0x24) {
-            let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
-            if exec_fn.as_native_function().is_some_and(|nf| {
-                nf.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec)
-            }) {
-                let found = re.find_from_utf16(ctx.heap(), &s_units, 0);
-                let mut accumulated: Vec<u16> = Vec::new();
-                let mut next_source_position: usize = 0;
-                for m in &found {
-                    let position = m.range.start;
-                    let match_length = m.range.end - m.range.start;
-                    if position >= next_source_position {
-                        let projected = accumulated
-                            .len()
-                            .saturating_add(position - next_source_position)
-                            .saturating_add(template_units.len());
-                        if projected > MAX_STRING_UNITS {
-                            return Err(crate::NativeError::RangeError {
-                                name,
-                                reason: "Invalid string length".to_string(),
-                            });
-                        }
-                        accumulated.extend_from_slice(&s_units[next_source_position..position]);
-                        accumulated.extend_from_slice(&template_units);
-                        next_source_position = position + match_length;
-                    }
-                }
-                if next_source_position < length_s {
-                    accumulated.extend_from_slice(&s_units[next_source_position..]);
-                }
-                return Ok(Value::string(
-                    JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
-                        crate::NativeError::TypeError {
-                            name,
-                            reason: "out of memory".to_string(),
-                        }
-                    })?,
-                ));
-            }
-        }
-    }
+    let result = (|| -> Result<Value, crate::NativeError> {
+        // Step 3 — S = ? ToString(string).
+        let string_arg = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+        let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + INPUT, Value::string(s));
+        let s_units = s.to_utf16_vec(ctx.heap());
+        let length_s = s_units.len();
 
-    // Step 10-12 — collect results.
-    let mut results: Vec<Value> = Vec::new();
-    loop {
-        let result = regexp_exec_runtime(ctx, &receiver, s, name)?;
-        if result.is_null() {
-            break;
-        }
-        results.push(result);
-        if !global {
-            break;
-        }
-        // Step 11.d.iii — empty match: advance lastIndex by one
-        // (or two for paired surrogates under `u` / `v`).
-        let matched_val = get_property_runtime(ctx, &result, "0", name)?;
-        let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
-        if matched_str.is_empty() {
-            let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
-            let this_index = to_length_runtime(ctx, &last_index_val, name)? as usize;
-            let next_index = advance_string_index(&s_units, this_index, full_unicode);
-            set_property_runtime(
-                ctx,
-                &receiver,
-                "lastIndex",
-                Value::number_f64(next_index as f64),
-                name,
-            )?;
-        }
-    }
+        // Step 4 — functionalReplace = IsCallable(replaceValue).
+        let replacer = ctx.interp_mut().iteration_anchor(anchor_base + REPLACER);
+        let functional_replace = ctx.interp_mut().is_callable_runtime(&replacer);
 
-    // Step 13-15 — build the accumulated replacement.
-    let mut accumulated: Vec<u16> = Vec::new();
-    let mut next_source_position: usize = 0;
-
-    for result in &results {
-        let length_val = get_property_runtime(ctx, result, "length", name)?;
-        let result_length = to_length_runtime(ctx, &length_val, name)? as usize;
-        let n_captures = result_length.saturating_sub(1);
-
-        let matched_val = get_property_runtime(ctx, result, "0", name)?;
-        let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
-        let match_units = matched_str.to_utf16_vec(ctx.heap());
-        let match_length = match_units.len();
-
-        let index_val = get_property_runtime(ctx, result, "index", name)?;
-        let position_raw = to_integer_or_infinity_runtime(ctx, &index_val, name)?;
-        let position = position_raw.max(0.0).min(length_s as f64) as usize;
-
-        let mut captures: Vec<Option<JsString>> = Vec::with_capacity(n_captures);
-        for i in 1..=n_captures {
-            let cap_key = i.to_string();
-            let cap_val = get_property_runtime(ctx, result, &cap_key, name)?;
-            if cap_val.is_undefined() {
-                captures.push(None);
-            } else {
-                captures.push(Some(coerce_to_jsstring_runtime(ctx, &cap_val, name)?));
-            }
+        // Step 5 — non-callable replacements are ToString-coerced once.
+        if !functional_replace {
+            let replacer = ctx.interp_mut().iteration_anchor(anchor_base + REPLACER);
+            let template = coerce_to_jsstring_runtime(ctx, &replacer, name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + TEMPLATE, Value::string(template));
         }
 
-        let named_captures = get_property_runtime(ctx, result, "groups", name)?;
-        let named_captures_obj = if named_captures.is_undefined() {
-            None
-        } else {
-            Some(named_captures)
-        };
+        // Step 6 — flags = ? ToString(? Get(rx, "flags")).
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let flags = get_property_runtime(ctx, &receiver, "flags", name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + FLAGS, flags);
+        let flags = ctx.interp_mut().iteration_anchor(anchor_base + FLAGS);
+        let flags = coerce_to_jsstring_runtime(ctx, &flags, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + FLAGS, Value::string(flags));
+        let (global, full_unicode, sticky) = flags.with_utf16(ctx.heap(), |units| {
+            (
+                units.contains(&(b'g' as u16)),
+                units.contains(&(b'u' as u16)) || units.contains(&(b'v' as u16)),
+                units.contains(&(b'y' as u16)),
+            )
+        });
 
-        let replacement: Vec<u16> = if functional_replace {
-            let mut replacer_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-            replacer_args.push(Value::string(matched_str));
-            for cap in &captures {
-                replacer_args.push(match cap {
-                    Some(s) => Value::string(*s),
-                    None => Value::undefined(),
-                });
-            }
-            replacer_args.push(Value::number_f64(position as f64));
-            replacer_args.push(Value::string(s));
-            if let Some(nc) = &named_captures_obj {
-                replacer_args.push(*nc);
-            }
-            let exec_ctx =
-                ctx.execution_context()
-                    .cloned()
+        // Step 9 — if global, Set(rx, "lastIndex", 0, true).
+        if global {
+            let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+            set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
+        }
+
+        // Fast path: a global, non-sticky, pristine RegExp with the native `exec`
+        // and a literal (`$`-free) string replacement. The replacement reads neither
+        // the matched text nor captures, and `lastIndex` was just reset to a plain
+        // `0`, so the per-match exec protocol and substitution machinery have no
+        // observable effect: collect the matches in one engine pass and stitch the
+        // source segments and literal template directly. Restricted to global so a
+        // non-global `lastIndex` read (its `ToLength` may fire a `valueOf`) stays
+        // observable, and to a regex with no own-property expando so an overridden
+        // `unicode` / `flags` cannot change the empty-match advancement the engine
+        // pass bakes in from the compiled flags. The whole loop runs on host
+        // buffers; only the final string allocation touches the GC.
+        let fast_receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        if global
+            && let Some(re) = fast_receiver.as_regexp()
+            && !sticky
+            && !functional_replace
+            && re.expando(ctx.heap()).is_none()
+        {
+            let template = ctx.interp_mut().iteration_anchor(anchor_base + TEMPLATE);
+            let template =
+                template
+                    .as_string(ctx.heap())
                     .ok_or_else(|| crate::NativeError::TypeError {
                         name,
-                        reason: "missing execution context".to_string(),
+                        reason: "replace template root is not a string".to_string(),
                     })?;
-            let raw = {
-                let (interp, _) = ctx.interp_mut_and_context();
-                interp
-                    .run_callable_sync(
-                        &exec_ctx,
-                        &replace_value_arg,
-                        Value::undefined(),
-                        replacer_args,
-                    )
-                    .map_err(vm_err_to_native(interp, name))?
-            };
-            let raw_str = coerce_to_jsstring_runtime(ctx, &raw, name)?;
-            raw_str.to_utf16_vec(ctx.heap())
-        } else {
-            // §22.2.6.11 step 14.n.i — the non-functional path coerces a
-            // present `groups` with ToObject before GetSubstitution. `null`
-            // (from a monkey-patched `exec`) throws; a primitive is passed
-            // through, since the `$<name>` lookups read it via the full
-            // [[Get]], which boxes primitives the same way ToObject would.
-            let named_captures_coerced = match named_captures_obj {
-                Some(nc) if nc.is_nullish() => {
-                    return Err(crate::NativeError::TypeError {
+            let template_units = template.to_utf16_vec(ctx.heap());
+            if !template_units.contains(&0x24) {
+                let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                let exec_fn = get_property_runtime(ctx, &receiver, "exec", name)?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + TEMP, exec_fn);
+                let exec_fn = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+                if exec_fn.as_native_function().is_some_and(|nf| {
+                    nf.is_static_native(ctx.heap(), crate::bootstrap_regexp::proto_exec)
+                }) {
+                    let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                    let re = receiver
+                        .as_regexp()
+                        .ok_or_else(|| crate::NativeError::TypeError {
+                            name,
+                            reason: "replace receiver root is not a RegExp".to_string(),
+                        })?;
+                    let found = re.find_from_utf16(ctx.heap(), &s_units, 0);
+                    let mut accumulated: Vec<u16> = Vec::new();
+                    let mut next_source_position: usize = 0;
+                    for m in &found {
+                        let position = m.range.start;
+                        let match_length = m.range.end - m.range.start;
+                        if position >= next_source_position {
+                            let projected = accumulated
+                                .len()
+                                .saturating_add(position - next_source_position)
+                                .saturating_add(template_units.len());
+                            if projected > MAX_STRING_UNITS {
+                                return Err(crate::NativeError::RangeError {
+                                    name,
+                                    reason: "Invalid string length".to_string(),
+                                });
+                            }
+                            accumulated.extend_from_slice(&s_units[next_source_position..position]);
+                            accumulated.extend_from_slice(&template_units);
+                            next_source_position = position + match_length;
+                        }
+                    }
+                    if next_source_position < length_s {
+                        accumulated.extend_from_slice(&s_units[next_source_position..]);
+                    }
+                    return Ok(Value::string(
+                        JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
+                            crate::NativeError::TypeError {
+                                name,
+                                reason: "out of memory".to_string(),
+                            }
+                        })?,
+                    ));
+                }
+            }
+        }
+
+        // Step 10-12 — collect results.
+        let mut result_indices: Vec<usize> = Vec::new();
+        loop {
+            let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let input =
+                input
+                    .as_string(ctx.heap())
+                    .ok_or_else(|| crate::NativeError::TypeError {
                         name,
-                        reason: "named capture groups is not coercible to an Object".to_string(),
+                        reason: "replace input root is not a string".to_string(),
+                    })?;
+            let result = regexp_exec_runtime(ctx, &receiver, input, name)?;
+            if result.is_null() {
+                break;
+            }
+            let result_index = ctx.interp_mut().push_iteration_anchor(result) - 1;
+            result_indices.push(result_index);
+            if !global {
+                break;
+            }
+            // Step 11.d.iii — empty match: advance lastIndex by one
+            // (or two for paired surrogates under `u` / `v`).
+            let result = ctx.interp_mut().iteration_anchor(result_index);
+            let matched_val = get_property_runtime(ctx, &result, "0", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + MATCHED, matched_val);
+            let matched_val = ctx.interp_mut().iteration_anchor(anchor_base + MATCHED);
+            let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + MATCHED, Value::string(matched_str));
+            if matched_str.is_empty() {
+                let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + TEMP, last_index_val);
+                let last_index_val = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+                let this_index = to_length_runtime(ctx, &last_index_val, name)? as usize;
+                let next_index = advance_string_index(&s_units, this_index, full_unicode);
+                let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                set_property_runtime(
+                    ctx,
+                    &receiver,
+                    "lastIndex",
+                    Value::number_f64(next_index as f64),
+                    name,
+                )?;
+            }
+        }
+
+        // Step 13-15 — build the accumulated replacement.
+        let mut accumulated: Vec<u16> = Vec::new();
+        let mut next_source_position: usize = 0;
+
+        for &result_index in &result_indices {
+            let capture_anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+            let result = ctx.interp_mut().iteration_anchor(result_index);
+            let length_val = get_property_runtime(ctx, &result, "length", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + TEMP, length_val);
+            let length_val = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+            let result_length = to_length_runtime(ctx, &length_val, name)? as usize;
+            let n_captures = result_length.saturating_sub(1);
+
+            let result = ctx.interp_mut().iteration_anchor(result_index);
+            let matched_val = get_property_runtime(ctx, &result, "0", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + MATCHED, matched_val);
+            let matched_val = ctx.interp_mut().iteration_anchor(anchor_base + MATCHED);
+            let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + MATCHED, Value::string(matched_str));
+            let match_units = matched_str.to_utf16_vec(ctx.heap());
+            let match_length = match_units.len();
+
+            let result = ctx.interp_mut().iteration_anchor(result_index);
+            let index_val = get_property_runtime(ctx, &result, "index", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + TEMP, index_val);
+            let index_val = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+            let position_raw = to_integer_or_infinity_runtime(ctx, &index_val, name)?;
+            let position = position_raw.max(0.0).min(length_s as f64) as usize;
+
+            let mut captures: Vec<Option<usize>> = Vec::with_capacity(n_captures);
+            for i in 1..=n_captures {
+                let cap_key = i.to_string();
+                let result = ctx.interp_mut().iteration_anchor(result_index);
+                let cap_val = get_property_runtime(ctx, &result, &cap_key, name)?;
+                if cap_val.is_undefined() {
+                    captures.push(None);
+                } else {
+                    ctx.interp_mut()
+                        .set_iteration_anchor(anchor_base + TEMP, cap_val);
+                    let cap_val = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+                    let capture = coerce_to_jsstring_runtime(ctx, &cap_val, name)?;
+                    let capture_index = ctx
+                        .interp_mut()
+                        .push_iteration_anchor(Value::string(capture))
+                        - 1;
+                    captures.push(Some(capture_index));
+                }
+            }
+
+            let result = ctx.interp_mut().iteration_anchor(result_index);
+            let named_captures = get_property_runtime(ctx, &result, "groups", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + NAMED, named_captures);
+            let named_captures = ctx.interp_mut().iteration_anchor(anchor_base + NAMED);
+            let named_captures_index = if named_captures.is_undefined() {
+                None
+            } else {
+                Some(anchor_base + NAMED)
+            };
+
+            let replacement: Vec<u16> = if functional_replace {
+                let mut replacer_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                replacer_args.push(ctx.interp_mut().iteration_anchor(anchor_base + MATCHED));
+                for cap in &captures {
+                    replacer_args.push(match cap {
+                        Some(index) => ctx.interp_mut().iteration_anchor(*index),
+                        None => Value::undefined(),
                     });
                 }
-                other => other,
-            };
-            let template = replacement_template
-                .as_ref()
-                .expect("non-functional path has a template")
-                .to_utf16_vec(ctx.heap());
-            get_substitution(
-                ctx,
-                &match_units,
-                &s_units,
-                position,
-                &captures,
-                named_captures_coerced.as_ref(),
-                &template,
-                name,
-            )?
-        };
-
-        if position >= next_source_position {
-            // Engine string-length cap — an unbounded global replace
-            // (huge template x many matches) must surface a
-            // catchable RangeError instead of asking the host for
-            // tens of GB and getting OOM-killed.
-            let projected = accumulated
-                .len()
-                .saturating_add(position - next_source_position)
-                .saturating_add(replacement.len());
-            if projected > MAX_STRING_UNITS {
-                return Err(crate::NativeError::RangeError {
+                replacer_args.push(Value::number_f64(position as f64));
+                replacer_args.push(ctx.interp_mut().iteration_anchor(anchor_base + INPUT));
+                if let Some(index) = named_captures_index {
+                    replacer_args.push(ctx.interp_mut().iteration_anchor(index));
+                }
+                let replacer = ctx.interp_mut().iteration_anchor(anchor_base + REPLACER);
+                let raw = ctx.call(replacer, Value::undefined(), &replacer_args)?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + TEMP, raw);
+                let raw = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+                let raw_str = coerce_to_jsstring_runtime(ctx, &raw, name)?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + TEMP, Value::string(raw_str));
+                raw_str.to_utf16_vec(ctx.heap())
+            } else {
+                // §22.2.6.11 step 14.n.i — the non-functional path coerces a
+                // present `groups` with ToObject before GetSubstitution. `null`
+                // (from a monkey-patched `exec`) throws; a primitive is passed
+                // through, since the `$<name>` lookups read it via the full
+                // [[Get]], which boxes primitives the same way ToObject would.
+                let named_captures_coerced = match named_captures_index {
+                    Some(index) if ctx.interp_mut().iteration_anchor(index).is_nullish() => {
+                        return Err(crate::NativeError::TypeError {
+                            name,
+                            reason: "named capture groups is not coercible to an Object"
+                                .to_string(),
+                        });
+                    }
+                    other => other,
+                };
+                let template = ctx.interp_mut().iteration_anchor(anchor_base + TEMPLATE);
+                let template = template.as_string(ctx.heap()).ok_or_else(|| {
+                    crate::NativeError::TypeError {
+                        name,
+                        reason: "replace template root is not a string".to_string(),
+                    }
+                })?;
+                let template = template.to_utf16_vec(ctx.heap());
+                get_substitution(
+                    ctx,
+                    &match_units,
+                    &s_units,
+                    position,
+                    &captures,
+                    named_captures_coerced,
+                    &template,
                     name,
-                    reason: "Invalid string length".to_string(),
-                });
+                )?
+            };
+
+            if position >= next_source_position {
+                // Engine string-length cap — an unbounded global replace
+                // (huge template x many matches) must surface a
+                // catchable RangeError instead of asking the host for
+                // tens of GB and getting OOM-killed.
+                let projected = accumulated
+                    .len()
+                    .saturating_add(position - next_source_position)
+                    .saturating_add(replacement.len());
+                if projected > MAX_STRING_UNITS {
+                    return Err(crate::NativeError::RangeError {
+                        name,
+                        reason: "Invalid string length".to_string(),
+                    });
+                }
+                accumulated.extend_from_slice(&s_units[next_source_position..position]);
+                accumulated.extend_from_slice(&replacement);
+                next_source_position = position + match_length;
             }
-            accumulated.extend_from_slice(&s_units[next_source_position..position]);
-            accumulated.extend_from_slice(&replacement);
-            next_source_position = position + match_length;
+            ctx.interp_mut()
+                .pop_iteration_anchors_to(capture_anchor_base);
         }
-    }
 
-    if next_source_position < length_s {
-        accumulated.extend_from_slice(&s_units[next_source_position..]);
-    }
+        if next_source_position < length_s {
+            accumulated.extend_from_slice(&s_units[next_source_position..]);
+        }
 
-    Ok(Value::string(
-        JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
-            crate::NativeError::TypeError {
-                name,
-                reason: "out of memory".to_string(),
-            }
-        })?,
-    ))
+        Ok(Value::string(
+            JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
+                crate::NativeError::TypeError {
+                    name,
+                    reason: "out of memory".to_string(),
+                }
+            })?,
+        ))
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// `? Get(value, Symbol.someKey)` driven through `ordinary_get_value`
@@ -1239,29 +1508,52 @@ pub(crate) fn get_symbol_property_runtime(
     sym: crate::symbol::JsSymbol,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
-    let outcome = interp
-        .ordinary_get_value(
-            &exec,
-            *receiver,
-            *receiver,
-            &crate::VmPropertyKey::Symbol(sym),
-            0,
-        )
-        .map_err(vm_err_to_native(interp, name))?;
-    match outcome {
-        crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+    const RECEIVER: usize = 0;
+    const RESULT: usize = 1;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(*receiver);
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+
+    let result = (|| -> Result<Value, crate::NativeError> {
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let exec =
+            ctx.execution_context()
+                .cloned()
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+        let outcome = ctx.with_turn_parts(|interp, stack| {
             interp
-                .run_callable_sync(&exec, &getter, *receiver, args)
+                .ordinary_get_value(
+                    stack,
+                    &exec,
+                    receiver,
+                    receiver,
+                    &crate::VmPropertyKey::Symbol(sym),
+                    0,
+                )
                 .map_err(vm_err_to_native(interp, name))
+        })?;
+        match outcome {
+            crate::VmGetOutcome::Value(value) => {
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + RESULT, value);
+            }
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + RESULT, getter);
+                let getter = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
+                let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+                let value = ctx.call(getter, receiver, &[])?;
+                ctx.interp_mut()
+                    .set_iteration_anchor(anchor_base + RESULT, value);
+            }
         }
-    }
+        Ok(ctx.interp_mut().iteration_anchor(anchor_base + RESULT))
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// §7.3.21 `SpeciesConstructor(O, defaultConstructor)`. Resolves the
@@ -1276,39 +1568,66 @@ pub(crate) fn species_constructor_runtime(
     default_ctor: &Value,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
-    let c = get_property_runtime(ctx, obj, "constructor", name)?;
-    if c.is_undefined() {
-        return Ok(*default_ctor);
-    }
-    if !c.is_object_type() {
-        return Err(crate::NativeError::TypeError {
+    const OBJECT: usize = 0;
+    const DEFAULT_CTOR: usize = 1;
+    const CONSTRUCTOR: usize = 2;
+    const SPECIES: usize = 3;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(*obj);
+    ctx.interp_mut().push_iteration_anchor(*default_ctor);
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+
+    let result = (|| -> Result<Value, crate::NativeError> {
+        let object = ctx.interp_mut().iteration_anchor(anchor_base + OBJECT);
+        let constructor = get_property_runtime(ctx, &object, "constructor", name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + CONSTRUCTOR, constructor);
+        let constructor = ctx.interp_mut().iteration_anchor(anchor_base + CONSTRUCTOR);
+        if constructor.is_undefined() {
+            return Ok(ctx
+                .interp_mut()
+                .iteration_anchor(anchor_base + DEFAULT_CTOR));
+        }
+        if !constructor.is_object_type() {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "constructor is not an Object".to_string(),
+            });
+        }
+        let species_sym = ctx
+            .interp_mut()
+            .well_known_symbols()
+            .get(crate::symbol::WellKnown::Species);
+        let species = get_symbol_property_runtime(ctx, &constructor, species_sym, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + SPECIES, species);
+        let species = ctx.interp_mut().iteration_anchor(anchor_base + SPECIES);
+        // §7.3.20 step 6 — `undefined`/`null` @@species falls back to the
+        // default constructor, not the resolved `constructor` value.
+        if species.is_nullish() {
+            return Ok(ctx
+                .interp_mut()
+                .iteration_anchor(anchor_base + DEFAULT_CTOR));
+        }
+        let is_constructor = {
+            let (interp, exec) = ctx.interp_mut_and_context();
+            let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+            crate::abstract_ops::is_constructor(&species, &exec, &interp.gc_heap)
+        };
+        if is_constructor {
+            return Ok(ctx.interp_mut().iteration_anchor(anchor_base + SPECIES));
+        }
+        Err(crate::NativeError::TypeError {
             name,
-            reason: "constructor is not an Object".to_string(),
-        });
-    }
-    let species_sym = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::Species);
-    let s = get_symbol_property_runtime(ctx, &c, species_sym, name)?;
-    // §7.3.20 step 6 — `undefined`/`null` @@species falls back to the
-    // default constructor, not the resolved `constructor` value.
-    if s.is_nullish() {
-        return Ok(*default_ctor);
-    }
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
-    if crate::abstract_ops::is_constructor(&s, &exec, &interp.gc_heap) {
-        return Ok(s);
-    }
-    Err(crate::NativeError::TypeError {
-        name,
-        reason: "Symbol.species is not a constructor".to_string(),
-    })
+            reason: "Symbol.species is not a constructor".to_string(),
+        })
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// §22.2.6.9 `RegExp.prototype[@@matchAll](string)`. Resolves
@@ -1339,72 +1658,130 @@ pub fn native_regexp_symbol_match_all(
         });
     }
     let string_arg = args.first().cloned().unwrap_or(Value::undefined());
-    let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
+    const RECEIVER: usize = 0;
+    const INPUT: usize = 1;
+    const DEFAULT_CTOR: usize = 2;
+    const CONSTRUCTOR: usize = 3;
+    const MATCHER: usize = 4;
+    const TEMP: usize = 5;
+    const RESULT: usize = 6;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(receiver);
+    ctx.interp_mut().push_iteration_anchor(string_arg);
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
 
-    let default_ctor = {
-        let interp = &ctx.cx.interp;
-        crate::object::get(interp.global_this, &interp.gc_heap, "RegExp").ok_or_else(|| {
-            crate::NativeError::TypeError {
-                name,
-                reason: "%RegExp% intrinsic missing".to_string(),
-            }
-        })?
-    };
-    let c = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
+    let result = (|| -> Result<Value, crate::NativeError> {
+        let string_arg = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+        let input = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + INPUT, Value::string(input));
 
-    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
-    let global = flags_str.contains('g');
-    let full_unicode = flags_str.contains('u') || flags_str.contains('v');
+        let default_ctor = {
+            let interp = &ctx.cx.interp;
+            crate::object::get(interp.global_this, &interp.gc_heap, "RegExp").ok_or_else(|| {
+                crate::NativeError::TypeError {
+                    name,
+                    reason: "%RegExp% intrinsic missing".to_string(),
+                }
+            })?
+        };
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + DEFAULT_CTOR, default_ctor);
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let default_ctor = ctx
+            .interp_mut()
+            .iteration_anchor(anchor_base + DEFAULT_CTOR);
+        let constructor = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + CONSTRUCTOR, constructor);
 
-    let flags_js = {
-        JsString::from_str(&flags_str, ctx.heap_mut()).map_err(|_| {
-            crate::NativeError::TypeError {
-                name,
-                reason: "out of memory".to_string(),
-            }
-        })?
-    };
-    let matcher = {
-        let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        ctor_args.push(receiver);
-        ctor_args.push(Value::string(flags_js));
-        let (interp, exec_ctx) = ctx.interp_mut_and_context();
-        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let flags = get_property_runtime(ctx, &receiver, "flags", name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + TEMP, flags);
+        let flags = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+        let flags = coerce_to_jsstring_runtime(ctx, &flags, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + TEMP, Value::string(flags));
+        let (global, full_unicode) = flags.with_utf16(ctx.heap(), |units| {
+            let global = units.contains(&(b'g' as u16));
+            let full_unicode = units.contains(&(b'u' as u16)) || units.contains(&(b'v' as u16));
+            (global, full_unicode)
+        });
+        let constructor = ctx.interp_mut().iteration_anchor(anchor_base + CONSTRUCTOR);
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let flags = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+        let matcher = ctx.construct(constructor, &[receiver, flags])?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + MATCHER, matcher);
+
+        // Step 2.f — snapshot rx.lastIndex into matcher.
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let last_index = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + TEMP, last_index);
+        let last_index = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+        let last_index = to_length_runtime(ctx, &last_index, name)? as f64;
+        let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
+        set_property_runtime(
+            ctx,
+            &matcher,
+            "lastIndex",
+            Value::number_f64(last_index),
             name,
-            reason: "missing execution context".to_string(),
-        })?;
-        interp
-            .run_construct_sync(&exec_ctx, &c, c, ctor_args)
-            .map_err(vm_err_to_native(interp, name))?
-    };
+        )?;
 
-    // Step 2.f — snapshot rx.lastIndex into matcher.
-    let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
-    let last_index = to_length_runtime(ctx, &last_index_val, name)? as f64;
-    set_property_runtime(
-        ctx,
-        &matcher,
-        "lastIndex",
-        Value::number_f64(last_index),
-        name,
-    )?;
+        let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
+        let input_root = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+        let input =
+            input_root
+                .as_string(ctx.heap())
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name,
+                    reason: "matchAll input root is not a string".to_string(),
+                })?;
+        let iter_state = crate::IteratorState::RegExpString {
+            matcher,
+            input,
+            global,
+            full_unicode,
+            done: false,
+        };
+        let handle = ctx
+            .alloc_iterator_state(iter_state, &[&matcher, &input_root], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + RESULT, Value::iterator(handle));
+        Ok(ctx.interp_mut().iteration_anchor(anchor_base + RESULT))
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
+}
 
-    let input_root = Value::string(s);
-    let iter_state = crate::IteratorState::RegExpString {
-        matcher,
-        input: s,
-        global,
-        full_unicode,
-        done: false,
-    };
-    let handle = ctx
-        .alloc_iterator_state(iter_state, &[&matcher, &input_root], &[])
+/// Materialize values retained by iteration-anchor index into a JS array.
+fn array_from_iteration_anchor_indices(
+    ctx: &mut NativeCtx<'_>,
+    indices: &[usize],
+    name: &'static str,
+) -> Result<Value, crate::NativeError> {
+    let mut elements = Vec::with_capacity(indices.len());
+    for &index in indices {
+        elements.push(ctx.interp_mut().iteration_anchor(index));
+    }
+    let arr = ctx
+        .array_from_elements_with_roots(elements.iter().copied(), &[], &[elements.as_slice()])
         .map_err(|_| crate::NativeError::TypeError {
             name,
-            reason: "iterator allocation failed".to_string(),
+            reason: "array allocation failed".to_string(),
         })?;
-    Ok(Value::iterator(handle))
+    Ok(Value::array(arr))
 }
 
 /// §22.2.6.14 `RegExp.prototype[@@split](string, limit)`.
@@ -1433,211 +1810,220 @@ pub fn native_regexp_symbol_split(
     }
     let string_arg = args.first().cloned().unwrap_or(Value::undefined());
     let limit_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+    const RECEIVER: usize = 0;
+    const INPUT: usize = 1;
+    const LIMIT: usize = 2;
+    const DEFAULT_CTOR: usize = 3;
+    const CONSTRUCTOR: usize = 4;
+    const SPLITTER: usize = 5;
+    const MATCH_RESULT: usize = 6;
+    const TEMP: usize = 7;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(receiver);
+    ctx.interp_mut().push_iteration_anchor(string_arg);
+    ctx.interp_mut().push_iteration_anchor(limit_arg);
+    for _ in DEFAULT_CTOR..=TEMP {
+        ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    }
 
-    // Step 4 — S = ? ToString(string).
-    let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
-    let s_units = s.to_utf16_vec(ctx.heap());
-    let size = s_units.len();
+    let result = (|| -> Result<Value, crate::NativeError> {
+        // Step 4 — S = ? ToString(string).
+        let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+        let input = coerce_to_jsstring_runtime(ctx, &input, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + INPUT, Value::string(input));
+        let s_units = input.to_utf16_vec(ctx.heap());
+        let size = s_units.len();
 
-    // Step 5 — C = ? SpeciesConstructor(rx, %RegExp%).
-    let default_ctor = {
-        let interp = &ctx.cx.interp;
-        crate::object::get(interp.global_this, &interp.gc_heap, "RegExp").ok_or_else(|| {
-            crate::NativeError::TypeError {
-                name,
-                reason: "%RegExp% intrinsic missing".to_string(),
-            }
-        })?
-    };
-    let c = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
+        // Step 5 — C = ? SpeciesConstructor(rx, %RegExp%).
+        let default_ctor = {
+            let interp = &ctx.cx.interp;
+            crate::object::get(interp.global_this, &interp.gc_heap, "RegExp").ok_or_else(|| {
+                crate::NativeError::TypeError {
+                    name,
+                    reason: "%RegExp% intrinsic missing".to_string(),
+                }
+            })?
+        };
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + DEFAULT_CTOR, default_ctor);
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let default_ctor = ctx
+            .interp_mut()
+            .iteration_anchor(anchor_base + DEFAULT_CTOR);
+        let constructor = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + CONSTRUCTOR, constructor);
 
-    // Step 6-8 — flags = ToString(Get(rx, "flags")). newFlags appends
-    // `y` so the splitter probes exactly the requested position each
-    // step. `unicodeMatching` keys off `u` or `v`.
-    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
-    let unicode_matching = flags_str.contains('u') || flags_str.contains('v');
-    let new_flags = if flags_str.contains('y') {
-        flags_str.clone()
-    } else {
-        let mut combined = String::with_capacity(flags_str.len() + 1);
-        combined.push_str(&flags_str);
-        combined.push('y');
-        combined
-    };
-    let new_flags_js = {
-        JsString::from_str(&new_flags, ctx.heap_mut()).map_err(|_| {
+        // Step 6-8 — append sticky `y`, preserving the coerced WTF-16 flags.
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let flags = get_property_runtime(ctx, &receiver, "flags", name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + TEMP, flags);
+        let flags = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+        let flags = coerce_to_jsstring_runtime(ctx, &flags, name)?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + TEMP, Value::string(flags));
+        let mut new_flags = flags.to_utf16_vec(ctx.heap());
+        let unicode_matching =
+            new_flags.contains(&(b'u' as u16)) || new_flags.contains(&(b'v' as u16));
+        if !new_flags.contains(&(b'y' as u16)) {
+            new_flags.push(b'y' as u16);
+        }
+        let new_flags = JsString::from_utf16_units(&new_flags, ctx.heap_mut()).map_err(|_| {
             crate::NativeError::TypeError {
                 name,
                 reason: "out of memory".to_string(),
             }
-        })?
-    };
-
-    // Step 9 — splitter = ? Construct(C, [rx, newFlags]).
-    let splitter = {
-        let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        ctor_args.push(receiver);
-        ctor_args.push(Value::string(new_flags_js));
-        let (interp, exec_ctx) = ctx.interp_mut_and_context();
-        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
         })?;
-        interp
-            .run_construct_sync(&exec_ctx, &c, c, ctor_args)
-            .map_err(vm_err_to_native(interp, name))?
-    };
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + TEMP, Value::string(new_flags));
 
-    // Step 13 — lim = limit === undefined ? 2^32 - 1 : ToUint32(limit).
-    let lim: u32 = if limit_arg.is_undefined() {
-        u32::MAX
-    } else {
-        // ToUint32 runs ToNumber, which throws for a Symbol / BigInt
-        // limit rather than coercing it to zero.
-        let exec =
-            ctx.execution_context()
-                .cloned()
-                .ok_or_else(|| crate::NativeError::TypeError {
-                    name,
-                    reason: "missing execution context".to_string(),
-                })?;
-        let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &limit_arg)
-            .map_err(vm_err_to_native(ctx.cx.interp, name))?
-            .as_f64();
-        if n.is_nan() {
-            0
+        // Step 9 — splitter = ? Construct(C, [rx, newFlags]) on this turn.
+        let constructor = ctx.interp_mut().iteration_anchor(anchor_base + CONSTRUCTOR);
+        let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
+        let flags = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+        let splitter = ctx.construct(constructor, &[receiver, flags])?;
+        ctx.interp_mut()
+            .set_iteration_anchor(anchor_base + SPLITTER, splitter);
+
+        // Step 13 — lim = limit === undefined ? 2^32 - 1 : ToUint32(limit).
+        let limit = ctx.interp_mut().iteration_anchor(anchor_base + LIMIT);
+        let lim: u32 = if limit.is_undefined() {
+            u32::MAX
         } else {
-            n.trunc().rem_euclid(4_294_967_296.0) as u32
+            let exec =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| crate::NativeError::TypeError {
+                        name,
+                        reason: "missing execution context".to_string(),
+                    })?;
+            let n = ctx
+                .with_turn_parts(|interp, stack| {
+                    crate::coerce::to_number_or_throw(interp, stack, &exec, &limit)
+                        .map_err(vm_err_to_native(interp, name))
+                })?
+                .as_f64();
+            if n.is_nan() {
+                0
+            } else {
+                n.trunc().rem_euclid(4_294_967_296.0) as u32
+            }
+        };
+
+        let mut output_indices: Vec<usize> = Vec::new();
+        if lim == 0 {
+            return array_from_iteration_anchor_indices(ctx, &output_indices, name);
         }
-    };
 
-    let mut out_elements: Vec<Value> = Vec::new();
+        if size == 0 {
+            let splitter = ctx.interp_mut().iteration_anchor(anchor_base + SPLITTER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let input =
+                input
+                    .as_string(ctx.heap())
+                    .ok_or_else(|| crate::NativeError::TypeError {
+                        name,
+                        reason: "split input root is not a string".to_string(),
+                    })?;
+            let matched = regexp_exec_runtime(ctx, &splitter, input, name)?;
+            if !matched.is_null() {
+                return array_from_iteration_anchor_indices(ctx, &output_indices, name);
+            }
+            output_indices.push(anchor_base + INPUT);
+            return array_from_iteration_anchor_indices(ctx, &output_indices, name);
+        }
 
-    // Step 14 — lim == 0 short-circuits to an empty array.
-    if lim == 0 {
-        let arr = ctx
-            .array_from_elements_with_roots(out_elements, &[&splitter], &[])
-            .map_err(|_| crate::NativeError::TypeError {
+        let mut p: usize = 0;
+        let mut q: usize = 0;
+        while q < size {
+            let splitter = ctx.interp_mut().iteration_anchor(anchor_base + SPLITTER);
+            set_property_runtime(
+                ctx,
+                &splitter,
+                "lastIndex",
+                Value::number_f64(q as f64),
                 name,
-                reason: "array allocation failed".to_string(),
-            })?;
-        return Ok(Value::array(arr));
-    }
-
-    // Step 16 — empty S: one probe; if exec yields a match, return
-    // empty array, otherwise return `[S]`.
-    if size == 0 {
-        let z = regexp_exec_runtime(ctx, &splitter, s, name)?;
-        if !z.is_null() {
-            let arr = ctx
-                .array_from_elements_with_roots(out_elements, &[&splitter], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "array allocation failed".to_string(),
+            )?;
+            let splitter = ctx.interp_mut().iteration_anchor(anchor_base + SPLITTER);
+            let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+            let input =
+                input
+                    .as_string(ctx.heap())
+                    .ok_or_else(|| crate::NativeError::TypeError {
+                        name,
+                        reason: "split input root is not a string".to_string(),
+                    })?;
+            let matched = regexp_exec_runtime(ctx, &splitter, input, name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + MATCH_RESULT, matched);
+            if ctx
+                .interp_mut()
+                .iteration_anchor(anchor_base + MATCH_RESULT)
+                .is_null()
+            {
+                q = advance_string_index(&s_units, q, unicode_matching);
+                continue;
+            }
+            let splitter = ctx.interp_mut().iteration_anchor(anchor_base + SPLITTER);
+            let last_index = get_property_runtime(ctx, &splitter, "lastIndex", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + TEMP, last_index);
+            let last_index = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+            let e = (to_length_runtime(ctx, &last_index, name)? as usize).min(size);
+            if e == p {
+                q = advance_string_index(&s_units, q, unicode_matching);
+                continue;
+            }
+            let part =
+                JsString::from_utf16_units(&s_units[p..q], ctx.heap_mut()).map_err(|_| {
+                    crate::NativeError::TypeError {
+                        name,
+                        reason: "out of memory".to_string(),
+                    }
                 })?;
-            return Ok(Value::array(arr));
+            let part_index = ctx.interp_mut().push_iteration_anchor(Value::string(part)) - 1;
+            output_indices.push(part_index);
+            if output_indices.len() as u32 == lim {
+                return array_from_iteration_anchor_indices(ctx, &output_indices, name);
+            }
+            p = e;
+            let matched = ctx
+                .interp_mut()
+                .iteration_anchor(anchor_base + MATCH_RESULT);
+            let length = get_property_runtime(ctx, &matched, "length", name)?;
+            ctx.interp_mut()
+                .set_iteration_anchor(anchor_base + TEMP, length);
+            let length = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
+            let number_of_captures =
+                (to_length_runtime(ctx, &length, name)? as usize).saturating_sub(1);
+            for i in 1..=number_of_captures {
+                let matched = ctx
+                    .interp_mut()
+                    .iteration_anchor(anchor_base + MATCH_RESULT);
+                let capture = get_property_runtime(ctx, &matched, &i.to_string(), name)?;
+                let capture_index = ctx.interp_mut().push_iteration_anchor(capture) - 1;
+                output_indices.push(capture_index);
+                if output_indices.len() as u32 == lim {
+                    return array_from_iteration_anchor_indices(ctx, &output_indices, name);
+                }
+            }
+            q = p;
         }
-        out_elements.push(Value::string(s));
-        let arr = ctx
-            .array_from_elements_with_roots(
-                out_elements.iter().cloned(),
-                &[&splitter],
-                &[out_elements.as_slice()],
-            )
-            .map_err(|_| crate::NativeError::TypeError {
-                name,
-                reason: "array allocation failed".to_string(),
-            })?;
-        return Ok(Value::array(arr));
-    }
 
-    // Step 17-21 — main loop.
-    let mut p: usize = 0;
-    let mut q: usize = 0;
-    while q < size {
-        set_property_runtime(
-            ctx,
-            &splitter,
-            "lastIndex",
-            Value::number_f64(q as f64),
-            name,
-        )?;
-        let z = regexp_exec_runtime(ctx, &splitter, s, name)?;
-        if z.is_null() {
-            q = advance_string_index(&s_units, q, unicode_matching);
-            continue;
-        }
-        let last_index_val = get_property_runtime(ctx, &splitter, "lastIndex", name)?;
-        let e_raw = to_length_runtime(ctx, &last_index_val, name)? as usize;
-        let e = e_raw.min(size);
-        if e == p {
-            q = advance_string_index(&s_units, q, unicode_matching);
-            continue;
-        }
-        let part = JsString::from_utf16_units(&s_units[p..q], ctx.cx.interp.gc_heap_mut())
-            .map_err(|_| crate::NativeError::TypeError {
+        let tail = JsString::from_utf16_units(&s_units[p..size], ctx.heap_mut()).map_err(|_| {
+            crate::NativeError::TypeError {
                 name,
                 reason: "out of memory".to_string(),
-            })?;
-        out_elements.push(Value::string(part));
-        if out_elements.len() as u32 == lim {
-            let arr = ctx
-                .array_from_elements_with_roots(
-                    out_elements.iter().cloned(),
-                    &[&splitter],
-                    &[out_elements.as_slice()],
-                )
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "array allocation failed".to_string(),
-                })?;
-            return Ok(Value::array(arr));
-        }
-        p = e;
-        let length_val = get_property_runtime(ctx, &z, "length", name)?;
-        let number_of_captures =
-            (to_length_runtime(ctx, &length_val, name)? as usize).saturating_sub(1);
-        for i in 1..=number_of_captures {
-            let cap_key = i.to_string();
-            let next_capture = get_property_runtime(ctx, &z, &cap_key, name)?;
-            out_elements.push(next_capture);
-            if out_elements.len() as u32 == lim {
-                let arr = ctx
-                    .array_from_elements_with_roots(
-                        out_elements.iter().cloned(),
-                        &[&splitter],
-                        &[out_elements.as_slice()],
-                    )
-                    .map_err(|_| crate::NativeError::TypeError {
-                        name,
-                        reason: "array allocation failed".to_string(),
-                    })?;
-                return Ok(Value::array(arr));
             }
-        }
-        q = p;
-    }
-
-    // Step 22 — trailing slice from `p` to end.
-    let tail = JsString::from_utf16_units(&s_units[p..size], ctx.cx.interp.gc_heap_mut()).map_err(
-        |_| crate::NativeError::TypeError {
-            name,
-            reason: "out of memory".to_string(),
-        },
-    )?;
-    out_elements.push(Value::string(tail));
-    let arr = ctx
-        .array_from_elements_with_roots(
-            out_elements.iter().cloned(),
-            &[&splitter],
-            &[out_elements.as_slice()],
-        )
-        .map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "array allocation failed".to_string(),
         })?;
-    Ok(Value::array(arr))
+        let tail_index = ctx.interp_mut().push_iteration_anchor(Value::string(tail)) - 1;
+        output_indices.push(tail_index);
+        array_from_iteration_anchor_indices(ctx, &output_indices, name)
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// §22.2.6.11.1 `GetSubstitution(matched, str, position, captures,
@@ -1650,130 +2036,155 @@ fn get_substitution(
     matched: &[u16],
     str_units: &[u16],
     position: usize,
-    captures: &[Option<JsString>],
-    named_captures: Option<&Value>,
+    captures: &[Option<usize>],
+    named_captures: Option<usize>,
     template: &[u16],
     name: &'static str,
 ) -> Result<Vec<u16>, crate::NativeError> {
-    let mut out: Vec<u16> = Vec::with_capacity(template.len());
-    let match_length = matched.len();
-    let str_length = str_units.len();
-    let tail_position = (position + match_length).min(str_length);
-    let m = captures.len();
-    let mut i = 0;
-    while i < template.len() {
-        let c = template[i];
-        if c != b'$' as u16 || i + 1 >= template.len() {
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        let next = template[i + 1];
-        match next {
-            n if n == b'$' as u16 => {
-                out.push(b'$' as u16);
-                i += 2;
-            }
-            n if n == b'&' as u16 => {
-                out.extend_from_slice(matched);
-                i += 2;
-            }
-            n if n == b'`' as u16 => {
-                out.extend_from_slice(&str_units[..position]);
-                i += 2;
-            }
-            n if n == b'\'' as u16 => {
-                out.extend_from_slice(&str_units[tail_position..]);
-                i += 2;
-            }
-            n if (b'0' as u16..=b'9' as u16).contains(&n) => {
-                // §22.2.6.11.1 step 11: parse one- or two-digit
-                // group index. Use two digits when the result is a
-                // valid (in-range, non-zero) capture index;
-                // otherwise fall back to single digit. `$0` is
-                // emitted literally per the spec table.
-                let first = (n - b'0' as u16) as usize;
-                let second = template
-                    .get(i + 2)
-                    .copied()
-                    .filter(|&c| (b'0' as u16..=b'9' as u16).contains(&c))
-                    .map(|c| (c - b'0' as u16) as usize);
-                let (idx, consumed) = match (first, second) {
-                    (0, None) => (None, 2),
-                    (0, Some(0)) => (None, 3),
-                    (0, Some(d)) if d > 0 && d <= m => (Some(d), 3),
-                    (0, Some(_)) => (None, 2),
-                    (a, Some(b)) => {
-                        let two = a * 10 + b;
-                        if two > 0 && two <= m {
-                            (Some(two), 3)
-                        } else if a > 0 && a <= m {
-                            (Some(a), 2)
-                        } else {
-                            (None, 2)
-                        }
-                    }
-                    (a, None) => {
-                        if a > 0 && a <= m {
-                            (Some(a), 2)
-                        } else {
-                            (None, 2)
-                        }
-                    }
-                };
-                if let Some(group_index) = idx {
-                    if let Some(Some(cap)) = captures.get(group_index - 1) {
-                        out.extend_from_slice(&cap.to_utf16_vec(ctx.heap()));
-                    }
-                    // Undefined capture group → emit nothing.
-                } else {
-                    // Out-of-range or `$0` → emit verbatim.
-                    out.push(c);
-                    for k in 1..consumed {
-                        out.push(template[i + k]);
-                    }
-                }
-                i += consumed;
-            }
-            n if n == b'<' as u16 => {
-                // §22.2.6.11.1 step 12 — named capture reference.
-                if named_captures.is_none() {
-                    // Without named captures, `$<` is a two-code-unit literal
-                    // substitution. The remaining template text is still
-                    // scanned, so `$<42$1>` can substitute `$1`.
-                    out.push(c);
-                    out.push(n);
-                    i += 2;
-                    continue;
-                }
-                let mut end = i + 2;
-                while end < template.len() && template[end] != b'>' as u16 {
-                    end += 1;
-                }
-                if end >= template.len() {
-                    // No closing `>`; emit literally.
-                    out.push(c);
-                    i += 1;
-                    continue;
-                }
-                let group_name_units = &template[i + 2..end];
-                let group_name = String::from_utf16_lossy(group_name_units);
-                if let Some(nc) = named_captures {
-                    let val = get_property_runtime(ctx, nc, &group_name, name)?;
-                    if !val.is_undefined() {
-                        let coerced = coerce_to_jsstring_runtime(ctx, &val, name)?;
-                        out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
-                    }
-                    i = end + 1;
-                }
-            }
-            _ => {
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(Value::undefined());
+    let result = (|| -> Result<Vec<u16>, crate::NativeError> {
+        let mut out: Vec<u16> = Vec::with_capacity(template.len());
+        let match_length = matched.len();
+        let str_length = str_units.len();
+        let tail_position = (position + match_length).min(str_length);
+        let m = captures.len();
+        let mut i = 0;
+        while i < template.len() {
+            let c = template[i];
+            if c != b'$' as u16 || i + 1 >= template.len() {
                 out.push(c);
                 i += 1;
+                continue;
+            }
+            let next = template[i + 1];
+            match next {
+                n if n == b'$' as u16 => {
+                    out.push(b'$' as u16);
+                    i += 2;
+                }
+                n if n == b'&' as u16 => {
+                    out.extend_from_slice(matched);
+                    i += 2;
+                }
+                n if n == b'`' as u16 => {
+                    out.extend_from_slice(&str_units[..position]);
+                    i += 2;
+                }
+                n if n == b'\'' as u16 => {
+                    out.extend_from_slice(&str_units[tail_position..]);
+                    i += 2;
+                }
+                n if (b'0' as u16..=b'9' as u16).contains(&n) => {
+                    // §22.2.6.11.1 step 11: parse one- or two-digit
+                    // group index. Use two digits when the result is a
+                    // valid (in-range, non-zero) capture index;
+                    // otherwise fall back to single digit. `$0` is
+                    // emitted literally per the spec table.
+                    let first = (n - b'0' as u16) as usize;
+                    let second = template
+                        .get(i + 2)
+                        .copied()
+                        .filter(|&c| (b'0' as u16..=b'9' as u16).contains(&c))
+                        .map(|c| (c - b'0' as u16) as usize);
+                    let (idx, consumed) = match (first, second) {
+                        (0, None) => (None, 2),
+                        (0, Some(0)) => (None, 3),
+                        (0, Some(d)) if d > 0 && d <= m => (Some(d), 3),
+                        (0, Some(_)) => (None, 2),
+                        (a, Some(b)) => {
+                            let two = a * 10 + b;
+                            if two > 0 && two <= m {
+                                (Some(two), 3)
+                            } else if a > 0 && a <= m {
+                                (Some(a), 2)
+                            } else {
+                                (None, 2)
+                            }
+                        }
+                        (a, None) => {
+                            if a > 0 && a <= m {
+                                (Some(a), 2)
+                            } else {
+                                (None, 2)
+                            }
+                        }
+                    };
+                    if let Some(group_index) = idx {
+                        if let Some(Some(cap_index)) = captures.get(group_index - 1) {
+                            let capture = ctx.interp_mut().iteration_anchor(*cap_index);
+                            let capture = capture.as_string(ctx.heap()).ok_or_else(|| {
+                                crate::NativeError::TypeError {
+                                    name,
+                                    reason: "replace capture root is not a string".to_string(),
+                                }
+                            })?;
+                            out.extend_from_slice(&capture.to_utf16_vec(ctx.heap()));
+                        }
+                        // Undefined capture group → emit nothing.
+                    } else {
+                        // Out-of-range or `$0` → emit verbatim.
+                        out.push(c);
+                        for k in 1..consumed {
+                            out.push(template[i + k]);
+                        }
+                    }
+                    i += consumed;
+                }
+                n if n == b'<' as u16 => {
+                    // §22.2.6.11.1 step 12 — named capture reference.
+                    if named_captures.is_none() {
+                        // Without named captures, `$<` is a two-code-unit literal
+                        // substitution. The remaining template text is still
+                        // scanned, so `$<42$1>` can substitute `$1`.
+                        out.push(c);
+                        out.push(n);
+                        i += 2;
+                        continue;
+                    }
+                    let mut end = i + 2;
+                    while end < template.len() && template[end] != b'>' as u16 {
+                        end += 1;
+                    }
+                    if end >= template.len() {
+                        // No closing `>`; emit literally.
+                        out.push(c);
+                        i += 1;
+                        continue;
+                    }
+                    let group_name_units = &template[i + 2..end];
+                    let group_name = String::from_utf16_lossy(group_name_units);
+                    if let Some(nc_index) = named_captures {
+                        let named = ctx.interp_mut().iteration_anchor(nc_index);
+                        let val = get_property_runtime(ctx, &named, &group_name, name)?;
+                        ctx.interp_mut().set_iteration_anchor(anchor_base, val);
+                        let val = ctx.interp_mut().iteration_anchor(anchor_base);
+                        if !val.is_undefined() {
+                            let coerced = coerce_to_jsstring_runtime(ctx, &val, name)?;
+                            ctx.interp_mut()
+                                .set_iteration_anchor(anchor_base, Value::string(coerced));
+                            let coerced = ctx.interp_mut().iteration_anchor(anchor_base);
+                            let coerced = coerced.as_string(ctx.heap()).ok_or_else(|| {
+                                crate::NativeError::TypeError {
+                                    name,
+                                    reason: "named replacement root is not a string".to_string(),
+                                }
+                            })?;
+                            out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
+                        }
+                        i = end + 1;
+                    }
+                }
+                _ => {
+                    out.push(c);
+                    i += 1;
+                }
             }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// Whether `name` is installed on `RegExp.prototype`.
@@ -1942,17 +2353,13 @@ mod tests {
     }
 
     fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {
-        let re = recv.as_regexp().unwrap();
+        recv.as_regexp().expect("RegExp receiver");
         let context = empty_context();
         NativeCtx::with_host_context(interp, NativeCallInfo::call(*recv), Some(&context), |ctx| {
             let text = string_arg_to_jsstring_for_test(args, 0, ctx).unwrap();
             match method {
-                "exec" => exec_once_native(&re, recv, text, ctx, &[]).unwrap(),
-                "test" => Value::boolean(
-                    !exec_once_native(&re, recv, text, ctx, &[])
-                        .unwrap()
-                        .is_null(),
-                ),
+                "exec" => exec_once_native(recv, text, ctx).unwrap(),
+                "test" => Value::boolean(!exec_once_native(recv, text, ctx).unwrap().is_null()),
                 _ => panic!("unknown regexp test method {method}"),
             }
         })

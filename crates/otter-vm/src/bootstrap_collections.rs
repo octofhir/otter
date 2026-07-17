@@ -23,6 +23,8 @@
 //!   the prototype are honoured per §24.1.1.2 AddEntriesFromIterable.
 //! - On abrupt completion from the adder, the iterator is closed via
 //!   §7.4.8 IteratorClose before the abrupt propagates.
+//! - Reentrant callbacks share the current activation stack and keep collection
+//!   receivers, keys, values, and returned results in traced anchors.
 //! - `WeakMap` / `WeakSet` reject primitive keys with `TypeError`.
 //!
 //! # See also
@@ -298,73 +300,71 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             name: "Map.groupBy",
             reason: "missing execution context".to_string(),
         })?;
-    let items_snapshot = match ctx
-        .with_turn_parts(|interp, stack| interp.iterator_to_list_sync(&exec_ctx, stack, &items))
-    {
-        Ok(v) => v,
-        Err(e) => return Err(map_group_by_vm_error(ctx.cx.interp, e)),
-    };
-    let result = ctx.alloc_map().map_err(|_| NativeError::TypeError {
-        name: "Map.groupBy",
-        reason: "out of memory".to_string(),
-    })?;
-    let result_value = Value::map(result);
-    for (idx, item) in items_snapshot.iter().enumerate() {
-        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        cb_args.push(*item);
-        cb_args.push(Value::number(crate::number::NumberValue::from_f64(
-            idx as f64,
-        )));
-        let key =
-            match ctx
-                .cx
-                .interp
-                .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
-            {
-                Ok(v) => v,
-                Err(e) => return Err(map_group_by_vm_error(ctx.cx.interp, e)),
-            };
-        let existing = crate::collections::map_get(result, ctx.heap(), &key);
-        let group_arr = if let Some(arr) = existing.and_then(|v| v.as_array()) {
-            arr
-        } else {
-            let arr = ctx
-                .array_from_elements_with_roots(
-                    std::iter::empty(),
-                    &[&result_value, &key, item],
-                    &[items_snapshot.as_slice()],
-                )
-                .map_err(|_| NativeError::TypeError {
-                    name: "Map.groupBy",
-                    reason: "out of memory".to_string(),
-                })?;
-            crate::collections::map_set(result, ctx.heap_mut(), key, Value::array(arr)).map_err(
-                |_| NativeError::TypeError {
-                    name: "Map.groupBy",
-                    reason: "out of memory".to_string(),
-                },
-            )?;
-            arr
-        };
-        let arr_value = Value::array(group_arr);
-        let len = crate::array::len(group_arr, ctx.heap());
-        let roots = ctx.collect_native_roots();
-        let item_clone = *item;
-        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            arr_value.trace_value_slots(visitor);
-            item_clone.trace_value_slots(visitor);
-        };
-        crate::array::set_with_roots(group_arr, ctx.heap_mut(), len, *item, &mut visit).map_err(
-            |_| NativeError::TypeError {
+    ctx.scope(|mut scope| {
+        let items_handle = scope.value(items);
+        let callback_handle = scope.value(callback);
+        let items_snapshot = scope.with_turn_parts(|interp, stack| {
+            let items = interp.escape_scoped(items_handle);
+            interp
+                .iterator_to_list_sync(&exec_ctx, stack, &items)
+                .map_err(|error| map_group_by_vm_error(interp, error))
+        })?;
+        let item_handles: SmallVec<[crate::Local<'_>; 8]> = items_snapshot
+            .into_iter()
+            .map(|item| scope.value(item))
+            .collect();
+        let result = scope
+            .context()
+            .alloc_map()
+            .map_err(|_| NativeError::TypeError {
                 name: "Map.groupBy",
                 reason: "out of memory".to_string(),
-            },
-        )?;
-    }
-    Ok(result_value)
+            })?;
+        let result_handle = scope.value(Value::map(result));
+
+        for (idx, item_handle) in item_handles.iter().copied().enumerate() {
+            scope.scope(|mut step| {
+                let this_value = step.value(Value::undefined());
+                let index = step.number(idx as f64);
+                let key = step.call(callback_handle, this_value, &[item_handle, index])?;
+                let map =
+                    step.raw(result_handle)
+                        .as_map()
+                        .ok_or_else(|| NativeError::TypeError {
+                            name: "Map.groupBy",
+                            reason: "result map was relocated incorrectly".to_string(),
+                        })?;
+                let key_value = step.raw(key);
+                let group =
+                    match crate::collections::map_get(map, step.context().heap(), &key_value)
+                        .and_then(|value| value.as_array())
+                    {
+                        Some(array) => step.value(Value::array(array)),
+                        None => {
+                            let array = step.array(0)?;
+                            let mut map = step.raw(result_handle).as_map().ok_or_else(|| {
+                                NativeError::TypeError {
+                                    name: "Map.groupBy",
+                                    reason: "result map was relocated incorrectly".to_string(),
+                                }
+                            })?;
+                            let key_value = step.raw(key);
+                            let array_value = step.raw(array);
+                            step.context()
+                                .map_set(&mut map, key_value, array_value)
+                                .map_err(|_| NativeError::TypeError {
+                                    name: "Map.groupBy",
+                                    reason: "out of memory".to_string(),
+                                })?;
+                            array
+                        }
+                    };
+                let len = step.array_length(group)?;
+                step.set_index(group, len, item_handle)
+            })?;
+        }
+        Ok(scope.finish(result_handle))
+    })
 }
 
 fn map_group_by_vm_error(interp: &mut crate::Interpreter, err: crate::VmError) -> NativeError {
@@ -546,21 +546,25 @@ fn add_entries_from_iterable<'s>(
     let adder_name = kind.adder_name();
     let adder = {
         let target = scope.raw(target_h);
-        let interp = scope.context().interp_mut();
-        let outcome = interp
-            .ordinary_get_value(
-                &context,
-                target,
-                target,
-                &VmPropertyKey::String(adder_name),
-                0,
-            )
-            .map_err(|e| vm_to_native(interp, e, ctor_name))?;
+        let outcome = scope.with_turn_parts(|interp, stack| {
+            interp
+                .ordinary_get_value(
+                    stack,
+                    &context,
+                    target,
+                    target,
+                    &VmPropertyKey::String(adder_name),
+                    0,
+                )
+                .map_err(|e| vm_to_native(interp, e, ctor_name))
+        })?;
         match outcome {
             VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => interp
-                .run_callable_sync(&context, &getter, target, SmallVec::new())
-                .map_err(|e| vm_to_native(interp, e, ctor_name))?,
+            VmGetOutcome::InvokeGetter { getter } => {
+                let getter_h = scope.value(getter);
+                let result_h = scope.call(getter_h, target_h, &[])?;
+                scope.raw(result_h)
+            }
         }
     };
     if !scope.context().interp_mut().is_callable_runtime(&adder) {
@@ -615,10 +619,11 @@ fn add_entries_eager<'s>(
         let call_args = build_adder_args(scope, context, entry_h, kind, None)?;
         let target = scope.raw(target_h);
         let adder = scope.raw(adder_h);
-        let interp = scope.context().interp_mut();
-        interp
-            .run_callable_sync(context, &adder, target, call_args)
-            .map_err(|e| vm_to_native(interp, e, ctor_name))?;
+        scope.with_turn_parts(|interp, stack| {
+            interp
+                .run_callable_sync_rooted(stack, context, &adder, target, call_args)
+                .map_err(|e| vm_to_native(interp, e, ctor_name))
+        })?;
     }
     Ok(())
 }
@@ -633,12 +638,11 @@ fn add_entries_lazy<'s>(
 ) -> Result<(), NativeError> {
     let ctor_name = kind.name();
     let iterable = scope.raw(iterable_h);
-    let (iterator, next_method) = {
-        let interp = scope.context().interp_mut();
+    let (iterator, next_method) = scope.with_turn_parts(|interp, stack| {
         interp
-            .get_iterator_sync(context, &iterable)
-            .map_err(|e| vm_to_native(interp, e, ctor_name))?
-    };
+            .get_iterator_sync(stack, context, &iterable)
+            .map_err(|e| vm_to_native(interp, e, ctor_name))
+    })?;
     // The iterator and its `next` method live across every step and
     // adder call — both allocate — so both are parked.
     let iterator_h = scope.value(iterator);
@@ -648,8 +652,9 @@ fn add_entries_lazy<'s>(
         let stepped = {
             let iterator = scope.raw(iterator_h);
             let next_method = scope.raw(next_method_h);
-            let interp = scope.context().interp_mut();
-            interp.iterator_step_sync(context, &iterator, &next_method)
+            scope.with_turn_parts(|interp, stack| {
+                interp.iterator_step_sync(stack, context, &iterator, &next_method)
+            })
         };
         let next = match stepped {
             Ok(Some(value)) => value,
@@ -666,16 +671,16 @@ fn add_entries_lazy<'s>(
         let call_result = {
             let target = scope.raw(target_h);
             let adder = scope.raw(adder_h);
-            let interp = scope.context().interp_mut();
-            interp.run_callable_sync(context, &adder, target, call_args)
+            scope.with_turn_parts(|interp, stack| {
+                interp.run_callable_sync_rooted(stack, context, &adder, target, call_args)
+            })
         };
         if let Err(err) = call_result {
             let original_throw = scope.context().interp_mut().take_pending_uncaught_throw();
             let iterator = scope.raw(iterator_h);
-            let _ = scope
-                .context()
-                .interp_mut()
-                .iterator_close_sync(context, &iterator);
+            let _ = scope.with_turn_parts(|interp, stack| {
+                interp.iterator_close_sync(stack, context, &iterator)
+            });
             if let Some(value) = original_throw {
                 scope
                     .context()
@@ -704,10 +709,9 @@ fn build_adder_args<'s>(
     let ctor_name = kind.name();
     if !value_is_object_like(&scope.raw(next_h)) {
         if let Some(iterator) = iterator_for_close {
-            let _ = scope
-                .context()
-                .interp_mut()
-                .iterator_close_sync(context, iterator);
+            let _ = scope.with_turn_parts(|interp, stack| {
+                interp.iterator_close_sync(stack, context, iterator)
+            });
         }
         return Err(NativeError::TypeError {
             name: ctor_name,
@@ -719,10 +723,9 @@ fn build_adder_args<'s>(
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
                 let original_throw = scope.context().interp_mut().take_pending_uncaught_throw();
-                let _ = scope
-                    .context()
-                    .interp_mut()
-                    .iterator_close_sync(context, iterator);
+                let _ = scope.with_turn_parts(|interp, stack| {
+                    interp.iterator_close_sync(stack, context, iterator)
+                });
                 if let Some(value) = original_throw {
                     scope
                         .context()
@@ -741,10 +744,9 @@ fn build_adder_args<'s>(
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
                 let original_throw = scope.context().interp_mut().take_pending_uncaught_throw();
-                let _ = scope
-                    .context()
-                    .interp_mut()
-                    .iterator_close_sync(context, iterator);
+                let _ = scope.with_turn_parts(|interp, stack| {
+                    interp.iterator_close_sync(stack, context, iterator)
+                });
                 if let Some(value) = original_throw {
                     scope
                         .context()
@@ -765,13 +767,24 @@ fn read_indexed_property<'s>(
     name: &str,
 ) -> Result<Value, VmError> {
     let target = scope.raw(target_h);
-    let interp = scope.context().interp_mut();
-    let outcome =
-        interp.ordinary_get_value(context, target, target, &VmPropertyKey::String(name), 0)?;
+    let outcome = scope.with_turn_parts(|interp, stack| {
+        interp.ordinary_get_value(
+            stack,
+            context,
+            target,
+            target,
+            &VmPropertyKey::String(name),
+            0,
+        )
+    })?;
     match outcome {
         VmGetOutcome::Value(v) => Ok(v),
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, target, SmallVec::new())
+            let getter_h = scope.value(getter);
+            let getter = scope.raw(getter_h);
+            scope.with_turn_parts(|interp, stack| {
+                interp.run_callable_sync_rooted(stack, context, &getter, target, SmallVec::new())
+            })
         }
     }
 }
@@ -926,7 +939,7 @@ fn map_proto_get_or_insert_computed(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let mut m = receiver_map(ctx, "Map.prototype.getOrInsertComputed")?;
+    let m = receiver_map(ctx, "Map.prototype.getOrInsertComputed")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&callback) {
@@ -939,28 +952,43 @@ fn map_proto_get_or_insert_computed(
     if let Some(existing) = collections::map_get(m, ctx.heap(), &key) {
         return Ok(existing);
     }
-    let canonical = canonicalize_collection_key(key);
-    let context = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "Map.prototype.getOrInsertComputed",
-            reason: "no active execution context".to_string(),
-        })?;
-    let value = ctx
-        .interp_mut()
-        .run_callable_sync(
-            &context,
-            &callback,
-            Value::undefined(),
-            smallvec::smallvec![canonical],
-        )
-        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "Map.prototype.getOrInsertComputed"))?;
-    // Re-scan / insert: `map_set` overwrites an entry the callback may
-    // have added for `key`, else appends a fresh one.
-    ctx.map_set(&mut m, key, value)
-        .map_err(|_| oom("Map.prototype.getOrInsertComputed"))?;
-    Ok(value)
+
+    // The callback is arbitrary re-entry: it can move the receiver/key and the
+    // value it returns. Keep exact traced slots and re-read them before the
+    // proposal's mandatory re-scan/write rather than using pre-call copies.
+    const MAP: usize = 0;
+    const KEY: usize = 1;
+    const CALLBACK: usize = 2;
+    const VALUE: usize = 3;
+    let anchor_base = ctx.interp_mut().iteration_anchors_for_trace().len();
+    ctx.interp_mut().push_iteration_anchor(Value::map(m));
+    ctx.interp_mut().push_iteration_anchor(key);
+    ctx.interp_mut().push_iteration_anchor(callback);
+    let result = (|| {
+        let canonical =
+            canonicalize_collection_key(ctx.interp_mut().iteration_anchor(anchor_base + KEY));
+        let callback = ctx.interp_mut().iteration_anchor(anchor_base + CALLBACK);
+        let value = ctx.call(callback, Value::undefined(), &[canonical])?;
+        ctx.interp_mut().push_iteration_anchor(value);
+
+        let mut map = ctx
+            .interp_mut()
+            .iteration_anchor(anchor_base + MAP)
+            .as_map()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "Map.prototype.getOrInsertComputed",
+                reason: "receiver was lost across callback re-entry".to_string(),
+            })?;
+        let key = ctx.interp_mut().iteration_anchor(anchor_base + KEY);
+        let value = ctx.interp_mut().iteration_anchor(anchor_base + VALUE);
+        // Re-scan / insert: `map_set` overwrites an entry the callback may
+        // have added for `key`, else appends a fresh one.
+        ctx.map_set(&mut map, key, value)
+            .map_err(|_| oom("Map.prototype.getOrInsertComputed"))?;
+        Ok(ctx.interp_mut().iteration_anchor(anchor_base + VALUE))
+    })();
+    ctx.interp_mut().pop_iteration_anchors_to(anchor_base);
+    result
 }
 
 /// §24.1.3.5 Map.prototype.forEach.
@@ -981,44 +1009,67 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             name: "Map.prototype.forEach",
             reason: "no active execution context".to_string(),
         })?;
-    let map_value = Value::map(m);
-    // Lean per-entry callback invocation (same mechanism as Array iteration):
-    // one reservation-stable stack + one reentry-guard entry for the whole
-    // walk. The error is captured so the release runs on the throw path too.
-    let mut lean = ctx
-        .interp_mut()
-        .acquire_lean_callback_stack(&context, callback);
-    let mut index = 0;
-    let mut err: Option<VmError> = None;
-    while index < collections::map_raw_len(m, ctx.heap()) {
-        let Some((k, v)) = collections::map_entry_at(m, ctx.heap(), index) else {
-            index += 1;
-            continue;
-        };
-        index += 1;
-        let interp = ctx.interp_mut();
-        let outcome = match lean {
-            Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
-                state,
-                &context,
-                this_arg,
-                &[v, k, map_value],
-            ),
-            None => {
-                let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, k, map_value];
-                interp.run_callable_sync(&context, &callback, this_arg, cb_args)
+    // Enter the callback above a floor on this native call's current turn.
+    // The callback state owns only reusable frame storage and traced closure
+    // metadata; it never attaches a second activation stack.
+    ctx.with_turn_parts(|interp, stack| {
+        const MAP: usize = 0;
+        const CALLBACK: usize = 1;
+        const THIS_ARG: usize = 2;
+        let anchor_base = interp.iteration_anchors_for_trace().len();
+        interp.push_iteration_anchor(Value::map(m));
+        interp.push_iteration_anchor(callback);
+        interp.push_iteration_anchor(this_arg);
+        let result = (|| {
+            let callback = interp.iteration_anchor(anchor_base + CALLBACK);
+            let mut lean = interp.acquire_lean_callback_stack(&context, callback);
+            let mut index = 0;
+            let mut err: Option<VmError> = None;
+            loop {
+                let map_value = interp.iteration_anchor(anchor_base + MAP);
+                let Some(map) = map_value.as_map() else {
+                    err = Some(VmError::InvalidOperand);
+                    break;
+                };
+                if index >= collections::map_raw_len(map, interp.gc_heap()) {
+                    break;
+                }
+                let Some((k, v)) = collections::map_entry_at(map, interp.gc_heap(), index) else {
+                    index += 1;
+                    continue;
+                };
+                index += 1;
+                let this_arg = interp.iteration_anchor(anchor_base + THIS_ARG);
+                let outcome = match lean {
+                    Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
+                        stack,
+                        state,
+                        &context,
+                        this_arg,
+                        &[v, k, map_value],
+                    ),
+                    None => {
+                        let callback = interp.iteration_anchor(anchor_base + CALLBACK);
+                        let cb_args: smallvec::SmallVec<[Value; 8]> =
+                            smallvec::smallvec![v, k, map_value];
+                        interp
+                            .run_callable_sync_rooted(stack, &context, &callback, this_arg, cb_args)
+                    }
+                };
+                if let Err(e) = outcome {
+                    err = Some(e);
+                    break;
+                }
             }
-        };
-        if let Err(e) = outcome {
-            err = Some(e);
-            break;
-        }
-    }
-    ctx.interp_mut().release_lean_callback_stack(lean);
-    if let Some(e) = err {
-        return Err(vm_to_native(ctx.interp_mut(), e, "Map.prototype.forEach"));
-    }
-    Ok(Value::undefined())
+            interp.release_lean_callback_stack(lean);
+            if let Some(e) = err {
+                return Err(vm_to_native(interp, e, "Map.prototype.forEach"));
+            }
+            Ok(Value::undefined())
+        })();
+        interp.pop_iteration_anchors_to(anchor_base);
+        result
+    })
 }
 
 fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1121,42 +1172,64 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             name: "Set.prototype.forEach",
             reason: "no active execution context".to_string(),
         })?;
-    let set_value = Value::set(s);
-    // Lean per-element callback invocation (see `map_proto_for_each`).
-    let mut lean = ctx
-        .interp_mut()
-        .acquire_lean_callback_stack(&context, callback);
-    let mut index = 0;
-    let mut err: Option<VmError> = None;
-    while index < collections::set_raw_len(s, ctx.heap()) {
-        let Some(v) = collections::set_value_at(s, ctx.heap(), index) else {
-            index += 1;
-            continue;
-        };
-        index += 1;
-        let interp = ctx.interp_mut();
-        let outcome = match lean {
-            Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
-                state,
-                &context,
-                this_arg,
-                &[v, v, set_value],
-            ),
-            None => {
-                let cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![v, v, set_value];
-                interp.run_callable_sync(&context, &callback, this_arg, cb_args)
+    ctx.with_turn_parts(|interp, stack| {
+        const SET: usize = 0;
+        const CALLBACK: usize = 1;
+        const THIS_ARG: usize = 2;
+        let anchor_base = interp.iteration_anchors_for_trace().len();
+        interp.push_iteration_anchor(Value::set(s));
+        interp.push_iteration_anchor(callback);
+        interp.push_iteration_anchor(this_arg);
+        let result = (|| {
+            let callback = interp.iteration_anchor(anchor_base + CALLBACK);
+            let mut lean = interp.acquire_lean_callback_stack(&context, callback);
+            let mut index = 0;
+            let mut err: Option<VmError> = None;
+            loop {
+                let set_value = interp.iteration_anchor(anchor_base + SET);
+                let Some(set) = set_value.as_set() else {
+                    err = Some(VmError::InvalidOperand);
+                    break;
+                };
+                if index >= collections::set_raw_len(set, interp.gc_heap()) {
+                    break;
+                }
+                let Some(v) = collections::set_value_at(set, interp.gc_heap(), index) else {
+                    index += 1;
+                    continue;
+                };
+                index += 1;
+                let this_arg = interp.iteration_anchor(anchor_base + THIS_ARG);
+                let outcome = match lean {
+                    Some(ref mut state) => interp.run_bytecode_callable_committed_lean_args(
+                        stack,
+                        state,
+                        &context,
+                        this_arg,
+                        &[v, v, set_value],
+                    ),
+                    None => {
+                        let callback = interp.iteration_anchor(anchor_base + CALLBACK);
+                        let cb_args: smallvec::SmallVec<[Value; 8]> =
+                            smallvec::smallvec![v, v, set_value];
+                        interp
+                            .run_callable_sync_rooted(stack, &context, &callback, this_arg, cb_args)
+                    }
+                };
+                if let Err(e) = outcome {
+                    err = Some(e);
+                    break;
+                }
             }
-        };
-        if let Err(e) = outcome {
-            err = Some(e);
-            break;
-        }
-    }
-    ctx.interp_mut().release_lean_callback_stack(lean);
-    if let Some(e) = err {
-        return Err(vm_to_native(ctx.interp_mut(), e, "Set.prototype.forEach"));
-    }
-    Ok(Value::undefined())
+            interp.release_lean_callback_stack(lean);
+            if let Some(e) = err {
+                return Err(vm_to_native(interp, e, "Set.prototype.forEach"));
+            }
+            Ok(Value::undefined())
+        })();
+        interp.pop_iteration_anchors_to(anchor_base);
+        result
+    })
 }
 
 /// Whether `name` belongs to the ES set-methods surface that needs
@@ -1226,13 +1299,7 @@ fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                 continue;
             };
             index += 1;
-            if set_record_has(
-                ctx,
-                &context,
-                &other_rec,
-                &value,
-                "Set.prototype.intersection",
-            )? {
+            if set_record_has(ctx, &other_rec, &value)? {
                 ctx.set_add(&mut result, value)
                     .map_err(|_| oom("Set.prototype.intersection"))?;
             }
@@ -1271,13 +1338,7 @@ fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let context = execution_context(ctx, "Set.prototype.difference")?;
     if (this_values.len() as f64) <= other_rec.size() {
         for value in this_values {
-            if set_record_has(
-                ctx,
-                &context,
-                &other_rec,
-                &value,
-                "Set.prototype.difference",
-            )? {
+            if set_record_has(ctx, &other_rec, &value)? {
                 collections::set_delete(result, ctx.heap_mut(), &value);
             }
         }
@@ -1351,7 +1412,6 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     if (collections::set_len(this, ctx.heap()) as f64) > other_rec.size() {
         return Ok(Value::boolean(false));
     }
-    let context = execution_context(ctx, "Set.prototype.isSubsetOf")?;
     let mut index = 0;
     while index < collections::set_raw_len(this, ctx.heap()) {
         let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
@@ -1359,13 +1419,7 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             continue;
         };
         index += 1;
-        if !set_record_has(
-            ctx,
-            &context,
-            &other_rec,
-            &value,
-            "Set.prototype.isSubsetOf",
-        )? {
+        if !set_record_has(ctx, &other_rec, &value)? {
             return Ok(Value::boolean(false));
         }
     }
@@ -1417,13 +1471,7 @@ fn set_proto_is_disjoint_from(
                 continue;
             };
             index += 1;
-            if set_record_has(
-                ctx,
-                &context,
-                &other_rec,
-                &value,
-                "Set.prototype.isDisjointFrom",
-            )? {
+            if set_record_has(ctx, &other_rec, &value)? {
                 return Ok(Value::boolean(false));
             }
         }
@@ -1514,7 +1562,7 @@ fn weak_map_proto_get_or_insert_computed(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let mut m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsertComputed")?;
+    let m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsertComputed")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     // step 2 — the key must be able to be held weakly.
@@ -1530,25 +1578,30 @@ fn weak_map_proto_get_or_insert_computed(
     if let Some(existing) = present {
         return Ok(existing);
     }
-    let context = ctx
-        .execution_context()
-        .cloned()
-        .ok_or_else(|| NativeError::TypeError {
-            name: "WeakMap.prototype.getOrInsertComputed",
-            reason: "no active execution context".to_string(),
-        })?;
-    let value = ctx
-        .interp_mut()
-        .run_callable_sync(
-            &context,
-            &callback,
-            Value::undefined(),
-            smallvec::smallvec![key],
-        )
-        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "WeakMap.prototype.getOrInsertComputed"))?;
-    ctx.weak_map_set(&mut m, key, value)
-        .map_err(|e| collection_to_native(e, "WeakMap.prototype.getOrInsertComputed"))?;
-    Ok(value)
+    ctx.scope(|mut scope| {
+        let map_handle = scope.value(Value::weak_map(m));
+        let key_handle = scope.value(key);
+        let callback_handle = scope.value(callback);
+        let this_value = scope.value(Value::undefined());
+        let value_handle = scope.call(callback_handle, this_value, &[key_handle])?;
+        let mut map =
+            scope
+                .raw(map_handle)
+                .as_weak_map()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "WeakMap.prototype.getOrInsertComputed",
+                    reason: "receiver was relocated incorrectly".to_string(),
+                })?;
+        let key = scope.raw(key_handle);
+        let value = scope.raw(value_handle);
+        scope
+            .context()
+            .weak_map_set(&mut map, key, value)
+            .map_err(|error| {
+                collection_to_native(error, "WeakMap.prototype.getOrInsertComputed")
+            })?;
+        Ok(scope.finish(value_handle))
+    })
 }
 
 // ---------------------------------------------------------------
@@ -1769,21 +1822,19 @@ fn get_set_record(
 
 fn set_record_has(
     ctx: &mut NativeCtx<'_>,
-    context: &crate::ExecutionContext,
     record: &SetRecord,
     value: &Value,
-    name: &'static str,
 ) -> Result<bool, NativeError> {
     match record {
         SetRecord::Set { set, .. } => Ok(collections::set_has(*set, ctx.heap(), value)),
         SetRecord::Map { map, .. } => Ok(collections::map_has(*map, ctx.heap(), value)),
-        SetRecord::Dynamic { set, has, .. } => {
-            let result = ctx
-                .interp_mut()
-                .run_callable_sync(context, has, *set, smallvec::smallvec![*value])
-                .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
-            Ok(result.to_boolean(ctx.heap()))
-        }
+        SetRecord::Dynamic { set, has, .. } => ctx.scope(|mut scope| {
+            let set = scope.value(*set);
+            let has = scope.value(*has);
+            let value = scope.value(*value);
+            let result = scope.call(has, set, &[value])?;
+            Ok(scope.raw(result).to_boolean(scope.context().heap()))
+        }),
     }
 }
 
@@ -1806,10 +1857,7 @@ fn set_record_keys(
             index: 0,
         }),
         SetRecord::Dynamic { set, keys, .. } => {
-            let iterator = ctx
-                .interp_mut()
-                .run_callable_sync(context, keys, *set, SmallVec::new())
-                .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
+            let iterator = ctx.call(*keys, *set, &[])?;
             if let Some(handle) = iterator.as_generator() {
                 return Ok(SetRecordKeys::Generator { handle });
             }
@@ -1861,14 +1909,16 @@ fn set_record_next_key(
             Ok(Some(value))
         }
         SetRecordKeys::Generator { handle } => {
-            let result = ctx
-                .interp_mut()
-                .resume_generator(
-                    context,
-                    handle,
-                    crate::GeneratorResumeKind::Next(Value::undefined()),
-                )
-                .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
+            let result = ctx.with_turn_parts(|interp, stack| {
+                interp
+                    .resume_generator(
+                        stack,
+                        context,
+                        handle,
+                        crate::GeneratorResumeKind::Next(Value::undefined()),
+                    )
+                    .map_err(|err| vm_to_native(interp, err, name))
+            })?;
             let Some(record) = result.as_object() else {
                 return Err(NativeError::TypeError {
                     name,
@@ -1888,10 +1938,11 @@ fn set_record_next_key(
         SetRecordKeys::Dynamic {
             iterator,
             next_method,
-        } => ctx
-            .interp_mut()
-            .iterator_step_sync(context, iterator, next_method)
-            .map_err(|err| vm_to_native(ctx.interp_mut(), err, name)),
+        } => ctx.with_turn_parts(|interp, stack| {
+            interp
+                .iterator_step_sync(stack, context, iterator, next_method)
+                .map_err(|err| vm_to_native(interp, err, name))
+        }),
     }
 }
 
@@ -1902,9 +1953,11 @@ fn set_record_close(
     name: &'static str,
 ) -> Result<(), NativeError> {
     if let SetRecordKeys::Dynamic { iterator, .. } = keys {
-        ctx.interp_mut()
-            .iterator_close_sync(context, iterator)
-            .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?;
+        ctx.with_turn_parts(|interp, stack| {
+            interp
+                .iterator_close_sync(stack, context, iterator)
+                .map_err(|err| vm_to_native(interp, err, name))
+        })?;
     }
     Ok(())
 }
@@ -1928,21 +1981,21 @@ fn read_property(
     property: &'static str,
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let interp = ctx.interp_mut();
-    let outcome = interp
-        .ordinary_get_value(
-            context,
-            *target,
-            *target,
-            &VmPropertyKey::String(property),
-            0,
-        )
-        .map_err(|err| vm_to_native(interp, err, name))?;
+    let outcome = ctx.with_turn_parts(|interp, stack| {
+        interp
+            .ordinary_get_value(
+                stack,
+                context,
+                *target,
+                *target,
+                &VmPropertyKey::String(property),
+                0,
+            )
+            .map_err(|err| vm_to_native(interp, err, name))
+    })?;
     match outcome {
         VmGetOutcome::Value(value) => Ok(value),
-        VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(context, &getter, *target, SmallVec::new())
-            .map_err(|err| vm_to_native(interp, err, name)),
+        VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, *target, &[]),
     }
 }
 
@@ -1955,9 +2008,16 @@ fn to_number_runtime(
     let primitive = if crate::abstract_ops::is_primitive(value) {
         *value
     } else {
-        ctx.interp_mut()
-            .evaluate_to_primitive(context, value, crate::abstract_ops::ToPrimitiveHint::Number)
-            .map_err(|err| vm_to_native(ctx.interp_mut(), err, name))?
+        ctx.with_turn_parts(|interp, stack| {
+            interp
+                .evaluate_to_primitive(
+                    stack,
+                    context,
+                    value,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )
+                .map_err(|err| vm_to_native(interp, err, name))
+        })?
     };
     if primitive.is_symbol() || primitive.is_big_int() {
         return Err(NativeError::TypeError {

@@ -606,12 +606,12 @@ impl Interpreter {
     /// specs stay static, while the actual object allocation and
     /// global mutation happen during one mutator turn.
     pub fn install_global_class(&mut self, spec: &'static ClassSpec) -> Result<(), JsSurfaceError> {
-        let raw_roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let global_root = Value::object(self.global_this);
         let value = ClassBuilder::from_spec_with_raw_and_value_roots(
             &mut self.gc_heap,
             spec,
-            raw_roots,
+            Vec::new(),
             vec![global_root],
         )
         .build()?;

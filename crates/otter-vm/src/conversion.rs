@@ -119,7 +119,7 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let input = *read_register(&stack[frame_index], src)?;
-        let value = self.coerce_to_number(context, &input)?;
+        let value = self.coerce_to_number(stack, context, &input)?;
         let frame = &mut stack[frame_index];
         write_register(frame, dst, Value::number(value))?;
         frame.advance_pc()?;
@@ -455,35 +455,73 @@ impl Interpreter {
     /// method" rather than as a missing property.
     fn get_string_for_to_primitive(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         base: &Value,
         name: &str,
     ) -> Result<Option<Value>, VmError> {
-        match self.ordinary_get_value(context, *base, *base, &VmPropertyKey::String(name), 0)? {
-            VmGetOutcome::Value(value) if value.is_undefined() => Ok(None),
-            VmGetOutcome::Value(value) => Ok(Some(value)),
-            VmGetOutcome::InvokeGetter { getter } => {
-                let value = self.run_callable_sync(context, &getter, *base, SmallVec::new())?;
-                Ok(Some(value))
+        self.with_handle_scope(|interp, scope| {
+            let base_handle = interp.scoped_value(scope, *base);
+            let base = interp.escape_scoped(base_handle);
+            match interp.ordinary_get_value(
+                stack,
+                context,
+                base,
+                base,
+                &VmPropertyKey::String(name),
+                0,
+            )? {
+                VmGetOutcome::Value(value) if value.is_undefined() => Ok(None),
+                VmGetOutcome::Value(value) => Ok(Some(value)),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let receiver = interp.escape_scoped(base_handle);
+                    let value = interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        receiver,
+                        SmallVec::new(),
+                    )?;
+                    Ok(Some(value))
+                }
             }
-        }
+        })
     }
 
     /// §7.1.1 step 2.a — `exoticToPrim = ? GetMethod(input, @@toPrimitive)`.
     fn get_symbol_for_to_primitive(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         base: &Value,
         sym: symbol::JsSymbol,
     ) -> Result<Option<Value>, VmError> {
-        match self.ordinary_get_value(context, *base, *base, &VmPropertyKey::Symbol(sym), 0)? {
-            VmGetOutcome::Value(value) if value.is_undefined() => Ok(None),
-            VmGetOutcome::Value(value) => Ok(Some(value)),
-            VmGetOutcome::InvokeGetter { getter } => {
-                let value = self.run_callable_sync(context, &getter, *base, SmallVec::new())?;
-                Ok(Some(value))
+        self.with_handle_scope(|interp, scope| {
+            let base_handle = interp.scoped_value(scope, *base);
+            let base = interp.escape_scoped(base_handle);
+            match interp.ordinary_get_value(
+                stack,
+                context,
+                base,
+                base,
+                &VmPropertyKey::Symbol(sym),
+                0,
+            )? {
+                VmGetOutcome::Value(value) if value.is_undefined() => Ok(None),
+                VmGetOutcome::Value(value) => Ok(Some(value)),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let receiver = interp.escape_scoped(base_handle);
+                    let value = interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        receiver,
+                        SmallVec::new(),
+                    )?;
+                    Ok(Some(value))
+                }
             }
-        }
+        })
     }
 
     /// Run a single stage of the §7.1.1 / §7.1.1.1 ladder, falling
@@ -503,7 +541,7 @@ impl Interpreter {
             match stage {
                 ToPrimitiveStage::SymbolToPrim => {
                     let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-                    match self.get_symbol_for_to_primitive(context, &obj, to_prim_sym)? {
+                    match self.get_symbol_for_to_primitive(stack, context, &obj, to_prim_sym)? {
                         Some(v) if v.is_nullish() => {
                             stage = ToPrimitiveStage::OrdinaryFirst;
                         }
@@ -535,7 +573,7 @@ impl Interpreter {
                 }
                 ToPrimitiveStage::OrdinaryFirst => {
                     let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_string_for_to_primitive(context, &obj, method)?;
+                    let callee = self.get_string_for_to_primitive(stack, context, &obj, method)?;
                     if let Some(callee) = &callee
                         && self.is_callable_runtime(callee)
                     {
@@ -588,7 +626,7 @@ impl Interpreter {
                 }
                 ToPrimitiveStage::OrdinarySecond => {
                     let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_string_for_to_primitive(context, &obj, method)?;
+                    let callee = self.get_string_for_to_primitive(stack, context, &obj, method)?;
                     if let Some(callee) = &callee
                         && self.is_callable_runtime(callee)
                     {

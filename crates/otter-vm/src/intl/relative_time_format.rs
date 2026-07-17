@@ -287,9 +287,12 @@ pub(crate) fn relative_time_format_format(
             name: "format",
             reason: "missing execution context".to_string(),
         })?;
-    let value = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &first)
+    let number = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_number_or_throw(interp, stack, &exec, &first)
+    });
+    let value = number
         .map(|n| n.as_f64())
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "format"))?;
+        .map_err(|e| crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "format"))?;
     if !value.is_finite() {
         return Err(NativeError::RangeError {
             name: "format",
@@ -300,8 +303,12 @@ pub(crate) fn relative_time_format_format(
     // sanctioned relative-time units (a RangeError otherwise).
     let unit = {
         let unit_v = args.get(1).copied().unwrap_or_else(Value::undefined);
-        crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &unit_v)
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, "format"))?
+        let string = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_string_or_throw(interp, stack, &exec, &unit_v)
+        });
+        string.map_err(|e| {
+            crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "format")
+        })?
     };
     if !is_valid_unit(&unit) {
         return Err(NativeError::RangeError {
@@ -333,11 +340,12 @@ pub(crate) fn relative_time_format_format_to_parts(
             name: "formatToParts",
             reason: "missing execution context".to_string(),
         })?;
-    let value = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &first)
-        .map(|n| n.as_f64())
-        .map_err(|e| {
-            crate::native_function::vm_to_native_error(ctx.cx.interp, e, "formatToParts")
-        })?;
+    let number = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_number_or_throw(interp, stack, &exec, &first)
+    });
+    let value = number.map(|n| n.as_f64()).map_err(|e| {
+        crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "formatToParts")
+    })?;
     if !value.is_finite() {
         return Err(NativeError::RangeError {
             name: "formatToParts",
@@ -346,8 +354,11 @@ pub(crate) fn relative_time_format_format_to_parts(
     }
     let unit = {
         let unit_v = args.get(1).copied().unwrap_or_else(Value::undefined);
-        crate::coerce::to_string_or_throw(ctx.cx.interp, &exec, &unit_v).map_err(|e| {
-            crate::native_function::vm_to_native_error(ctx.cx.interp, e, "formatToParts")
+        let string = ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_string_or_throw(interp, stack, &exec, &unit_v)
+        });
+        string.map_err(|e| {
+            crate::native_function::vm_to_native_error(ctx.interp_mut(), e, "formatToParts")
         })?
     };
     if !is_valid_unit(&unit) {

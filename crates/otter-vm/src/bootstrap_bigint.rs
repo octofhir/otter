@@ -87,57 +87,72 @@ fn coerce_bigint_call_args(
     args: &[Value],
     name: &'static str,
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
-    let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    for slot in out.iter_mut() {
-        if let Some(arr) = slot.as_array() {
-            let parts: Vec<String> = {
-                let heap = ctx.heap();
-                crate::array::with_elements(arr, heap, |elements| {
-                    elements
-                        .iter()
-                        .map(|v| {
-                            if v.is_undefined() || v.is_null() || v.is_hole() {
-                                String::new()
-                            } else {
-                                v.display_string(heap)
-                            }
-                        })
-                        .collect()
-                })
-            };
-            let joined = parts.join(",");
-            *slot = Value::string(
-                crate::string::JsString::from_str(&joined, ctx.heap_mut()).map_err(|_| {
+    ctx.scope(|mut scope| {
+        let inputs: smallvec::SmallVec<[crate::Local<'_>; 4]> =
+            args.iter().map(|value| scope.value(*value)).collect();
+        let mut outputs: smallvec::SmallVec<[crate::Local<'_>; 4]> =
+            smallvec::SmallVec::with_capacity(inputs.len());
+        for input in inputs {
+            let value = scope.raw(input);
+            if let Some(arr) = value.as_array() {
+                let parts: Vec<String> = {
+                    let heap = scope.context().heap();
+                    crate::array::with_elements(arr, heap, |elements| {
+                        elements
+                            .iter()
+                            .map(|value| {
+                                if value.is_undefined() || value.is_null() || value.is_hole() {
+                                    String::new()
+                                } else {
+                                    value.display_string(heap)
+                                }
+                            })
+                            .collect()
+                    })
+                };
+                outputs.push(scope.string(&parts.join(",")).map_err(|_| {
                     NativeError::TypeError {
                         name,
                         reason: "out of memory".to_string(),
                     }
-                })?,
-            );
-        } else if slot.is_object()
-            || slot.is_function()
-            || slot.is_closure()
-            || slot.is_native_function()
-            || slot.is_bound_function()
-            || slot.is_class_constructor()
-            || slot.is_proxy()
-            || slot.is_regexp()
-            || slot.is_map()
-            || slot.is_set()
-        {
-            // §7.1.1 ToPrimitive ladder for object-like operands.
-            let (interp, exec) = ctx.interp_mut_and_context();
-            let exec = exec.ok_or_else(|| NativeError::TypeError {
-                name,
-                reason: "missing execution context".to_string(),
-            })?;
-            let primitive = interp
-                .evaluate_to_primitive(&exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                .map_err(|e| vm_to_native(interp, e, name))?;
-            *slot = primitive;
+                })?);
+            } else if value.is_object()
+                || value.is_function()
+                || value.is_closure()
+                || value.is_native_function()
+                || value.is_bound_function()
+                || value.is_class_constructor()
+                || value.is_proxy()
+                || value.is_regexp()
+                || value.is_map()
+                || value.is_set()
+            {
+                // §7.1.1 ToPrimitive ladder for object-like operands.
+                let exec = scope
+                    .context()
+                    .execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name,
+                        reason: "missing execution context".to_string(),
+                    })?;
+                let primitive = scope.with_turn_parts(|interp, stack| {
+                    interp
+                        .evaluate_to_primitive(
+                            stack,
+                            &exec,
+                            &value,
+                            crate::abstract_ops::ToPrimitiveHint::Number,
+                        )
+                        .map_err(|error| vm_to_native(interp, error, name))
+                })?;
+                outputs.push(scope.value(primitive));
+            } else {
+                outputs.push(input);
+            }
         }
-    }
-    Ok(out)
+        Ok(outputs.iter().map(|value| scope.raw(*value)).collect())
+    })
 }
 
 // ---------------------------------------------------------------
@@ -145,42 +160,46 @@ fn coerce_bigint_call_args(
 // ---------------------------------------------------------------
 
 fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this = ctx.this_value();
-    let b = if let Some(b) = this.as_big_int() {
-        b
-    } else if let Some(obj) = this.as_object() {
-        crate::object::bigint_data(obj, ctx.heap()).ok_or_else(|| NativeError::TypeError {
-            name: "BigInt.prototype.toString",
-            reason: "this is not a BigInt".to_string(),
-        })?
-    } else {
-        return Err(NativeError::TypeError {
-            name: "BigInt.prototype.toString",
-            reason: "this is not a BigInt".to_string(),
-        });
-    };
-    // §21.2.3.4 step 2 — `radix` defaults to 10 when `undefined`,
-    // otherwise routes through `ToIntegerOrInfinity`. The spec
-    // raises RangeError for `< 2` / `> 36`; non-coercible operands
-    // raise TypeError.
-    let radix = match args.first() {
-        None => 10u32,
-        Some(v) if v.is_undefined() => 10u32,
-        Some(v) => {
+    ctx.scope(|mut scope| {
+        let this = scope.this();
+        let this_value = scope.raw(this);
+        if this_value.as_big_int().is_none()
+            && this_value
+                .as_object()
+                .and_then(|obj| crate::object::bigint_data(obj, scope.context().heap()))
+                .is_none()
+        {
+            return Err(NativeError::TypeError {
+                name: "BigInt.prototype.toString",
+                reason: "this is not a BigInt".to_string(),
+            });
+        }
+
+        // §21.2.3.4 step 2 — `radix` defaults to 10 when `undefined`,
+        // otherwise routes through `ToIntegerOrInfinity`. The spec
+        // raises RangeError for `< 2` / `> 36`; non-coercible operands
+        // raise TypeError.
+        let radix_value = scope.argument(args, 0);
+        let radix = if scope.raw(radix_value).is_undefined() {
+            10u32
+        } else {
             // §21.2.3.3 step 4 — radixNumber = ToIntegerOrInfinity(radix),
             // whose ToNumber runs a `valueOf` / `@@toPrimitive` (poisoned
             // ones throw) and rejects Symbol / BigInt; an object operand
             // must not be silently dropped to NaN.
-            let v = *v;
-            let number = {
-                let (interp, exec) = ctx.interp_mut_and_context();
-                let exec = exec.ok_or_else(|| NativeError::TypeError {
+            let value = scope.raw(radix_value);
+            let exec = scope
+                .context()
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
                     name: "BigInt.prototype.toString",
                     reason: "missing execution context".to_string(),
                 })?;
-                crate::coerce::to_number_or_throw(interp, &exec, &v)
-                    .map_err(|err| vm_to_native(interp, err, "BigInt.prototype.toString"))?
-            };
+            let number = scope.with_turn_parts(|interp, stack| {
+                crate::coerce::to_number_or_throw(interp, stack, &exec, &value)
+                    .map_err(|err| vm_to_native(interp, err, "BigInt.prototype.toString"))
+            })?;
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
@@ -190,13 +209,30 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                 });
             }
             trunc as u32
-        }
-    };
-    let rendered = b.with_inner(ctx.heap(), |bi| bi.to_str_radix(radix));
+        };
 
-    let s = crate::string::JsString::from_str(&rendered, ctx.heap_mut())
-        .map_err(|_| oom("BigInt.prototype.toString"))?;
-    Ok(Value::string(s))
+        let this_value = scope.raw(this);
+        let b = if let Some(b) = this_value.as_big_int() {
+            b
+        } else if let Some(obj) = this_value.as_object() {
+            crate::object::bigint_data(obj, scope.context().heap()).ok_or_else(|| {
+                NativeError::TypeError {
+                    name: "BigInt.prototype.toString",
+                    reason: "this is not a BigInt".to_string(),
+                }
+            })?
+        } else {
+            return Err(NativeError::TypeError {
+                name: "BigInt.prototype.toString",
+                reason: "this is not a BigInt".to_string(),
+            });
+        };
+        let rendered = b.with_inner(scope.context().heap(), |bi| bi.to_str_radix(radix));
+        let rendered = scope
+            .string(&rendered)
+            .map_err(|_| oom("BigInt.prototype.toString"))?;
+        Ok(scope.finish(rendered))
+    })
 }
 
 /// §BigInt.prototype.toLocaleString — brand-check `this`, then format

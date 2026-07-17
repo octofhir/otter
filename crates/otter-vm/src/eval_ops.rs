@@ -26,6 +26,7 @@
 
 use crate::activation_stack::ActivationStack;
 use otter_bytecode::{BytecodeModule, Operand};
+use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
@@ -121,6 +122,7 @@ impl Interpreter {
             // environment *is* the global environment, which the
             // compiled chunk reaches through the global mirror.
             self.run_eval(
+                stack,
                 &value,
                 EvalCompileOptions {
                     force_strict,
@@ -370,9 +372,9 @@ impl Interpreter {
             let r = register_operand(operands.get(2 + i))?;
             let top_idx = stack.len() - 1;
             let value = *read_register(&stack[top_idx], r)?;
-            parts.push(self.function_constructor_arg_to_string(context, &value)?);
+            parts.push(self.function_constructor_arg_to_string(stack, context, &value)?);
         }
-        let result = self.build_function_constructor_from_parts(parts)?;
+        let result = self.build_function_constructor_from_parts(stack, parts)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
@@ -387,25 +389,36 @@ impl Interpreter {
     /// # Errors
     /// - [`VmError::SyntaxError`] when parsing / compilation fail.
     pub fn run_host_script(&mut self, source: &Value) -> Result<Value, VmError> {
-        self.run_eval(
-            source,
-            EvalCompileOptions {
-                script_goal: true,
-                ..Default::default()
+        crate::NativeCtx::with_host_context(
+            self,
+            crate::NativeCallInfo::default_call(),
+            None,
+            |ctx| {
+                ctx.with_turn_parts(|interp, stack| {
+                    interp.run_eval(
+                        stack,
+                        source,
+                        EvalCompileOptions {
+                            script_goal: true,
+                            ..Default::default()
+                        },
+                    )
+                })
             },
         )
     }
 
     /// Execute `eval(source)` per §19.4.1.1 indirect-eval semantics:
-    /// parse + compile via the embedder hook, then run `<main>`
-    /// on a sub-stack. The current dispatch loop's stack stays
-    /// untouched.
+    /// parse + compile via the embedder hook, then run `<main>` above an
+    /// activation floor on the current rooted runtime turn. Caller-owned frames
+    /// remain in place and are released only down to that floor.
     ///
     /// # Errors
     /// - [`VmError::SyntaxError`] when no eval hook is installed or
     ///   parsing / compilation fail.
     pub(crate) fn run_eval(
         &mut self,
+        stack: &mut ActivationStack,
         value: &Value,
         options: EvalCompileOptions,
     ) -> Result<Value, VmError> {
@@ -424,7 +437,6 @@ impl Interpreter {
         // eval stay callable from any later frame.
         let context = self.link_module(module);
         let main = context.exec_main();
-        let mut stack: ActivationStack = ActivationStack::new();
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
         // §19.2.1.3 — eval code evaluated at global scope (direct at
@@ -440,36 +452,46 @@ impl Interpreter {
         let entry =
             Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this, window);
         let entry_is_async = main.is_async;
+        let floor = stack.floor();
         stack.push(entry);
-        let entry_promise = if entry_is_async {
-            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_stack_rooted(self, &stack, &[], &[])?;
-            let frame = stack.last_mut().expect("entry frame was just pushed");
-            self.frame_set_async_state(
-                frame,
-                AsyncFrameState {
-                    result_promise: result,
-                },
-            );
-            Some(result)
-        } else {
-            None
-        };
-        let value = self.dispatch_loop(&context, &mut stack)?;
-        if let Some(promise) = entry_promise {
-            // Drain microtasks attached to top-level await so the
-            // entry promise settles before we read its value.
-            self.drain_microtasks_with_default(Some(context))
-                .map_err(|e| e.error)?;
-            return Ok(match promise.state(&self.gc_heap) {
-                crate::promise::PromiseState::Fulfilled(v) => v,
-                crate::promise::PromiseState::Rejected(reason) => {
-                    return Err(self.err_uncaught((self.render_thrown(&reason)).into()));
-                }
-                crate::promise::PromiseState::Pending => Value::undefined(),
-            });
-        }
-        Ok(value)
+        self.with_handle_scope(|interp, scope| {
+            let entry_promise = if entry_is_async {
+                let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                    .pending_stack_rooted(interp, stack, &[], &[])?;
+                let frame = stack.last_mut().expect("entry frame was just pushed");
+                interp.frame_set_async_state(
+                    frame,
+                    AsyncFrameState {
+                        result_promise: result,
+                    },
+                );
+                Some(interp.scoped_value(scope, Value::promise(result)))
+            } else {
+                None
+            };
+            let result = interp.dispatch_loop_above_rooted(&context, stack, floor);
+            interp.release_frames_above(stack, floor);
+            let value = result?;
+            if let Some(promise) = entry_promise {
+                // Drain microtasks attached to top-level await so the
+                // entry promise settles before we read its value.
+                interp
+                    .drain_microtasks_with_default(Some(context))
+                    .map_err(|e| e.error)?;
+                let promise = interp
+                    .escape_scoped(promise)
+                    .as_promise()
+                    .ok_or(VmError::TypeMismatch)?;
+                return Ok(match promise.state(&interp.gc_heap) {
+                    crate::promise::PromiseState::Fulfilled(v) => v,
+                    crate::promise::PromiseState::Rejected(reason) => {
+                        return Err(interp.err_uncaught((interp.render_thrown(&reason)).into()));
+                    }
+                    crate::promise::PromiseState::Pending => Value::undefined(),
+                });
+            }
+            Ok(value)
+        })
     }
 
     /// Build a `Function(args, body)` callable per §20.2.1.1. `args`
@@ -485,24 +507,36 @@ impl Interpreter {
     /// bodies under the right goal symbol.
     pub(crate) fn build_dynamic_function(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         args: &[Value],
         kind: DynamicFunctionKind,
     ) -> Result<Value, VmError> {
-        // Coerce every argument to a string per §20.2.1.1 step 1.
-        let mut parts: Vec<String> = Vec::with_capacity(args.len());
-        for arg in args {
-            parts.push(self.function_constructor_arg_to_string(context, arg)?);
-        }
-        self.build_dynamic_function_from_parts(parts, kind)
+        self.with_handle_scope(|interp, scope| {
+            let arg_handles: SmallVec<[crate::Local<'_>; 8]> = args
+                .iter()
+                .copied()
+                .map(|value| interp.scoped_value(scope, value))
+                .collect();
+            // Coercion can re-enter user code. Re-read each argument from its
+            // moving-GC handle so an earlier conversion cannot stale later
+            // constructor arguments.
+            let mut parts: Vec<String> = Vec::with_capacity(arg_handles.len());
+            for handle in arg_handles {
+                let arg = interp.escape_scoped(handle);
+                parts.push(interp.function_constructor_arg_to_string(stack, context, &arg)?);
+            }
+            interp.build_dynamic_function_from_parts(stack, parts, kind)
+        })
     }
 
     /// §20.2.1.1 steps 2+ over already-coerced argument strings.
     pub(crate) fn build_function_constructor_from_parts(
         &mut self,
+        stack: &mut ActivationStack,
         parts: Vec<String>,
     ) -> Result<Value, VmError> {
-        self.build_dynamic_function_from_parts(parts, DynamicFunctionKind::Normal)
+        self.build_dynamic_function_from_parts(stack, parts, DynamicFunctionKind::Normal)
     }
 
     /// Build a CommonJS module wrapper function and return it as a callable
@@ -526,6 +560,7 @@ impl Interpreter {
     /// `SyntaxError`) or if the eval/compiler hook is not installed.
     pub fn create_commonjs_wrapper(
         &mut self,
+        stack: &mut ActivationStack,
         module_url: &str,
         body: &str,
     ) -> Result<Value, VmError> {
@@ -553,19 +588,21 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the wrapper
         // function value (the parenthesised expression is the program's
         // completion).
-        let mut stack: ActivationStack = ActivationStack::new();
         let main = context.main();
         let total = main
             .param_count
             .saturating_add(main.locals)
             .saturating_add(main.scratch) as usize;
         let window = self.alloc_reg_window(total)?;
+        let floor = stack.floor();
         stack.push(Frame::for_function_with_heap(
             main,
             &mut self.gc_heap,
             window,
         )?);
-        self.dispatch_loop(&context, &mut stack)
+        let result = self.dispatch_loop_above_rooted(&context, stack, floor);
+        self.release_frames_above(stack, floor);
+        result
     }
 
     /// §20.2.1.1.1 CreateDynamicFunction steps 7–20: synthesise the
@@ -573,6 +610,7 @@ impl Interpreter {
     /// return the resulting function value.
     pub(crate) fn build_dynamic_function_from_parts(
         &mut self,
+        stack: &mut ActivationStack,
         parts: Vec<String>,
         kind: DynamicFunctionKind,
     ) -> Result<Value, VmError> {
@@ -594,28 +632,31 @@ impl Interpreter {
         // Running the synthesised module's `<main>` returns the
         // function value (the parenthesised expression is the
         // program's completion).
-        let mut stack: ActivationStack = ActivationStack::new();
         let main = context.main();
         let total = main
             .param_count
             .saturating_add(main.locals)
             .saturating_add(main.scratch) as usize;
         let window = self.alloc_reg_window(total)?;
+        let floor = stack.floor();
         stack.push(Frame::for_function_with_heap(
             main,
             &mut self.gc_heap,
             window,
         )?);
-        self.dispatch_loop(&context, &mut stack)
+        let result = self.dispatch_loop_above_rooted(&context, stack, floor);
+        self.release_frames_above(stack, floor);
+        result
     }
 
     fn function_constructor_arg_to_string(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<String, VmError> {
         let primitive = if value.is_object() || value.is_proxy() {
-            self.to_primitive_string_hint_sync(context, *value)?
+            self.to_primitive_string_hint_sync(stack, context, *value)?
         } else {
             *value
         };
@@ -636,6 +677,7 @@ impl Interpreter {
     #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_primitive_string_hint_sync(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
     ) -> Result<Value, VmError> {
@@ -643,7 +685,7 @@ impl Interpreter {
         // `@@toPrimitive` method, then fall back to the
         // OrdinaryToPrimitive `toString` / `valueOf` ladder. Delegate to
         // the full implementation so both paths agree.
-        self.to_primitive_sync(context, value, abstract_ops::ToPrimitiveHint::String)
+        self.to_primitive_sync(stack, context, value, abstract_ops::ToPrimitiveHint::String)
     }
 
     /// Helper — invoke the eval hook, mapping its error to a

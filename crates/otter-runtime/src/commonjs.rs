@@ -59,13 +59,6 @@ fn oom(err: impl std::fmt::Display) -> NativeError {
     runtime_type_error("require", format!("out of memory: {err}"))
 }
 
-/// Propagate a VM error across the `require` boundary *intact* — a thrown JS
-/// value stays a thrown value (no re-wrapping/stringifying at each nested
-/// require level), so the original error survives to the outermost boundary.
-fn vm_err(interp: &otter_vm::Interpreter, err: otter_vm::VmError) -> NativeError {
-    otter_vm::native_function::vm_to_native_error(interp, err, "require")
-}
-
 /// Run an embedded JavaScript shim as a CommonJS module and return its
 /// `module.exports`. For builtin modules whose natural implementation is a
 /// self-contained JS class or helper set (e.g. `events`, `node:test`).
@@ -131,31 +124,30 @@ pub fn run_builtin_cjs_shim(
     let module_val = ctx.interp_mut().module_root(module_idx);
     let exports_val = ctx.interp_mut().module_root(exports_idx);
 
-    let (interp, context) = ctx.interp_mut_and_context();
-    let context = context.ok_or_else(|| "missing execution context for shim load".to_string())?;
-    let wrapper = interp
+    let wrapper = ctx
         .create_commonjs_wrapper(name, source)
         .map_err(|e| e.to_string())?;
-    let wrapper_idx = interp.push_module_root(wrapper) - 1;
-    let wrapper = interp.module_root(wrapper_idx);
-    let require_val = interp.module_root(require_idx);
-    let name_val = interp.module_root(name_idx);
+    let wrapper_idx = ctx.interp_mut().push_module_root(wrapper) - 1;
+    let wrapper = ctx.interp_mut().module_root(wrapper_idx);
+    let require_val = ctx.interp_mut().module_root(require_idx);
+    let name_val = ctx.interp_mut().module_root(name_idx);
     let call_args: SmallVec<[Value; 8]> =
         smallvec![exports_val, require_val, module_val, name_val, name_val,];
 
-    let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
+    let run = ctx
+        .call(wrapper, exports_val, call_args.as_slice())
+        .map_err(|error| error.to_string());
 
-    let module = interp
+    let module = ctx
+        .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    let exports_val = interp.module_root(exports_idx);
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
 
-    let result = run
-        .map_err(|e| e.to_string())
-        .map(|_ret| object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val));
+    let result = run.map(|_ret| object::get(module, ctx.heap(), "exports").unwrap_or(exports_val));
 
-    interp.pop_module_roots_to(root_base);
+    ctx.interp_mut().pop_module_roots_to(root_base);
     result
 }
 
@@ -501,20 +493,16 @@ pub(crate) fn cjs_instantiate_file(
     let filename_idx = ctx.interp_mut().push_module_root(filename_arg) - 1;
 
     // Compile the wrapper and run it.
-    let (interp, context) = ctx.interp_mut_and_context();
-    let context = context.ok_or_else(|| {
-        runtime_type_error("require", "missing execution context for module load")
-    })?;
-    let wrapper = interp
-        .create_commonjs_wrapper(&id, source)
-        .map_err(|e| vm_err(interp, e))?;
+    let wrapper = ctx.create_commonjs_wrapper(&id, source)?;
+    let wrapper_idx = ctx.interp_mut().push_module_root(wrapper) - 1;
+    let wrapper = ctx.interp_mut().module_root(wrapper_idx);
     // Re-fetch every argument from its module-root slot: `create_commonjs_wrapper`
     // (and the string/require allocations before it) may have relocated them.
-    let exports_val = interp.module_root(exports_idx);
-    let require_val = interp.module_root(require_idx);
-    let module_val = interp.module_root(module_idx);
-    let filename_arg = interp.module_root(filename_idx);
-    let dirname_val = interp.module_root(dirname_idx);
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
+    let require_val = ctx.interp_mut().module_root(require_idx);
+    let module_val = ctx.interp_mut().module_root(module_idx);
+    let filename_arg = ctx.interp_mut().module_root(filename_idx);
+    let dirname_val = ctx.interp_mut().module_root(dirname_idx);
     let call_args: SmallVec<[Value; 8]> = smallvec![
         exports_val,
         require_val,
@@ -529,33 +517,29 @@ pub(crate) fn cjs_instantiate_file(
     // handles back afterwards. Without this, a module whose body allocates enough
     // to scavenge would leave these handles dangling and the post-run
     // `module.exports` read would dereference a forwarded (moved) object.
-    let run = interp.run_callable_sync(&context, &wrapper, exports_val, call_args);
+    let run = ctx.call(wrapper, exports_val, call_args.as_slice());
 
     // Relocated handles (the collector may have moved them during the run).
-    let mut module = interp
+    let mut module = ctx
+        .interp_mut()
         .module_root(module_idx)
         .as_object()
         .expect("module object survives module-root rooting");
-    let mut cache = interp
+    let mut cache = ctx
+        .interp_mut()
         .module_root(cache_idx)
         .as_object()
         .expect("require cache survives module-root rooting");
-    let exports_val = interp.module_root(exports_idx);
+    let exports_val = ctx.interp_mut().module_root(exports_idx);
 
-    let run = run.map_err(|e| vm_err(interp, e));
     let result = run.map(|_ret| {
         // `module.exports` may have been reassigned by the module body.
-        let final_exports = object::get(module, interp.gc_heap(), "exports").unwrap_or(exports_val);
-        object::set(
-            &mut module,
-            interp.gc_heap_mut(),
-            "loaded",
-            Value::boolean(true),
-        );
-        object::set(&mut cache, interp.gc_heap_mut(), &id, final_exports);
+        let final_exports = object::get(module, ctx.heap(), "exports").unwrap_or(exports_val);
+        object::set(&mut module, ctx.heap_mut(), "loaded", Value::boolean(true));
+        object::set(&mut cache, ctx.heap_mut(), &id, final_exports);
         final_exports
     });
 
-    interp.pop_module_roots_to(root_base);
+    ctx.interp_mut().pop_module_roots_to(root_base);
     result
 }

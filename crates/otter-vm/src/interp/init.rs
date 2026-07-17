@@ -181,7 +181,6 @@ impl Interpreter {
             bigint_constant_cache: rustc_hash::FxHashMap::default(),
             lean_callback_roots: Vec::new(),
             pending_error_detail: std::cell::RefCell::new(None),
-            json_root_stack: Vec::new(),
             handle_arena: crate::handles::HandleArena::new(),
             json_stringify_capacity_hint: 0,
             external_memory_adjustment: None,
@@ -237,7 +236,6 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
             jit_next_code_object_id: 1,
-            reentry_stack_cache: Vec::new(),
             register_stack: register_stack::RegisterStack::new(),
             native_call_owners: native_call_owners::NativeCallOwnerStack::new(),
             jit_native_activations: vec![

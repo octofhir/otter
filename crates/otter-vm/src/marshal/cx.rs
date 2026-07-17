@@ -367,10 +367,10 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
             ));
         };
         let value = self.ctx.cx.interp.escape_scoped(v);
-        let interp = self.ctx.interp_mut();
-        interp
-            .coerce_to_string(context, &value)
-            .map_err(|err| self.vm_err(err))
+        let result = self
+            .ctx
+            .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, context, &value));
+        result.map_err(|err| self.vm_err(err))
     }
 
     /// §7.1.17 `ToString`, returning WTF-16 code units (lone
@@ -384,8 +384,9 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         }
         let context = self.context();
         let value = self.ctx.cx.interp.escape_scoped(v);
-        let interp = self.ctx.interp_mut();
-        let string = crate::coerce::to_js_string_units(interp, context, &value);
+        let string = self.ctx.with_turn_parts(|interp, stack| {
+            crate::coerce::to_js_string_units(interp, stack, context, &value)
+        });
         match string {
             Ok(units) => Ok(units),
             Err(err) => Err(self.vm_err(err)),
@@ -408,9 +409,10 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
             ));
         };
         let value = self.ctx.cx.interp.escape_scoped(v);
-        let interp = self.ctx.interp_mut();
-        interp
-            .coerce_to_number(context, &value)
+        let result = self
+            .ctx
+            .with_turn_parts(|interp, stack| interp.coerce_to_number(stack, context, &value));
+        result
             .map(crate::number::NumberValue::as_f64)
             .map_err(|err| self.vm_err(err))
     }
@@ -486,23 +488,25 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         this_value: Local<'_>,
         args: &[Local<'_>],
     ) -> Result<Local<'s>, JsError> {
-        let Some(context) = self.context() else {
+        if self.context().is_none() {
             return Err(JsError::Type(
                 "cannot invoke a callback without an execution context".to_string(),
             ));
-        };
+        }
         let scope = self.scope;
-        let interp = self.ctx.interp_mut();
-        // Re-resolve every handle through the arena immediately before
-        // the call; run_callable_sync roots its own frame from there.
-        let callee = interp.escape_scoped(callee);
-        let this_value = interp.escape_scoped(this_value);
-        let argv: smallvec::SmallVec<[Value; 8]> =
-            args.iter().map(|a| interp.escape_scoped(*a)).collect();
-        let result = interp.run_callable_sync(context, &callee, this_value, argv);
+        // Re-resolve every handle through the arena immediately before the
+        // call. `NativeCtx::call_owned` appends above this turn's activation
+        // floor instead of opening a detached re-entry stack.
+        let callee = self.ctx.cx.interp.escape_scoped(callee);
+        let this_value = self.ctx.cx.interp.escape_scoped(this_value);
+        let argv: smallvec::SmallVec<[Value; 8]> = args
+            .iter()
+            .map(|a| self.ctx.cx.interp.escape_scoped(*a))
+            .collect();
+        let result = self.ctx.call_owned(callee, this_value, argv);
         match result {
-            Ok(value) => Ok(interp.scoped_value(scope, value)),
-            Err(err) => Err(self.vm_err(err)),
+            Ok(value) => Ok(self.ctx.cx.interp.scoped_value(scope, value)),
+            Err(err) => Err(JsError::from_native(err)),
         }
     }
 }

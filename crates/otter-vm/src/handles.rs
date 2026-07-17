@@ -25,12 +25,12 @@
 //! # Invariants
 //!
 //! - **Every collection entry point that can run while native code is on the
-//!   Rust stack must trace the arena.** There are exactly two: the extra-roots
-//!   provider path walked during dispatch and the per-allocation snapshot path
-//!   (`collect_runtime_roots`). Both reach
-//!   [`crate::runtime_state::RuntimeState::trace_roots`], which walks the
-//!   arena, so a slot is always current after any collection. A handle read
-//!   through a live arena is therefore never stale.
+//!   Rust stack must trace the arena.** Dispatch publishes the interpreter's
+//!   direct extra-roots provider. A host-side scope temporarily publishes the
+//!   same provider when none exists. Both reach
+//!   [`crate::runtime_state::RuntimeState::trace_roots`], which walks the arena,
+//!   so no allocation eagerly snapshots the runtime root set and a handle read
+//!   through a live arena is never stale.
 //! - The arena is a strict stack: [`HandleScope`] truncation may only drop the
 //!   range the scope opened, never slots an outer scope owns. Nesting is free —
 //!   an inner scope's `base` is the current arena length, and its truncate
@@ -41,7 +41,7 @@
 //!   its symbol/define variants), and that box allocation traces only the
 //!   receiver it is handed. On the host-side path no dispatch provider is
 //!   registered, so a scope installs the interpreter's runtime-root provider
-//!   for its lifetime (see [`Interpreter::push_scope_runtime_roots`]) — the
+//!   for its lifetime (see [`Interpreter::scope_runtime_roots_guard`]) — the
 //!   arena is then traced by any collection the box drives, so sibling handles
 //!   never go stale. The registration is gated on there being no provider
 //!   already, so the dispatch hot path pays nothing.
@@ -49,8 +49,7 @@
 //! # See also
 //!
 //! - [`crate::runtime_state`] — the root walker that traces the arena.
-//! - [`crate::allocation_ops`] — the snapshot root path used by host-side
-//!   allocations.
+//! - [`crate::allocation_ops`] — direct-provider host allocation helpers.
 
 use std::marker::PhantomData;
 
@@ -93,10 +92,11 @@ impl HandleArena {
         self.slots[idx as usize]
     }
 
-    /// Overwrite the value parked at `idx`. Test-only: production writes never
-    /// re-park a handle, because the only way a parked object relocates is a
-    /// collection that rewrites its slot in place (see [`crate::NativeScope::set`]).
-    #[cfg(test)]
+    /// Overwrite the value parked at `idx`.
+    ///
+    /// Internal spec algorithms use this to advance a fixed rooted cursor
+    /// along a prototype chain without opening one handle scope per hop.
+    /// The slot remains collector-visible throughout the enclosing scope.
     pub(crate) fn set(&mut self, idx: u32, v: Value) {
         self.slots[idx as usize] = v;
     }
@@ -289,12 +289,12 @@ impl Interpreter {
     /// symbol/define variants); that box allocation traces only the receiver it
     /// is handed. On the dispatch path the loop already installs a provider over
     /// [`crate::runtime_state::RuntimeState::trace_roots`], so a collection
-    /// driven by the box sees the arena and sibling handles stay live. On the
-    /// host-side path — module init, timer/worker dispatch — no provider is
-    /// registered, so that same collection would walk only the receiver and
-    /// strand every sibling parked in the arena. Installing the provider for the
-    /// scope closes that hole for *every* scoped op uniformly, without threading
-    /// a root snapshot through each write.
+    /// driven by the box sees the arena and sibling handles stay live. For an
+    /// out-of-band host allocation with no enclosing runtime turn, that same
+    /// collection would otherwise walk only the receiver and strand every
+    /// sibling parked in the arena. Installing the provider for the scope closes
+    /// that hole for *every* scoped op uniformly, without threading a root
+    /// snapshot through each write.
     ///
     /// Gated on [`otter_gc::GcHeap::has_extra_roots`] so the dispatch hot path
     /// pays nothing: it already has a provider, so this is a no-op there. Returns
@@ -316,6 +316,14 @@ impl Interpreter {
     pub(crate) fn scoped_value<'s>(&mut self, _scope: &'s HandleScope, value: Value) -> Local<'s> {
         let idx = self.handle_arena.push(value);
         Local::new(idx)
+    }
+
+    /// Replace a value in an existing local slot.
+    ///
+    /// The handle identity and scope lifetime are unchanged; subsequent reads
+    /// observe either this value or the collector-rewritten forwarding value.
+    pub(crate) fn set_scoped(&mut self, handle: Local<'_>, value: Value) {
+        self.handle_arena.set(handle.index(), value);
     }
 
     /// Allocate a string and park it in the current scope.
@@ -390,19 +398,15 @@ impl Interpreter {
     }
 
     /// Allocate an array whose `length` is `len` (elements start as holes) and
-    /// park it in the current scope. The runtime-root snapshot keeps prior
-    /// handles live across the allocation and the length reservation.
+    /// park it in the current scope. The scope's direct runtime-root provider
+    /// keeps prior handles live across allocation and length reservation.
     pub(crate) fn scoped_array<'s>(
         &mut self,
         scope: &'s HandleScope,
         len: usize,
     ) -> Result<Local<'s>, VmError> {
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let array = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(VmError::from)?;
         // Park before growing so the handle survives any allocation the length
@@ -425,12 +429,8 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
     ) -> Result<Local<'s>, VmError> {
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let set = crate::collections::alloc_set_with_roots(&mut self.gc_heap, &mut external_visit)?;
         Ok(self.scoped_value(scope, Value::set(set)))
     }
@@ -448,12 +448,8 @@ impl Interpreter {
         if !target.is_object_type() || !handler.is_object_type() {
             return Err(VmError::TypeMismatch);
         }
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let proxy = crate::proxy::alloc_proxy_with_roots(
             &mut self.gc_heap,
             target,
@@ -513,9 +509,9 @@ impl Interpreter {
 
     /// Allocate a static builtin native function and park it in the current
     /// scope. Mirrors the object-builder `builtin_method` path: a builtin-tagged
-    /// function backed by the static fast-call `call`. The allocation snapshots
-    /// the runtime roots (including the arena), so prior handles survive any
-    /// collection it drives; the fresh function is parked immediately.
+    /// function backed by the static fast-call `call`. The scope's direct root
+    /// provider keeps the arena live through allocation; the fresh function is
+    /// parked immediately.
     pub(crate) fn scoped_native_static<'s>(
         &mut self,
         scope: &'s HandleScope,
@@ -523,12 +519,8 @@ impl Interpreter {
         length: u8,
         call: crate::native_function::NativeFastFn,
     ) -> Result<Local<'s>, VmError> {
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let function = crate::native_function::NativeFunction::new_static_with_roots(
             &mut self.gc_heap,
             name,
@@ -573,14 +565,24 @@ impl Interpreter {
         key: &str,
         value: Local<'_>,
     ) -> Result<(), VmError> {
-        let mut object = self
-            .handle_arena
-            .get(obj.index())
-            .as_object()
-            .ok_or(VmError::TypeMismatch)?;
+        let receiver = self.handle_arena.get(obj.index());
         let stored = self.handle_arena.get(value.index());
-        crate::object::set(&mut object, &mut self.gc_heap, key, stored);
-        Ok(())
+        if let Some(mut object) = receiver.as_object() {
+            crate::object::set(&mut object, &mut self.gc_heap, key, stored);
+            return Ok(());
+        }
+        if let Some(array) = receiver.as_array() {
+            // NativeScope exposes indexed writes separately. Restrict this
+            // path to named own properties so it cannot enter dense growth or
+            // ArraySetLength while holding an unrefreshable raw array copy.
+            if key == "length" || crate::object::array_index_property_name(key).is_some() {
+                return Err(VmError::TypeMismatch);
+            }
+            crate::array::set_named_property(array, &mut self.gc_heap, key, stored)
+                .map_err(|_| VmError::TypeMismatch)?;
+            return Ok(());
+        }
+        Err(VmError::TypeMismatch)
     }
 
     /// Write `value` to the symbol-keyed property `key` on the object handle
@@ -594,17 +596,20 @@ impl Interpreter {
         key: crate::symbol::JsSymbol,
         value: Local<'_>,
     ) -> Result<(), VmError> {
-        let object = self
-            .handle_arena
-            .get(obj.index())
-            .as_object()
-            .ok_or(VmError::TypeMismatch)?;
+        let receiver = self.handle_arena.get(obj.index());
         let stored = self.handle_arena.get(value.index());
-        if crate::object::set_symbol(object, &mut self.gc_heap, key, stored) {
-            Ok(())
-        } else {
-            Err(VmError::TypeMismatch)
+        if let Some(object) = receiver.as_object() {
+            return if crate::object::set_symbol(object, &mut self.gc_heap, key, stored) {
+                Ok(())
+            } else {
+                Err(VmError::TypeMismatch)
+            };
         }
+        if let Some(array) = receiver.as_array() {
+            crate::array::set_symbol_property(array, &mut self.gc_heap, key, stored);
+            return Ok(());
+        }
+        Err(VmError::TypeMismatch)
     }
 
     /// Allocate an ordinary object whose prototype is the object held by the
@@ -802,12 +807,8 @@ impl Interpreter {
             .as_array()
             .ok_or(VmError::TypeMismatch)?;
         let stored = self.handle_arena.get(value.index());
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         crate::array::set_with_roots(array, &mut self.gc_heap, index, stored, &mut external_visit)
             .map_err(VmError::from)
     }
@@ -860,20 +861,15 @@ impl Interpreter {
         self.handle_arena.len()
     }
 
-    /// Force a minor collection while tracing the full runtime root set
-    /// (including the handle arena), mirroring the host-side snapshot path so
-    /// tests can drive a relocation with handles live.
+    /// Force a minor collection while the direct runtime-root provider is
+    /// active, so tests can drive a relocation with handles live.
     ///
     /// `pub(crate)` so the native-context test module can drive a scavenge from
     /// inside a `NativeCtx::scope` closure with handles live.
     pub(crate) fn collect_minor_tracing_runtime_roots(&mut self) {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         self.gc_heap
-            .collect_minor_with_roots(&mut |visitor| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-            })
+            .collect_minor_with_roots(&mut |_visitor| {})
             .expect("minor GC");
     }
 
@@ -901,13 +897,9 @@ impl Interpreter {
     /// the root walk cannot reach is swept — so surviving one proves the arena
     /// keeps a handle live.
     fn collect_full_tracing_runtime_roots(&mut self) {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         self.gc_heap
-            .collect_full(&mut |visitor| {
-                for &slot in &roots {
-                    visitor(slot);
-                }
-            })
+            .collect_full(&mut |_visitor| {})
             .expect("full GC");
     }
 }

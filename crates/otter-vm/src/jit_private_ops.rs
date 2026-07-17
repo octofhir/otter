@@ -43,7 +43,7 @@ impl Interpreter {
                 .into(),
             ));
         };
-        let found = self.private_element_lookup(context, &receiver, sym)?;
+        let found = self.private_element_lookup(stack, context, &receiver, sym)?;
         let result = match found {
             None => {
                 return Err(self.err_type(
@@ -56,7 +56,14 @@ impl Interpreter {
                 object::DescriptorKind::Data { value } => value,
                 object::DescriptorKind::Accessor { getter, .. } => match getter {
                     Some(getter) => {
-                        self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                        self.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            receiver,
+                            SmallVec::new(),
+                        )?
                     }
                     None => {
                         return Err(
@@ -84,7 +91,6 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let key = *read_register(&stack[top_idx], key_reg)?;
-        let value = *read_register(&stack[top_idx], value_reg)?;
         let Some(sym) = key.as_symbol(&self.gc_heap) else {
             return Err(self.err_type(
                 ("Cannot write private member to an object whose class did not declare it"
@@ -92,7 +98,7 @@ impl Interpreter {
                 .into(),
             ));
         };
-        let found = self.private_element_lookup(context, &receiver, sym)?;
+        let found = self.private_element_lookup(stack, context, &receiver, sym)?;
         match found {
             None => {
                 return Err(self.err_type(
@@ -104,8 +110,10 @@ impl Interpreter {
             Some((holder, desc)) => match desc.kind {
                 object::DescriptorKind::Accessor { setter, .. } => match setter {
                     Some(setter) => {
+                        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+                        let value = *read_register(&stack[top_idx], value_reg)?;
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        self.run_callable_sync(context, &setter, receiver, argv)?;
+                        self.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                     }
                     None => {
                         return Err(
@@ -114,17 +122,19 @@ impl Interpreter {
                     }
                 },
                 object::DescriptorKind::Data { .. } => {
+                    let receiver = *read_register(&stack[top_idx], obj_reg)?;
                     if holder != receiver || !desc.flags.writable() {
                         return Err(
                             self.err_type(("Private method is not writable".to_string()).into())
                         );
                     }
+                    let value = *read_register(&stack[top_idx], value_reg)?;
                     let descriptor = object::PartialPropertyDescriptor {
                         value: Some(value),
                         ..Default::default()
                     };
                     let vm_key = VmPropertyKey::Symbol(sym);
-                    self.define_own_property_value(context, &receiver, &vm_key, descriptor)?;
+                    self.define_own_property_value(stack, context, &receiver, &vm_key, descriptor)?;
                 }
             },
         }
@@ -154,15 +164,8 @@ impl Interpreter {
         let found = if let Some(p) = receiver.as_proxy() {
             self.proxy_private_find(&p, sym).is_some()
         } else {
-            self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                context,
-                receiver,
-                &key,
-                0,
-                &[&receiver, &brand],
-                &[],
-            )?
-            .is_some()
+            self.ordinary_get_own_property_descriptor_value(stack, context, receiver, &key, 0)?
+                .is_some()
         };
         if !found {
             return Err(self.err_type(

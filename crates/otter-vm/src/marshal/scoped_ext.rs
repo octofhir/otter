@@ -4,10 +4,10 @@
 //! [`super::IntoJs`] implementations need — binary buffers, typed-array
 //! views, settled promises — plus the iterable drain that
 //! [`super::Sequence`] extraction rides. Each builder follows the
-//! handle-scope rooting contract: the allocation snapshots the runtime
-//! roots (which trace the handle arena), locals that must survive the
-//! allocation are traced explicitly, and the result is parked in the
-//! caller's scope before return.
+//! handle-scope rooting contract: the scope publishes the interpreter's direct
+//! runtime-root provider, caller-local values that must survive an allocation
+//! are traced explicitly, and each result is parked in the caller's scope
+//! before return.
 //!
 //! # Contents
 //! - [`Interpreter::scoped_array_buffer_from_bytes`]
@@ -38,19 +38,15 @@ use crate::{ExecutionContext, Interpreter, Value, VmError};
 impl Interpreter {
     /// Allocate a fixed-length `ArrayBuffer` owning `bytes` and park it
     /// in the current scope. The backing store is accounted as external
-    /// memory; prior handles survive the reservation via the
-    /// runtime-root snapshot.
+    /// memory; the scope's direct root provider keeps prior handles live
+    /// through the reservation.
     pub(crate) fn scoped_array_buffer_from_bytes<'s>(
         &mut self,
         scope: &'s HandleScope,
         bytes: Vec<u8>,
     ) -> Result<Local<'s>, VmError> {
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let buffer = crate::binary::JsArrayBuffer::from_bytes_with_roots(
             bytes,
             &mut self.gc_heap,
@@ -81,12 +77,8 @@ impl Interpreter {
             ));
         }
         let length = bytes.len() / width;
-        let roots = self.collect_runtime_roots();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
         let buffer = crate::binary::JsArrayBuffer::from_bytes_with_roots(
             bytes,
             &mut self.gc_heap,
@@ -126,15 +118,12 @@ impl Interpreter {
         payload: Value,
         fulfilled: bool,
     ) -> Result<Local<'s>, VmError> {
-        let roots = self.collect_runtime_roots();
+        let _runtime_roots_guard = self.scope_runtime_roots_guard();
         // The payload local is stored into the promise body by the same
         // allocation that can move it; tracing it rewrites this frame's
         // copy in place, so the stored value is current.
         let payload_root = payload;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
             payload_root.trace_value_slots(visitor);
         };
         let promise = if fulfilled {

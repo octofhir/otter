@@ -8,6 +8,9 @@
 //! # Invariants
 //! Namespace objects are created lazily and cached per URL; module
 //! environments registered here are GC roots via the trace surface.
+//! Module init re-entry always appends above an [`ActivationFloor`] on the
+//! caller's rooted [`ActivationStack`]; it never publishes a second frame stack
+//! or snapshots register roots.
 #![allow(unused_imports)]
 use crate::*;
 
@@ -59,12 +62,13 @@ impl Interpreter {
     /// Propagates any `VmError` thrown synchronously by the init body.
     pub fn run_module_init(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         env: Value,
         import_meta: Value,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
-        self.run_module_init_phase(context, function_id, env, import_meta, false)
+        self.run_module_init_phase(stack, context, function_id, env, import_meta, false)
     }
 
     /// Link-phase init invocation — runs only the §16.2.1.7
@@ -72,17 +76,19 @@ impl Interpreter {
     /// function instantiation) and returns before any body statement.
     pub fn run_module_init_hoist(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         env: Value,
         import_meta: Value,
     ) -> Result<(), VmError> {
-        self.run_module_init_phase(context, function_id, env, import_meta, true)
+        self.run_module_init_phase(stack, context, function_id, env, import_meta, true)
             .map(|_| ())
     }
 
     pub(crate) fn run_module_init_phase(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         env: Value,
@@ -90,72 +96,94 @@ impl Interpreter {
         hoist_phase: bool,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
         self.enter_sync_reentry()?;
-        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        let extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let result =
-            self.run_module_init_inner(context, function_id, env, import_meta, hoist_phase);
-        drop(extra_roots_guard);
+            self.run_module_init_inner(stack, context, function_id, env, import_meta, hoist_phase);
         self.leave_sync_reentry();
         result
     }
 
     pub(crate) fn run_module_init_inner(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         function_id: u32,
         env: Value,
         import_meta: Value,
         hoist_phase: bool,
     ) -> Result<Option<crate::promise::JsPromiseHandle>, VmError> {
-        let function = context
-            .exec_function(function_id)
-            .ok_or_else(|| VmError::InvalidOperand)?;
-        // The module environment record: link-phase and
-        // evaluation-phase invocations share one persistent set of
-        // own-upvalue cells so hoisted closures and the body bind the
-        // same module-scope storage.
-        let module_url: std::sync::Arc<str> = std::sync::Arc::from(function.module_url.as_ref());
-        let upvalues = if let Some(cells) = self.module_init_upvalues.get(&module_url) {
-            cells.clone()
-        } else {
-            let built = Frame::build_upvalues_for_exec(
-                &mut self.gc_heap,
+        let floor = stack.floor();
+        let result = self.with_handle_scope(|interp, scope| {
+            let env = interp.scoped_value(scope, env);
+            let import_meta = interp.scoped_value(scope, import_meta);
+            let function = context
+                .exec_function(function_id)
+                .ok_or(VmError::InvalidOperand)?;
+            // The module environment record: link-phase and
+            // evaluation-phase invocations share one persistent set of
+            // own-upvalue cells so hoisted closures and the body bind the
+            // same module-scope storage.
+            let module_url: std::sync::Arc<str> =
+                std::sync::Arc::from(function.module_url.as_ref());
+            let upvalues = if let Some(cells) = interp.module_init_upvalues.get(&module_url) {
+                cells.clone()
+            } else {
+                let built = Frame::build_upvalues_for_exec(
+                    &mut interp.gc_heap,
+                    function,
+                    Frame::empty_upvalues(),
+                )?;
+                interp
+                    .module_init_upvalues
+                    .insert(module_url, built.clone());
+                built
+            };
+            let window = interp.alloc_reg_window(function.register_count as usize)?;
+            let frame = Frame::with_exec_return_upvalues_and_this(
                 function,
-                Frame::empty_upvalues(),
-            )?;
-            self.module_init_upvalues.insert(module_url, built.clone());
-            built
-        };
-        let _window_rollback = self.register_window_rollback();
-        let window = self.alloc_reg_window(function.register_count as usize)?;
-        let mut frame = Frame::with_exec_return_upvalues_and_this(
-            function,
-            None,
-            upvalues,
-            Value::undefined(),
-            window,
-        );
-        let args: SmallVec<[Value; 8]> =
-            smallvec::smallvec![env, import_meta, Value::boolean(hoist_phase)];
-        self.bind_bytecode_call_arguments(function, &mut frame, args)?;
-        let mut stack: ActivationStack = ActivationStack::new();
-        stack.push(frame);
-        let init_promise = if function.is_async {
-            let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .pending_stack_rooted(self, &stack, &[&env, &import_meta], &[])?;
-            let frame = stack.last_mut().expect("init frame was just pushed");
-            self.frame_set_async_state(
-                frame,
-                AsyncFrameState {
-                    result_promise: result,
-                },
+                None,
+                upvalues,
+                Value::undefined(),
+                window,
             );
-            Some(result)
-        } else {
-            None
-        };
-        self.dispatch_loop(context, &mut stack)?;
-        Ok(init_promise)
+            stack.push(frame);
+            let env_value = interp.escape_scoped(env);
+            let import_meta_value = interp.escape_scoped(import_meta);
+            let args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![env_value, import_meta_value, Value::boolean(hoist_phase)];
+            if let Err(error) =
+                interp.bind_bytecode_call_arguments(function, &mut stack[floor.depth()], args)
+            {
+                interp.release_frames_above(stack, floor);
+                return Err(error);
+            }
+            let init_promise = if function.is_async {
+                let result = promise_dispatch::PromiseBuilder::with_context(context.clone())
+                    .pending_stack_rooted(interp, stack, &[&env_value, &import_meta_value], &[])?;
+                let frame = stack.last_mut().expect("init frame was just pushed");
+                interp.frame_set_async_state(
+                    frame,
+                    AsyncFrameState {
+                        result_promise: result,
+                    },
+                );
+                Some(interp.scoped_value(scope, Value::promise(result)))
+            } else {
+                None
+            };
+            let dispatch = interp.dispatch_loop_above_rooted(context, stack, floor);
+            interp.release_frames_above(stack, floor);
+            dispatch?;
+            Ok(init_promise.map(|promise| {
+                interp
+                    .escape_scoped(promise)
+                    .as_promise()
+                    .expect("rooted module init promise remains a promise")
+            }))
+        });
+        if result.is_err() {
+            self.release_frames_above(stack, floor);
+        }
+        result
     }
 
     /// Defer settlement of dynamic-import `token` until the gating

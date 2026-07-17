@@ -579,7 +579,8 @@ impl Interpreter {
     ///
     /// This is the reentrant sibling of the interpreter's frame-push
     /// [`Self::drive_bind_function`]: accessor `name`/`length` getters on the
-    /// bind target run through [`Self::run_callable_sync`] instead of parking a
+    /// bind target run through [`Self::run_callable_sync_rooted`] on the
+    /// published activation stack instead of parking a
     /// [`PendingBindFunction`] continuation, so the JIT never resumes a
     /// partially observed bind. The single VM metadata reader
     /// ([`Self::callable_bind_metadata_get`]) and the single allocator
@@ -609,7 +610,7 @@ impl Interpreter {
             BindMetadataGet::Value(value) => value,
             BindMetadataGet::Getter(getter) => {
                 let receiver = *read_register(&stack[top_idx], callee_reg)?;
-                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
             }
         };
 
@@ -622,7 +623,7 @@ impl Interpreter {
             BindMetadataGet::Value(value) => value,
             BindMetadataGet::Getter(getter) => {
                 let receiver = *read_register(&stack[top_idx], callee_reg)?;
-                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())?
             }
         };
 
@@ -686,35 +687,34 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn run_vm_intrinsic_sync(
+    pub(crate) fn run_vm_intrinsic_sync_rooted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         intrinsic: VmIntrinsicFunction,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        if !stack.is_runtime_rooted_by(self) {
+            return Err(VmError::InvalidOperand);
+        }
         // Intrinsics can allocate before forwarding to their terminal callee
         // (`apply` materializes an argument list; `bind` performs observable
         // property gets). Own and register the incoming state here instead of
         // relying on a caller whose argument slot has already been emptied by
         // a zero-copy hand-off.
-        let roots = crate::call_ops::SyncJsCallRoots::call(
-            self,
-            this_value,
-            Value::undefined(),
-            args,
-            true,
-        );
+        let roots = crate::call_ops::SyncJsCallRoots::call(this_value, Value::undefined(), args);
         let roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_vm_intrinsic_sync_rooted(context, intrinsic, &roots);
+        let result = self.run_vm_intrinsic_sync_with_roots(stack, context, intrinsic, &roots);
         drop(roots_guard);
         result
     }
 
-    fn run_vm_intrinsic_sync_rooted(
+    fn run_vm_intrinsic_sync_with_roots(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         intrinsic: VmIntrinsicFunction,
         roots: &crate::call_ops::SyncJsCallRoots,
@@ -731,7 +731,7 @@ impl Interpreter {
                     forwarded.remove(0)
                 };
                 let target = roots.target();
-                self.run_callable_sync(context, &target, receiver, forwarded)
+                self.run_callable_sync_rooted(stack, context, &target, receiver, forwarded)
             }
             VmIntrinsicFunction::FunctionPrototypeApply => {
                 if !self.is_callable_runtime(&roots.target()) {
@@ -745,12 +745,12 @@ impl Interpreter {
                     Some(v) if v.is_nullish() => SmallVec::new(),
                     Some(arg_array) => {
                         roots.set_scratch(0, arg_array);
-                        self.create_list_from_array_like(context, roots.scratch(0))?
+                        self.create_list_from_array_like(stack, context, roots.scratch(0))?
                     }
                 };
                 let target = roots.target();
                 let receiver = roots.receiver_value();
-                self.run_callable_sync(context, &target, receiver, forwarded)
+                self.run_callable_sync_rooted(stack, context, &target, receiver, forwarded)
             }
             VmIntrinsicFunction::FunctionPrototypeBind => {
                 if !self.is_callable_runtime(&roots.target()) {
@@ -770,16 +770,11 @@ impl Interpreter {
                 let target_name = {
                     let target = roots.target();
                     let key = VmPropertyKey::String("name");
-                    let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                        context,
-                        target,
-                        &key,
-                        0,
-                        &[&target],
-                        &[],
+                    let own = self.ordinary_get_own_property_descriptor_value(
+                        stack, context, target, &key, 0,
                     )?;
                     if own.is_some() {
-                        self.get_property_value_for_call(context, target, "name")?
+                        self.get_property_value_for_call(stack, context, target, "name")?
                     } else {
                         Value::undefined()
                     }
@@ -791,16 +786,11 @@ impl Interpreter {
                 let target_length = {
                     let target = roots.target();
                     let key = VmPropertyKey::String("length");
-                    let own = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                        context,
-                        target,
-                        &key,
-                        0,
-                        &[&target],
-                        &[],
+                    let own = self.ordinary_get_own_property_descriptor_value(
+                        stack, context, target, &key, 0,
                     )?;
                     if own.is_some() {
-                        self.get_property_value_for_call(context, target, "length")?
+                        self.get_property_value_for_call(stack, context, target, "length")?
                     } else {
                         Value::undefined()
                     }
@@ -861,7 +851,7 @@ impl Interpreter {
                 roots.set_receiver(v);
                 let target = roots.target();
                 let result =
-                    self.ordinary_has_instance(context, &target, &roots.receiver_value())?;
+                    self.ordinary_has_instance(stack, context, &target, &roots.receiver_value())?;
                 Ok(Value::boolean(result))
             }
         }
@@ -873,6 +863,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-ordinaryhasinstance>
     pub(crate) fn ordinary_has_instance(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         c: &Value,
         o: &Value,
@@ -882,12 +873,12 @@ impl Interpreter {
         }
         if let Some(bound) = c.as_bound_function() {
             let (target, _, _) = bound.parts(&self.gc_heap);
-            return self.instanceof_operator(context, o, &target);
+            return self.instanceof_operator(stack, context, o, &target);
         }
         if !o.is_object_type() {
             return Ok(false);
         }
-        let Some(prototype) = self.instanceof_target_prototype(context, c)? else {
+        let Some(prototype) = self.instanceof_target_prototype(stack, context, c)? else {
             return Ok(false);
         };
         if !(prototype.is_object_type() || prototype.is_proxy()) {
@@ -896,37 +887,7 @@ impl Interpreter {
                     .into(),
             ));
         }
-        self.value_has_proxy_aware_prototype(context, *o, &prototype)
-    }
-
-    pub(crate) fn ordinary_has_instance_stack_rooted(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        c: &Value,
-        o: &Value,
-    ) -> Result<bool, VmError> {
-        if !self.is_callable_runtime(c) {
-            return Ok(false);
-        }
-        if let Some(bound) = c.as_bound_function() {
-            let (target, _, _) = bound.parts(&self.gc_heap);
-            return self.instanceof_operator_stack_rooted(context, stack, o, &target);
-        }
-        if !o.is_object_type() {
-            return Ok(false);
-        }
-        let Some(prototype) = self.instanceof_target_prototype_stack_rooted(context, stack, c)?
-        else {
-            return Ok(false);
-        };
-        if !(prototype.is_object_type() || prototype.is_proxy()) {
-            return Err(self.err_type(
-                ("Function has non-object prototype 'undefined' in instanceof check".to_string())
-                    .into(),
-            ));
-        }
-        self.value_has_proxy_aware_prototype(context, *o, &prototype)
+        self.value_has_proxy_aware_prototype(stack, context, *o, &prototype)
     }
 
     /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
@@ -935,6 +896,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-instanceofoperator>
     pub(crate) fn instanceof_operator(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         v: &Value,
         target: &Value,
@@ -945,10 +907,10 @@ impl Interpreter {
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
-        let handler = match self.ordinary_get_value(context, *target, *target, &key, 0)? {
+        let handler = match self.ordinary_get_value(stack, context, *target, *target, &key, 0)? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, *target, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, *target, SmallVec::new())?
             }
         };
         if !handler.is_nullish() {
@@ -961,11 +923,11 @@ impl Interpreter {
                     VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
                 )
             {
-                return self.ordinary_has_instance(context, target, v);
+                return self.ordinary_has_instance(stack, context, target, v);
             }
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(*v);
-            let result = self.run_callable_sync(context, &handler, *target, args)?;
+            let result = self.run_callable_sync_rooted(stack, context, &handler, *target, args)?;
             return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
@@ -973,55 +935,12 @@ impl Interpreter {
                 self.err_type(("Right-hand side of instanceof is not callable".to_string()).into())
             );
         }
-        self.ordinary_has_instance(context, target, v)
-    }
-
-    pub(crate) fn instanceof_operator_stack_rooted(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        v: &Value,
-        target: &Value,
-    ) -> Result<bool, VmError> {
-        if !target.is_object_type() {
-            return Err(self
-                .err_type(("Right-hand side of instanceof is not an object".to_string()).into()));
-        }
-        let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
-        let key = VmPropertyKey::Symbol(has_instance_sym);
-        let handler = match self.ordinary_get_value(context, *target, *target, &key, 0)? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, *target, SmallVec::new())?
-            }
-        };
-        if !handler.is_nullish() {
-            if !self.is_callable_runtime(&handler) {
-                return Err(self.err_type(("@@hasInstance must be callable".to_string()).into()));
-            }
-            if let Some(native) = handler.as_native_function()
-                && native.is_vm_intrinsic(
-                    &self.gc_heap,
-                    VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
-                )
-            {
-                return self.ordinary_has_instance_stack_rooted(context, stack, target, v);
-            }
-            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(*v);
-            let result = self.run_callable_sync(context, &handler, *target, args)?;
-            return Ok(result.to_boolean(&self.gc_heap));
-        }
-        if !self.is_callable_runtime(target) {
-            return Err(
-                self.err_type(("Right-hand side of instanceof is not callable".to_string()).into())
-            );
-        }
-        self.ordinary_has_instance_stack_rooted(context, stack, target, v)
+        self.ordinary_has_instance(stack, context, target, v)
     }
 
     pub(crate) fn create_list_from_array_like(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: Value,
     ) -> Result<SmallVec<[Value; 8]>, VmError> {
@@ -1050,19 +969,19 @@ impl Interpreter {
                 ("Function.prototype.apply argument list must be object-like".to_string()).into(),
             ));
         }
-        let length = self.get_property_value_for_call(context, value, "length")?;
+        let length = self.get_property_value_for_call(stack, context, value, "length")?;
         // §7.3.18 step 3 — `len = ? ToLength(? Get(obj, "length"))`. The
         // §7.1.4 ToNumber inside ToLength fires a `valueOf` /
         // `@@toPrimitive` hook on an object-valued `length`, so coerce
         // with the execution context here rather than through the
         // infallible primitive-only `to_length` (which would read an
         // object as NaN -> 0).
-        let length_num = self.coerce_to_number(context, &length)?;
+        let length_num = self.coerce_to_number(stack, context, &length)?;
         let len = to_length(&Value::number(length_num), &self.gc_heap)?;
         let mut values = SmallVec::new();
         for index in 0..len {
             let key = index.to_string();
-            values.push(self.get_property_value_for_call(context, value, &key)?);
+            values.push(self.get_property_value_for_call(stack, context, value, &key)?);
         }
         Ok(values)
     }
@@ -1076,24 +995,26 @@ impl Interpreter {
     /// Propagates any error thrown by an invoked getter.
     pub fn get_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         key: &str,
     ) -> Result<Value, VmError> {
-        self.get_property_value_for_call(context, receiver, key)
+        self.get_property_value_for_call(stack, context, receiver, key)
     }
 
     pub(crate) fn get_property_value_for_call(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
         key: &str,
     ) -> Result<Value, VmError> {
         let property_key = VmPropertyKey::String(key);
-        match self.ordinary_get_value(context, receiver, receiver, &property_key, 0)? {
+        match self.ordinary_get_value(stack, context, receiver, receiver, &property_key, 0)? {
             VmGetOutcome::Value(value) => Ok(value),
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, receiver, SmallVec::new())
+                self.run_callable_sync_rooted(stack, context, &getter, receiver, SmallVec::new())
             }
         }
     }
@@ -1105,11 +1026,12 @@ impl Interpreter {
     /// through the `[[Get]]` ladder so user getters fire.
     pub(crate) fn species_constructor_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         obj: &Value,
         default_ctor: &Value,
     ) -> Result<Value, VmError> {
-        let c = self.get_property_value_for_call(context, *obj, "constructor")?;
+        let c = self.get_property_value_for_call(stack, context, *obj, "constructor")?;
         if c.is_undefined() {
             return Ok(*default_ctor);
         }
@@ -1119,13 +1041,19 @@ impl Interpreter {
         let species_sym = self
             .well_known_symbols()
             .get(crate::symbol::WellKnown::Species);
-        let s =
-            match self.ordinary_get_value(context, c, c, &VmPropertyKey::Symbol(species_sym), 0)? {
-                VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, c, SmallVec::new())?
-                }
-            };
+        let s = match self.ordinary_get_value(
+            stack,
+            context,
+            c,
+            c,
+            &VmPropertyKey::Symbol(species_sym),
+            0,
+        )? {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync_rooted(stack, context, &getter, c, SmallVec::new())?
+            }
+        };
         if s.is_nullish() {
             return Ok(*default_ctor);
         }
@@ -1254,54 +1182,45 @@ impl Interpreter {
         None
     }
 
-    pub(crate) fn function_user_bag_stack_rooted(
+    pub(crate) fn function_user_bag(
         &mut self,
-        stack: &ActivationStack,
+        stack: &mut ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         value_roots: &[&Value],
     ) -> Result<JsObject, VmError> {
-        if let Some(c) = owner {
-            if let Some(bag) = c.own_props(&self.gc_heap) {
+        self.with_handle_scope(|interp, scope| {
+            // Park every transient descriptor input in the handle arena instead
+            // of materialising another roots snapshot for this allocation.
+            for value in value_roots {
+                let _ = interp.scoped_value(scope, **value);
+            }
+            let owner = owner.map(|owner| interp.scoped_value(scope, Value::closure(owner)));
+            if let Some(owner) = owner {
+                let closure = interp
+                    .escape_scoped(owner)
+                    .as_closure(&interp.gc_heap)
+                    .ok_or(VmError::TypeMismatch)?;
+                if let Some(bag) = closure.own_props(&interp.gc_heap) {
+                    return Ok(bag);
+                }
+                let bag = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+                let closure = interp
+                    .escape_scoped(owner)
+                    .as_closure(&interp.gc_heap)
+                    .ok_or(VmError::TypeMismatch)?;
+                closure.set_own_props(&mut interp.gc_heap, bag);
                 return Ok(bag);
             }
-            let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
-            c.set_own_props(&mut self.gc_heap, bag);
-            return Ok(bag);
-        }
-        match self.function_user_props.get(&function_id).copied() {
-            Some(bag) => Ok(bag),
-            None => {
-                let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
-                self.function_user_props.insert(function_id, bag);
-                Ok(bag)
+            match interp.function_user_props.get(&function_id).copied() {
+                Some(bag) => Ok(bag),
+                None => {
+                    let bag = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+                    interp.function_user_props.insert(function_id, bag);
+                    Ok(bag)
+                }
             }
-        }
-    }
-
-    pub(crate) fn function_user_bag_runtime_rooted(
-        &mut self,
-        owner: Option<crate::closure::JsClosure>,
-        function_id: u32,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<JsObject, VmError> {
-        if let Some(c) = owner {
-            if let Some(bag) = c.own_props(&self.gc_heap) {
-                return Ok(bag);
-            }
-            let bag = self.alloc_runtime_rooted_object_with_roots(value_roots, slice_roots)?;
-            c.set_own_props(&mut self.gc_heap, bag);
-            return Ok(bag);
-        }
-        match self.function_user_props.get(&function_id).copied() {
-            Some(bag) => Ok(bag),
-            None => {
-                let bag = self.alloc_runtime_rooted_object_with_roots(value_roots, slice_roots)?;
-                self.function_user_props.insert(function_id, bag);
-                Ok(bag)
-            }
-        }
+        })
     }
 
     /// §10.1.3 / §10.1.4 ordinary function `[[Extensible]]`.
@@ -1527,35 +1446,13 @@ impl Interpreter {
 
     pub(crate) fn ordinary_function_define_own_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: Option<&ExecutionContext>,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         key: &str,
         desc_obj: Option<JsObject>,
         descriptor: object::PropertyDescriptor,
-    ) -> Result<bool, VmError> {
-        self.ordinary_function_define_own_property_with_roots(
-            context,
-            owner,
-            function_id,
-            key,
-            desc_obj,
-            descriptor,
-            None,
-            &[],
-        )
-    }
-
-    fn ordinary_function_define_own_property_with_roots(
-        &mut self,
-        context: Option<&ExecutionContext>,
-        owner: Option<crate::closure::JsClosure>,
-        function_id: u32,
-        key: &str,
-        desc_obj: Option<JsObject>,
-        descriptor: object::PropertyDescriptor,
-        stack_roots: Option<&ActivationStack>,
-        value_roots: &[&Value],
     ) -> Result<bool, VmError> {
         let descriptor = match self.ordinary_function_own_property_descriptor(
             context,
@@ -1597,8 +1494,7 @@ impl Interpreter {
                 descriptor
             }
         };
-        let mut roots = Vec::with_capacity(value_roots.len() + 3);
-        roots.extend_from_slice(value_roots);
+        let mut roots = Vec::with_capacity(3);
         let desc_obj_root = desc_obj.map(Value::object);
         if let Some(value) = &desc_obj_root {
             roots.push(value);
@@ -1614,12 +1510,7 @@ impl Interpreter {
                 }
             }
         }
-        let bag = match stack_roots {
-            Some(stack) => {
-                self.function_user_bag_stack_rooted(stack, owner, function_id, &roots)?
-            }
-            None => self.function_user_bag_runtime_rooted(owner, function_id, &roots, &[])?,
-        };
+        let bag = self.function_user_bag(stack, owner, function_id, &roots)?;
         let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
         if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) {
             self.function_deleted_metadata
@@ -1657,8 +1548,8 @@ impl Interpreter {
 
     pub(crate) fn try_function_object_static_call(
         &mut self,
+        stack: &mut ActivationStack,
         context: Option<&ExecutionContext>,
-        stack_roots: Option<&ActivationStack>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -1675,6 +1566,7 @@ impl Interpreter {
             match method {
                 M::Freeze => {
                     if !self.set_integrity_level_value(
+                        stack,
                         context,
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
@@ -1685,6 +1577,7 @@ impl Interpreter {
                 }
                 M::Seal => {
                     if !self.set_integrity_level_value(
+                        stack,
                         context,
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
@@ -1695,6 +1588,7 @@ impl Interpreter {
                 }
                 M::IsFrozen => {
                     let frozen = self.test_integrity_level_value(
+                        stack,
                         context,
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
@@ -1703,6 +1597,7 @@ impl Interpreter {
                 }
                 M::IsSealed => {
                     let sealed = self.test_integrity_level_value(
+                        stack,
                         context,
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
@@ -1740,12 +1635,12 @@ impl Interpreter {
                 // so Arrays, string wrappers, functions, and Proxies
                 // agree with `Reflect.ownKeys`.
                 let values: Vec<Value> = self
-                    .own_property_keys_value(context, &target)?
+                    .own_property_keys_value(stack, context, &target)?
                     .into_iter()
                     .filter(|v| v.is_string())
                     .collect();
                 return Ok(Some(Value::array(self.function_static_array_from_values(
-                    stack_roots,
+                    &*stack,
                     values,
                     &[&target],
                     &[args],
@@ -1756,7 +1651,7 @@ impl Interpreter {
                 // ownKeys path so trap invariants apply, then filter
                 // to enumerable strings per §20.1.2.17 Object.keys.
                 if target.is_proxy() {
-                    let trap_keys = self.own_property_keys_value(context, &target)?;
+                    let trap_keys = self.own_property_keys_value(stack, context, &target)?;
                     let mut values: Vec<Value> = Vec::with_capacity(trap_keys.len());
                     for key in trap_keys {
                         if !key.is_string() {
@@ -1769,33 +1664,21 @@ impl Interpreter {
                         } else {
                             return Err(VmError::TypeMismatch);
                         };
-                        let desc = match stack_roots {
-                            Some(stack) => self
-                                .ordinary_get_own_property_descriptor_value_stack_rooted(
-                                    context, stack, target, &vm_key, 0,
-                                )?,
-                            None => self
-                                .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                    context,
-                                    target,
-                                    &vm_key,
-                                    0,
-                                    &[&target],
-                                    &[args],
-                                )?,
-                        };
+                        let desc = self.ordinary_get_own_property_descriptor_value(
+                            stack, context, target, &vm_key, 0,
+                        )?;
                         if desc.as_ref().is_some_and(|d| d.enumerable()) {
                             values.push(key);
                         }
                     }
                     return Ok(Some(Value::array(self.function_static_array_from_values(
-                        stack_roots,
+                        &*stack,
                         values,
                         &[&target],
                         &[args],
                     )?)));
                 }
-                let keys = self.enumerable_own_string_keys_for_value(context, target, 0)?;
+                let keys = self.enumerable_own_string_keys_for_value(stack, context, target, 0)?;
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
                     values.push(Value::string(
@@ -1804,24 +1687,20 @@ impl Interpreter {
                     ));
                 }
                 return Ok(Some(Value::array(self.function_static_array_from_values(
-                    stack_roots,
+                    &*stack,
                     values,
                     &[&target],
                     &[args],
                 )?)));
             }
-            let desc = self.get_own_property_descriptor_for_value(context, target, args.get(1))?;
+            let desc =
+                self.get_own_property_descriptor_for_value(stack, context, target, args.get(1))?;
             if matches!(method, M::HasOwn) {
                 return Ok(Some(Value::boolean(desc.is_some())));
             }
             return match desc {
                 Some(desc) => Ok(Some(Value::object(
-                    self.function_static_descriptor_to_object(
-                        stack_roots,
-                        &desc,
-                        &[&target],
-                        args,
-                    )?,
+                    self.function_static_descriptor_to_object(&*stack, &desc, &[&target], args)?,
                 ))),
                 None => Ok(Some(Value::undefined())),
             };
@@ -1855,20 +1734,7 @@ impl Interpreter {
                         {
                             return Err(VmError::TypeMismatch);
                         }
-                        let bag = match stack_roots {
-                            Some(stack) => self.function_user_bag_stack_rooted(
-                                stack,
-                                owner,
-                                function_id,
-                                &[&target],
-                            )?,
-                            None => self.function_user_bag_runtime_rooted(
-                                owner,
-                                function_id,
-                                &[&target],
-                                &[args],
-                            )?,
-                        };
+                        let bag = self.function_user_bag(stack, owner, function_id, &[&target])?;
                         crate::object::define_own_symbol_property_partial(
                             bag,
                             &mut self.gc_heap,
@@ -1876,18 +1742,16 @@ impl Interpreter {
                             descriptor,
                         )
                     }
-                    (Some(function_id), _) => self
-                        .ordinary_function_define_own_property_with_roots(
-                            context,
-                            owner,
-                            function_id,
-                            key.string_name()
-                                .expect("non-symbol key has string spelling"),
-                            Some(desc_obj),
-                            completed,
-                            stack_roots,
-                            &[&target],
-                        )?,
+                    (Some(function_id), _) => self.ordinary_function_define_own_property(
+                        stack,
+                        context,
+                        owner,
+                        function_id,
+                        key.string_name()
+                            .expect("non-symbol key has string spelling"),
+                        Some(desc_obj),
+                        completed,
+                    )?,
                     (None, VmPropertyKey::Symbol(_)) => false,
                     (None, _) => {
                         let Some(bound) = target.as_bound_function() else {
@@ -1939,7 +1803,7 @@ impl Interpreter {
                 match desc {
                     Some(desc) => Ok(Some(Value::object(
                         self.function_static_descriptor_to_object(
-                            stack_roots,
+                            &*stack,
                             &desc,
                             &[&target],
                             args,
@@ -2048,25 +1912,22 @@ impl Interpreter {
 
     fn function_static_array_from_values(
         &mut self,
-        stack_roots: Option<&ActivationStack>,
+        stack: &ActivationStack,
         values: Vec<Value>,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<array::JsArray, VmError> {
-        match stack_roots {
-            Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
-                stack,
-                values,
-                value_roots,
-                slice_roots,
-            ),
-            None => self.alloc_runtime_rooted_array_from_values(values, value_roots, slice_roots),
-        }
+        self.alloc_stack_rooted_array_from_values_with_root_slices(
+            stack,
+            values,
+            value_roots,
+            slice_roots,
+        )
     }
 
     fn function_static_descriptor_to_object(
         &mut self,
-        stack_roots: Option<&ActivationStack>,
+        stack: &ActivationStack,
         desc: &object::PropertyDescriptor,
         value_roots: &[&Value],
         slice_roots: &[Value],
@@ -2088,16 +1949,8 @@ impl Interpreter {
                 }
             }
         }
-        let result = match stack_roots {
-            Some(stack) => self.alloc_stack_rooted_object_with_value_roots(
-                stack,
-                roots.as_slice(),
-                slice_roots,
-            )?,
-            None => {
-                self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[slice_roots])?
-            }
-        };
+        let result =
+            self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
         if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
             object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
         }
@@ -2129,26 +1982,18 @@ impl Interpreter {
     /// `object_statics::call` path.
     pub(crate) fn function_property_get(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         name: &str,
     ) -> Result<Value, VmError> {
-        if name == "prototype" {
-            return self.function_property_get_runtime_rooted(
-                context,
-                owner,
-                function_id,
-                name,
-                &[],
-                &[],
-            );
-        }
-        self.function_property_get_non_prototype(context, owner, function_id, name)
+        self.function_property_get_with_receiver(stack, context, owner, function_id, None, name)
     }
 
     fn function_property_get_non_prototype(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
@@ -2180,10 +2025,10 @@ impl Interpreter {
                 return Ok(Value::undefined());
             }
             let key = VmPropertyKey::OwnedString(name.to_string());
-            return match self.ordinary_get_value(context, over, over, &key, 0)? {
+            return match self.ordinary_get_value(stack, context, over, over, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, over, SmallVec::new())
+                    self.run_callable_sync_rooted(stack, context, &getter, over, SmallVec::new())
                 }
             };
         }
@@ -2201,41 +2046,29 @@ impl Interpreter {
         Ok(Value::undefined())
     }
 
-    pub(crate) fn function_property_get_stack_rooted(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &ActivationStack,
-        owner: Option<crate::closure::JsClosure>,
-        function_id: u32,
-        name: &str,
-    ) -> Result<Value, VmError> {
-        self.function_property_get_stack_rooted_with_receiver(
-            context,
-            stack,
-            owner,
-            function_id,
-            None,
-            name,
-        )
-    }
-
-    /// As [`Self::function_property_get_stack_rooted`], but `receiver`
+    /// As [`Self::function_property_get`], but `receiver`
     /// supplies the value written to a freshly materialized
     /// `prototype.constructor`. For a closure the canonical callable is
     /// the closure value itself, not `Value::function(function_id)`, so
     /// callers that hold the closure pass it through to keep
     /// `C.prototype.constructor === C`.
-    pub(crate) fn function_property_get_stack_rooted_with_receiver(
+    pub(crate) fn function_property_get_with_receiver(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         receiver: Option<Value>,
         name: &str,
     ) -> Result<Value, VmError> {
         if name != "prototype" {
-            return self.function_property_get_non_prototype(context, owner, function_id, name);
+            return self.function_property_get_non_prototype(
+                stack,
+                context,
+                owner,
+                function_id,
+                name,
+            );
         }
         // A user-installed own `prototype` (data or accessor, e.g. via
         // Object.defineProperty) shadows the implicit one. An accessor
@@ -2249,7 +2082,7 @@ impl Interpreter {
                     return match getter {
                         Some(g) if abstract_ops::is_callable(&g) => {
                             let recv = receiver.unwrap_or_else(|| Value::function(function_id));
-                            self.run_callable_sync(context, &g, recv, SmallVec::new())
+                            self.run_callable_sync_rooted(stack, context, &g, recv, SmallVec::new())
                         }
                         _ => Ok(Value::undefined()),
                     };
@@ -2266,7 +2099,7 @@ impl Interpreter {
 
         let function_root = Value::function(function_id);
         let constructor_value = receiver.unwrap_or(function_root);
-        let bag = self.function_user_bag_stack_rooted(
+        let bag = self.function_user_bag(
             stack,
             owner,
             function_id,
@@ -2309,170 +2142,6 @@ impl Interpreter {
                     stack,
                     &[&function_root, &bag_root, &proto_value],
                 )?;
-                self.finish_generator_function_prototype(context, function_id, proto, parent)?;
-            }
-        }
-        // Install `prototype` on the function's property bag first. It is a
-        // non-moving define, and routing it before the constructor install means
-        // the bag's `prototype` slot already tracks `proto` (the collector
-        // forwards live GC slots) when the shape-advancing constructor define
-        // below may relocate the heap.
-        // `bag` is a bare local from before the `proto` allocation, which can
-        // scavenge and relocate it; re-fetch the live handle from its rooted
-        // `bag_root` before the define, or it dereferences a moved-from shape cell.
-        let bag = bag_root
-            .as_object()
-            .expect("function bag survives stack rooting");
-        let prototype_desc =
-            object::PropertyDescriptor::data(Value::object(proto), true, false, false);
-        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
-        // §27.5.1 — a generator function's `.prototype` object has NO own
-        // properties (no back-pointing `constructor`); ordinary functions get
-        // the §10.2.5 MakeConstructor pair. Route the `constructor` install
-        // through the hidden-class-advancing define rather than the
-        // dictionary-mode `object::define_own_property` (which nulls the shape),
-        // so the prototype keeps a fast shape: prototype-style method
-        // definitions (`Foo.prototype.m = ...`) then land in shape slots and
-        // instance method calls stay inline/direct-call guardable instead of
-        // forcing every dispatch through the generic method bridge. The define
-        // allocates a hidden-class child and can move the heap, so the bare
-        // `proto` / `bag` locals may be stale afterward.
-        if !context
-            .function(function_id)
-            .is_some_and(|function| function.is_generator)
-        {
-            let constructor_desc = object::PartialPropertyDescriptor {
-                value: Some(constructor_value),
-                writable: Some(true),
-                enumerable: Some(false),
-                configurable: Some(true),
-                ..Default::default()
-            };
-            let _ = self.define_own_property_partial(proto, "constructor", constructor_desc)?;
-        }
-        // Re-acquire the (possibly relocated) prototype through the function's
-        // bag, which the collector forwarded; the bare `proto` handle may be
-        // stale after the shape allocation above.
-        let proto_value = self
-            .callable_bag_read(owner, function_id)
-            .and_then(|bag| crate::object::get_own(bag, &self.gc_heap, "prototype"))
-            .unwrap_or_else(|| Value::object(proto));
-        Ok(proto_value)
-    }
-
-    pub(crate) fn function_property_get_runtime_rooted(
-        &mut self,
-        context: &ExecutionContext,
-        owner: Option<crate::closure::JsClosure>,
-        function_id: u32,
-        name: &str,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        self.function_property_get_runtime_rooted_with_receiver(
-            context,
-            owner,
-            function_id,
-            None,
-            name,
-            value_roots,
-            slice_roots,
-        )
-    }
-
-    /// As [`Self::function_property_get_runtime_rooted`], but `receiver`
-    /// supplies the value written to a freshly materialized
-    /// `prototype.constructor` (the closure value for a closure; see
-    /// [`Self::function_property_get_stack_rooted_with_receiver`]).
-    pub(crate) fn function_property_get_runtime_rooted_with_receiver(
-        &mut self,
-        context: &ExecutionContext,
-        owner: Option<crate::closure::JsClosure>,
-        function_id: u32,
-        receiver: Option<Value>,
-        name: &str,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<Value, VmError> {
-        if name != "prototype" {
-            return self.function_property_get_non_prototype(context, owner, function_id, name);
-        }
-        // A user-installed own `prototype` (data or accessor, e.g. via
-        // Object.defineProperty) shadows the implicit one. An accessor
-        // must fire its getter with the function as receiver — §7.3.12
-        // Get(C, "prototype") in OrdinaryHasInstance — so a poisoned
-        // getter propagates instead of reading back `undefined`.
-        if let Some(bag) = self.callable_bag_read(owner, function_id) {
-            match crate::object::lookup_own(bag, &self.gc_heap, name) {
-                crate::object::PropertyLookup::Data { value, .. } => return Ok(value),
-                crate::object::PropertyLookup::Accessor { getter, .. } => {
-                    return match getter {
-                        Some(g) if abstract_ops::is_callable(&g) => {
-                            let recv = receiver.unwrap_or_else(|| Value::function(function_id));
-                            self.run_callable_sync(context, &g, recv, SmallVec::new())
-                        }
-                        _ => Ok(Value::undefined()),
-                    };
-                }
-                crate::object::PropertyLookup::Absent => {}
-            }
-        }
-        // §10.2.5 — arrows, methods, and async (non-generator)
-        // functions have no `prototype` property at all, so there is
-        // nothing to materialize.
-        if !context.function_has_prototype_property(function_id) {
-            return Ok(Value::undefined());
-        }
-
-        let function_root = Value::function(function_id);
-        let constructor_value = receiver.unwrap_or(function_root);
-        let mut bag_roots = Vec::with_capacity(value_roots.len() + 2);
-        bag_roots.push(&function_root);
-        bag_roots.push(&constructor_value);
-        bag_roots.extend_from_slice(value_roots);
-        let bag =
-            self.function_user_bag_runtime_rooted(owner, function_id, &bag_roots, slice_roots)?;
-        if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
-            return Ok(existing);
-        }
-
-        let bag_root = Value::object(bag);
-        let mut proto_roots = Vec::with_capacity(value_roots.len() + 3);
-        proto_roots.push(&function_root);
-        proto_roots.push(&constructor_value);
-        proto_roots.push(&bag_root);
-        proto_roots.extend_from_slice(value_roots);
-        let proto = self.alloc_runtime_rooted_object_with_roots(&proto_roots, slice_roots)?;
-        if let Some(object_proto) = self.realm_intrinsics.object_prototype.or_else(|| {
-            crate::object::get(self.global_this, &self.gc_heap, "Object")
-                .and_then(|v| v.as_object())
-                .and_then(|object_ctor| {
-                    crate::object::get(object_ctor, &self.gc_heap, "prototype")
-                        .and_then(|v| v.as_object())
-                })
-        }) {
-            crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
-        }
-        if context
-            .function(function_id)
-            .is_some_and(|function| function.is_generator)
-        {
-            let is_async = context
-                .function(function_id)
-                .is_some_and(|function| function.is_async_generator);
-            if let Some(shared) = self.shared_generator_object_prototype(is_async) {
-                // §27.5.1 / §27.6.1 — inherit from the one shared
-                // %GeneratorPrototype% / %AsyncGeneratorPrototype%.
-                object::set_prototype(proto, &mut self.gc_heap, Some(shared));
-            } else {
-                let proto_value = Value::object(proto);
-                let mut parent_roots = Vec::with_capacity(value_roots.len() + 3);
-                parent_roots.push(&function_root);
-                parent_roots.push(&bag_root);
-                parent_roots.push(&proto_value);
-                parent_roots.extend_from_slice(value_roots);
-                let parent =
-                    self.alloc_runtime_rooted_object_with_roots(&parent_roots, slice_roots)?;
                 self.finish_generator_function_prototype(context, function_id, proto, parent)?;
             }
         }

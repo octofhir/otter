@@ -57,52 +57,61 @@ fn coerce_numeric_args(
     name: &'static str,
     args: &[Value],
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
-    let exec = ctx.execution_context().cloned();
-    let mut out: smallvec::SmallVec<[Value; 4]> = smallvec::SmallVec::with_capacity(args.len());
-    for arg in args {
-        let object_like = arg.is_object()
-            || arg.is_array()
-            || arg.is_function()
-            || arg.is_closure()
-            || arg.is_native_function()
-            || arg.is_bound_function()
-            || arg.is_class_constructor()
-            || arg.is_proxy()
-            || arg.is_regexp();
-        if object_like {
-            let Some(exec) = &exec else {
-                out.push(*arg);
-                continue;
-            };
-            let interp = ctx.interp_mut();
-            match interp.evaluate_to_primitive(
-                exec,
-                arg,
-                crate::abstract_ops::ToPrimitiveHint::Number,
-            ) {
-                Ok(primitive) => out.push(primitive),
-                Err(crate::VmError::Uncaught) => {
-                    let value = match interp.take_error_detail() {
-                        Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                        _ => Default::default(),
-                    };
-                    return Err(NativeError::Thrown {
-                        name,
-                        message: value.into(),
-                    });
+    ctx.scope(|mut scope| {
+        let exec = scope.context().execution_context().cloned();
+        let inputs: smallvec::SmallVec<[crate::Local<'_>; 4]> =
+            args.iter().map(|value| scope.value(*value)).collect();
+        let mut outputs: smallvec::SmallVec<[crate::Local<'_>; 4]> =
+            smallvec::SmallVec::with_capacity(inputs.len());
+        for input in inputs {
+            let value = scope.raw(input);
+            let object_like = value.is_object()
+                || value.is_array()
+                || value.is_function()
+                || value.is_closure()
+                || value.is_native_function()
+                || value.is_bound_function()
+                || value.is_class_constructor()
+                || value.is_proxy()
+                || value.is_regexp();
+            if object_like {
+                let Some(exec) = &exec else {
+                    outputs.push(input);
+                    continue;
+                };
+                let result = scope.with_turn_parts(|interp, stack| {
+                    interp.evaluate_to_primitive(
+                        stack,
+                        exec,
+                        &value,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                });
+                match result {
+                    Ok(primitive) => outputs.push(scope.value(primitive)),
+                    Err(crate::VmError::Uncaught) => {
+                        let value = match scope.context().interp_mut().take_error_detail() {
+                            Some(crate::run_control::ErrorDetail::Uncaught(message)) => message,
+                            _ => Default::default(),
+                        };
+                        return Err(NativeError::Thrown {
+                            name,
+                            message: value.into(),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(NativeError::TypeError {
+                            name,
+                            reason: error.to_string(),
+                        });
+                    }
                 }
-                Err(err) => {
-                    return Err(NativeError::TypeError {
-                        name,
-                        reason: err.to_string(),
-                    });
-                }
+            } else {
+                outputs.push(input);
             }
-        } else {
-            out.push(*arg);
         }
-    }
-    Ok(out)
+        Ok(outputs.iter().map(|value| scope.raw(*value)).collect())
+    })
 }
 
 /// Coerce a digit-count argument (`fractionDigits` / `precision`) per
@@ -156,16 +165,18 @@ fn to_string_radix(
             // earlier inline coercion dropped an object operand to NaN
             // without ever observing its `valueOf`.
             let v = *v;
-            let number = {
-                let (interp, exec) = ctx.interp_mut_and_context();
-                let exec = exec.ok_or_else(|| NativeError::TypeError {
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
                     name,
                     reason: "missing execution context".to_string(),
                 })?;
-                let number_result = crate::coerce::to_number_or_throw(interp, &exec, &v);
-                number_result
-                    .map_err(|err| crate::native_function::vm_to_native_error(interp, err, name))?
-            };
+            let number = ctx.with_turn_parts(|interp, stack| {
+                crate::coerce::to_number_or_throw(interp, stack, &exec, &v).map_err(|error| {
+                    crate::native_function::vm_to_native_error(interp, error, name)
+                })
+            })?;
             let f = number.as_f64();
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {

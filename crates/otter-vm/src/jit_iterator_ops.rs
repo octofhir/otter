@@ -79,6 +79,7 @@ impl Interpreter {
                     None => Err(VmError::TypeMismatch),
                 }?;
                 if was_registered && !done {
+                    let iterator = *read_register(&stack[frame_index], iter_reg)?;
                     self.register_frame_iterator_closer(&mut stack[frame_index], iterator);
                 }
                 write_register(&mut stack[frame_index], value_dst, value)?;
@@ -93,7 +94,7 @@ impl Interpreter {
             value if value == Op::IteratorClose as u8 => {
                 let iterator = *read_register(&stack[frame_index], arg0 as u16)?;
                 self.deregister_frame_iterator_closer(&mut stack[frame_index], iterator);
-                self.iterator_close_value_sync(context, iterator)?;
+                self.iterator_close_value_sync(stack, context, iterator)?;
                 stack[frame_index].pc = saved_pc;
                 Ok(())
             }

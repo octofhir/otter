@@ -91,7 +91,7 @@ use otter_compiler::{
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
-use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag};
+use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag, NativeCallInfo};
 use serde::{Deserialize, Serialize};
 
 pub use compiled_program::CompiledProgram;
@@ -2542,7 +2542,13 @@ impl Runtime {
         // §13.3.10 step 7 — Evaluate(target): the records-backed
         // InnerModuleEvaluation walks the target's eager dependency
         // closure, parking on top-level await instead of blocking.
-        match self.interp.evaluate_module(&context, &target_url) {
+        let evaluation = NativeCtx::with_host_context(
+            &mut self.interp,
+            NativeCallInfo::default_call(),
+            Some(&context),
+            |ctx| ctx.evaluate_module(&target_url),
+        );
+        match evaluation {
             Ok(Some(promise)) => {
                 return Ok(DynamicModuleLoad::PendingAsyncEvaluation {
                     promise,

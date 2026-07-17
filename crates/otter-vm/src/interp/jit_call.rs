@@ -712,7 +712,7 @@ impl Interpreter {
     /// observable `[[Get]]`. On `Ok(true)` the destination register holds the
     /// call result and the compiled caller continues at the next instruction.
     ///
-    /// The callee runs through [`Self::run_callable_sync_already_rooted`]
+    /// The callee runs through [`Self::run_callable_sync_rooted`]
     /// under the caller's published activation: it may allocate, re-enter
     /// arbitrary JS, and invalidate the caller's body (the entry anchor keeps
     /// the mapping alive). Register windows live in the pinned register-stack
@@ -868,7 +868,7 @@ impl Interpreter {
             // SAFETY: compiler-emitted argument indices into the caller window.
             args.push(unsafe { *caller_regs.add(arg as usize) });
         }
-        let result = self.run_callable_sync_already_rooted(context, &method, recv, args);
+        let result = self.run_callable_sync_rooted(stack, context, &method, recv, args);
         self.pop_iteration_anchors_to(method_anchor);
         let result = result?;
         if let (Some(method_fid), Some(method_site)) = (method_fid, method_site) {
@@ -890,7 +890,7 @@ impl Interpreter {
     /// The interpreter's `Op::Call` has no exotic receiver branches — its
     /// semantics are exactly "call the callee value with `undefined` as
     /// `this`" — so any callable completes here through
-    /// [`Self::run_callable_sync_already_rooted`] under the caller's
+    /// [`Self::run_callable_sync_rooted`] under the caller's
     /// published activation. A non-callable value reports `Ok(false)` and
     /// side-exits, keeping the interpreter the owner of the thrown error.
     /// On `Ok(true)` the destination register holds the call result.
@@ -903,6 +903,7 @@ impl Interpreter {
     pub fn jit_runtime_call_in_place(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         dst_reg: u16,
         callee_reg: u16,
         arg_regs: &[u16],
@@ -922,7 +923,7 @@ impl Interpreter {
             args.push(unsafe { *caller_regs.add(arg as usize) });
         }
         let result =
-            self.run_callable_sync_already_rooted(context, &callee, Value::undefined(), args)?;
+            self.run_callable_sync_rooted(stack, context, &callee, Value::undefined(), args)?;
         // SAFETY: `dst_reg` is a compiler-emitted index into the caller
         // window; the window slab is pinned, so the pointer survived the
         // nested dispatch.
@@ -945,7 +946,7 @@ impl Interpreter {
     /// caller continues at the next instruction.
     ///
     /// The constructor body runs through
-    /// [`Self::run_construct_sync_already_rooted`] (the caller already holds an
+    /// [`Self::run_construct_sync_rooted`] (the caller already holds an
     /// `ExtraRoots` registration): it may allocate, re-enter arbitrary JS, and
     /// invalidate the caller's body — the entry anchor keeps the mapping alive.
     /// Register windows live in the pinned register-stack slab, so `caller_regs`
@@ -961,6 +962,7 @@ impl Interpreter {
     pub fn jit_runtime_construct_in_place(
         &mut self,
         context: &ExecutionContext,
+        stack: &mut ActivationStack,
         dst_reg: u16,
         callee_reg: u16,
         arg_regs: &[u16],
@@ -983,7 +985,7 @@ impl Interpreter {
         }
         // A plain `new callee(args…)` uses the callee itself as `new.target`,
         // matching `do_construct`'s `effective_new_target`.
-        let result = self.run_construct_sync_already_rooted(context, &callee, callee, args)?;
+        let result = self.run_construct_sync_rooted(stack, context, &callee, callee, args)?;
         // SAFETY: `dst_reg` is a compiler-emitted index into the caller
         // window; the window slab is pinned, so the pointer survived the
         // nested dispatch.
@@ -1007,6 +1009,7 @@ impl Interpreter {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn jit_runtime_loose_equal_in_place(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         dst_reg: u16,
         lhs_reg: u16,
@@ -1018,7 +1021,7 @@ impl Interpreter {
         // SAFETY: compiler-emitted operand indices into the caller window.
         let lhs = unsafe { *caller_regs.add(lhs_reg as usize) };
         let rhs = unsafe { *caller_regs.add(rhs_reg as usize) };
-        let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
+        let eq = self.loose_equal_with_context(stack, context, &lhs, &rhs)?;
         // SAFETY: `dst_reg` is a compiler-emitted index into the caller
         // window; the window slab is pinned, so the pointer survived any
         // nested coercion dispatch.

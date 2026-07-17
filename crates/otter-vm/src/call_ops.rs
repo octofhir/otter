@@ -8,6 +8,7 @@
 //! - Ordinary call entry and shared callable invocation.
 //! - Constructor call entry and receiver/prototype setup.
 //! - Spread and explicit-`this` call forms.
+//! - Same-stack synchronous re-entry and reusable lean callback frames.
 //!
 //! # Invariants
 //! - Call-site helpers advance the caller PC before pushing or synchronously
@@ -16,6 +17,11 @@
 //!   callables, bound functions, class constructors, and proxies.
 //! - Constructor dispatch preserves `new.target` and receiver substitution
 //!   invariants used by `pop_frame`.
+//! - Nested call/construct dispatch appends above an `ActivationFloor` on the
+//!   current rooted stack; native boundary slots are collector-rewritten in
+//!   their original storage.
+//! - Lean callback state owns reusable frame storage, never a detached stack;
+//!   caller argument slots remain traced through allocating frame setup.
 //! - A freshly-started generator remains in a moving GC root through observable
 //!   `prototype` lookup and publication into the caller.
 //!
@@ -35,21 +41,8 @@ use crate::{
     NativeCtx, NativeFunction, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     argument_window::BytecodeArgumentWindow, executable::OperandView, frame_state::UpvalueSpine,
     is_constructor_runtime, native_to_vm_error_with_stack, operand_decode::register_operand,
-    promise_dispatch, read_register, write_register,
+    promise_dispatch, read_register, runtime_cx::NativeCallRoots, write_register,
 };
-
-struct SyncNativeCallRoots<'a> {
-    /// Inner registration over the interpreter, re-dispatched so its
-    /// runtime roots are re-enumerated **live** at every trace. A
-    /// snapshot `Vec<*mut RawGc>` taken at call entry would miss
-    /// anything the native registers afterwards (fresh anchors, IC
-    /// entries, shape transitions), and a moving scavenge inside the
-    /// native would then sweep or relocate objects those late slots
-    /// still reference.
-    interp_roots: otter_gc::ExtraRoots,
-    value_roots: SmallVec<[&'a Value; 4]>,
-    slice_roots: SmallVec<[&'a [Value]; 2]>,
-}
 
 /// Mutable root state for synchronous JS re-entry before a callee frame owns
 /// the values. Bound/proxy unwrapping replaces these fields in place; the
@@ -85,7 +78,6 @@ impl JsCallRootSlot {
 }
 
 pub(crate) struct SyncJsCallRoots {
-    interp_roots: Option<otter_gc::ExtraRoots>,
     current: JsCallRootSlot,
     receiver: JsCallRootSlot,
     new_target: JsCallRootSlot,
@@ -95,16 +87,8 @@ pub(crate) struct SyncJsCallRoots {
 }
 
 impl SyncJsCallRoots {
-    pub(crate) fn call(
-        interp: &Interpreter,
-        current: Value,
-        receiver: Value,
-        args: SmallVec<[Value; 8]>,
-        include_interpreter: bool,
-    ) -> Self {
+    pub(crate) fn call(current: Value, receiver: Value, args: SmallVec<[Value; 8]>) -> Self {
         Self {
-            interp_roots: include_interpreter
-                .then(|| otter_gc::ExtraRoots::new::<Interpreter>(interp)),
             current: JsCallRootSlot::new(current),
             receiver: JsCallRootSlot::new(receiver),
             new_target: JsCallRootSlot::new(Value::undefined()),
@@ -114,16 +98,8 @@ impl SyncJsCallRoots {
         }
     }
 
-    fn construct(
-        interp: &Interpreter,
-        current: Value,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
-        include_interpreter: bool,
-    ) -> Self {
+    fn construct(current: Value, new_target: Value, args: SmallVec<[Value; 8]>) -> Self {
         Self {
-            interp_roots: include_interpreter
-                .then(|| otter_gc::ExtraRoots::new::<Interpreter>(interp)),
             current: JsCallRootSlot::new(current),
             receiver: JsCallRootSlot::new(Value::undefined()),
             new_target: JsCallRootSlot::new(new_target),
@@ -181,9 +157,6 @@ impl SyncJsCallRoots {
 
 impl otter_gc::ExtraRootSource for SyncJsCallRoots {
     fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        if let Some(interp_roots) = self.interp_roots {
-            interp_roots.visit(visitor);
-        }
         self.current.trace(visitor);
         self.receiver.trace(visitor);
         self.new_target.trace(visitor);
@@ -199,20 +172,6 @@ impl otter_gc::ExtraRootSource for SyncJsCallRoots {
     }
 }
 
-impl otter_gc::ExtraRootSource for SyncNativeCallRoots<'_> {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        self.interp_roots.visit(visitor);
-        for value in &self.value_roots {
-            value.trace_value_slots(visitor);
-        }
-        for slice in &self.slice_roots {
-            for value in *slice {
-                value.trace_value_slots(visitor);
-            }
-        }
-    }
-}
-
 fn invoke_native_call_with_roots(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
@@ -223,30 +182,25 @@ fn invoke_native_call_with_roots(
     value_roots: &[&Value],
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let this_root = this_value;
-    let mut roots = SyncNativeCallRoots {
-        interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(interp),
-        value_roots: smallvec::smallvec![&this_root],
-        slice_roots: smallvec::smallvec![args],
-    };
-    roots.value_roots.extend_from_slice(value_roots);
+    let call_info = NativeCallInfo::call(this_value);
+    let slice_roots = [args];
+    let roots = NativeCallRoots::new(&call_info, value_roots, &slice_roots);
     // Pushed (not installed) so any outer scope's value/slice roots
     // stay visible to scavenges triggered inside this native.
     let _roots_guard = interp
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    let call_info = NativeCallInfo::call(this_root);
     debug_assert!(interp.gc_heap.has_frame_root_providers());
     if let Some(global) = realm_global {
         interp.with_host_realm_global(global, |interp| {
             let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
-            let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
+            let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
             let raw = call.invoke(&mut ctx, args);
             raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
         })
     } else {
         let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(interp, stack);
-        let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
+        let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
         raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))
     }
@@ -354,7 +308,6 @@ impl LeanCallbackRoot {
 }
 
 pub(crate) struct LeanCallbackState {
-    stack: ActivationStack,
     root_index: usize,
     function_id: u32,
     /// Callee register-window length, read once from the executable function.
@@ -382,10 +335,6 @@ pub(crate) struct LeanCallbackState {
     /// being drawn, built, and dropped per element. `None` until the first
     /// fast-path call builds it, and whenever a bail consumes it mid-loop.
     reuse_frame: Option<Frame>,
-    /// Cached `(input this, coerced this)` pair. The builtin passes a constant
-    /// receiver for the whole loop, so the §10.2 sloppy-`this` coercion runs
-    /// once; a changed input recomputes it.
-    cached_this: Option<(Value, Value)>,
 }
 
 impl Interpreter {
@@ -736,23 +685,6 @@ impl Interpreter {
         Ok(frame)
     }
 
-    fn invoke_native_construct(
-        &mut self,
-        context: &ExecutionContext,
-        native: NativeFunction,
-        this_value: &Value,
-        new_target: &Value,
-        args: &[Value],
-    ) -> Result<Value, VmError> {
-        let mut activations = ActivationStack::new();
-        self.with_runtime_turn(&mut activations, |turn| {
-            let (interp, stack) = turn.into_parts();
-            interp.invoke_native_construct_rooted(
-                stack, context, native, this_value, new_target, args,
-            )
-        })
-    }
-
     fn invoke_native_construct_rooted(
         &mut self,
         stack: &mut ActivationStack,
@@ -771,25 +703,21 @@ impl Interpreter {
         // pin `this`, `new.target`, and the argument slice across every
         // scavenge the constructor triggers. Without this a native `new X(…)`
         // ran fully unrooted — e.g. `new Set([...])` stranded its iterable.
-        let this_root = *this_value;
-        let new_target_root = *new_target;
-        let roots = SyncNativeCallRoots {
-            interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
-            value_roots: smallvec::smallvec![&this_root, &new_target_root],
-            slice_roots: smallvec::smallvec![args],
-        };
+        let slice_roots = [args];
+        let roots = NativeCallRoots::new(&call_info, &[], &slice_roots);
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
         let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(self, stack);
-        let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
+        let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
         let raw = call.invoke(&mut ctx, args);
+        let rooted_this = *ctx.this_value();
         let (interp, stack) = ctx.cx.into_parts();
         let result = raw.map_err(|e| native_to_vm_error_with_stack(interp, stack, e))?;
         Ok(if result.is_object_type() {
             result
         } else {
-            *this_value
+            rooted_this
         })
     }
 
@@ -909,9 +837,9 @@ impl Interpreter {
                 let prologue = self.dispatch_loop_above_rooted(context, stack, prologue_floor);
                 self.release_frames_above(stack, prologue_floor);
                 prologue?;
-                self.resolve_generator_prototype_stack_rooted(
-                    context,
+                self.resolve_generator_prototype(
                     stack,
+                    context,
                     callee_closure,
                     generator_function_id,
                     generator_anchor,
@@ -992,10 +920,10 @@ impl Interpreter {
     /// [[Prototype]] from `fn.prototype` AFTER the prologue ran; a
     /// non-object answer falls back (override `None`) to the realm's
     /// shared `%GeneratorPrototype%` / `%AsyncGeneratorPrototype%`.
-    fn resolve_generator_prototype_stack_rooted(
+    fn resolve_generator_prototype(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
         generator_anchor: usize,
@@ -1004,13 +932,7 @@ impl Interpreter {
         // materializes per closure, so resolving through the template
         // bag would hand the generator a parallel prototype object that
         // fails `Object.getPrototypeOf(gen) === fn.prototype`.
-        let proto = self.function_property_get_stack_rooted(
-            context,
-            stack,
-            owner,
-            function_id,
-            "prototype",
-        )?;
+        let proto = self.function_property_get(stack, context, owner, function_id, "prototype")?;
         let gen_handle = self
             .iteration_anchor(generator_anchor)
             .as_generator()
@@ -1066,9 +988,9 @@ impl Interpreter {
                 let prologue = self.dispatch_loop_above_rooted(context, stack, prologue_floor);
                 self.release_frames_above(stack, prologue_floor);
                 prologue?;
-                self.resolve_generator_prototype_stack_rooted(
-                    context,
+                self.resolve_generator_prototype(
                     stack,
+                    context,
                     callee_closure,
                     generator_function_id,
                     generator_anchor,
@@ -1455,8 +1377,13 @@ impl Interpreter {
         if let Some(native) = current.as_native_function() {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                let result =
-                    self.run_vm_intrinsic_sync(context, intrinsic, effective_this, effective_args)?;
+                let result = self.run_vm_intrinsic_sync_rooted(
+                    stack,
+                    context,
+                    intrinsic,
+                    effective_this,
+                    effective_args,
+                )?;
                 let top_idx = stack.len() - 1;
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
@@ -1492,14 +1419,20 @@ impl Interpreter {
                 effective_this,
                 Value::array(argv_array),
             ];
-            let result = match self.invoke_proxy_trap(context, &proxy, "apply", trap_args)? {
+            let result = match self.invoke_proxy_trap(stack, context, &proxy, "apply", trap_args)? {
                 Some(v) => v,
                 None => {
                     // Fall through to the target's [[Call]] —
                     // `proxy.target(&self.gc_heap)` returns the original Value,
                     // which may be a callable directly.
                     let underlying = proxy.target(&self.gc_heap);
-                    self.run_callable_sync(context, &underlying, effective_this, effective_args)?
+                    self.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &underlying,
+                        effective_this,
+                        effective_args,
+                    )?
                 }
             };
             let top_idx = stack.len() - 1;
@@ -1591,11 +1524,7 @@ impl Interpreter {
         }
 
         self.record_runtime_construct_call();
-        let proto = self.construct_prototype_for_callee_stack_rooted(
-            context,
-            stack,
-            &effective_new_target,
-        )?;
+        let proto = self.construct_prototype_for_callee(stack, context, &effective_new_target)?;
         // OrdinaryCreateFromConstructor — a missing or non-object
         // `prototype` falls back to %Object.prototype% (§10.1.13).
         let proto = match proto {
@@ -1892,30 +1821,32 @@ impl Interpreter {
                 Value::array(argv_array),
                 new_target,
             ];
-            let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
-                Some(v) => {
-                    // §10.5.13 step 9 — trap result must be an Object;
-                    // primitive returns surface as TypeError.
-                    if !v.is_object_type() {
-                        return Err(self.err_type(
-                            ("Proxy construct trap returned non-object".to_string()).into(),
-                        ));
+            let result =
+                match self.invoke_proxy_trap(stack, context, &proxy, "construct", trap_args)? {
+                    Some(v) => {
+                        // §10.5.13 step 9 — trap result must be an Object;
+                        // primitive returns surface as TypeError.
+                        if !v.is_object_type() {
+                            return Err(self.err_type(
+                                ("Proxy construct trap returned non-object".to_string()).into(),
+                            ));
+                        }
+                        v
                     }
-                    v
-                }
-                None => {
-                    // Fall through to [[Construct]] on the underlying
-                    // target via `run_construct_sync`, which honours
-                    // bound/proxy/native paths and re-checks the
-                    // constructor-return invariants.
-                    self.run_construct_sync(
-                        context,
-                        &proxy.target(&self.gc_heap),
-                        new_target,
-                        args,
-                    )?
-                }
-            };
+                    None => {
+                        // Fall through to [[Construct]] on the underlying
+                        // target via `run_construct_sync`, which honours
+                        // bound/proxy/native paths and re-checks the
+                        // constructor-return invariants.
+                        self.run_construct_sync_rooted(
+                            stack,
+                            context,
+                            &proxy.target(&self.gc_heap),
+                            new_target,
+                            args,
+                        )?
+                    }
+                };
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
@@ -1937,8 +1868,7 @@ impl Interpreter {
         // the new frame. The constructor might mutate the receiver
         // immediately, so the prototype link must already be in
         // place.
-        let proto =
-            self.construct_prototype_for_callee_stack_rooted(context, stack, &new_target)?;
+        let proto = self.construct_prototype_for_callee(stack, context, &new_target)?;
         // OrdinaryCreateFromConstructor — a missing or non-object
         // `prototype` falls back to %Object.prototype% (§10.1.13).
         let proto = match proto {
@@ -2042,10 +1972,10 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn construct_prototype_for_callee_stack_rooted(
+    pub(crate) fn construct_prototype_for_callee(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
-        stack: &ActivationStack,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         let function_id = callee.as_function().or_else(|| {
@@ -2055,71 +1985,13 @@ impl Interpreter {
         });
         if let Some(function_id) = function_id {
             let owner = callee.as_closure(&self.gc_heap);
-            return match self.function_property_get_stack_rooted_with_receiver(
-                context,
+            return match self.function_property_get_with_receiver(
                 stack,
-                owner,
-                function_id,
-                Some(*callee),
-                "prototype",
-            )? {
-                proto if proto.is_object_type() => Ok(Some(proto)),
-                _ => Ok(None),
-            };
-        }
-        if let Some(c) = callee.as_class_constructor() {
-            return Ok(Some(Value::object(c.prototype(&self.gc_heap))));
-        }
-        if callee.as_proxy().is_some() {
-            return self.construct_prototype_via_get(context, callee);
-        }
-        if let Some(obj) = callee.as_object() {
-            return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
-                Some(proto) if proto.is_object_type() => Some(proto),
-                _ => None,
-            });
-        }
-        if callee.is_bound_function() {
-            return self.construct_prototype_via_get(context, callee);
-        }
-        if let Some(native) = callee.as_native_function() {
-            return native
-                .own_property_descriptor(&mut self.gc_heap, "prototype")
-                .map_err(|_| VmError::InvalidOperand)
-                .map(|desc| {
-                    desc.and_then(|d| match d.kind {
-                        crate::object::DescriptorKind::Data { value } if value.is_object_type() => {
-                            Some(value)
-                        }
-                        _ => None,
-                    })
-                });
-        }
-        Ok(None)
-    }
-
-    pub(crate) fn construct_prototype_for_callee_runtime_rooted(
-        &mut self,
-        context: &ExecutionContext,
-        callee: &Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<Option<Value>, VmError> {
-        let function_id = callee.as_function().or_else(|| {
-            callee
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        });
-        if let Some(function_id) = function_id {
-            let owner = callee.as_closure(&self.gc_heap);
-            return match self.function_property_get_runtime_rooted_with_receiver(
                 context,
                 owner,
                 function_id,
                 Some(*callee),
                 "prototype",
-                value_roots,
-                slice_roots,
             )? {
                 proto if proto.is_object_type() => Ok(Some(proto)),
                 _ => Ok(None),
@@ -2129,7 +2001,7 @@ impl Interpreter {
             return Ok(Some(Value::object(c.prototype(&self.gc_heap))));
         }
         if callee.as_proxy().is_some() {
-            return self.construct_prototype_via_get(context, callee);
+            return self.construct_prototype_via_get(stack, context, callee);
         }
         if let Some(obj) = callee.as_object() {
             return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
@@ -2138,7 +2010,7 @@ impl Interpreter {
             });
         }
         if callee.is_bound_function() {
-            return self.construct_prototype_via_get(context, callee);
+            return self.construct_prototype_via_get(stack, context, callee);
         }
         if let Some(native) = callee.as_native_function() {
             return native
@@ -2158,15 +2030,16 @@ impl Interpreter {
 
     fn construct_prototype_via_get(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         let proxy = callee.as_proxy();
         let key = VmPropertyKey::String("prototype");
-        let proto = match self.ordinary_get_value(context, *callee, *callee, &key, 0)? {
+        let proto = match self.ordinary_get_value(stack, context, *callee, *callee, &key, 0)? {
             VmGetOutcome::Value(value) => value,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, *callee, SmallVec::new())?
+                self.run_callable_sync_rooted(stack, context, &getter, *callee, SmallVec::new())?
             }
         };
         if !proto.is_object_type() && proxy.is_some_and(|proxy| proxy.is_revoked(&self.gc_heap)) {
@@ -2289,56 +2162,45 @@ impl Interpreter {
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
-        self.enter_sync_reentry()?;
-        // Host callers (timer fire, worker message dispatch) enter
-        // here without `Interpreter::run`'s rooted scope, and the
-        // inner body allocates (upvalue spines, `this` boxing) before
-        // `dispatch_loop` registers frame roots — so the runtime
-        // roots must be registered for the whole call.
-        let roots = SyncJsCallRoots::call(self, *callee, this_value, args, true);
-        let extra_roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_callable_sync_inner(context, &roots);
-        drop(extra_roots_guard);
-        self.leave_sync_reentry();
-        result
+        let mut activations = ActivationStack::new();
+        self.with_runtime_turn(&mut activations, |turn| {
+            let (interp, stack) = turn.into_parts();
+            interp.run_callable_sync_rooted(stack, context, callee, this_value, args)
+        })
     }
 
-    /// Synchronous callable re-entry for callers that already hold a live
-    /// [`otter_gc::ExtraRoots`] registration for this interpreter on the heap's
-    /// LIFO stack — specifically the JIT call bridge ([`Interpreter::jit_runtime_call`]).
+    /// Synchronously invoke a callable above the current activation floor.
     ///
-    /// Compiled code only ever runs under an enclosing `dispatch_loop`
-    /// (loop-OSR / function-entry tier-up) or under [`Self::run_callable_sync`]
-    /// itself, both of which push `ExtraRoots::new(self as &Interpreter)` before
-    /// entering compiled code. That registration traces runtime-global roots
-    /// (shape tables, `globalThis`, module envs, the microtask queue) which are
-    /// frame-independent, so a second push for the nested call is a pure
-    /// duplicate the heap's `same_source` walk already skips. Eliding it removes
-    /// a `Vec` push/truncate per JIT→VM call without changing the traced root
-    /// set. The stack-overflow guard (`enter_sync_reentry`) is retained because
-    /// each level still consumes native stack.
-    pub(crate) fn run_callable_sync_already_rooted(
+    /// The exact stack is already published by the enclosing [`RuntimeTurn`].
+    /// Nested execution appends to it and releases back to the captured floor;
+    /// it never installs another frame provider or draws a detached stack.
+    pub(crate) fn run_callable_sync_rooted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         callee: &Value,
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        if !stack.is_runtime_rooted_by(self) {
+            return Err(VmError::InvalidOperand);
+        }
         self.enter_sync_reentry()?;
-        let roots = SyncJsCallRoots::call(self, *callee, this_value, args, false);
+        let floor = stack.floor();
+        let roots = SyncJsCallRoots::call(*callee, this_value, args);
         let roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_callable_sync_inner(context, &roots);
+        let result = self.run_callable_sync_inner_rooted(stack, context, &roots);
         drop(roots_guard);
+        self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
     }
 
-    fn run_callable_sync_inner(
+    fn run_callable_sync_inner_rooted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
@@ -2380,11 +2242,17 @@ impl Interpreter {
                 let trap_key = VmPropertyKey::String("apply");
                 let trap_value = {
                     let handler = roots.scratch_0.get();
-                    match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
+                    match self.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
                         VmGetOutcome::Value(value) => value,
                         VmGetOutcome::InvokeGetter { getter } => {
                             let handler = roots.scratch_0.get();
-                            self.run_callable_sync(context, &getter, handler, SmallVec::new())?
+                            self.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                handler,
+                                SmallVec::new(),
+                            )?
                         }
                     }
                 };
@@ -2406,7 +2274,8 @@ impl Interpreter {
                         roots.receiver.get(),
                         Value::array(argv_array),
                     ];
-                    return self.run_callable_sync(
+                    return self.run_callable_sync_rooted(
+                        stack,
                         context,
                         &roots.scratch_1.get(),
                         roots.scratch_0.get(),
@@ -2434,20 +2303,16 @@ impl Interpreter {
             let current = roots.current.get();
             let receiver = roots.receiver.get();
             let args = roots.take_args();
-            let mut activations = ActivationStack::new();
-            return self.with_runtime_turn(&mut activations, |turn| {
-                let (interp, stack) = turn.into_parts();
-                invoke_native_call_with_roots(
-                    interp,
-                    stack,
-                    context,
-                    call,
-                    realm_global,
-                    receiver,
-                    &[&current],
-                    args.as_slice(),
-                )
-            });
+            return invoke_native_call_with_roots(
+                self,
+                stack,
+                context,
+                call,
+                realm_global,
+                receiver,
+                &[&current],
+                args.as_slice(),
+            );
         }
         if let Some(native) = roots.current.get().as_native_function() {
             let native = &native;
@@ -2455,36 +2320,26 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 let receiver = roots.receiver.get();
                 let args = roots.take_args();
-                return self.run_vm_intrinsic_sync(context, intrinsic, receiver, args);
+                return self
+                    .run_vm_intrinsic_sync_rooted(stack, context, intrinsic, receiver, args);
             }
             self.record_runtime_native_call();
             let realm_global = native.realm_global(&self.gc_heap);
             let current = roots.current.get();
             let receiver = roots.receiver.get();
             let args = roots.take_args();
-            let mut activations = ActivationStack::new();
-            return self.with_runtime_turn(&mut activations, |turn| {
-                let (interp, stack) = turn.into_parts();
-                invoke_native_call_with_roots(
-                    interp,
-                    stack,
-                    context,
-                    call,
-                    realm_global,
-                    receiver,
-                    &[&current],
-                    args.as_slice(),
-                )
-            });
+            return invoke_native_call_with_roots(
+                self,
+                stack,
+                context,
+                call,
+                realm_global,
+                receiver,
+                &[&current],
+                args.as_slice(),
+            );
         }
-        let mut inner = self.take_reentry_stack();
-        let current = roots.current.get();
-        let receiver = roots.receiver.get();
-        let args = roots.take_args();
-        let result =
-            self.run_bytecode_callable_committed(&mut inner, context, current, receiver, args);
-        self.recycle_reentry_stack(inner);
-        result
+        self.run_bytecode_callable_committed_rooted(stack, context, roots)
     }
 
     /// Build and run the bytecode-callable frame for `current` on `inner` — the
@@ -2534,12 +2389,10 @@ impl Interpreter {
             && root.bound_derived_this.is_none()
             && root.eval_env.is_none();
         if self.enter_sync_reentry().is_ok() {
-            let stack = self.take_reentry_stack();
             let root_index = self.lean_callback_roots.len();
             let function_id = root.function_id;
             self.lean_callback_roots.push(root);
             Some(LeanCallbackState {
-                stack,
                 root_index,
                 function_id,
                 register_count,
@@ -2549,15 +2402,14 @@ impl Interpreter {
                 fast_reuse,
                 compiled: None,
                 reuse_frame: None,
-                cached_this: None,
             })
         } else {
             None
         }
     }
 
-    /// Return the lean-path stack to the pool and leave the sync-reentry guard
-    /// entered by [`Self::acquire_lean_callback_stack`]. No-op for `None`.
+    /// Release the lean-path state and leave the sync-reentry guard entered by
+    /// [`Self::acquire_lean_callback_stack`]. No-op for `None`.
     pub(crate) fn release_lean_callback_stack(&mut self, state: Option<LeanCallbackState>) {
         if let Some(mut state) = state {
             // Return the recycled frame's spilled register backing to the pool;
@@ -2566,7 +2418,6 @@ impl Interpreter {
                 self.frame_release_cold(&mut frame);
                 self.reclaim_registers(&mut frame);
             }
-            self.recycle_reentry_stack(state.stack);
             let root = self
                 .lean_callback_roots
                 .pop()
@@ -2577,27 +2428,6 @@ impl Interpreter {
             );
             self.leave_sync_reentry();
         }
-    }
-
-    pub(crate) fn run_bytecode_callable_committed(
-        &mut self,
-        inner: &mut ActivationStack,
-        context: &ExecutionContext,
-        current: Value,
-        effective_this: Value,
-        effective_args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        // The caller transfers its argument buffer with `mem::take`, so its
-        // provider deliberately stops tracing those slots. Install the callee
-        // entry provider before even inspecting the target; it owns the moved
-        // buffer until the completed frame takes it at the terminal hand-off.
-        let roots = SyncJsCallRoots::call(self, current, effective_this, effective_args, true);
-        let roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_bytecode_callable_committed_rooted(inner, context, &roots);
-        drop(roots_guard);
-        result
     }
 
     fn run_bytecode_callable_committed_rooted(
@@ -2728,20 +2558,19 @@ impl Interpreter {
                 }
                 let prologue_floor = inner.floor();
                 inner.push(frame);
-                let prologue = self.dispatch_loop_above(context, inner, prologue_floor);
+                let prologue = self.dispatch_loop_above_rooted(context, inner, prologue_floor);
                 self.release_frames_above(inner, prologue_floor);
                 prologue?;
                 // §27.5.1 step 3 — resolve [[Prototype]] after the
                 // prologue (FunctionDeclarationInstantiation) ran, through
                 // the invoked closure's bag so the generator's prototype is
                 // the same object later `fn.prototype` reads observe.
-                let proto = self.function_property_get_runtime_rooted(
+                let proto = self.function_property_get(
+                    inner,
                     context,
                     roots.target().as_closure(&self.gc_heap),
                     function_id,
                     "prototype",
-                    &[],
-                    &[],
                 )?;
                 let gen_handle = roots
                     .scratch(0)
@@ -2770,30 +2599,28 @@ impl Interpreter {
             // loop's terminal frame value. A suspending frame must never take
             // the compiled sync-entry path, whose fast tier assumes the entry
             // frame cannot suspend.
-            self.dispatch_loop_above(context, inner, entry_floor)?;
+            self.dispatch_loop_above_rooted(context, inner, entry_floor)?;
             return Ok(Value::promise(result_promise));
         }
         // Tier-up the entry frame itself: a synchronously-entered callee reaches
         // `dispatch_loop` directly (no `Op::Call`), so without this hook the
         // entry level would always interpret while only its sub-calls JIT. This
         // lets a hot recursion run compiled→compiled with no interpreted levels.
-        self.with_runtime_turn(inner, |turn| {
-            let (interp, inner) = turn.into_parts();
-            if let Some(value) = interp.dispatch_jit_sync_entry(inner, context)? {
-                // The compiled entry frame ran to completion and is terminal
-                // (the integer subset cannot suspend or escape its frame), so
-                // return its spilled register window to the pool.
-                if let Some(mut done) = inner.pop() {
-                    interp.reclaim_registers(&mut done);
-                }
-                return Ok(value);
+        if let Some(value) = self.dispatch_jit_sync_entry(inner, context)? {
+            // The compiled entry frame ran to completion and is terminal
+            // (the integer subset cannot suspend or escape its frame), so
+            // return its spilled register window to the pool.
+            if let Some(mut done) = inner.pop() {
+                self.reclaim_registers(&mut done);
             }
-            interp.dispatch_loop_above_rooted(context, inner, entry_floor)
-        })
+            return Ok(value);
+        }
+        self.dispatch_loop_above_rooted(context, inner, entry_floor)
     }
 
     pub(crate) fn run_bytecode_callable_committed_lean_args(
         &mut self,
+        stack: &mut ActivationStack,
         state: &mut LeanCallbackState,
         context: &ExecutionContext,
         effective_this: Value,
@@ -2815,6 +2642,7 @@ impl Interpreter {
                     self.note_jit_function_entry(state.function_id);
                 }
                 return self.invoke_prepared_lean(
+                    stack,
                     state,
                     context,
                     &code,
@@ -2825,18 +2653,26 @@ impl Interpreter {
             // Still cold (below the tier-up threshold). The probe above already
             // advanced the counter, so interpret this element directly without
             // re-probing through the synchronous-entry path.
-            return self.invoke_cold_lean(state, context, effective_this, effective_args, false);
+            return self.invoke_cold_lean(
+                stack,
+                state,
+                context,
+                effective_this,
+                effective_args,
+                false,
+            );
         }
         // Callback carries a bound `new.target` / derived-`this` cell / captured
         // eval environment: build a fresh frame per element and tier up through
         // the synchronous-entry path as before.
-        self.invoke_cold_lean(state, context, effective_this, effective_args, true)
+        self.invoke_cold_lean(stack, state, context, effective_this, effective_args, true)
     }
 
     /// Re-enter the callback's already-compiled body with the recycled frame
     /// held in `state`. See [`Self::run_bytecode_callable_committed_lean_args`].
     fn invoke_prepared_lean(
         &mut self,
+        stack: &mut ActivationStack,
         state: &mut LeanCallbackState,
         context: &ExecutionContext,
         code: &std::sync::Arc<dyn crate::jit::JitFunctionCode>,
@@ -2856,26 +2692,17 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             root.bound_this.unwrap_or(effective_this)
         };
-        // The builtin passes a constant receiver across the whole loop, so the
-        // §10.2 sloppy-`this` coercion is computed once and reused.
         let this_for_callee = if state.this_passthrough {
             bound_this
         } else {
-            match state.cached_this {
-                Some((input, coerced)) if input == bound_this => coerced,
-                _ => {
-                    let function = context
-                        .exec_function(state.function_id)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let coerced = self.this_for_bytecode_call_runtime_rooted(
-                        function,
-                        bound_this,
-                        &[effective_args],
-                    )?;
-                    state.cached_this = Some((bound_this, coerced));
-                    coerced
-                }
-            }
+            // OrdinaryCallBindThis performs ToObject for every sloppy call.
+            // Reusing a wrapper would be observably wrong (`this` identity
+            // must differ between callback invocations) and would retain an
+            // untraced young handle in the lean state across moving GC.
+            let function = context
+                .exec_function(state.function_id)
+                .ok_or(VmError::InvalidOperand)?;
+            self.this_for_bytecode_call_runtime_rooted(function, bound_this, &[effective_args])?
         };
         let register_count = state.register_count;
         // Receiver coercion may collect. Re-read both exact SELF and the stable
@@ -2896,7 +2723,11 @@ impl Interpreter {
                 frame.self_value = self_value;
                 frame.this_value = this_for_callee;
                 if state.has_parent_upvalues {
-                    parent_upvalues.copy_into(frame.upvalues.as_mut())?;
+                    if let Err(error) = parent_upvalues.copy_into(frame.upvalues.as_mut()) {
+                        self.frame_release_cold(&mut frame);
+                        self.reclaim_registers(&mut frame);
+                        return Err(error);
+                    }
                 }
                 frame
             }
@@ -2925,42 +2756,37 @@ impl Interpreter {
             self.reclaim_registers(&mut frame);
             return Err(error);
         }
-        let entry_floor = state.stack.floor();
-        state.stack.push(frame);
-        let stack = &mut state.stack;
-        let reuse_frame = &mut state.reuse_frame;
-        self.with_runtime_turn(stack, |turn| {
-            let (interp, stack) = turn.into_parts();
-            let top_idx = stack.len() - 1;
-            let outcome = interp
-                .run_optimized_frame(stack, context, top_idx)
-                .unwrap_or_else(|| interp.run_compiled_frame(stack, context, top_idx, code));
-            match outcome {
-                crate::jit::JitExecOutcome::Returned(value) => {
-                    // The body ran to completion and left its frame on the
-                    // stack; recycle that frame (window + shell) for the next
-                    // element.
-                    *reuse_frame = stack.pop();
-                    window_rollback.commit();
-                    Ok(value)
+        let entry_floor = stack.floor();
+        stack.push(frame);
+        let top_idx = stack.len() - 1;
+        let outcome = self
+            .run_optimized_frame(stack, context, top_idx)
+            .unwrap_or_else(|| self.run_compiled_frame(stack, context, top_idx, code));
+        match outcome {
+            crate::jit::JitExecOutcome::Returned(value) => {
+                // The body ran to completion and left its frame on the stack;
+                // recycle that frame (window + shell) for the next element.
+                if stack.len_above(entry_floor) != 1 {
+                    self.release_frames_above(stack, entry_floor);
+                    return Err(VmError::InvalidOperand);
                 }
-                crate::jit::JitExecOutcome::Bailed(pc) => {
-                    // Finish the partially-run frame in the interpreter, which
-                    // pops it on return; the next element rebuilds a fresh
-                    // recycled frame.
-                    stack[top_idx].pc = pc;
-                    let result = interp.dispatch_loop_above_rooted(context, stack, entry_floor);
-                    if result.is_err() {
-                        interp.release_frames_above(stack, entry_floor);
-                    }
-                    result
-                }
-                crate::jit::JitExecOutcome::Threw(err) => {
-                    interp.release_frames_above(stack, entry_floor);
-                    Err(err)
-                }
+                state.reuse_frame = stack.pop();
+                window_rollback.commit();
+                Ok(value)
             }
-        })
+            crate::jit::JitExecOutcome::Bailed(pc) => {
+                // Finish the partially-run frame in the interpreter. A bailout
+                // consumes the recyclable frame; the next element rebuilds it.
+                stack[top_idx].pc = pc;
+                let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
+                self.release_frames_above(stack, entry_floor);
+                result
+            }
+            crate::jit::JitExecOutcome::Threw(err) => {
+                self.release_frames_above(stack, entry_floor);
+                Err(err)
+            }
+        }
     }
 
     /// Build a fresh callee frame for one lean-callback element. `probe` drives
@@ -2969,6 +2795,7 @@ impl Interpreter {
     /// directly because the caller already advanced the tier-up counter.
     fn invoke_cold_lean(
         &mut self,
+        stack: &mut ActivationStack,
         state: &mut LeanCallbackState,
         context: &ExecutionContext,
         effective_this: Value,
@@ -3036,6 +2863,13 @@ impl Interpreter {
             if let Some(env) = &mut callee_eval_env {
                 visitor(env as *mut crate::eval_env::EvalEnvHandle as *mut RawGc);
             }
+            // Keep the caller-owned argument window as the one authoritative
+            // set of slots. Upvalue-cell allocation may move young values, so
+            // the collector must rewrite the exact slice that the binder reads
+            // below instead of a detached snapshot.
+            for value in effective_args {
+                value.trace_value_slots(visitor);
+            }
         };
         let upvalues = Frame::build_upvalues_for_exec_from_source_with_roots(
             &mut self.gc_heap,
@@ -3063,93 +2897,67 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut new_frame);
             cold.derived_this_cell = Some(cell);
         }
-        self.stash_frame_eval_env(function, &mut new_frame, callee_eval_env)?;
-        Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
-        let entry_floor = state.stack.floor();
-        state.stack.push(new_frame);
-        self.with_runtime_turn(&mut state.stack, |turn| {
-            let (interp, stack) = turn.into_parts();
-            if probe {
-                match interp.dispatch_jit_sync_entry(stack, context) {
-                    Ok(Some(value)) => {
-                        interp.release_frames_above(stack, entry_floor);
-                        return Ok(value);
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        interp.release_frames_above(stack, entry_floor);
-                        return Err(err);
-                    }
+        let setup = self
+            .stash_frame_eval_env(function, &mut new_frame, callee_eval_env)
+            .and_then(|()| {
+                // `effective_args` is the same collector-rewritten window
+                // traced by `build_roots`; read it only after the allocating
+                // upvalue build has completed.
+                Self::bind_lean_bytecode_call_arguments(function, &mut new_frame, effective_args)
+            });
+        if let Err(error) = setup {
+            self.frame_release_cold(&mut new_frame);
+            self.reclaim_registers(&mut new_frame);
+            return Err(error);
+        }
+        let entry_floor = stack.floor();
+        stack.push(new_frame);
+        if probe {
+            match self.dispatch_jit_sync_entry(stack, context) {
+                Ok(Some(value)) => {
+                    self.release_frames_above(stack, entry_floor);
+                    return Ok(value);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.release_frames_above(stack, entry_floor);
+                    return Err(err);
                 }
             }
-            let result = interp.dispatch_loop_above_rooted(context, stack, entry_floor);
-            if result.is_err() {
-                interp.release_frames_above(stack, entry_floor);
-            }
-            result
-        })
-    }
-
-    /// Synchronously perform `Construct(target, args, newTarget)`.
-    ///
-    /// This mirrors the `Op::New` user-function entry path but
-    /// returns the completion directly for builtins such as
-    /// `Reflect.construct`. Bound functions are unwrapped with the
-    /// ECMA-262 `[[Construct]]` newTarget rewrite: constructing a
-    /// bound function as itself exposes the bound target as
-    /// `new.target` inside the target body.
-    pub(crate) fn run_construct_sync(
-        &mut self,
-        context: &ExecutionContext,
-        target: &Value,
-        new_target: Value,
-        args: SmallVec<[Value; 8]>,
-    ) -> Result<Value, VmError> {
-        self.enter_sync_reentry()?;
-        // Same rooting contract as [`Self::run_callable_sync`].
-        let roots = SyncJsCallRoots::construct(self, *target, new_target, args, true);
-        let extra_roots_guard = self
-            .gc_heap
-            .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_construct_sync_inner(context, &roots);
-        drop(extra_roots_guard);
-        self.leave_sync_reentry();
+        }
+        let result = self.dispatch_loop_above_rooted(context, stack, entry_floor);
+        self.release_frames_above(stack, entry_floor);
         result
     }
 
-    /// Synchronous `Construct` re-entry for callers that already hold a live
-    /// [`otter_gc::ExtraRoots`] registration for this interpreter on the heap's
-    /// LIFO stack — the JIT construct bridge ([`Interpreter::jit_runtime_construct_in_place`]).
-    ///
-    /// Mirrors [`Self::run_callable_sync_already_rooted`]: compiled code only
-    /// runs under an enclosing `dispatch_loop` (loop-OSR / function-entry
-    /// tier-up) or under [`Self::run_construct_sync`] itself, both of which
-    /// push `ExtraRoots::new(self as &Interpreter)` before entering compiled
-    /// code. That registration traces the frame-independent runtime-global
-    /// roots, so a second push for the nested construct is a pure duplicate the
-    /// heap's `same_source` walk already skips. The stack-overflow guard
-    /// (`enter_sync_reentry`) is retained because each level still consumes
-    /// native stack.
-    pub(crate) fn run_construct_sync_already_rooted(
+    /// Synchronously construct above the current rooted activation floor.
+    pub(crate) fn run_construct_sync_rooted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         target: &Value,
         new_target: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        if !stack.is_runtime_rooted_by(self) {
+            return Err(VmError::InvalidOperand);
+        }
         self.enter_sync_reentry()?;
-        let roots = SyncJsCallRoots::construct(self, *target, new_target, args, false);
+        let floor = stack.floor();
+        let roots = SyncJsCallRoots::construct(*target, new_target, args);
         let roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        let result = self.run_construct_sync_inner(context, &roots);
+        let result = self.run_construct_sync_inner_rooted(stack, context, &roots);
         drop(roots_guard);
+        self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
     }
 
-    fn run_construct_sync_inner(
+    fn run_construct_sync_inner_rooted(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         roots: &SyncJsCallRoots,
     ) -> Result<Value, VmError> {
@@ -3191,11 +2999,17 @@ impl Interpreter {
                 let trap_key = VmPropertyKey::String("construct");
                 let trap_value = {
                     let handler = roots.scratch_0.get();
-                    match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
+                    match self.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
                         VmGetOutcome::Value(value) => value,
                         VmGetOutcome::InvokeGetter { getter } => {
                             let handler = roots.scratch_0.get();
-                            self.run_callable_sync(context, &getter, handler, SmallVec::new())?
+                            self.run_callable_sync_rooted(
+                                stack,
+                                context,
+                                &getter,
+                                handler,
+                                SmallVec::new(),
+                            )?
                         }
                     }
                 };
@@ -3226,7 +3040,8 @@ impl Interpreter {
                         Value::array(argv_array),
                         roots.new_target.get(),
                     ];
-                    let result = self.run_callable_sync(
+                    let result = self.run_callable_sync_rooted(
+                        stack,
                         context,
                         &roots.scratch_1.get(),
                         roots.scratch_0.get(),
@@ -3254,7 +3069,8 @@ impl Interpreter {
         let effective_args = roots.take_args();
         if let Some(native) = self.native_promise_constructor(&roots.current.get()) {
             let new_target = roots.new_target.get();
-            return self.invoke_native_construct(
+            return self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &Value::undefined(),
@@ -3283,7 +3099,8 @@ impl Interpreter {
             )
         {
             let new_target = roots.new_target.get();
-            return self.invoke_native_construct(
+            return self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &Value::undefined(),
@@ -3292,14 +3109,9 @@ impl Interpreter {
             );
         }
 
-        let current = roots.current.get();
         let effective_new_target = roots.new_target.get();
-        let mut proto = self.construct_prototype_for_callee_runtime_rooted(
-            context,
-            &effective_new_target,
-            &[&current, &effective_new_target],
-            &[effective_args.as_slice()],
-        )?;
+        let mut proto =
+            self.construct_prototype_for_callee(stack, context, &effective_new_target)?;
         if proto.is_none()
             && roots
                 .current
@@ -3344,7 +3156,8 @@ impl Interpreter {
         {
             let this_value = roots.receiver.get();
             let new_target = roots.new_target.get();
-            return self.invoke_native_construct(
+            return self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &this_value,
@@ -3355,7 +3168,8 @@ impl Interpreter {
         if let Some(native) = roots.current.get().as_native_function() {
             let this_value = roots.receiver.get();
             let new_target = roots.new_target.get();
-            return self.invoke_native_construct(
+            return self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &this_value,
@@ -3368,7 +3182,8 @@ impl Interpreter {
         {
             let this_value = roots.receiver.get();
             let new_target = roots.new_target.get();
-            return self.invoke_native_construct(
+            return self.invoke_native_construct_rooted(
+                stack,
                 context,
                 native,
                 &this_value,
@@ -3390,8 +3205,8 @@ impl Interpreter {
             effective_args,
             None,
         )?;
-        let mut inner: ActivationStack = ActivationStack::new();
-        inner.push(new_frame);
-        self.dispatch_loop(context, &mut inner)
+        let floor = stack.floor();
+        stack.push(new_frame);
+        self.dispatch_loop_above_rooted(context, stack, floor)
     }
 }

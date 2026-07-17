@@ -86,13 +86,17 @@ fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 /// spec `CreateDataPropertyOrThrow` / `Set(A, "length", …)` protocol).
 fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: "Array.of",
-        reason: "missing execution context".to_string(),
-    })?;
-    let result = interp.array_of_sync(&exec, this_value, args);
-    result.map_err(|e| vm_to_native_array_static(interp, "Array.of", e))
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Array.of",
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.with_turn_parts(|interp, stack| {
+        let result = interp.array_of_sync(stack, &exec, this_value, args);
+        result.map_err(|e| vm_to_native_array_static(interp, "Array.of", e))
+    })
 }
 
 /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)` JS-visible
@@ -101,13 +105,17 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// ladder observes user `@@iterator` / `mapFn` / `thisArg`.
 fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: "Array.from",
-        reason: "missing execution context".to_string(),
-    })?;
-    let result = interp.array_from_sync(&exec, this_value, args);
-    result.map_err(|e| vm_to_native_array_static(interp, "Array.from", e))
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Array.from",
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.with_turn_parts(|interp, stack| {
+        let result = interp.array_from_sync(stack, &exec, this_value, args);
+        result.map_err(|e| vm_to_native_array_static(interp, "Array.from", e))
+    })
 }
 
 /// §23.1.2.2 `Array.fromAsync(items, mapFn?, thisArg?)`.

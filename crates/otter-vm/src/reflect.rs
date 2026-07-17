@@ -39,6 +39,7 @@
 use smallvec::SmallVec;
 
 use crate::ExecutionContext;
+use crate::activation_stack::ActivationStack;
 use crate::{Interpreter, NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
 
 /// Dispatch `Reflect.<name>(args...)`.
@@ -52,6 +53,7 @@ use crate::{Interpreter, NativeCtx, NativeError, Value, VmError, VmGetOutcome, V
 /// - [`VmError::TypeMismatch`] for receiver / argument shape errors.
 pub fn call(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     method: otter_bytecode::method_id::ReflectMethod,
     args: &[Value],
@@ -66,8 +68,8 @@ pub fn call(
                 return Err(VmError::NotCallable);
             }
             let this_value = args.get(1).cloned().unwrap_or(Value::undefined());
-            let argv = create_list_from_array_like(interp, context, args.get(2))?;
-            interp.run_callable_sync(context, &target, this_value, argv)
+            let argv = create_list_from_array_like(interp, stack, context, args.get(2))?;
+            interp.run_callable_sync_rooted(stack, context, &target, this_value, argv)
         }
         // §28.1.3 Reflect.construct(target, argumentsList[, newTarget])
         // <https://tc39.es/ecma262/#sec-reflect.construct>
@@ -80,8 +82,8 @@ pub fn call(
             if !is_constructor(&new_target, context, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
-            let argv = create_list_from_array_like(interp, context, args.get(1))?;
-            interp.run_construct_sync(context, &target, new_target, argv)
+            let argv = create_list_from_array_like(interp, stack, context, args.get(1))?;
+            interp.run_construct_sync_rooted(stack, context, &target, new_target, argv)
         }
         // §28.1.4 Reflect.defineProperty(target, propertyKey, attributes)
         // <https://tc39.es/ecma262/#sec-reflect.defineproperty>
@@ -91,11 +93,11 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())?;
-            let key = coerce_property_key(interp, context, args.get(1))?;
+            let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())?;
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
-            let descriptor = interp.evaluate_to_property_descriptor(context, &attributes)?;
-            let ok = interp.define_own_property_value(context, &target, &key, descriptor)?;
+            let descriptor = interp.evaluate_to_property_descriptor(stack, context, &attributes)?;
+            let ok = interp.define_own_property_value(stack, context, &target, &key, descriptor)?;
             Ok(Value::boolean(ok))
         }
         // §28.1.5 Reflect.deleteProperty(target, propertyKey)
@@ -106,9 +108,9 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())?;
-            let key = coerce_property_key(interp, context, args.get(1))?;
+            let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())?;
-            let removed = interp.ordinary_delete_value(context, target, &key, 0)?;
+            let removed = interp.ordinary_delete_value(stack, context, target, &key, 0)?;
             Ok(Value::boolean(removed))
         }
         // §28.1.6 Reflect.get(target, propertyKey[, receiver])
@@ -119,14 +121,14 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())?;
-            let key = coerce_property_key(interp, context, args.get(1))?;
+            let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())?;
             let receiver = args.get(2).cloned().unwrap_or(target);
-            match interp.ordinary_get_value(context, target, receiver, &key, 0)? {
+            match interp.ordinary_get_value(stack, context, target, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let argv: SmallVec<[Value; 8]> = SmallVec::new();
-                    interp.run_callable_sync(context, &getter, receiver, argv)
+                    interp.run_callable_sync_rooted(stack, context, &getter, receiver, argv)
                 }
             }
         }
@@ -138,16 +140,11 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())?;
-            let key = coerce_property_key(interp, context, args.get(1))?;
+            let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())?;
-            match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
-                context,
-                target,
-                &key,
-                0,
-                &[&target],
-                &[args],
-            )? {
+            match interp
+                .ordinary_get_own_property_descriptor_value(stack, context, target, &key, 0)?
+            {
                 None => Ok(Value::undefined()),
                 Some(desc) => {
                     let flags = desc.flags;
@@ -158,8 +155,11 @@ pub fn call(
                             (*setter).unwrap_or(Value::undefined()),
                         ],
                     };
-                    let obj =
-                        interp.alloc_runtime_rooted_object_with_roots(&[], &[&descriptor_roots])?;
+                    let obj = interp.alloc_stack_rooted_object_with_value_roots(
+                        stack,
+                        &[],
+                        descriptor_roots.as_slice(),
+                    )?;
                     match &desc.kind {
                         crate::object::DescriptorKind::Data { .. } => {
                             let mut external_visit =
@@ -221,7 +221,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.getprototypeof>
         M::GetPrototypeOf => {
             let target = expect_object_value(args.first())?;
-            interp.ordinary_get_prototype_value(context, target, 0)
+            interp.ordinary_get_prototype_value(stack, context, target, 0)
         }
         // §28.1.9 Reflect.has(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.has>
@@ -231,32 +231,37 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())?;
-            let key = coerce_property_key(interp, context, args.get(1))?;
+            let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())?;
-            let present = interp.ordinary_has_property_value(context, target, &key, 0)?;
+            let present = interp.ordinary_has_property_value(stack, context, target, &key, 0)?;
             Ok(Value::boolean(present))
         }
         // §28.1.10 Reflect.isExtensible(target)
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
         M::IsExtensible => {
             let target = expect_object_value(args.first())?;
-            let ext = interp.is_extensible_value(context, &target)?;
+            let ext = interp.is_extensible_value(stack, context, &target)?;
             Ok(Value::boolean(ext))
         }
         // §28.1.11 Reflect.ownKeys(target)
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
         M::OwnKeys => {
             let target = expect_object_value(args.first())?;
-            let keys = interp.own_property_keys_value(context, &target)?;
+            let keys = interp.own_property_keys_value(stack, context, &target)?;
             Ok(Value::array(
-                interp.alloc_runtime_rooted_array_from_values(keys, &[&target], &[])?,
+                interp.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    keys,
+                    &[&target],
+                    &[args],
+                )?,
             ))
         }
         // §28.1.12 Reflect.preventExtensions(target)
         // <https://tc39.es/ecma262/#sec-reflect.preventextensions>
         M::PreventExtensions => {
             let target = expect_object_value(args.first())?;
-            let ok = interp.prevent_extensions_value(context, &target)?;
+            let ok = interp.prevent_extensions_value(stack, context, &target)?;
             Ok(Value::boolean(ok))
         }
         // §28.1.13 Reflect.set(target, propertyKey, V[, receiver])
@@ -267,7 +272,7 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first())?;
-            let key = coerce_property_key(interp, context, args.get(1))?;
+            let key = coerce_property_key(interp, stack, context, args.get(1))?;
             let target = expect_object_value(args.first())?;
             let value = args.get(2).cloned().unwrap_or(Value::undefined());
             let receiver = args.get(3).cloned().unwrap_or(target);
@@ -296,15 +301,16 @@ pub fn call(
                             return Ok(Value::boolean(false));
                         }
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
-                        interp.run_callable_sync(context, &setter, receiver, argv)?;
+                        interp.run_callable_sync_rooted(stack, context, &setter, receiver, argv)?;
                         return Ok(Value::boolean(true));
                     }
                     crate::object::SetOutcome::Reject { .. } => {
                         return Ok(Value::boolean(false));
                     }
                     crate::object::SetOutcome::ExoticParent { parent } => {
-                        let ok = interp
-                            .ordinary_set_data_value(context, parent, &key, value, receiver, 1)?;
+                        let ok = interp.ordinary_set_data_value(
+                            stack, context, parent, &key, value, receiver, 1,
+                        )?;
                         return Ok(Value::boolean(ok));
                     }
                     crate::object::SetOutcome::AssignData => {
@@ -317,13 +323,8 @@ pub fn call(
                         // original receiver), not a data write on the
                         // receiver.
                         let target_has_own = interp
-                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                context,
-                                target,
-                                &key,
-                                0,
-                                &[&target, &value, &receiver],
-                                &[],
+                            .ordinary_get_own_property_descriptor_value(
+                                stack, context, target, &key, 0,
                             )?
                             .is_some();
                         if !target_has_own
@@ -331,6 +332,7 @@ pub fn call(
                                 interp.first_proxy_in_prototype_chain(target)?
                         {
                             let ok = interp.ordinary_set_data_value(
+                                stack,
                                 context,
                                 proxy_proto,
                                 &key,
@@ -344,12 +346,13 @@ pub fn call(
                         // when target ≠ receiver, the data write lands
                         // on receiver, not target.
                         return Ok(Value::boolean(set_data_on_receiver(
-                            interp, context, &target, &key, value, &receiver,
+                            interp, stack, context, &target, &key, value, &receiver,
                         )?));
                     }
                 }
             }
-            let ok = interp.ordinary_set_data_value(context, target, &key, value, receiver, 0)?;
+            let ok =
+                interp.ordinary_set_data_value(stack, context, target, &key, value, receiver, 0)?;
             Ok(Value::boolean(ok))
         }
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
@@ -363,7 +366,7 @@ pub fn call(
                 v if v.is_object() || v.is_proxy() || v.is_null() => v,
                 _ => return Err(VmError::TypeMismatch),
             };
-            let ok = interp.set_prototype_value_proxy_aware(context, &target, &proto)?;
+            let ok = interp.set_prototype_value_proxy_aware(stack, context, &target, &proto)?;
             Ok(Value::boolean(ok))
         }
     }
@@ -381,6 +384,7 @@ pub fn call(
 /// - <https://tc39.es/ecma262/#sec-ordinarysetwithowndescriptor>
 fn set_data_on_receiver(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     _target: &Value,
     key: &VmPropertyKey,
@@ -388,7 +392,7 @@ fn set_data_on_receiver(
     receiver: &Value,
 ) -> Result<bool, VmError> {
     let _ = _target;
-    interp.ordinary_set_on_receiver(context, key, value, receiver)
+    interp.ordinary_set_on_receiver(stack, context, key, value, receiver)
 }
 
 /// `true` when `value` is a member of the spec type Object — anything
@@ -425,6 +429,7 @@ fn expect_object_value(arg: Option<&Value>) -> Result<Value, VmError> {
 /// ladder's behaviour on simple keys.
 fn coerce_property_key(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     arg: Option<&Value>,
 ) -> Result<VmPropertyKey<'static>, VmError> {
@@ -452,7 +457,7 @@ fn coerce_property_key(
         return Ok(VmPropertyKey::Symbol(sym));
     }
     // Fall through to general coercion path.
-    interp.evaluate_to_property_key(context, v)
+    interp.evaluate_to_property_key(stack, context, v)
 }
 
 /// §7.3.18 CreateListFromArrayLike for the array-like arguments that
@@ -461,6 +466,7 @@ fn coerce_property_key(
 /// with `length` + indexed properties via the shared interpreter helper.
 fn create_list_from_array_like(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     arg: Option<&Value>,
 ) -> Result<SmallVec<[Value; 8]>, VmError> {
@@ -480,7 +486,7 @@ fn create_list_from_array_like(
     if let Some(v) = arg
         && is_type_object(v)
     {
-        return interp.create_list_from_array_like(context, *v);
+        return interp.create_list_from_array_like(stack, context, *v);
     }
     Err(interp.err_type(("argumentsList must be an object".to_string()).into()))
 }
@@ -610,14 +616,17 @@ fn invoke(
     method: otter_bytecode::method_id::ReflectMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let (interp, context) = ctx.interp_mut_and_context();
-    let context = context.ok_or_else(|| NativeError::TypeError {
-        name: "Reflect",
-        reason: "no active execution context".to_string(),
-    })?;
-    match call(interp, &context, method, args) {
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Reflect",
+            reason: "no active execution context".to_string(),
+        })?;
+    let result = ctx.with_turn_parts(|interp, stack| call(interp, stack, &context, method, args));
+    match result {
         Ok(v) => Ok(v),
-        Err(e) => Err(vm_to_native(interp, e)),
+        Err(e) => Err(vm_to_native(ctx.interp_mut(), e)),
     }
 }
 
@@ -763,9 +772,11 @@ mod tests {
         let key =
             Value::string(crate::JsString::from_str("answer", interp.gc_heap_mut()).expect("key"));
         let before = interp.gc_heap().stats().new_allocated_bytes;
+        let mut stack = ActivationStack::new();
 
         let result = call(
             &mut interp,
+            &mut stack,
             &context,
             ReflectMethod::GetOwnPropertyDescriptor,
             &[Value::object(target), key],
@@ -788,9 +799,11 @@ mod tests {
         crate::object::set(&mut target, interp.gc_heap_mut(), "a", Value::boolean(true));
         let context = empty_context();
         let before = interp.gc_heap().stats().new_allocated_bytes;
+        let mut stack = ActivationStack::new();
 
         let result = call(
             &mut interp,
+            &mut stack,
             &context,
             ReflectMethod::OwnKeys,
             &[Value::object(target)],

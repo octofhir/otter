@@ -283,16 +283,21 @@ fn coerce_math_args(
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     for slot in out.iter_mut() {
         if needs_to_primitive_for_math(slot) {
-            let (interp, exec) = ctx.interp_mut_and_context();
-            let exec = exec.ok_or_else(|| NativeError::TypeError {
-                name: "Math",
-                reason: "missing execution context".to_string(),
-            })?;
-            match interp.evaluate_to_primitive(
-                &exec,
-                slot,
-                crate::abstract_ops::ToPrimitiveHint::Number,
-            ) {
+            let exec = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "Math",
+                    reason: "missing execution context".to_string(),
+                })?;
+            match ctx.with_turn_parts(|interp, stack| {
+                interp.evaluate_to_primitive(
+                    stack,
+                    &exec,
+                    slot,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )
+            }) {
                 Ok(primitive) => *slot = primitive,
                 // A user-thrown value (e.g. a throwing `valueOf`) must
                 // propagate intact, not be re-wrapped as a TypeError:
@@ -301,7 +306,9 @@ fn coerce_math_args(
                 // preserves `VmError::Uncaught` as `NativeError::Thrown`.
                 Err(e) => {
                     return Err(crate::native_function::vm_to_native_error(
-                        interp, e, "Math",
+                        ctx.interp_mut(),
+                        e,
+                        "Math",
                     ));
                 }
             }
@@ -732,85 +739,88 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     use crate::native_function::vm_to_native_error;
 
     let items = args.first().copied().unwrap_or_else(Value::undefined);
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: "Math.sumPrecise",
-        reason: "missing execution context".to_string(),
-    })?;
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Math.sumPrecise",
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.with_turn_parts(|interp, stack| {
+        // step — GetIterator(items, sync). Rejects non-iterables (and the
+        // `Math.sumPrecise()` / `{}` cases) with a TypeError.
+        let iter_result = interp.get_iterator_sync(stack, &exec, &items);
+        let (iterator, next) =
+            iter_result.map_err(|e| vm_to_native_error(interp, e, "Math.sumPrecise"))?;
 
-    // step — GetIterator(items, sync). Rejects non-iterables (and the
-    // `Math.sumPrecise()` / `{}` cases) with a TypeError.
-    let iter_result = interp.get_iterator_sync(&exec, &items);
-    let (iterator, next) =
-        iter_result.map_err(|e| vm_to_native_error(interp, e, "Math.sumPrecise"))?;
+        let mut state = SumState::MinusZero;
+        let mut acc = num_bigint::BigInt::from(0);
+        let mut count: u64 = 0;
 
-    let mut state = SumState::MinusZero;
-    let mut acc = num_bigint::BigInt::from(0);
-    let mut count: u64 = 0;
-
-    loop {
-        match interp.iterator_step_sync(&exec, &iterator, &next) {
-            Ok(None) => break,
-            Ok(Some(value)) => {
-                count += 1;
-                // step — count is bounded by 2^53 - 1.
-                if count >= (1u64 << 53) {
-                    let _ = interp.iterator_close_sync(&exec, &iterator);
-                    return Err(NativeError::RangeError {
-                        name: "Math.sumPrecise",
-                        reason: "input exceeds 2^53 - 1 elements".to_string(),
-                    });
-                }
-                // step — every element must be a Number, checked before
-                // any state transition and without coercion. A non-Number
-                // closes the iterator, then throws.
-                let Some(n) = value.as_number() else {
-                    let _ = interp.iterator_close_sync(&exec, &iterator);
-                    return Err(NativeError::TypeError {
-                        name: "Math.sumPrecise",
-                        reason: "every element must be a Number".to_string(),
-                    });
-                };
-                if state == SumState::NotANumber {
-                    continue;
-                }
-                let n = n.as_f64();
-                if n.is_nan() {
-                    state = SumState::NotANumber;
-                } else if n == f64::INFINITY {
-                    state = if state == SumState::MinusInfinity {
-                        SumState::NotANumber
-                    } else {
-                        SumState::PlusInfinity
+        loop {
+            match interp.iterator_step_sync(stack, &exec, &iterator, &next) {
+                Ok(None) => break,
+                Ok(Some(value)) => {
+                    count += 1;
+                    // step — count is bounded by 2^53 - 1.
+                    if count >= (1u64 << 53) {
+                        let _ = interp.iterator_close_sync(stack, &exec, &iterator);
+                        return Err(NativeError::RangeError {
+                            name: "Math.sumPrecise",
+                            reason: "input exceeds 2^53 - 1 elements".to_string(),
+                        });
+                    }
+                    // step — every element must be a Number, checked before
+                    // any state transition and without coercion. A non-Number
+                    // closes the iterator, then throws.
+                    let Some(n) = value.as_number() else {
+                        let _ = interp.iterator_close_sync(stack, &exec, &iterator);
+                        return Err(NativeError::TypeError {
+                            name: "Math.sumPrecise",
+                            reason: "every element must be a Number".to_string(),
+                        });
                     };
-                } else if n == f64::NEG_INFINITY {
-                    state = if state == SumState::PlusInfinity {
-                        SumState::NotANumber
-                    } else {
-                        SumState::MinusInfinity
-                    };
-                } else if (state == SumState::MinusZero || state == SumState::Finite)
-                    && !(n == 0.0 && n.is_sign_negative())
-                {
-                    // Finite, non-(-0) addend joins the exact sum.
-                    state = SumState::Finite;
-                    add_finite_f64(&mut acc, n);
+                    if state == SumState::NotANumber {
+                        continue;
+                    }
+                    let n = n.as_f64();
+                    if n.is_nan() {
+                        state = SumState::NotANumber;
+                    } else if n == f64::INFINITY {
+                        state = if state == SumState::MinusInfinity {
+                            SumState::NotANumber
+                        } else {
+                            SumState::PlusInfinity
+                        };
+                    } else if n == f64::NEG_INFINITY {
+                        state = if state == SumState::PlusInfinity {
+                            SumState::NotANumber
+                        } else {
+                            SumState::MinusInfinity
+                        };
+                    } else if (state == SumState::MinusZero || state == SumState::Finite)
+                        && !(n == 0.0 && n.is_sign_negative())
+                    {
+                        // Finite, non-(-0) addend joins the exact sum.
+                        state = SumState::Finite;
+                        add_finite_f64(&mut acc, n);
+                    }
                 }
+                // IteratorStepValue threw: the record is already closed by
+                // the protocol; propagate without re-closing.
+                Err(e) => return Err(vm_to_native_error(interp, e, "Math.sumPrecise")),
             }
-            // IteratorStepValue threw: the record is already closed by
-            // the protocol; propagate without re-closing.
-            Err(e) => return Err(vm_to_native_error(interp, e, "Math.sumPrecise")),
         }
-    }
 
-    let result = match state {
-        SumState::NotANumber => f64::NAN,
-        SumState::PlusInfinity => f64::INFINITY,
-        SumState::MinusInfinity => f64::NEG_INFINITY,
-        SumState::MinusZero => -0.0,
-        SumState::Finite => scaled_bigint_to_f64(&acc),
-    };
-    Ok(Value::number(NumberValue::from_f64(result)))
+        let result = match state {
+            SumState::NotANumber => f64::NAN,
+            SumState::PlusInfinity => f64::INFINITY,
+            SumState::MinusInfinity => f64::NEG_INFINITY,
+            SumState::MinusZero => -0.0,
+            SumState::Finite => scaled_bigint_to_f64(&acc),
+        };
+        Ok(Value::number(NumberValue::from_f64(result)))
+    })
 }
 
 /// §21.3.2.16 `Math.f16round(x)` — round `x` to the nearest IEEE-754

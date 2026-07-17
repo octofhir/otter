@@ -475,13 +475,19 @@ fn coerce_format_arg(ctx: &mut NativeCtx<'_>, first: Option<&Value>) -> Result<f
             .unwrap_or(f64::NAN));
     }
     let value = *value;
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: "format",
-        reason: "missing execution context".to_string(),
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "format",
+            reason: "missing execution context".to_string(),
+        })?;
+    let number = ctx.with_turn_parts(|interp, stack| {
+        crate::coerce::to_number_or_throw(interp, stack, &exec, &value)
+    });
+    let n = number.map_err(|error| {
+        crate::native_function::vm_to_native_error(ctx.interp_mut(), error, "format")
     })?;
-    let n = crate::coerce::to_number_or_throw(interp, &exec, &value)
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, "format"))?;
     Ok(n.as_f64())
 }
 

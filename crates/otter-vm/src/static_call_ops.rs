@@ -199,7 +199,7 @@ impl Interpreter {
             let target = *read_register(frame, src)?;
             (dst, target)
         };
-        let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
+        let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
         let args_root = [target];
         let names = self.scoped_key_strings(&keys)?;
         let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
@@ -231,7 +231,7 @@ impl Interpreter {
             )
         };
         let args = [target, src];
-        let _ = self.do_object_assign(context, Some(stack), &args)?;
+        let _ = self.do_object_assign(context, stack, &args)?;
         let frame = &mut stack[top_idx];
         frame.advance_pc()?;
         Ok(())
@@ -268,7 +268,7 @@ impl Interpreter {
         let target = *read_register(&stack[frame_index], target_reg)?;
         if target.is_object() {
             let existing: std::collections::HashSet<String> = self
-                .enumerable_own_string_keys_for_value(context, target, 0)?
+                .enumerable_own_string_keys_for_value(stack, context, target, 0)?
                 .into_iter()
                 .collect();
             let src = *read_register(&stack[frame_index], src_reg)?;
@@ -276,7 +276,7 @@ impl Interpreter {
                 stack[frame_index].advance_pc()?;
                 return Ok(());
             }
-            let names = self.enumerable_own_string_keys_for_value(context, src, 0)?;
+            let names = self.enumerable_own_string_keys_for_value(stack, context, src, 0)?;
             for name in names {
                 if name == "default" || existing.contains(&name) {
                     continue;
@@ -330,16 +330,12 @@ impl Interpreter {
         key_reg: u16,
         descriptor_reg: u16,
     ) -> Result<(), VmError> {
-        let frame = stack.get_mut(frame_index).ok_or(VmError::InvalidOperand)?;
-        let mut frame = ActiveFrameMut::materialized(frame);
-        self.run_define_own_property_active(
-            context,
-            &mut frame,
-            target_reg,
-            key_reg,
-            descriptor_reg,
-        )?;
-        frame.advance_pc()
+        let frame = stack.get(frame_index).ok_or(VmError::InvalidOperand)?;
+        let target = *read_register(frame, target_reg)?;
+        let key_value = *read_register(frame, key_reg)?;
+        let desc_value = *read_register(frame, descriptor_reg)?;
+        self.define_own_property_values(stack, context, target, key_value, desc_value)?;
+        stack[frame_index].advance_pc()
     }
 
     /// Apply a property descriptor through the canonical activation.
@@ -350,6 +346,7 @@ impl Interpreter {
     /// the descriptor conversion.
     pub(crate) fn run_define_own_property_active(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         frame: &mut ActiveFrameMut<'_>,
         target_reg: u16,
@@ -359,6 +356,17 @@ impl Interpreter {
         let target = frame.read(target_reg)?;
         let key_value = frame.read(key_reg)?;
         let desc_value = frame.read(descriptor_reg)?;
+        self.define_own_property_values(stack, context, target, key_value, desc_value)
+    }
+
+    fn define_own_property_values(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        target: Value,
+        key_value: Value,
+        desc_value: Value,
+    ) -> Result<(), VmError> {
         if !target.is_object_type() {
             return Err(
                 self.err_type(("DefineOwnProperty target must be an object".to_string()).into())
@@ -373,7 +381,11 @@ impl Interpreter {
             let target = interp.scoped_value(scope, target);
             let key_value = interp.scoped_value(scope, key_value);
             let desc_value = interp.scoped_value(scope, desc_value);
-            let key = interp.evaluate_to_property_key(context, &interp.escape_scoped(key_value))?;
+            let key = interp.evaluate_to_property_key(
+                stack,
+                context,
+                &interp.escape_scoped(key_value),
+            )?;
             let key = match key {
                 VmPropertyKey::Symbol(symbol) => {
                     RootedKey::Symbol(interp.scoped_value(scope, Value::symbol(symbol)))
@@ -382,8 +394,11 @@ impl Interpreter {
                 VmPropertyKey::String(name) => RootedKey::String(name.to_string()),
                 VmPropertyKey::OwnedString(name) => RootedKey::String(name),
             };
-            let descriptor = interp
-                .evaluate_to_property_descriptor(context, &interp.escape_scoped(desc_value))?;
+            let descriptor = interp.evaluate_to_property_descriptor(
+                stack,
+                context,
+                &interp.escape_scoped(desc_value),
+            )?;
             let key = match key {
                 RootedKey::String(name) => VmPropertyKey::OwnedString(name),
                 RootedKey::Symbol(symbol) => VmPropertyKey::Symbol(
@@ -394,7 +409,7 @@ impl Interpreter {
                 ),
             };
             let target = interp.escape_scoped(target);
-            if !interp.define_own_property_value(context, &target, &key, descriptor)? {
+            if !interp.define_own_property_value(stack, context, &target, &key, descriptor)? {
                 return Err(interp.err_type(("Cannot define property".to_string()).into()));
             }
             Ok(())
@@ -421,7 +436,7 @@ impl Interpreter {
     pub(crate) fn do_object_create_with_descriptors(
         &mut self,
         context: &ExecutionContext,
-        stack: Option<&ActivationStack>,
+        stack: &mut ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::undefined());
@@ -436,12 +451,7 @@ impl Interpreter {
         if !proto.is_object_type() && !proto.is_null() {
             return Err(VmError::TypeMismatch);
         }
-        let obj = match stack {
-            Some(stack) => {
-                self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?
-            }
-            None => self.alloc_runtime_rooted_object_with_roots(&[&proto], &[args])?,
-        };
+        let obj = self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?;
         let proto_value = if proto.is_null() { None } else { Some(proto) };
         if !object::set_prototype_value(obj, &mut self.gc_heap, proto_value) {
             return Err(self.err_type(("Object.create failed".to_string()).into()));
@@ -455,19 +465,21 @@ impl Interpreter {
             // `toString` / accessor getters fire per §6.2.5.5
             // ToPropertyDescriptor.
             let props_owned = *props_arg;
-            let keys = own_enumerable_keys_for_define(self, context, &props_owned)?;
+            let keys = own_enumerable_keys_for_define(self, stack, context, &props_owned)?;
             for key in keys {
                 let outcome =
-                    self.ordinary_get_value(context, props_owned, props_owned, &key, 0)?;
+                    self.ordinary_get_value(stack, context, props_owned, props_owned, &key, 0)?;
                 let desc_value = match outcome {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, props_owned, args)?
+                        self.run_callable_sync_rooted(stack, context, &getter, props_owned, args)?
                     }
                 };
-                let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
+                let descriptor =
+                    self.evaluate_to_property_descriptor(stack, context, &desc_value)?;
                 if !self.define_own_property_value(
+                    stack,
                     context,
                     &Value::object(obj),
                     &key,
@@ -499,7 +511,7 @@ impl Interpreter {
     pub(crate) fn do_object_define_properties(
         &mut self,
         context: &ExecutionContext,
-        _stack: Option<&ActivationStack>,
+        stack: &mut ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_value = args.first().cloned().unwrap_or(Value::undefined());
@@ -527,23 +539,25 @@ impl Interpreter {
                 ("Object.defineProperties properties must be an object".to_string()).into(),
             ));
         }
-        let keys = own_enumerable_keys_for_define(self, context, &props_value)?;
+        let keys = own_enumerable_keys_for_define(self, stack, context, &props_value)?;
         for key in keys {
             // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
             // and step 5 — `ToPropertyDescriptor(descObj)` reads the
             // accessor / data fields off the resolved value. Thread
             // both through the interpreter so user getters fire and
             // any abrupt completion propagates.
-            let outcome = self.ordinary_get_value(context, props_value, props_value, &key, 0)?;
+            let outcome =
+                self.ordinary_get_value(stack, context, props_value, props_value, &key, 0)?;
             let desc_value = match outcome {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
                     let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    self.run_callable_sync(context, &getter, props_value, args)?
+                    self.run_callable_sync_rooted(stack, context, &getter, props_value, args)?
                 }
             };
-            let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-            let ok = self.define_own_property_value(context, &target_value, &key, descriptor)?;
+            let descriptor = self.evaluate_to_property_descriptor(stack, context, &desc_value)?;
+            let ok =
+                self.define_own_property_value(stack, context, &target_value, &key, descriptor)?;
             if !ok {
                 return Err(self.err_type(
                     (format!(
@@ -574,7 +588,7 @@ impl Interpreter {
     pub(crate) fn do_object_assign(
         &mut self,
         context: &ExecutionContext,
-        stack: Option<&ActivationStack>,
+        stack: &mut ActivationStack,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_input = args.first().cloned().unwrap_or(Value::undefined());
@@ -589,15 +603,7 @@ impl Interpreter {
                 self.err_type(("Object.assign called on null or undefined".to_string()).into())
             );
         } else {
-            let arg_slice = args;
-            match stack {
-                Some(stack) => {
-                    self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[arg_slice])?
-                }
-                None => {
-                    self.box_sloppy_this_primitive_runtime_rooted(target_input, &[arg_slice])?
-                }
-            }
+            self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[args])?
         };
         // Cache the object form when applicable so the existing
         // `ordinary_set_with_callable_setter` fast path keeps working
@@ -622,6 +628,7 @@ impl Interpreter {
                             .map_err(|_| VmError::TypeMismatch)?;
                     assign_set_string(
                         self,
+                        stack,
                         context,
                         &target_value,
                         target_object,
@@ -630,7 +637,7 @@ impl Interpreter {
                     )?;
                 }
             } else if assign_source_uses_own_property_keys(src) {
-                assign_copy_source_keys(self, context, &target_value, target_object, src, args)?;
+                assign_copy_source_keys(self, stack, context, &target_value, target_object, src)?;
             } else {
                 // Primitive Boolean / Number / Symbol / BigInt
                 // wrappers have no enumerable own properties in
@@ -660,7 +667,7 @@ impl Interpreter {
         match method {
             M::ForInKeys => {
                 let target = args.first().cloned().unwrap_or(Value::undefined());
-                let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
+                let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
                 let names = self.scoped_key_strings(&keys)?;
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
@@ -700,7 +707,7 @@ impl Interpreter {
                         (0..len).map(|i| i.to_string()).collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
-                        self.enumerable_own_string_keys_for_value(context, *target, 0)?
+                        self.enumerable_own_string_keys_for_value(stack, context, *target, 0)?
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
@@ -746,7 +753,7 @@ impl Interpreter {
                             .collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
-                        enumerable_own_string_entries(self, context, target, args)?
+                        enumerable_own_string_entries(self, stack, context, target)?
                             .into_iter()
                             .map(|(_, value)| value)
                             .collect()
@@ -799,7 +806,7 @@ impl Interpreter {
                             .collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
-                        enumerable_own_string_entries(self, context, target, args)?
+                        enumerable_own_string_entries(self, stack, context, target)?
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
@@ -862,16 +869,17 @@ impl Interpreter {
                     object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
                 }
 
-                let (iterator, next_method) = self.get_iterator_sync(context, &iter)?;
+                let (iterator, next_method) = self.get_iterator_sync(stack, context, &iter)?;
 
                 loop {
-                    let stepped = self.iterator_step_sync(context, &iterator, &next_method)?;
+                    let stepped =
+                        self.iterator_step_sync(stack, context, &iterator, &next_method)?;
                     let Some(entry) = stepped else {
                         break;
                     };
 
                     if !entry.is_object_type() {
-                        let _ = self.iterator_close_sync(context, &iterator);
+                        let _ = self.iterator_close_sync(stack, context, &iterator);
                         return Err(self.err_type(
                             ("Object.fromEntries: iterator value is not an entry object"
                                 .to_string())
@@ -879,25 +887,25 @@ impl Interpreter {
                         ));
                     }
 
-                    let key = match read_indexed_entry(self, context, &entry, "0") {
+                    let key = match read_indexed_entry(self, stack, context, &entry, "0") {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = self.iterator_close_sync(context, &iterator);
+                            let _ = self.iterator_close_sync(stack, context, &iterator);
                             return Err(e);
                         }
                     };
-                    let value = match read_indexed_entry(self, context, &entry, "1") {
+                    let value = match read_indexed_entry(self, stack, context, &entry, "1") {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = self.iterator_close_sync(context, &iterator);
+                            let _ = self.iterator_close_sync(stack, context, &iterator);
                             return Err(e);
                         }
                     };
 
-                    let key_pk = match self.to_property_key_sync(context, key) {
+                    let key_pk = match self.to_property_key_sync(stack, context, key) {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = self.iterator_close_sync(context, &iterator);
+                            let _ = self.iterator_close_sync(stack, context, &iterator);
                             return Err(e);
                         }
                     };
@@ -915,7 +923,7 @@ impl Interpreter {
                         }
                     };
                     if let Err(e) = set_result {
-                        let _ = self.iterator_close_sync(context, &iterator);
+                        let _ = self.iterator_close_sync(stack, context, &iterator);
                         return Err(e);
                     }
                 }
@@ -951,8 +959,8 @@ impl Interpreter {
                     // [[GetOwnProperty]] there also surfaces the synthetic
                     // `prototype` / `name` / `length` own properties
                     // (§10.2.4 / §15.7) the statics table does not store.
-                    self.ordinary_get_own_property_descriptor_value_stack_rooted(
-                        context, stack, *target, &key, 0,
+                    self.ordinary_get_own_property_descriptor_value(
+                        stack, context, *target, &key, 0,
                     )?
                 } else if let Some(native) = target.as_native_function() {
                     match &key {
@@ -1116,7 +1124,7 @@ impl Interpreter {
                         // `own_property_keys_value`, then read each descriptor
                         // through the target's `[[GetOwnProperty]]`.
                         let target_value = interp.escape_scoped(target_h);
-                        let keys = interp.own_property_keys_value(context, &target_value)?;
+                        let keys = interp.own_property_keys_value(stack, context, &target_value)?;
                         // Park every key before the first descriptor allocation:
                         // the fresh young key strings would otherwise dangle.
                         let mut key_handles: Vec<Local> = Vec::with_capacity(keys.len());
@@ -1135,15 +1143,13 @@ impl Interpreter {
                                 continue;
                             };
                             let target_value = interp.escape_scoped(target_h);
-                            let desc = interp
-                                .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                    context,
-                                    target_value,
-                                    &vm_key,
-                                    0,
-                                    &[],
-                                    &[],
-                                )?;
+                            let desc = interp.ordinary_get_own_property_descriptor_value(
+                                stack,
+                                context,
+                                target_value,
+                                &vm_key,
+                                0,
+                            )?;
                             let Some(desc) = desc else {
                                 continue;
                             };
@@ -1188,7 +1194,7 @@ impl Interpreter {
                     keys.push("length".to_string());
                     keys
                 } else if own_property_names_uses_internal_methods(target) {
-                    self.own_property_keys_value(context, target)?
+                    self.own_property_keys_value(stack, context, target)?
                         .into_iter()
                         .filter_map(|key| {
                             key.as_string(&self.gc_heap)
@@ -1228,7 +1234,7 @@ impl Interpreter {
                 {
                     Vec::new()
                 } else if own_property_names_uses_internal_methods(target) {
-                    self.own_property_keys_value(context, target)?
+                    self.own_property_keys_value(stack, context, target)?
                         .into_iter()
                         .filter(|key| key.is_symbol())
                         .collect()
@@ -1283,8 +1289,14 @@ impl Interpreter {
             cb_args.push(Value::number(crate::number::NumberValue::from_f64(
                 idx as f64,
             )));
-            let key = self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
-            let key_pk = self.to_property_key_sync(context, key)?;
+            let key = self.run_callable_sync_rooted(
+                stack,
+                context,
+                &callback,
+                Value::undefined(),
+                cb_args,
+            )?;
+            let key_pk = self.to_property_key_sync(stack, context, key)?;
             let key_str = match key_pk {
                 crate::VmPropertyKey::Symbol(sym) => {
                     let existing = crate::object::get_symbol(result, &self.gc_heap, sym);
@@ -1438,6 +1450,7 @@ impl Interpreter {
 /// accessor-aware path.
 fn own_enumerable_keys_for_define(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     props: &Value,
 ) -> Result<Vec<VmPropertyKey<'static>>, VmError> {
@@ -1453,11 +1466,12 @@ fn own_enumerable_keys_for_define(
         || props.is_regexp()
         || props.is_proxy()
     {
-        let keys = interp.own_property_keys_value(context, props)?;
+        let keys = interp.own_property_keys_value(stack, context, props)?;
         let mut out = Vec::new();
         for key in keys {
             let vm_key = value_to_static_property_key(interp, &key, interp.gc_heap())?;
-            let desc = interp.get_own_property_descriptor_for_value(context, *props, Some(&key))?;
+            let desc =
+                interp.get_own_property_descriptor_for_value(stack, context, *props, Some(&key))?;
             if desc.is_some_and(|desc| desc.enumerable()) {
                 out.push(vm_key);
             }
@@ -1590,11 +1604,11 @@ fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
 
 pub(crate) fn enumerable_own_string_entries(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     target: &Value,
-    args: &[Value],
 ) -> Result<Vec<(String, Value)>, VmError> {
-    let keys = interp.own_property_keys_value(context, target)?;
+    let keys = interp.own_property_keys_value(stack, context, target)?;
     let mut entries = Vec::new();
     for key_value in &keys {
         let Some(name) = key_value.as_string(interp.gc_heap()) else {
@@ -1602,25 +1616,23 @@ pub(crate) fn enumerable_own_string_entries(
         };
         let key_name = name.to_lossy_string(interp.gc_heap());
         let key = VmPropertyKey::OwnedString(key_name.clone());
-        let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
-            context,
-            *target,
-            &key,
-            0,
-            &[target],
-            &[args, keys.as_slice()],
-        )?;
+        let desc =
+            interp.ordinary_get_own_property_descriptor_value(stack, context, *target, &key, 0)?;
         let Some(desc) = desc else {
             continue;
         };
         if !desc.enumerable() {
             continue;
         }
-        let value = match interp.ordinary_get_value(context, *target, *target, &key, 0)? {
+        let value = match interp.ordinary_get_value(stack, context, *target, *target, &key, 0)? {
             crate::VmGetOutcome::Value(value) => value,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                interp.run_callable_sync(context, &getter, *target, SmallVec::new())?
-            }
+            crate::VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &getter,
+                *target,
+                SmallVec::new(),
+            )?,
         };
         entries.push((key_name, value));
     }
@@ -1633,13 +1645,13 @@ fn assign_source_uses_own_property_keys(source: &Value) -> bool {
 
 fn assign_copy_source_keys(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     target_value: &Value,
     target_object: Option<crate::object::JsObject>,
     source: &Value,
-    args: &[Value],
 ) -> Result<(), VmError> {
-    let keys = interp.own_property_keys_value(context, source)?;
+    let keys = interp.own_property_keys_value(stack, context, source)?;
     for key_value in &keys {
         let key = if let Some(s) = key_value.as_string(interp.gc_heap()) {
             VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap()))
@@ -1650,33 +1662,40 @@ fn assign_copy_source_keys(
                 ("Object.assign source ownKeys returned non-property key".to_string()).into(),
             ));
         };
-        let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
-            context,
-            *source,
-            &key,
-            0,
-            &[target_value, source],
-            &[args, keys.as_slice()],
-        )?;
+        let desc =
+            interp.ordinary_get_own_property_descriptor_value(stack, context, *source, &key, 0)?;
         let Some(desc) = desc else {
             continue;
         };
         if !desc.enumerable() {
             continue;
         }
-        let value = match interp.ordinary_get_value(context, *source, *source, &key, 0)? {
+        let value = match interp.ordinary_get_value(stack, context, *source, *source, &key, 0)? {
             crate::VmGetOutcome::Value(value) => value,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                interp.run_callable_sync(context, &getter, *source, SmallVec::new())?
-            }
+            crate::VmGetOutcome::InvokeGetter { getter } => interp.run_callable_sync_rooted(
+                stack,
+                context,
+                &getter,
+                *source,
+                SmallVec::new(),
+            )?,
         };
         match &key {
             VmPropertyKey::Symbol(sym) => {
-                assign_set_symbol(interp, context, target_value, target_object, *sym, value)?;
+                assign_set_symbol(
+                    interp,
+                    stack,
+                    context,
+                    target_value,
+                    target_object,
+                    *sym,
+                    value,
+                )?;
             }
             _ => {
                 assign_set_string(
                     interp,
+                    stack,
                     context,
                     target_value,
                     target_object,
@@ -1704,6 +1723,7 @@ fn assign_copy_source_keys(
 /// `strict` is implicit-`true` per §20.1.2.1 step 4.c.iii.2.b.
 fn assign_set_string(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     target_value: &Value,
     target_object: Option<crate::object::JsObject>,
@@ -1719,11 +1739,11 @@ fn assign_set_string(
                 interp.err_type((format!("Cannot assign to read-only property '{key}'")).into())
             );
         }
-        return interp.ordinary_set_with_callable_setter(context, obj, key, value, true);
+        return interp.ordinary_set_with_callable_setter(stack, context, obj, key, value, true);
     }
     if let Some(arr) = target_value.as_array() {
         if key == "length" {
-            let number_len = crate::coerce::to_number_or_throw(interp, context, &value)?;
+            let number_len = crate::coerce::to_number_or_throw(interp, stack, context, &value)?;
             let new_len = crate::number::bitwise::to_uint32(number_len);
             if (new_len as f64) != number_len.as_f64() {
                 return Err(interp.err_range(("Invalid array length".to_string()).into()));
@@ -1743,6 +1763,7 @@ fn assign_set_string(
     }
     let property_key = VmPropertyKey::String(key);
     if interp.ordinary_set_data_value(
+        stack,
         context,
         *target_value,
         &property_key,
@@ -1764,6 +1785,7 @@ fn assign_set_string(
 
 fn assign_set_symbol(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     target_value: &Value,
     target_object: Option<crate::object::JsObject>,
@@ -1771,7 +1793,8 @@ fn assign_set_symbol(
     value: Value,
 ) -> Result<(), VmError> {
     if let Some(obj) = target_object {
-        return interp.ordinary_set_symbol_with_callable_setter(context, obj, sym, value, true);
+        return interp
+            .ordinary_set_symbol_with_callable_setter(stack, context, obj, sym, value, true);
     }
     if let Some(arr) = target_value.as_array() {
         crate::array::set_symbol_property(arr, &mut interp.gc_heap, sym, value);
@@ -1779,6 +1802,7 @@ fn assign_set_symbol(
     }
     let property_key = VmPropertyKey::Symbol(sym);
     if interp.ordinary_set_data_value(
+        stack,
         context,
         *target_value,
         &property_key,
@@ -1803,16 +1827,23 @@ fn assign_set_symbol(
 /// `ordinary_get_value` outcome ladder.
 fn read_indexed_entry(
     interp: &mut Interpreter,
+    stack: &mut ActivationStack,
     context: &ExecutionContext,
     target: &Value,
     name: &str,
 ) -> Result<Value, VmError> {
-    let outcome =
-        interp.ordinary_get_value(context, *target, *target, &VmPropertyKey::String(name), 0)?;
+    let outcome = interp.ordinary_get_value(
+        stack,
+        context,
+        *target,
+        *target,
+        &VmPropertyKey::String(name),
+        0,
+    )?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, *target, SmallVec::new())
+            interp.run_callable_sync_rooted(stack, context, &getter, *target, SmallVec::new())
         }
     }
 }

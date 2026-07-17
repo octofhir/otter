@@ -81,16 +81,18 @@ fn dynamic_function_ctor_call(
     kind: crate::eval_ops::DynamicFunctionKind,
 ) -> Result<Value, NativeError> {
     let new_target_proto = crate::bootstrap::native_new_target_prototype(ctx, "Function")?;
-    let (interp, context) = ctx.interp_mut_and_context();
-    let Some(context) = context else {
+    let Some(context) = ctx.execution_context().cloned() else {
         return Err(NativeError::TypeError {
             name: "Function",
             reason: "missing execution context for Function constructor".to_string(),
         });
     };
-    let result = interp
-        .build_dynamic_function(&context, args, kind)
-        .map_err(|err| {
+    ctx.scope(|mut scope| {
+        let new_target_proto = new_target_proto.map(|prototype| scope.value(prototype));
+        let result = scope.with_turn_parts(|interp, stack| {
+            interp.build_dynamic_function(stack, &context, args, kind)
+        });
+        let result = result.map_err(|err| {
             let reason = format!("{err}");
             match err {
                 crate::VmError::SyntaxError => NativeError::SyntaxError {
@@ -103,12 +105,18 @@ fn dynamic_function_ctor_call(
                 },
             }
         })?;
-    if let (Some(native), Some(proto)) = (result.as_native_function(), new_target_proto) {
-        native.set_prototype_override(interp.gc_heap_mut(), Some(proto));
-    } else {
-        interp.set_function_prototype_override(&result, new_target_proto);
-    }
-    Ok(result)
+        let result_handle = scope.value(result);
+        let result = scope.raw(result_handle);
+        let new_target_proto = new_target_proto.map(|prototype| scope.raw(prototype));
+        scope.with_turn_parts(|interp, _| {
+            if let (Some(native), Some(proto)) = (result.as_native_function(), new_target_proto) {
+                native.set_prototype_override(interp.gc_heap_mut(), Some(proto));
+            } else {
+                interp.set_function_prototype_override(&result, new_target_proto);
+            }
+        });
+        Ok(scope.finish(result_handle))
+    })
 }
 
 /// Post-bootstrap fixup for §20.2.3 `%Function.prototype%`:

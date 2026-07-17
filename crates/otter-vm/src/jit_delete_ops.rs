@@ -56,7 +56,12 @@ impl Interpreter {
                 if receiver.as_object().is_some_and(|o| {
                     crate::object::deferred_namespace_target(o, &self.gc_heap).is_some()
                 }) {
-                    self.ensure_deferred_namespace_ready(context, &receiver, key.name() != "then")?;
+                    self.ensure_deferred_namespace_ready(
+                        stack,
+                        context,
+                        &receiver,
+                        key.name() != "then",
+                    )?;
                 }
                 let ops = [
                     Operand::Register(dst),
@@ -85,7 +90,7 @@ impl Interpreter {
                         || key_val
                             .as_string(&self.gc_heap)
                             .is_some_and(|s| s.to_lossy_string(&self.gc_heap) == "then");
-                    self.ensure_deferred_namespace_ready(context, &receiver, !symbol_like)?;
+                    self.ensure_deferred_namespace_ready(stack, context, &receiver, !symbol_like)?;
                 }
                 let ops = [
                     Operand::Register(dst),

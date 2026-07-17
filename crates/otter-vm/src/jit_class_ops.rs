@@ -16,8 +16,8 @@
 use otter_bytecode::Op;
 
 use crate::{
-    ExecutionContext, Interpreter, JsString, Value, VmError, abstract_ops,
-    activation_stack::ActivationStack, object, read_register,
+    ExecutionContext, Interpreter, VmError, abstract_ops, activation_stack::ActivationStack,
+    object, read_register,
 };
 
 impl Interpreter {
@@ -144,22 +144,28 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         }) {
-            let owner = callee.as_closure(&self.gc_heap);
-            let name_str = JsString::from_str(&name, &mut self.gc_heap)?;
-            let descriptor = object::PropertyDescriptor {
-                kind: object::DescriptorKind::Data {
-                    value: Value::string(name_str),
-                },
-                flags: object::PropertyFlags::new(false, false, true),
-            };
-            self.ordinary_function_define_own_property(
-                Some(context),
-                owner,
-                fid,
-                "name",
-                None,
-                descriptor,
-            )?;
+            self.with_handle_scope(|interp, scope| {
+                let callee = interp.scoped_value(scope, callee);
+                let name = interp.scoped_string(scope, &name)?;
+                let callee = interp.escape_scoped(callee);
+                let owner = callee.as_closure(&interp.gc_heap);
+                let descriptor = object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Data {
+                        value: interp.escape_scoped(name),
+                    },
+                    flags: object::PropertyFlags::new(false, false, true),
+                };
+                interp.ordinary_function_define_own_property(
+                    stack,
+                    Some(context),
+                    owner,
+                    fid,
+                    "name",
+                    None,
+                    descriptor,
+                )?;
+                Ok::<(), VmError>(())
+            })?;
         }
         stack[top_idx].advance_pc()?;
         Ok(())

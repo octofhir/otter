@@ -150,23 +150,22 @@ fn native_call(
         use otter_bytecode::method_id::ObjectMethod as M;
         match method {
             M::Create => {
-                let create_result = ctx
-                    .cx
-                    .interp
-                    .do_object_create_with_descriptors(context, None, args);
+                let create_result = ctx.with_turn_parts(|interp, stack| {
+                    interp.do_object_create_with_descriptors(context, stack, args)
+                });
                 return create_result
                     .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
             }
             M::DefineProperties => {
-                let define_result = ctx
-                    .cx
-                    .interp
-                    .do_object_define_properties(context, None, args);
+                let define_result = ctx.with_turn_parts(|interp, stack| {
+                    interp.do_object_define_properties(context, stack, args)
+                });
                 return define_result
                     .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
             }
             M::Assign => {
-                let assign_result = ctx.cx.interp.do_object_assign(context, None, args);
+                let assign_result = ctx
+                    .with_turn_parts(|interp, stack| interp.do_object_assign(context, stack, args));
                 return assign_result
                     .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err));
             }
@@ -192,7 +191,9 @@ fn native_call(
                     || key_arg.is_undefined()
                     || key_arg.is_symbol());
                 if needs_coercion {
-                    let key_result = ctx.cx.interp.evaluate_to_property_key(context, &key_arg);
+                    let key_result = ctx.with_turn_parts(|interp, stack| {
+                        interp.evaluate_to_property_key(stack, context, &key_arg)
+                    });
                     let coerced_key = key_result
                         .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?;
                     let coerced_value = match &coerced_key {
@@ -231,20 +232,18 @@ fn native_call(
 
     // Function / Proxy spec ladders go first so they observe the
     // canonical descriptor / trap behaviour.
-    let function_result =
-        ctx.cx
-            .interp
-            .try_function_object_static_call(context.as_ref(), None, method, args);
+    let function_result = ctx.with_turn_parts(|interp, stack| {
+        interp.try_function_object_static_call(stack, context.as_ref(), method, args)
+    });
     if let Some(result) =
         function_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
     {
         return Ok(result);
     }
     if let Some(context) = context.as_ref() {
-        let proxy_result = ctx
-            .cx
-            .interp
-            .try_proxy_object_static_call(context, None, method, args);
+        let proxy_result = ctx.with_turn_parts(|interp, stack| {
+            interp.try_proxy_object_static_call(stack, context, method, args)
+        });
         if let Some(result) =
             proxy_result.map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
         {
@@ -254,9 +253,8 @@ fn native_call(
 
     // Full spec-aware dispatch (primitive coercion, accessor
     // enumeration, string-exotic indexed slots, …) lives in the
-    // operand-dispatcher helper. Reuse it with an empty frame stack
-    // so the alloc helpers fall back to runtime-rooted allocation
-    // and `args` survives via slice_roots.
+    // operand-dispatcher helper. Reuse the current turn's exact activation
+    // stack so nested calls and allocation root walks share one owner.
     if let Some(context) = context.as_ref() {
         let static_result = ctx.cx.with_parts(|interp, stack| {
             interp.object_static_call_stack_rooted(context, stack, method, args)
@@ -461,7 +459,6 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             reason: "missing execution context".to_string(),
         })?;
     let closure_id = target.as_closure(ctx.heap()).map(|c| c.cached_function_id);
-    let interp = ctx.interp_mut();
     let primitive_proto_name = if target.is_boolean() {
         Some("Boolean")
     } else if target.is_number() {
@@ -476,18 +473,22 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         None
     };
     if let Some(name) = primitive_proto_name {
-        let proto_result = interp.constructor_prototype_value(name);
+        let proto_result = ctx.interp_mut().constructor_prototype_value(name);
         return proto_result
-            .map_err(|err| object_native_error(interp, "Object.getPrototypeOf", err));
+            .map_err(|err| object_native_error(ctx.cx.interp, "Object.getPrototypeOf", err));
     }
     let function_id = target.as_function().or(closure_id);
     if let Some(function_id) = function_id
-        && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, function_id)
+        && let Some(proto) = ctx
+            .interp_mut()
+            .function_kind_prototype_for(&exec_ctx, function_id)
     {
         return Ok(Value::object(proto));
     }
-    let ordinary_result = interp.ordinary_get_prototype_value(&exec_ctx, target, 0);
-    ordinary_result.map_err(|err| object_native_error(interp, "Object.getPrototypeOf", err))
+    let ordinary_result = ctx.with_turn_parts(|interp, stack| {
+        interp.ordinary_get_prototype_value(stack, &exec_ctx, target, 0)
+    });
+    ordinary_result.map_err(|err| object_native_error(ctx.cx.interp, "Object.getPrototypeOf", err))
 }
 
 /// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
@@ -518,10 +519,9 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             name: "Object.setPrototypeOf",
             reason: "missing execution context".to_string(),
         })?;
-    let set_result = ctx
-        .cx
-        .interp
-        .set_prototype_value_proxy_aware(&exec_ctx, &target, &proto);
+    let set_result = ctx.with_turn_parts(|interp, stack| {
+        interp.set_prototype_value_proxy_aware(stack, &exec_ctx, &target, &proto)
+    });
     let ok = set_result
         .map_err(|err| object_native_error(ctx.cx.interp, "Object.setPrototypeOf", err))?;
     if !ok {
@@ -644,22 +644,13 @@ fn native_prototype_to_locale_string(
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
-        let callee_result = ctx
-            .cx
-            .interp
-            .get_property_value_for_call(&context, this_value, "toString");
+        let callee_result = ctx.with_turn_parts(|interp, stack| {
+            interp.get_property_value_for_call(stack, &context, this_value, "toString")
+        });
         let callee = callee_result
             .map_err(|err| object_native_error(ctx.cx.interp, "toLocaleString", err))?;
         if crate::is_callable_value(&callee) {
-            let invoke_result = ctx.cx.interp.run_callable_sync(
-                &context,
-                &callee,
-                this_value,
-                smallvec::SmallVec::new(),
-            );
-            let result = invoke_result
-                .map_err(|err| object_native_error(ctx.cx.interp, "toLocaleString", err))?;
-            return Ok(result);
+            return ctx.call(callee, this_value, &[]);
         }
         // §20.1.3.5 — `toLocaleString` is `Invoke(O, "toString")`; a
         // non-callable `toString` is a TypeError, not a fall-back to the
@@ -678,10 +669,13 @@ fn native_prototype_has_own_property(
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
-        let key_result = ctx.cx.interp.to_property_key_sync(
-            &context,
-            args.first().cloned().unwrap_or(Value::undefined()),
-        );
+        let key_result = ctx.with_turn_parts(|interp, stack| {
+            interp.to_property_key_sync(
+                stack,
+                &context,
+                args.first().cloned().unwrap_or(Value::undefined()),
+            )
+        });
         let key =
             key_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
         if this_value.is_nullish() {
@@ -690,17 +684,9 @@ fn native_prototype_has_own_property(
                 reason: "cannot convert null or undefined to object".to_string(),
             });
         }
-        let desc_result = ctx
-            .cx
-            .interp
-            .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                &context,
-                this_value,
-                &key,
-                0,
-                &[&this_value],
-                &[],
-            );
+        let desc_result = ctx.with_turn_parts(|interp, stack| {
+            interp.ordinary_get_own_property_descriptor_value(stack, &context, this_value, &key, 0)
+        });
         let desc =
             desc_result.map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
         return Ok(Value::boolean(desc.is_some()));
@@ -749,10 +735,9 @@ fn native_prototype_property_is_enumerable(
         });
     }
     if let Some(context) = ctx.execution_context().cloned() {
-        let desc_result =
-            ctx.cx
-                .interp
-                .get_own_property_descriptor_for_value(&context, this_value, args.first());
+        let desc_result = ctx.with_turn_parts(|interp, stack| {
+            interp.get_own_property_descriptor_for_value(stack, &context, this_value, args.first())
+        });
         let desc = desc_result
             .map_err(|err| object_native_error(ctx.cx.interp, "propertyIsEnumerable", err))?;
         return Ok(Value::boolean(
@@ -837,10 +822,9 @@ fn native_prototype_is_prototype_of(
         })?;
     let mut current = target;
     for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
-        let proto_result = ctx
-            .cx
-            .interp
-            .ordinary_get_prototype_value(&exec_ctx, current, 0);
+        let proto_result = ctx.with_turn_parts(|interp, stack| {
+            interp.ordinary_get_prototype_value(stack, &exec_ctx, current, 0)
+        });
         let proto =
             proto_result.map_err(|err| object_native_error(ctx.cx.interp, "isPrototypeOf", err))?;
         if proto.is_null() {
@@ -878,10 +862,9 @@ pub fn native_prototype_proto_get(
     // `[[GetPrototypeOf]]` so user `getPrototypeOf` traps fire
     // observably.
     if let Some(exec_ctx) = ctx.execution_context().cloned() {
-        let proto_result = ctx
-            .cx
-            .interp
-            .ordinary_get_prototype_value(&exec_ctx, this_value, 0);
+        let proto_result = ctx.with_turn_parts(|interp, stack| {
+            interp.ordinary_get_prototype_value(stack, &exec_ctx, this_value, 0)
+        });
         let result =
             proto_result.map_err(|err| object_native_error(ctx.cx.interp, "get __proto__", err))?;
         return Ok(result);
@@ -972,10 +955,9 @@ pub fn native_prototype_proto_set(
             name: "set __proto__",
             reason: "missing execution context".to_string(),
         })?;
-    let set_result =
-        ctx.cx
-            .interp
-            .set_prototype_value_proxy_aware(&exec_ctx, &this_value, &proto_value);
+    let set_result = ctx.with_turn_parts(|interp, stack| {
+        interp.set_prototype_value_proxy_aware(stack, &exec_ctx, &this_value, &proto_value)
+    });
     let ok = set_result.map_err(|err| object_native_error(ctx.cx.interp, "set __proto__", err))?;
     if !ok {
         return Err(NativeError::TypeError {
@@ -1058,10 +1040,9 @@ fn define_accessor_helper(
         && this_value.is_object_type()
     {
         let key = property_key_to_vm_key(&key);
-        let define_result =
-            ctx.cx
-                .interp
-                .define_own_property_value(&exec_ctx, &this_value, &key, desc);
+        let define_result = ctx.with_turn_parts(|interp, stack| {
+            interp.define_own_property_value(stack, &exec_ctx, &this_value, &key, desc)
+        });
         let ok =
             define_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
         if !ok {
@@ -1153,17 +1134,9 @@ fn lookup_accessor_helper(
             _ => return Ok(Value::undefined()),
         };
         while let Some(value) = current {
-            let desc_result = ctx
-                .cx
-                .interp
-                .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                    &exec_ctx,
-                    value,
-                    &key,
-                    0,
-                    &[&value],
-                    &[],
-                );
+            let desc_result = ctx.with_turn_parts(|interp, stack| {
+                interp.ordinary_get_own_property_descriptor_value(stack, &exec_ctx, value, &key, 0)
+            });
             let desc =
                 desc_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
             if let Some(desc) = desc {
@@ -1178,10 +1151,9 @@ fn lookup_accessor_helper(
                     DescriptorKind::Data { .. } => Value::undefined(),
                 });
             }
-            let proto_result = ctx
-                .cx
-                .interp
-                .ordinary_get_prototype_value(&exec_ctx, value, 0);
+            let proto_result = ctx.with_turn_parts(|interp, stack| {
+                interp.ordinary_get_prototype_value(stack, &exec_ctx, value, 0)
+            });
             let proto =
                 proto_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
             current = if proto.is_null() { None } else { Some(proto) };
@@ -1434,21 +1406,27 @@ fn explicit_to_string_tag_with_context(
     } else {
         this_value
     };
-    let outcome = ctx.cx.interp.ordinary_get_value(
-        exec_ctx,
-        base,
-        this_value,
-        &crate::VmPropertyKey::Symbol(tag_symbol),
-        0,
-    )?;
+    let outcome = ctx.with_turn_parts(|interp, stack| {
+        interp.ordinary_get_value(
+            stack,
+            exec_ctx,
+            base,
+            this_value,
+            &crate::VmPropertyKey::Symbol(tag_symbol),
+            0,
+        )
+    })?;
     let value = match outcome {
         crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx.cx.interp.run_callable_sync(
-            exec_ctx,
-            &getter,
-            this_value,
-            smallvec::SmallVec::new(),
-        )?,
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx.cx.with_parts(|interp, stack| {
+            interp.run_callable_sync_rooted(
+                stack,
+                exec_ctx,
+                &getter,
+                this_value,
+                smallvec::SmallVec::new(),
+            )
+        })?,
     };
     Ok(value
         .as_string(ctx.heap())
@@ -2553,7 +2531,8 @@ fn native_to_property_key(
         let expect_result = expect_property_key(Some(&value), ctx.heap());
         return expect_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err));
     };
-    let key_result = ctx.cx.interp.to_property_key_sync(&exec_ctx, value);
+    let key_result =
+        ctx.with_turn_parts(|interp, stack| interp.to_property_key_sync(stack, &exec_ctx, value));
     let key = key_result.map_err(|err| object_native_error(ctx.cx.interp, method_name, err))?;
     match key {
         crate::VmPropertyKey::Symbol(sym) => Ok(PropertyKey::Symbol(sym)),

@@ -25,8 +25,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array,
-    operand_decode::register_operand, read_register, rooting::RootScopeExt, symbol, to_length,
-    write_register,
+    operand_decode::register_operand, read_register, symbol, to_length, write_register,
 };
 
 const MAX_DENSE_ARRAY_CONSTRUCT_HOLES: u32 = 1_048_576;
@@ -46,7 +45,7 @@ impl Interpreter {
         stack[top_idx].advance_pc()?;
         let result = match op {
             Op::ArrayConstruct => self.array_construct_stack_rooted(stack, &args)?,
-            Op::ArrayFrom => self.array_from_sync(context, Value::undefined(), &args)?,
+            Op::ArrayFrom => self.array_from_sync(stack, context, Value::undefined(), &args)?,
             Op::ArrayOf => self.array_of_stack_rooted(stack, &args)?,
             _ => return Err(VmError::InvalidOperand),
         };
@@ -145,228 +144,303 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-array.from>
     pub(crate) fn array_from_sync(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         constructor: Value,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let mut constructor = constructor;
-        let mut items = args.first().cloned().unwrap_or(Value::undefined());
-        let mut map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
-        let mut this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
-        let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);
-        // SAFETY: the canonical argument slots precede the scope and stay live
-        // until the complete Array.from algorithm returns. Every later use
-        // reads these slots anew, so a moving scavenge cannot leave the copied
-        // opcode/native arguments stale.
-        unsafe {
-            roots.add_value(&mut constructor);
-            roots.add_value(&mut items);
-            roots.add_value(&mut map_fn);
-            roots.add_value(&mut this_arg);
-        }
-        let has_map = !map_fn.is_undefined();
-        if has_map && !self.is_callable_runtime(&map_fn) {
-            return Err(self.err_type(("Array.from mapFn must be callable".to_string()).into()));
-        }
-        let use_ctor = !constructor.is_undefined()
-            && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
+        let items = args.first().copied().unwrap_or_else(Value::undefined);
+        let map_fn = args.get(1).copied().unwrap_or_else(Value::undefined);
+        let this_arg = args.get(2).copied().unwrap_or_else(Value::undefined);
+        self.with_handle_scope(|interp, scope| {
+            let constructor_handle = interp.scoped_value(scope, constructor);
+            let items_handle = interp.scoped_value(scope, items);
+            let map_fn_handle = interp.scoped_value(scope, map_fn);
+            let this_arg_handle = interp.scoped_value(scope, this_arg);
 
-        if !has_map
-            && !use_ctor
-            && let Some(arr) = items.as_array()
-        {
-            let len = crate::array::len(arr, &self.gc_heap);
-            let values = (0..len)
-                .map(|index| crate::array::get(arr, &self.gc_heap, index))
-                .collect::<Vec<_>>();
-            return Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
-                values,
-                &[&items],
-                &[],
-            )?));
-        }
+            let map_fn = interp.escape_scoped(map_fn_handle);
+            let has_map = !map_fn.is_undefined();
+            if has_map && !interp.is_callable_runtime(&map_fn) {
+                return Err(
+                    interp.err_type(("Array.from mapFn must be callable".to_string()).into())
+                );
+            }
+            let constructor = interp.escape_scoped(constructor_handle);
+            let use_ctor = !constructor.is_undefined()
+                && crate::abstract_ops::is_constructor(&constructor, context, &interp.gc_heap);
 
-        if !has_map && let Some(arr) = items.as_array() {
-            let len = crate::array::len(arr, &self.gc_heap);
-            let anchor_base = self.push_iteration_anchor(items) - 1;
-            let result = (|interp: &mut Self| -> Result<Value, VmError> {
-                let target =
-                    interp.array_from_make_target(context, use_ctor, &constructor, None)?;
-                let target_anchor = interp.push_iteration_anchor(target) - 1;
+            let items = interp.escape_scoped(items_handle);
+            if !has_map
+                && !use_ctor
+                && let Some(arr) = items.as_array()
+            {
+                let len = crate::array::len(arr, &interp.gc_heap);
+                let result = interp.scoped_array(scope, len)?;
+                let value_handle = interp.scoped_value(scope, Value::undefined());
                 for index in 0..len {
-                    let items = interp.iteration_anchor(anchor_base);
-                    let arr = items.as_array().expect("array fast path anchor");
+                    let items = interp.escape_scoped(items_handle);
+                    let arr = items.as_array().ok_or(VmError::InvalidOperand)?;
                     let value = crate::array::get(arr, &interp.gc_heap, index);
+                    interp.set_scoped(value_handle, value);
+                    interp.scoped_set_index(scope, result, index, value_handle)?;
+                }
+                return Ok(interp.escape_scoped(result));
+            }
+
+            if !has_map && let Some(arr) = items.as_array() {
+                let len = crate::array::len(arr, &interp.gc_heap);
+                let anchor_base = interp.push_iteration_anchor(items) - 1;
+                let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                    let constructor = interp.escape_scoped(constructor_handle);
+                    let target = interp.array_from_make_target(
+                        stack,
+                        context,
+                        use_ctor,
+                        &constructor,
+                        None,
+                    )?;
+                    let target_anchor = interp.push_iteration_anchor(target) - 1;
+                    for index in 0..len {
+                        let items = interp.escape_scoped(items_handle);
+                        let arr = items.as_array().ok_or(VmError::InvalidOperand)?;
+                        let value = crate::array::get(arr, &interp.gc_heap, index);
+                        let target = interp.iteration_anchor(target_anchor);
+                        interp.create_data_property_or_throw(
+                            stack,
+                            context,
+                            target,
+                            &index.to_string(),
+                            value,
+                        )?;
+                    }
                     let target = interp.iteration_anchor(target_anchor);
+                    interp.array_set_property_throwing(
+                        stack,
+                        context,
+                        target,
+                        "length",
+                        Value::number_f64(len as f64),
+                    )?;
+                    Ok(target)
+                })(interp);
+                interp.pop_iteration_anchors_to(anchor_base);
+                return result;
+            }
+
+            // §23.1.2.1 step 4 — `usingIterator = GetMethod(items,
+            // @@iterator)`. Resolve `@@iterator` through the ordinary
+            // property ladder so a user-deleted or user-overridden iterator
+            // is honored: deleting `String.prototype[@@iterator]` makes a
+            // string array-like rather than forcing the (now absent)
+            // iterator path.
+            let items = interp.escape_scoped(items_handle);
+            let iterator_method = if items.is_undefined() || items.is_null() {
+                Value::undefined()
+            } else {
+                let iterator_sym = interp.well_known_symbols.get(symbol::WellKnown::Iterator);
+                match interp.ordinary_get_value(
+                    stack,
+                    context,
+                    items,
+                    items,
+                    &VmPropertyKey::Symbol(iterator_sym),
+                    0,
+                )? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let items = interp.escape_scoped(items_handle);
+                        interp.run_callable_sync_rooted(
+                            stack,
+                            context,
+                            &getter,
+                            items,
+                            SmallVec::new(),
+                        )?
+                    }
+                }
+            };
+
+            if !iterator_method.is_undefined() && !iterator_method.is_null() {
+                if !interp.is_callable_runtime(&iterator_method) {
+                    return Err(
+                        interp.err_type(("iterator method is not callable".to_string()).into())
+                    );
+                }
+                // Step 6 — iterator path. `A = Construct(C)` (no length
+                // forwarded; the count is unknown up front) or a fresh
+                // Array.
+                let anchor_base =
+                    interp.push_iteration_anchor(interp.escape_scoped(items_handle)) - 1;
+                interp.push_iteration_anchor(interp.escape_scoped(map_fn_handle));
+                interp.push_iteration_anchor(interp.escape_scoped(this_arg_handle));
+                let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                    let constructor = interp.escape_scoped(constructor_handle);
+                    let target = interp.array_from_make_target(
+                        stack,
+                        context,
+                        use_ctor,
+                        &constructor,
+                        None,
+                    )?;
+                    let target_anchor = interp.push_iteration_anchor(target) - 1;
+                    let items = interp.iteration_anchor(anchor_base);
+                    let (iterator, next_method) =
+                        interp.get_iterator_sync(stack, context, &items)?;
+                    let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
+                    let next_method_anchor = interp.push_iteration_anchor(next_method) - 1;
+                    let mut k = 0usize;
+                    let result = loop {
+                        let iterator = interp.iteration_anchor(iterator_anchor);
+                        let next_method = interp.iteration_anchor(next_method_anchor);
+                        let value = match interp.iterator_step_sync(
+                            stack,
+                            context,
+                            &iterator,
+                            &next_method,
+                        ) {
+                            Ok(Some(value)) => value,
+                            Ok(None) => break Ok(()),
+                            // `next` threw: the iterator is already done, no close.
+                            Err(err) => break Err(err),
+                        };
+                        let mapped = if has_map {
+                            let map_fn = interp.iteration_anchor(anchor_base + 1);
+                            let this_arg = interp.iteration_anchor(anchor_base + 2);
+                            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                            cb_args.push(value);
+                            cb_args.push(Value::number_f64(k as f64));
+                            match interp.run_callable_sync_rooted(
+                                stack, context, &map_fn, this_arg, cb_args,
+                            ) {
+                                Ok(mapped) => mapped,
+                                Err(err) => {
+                                    let iterator = interp.iteration_anchor(iterator_anchor);
+                                    let _ = interp.iterator_close_sync(stack, context, &iterator);
+                                    break Err(err);
+                                }
+                            }
+                        } else {
+                            value
+                        };
+                        let iterator = interp.iteration_anchor(iterator_anchor);
+                        let target = interp.iteration_anchor(target_anchor);
+                        if let Err(err) = interp.create_data_property_or_throw(
+                            stack,
+                            context,
+                            target,
+                            &k.to_string(),
+                            mapped,
+                        ) {
+                            let _ = interp.iterator_close_sync(stack, context, &iterator);
+                            break Err(err);
+                        }
+                        k = k.saturating_add(1);
+                    };
+                    result?;
+                    let target = interp.iteration_anchor(target_anchor);
+                    interp.array_set_property_throwing(
+                        stack,
+                        context,
+                        target,
+                        "length",
+                        Value::number_f64(k as f64),
+                    )?;
+                    Ok(target)
+                })(interp);
+                interp.pop_iteration_anchors_to(anchor_base);
+                return result;
+            }
+
+            // Step 4 — array-like path.
+            let items = interp.escape_scoped(items_handle);
+            if items.is_undefined() || items.is_null() {
+                return Err(interp.err_type(
+                    ("Array.from requires an iterable or array-like".to_string()).into(),
+                ));
+            }
+            let length_value = match interp.ordinary_get_value(
+                stack,
+                context,
+                items,
+                items,
+                &VmPropertyKey::String("length"),
+                0,
+            )? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let items = interp.escape_scoped(items_handle);
+                    interp.run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        items,
+                        SmallVec::new(),
+                    )?
+                }
+            };
+            let len = to_length(&length_value, &interp.gc_heap)?;
+            let constructor = interp.escape_scoped(constructor_handle);
+            let target =
+                interp.array_from_make_target(stack, context, use_ctor, &constructor, Some(len))?;
+            const TARGET: usize = 0;
+            const ITEMS: usize = 1;
+            const MAP_FN: usize = 2;
+            const THIS_ARG: usize = 3;
+            let anchor_base = interp.push_iteration_anchor(target) - 1;
+            interp.push_iteration_anchor(interp.escape_scoped(items_handle));
+            interp.push_iteration_anchor(interp.escape_scoped(map_fn_handle));
+            interp.push_iteration_anchor(interp.escape_scoped(this_arg_handle));
+            let result = (|interp: &mut Self| -> Result<Value, VmError> {
+                for index in 0..len {
+                    let key = VmPropertyKey::OwnedString(index.to_string());
+                    let items = interp.iteration_anchor(anchor_base + ITEMS);
+                    let value =
+                        match interp.ordinary_get_value(stack, context, items, items, &key, 0)? {
+                            VmGetOutcome::Value(value) => value,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                let items = interp.iteration_anchor(anchor_base + ITEMS);
+                                interp.run_callable_sync_rooted(
+                                    stack,
+                                    context,
+                                    &getter,
+                                    items,
+                                    SmallVec::new(),
+                                )?
+                            }
+                        };
+                    let mapped = if has_map {
+                        let map_fn = interp.iteration_anchor(anchor_base + MAP_FN);
+                        let this_arg = interp.iteration_anchor(anchor_base + THIS_ARG);
+                        let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        cb_args.push(value);
+                        cb_args.push(Value::number_f64(index as f64));
+                        interp
+                            .run_callable_sync_rooted(stack, context, &map_fn, this_arg, cb_args)?
+                    } else {
+                        value
+                    };
+                    let target = interp.iteration_anchor(anchor_base + TARGET);
                     interp.create_data_property_or_throw(
+                        stack,
                         context,
                         target,
                         &index.to_string(),
-                        value,
+                        mapped,
                     )?;
                 }
-                let target = interp.iteration_anchor(target_anchor);
+                let target = interp.iteration_anchor(anchor_base + TARGET);
                 interp.array_set_property_throwing(
+                    stack,
                     context,
                     target,
                     "length",
                     Value::number_f64(len as f64),
                 )?;
                 Ok(target)
-            })(self);
-            self.pop_iteration_anchors_to(anchor_base);
-            return result;
-        }
-
-        // §23.1.2.1 step 4 — `usingIterator = GetMethod(items,
-        // @@iterator)`. Resolve `@@iterator` through the ordinary
-        // property ladder so a user-deleted or user-overridden iterator
-        // is honored: deleting `String.prototype[@@iterator]` makes a
-        // string array-like rather than forcing the (now absent)
-        // iterator path.
-        let iterator_method = if items.is_undefined() || items.is_null() {
-            Value::undefined()
-        } else {
-            let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
-            match self.ordinary_get_value(
-                context,
-                items,
-                items,
-                &VmPropertyKey::Symbol(iterator_sym),
-                0,
-            )? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, items, SmallVec::new())?
-                }
-            }
-        };
-
-        if !iterator_method.is_undefined() && !iterator_method.is_null() {
-            if !self.is_callable_runtime(&iterator_method) {
-                return Err(self.err_type(("iterator method is not callable".to_string()).into()));
-            }
-            // Step 6 — iterator path. `A = Construct(C)` (no length
-            // forwarded; the count is unknown up front) or a fresh
-            // Array.
-            let anchor_base = self.push_iteration_anchor(items) - 1;
-            self.push_iteration_anchor(map_fn);
-            self.push_iteration_anchor(this_arg);
-            let result = (|interp: &mut Self| -> Result<Value, VmError> {
-                let target =
-                    interp.array_from_make_target(context, use_ctor, &constructor, None)?;
-                let target_anchor = interp.push_iteration_anchor(target) - 1;
-                let items = interp.iteration_anchor(anchor_base);
-                let (iterator, next_method) = interp.get_iterator_sync(context, &items)?;
-                let iterator_anchor = interp.push_iteration_anchor(iterator) - 1;
-                let next_method_anchor = interp.push_iteration_anchor(next_method) - 1;
-                let mut k = 0usize;
-                let result = loop {
-                    let iterator = interp.iteration_anchor(iterator_anchor);
-                    let next_method = interp.iteration_anchor(next_method_anchor);
-                    let value = match interp.iterator_step_sync(context, &iterator, &next_method) {
-                        Ok(Some(value)) => value,
-                        Ok(None) => break Ok(()),
-                        // `next` threw: the iterator is already done, no close.
-                        Err(err) => break Err(err),
-                    };
-                    let mapped = if has_map {
-                        let map_fn = interp.iteration_anchor(anchor_base + 1);
-                        let this_arg = interp.iteration_anchor(anchor_base + 2);
-                        let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        cb_args.push(value);
-                        cb_args.push(Value::number_f64(k as f64));
-                        match interp.run_callable_sync(context, &map_fn, this_arg, cb_args) {
-                            Ok(mapped) => mapped,
-                            Err(err) => {
-                                let _ = interp.iterator_close_sync(context, &iterator);
-                                break Err(err);
-                            }
-                        }
-                    } else {
-                        value
-                    };
-                    let iterator = interp.iteration_anchor(iterator_anchor);
-                    let target = interp.iteration_anchor(target_anchor);
-                    if let Err(err) = interp.create_data_property_or_throw(
-                        context,
-                        target,
-                        &k.to_string(),
-                        mapped,
-                    ) {
-                        let _ = interp.iterator_close_sync(context, &iterator);
-                        break Err(err);
-                    }
-                    k = k.saturating_add(1);
-                };
-                result?;
-                let target = interp.iteration_anchor(target_anchor);
-                interp.array_set_property_throwing(
-                    context,
-                    target,
-                    "length",
-                    Value::number_f64(k as f64),
-                )?;
-                Ok(target)
-            })(self);
-            self.pop_iteration_anchors_to(anchor_base);
-            return result;
-        }
-
-        // Step 4 — array-like path.
-        if items.is_undefined() || items.is_null() {
-            return Err(
-                self.err_type(("Array.from requires an iterable or array-like".to_string()).into())
-            );
-        }
-        let length_value = match self.ordinary_get_value(
-            context,
-            items,
-            items,
-            &VmPropertyKey::String("length"),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, items, SmallVec::new())?
-            }
-        };
-        let len = to_length(&length_value, &self.gc_heap)?;
-        let target = self.array_from_make_target(context, use_ctor, &constructor, Some(len))?;
-        let anchor_base = self.push_iteration_anchor(target) - 1;
-        self.push_iteration_anchor(items);
-        self.push_iteration_anchor(map_fn);
-        self.push_iteration_anchor(this_arg);
-        let result = (|interp: &mut Self| -> Result<(), VmError> {
-            for index in 0..len {
-                let key = VmPropertyKey::OwnedString(index.to_string());
-                let value = match interp.ordinary_get_value(context, items, items, &key, 0)? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        interp.run_callable_sync(context, &getter, items, SmallVec::new())?
-                    }
-                };
-                let mapped = if has_map {
-                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(value);
-                    cb_args.push(Value::number_f64(index as f64));
-                    interp.run_callable_sync(context, &map_fn, this_arg, cb_args)?
-                } else {
-                    value
-                };
-                interp.create_data_property_or_throw(
-                    context,
-                    target,
-                    &index.to_string(),
-                    mapped,
-                )?;
-            }
-            Ok(())
-        })(self);
-        self.pop_iteration_anchors_to(anchor_base);
-        result?;
-        self.array_set_property_throwing(context, target, "length", Value::number_f64(len as f64))?;
-        Ok(target)
+            })(interp);
+            interp.pop_iteration_anchors_to(anchor_base);
+            result
+        })
     }
 
     /// Allocate the Array.from result object: `Construct(C)` (optionally
@@ -374,6 +448,7 @@ impl Interpreter {
     /// ordinary Array.
     fn array_from_make_target(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         use_ctor: bool,
         constructor: &Value,
@@ -384,7 +459,7 @@ impl Interpreter {
             if let Some(len) = len {
                 ctor_args.push(Value::number_f64(len as f64));
             }
-            self.run_construct_sync(context, constructor, *constructor, ctor_args)
+            self.run_construct_sync_rooted(stack, context, constructor, *constructor, ctor_args)
         } else {
             Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
                 Vec::new(),
@@ -408,6 +483,7 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-array.of>
     pub(crate) fn array_of_sync(
         &mut self,
+        stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         constructor: Value,
         items: &[Value],
@@ -415,17 +491,30 @@ impl Interpreter {
         let use_ctor = !constructor.is_undefined()
             && crate::abstract_ops::is_constructor(&constructor, context, &self.gc_heap);
         let len = items.len();
-        let target = self.array_from_make_target(context, use_ctor, &constructor, Some(len))?;
+        let target =
+            self.array_from_make_target(stack, context, use_ctor, &constructor, Some(len))?;
         let anchor_base = self.push_iteration_anchor(target) - 1;
         let result = (|interp: &mut Self| -> Result<(), VmError> {
             for (k, value) in items.iter().enumerate() {
-                interp.create_data_property_or_throw(context, target, &k.to_string(), *value)?;
+                interp.create_data_property_or_throw(
+                    stack,
+                    context,
+                    target,
+                    &k.to_string(),
+                    *value,
+                )?;
             }
             Ok(())
         })(self);
         self.pop_iteration_anchors_to(anchor_base);
         result?;
-        self.array_set_property_throwing(context, target, "length", Value::number_f64(len as f64))?;
+        self.array_set_property_throwing(
+            stack,
+            context,
+            target,
+            "length",
+            Value::number_f64(len as f64),
+        )?;
         Ok(target)
     }
 }
@@ -544,10 +633,22 @@ mod tests {
         )
         .expect("source");
         let context = empty_context();
+        let module = empty_module();
+        let mut stack = ActivationStack::new();
+        stack.push(
+            interp
+                .test_frame_for_function(&module.functions[0])
+                .expect("frame"),
+        );
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = interp
-            .array_from_sync(&context, Value::undefined(), &[Value::array(source)])
+            .array_from_sync(
+                &mut stack,
+                &context,
+                Value::undefined(),
+                &[Value::array(source)],
+            )
             .expect("Array.from");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;

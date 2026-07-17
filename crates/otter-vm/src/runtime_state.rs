@@ -132,11 +132,8 @@ impl<'a> RuntimeState<'a> {
         for root in interp.lean_callback_roots_for_trace() {
             root.trace_slots(visitor);
         }
-        // 2b-quater) Native serializer scratch roots (`JSON.stringify`).
-        for value in interp.json_root_stack_for_trace() {
-            value.trace_value_slots(visitor);
-        }
-        // 2b-quinquies-pre) Scope-handle arena — native value-building roots.
+        // 2b-quater) Shared scope-handle arena — native value-building and
+        // serializer scratch roots.
         // Every collection that can run while a native call holds handles must
         // trace these, or a parked handle goes stale across a move. The
         // snapshot path (`collect_runtime_roots`) also reaches here.

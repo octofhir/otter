@@ -729,8 +729,11 @@ fn bytecode_store_property_function_bag_uses_young_allocation_with_frame_roots()
 }
 
 #[test]
-fn bytecode_function_prototype_uses_young_allocation_with_frame_roots() {
-    let module = module_with(Vec::new(), 4);
+fn bytecode_function_prototype_preserves_the_shared_caller_frame() {
+    let mut module = module_with(Vec::new(), 4);
+    module
+        .functions
+        .push(test_function(1, "target", 0, 1, Vec::new()));
     let context = ExecutionContext::from_module(module.clone());
     let mut interp = Interpreter::new();
     let mut stack: ActivationStack = ActivationStack::new();
@@ -740,14 +743,31 @@ fn bytecode_function_prototype_uses_young_allocation_with_frame_roots() {
     frame.registers[0] = Value::function(1);
     stack.push(frame);
 
-    let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let prototype = interp
-        .function_property_get_stack_rooted(&context, &stack, None, 1, "prototype")
-        .expect("prototype");
-    let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-    assert!(
-        after > before,
-        "Function .prototype should allocate user bag and prototype object in young space"
+    let target = Value::function(1);
+    let prototype = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        match interp
+            .ordinary_get_value(
+                stack,
+                &context,
+                target,
+                target,
+                &VmPropertyKey::String("prototype"),
+                0,
+            )
+            .expect("prototype")
+        {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { .. } => panic!("function prototype is a data property"),
+        }
+    });
+    assert_eq!(
+        stack.len(),
+        1,
+        "nested property lookup preserves caller depth"
+    );
+    assert_eq!(
+        stack[0].registers[0], target,
+        "nested property lookup preserves the caller register window"
     );
 
     let Some(proto) = (prototype).as_object() else {
@@ -760,22 +780,47 @@ fn bytecode_function_prototype_uses_young_allocation_with_frame_roots() {
 }
 
 #[test]
-fn runtime_function_prototype_uses_young_allocation_with_explicit_roots() {
-    let module = module_with(Vec::new(), 4);
+fn handle_scoped_function_prototype_keeps_sibling_handle_live_without_a_frame() {
+    let mut module = module_with(Vec::new(), 4);
+    module
+        .functions
+        .push(test_function(1, "target", 0, 1, Vec::new()));
     let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let mut stack = ActivationStack::new();
     let target = Value::function(1);
     let arg = Value::string(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
-    let args = [arg];
 
-    let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let prototype = interp
-        .function_property_get_runtime_rooted(&context, None, 1, "prototype", &[&target], &[&args])
-        .expect("prototype");
-    let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+    let prototype = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp
+            .with_handle_scope(|interp, scope| -> Result<Value, VmError> {
+                let target = interp.scoped_value(scope, target);
+                let arg = interp.scoped_value(scope, arg);
+                let target_value = interp.escape_scoped(target);
+                let result = interp.ordinary_get_value(
+                    stack,
+                    &context,
+                    target_value,
+                    target_value,
+                    &VmPropertyKey::String("prototype"),
+                    0,
+                )?;
+                assert!(
+                    interp.escape_scoped(arg).is_string(),
+                    "unrelated handle remains live across nested allocation"
+                );
+                match result {
+                    VmGetOutcome::Value(value) => Ok(value),
+                    VmGetOutcome::InvokeGetter { .. } => {
+                        panic!("function prototype is a data property")
+                    }
+                }
+            })
+            .expect("prototype")
+    });
     assert!(
-        after > before,
-        "Function .prototype should allocate through runtime roots when no VM frame is active"
+        stack.is_empty(),
+        "frame-free property lookup leaves the shared activation stack empty"
     );
 
     let Some(proto) = (prototype).as_object() else {
@@ -855,14 +900,18 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
     interp.set_eval_hook(Some(std::sync::Arc::new(move |_, _| Ok(compiled.clone()))));
     let arg = Value::string(JsString::from_str("", interp.gc_heap_mut()).unwrap());
     let args = [arg];
+    let mut stack = ActivationStack::new();
 
-    let result = interp
-        .build_dynamic_function(
-            &context,
-            args.as_slice(),
-            crate::eval_ops::DynamicFunctionKind::Normal,
-        )
-        .expect("Function constructor");
+    let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp
+            .build_dynamic_function(
+                stack,
+                &context,
+                args.as_slice(),
+                crate::eval_ops::DynamicFunctionKind::Normal,
+            )
+            .expect("Function constructor")
+    });
 
     let fid = result
         .as_function()
@@ -2744,10 +2793,19 @@ fn call_method_function_own_non_callable_shadows_call() {
     frame.registers[0] = Value::function(0);
     stack.push(frame);
     let function_value = Value::function(0);
-    let mut bag = interp
-        .function_user_bag_stack_rooted(&stack, None, 0, &[&function_value])
-        .expect("function user bag");
-    object::set(&mut bag, interp.gc_heap_mut(), "call", Value::number_i32(1));
+    assert!(
+        interp
+            .ordinary_set_data_value(
+                &mut stack,
+                &context,
+                function_value,
+                &VmPropertyKey::String("call"),
+                Value::number_i32(1),
+                function_value,
+                0,
+            )
+            .expect("function user property")
+    );
 
     let err = interp
         .do_call_method_value(
@@ -2787,14 +2845,18 @@ fn call_method_function_own_non_callable_shadows_object_method() {
     frame.registers[0] = Value::function(0);
     stack.push(frame);
     let function_value = Value::function(0);
-    let mut bag = interp
-        .function_user_bag_stack_rooted(&stack, None, 0, &[&function_value])
-        .expect("function user bag");
-    object::set(
-        &mut bag,
-        interp.gc_heap_mut(),
-        "hasOwnProperty",
-        Value::number_i32(1),
+    assert!(
+        interp
+            .ordinary_set_data_value(
+                &mut stack,
+                &context,
+                function_value,
+                &VmPropertyKey::String("hasOwnProperty"),
+                Value::number_i32(1),
+                function_value,
+                0,
+            )
+            .expect("function user property")
     );
 
     let err = interp
@@ -3503,18 +3565,20 @@ fn async_generator_method_uses_stack_rooted_capability_allocation() {
     stack.push(frame);
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    interp
-        .do_call_method_value(
-            &mut stack,
-            &context,
-            &[
-                Operand::Register(0),
-                Operand::Register(0),
-                Operand::ConstIndex(0),
-                Operand::ConstIndex(0),
-            ],
-        )
-        .expect("async generator next");
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp
+            .do_call_method_value(
+                stack,
+                &context,
+                &[
+                    Operand::Register(0),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect("async generator next");
+    });
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     assert!(
@@ -3679,14 +3743,11 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
     let context = ExecutionContext::from_module(module);
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
-    interp
-        .do_await(
-            &mut stack,
-            &context,
-            0,
-            Value::number(NumberValue::Smi(307)),
-        )
-        .expect("await");
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp
+            .do_await(stack, &context, 0, Value::number(NumberValue::Smi(307)))
+            .expect("await");
+    });
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
     assert!(
@@ -4676,7 +4737,10 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
     ];
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    interp.do_call(&mut stack, &context, &operands).unwrap();
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.do_call(stack, &context, &operands)
+    })
+    .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     let Some(argv) = (stack[0].registers[3]).as_array() else {
@@ -4757,9 +4821,10 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
     ];
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    interp
-        .do_construct(&mut stack, &context, &operands)
-        .unwrap();
+    with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.do_construct(stack, &context, &operands)
+    })
+    .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     assert!(stack[0].registers[0].is_proxy());
@@ -4818,7 +4883,7 @@ fn run_callable_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
 }
 
 #[test]
-fn run_construct_sync_receiver_uses_runtime_rooted_young_allocation() {
+fn rooted_construct_receiver_uses_shared_turn_young_allocation() {
     let ctor = test_function(
         1,
         "Ctor",
@@ -4848,23 +4913,25 @@ fn run_construct_sync_receiver_uses_runtime_rooted_young_allocation() {
     };
     let context = ExecutionContext::from_module(module);
     let mut interp = Interpreter::new();
+    let mut stack = ActivationStack::new();
     let target = Value::function(1);
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let result = interp
-        .run_construct_sync(&context, &target, target, SmallVec::new())
-        .unwrap();
+    let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.run_construct_sync_rooted(stack, &context, &target, target, SmallVec::new())
+    })
+    .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     assert!(result.is_object());
     assert!(
         after > before,
-        "run_construct_sync should allocate the receiver in young space"
+        "rooted construct should allocate the receiver in young space"
     );
 }
 
 #[test]
-fn run_construct_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
+fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
     fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         Ok(args.get(1).cloned().unwrap_or(Value::undefined()))
     }
@@ -4911,11 +4978,13 @@ fn run_construct_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
         .unwrap(),
     );
     let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::number(NumberValue::Smi(13))];
+    let mut stack = ActivationStack::new();
 
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-    let result = interp
-        .run_construct_sync(&context, &proxy, proxy, args)
-        .unwrap();
+    let result = with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
+        interp.run_construct_sync_rooted(stack, &context, &proxy, proxy, args)
+    })
+    .unwrap();
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     let Some(argv) = (result).as_array() else {
@@ -4925,7 +4994,7 @@ fn run_construct_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
     assert_eq!(elements, vec![Value::number(NumberValue::Smi(13))]);
     assert!(
         after > before,
-        "run_construct_sync proxy argv array should allocate in young space"
+        "rooted proxy construct argv array should allocate in young space"
     );
 }
 

@@ -8,6 +8,10 @@
 //! # Invariants
 //! Drains that run outside `run`'s rooted scope must push the
 //! interpreter's extra roots before touching the heap.
+//! Each ordinary microtask publishes one activation stack for native or
+//! bytecode execution, and nested dispatch releases back to that task's floor.
+//! Async reaction result promises remain in traced anchors across parking and
+//! downstream settlement.
 //! Linked bytecode chunks retain the scalar identity of their creation realm;
 //! no moving-GC handle is stored in function metadata.
 #![allow(unused_imports)]
@@ -343,14 +347,20 @@ impl Interpreter {
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&locals_root));
         let mut stack = ActivationStack::new();
-        self.invoke_microtask_rooted(
-            context,
-            &mut result_capability,
-            &mut current,
-            &mut effective_this,
-            &mut effective_args,
-            &mut stack,
-        )
+        let floor = stack.floor();
+        self.with_runtime_turn(&mut stack, |turn| {
+            let (interp, stack) = turn.into_parts();
+            let result = interp.invoke_microtask_rooted(
+                context,
+                &mut result_capability,
+                &mut current,
+                &mut effective_this,
+                &mut effective_args,
+                stack,
+            );
+            interp.release_frames_above(stack, floor);
+            result
+        })
     }
 
     /// Body of [`Self::invoke_microtask`] running under the
@@ -367,6 +377,9 @@ impl Interpreter {
         effective_args: &mut SmallVec<[Value; 8]>,
         stack: &mut ActivationStack,
     ) -> Result<(), RunError> {
+        if !stack.is_runtime_rooted_by(self) {
+            return Err(RunError::bare(VmError::InvalidOperand));
+        }
         let mut hops: u32 = 0;
         loop {
             if hops >= self.max_stack_depth {
@@ -401,7 +414,8 @@ impl Interpreter {
             let native = &native;
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
-                return match self.run_vm_intrinsic_sync(
+                return match self.run_vm_intrinsic_sync_rooted(
+                    stack,
                     context,
                     intrinsic,
                     *effective_this,
@@ -436,12 +450,18 @@ impl Interpreter {
             }
             let call_info = NativeCallInfo::call(*effective_this);
             self.record_runtime_native_call();
-            let raw = self.with_runtime_turn(stack, |turn| {
-                let mut ctx = NativeCtx::from_runtime_turn(turn, call_info, Some(context));
+            let raw = {
+                let slice_roots = [effective_args.as_slice()];
+                let roots = crate::runtime_cx::NativeCallRoots::new(&call_info, &[], &slice_roots);
+                let _call_roots = self
+                    .gc_heap
+                    .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+                let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(self, stack);
+                let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
                 let result = call.invoke(&mut ctx, effective_args.as_slice());
                 let (interp, stack) = ctx.cx.into_parts();
                 result.map_err(|err| native_to_vm_error_with_stack(interp, stack, err))
-            });
+            };
             return match raw {
                 Ok(value) => {
                     self.settle_microtask_capability(context, result_capability.take(), Ok(value));
@@ -552,6 +572,7 @@ impl Interpreter {
                 frames: Vec::new(),
                 detail: self.take_error_detail(),
             })?;
+        let entry_floor = stack.floor();
         stack.push(new_frame);
         // An `async` handler invoked as a reaction is a top-level call with no
         // caller frame, so — exactly like the async entry frame in `run_inner`
@@ -559,7 +580,7 @@ impl Interpreter {
         // front. Without it `Op::Await` finds no `async_state` and aborts with
         // `InvalidOperand`. The downstream reaction promise then adopts this
         // result promise, so it settles when the handler ultimately completes.
-        let async_result = if function.is_async && !function.is_generator {
+        let async_result_anchor = if function.is_async && !function.is_generator {
             let result = match promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, stack, &[], &[])
             {
@@ -572,25 +593,34 @@ impl Interpreter {
                     });
                 }
             };
+            // The dispatch below can park/pop the async frame and perform an
+            // arbitrary number of moving collections. Keep the promise value
+            // in an interpreter-owned root slot rather than retaining the raw
+            // `JsPromise` handle in this Rust local.
+            let result_anchor = self.push_iteration_anchor(Value::promise(result)) - 1;
+            let rooted_result = self
+                .iteration_anchor(result_anchor)
+                .as_promise()
+                .expect("async result anchor must contain a promise");
             let frame = stack.last_mut().expect("reaction frame was just pushed");
             self.frame_set_async_state(
                 frame,
                 AsyncFrameState {
-                    result_promise: result,
+                    result_promise: rooted_result,
                 },
             );
-            Some(result)
+            Some(result_anchor)
         } else {
             None
         };
-        match self.dispatch_loop(context, stack) {
+        let result = match self.dispatch_loop_above_rooted(context, stack, entry_floor) {
             Ok(value) => {
                 // Reaction job: settle the downstream promise with
                 // the handler's return value (spec §27.2.5.4). For an async
                 // handler the return value is its result promise, which the
                 // downstream adopts (resolving once the handler completes).
-                let settle_value = match async_result {
-                    Some(result) => Value::promise(result),
+                let settle_value = match async_result_anchor {
+                    Some(anchor) => self.iteration_anchor(anchor),
                     None => value,
                 };
                 self.settle_microtask_capability(
@@ -630,7 +660,11 @@ impl Interpreter {
                     })
                 }
             }
+        };
+        if let Some(anchor) = async_result_anchor {
+            self.pop_iteration_anchors_to(anchor);
         }
+        result
     }
 
     /// Resolve / reject the downstream promise that a reaction

@@ -34,8 +34,9 @@
 use otter_bytecode::Op;
 
 use crate::{
-    Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint,
-    feedback::InstructionFeedbackRecorder, number, oom_to_vm, read_register, write_register,
+    Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops,
+    activation_stack::ActivationStack, bigint, feedback::InstructionFeedbackRecorder, number,
+    oom_to_vm, read_register, write_register,
 };
 
 /// Signature of every BigInt binary op routed through this module.
@@ -355,19 +356,20 @@ impl Interpreter {
     /// Observable coercion completes before `dst` is committed.
     pub(crate) fn run_increment_regs(
         &mut self,
+        stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        frame: &mut Frame,
+        top_idx: usize,
         dst: u16,
         src: u16,
         delta: i32,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let value = *read_register(frame, src)?;
+        let value = *read_register(&stack[top_idx], src)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(value, Value::number_i32(delta));
         }
-        let result = self.increment_value(context, value, delta)?;
-        commit_frame_result(frame, dst, result)
+        let result = self.increment_value(stack, context, value, delta)?;
+        commit_frame_result(&mut stack[top_idx], dst, result)
     }
 
     /// Evaluate one decoded native numeric request from already-read values.
@@ -377,6 +379,7 @@ impl Interpreter {
     /// frame state, so materialized and native register windows share it.
     pub(crate) fn numeric_runtime_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
         operation: NumericRuntimeOp,
         lhs: Value,
@@ -433,7 +436,9 @@ impl Interpreter {
             }
             NumericRuntimeOp::Neg => self.neg_value(lhs),
             NumericRuntimeOp::BitwiseNot => self.bitwise_not_value(lhs),
-            NumericRuntimeOp::Increment { delta } => self.increment_value(context, lhs, delta),
+            NumericRuntimeOp::Increment { delta } => {
+                self.increment_value(stack, context, lhs, delta)
+            }
         }
     }
 
@@ -467,12 +472,17 @@ impl Interpreter {
 
     fn increment_value(
         &mut self,
+        stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
         value: Value,
         delta: i32,
     ) -> Result<Value, VmError> {
-        let primitive =
-            self.evaluate_to_primitive(context, &value, abstract_ops::ToPrimitiveHint::Number)?;
+        let primitive = self.evaluate_to_primitive(
+            stack,
+            context,
+            &value,
+            abstract_ops::ToPrimitiveHint::Number,
+        )?;
         let kind = abstract_ops::to_numeric_kind(&primitive, &self.gc_heap)
             .ok_or(VmError::TypeMismatch)?;
         match kind {
@@ -515,21 +525,22 @@ impl Interpreter {
 
     pub(crate) fn run_loose_equal_regs(
         &mut self,
+        stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
-        frame: &mut Frame,
+        top_idx: usize,
         dst: u16,
         lhs: u16,
         rhs: u16,
         negate: bool,
         feedback: Option<InstructionFeedbackRecorder<'_>>,
     ) -> Result<(), VmError> {
-        let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
+        let (dst, lhs, rhs) = binop_values(&stack[top_idx], dst, lhs, rhs)?;
         if let Some(feedback) = feedback {
             feedback.record_arith(lhs, rhs);
         }
-        let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
-        write_register(frame, dst, Value::boolean(eq ^ negate))?;
-        frame.advance_pc()?;
+        let eq = self.loose_equal_with_context(stack, context, &lhs, &rhs)?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(eq ^ negate))?;
+        stack[top_idx].advance_pc()?;
         Ok(())
     }
 
@@ -540,6 +551,7 @@ impl Interpreter {
     /// identity (§7.2.13 step 1 + IsStrictlyEqual for objects).
     pub(crate) fn loose_equal_with_context(
         &mut self,
+        stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
         x: &Value,
         y: &Value,
@@ -574,8 +586,12 @@ impl Interpreter {
         if primitive.is_null() || primitive.is_undefined() {
             return Ok(false);
         }
-        let coerced =
-            self.evaluate_to_primitive(context, object, abstract_ops::ToPrimitiveHint::Default)?;
+        let coerced = self.evaluate_to_primitive(
+            stack,
+            context,
+            object,
+            abstract_ops::ToPrimitiveHint::Default,
+        )?;
         let (lhs_p, rhs_p) = if object_is_x {
             (coerced, *y)
         } else {
@@ -786,9 +802,11 @@ mod tests {
     fn typed_numeric_runtime_dispatch_returns_values_without_frame_state() {
         let context = empty_context();
         let mut interp = Interpreter::new();
+        let mut stack = ActivationStack::new();
 
         let difference = interp
             .numeric_runtime_value(
+                &mut stack,
                 &context,
                 NumericRuntimeOp::Sub { rhs: 1 },
                 Value::number_i32(9),
@@ -799,6 +817,7 @@ mod tests {
 
         let comparison = interp
             .numeric_runtime_value(
+                &mut stack,
                 &context,
                 NumericRuntimeOp::LessThan { rhs: 1 },
                 Value::number_i32(4),
@@ -809,6 +828,7 @@ mod tests {
 
         assert!(matches!(
             interp.numeric_runtime_value(
+                &mut stack,
                 &context,
                 NumericRuntimeOp::Mul { rhs: 1 },
                 Value::number_i32(3),

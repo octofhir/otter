@@ -135,12 +135,18 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             });
         }
     };
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| NativeError::TypeError {
-        name: NAME,
-        reason: "missing execution context".to_string(),
-    })?;
-    match interp.evaluate_ordinary_to_primitive(&exec, &receiver, try_first) {
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: NAME,
+            reason: "missing execution context".to_string(),
+        })?;
+    let result = ctx.with_turn_parts(|interp, stack| {
+        interp.evaluate_ordinary_to_primitive(stack, &exec, &receiver, try_first)
+    });
+    let interp = ctx.interp_mut();
+    match result {
         Ok(v) => Ok(v),
         Err(VmError::Uncaught) => {
             let value = match interp.take_error_detail() {

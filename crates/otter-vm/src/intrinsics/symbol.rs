@@ -49,55 +49,58 @@ fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             reason: "Symbol is not a constructor".to_string(),
         });
     }
-    let description =
-        match args.first() {
-            None => None,
-            Some(v) if v.is_undefined() => None,
-            Some(other) => {
-                let context =
-                    ctx.execution_context()
-                        .cloned()
-                        .ok_or_else(|| NativeError::TypeError {
-                            name: "Symbol",
-                            reason: "missing execution context".to_string(),
-                        })?;
-                let coerced = match ctx.cx.interp.coerce_to_string(&context, other) {
-                    Ok(s) => s,
-                    Err(crate::VmError::TypeError) => {
-                        let message = match ctx.cx.interp.take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Message(m)) => m,
-                            _ => Default::default(),
-                        };
-                        return Err(NativeError::TypeError {
-                            name: "Symbol",
-                            reason: message.into(),
-                        });
-                    }
-                    Err(crate::VmError::Uncaught) => {
-                        let value = match ctx.cx.interp.take_error_detail() {
-                            Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
-                            _ => Default::default(),
-                        };
-                        return Err(NativeError::Thrown {
-                            name: "Symbol",
-                            message: value.into(),
-                        });
-                    }
-                    Err(other) => {
-                        return Err(NativeError::TypeError {
-                            name: "Symbol",
-                            reason: other.to_string(),
-                        });
-                    }
-                };
-                let rendered = crate::string::JsString::from_str(&coerced, ctx.heap_mut())
-                    .map_err(|_| NativeError::TypeError {
+    let description = match args.first() {
+        None => None,
+        Some(v) if v.is_undefined() => None,
+        Some(other) => {
+            let context =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Symbol",
+                        reason: "missing execution context".to_string(),
+                    })?;
+            let result = ctx
+                .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &context, other));
+            let coerced = match result {
+                Ok(s) => s,
+                Err(crate::VmError::TypeError) => {
+                    let message = match ctx.cx.interp.take_error_detail() {
+                        Some(crate::run_control::ErrorDetail::Message(m)) => m,
+                        _ => Default::default(),
+                    };
+                    return Err(NativeError::TypeError {
+                        name: "Symbol",
+                        reason: message.into(),
+                    });
+                }
+                Err(crate::VmError::Uncaught) => {
+                    let value = match ctx.cx.interp.take_error_detail() {
+                        Some(crate::run_control::ErrorDetail::Uncaught(m)) => m,
+                        _ => Default::default(),
+                    };
+                    return Err(NativeError::Thrown {
+                        name: "Symbol",
+                        message: value.into(),
+                    });
+                }
+                Err(other) => {
+                    return Err(NativeError::TypeError {
+                        name: "Symbol",
+                        reason: other.to_string(),
+                    });
+                }
+            };
+            let rendered =
+                crate::string::JsString::from_str(&coerced, ctx.heap_mut()).map_err(|_| {
+                    NativeError::TypeError {
                         name: "Symbol",
                         reason: "out of memory".to_string(),
-                    })?;
-                Some(rendered)
-            }
-        };
+                    }
+                })?;
+            Some(rendered)
+        }
+    };
     let sym = crate::symbol::JsSymbol::new(ctx.interp_mut().gc_heap_mut(), description).map_err(
         |_| NativeError::TypeError {
             name: "Symbol",
@@ -123,7 +126,9 @@ fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
                         name: "Symbol.for",
                         reason: "missing execution context".to_string(),
                     })?;
-            match ctx.cx.interp.coerce_to_string(&context, other) {
+            let result = ctx
+                .with_turn_parts(|interp, stack| interp.coerce_to_string(stack, &context, other));
+            match result {
                 Ok(s) => s,
                 Err(crate::VmError::TypeError) => {
                     let message = match ctx.cx.interp.take_error_detail() {

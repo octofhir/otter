@@ -710,22 +710,13 @@ pub struct Interpreter {
     /// helpers take `&self` and stay callable from `&self` methods and from
     /// `ok_or_else` / `map_err` closures without borrow conflicts.
     pending_error_detail: std::cell::RefCell<Option<run_control::ErrorDetail>>,
-    /// Scratch GC-root stack for native recursive algorithms (today:
-    /// `JSON.stringify`'s spec serializer) that must hold live `Value`s
-    /// across calls which allocate — e.g. key-name `JsString`s minted by
-    /// `[[OwnPropertyKeys]]`, user getters, `toJSON`, or a replacer. Each
-    /// entry is a stable slot the collector rewrites on a move, so the
-    /// serializer re-reads its container from the slot after every
-    /// allocating sub-call instead of dereferencing a stale copy. Traced
-    /// in [`crate::runtime_state::RuntimeState::trace_roots`]; pushed/read
-    /// back/popped as a strict stack so it is empty between top-level
-    /// native calls.
-    json_root_stack: Vec<Value>,
     /// Scope-based GC handle storage for native value building. Handles minted
     /// through [`Self::with_handle_scope`] park their `Value` here; the runtime
     /// root walk traces every live slot and the collector rewrites it in place,
-    /// so a handle read is never stale across an allocation. Truncated back to
-    /// the opening length when each scope returns. See [`crate::handles`].
+    /// so a handle read is never stale across an allocation. Native recursive
+    /// algorithms such as JSON use strict-stack ranges in this same arena rather
+    /// than maintaining parallel root stores. Truncated back to the opening
+    /// length when each scope returns. See [`crate::handles`].
     handle_arena: handles::HandleArena,
     /// Byte length of the most recent `JSON.stringify` output, used to
     /// pre-size the next call's scratch buffer. Repeated stringify of
@@ -990,10 +981,6 @@ pub struct Interpreter {
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
     /// Next unique code-object identity handed to a compile request.
     jit_next_code_object_id: u64,
-    /// Pool of materialized frame vectors reused for synchronous callable
-    /// re-entry. Reuse retains only capacity actually reached by prior calls;
-    /// no stack pre-reserves the maximum call depth.
-    reentry_stack_cache: Vec<ActivationStack>,
     /// Flat register stack for JIT-built callee windows. Compiled code sets up a
     /// direct call by bumping `reg_top`, writing the callee's window into
     /// `reg_stack[reg_top..reg_top+regcount]`, and running the callee — no Rust
@@ -1378,11 +1365,6 @@ impl Interpreter {
         self.lean_callback_roots.iter()
     }
 
-    /// Root-tracing view of the native serializer scratch root stack.
-    pub(crate) fn json_root_stack_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.json_root_stack.iter()
-    }
-
     /// Trace every live scope-handle slot as a GC root. Called from the runtime
     /// root walk so the collector rewrites parked handles on a move.
     pub(crate) fn handle_arena_trace(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
@@ -1407,32 +1389,31 @@ impl Interpreter {
         Ok(value)
     }
 
-    /// Push `value` onto the native serializer scratch root stack,
-    /// returning its stable index. The collector traces and rewrites
-    /// the slot on a move, so the caller re-reads the relocated value
-    /// via [`Self::json_root_get`] after any allocating sub-call.
+    /// Push `value` into JSON's strict-stack range in the shared handle arena,
+    /// returning its stable index. The collector traces and rewrites the slot on
+    /// a move, so the caller re-reads the relocated value after an allocating
+    /// sub-call without a second root store.
     pub(crate) fn json_root_push(&mut self, value: Value) -> usize {
-        let idx = self.json_root_stack.len();
-        self.json_root_stack.push(value);
+        let idx = self.handle_arena.len();
+        self.handle_arena.push(value);
         idx
     }
 
     /// Read the (possibly relocated) value parked at `idx`.
     pub(crate) fn json_root_get(&self, idx: usize) -> Value {
-        self.json_root_stack[idx]
+        self.handle_arena.get(idx as u32)
     }
 
     /// Overwrite the parked value at `idx` (the serializer reassigns
     /// `value` as `toJSON` / the replacer / wrapper unwrapping run).
     pub(crate) fn json_root_set(&mut self, idx: usize, value: Value) {
-        self.json_root_stack[idx] = value;
+        self.handle_arena.set(idx as u32, value);
     }
 
-    /// Pop the scratch root stack back down to `idx` (the value that
-    /// [`Self::json_root_push`] returned), restoring the strict-stack
-    /// discipline after a serializer frame returns.
+    /// Pop JSON's handle range back down to `idx`, preserving handles owned by
+    /// an enclosing native scope.
     pub(crate) fn json_root_pop_to(&mut self, idx: usize) {
-        self.json_root_stack.truncate(idx);
+        self.handle_arena.truncate(idx);
     }
 
     /// §13.2.8.4 GetTemplateObject steps 7-15 — build the frozen

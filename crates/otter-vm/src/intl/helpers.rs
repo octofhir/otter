@@ -64,40 +64,46 @@ pub(crate) fn string_list_from_iterable(
         Some(v) if !v.is_undefined() => *v,
         _ => return Ok(Vec::new()),
     };
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
-        name,
-        reason: "missing execution context".to_string(),
-    })?;
-    let (iterator, next_method) = interp
-        .get_iterator_sync(&exec, &iterable)
-        .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
-    let it_anchor = interp.push_iteration_anchor(iterator) - 1;
-    let nm_anchor = interp.push_iteration_anchor(next_method) - 1;
-    let mut out: Vec<String> = Vec::new();
-    let result = loop {
-        let iterator = interp.iteration_anchor(it_anchor);
-        let next_method = interp.iteration_anchor(nm_anchor);
-        match interp.iterator_step_sync(&exec, &iterator, &next_method) {
-            Ok(Some(value)) => {
-                if let Some(s) = value.as_string(interp.gc_heap()) {
-                    out.push(s.to_lossy_string(interp.gc_heap()));
-                } else {
-                    // §13.5.1 step 5.b.ii — a non-String element closes
-                    // the iterator with the pending TypeError completion.
-                    let _ = interp.iterator_close_value_sync(&exec, iterator);
-                    break Err(crate::NativeError::TypeError {
-                        name,
-                        reason: "list elements must be strings".to_string(),
-                    });
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+    ctx.with_turn_parts(|interp, stack| {
+        let (iterator, next_method) = interp
+            .get_iterator_sync(stack, &exec, &iterable)
+            .map_err(|e| crate::native_function::vm_to_native_error(interp, e, name))?;
+        let it_anchor = interp.push_iteration_anchor(iterator) - 1;
+        let nm_anchor = interp.push_iteration_anchor(next_method) - 1;
+        let mut out: Vec<String> = Vec::new();
+        let result = loop {
+            let iterator = interp.iteration_anchor(it_anchor);
+            let next_method = interp.iteration_anchor(nm_anchor);
+            match interp.iterator_step_sync(stack, &exec, &iterator, &next_method) {
+                Ok(Some(value)) => {
+                    if let Some(s) = value.as_string(interp.gc_heap()) {
+                        out.push(s.to_lossy_string(interp.gc_heap()));
+                    } else {
+                        // §13.5.1 step 5.b.ii — a non-String element closes
+                        // the iterator with the pending TypeError completion.
+                        let _ = interp.iterator_close_value_sync(stack, &exec, iterator);
+                        break Err(crate::NativeError::TypeError {
+                            name,
+                            reason: "list elements must be strings".to_string(),
+                        });
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => {
+                    break Err(crate::native_function::vm_to_native_error(interp, e, name));
                 }
             }
-            Ok(None) => break Ok(()),
-            Err(e) => break Err(crate::native_function::vm_to_native_error(interp, e, name)),
-        }
-    };
-    interp.pop_iteration_anchors_to(it_anchor);
-    result.map(|()| out)
+        };
+        interp.pop_iteration_anchors_to(it_anchor);
+        result.map(|()| out)
+    })
 }
 
 /// Read an optional string field with default fallback.
@@ -336,11 +342,11 @@ pub fn option_to_string(
                 name: class,
                 reason: "missing execution context".to_string(),
             })?;
-        let prim = ctx
-            .cx
-            .interp
-            .to_primitive_string_hint_sync(&exec, value)
-            .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
+        let prim = ctx.with_turn_parts(|interp, stack| {
+            interp.to_primitive_string_hint_sync(stack, &exec, value)
+        });
+        let prim =
+            prim.map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?;
         if let Some(s) = prim.as_string(ctx.heap()) {
             return Ok(s.to_lossy_string(ctx.heap()));
         }
@@ -449,8 +455,11 @@ pub fn get_number_option(
             name: class,
             reason: "missing execution context".to_string(),
         })?;
-    let n = crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, &v)
-        .map_err(|e| crate::native_function::vm_to_native_error(ctx.cx.interp, e, class))?
+    let n = ctx
+        .with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, &exec, &v)
+                .map_err(|e| crate::native_function::vm_to_native_error(interp, e, class))
+        })?
         .as_f64();
     if n.is_nan() || n < min || n > max {
         return Err(NativeError::RangeError {

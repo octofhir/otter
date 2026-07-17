@@ -32,7 +32,7 @@ use super::MAX_NESTING_DEPTH;
 use crate::number::NumberValue;
 use crate::object;
 use crate::string::JsString;
-use crate::{ExecutionContext, Interpreter, Value, VmError};
+use crate::{ActivationStack, ExecutionContext, Interpreter, Value, VmError};
 
 const CYCLIC_MESSAGE: &str = "JSON.stringify cannot serialize cyclic structures.";
 const BIGINT_MESSAGE: &str = "JSON.stringify cannot serialize BigInt values.";
@@ -117,6 +117,7 @@ impl Interpreter {
     /// nothing (e.g. a function or `undefined`).
     pub(crate) fn json_stringify_spec(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         args: &[Value],
     ) -> Result<Value, VmError> {
@@ -131,33 +132,40 @@ impl Interpreter {
         // or a `space` wrapper's `valueOf` can scavenge). `value_root`
         // is the bottom of this call's scratch-root region.
         let value_root = self.json_root_push(value);
-
-        // §25.5.2.1 steps 4–5 — classify the replacer argument.
-        if replacer.is_object_type() {
-            if replacer.is_callable() {
-                state.replacer_root = Some(self.json_root_push(replacer));
-            } else if self.json_is_array(&replacer)? {
-                state.property_list = Some(self.json_build_property_list(context, &replacer)?);
+        let space_root = self.json_root_push(space);
+        let result: Result<(bool, String), VmError> = (|| {
+            // §25.5.2.1 steps 4–5 — classify the replacer argument.
+            if replacer.is_object_type() {
+                if replacer.is_callable() {
+                    state.replacer_root = Some(self.json_root_push(replacer));
+                } else if self.json_is_array(&replacer)? {
+                    state.property_list =
+                        Some(self.json_build_property_list(stack, context, &replacer)?);
+                }
             }
-        }
 
-        // §25.5.2.1 steps 6–9 — derive `gap` from `space`.
-        state.gap = self.json_gap(context, &space)?;
+            // §25.5.2.1 steps 6–9 — derive `gap` from `space`.
+            state.gap = self.json_gap(stack, context, &self.json_root_get(space_root))?;
 
-        // §25.5.2.1 step 10 — wrapper = { "": value }.
-        let rooted_value = self.json_root_get(value_root);
-        let wrapper = self.json_make_wrapper(rooted_value)?;
+            // §25.5.2.1 step 10 — wrapper = { "": value }.
+            let rooted_value = self.json_root_get(value_root);
+            let wrapper = self.json_make_wrapper(rooted_value)?;
 
-        let mut buffer = String::with_capacity(self.json_stringify_capacity_hint);
-        let wrote = self.serialize_json_property_into(
-            context,
-            &mut state,
-            "",
-            Value::object(wrapper),
-            &mut buffer,
-        )?;
-        // Release this call's scratch roots (value + any replacer).
+            let mut buffer = String::with_capacity(self.json_stringify_capacity_hint);
+            let wrote = self.serialize_json_property_into(
+                stack,
+                context,
+                &mut state,
+                "",
+                Value::object(wrapper),
+                &mut buffer,
+            )?;
+            Ok((wrote, buffer))
+        })();
+        // Release this call's scratch roots (value + any replacer) on
+        // success and every abrupt completion.
         self.json_root_pop_to(value_root);
+        let (wrote, buffer) = result?;
 
         if wrote {
             // Pre-size the next stringify from this one's output length so a
@@ -178,22 +186,37 @@ impl Interpreter {
     /// `json-parse-with-source` proposal); `None` disables it.
     pub(crate) fn json_internalize_root(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         unfiltered: Value,
         reviver: Value,
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<Value, VmError> {
-        let root = self.json_make_wrapper(unfiltered)?;
-        self.internalize_json_property(context, Value::object(root), "", &reviver, source)
+        let base_root = self.json_root_push(unfiltered);
+        let reviver_root = self.json_root_push(reviver);
+        let result = (|| {
+            let root = self.json_make_wrapper(self.json_root_get(base_root))?;
+            self.internalize_json_property(
+                stack,
+                context,
+                Value::object(root),
+                "",
+                reviver_root,
+                source,
+            )
+        })();
+        self.json_root_pop_to(base_root);
+        result
     }
 
     /// §25.5.1.1 InternalizeJSONProperty(holder, name, reviver).
     fn internalize_json_property(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         holder: Value,
         name: &str,
-        reviver: &Value,
+        reviver_root: usize,
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<Value, VmError> {
         // `holder` and `value` are parked on the scratch root stack: every
@@ -202,57 +225,71 @@ impl Interpreter {
         // writing through a moved handle would touch freed heap. Each step
         // re-reads from the slot.
         let holder_root = self.json_root_push(holder);
-        let value0 = self.get_property_value_for_call(context, holder, name)?;
-        let value_root = self.json_root_push(value0);
+        let result = (|| {
+            let value0 = self.get_property_value_for_call(
+                stack,
+                context,
+                self.json_root_get(holder_root),
+                name,
+            )?;
+            let value_root = self.json_root_push(value0);
 
-        if self.json_root_get(value_root).is_object_type() {
-            if self.json_is_array(&self.json_root_get(value_root))? {
-                let len = self.json_length(context, &self.json_root_get(value_root))?;
-                for index in 0..len {
-                    let key = index.to_string();
-                    let child = source.and_then(|s| s.array_child(index));
-                    self.internalize_one(
+            if self.json_root_get(value_root).is_object_type() {
+                if self.json_is_array(&self.json_root_get(value_root))? {
+                    let len = self.json_length(stack, context, &self.json_root_get(value_root))?;
+                    for index in 0..len {
+                        let key = index.to_string();
+                        let child = source.and_then(|s| s.array_child(index));
+                        self.internalize_one(
+                            stack,
+                            context,
+                            self.json_root_get(value_root),
+                            &key,
+                            reviver_root,
+                            child,
+                        )?;
+                    }
+                } else {
+                    // EnumerableOwnPropertyNames is snapshotted up front so
+                    // a reviver mutating later siblings cannot perturb the
+                    // key set already chosen (§25.5.1.1 step 2.c.i).
+                    let keys = self.json_enumerable_string_keys(
+                        stack,
                         context,
-                        self.json_root_get(value_root),
-                        &key,
-                        reviver,
-                        child,
+                        &self.json_root_get(value_root),
                     )?;
-                }
-            } else {
-                // EnumerableOwnPropertyNames is snapshotted up front so
-                // a reviver mutating later siblings cannot perturb the
-                // key set already chosen (§25.5.1.1 step 2.c.i).
-                let keys =
-                    self.json_enumerable_string_keys(context, &self.json_root_get(value_root))?;
-                for key in keys {
-                    let child = source.and_then(|s| s.object_child(&key));
-                    self.internalize_one(
-                        context,
-                        self.json_root_get(value_root),
-                        &key,
-                        reviver,
-                        child,
-                    )?;
+                    for key in keys {
+                        let child = source.and_then(|s| s.object_child(&key));
+                        self.internalize_one(
+                            stack,
+                            context,
+                            self.json_root_get(value_root),
+                            &key,
+                            reviver_root,
+                            child,
+                        )?;
+                    }
                 }
             }
-        }
 
-        // §25.5.1.1 — the reviver receives a `context` object whose
-        // own `source` property is present only for primitive leaves. Park
-        // every reviver argument so a later argument's allocation cannot
-        // dangle an earlier one before the call assembles them.
-        let name_arg = self.json_key_value(name)?;
-        let name_root = self.json_root_push(name_arg);
-        let context_obj = self.json_make_reviver_context(self.json_root_get(value_root), source)?;
-        let context_root = self.json_root_push(context_obj);
-        let args: SmallVec<[Value; 8]> = smallvec![
-            self.json_root_get(name_root),
-            self.json_root_get(value_root),
-            self.json_root_get(context_root),
-        ];
-        let holder = self.json_root_get(holder_root);
-        let result = self.run_callable_sync(context, reviver, holder, args);
+            // §25.5.1.1 — the reviver receives a `context` object whose
+            // own `source` property is present only for primitive leaves. Park
+            // every reviver argument so a later argument's allocation cannot
+            // dangle an earlier one before the call assembles them.
+            let name_arg = self.json_key_value(name)?;
+            let name_root = self.json_root_push(name_arg);
+            let context_obj =
+                self.json_make_reviver_context(self.json_root_get(value_root), source)?;
+            let context_root = self.json_root_push(context_obj);
+            let args: SmallVec<[Value; 8]> = smallvec![
+                self.json_root_get(name_root),
+                self.json_root_get(value_root),
+                self.json_root_get(context_root),
+            ];
+            let holder = self.json_root_get(holder_root);
+            let reviver = self.json_root_get(reviver_root);
+            self.run_callable_sync_rooted(stack, context, &reviver, holder, args)
+        })();
         self.json_root_pop_to(holder_root);
         result
     }
@@ -265,44 +302,44 @@ impl Interpreter {
         value: Value,
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<Value, VmError> {
-        let obj = self.json_make_plain_object()?;
-        // Root the context object and the leaf value across the re-parse and
-        // string allocations below: under GC both can move, and writing
-        // `source` through a stale receiver handle (or comparing a stale leaf)
-        // would read or corrupt freed heap.
-        let obj_root = self.json_root_push(Value::object(obj));
+        // Root the leaf before allocating the context object; that first
+        // allocation can itself collect.
         let value_root = self.json_root_push(value);
-        if !value.is_object_type()
-            && let Some(src) = source.and_then(|s| s.source())
-        {
-            // The `source` text applies only while the leaf still holds
-            // its originally parsed value; a reviver that forward-
-            // replaces a slot makes the new value source-less. Compare
-            // against the re-parsed token via SameValue.
-            let still_original = crate::json::parse::parse(src, self.gc_heap_mut())
-                .ok()
-                .is_some_and(|parsed| {
-                    let leaf = self.json_root_get(value_root);
-                    crate::abstract_ops::same_value(&leaf, &parsed, self.gc_heap())
-                });
-            if still_original {
-                let js = JsString::from_str(src, self.gc_heap_mut())
-                    .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
-                let mut obj_now = self
-                    .json_root_get(obj_root)
-                    .as_object()
-                    .expect("rooted reviver context object");
-                object::set(
-                    &mut obj_now,
-                    self.gc_heap_mut(),
-                    "source",
-                    Value::string(js),
-                );
+        let result = (|| {
+            let obj = self.json_make_plain_object()?;
+            let obj_root = self.json_root_push(Value::object(obj));
+            if !self.json_root_get(value_root).is_object_type()
+                && let Some(src) = source.and_then(|s| s.source())
+            {
+                // The `source` text applies only while the leaf still holds
+                // its originally parsed value; a reviver that forward-
+                // replaces a slot makes the new value source-less. Compare
+                // against the re-parsed token via SameValue.
+                let still_original = crate::json::parse::parse(src, self.gc_heap_mut())
+                    .ok()
+                    .is_some_and(|parsed| {
+                        let leaf = self.json_root_get(value_root);
+                        crate::abstract_ops::same_value(&leaf, &parsed, self.gc_heap())
+                    });
+                if still_original {
+                    let js = JsString::from_str(src, self.gc_heap_mut())
+                        .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
+                    let mut obj_now = self
+                        .json_root_get(obj_root)
+                        .as_object()
+                        .expect("rooted reviver context object");
+                    object::set(
+                        &mut obj_now,
+                        self.gc_heap_mut(),
+                        "source",
+                        Value::string(js),
+                    );
+                }
             }
-        }
-        let result = self.json_root_get(obj_root);
-        self.json_root_pop_to(obj_root);
-        Ok(result)
+            Ok(self.json_root_get(obj_root))
+        })();
+        self.json_root_pop_to(value_root);
+        result
     }
 
     /// Allocate an empty `%Object.prototype%`-backed object.
@@ -322,35 +359,46 @@ impl Interpreter {
     /// 2.b/2.c).
     fn internalize_one(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         holder: Value,
         key: &str,
-        reviver: &Value,
+        reviver_root: usize,
         source: Option<&crate::json::parse::SourceNode>,
     ) -> Result<(), VmError> {
         // The recursive revive moves the heap; root `holder` so the define /
         // delete below targets the live object, not a stale handle.
         let holder_root = self.json_root_push(holder);
-        let new_element = self.internalize_json_property(context, holder, key, reviver, source)?;
-        let property_key = crate::VmPropertyKey::OwnedString(key.to_string());
-        if new_element.is_undefined() {
-            let holder = self.json_root_get(holder_root);
-            self.ordinary_delete_value(context, holder, &property_key, 0)?;
-        } else {
-            // Park the revived value across the define's transition allocation.
-            let elem_root = self.json_root_push(new_element);
-            let holder = self.json_root_get(holder_root);
-            let descriptor = object::PartialPropertyDescriptor {
-                value: Some(self.json_root_get(elem_root)),
-                writable: Some(true),
-                enumerable: Some(true),
-                configurable: Some(true),
-                ..object::PartialPropertyDescriptor::default()
-            };
-            self.define_own_property_value(context, &holder, &property_key, descriptor)?;
-        }
+        let result = (|| {
+            let new_element = self.internalize_json_property(
+                stack,
+                context,
+                self.json_root_get(holder_root),
+                key,
+                reviver_root,
+                source,
+            )?;
+            let property_key = crate::VmPropertyKey::OwnedString(key.to_string());
+            if new_element.is_undefined() {
+                let holder = self.json_root_get(holder_root);
+                self.ordinary_delete_value(stack, context, holder, &property_key, 0)?;
+            } else {
+                // Park the revived value across the define's transition allocation.
+                let elem_root = self.json_root_push(new_element);
+                let holder = self.json_root_get(holder_root);
+                let descriptor = object::PartialPropertyDescriptor {
+                    value: Some(self.json_root_get(elem_root)),
+                    writable: Some(true),
+                    enumerable: Some(true),
+                    configurable: Some(true),
+                    ..object::PartialPropertyDescriptor::default()
+                };
+                self.define_own_property_value(stack, context, &holder, &property_key, descriptor)?;
+            }
+            Ok(())
+        })();
         self.json_root_pop_to(holder_root);
-        Ok(())
+        result
     }
 
     /// §25.5.2.2 SerializeJSONProperty(key, holder).
@@ -361,6 +409,7 @@ impl Interpreter {
     /// allocation + parent-level `join`, which dominated `JSON.stringify`.
     fn serialize_json_property_into(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         state: &mut JsonState,
         key: &str,
@@ -374,18 +423,24 @@ impl Interpreter {
         // replacer — can trigger a scavenge without leaving us
         // dereferencing a moved object. Each step re-reads from the slot.
         let holder_root = self.json_root_push(holder);
-        let value0 =
-            self.get_property_value_for_call(context, self.json_root_get(holder_root), key)?;
-        let value_root = self.json_root_push(value0);
-
-        let rendered = self.serialize_json_property_rooted_into(
-            context,
-            state,
-            key,
-            holder_root,
-            value_root,
-            out,
-        );
+        let rendered = (|| {
+            let value0 = self.get_property_value_for_call(
+                stack,
+                context,
+                self.json_root_get(holder_root),
+                key,
+            )?;
+            let value_root = self.json_root_push(value0);
+            self.serialize_json_property_rooted_into(
+                stack,
+                context,
+                state,
+                key,
+                holder_root,
+                value_root,
+                out,
+            )
+        })();
         // Restore the strict-stack invariant regardless of outcome.
         self.json_root_pop_to(holder_root);
         rendered
@@ -399,6 +454,7 @@ impl Interpreter {
     /// [`Self::serialize_json_property_into`].
     fn serialize_json_known_value_into(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         state: &mut JsonState,
         key: &str,
@@ -408,6 +464,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let value_root = self.json_root_push(value);
         let rendered = self.serialize_json_property_rooted_into(
+            stack,
             context,
             state,
             key,
@@ -426,6 +483,7 @@ impl Interpreter {
     /// stale copy.
     fn serialize_json_property_rooted_into(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         state: &mut JsonState,
         key: &str,
@@ -436,12 +494,16 @@ impl Interpreter {
         // step 2 — invoke `toJSON` when present and callable.
         let value = self.json_root_get(value_root);
         if value.is_object_type() || value.is_big_int() {
-            let to_json = self.get_property_value_for_call(context, value, "toJSON")?;
+            let to_json = self.get_property_value_for_call(stack, context, value, "toJSON")?;
             if to_json.is_callable() {
+                let to_json_root = self.json_root_push(to_json);
                 let key_arg = self.json_key_value(key)?;
                 let args: SmallVec<[Value; 8]> = smallvec![key_arg];
                 let receiver = self.json_root_get(value_root);
-                let next = self.run_callable_sync(context, &to_json, receiver, args)?;
+                let to_json = self.json_root_get(to_json_root);
+                let next =
+                    self.run_callable_sync_rooted(stack, context, &to_json, receiver, args)?;
+                self.json_root_pop_to(to_json_root);
                 self.json_root_set(value_root, next);
             }
         }
@@ -452,7 +514,7 @@ impl Interpreter {
             let args: SmallVec<[Value; 8]> = smallvec![key_arg, self.json_root_get(value_root)];
             let holder = self.json_root_get(holder_root);
             let replacer = self.json_root_get(replacer_root);
-            let next = self.run_callable_sync(context, &replacer, holder, args)?;
+            let next = self.run_callable_sync_rooted(stack, context, &replacer, holder, args)?;
             self.json_root_set(value_root, next);
         }
 
@@ -477,10 +539,10 @@ impl Interpreter {
             };
             match kind {
                 WrapperKind::Number => {
-                    value = Value::number(self.coerce_to_number(context, &value)?)
+                    value = Value::number(self.coerce_to_number(stack, context, &value)?)
                 }
                 WrapperKind::String => {
-                    let s = self.coerce_to_string(context, &value)?;
+                    let s = self.coerce_to_string(stack, context, &value)?;
                     let js = JsString::from_str(&s, self.gc_heap_mut())
                         .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
                     value = Value::string(js);
@@ -496,7 +558,7 @@ impl Interpreter {
         if let Some(obj) = value.as_object()
             && object::is_raw_json(obj, self.gc_heap())
         {
-            let raw = self.get_property_value_for_call(context, value, "rawJSON")?;
+            let raw = self.get_property_value_for_call(stack, context, value, "rawJSON")?;
             if let Some(s) = raw.as_string(self.gc_heap()) {
                 out.push_str(&s.to_lossy_string(self.gc_heap()));
                 return Ok(true);
@@ -526,9 +588,9 @@ impl Interpreter {
         // step 11 — Object that is not callable.
         if value.is_object_type() && !value.is_callable() {
             if self.json_is_array(&value)? {
-                self.serialize_json_array_into(context, state, value, out)?;
+                self.serialize_json_array_into(stack, context, state, value, out)?;
             } else {
-                self.serialize_json_object_into(context, state, value, out)?;
+                self.serialize_json_object_into(stack, context, state, value, out)?;
             }
             return Ok(true);
         }
@@ -539,6 +601,7 @@ impl Interpreter {
     /// §25.5.2.4 SerializeJSONObject(value), appending into `out`.
     fn serialize_json_object_into(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         state: &mut JsonState,
         value: Value,
@@ -549,117 +612,124 @@ impl Interpreter {
         // `JsString` per key and each property may recurse, so a
         // scavenge can move `value` mid-loop. Re-read from the slot.
         let value_root = self.json_root_push(value);
-
-        // Each entry is `(key, Some(slot))` for the fast path (read the value
-        // straight from its flat data slot, re-validating the shape per key) or
-        // `(key, None)` for the observable `[[Get]]` path. The fast path applies
-        // only to an ordinary object with a replacer-free key list and no
-        // enumerable accessors; everything else (replacer property list, proxy /
-        // typed array / module namespace / String wrapper, any enumerable
-        // getter) keeps the spec `[[Get]]` per key.
-        // Resolve this container's enumerable member list. The fast object
-        // path caches the (name, slot) list by hidden class so a homogeneous
-        // array clones each key name once per stringify rather than per
-        // element; the slow path keeps the observable `[[Get]]` key order.
-        let keys: KeySource = match &state.property_list {
-            Some(list) => KeySource::Slow(list.clone()),
-            None => {
-                let v = self.json_root_get(value_root);
-                let heap = self.gc_heap();
-                let fast = v.as_object().filter(|obj| {
-                    v.as_proxy().is_none()
-                        && v.as_typed_array(heap).is_none()
-                        && object::module_namespace_env(*obj, heap).is_none()
-                        && object::string_data(*obj, heap).is_none()
-                });
-                let fast_sid = fast.and_then(|obj| {
-                    let sid = object::shape_id(obj, heap);
-                    if state.key_cache.contains_key(&sid) {
-                        return Some(sid);
-                    }
-                    let offs =
-                        object::with_properties(obj, heap, |p| p.enumerable_string_data_offsets())?;
-                    let list: std::rc::Rc<[(Box<str>, u16)]> = offs
-                        .into_iter()
-                        .map(|(k, o)| (k.into_boxed_str(), o))
-                        .collect();
-                    state.key_cache.insert(sid, list);
-                    Some(sid)
-                });
-                match fast_sid {
-                    Some(sid) => KeySource::Fast(state.key_cache[&sid].clone(), sid),
-                    None => {
-                        let keys = self.json_enumerable_string_keys(context, &v)?;
-                        KeySource::Slow(keys)
+        let stepback = state.indent.clone();
+        let result = (|| {
+            // Each entry is `(key, Some(slot))` for the fast path (read the value
+            // straight from its flat data slot, re-validating the shape per key) or
+            // `(key, None)` for the observable `[[Get]]` path. The fast path applies
+            // only to an ordinary object with a replacer-free key list and no
+            // enumerable accessors; everything else (replacer property list, proxy /
+            // typed array / module namespace / String wrapper, any enumerable
+            // getter) keeps the spec `[[Get]]` per key.
+            // Resolve this container's enumerable member list. The fast object
+            // path caches the (name, slot) list by hidden class so a homogeneous
+            // array clones each key name once per stringify rather than per
+            // element; the slow path keeps the observable `[[Get]]` key order.
+            let keys: KeySource = match &state.property_list {
+                Some(list) => KeySource::Slow(list.clone()),
+                None => {
+                    let v = self.json_root_get(value_root);
+                    let heap = self.gc_heap();
+                    let fast = v.as_object().filter(|obj| {
+                        v.as_proxy().is_none()
+                            && v.as_typed_array(heap).is_none()
+                            && object::module_namespace_env(*obj, heap).is_none()
+                            && object::string_data(*obj, heap).is_none()
+                    });
+                    let fast_sid = fast.and_then(|obj| {
+                        let sid = object::shape_id(obj, heap);
+                        if state.key_cache.contains_key(&sid) {
+                            return Some(sid);
+                        }
+                        let offs = object::with_properties(obj, heap, |p| {
+                            p.enumerable_string_data_offsets()
+                        })?;
+                        let list: std::rc::Rc<[(Box<str>, u16)]> = offs
+                            .into_iter()
+                            .map(|(k, o)| (k.into_boxed_str(), o))
+                            .collect();
+                        state.key_cache.insert(sid, list);
+                        Some(sid)
+                    });
+                    match fast_sid {
+                        Some(sid) => KeySource::Fast(state.key_cache[&sid].clone(), sid),
+                        None => {
+                            let keys = self.json_enumerable_string_keys(stack, context, &v)?;
+                            KeySource::Slow(keys)
+                        }
                     }
                 }
-            }
-        };
-        let fast_shape = keys.fast_shape();
-        let key_count = keys.len();
+            };
+            let fast_shape = keys.fast_shape();
+            let key_count = keys.len();
 
-        let stepback = state.indent.clone();
-        state.indent.push_str(&state.gap);
+            state.indent.push_str(&state.gap);
 
-        out.push('{');
-        let mut any = false;
-        for entry_idx in 0..key_count {
-            let (key, fast_slot) = keys.entry(entry_idx);
-            let holder = self.json_root_get(value_root);
-            // Tentatively write this member's separator + key prefix, then
-            // its value; if the property is omitted, rewind `out` to undo
-            // the prefix so no stray comma/key survives.
-            let mark = out.len();
-            if any {
-                out.push(',');
+            out.push('{');
+            let mut any = false;
+            for entry_idx in 0..key_count {
+                let (key, fast_slot) = keys.entry(entry_idx);
+                let holder = self.json_root_get(value_root);
+                // Tentatively write this member's separator + key prefix, then
+                // its value; if the property is omitted, rewind `out` to undo
+                // the prefix so no stray comma/key survives.
+                let mark = out.len();
+                if any {
+                    out.push(',');
+                }
+                if !state.gap.is_empty() {
+                    out.push('\n');
+                    out.push_str(&state.indent);
+                }
+                quote_json_string_str_into(key, out);
+                out.push(':');
+                if !state.gap.is_empty() {
+                    out.push(' ');
+                }
+                // Fast path: read the value directly from its data slot, but only
+                // while the holder's live shape still matches the one enumerated
+                // above (a nested `toJSON` could have mutated the holder). On any
+                // mismatch fall back to the observable `[[Get]]`, so behaviour is
+                // identical to the spec path.
+                let fast_value = match fast_slot {
+                    Some(slot) => holder
+                        .as_object()
+                        .filter(|o| Some(object::shape_id(*o, self.gc_heap())) == fast_shape)
+                        .map(|o| object::data_value_at(o, self.gc_heap(), slot)),
+                    None => None,
+                };
+                let rendered = match fast_value {
+                    Some(value) => self.serialize_json_known_value_into(
+                        stack, context, state, key, value_root, value, out,
+                    )?,
+                    None => {
+                        self.serialize_json_property_into(stack, context, state, key, holder, out)?
+                    }
+                };
+                if rendered {
+                    any = true;
+                } else {
+                    out.truncate(mark);
+                }
             }
-            if !state.gap.is_empty() {
+            if any && !state.gap.is_empty() {
                 out.push('\n');
-                out.push_str(&state.indent);
+                out.push_str(&stepback);
             }
-            quote_json_string_str_into(key, out);
-            out.push(':');
-            if !state.gap.is_empty() {
-                out.push(' ');
-            }
-            // Fast path: read the value directly from its data slot, but only
-            // while the holder's live shape still matches the one enumerated
-            // above (a nested `toJSON` could have mutated the holder). On any
-            // mismatch fall back to the observable `[[Get]]`, so behaviour is
-            // identical to the spec path.
-            let fast_value = match fast_slot {
-                Some(slot) => holder
-                    .as_object()
-                    .filter(|o| Some(object::shape_id(*o, self.gc_heap())) == fast_shape)
-                    .map(|o| object::data_value_at(o, self.gc_heap(), slot)),
-                None => None,
-            };
-            let rendered = match fast_value {
-                Some(value) => self
-                    .serialize_json_known_value_into(context, state, key, value_root, value, out)?,
-                None => self.serialize_json_property_into(context, state, key, holder, out)?,
-            };
-            if rendered {
-                any = true;
-            } else {
-                out.truncate(mark);
-            }
-        }
-        if any && !state.gap.is_empty() {
-            out.push('\n');
-            out.push_str(&stepback);
-        }
-        out.push('}');
+            out.push('}');
+            Ok(())
+        })();
 
         state.indent = stepback;
         self.json_root_pop_to(value_root);
         self.json_leave(state);
-        Ok(())
+        result
     }
 
     /// §25.5.2.5 SerializeJSONArray(value), appending into `out`.
     fn serialize_json_array_into(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         state: &mut JsonState,
         value: Value,
@@ -669,61 +739,65 @@ impl Interpreter {
         // Park the container so per-index recursion (which allocates
         // index-key strings and may scavenge) can't strand a stale copy.
         let value_root = self.json_root_push(value);
-
-        let len = {
-            let v = self.json_root_get(value_root);
-            self.json_length(context, &v)?
-        };
         let stepback = state.indent.clone();
-        state.indent.push_str(&state.gap);
+        let result = (|| {
+            let len = {
+                let v = self.json_root_get(value_root);
+                self.json_length(stack, context, &v)?
+            };
+            state.indent.push_str(&state.gap);
 
-        out.push('[');
-        for index in 0..len {
-            if index > 0 {
-                out.push(',');
+            out.push('[');
+            for index in 0..len {
+                if index > 0 {
+                    out.push(',');
+                }
+                if !state.gap.is_empty() {
+                    out.push('\n');
+                    out.push_str(&state.indent);
+                }
+                let key = index.to_string();
+                let holder = self.json_root_get(value_root);
+                // Fast path: read the element straight from the dense vector,
+                // skipping the per-index `Get(holder, ToString(index))` string-keyed
+                // property lookup. `own_data_element_without_accessors` returns the
+                // own element only when the array has no indexed accessors and the
+                // slot is a present (non-hole) value — so the read is identical to
+                // `[[Get]]` and the prototype chain is never consulted. A hole,
+                // accessor, sparse miss, or active array-form replacer falls back to
+                // the observable path (which handles hole -> inherited / `null`).
+                let fast_value = if state.property_list.is_none() {
+                    holder.as_array().and_then(|arr| {
+                        crate::array::own_data_element_without_accessors(arr, self.gc_heap(), index)
+                    })
+                } else {
+                    None
+                };
+                let rendered = match fast_value {
+                    Some(value) => self.serialize_json_known_value_into(
+                        stack, context, state, &key, value_root, value, out,
+                    )?,
+                    // §25.5.2.5 — an omitted element serialises as `null`.
+                    None => {
+                        self.serialize_json_property_into(stack, context, state, &key, holder, out)?
+                    }
+                };
+                if !rendered {
+                    out.push_str("null");
+                }
             }
-            if !state.gap.is_empty() {
+            if len > 0 && !state.gap.is_empty() {
                 out.push('\n');
-                out.push_str(&state.indent);
+                out.push_str(&stepback);
             }
-            let key = index.to_string();
-            let holder = self.json_root_get(value_root);
-            // Fast path: read the element straight from the dense vector,
-            // skipping the per-index `Get(holder, ToString(index))` string-keyed
-            // property lookup. `own_data_element_without_accessors` returns the
-            // own element only when the array has no indexed accessors and the
-            // slot is a present (non-hole) value — so the read is identical to
-            // `[[Get]]` and the prototype chain is never consulted. A hole,
-            // accessor, sparse miss, or active array-form replacer falls back to
-            // the observable path (which handles hole -> inherited / `null`).
-            let fast_value = if state.property_list.is_none() {
-                holder.as_array().and_then(|arr| {
-                    crate::array::own_data_element_without_accessors(arr, self.gc_heap(), index)
-                })
-            } else {
-                None
-            };
-            let rendered = match fast_value {
-                Some(value) => self.serialize_json_known_value_into(
-                    context, state, &key, value_root, value, out,
-                )?,
-                // §25.5.2.5 — an omitted element serialises as `null`.
-                None => self.serialize_json_property_into(context, state, &key, holder, out)?,
-            };
-            if !rendered {
-                out.push_str("null");
-            }
-        }
-        if len > 0 && !state.gap.is_empty() {
-            out.push('\n');
-            out.push_str(&stepback);
-        }
-        out.push(']');
+            out.push(']');
+            Ok(())
+        })();
 
         state.indent = stepback;
         self.json_root_pop_to(value_root);
         self.json_leave(state);
-        Ok(())
+        result
     }
 
     /// Push `value`'s identity onto the cycle stack, rejecting
@@ -783,21 +857,17 @@ impl Interpreter {
     }
 
     /// §7.3.18 LengthOfArrayLike(value) for the array branch.
-    fn json_length(&mut self, context: &ExecutionContext, value: &Value) -> Result<usize, VmError> {
+    fn json_length(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        value: &Value,
+    ) -> Result<usize, VmError> {
         if let Some(arr) = value.as_array() {
             return Ok(crate::array::len(arr, self.gc_heap()));
         }
-        let len_val = self.get_property_value_for_call(context, *value, "length")?;
-        let len_val = if len_val.is_object_type() {
-            self.evaluate_to_primitive(
-                context,
-                &len_val,
-                crate::abstract_ops::ToPrimitiveHint::Number,
-            )?
-        } else {
-            len_val
-        };
-        crate::to_length(&len_val, self.gc_heap())
+        let len_val = self.get_property_value_for_call(stack, context, *value, "length")?;
+        crate::coerce::to_length_or_throw(self, stack, context, &len_val)
     }
 
     /// EnumerableOwnPropertyNames(value, key) restricted to string
@@ -805,6 +875,7 @@ impl Interpreter {
     /// enumerable keys are filtered out.
     fn json_enumerable_string_keys(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<Vec<String>, VmError> {
@@ -836,27 +907,37 @@ impl Interpreter {
         // parked and re-read from its root slot before each descriptor
         // lookup instead of dereferencing a possibly-moved copy.
         let value_root = self.json_root_push(*value);
-        let keys = {
-            let v = self.json_root_get(value_root);
-            self.own_property_keys_value(context, &v)?
-        };
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            if key.is_symbol() {
-                continue;
+        let result = (|| {
+            let keys = {
+                let v = self.json_root_get(value_root);
+                self.own_property_keys_value(stack, context, &v)?
+            };
+            let key_roots: Vec<usize> = keys
+                .into_iter()
+                .map(|key| self.json_root_push(key))
+                .collect();
+            let mut out = Vec::with_capacity(key_roots.len());
+            for key_root in key_roots {
+                if self.json_root_get(key_root).is_symbol() {
+                    continue;
+                }
+                let holder = self.json_root_get(value_root);
+                let key = self.json_root_get(key_root);
+                let desc =
+                    self.get_own_property_descriptor_for_value(stack, context, holder, Some(&key))?;
+                if desc.is_some_and(|d| d.enumerable()) {
+                    let key = self.json_root_get(key_root);
+                    let s = key
+                        .as_string(self.gc_heap())
+                        .map(|js| js.to_lossy_string(self.gc_heap()))
+                        .unwrap_or_else(|| key.display_string(self.gc_heap()));
+                    out.push(s);
+                }
             }
-            let holder = self.json_root_get(value_root);
-            let desc = self.get_own_property_descriptor_for_value(context, holder, Some(&key))?;
-            if desc.is_some_and(|d| d.enumerable()) {
-                let s = key
-                    .as_string(self.gc_heap())
-                    .map(|js| js.to_lossy_string(self.gc_heap()))
-                    .unwrap_or_else(|| key.display_string(self.gc_heap()));
-                out.push(s);
-            }
-        }
+            Ok(out)
+        })();
         self.json_root_pop_to(value_root);
-        Ok(out)
+        result
     }
 
     /// Build the deduplicated `PropertyList` from an array replacer
@@ -864,21 +945,32 @@ impl Interpreter {
     /// is a String / Number (or their wrapper objects).
     fn json_build_property_list(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         replacer: &Value,
     ) -> Result<Vec<String>, VmError> {
-        let len = self.json_length(context, replacer)?;
-        let mut list: Vec<String> = Vec::new();
-        for index in 0..len {
-            let key = index.to_string();
-            let item = self.get_property_value_for_call(context, *replacer, &key)?;
-            if let Some(entry) = self.json_property_list_entry(context, &item)?
-                && !list.contains(&entry)
-            {
-                list.push(entry);
+        let replacer_root = self.json_root_push(*replacer);
+        let result = (|| {
+            let len = self.json_length(stack, context, &self.json_root_get(replacer_root))?;
+            let mut list: Vec<String> = Vec::new();
+            for index in 0..len {
+                let key = index.to_string();
+                let item = self.get_property_value_for_call(
+                    stack,
+                    context,
+                    self.json_root_get(replacer_root),
+                    &key,
+                )?;
+                if let Some(entry) = self.json_property_list_entry(stack, context, &item)?
+                    && !list.contains(&entry)
+                {
+                    list.push(entry);
+                }
             }
-        }
-        Ok(list)
+            Ok(list)
+        })();
+        self.json_root_pop_to(replacer_root);
+        result
     }
 
     /// Coerce one array-replacer item to its key string per §25.5.2.1
@@ -888,6 +980,7 @@ impl Interpreter {
     /// `ToString` (so a wrapper `toString` is observable).
     fn json_property_list_entry(
         &mut self,
+        stack: &mut ActivationStack,
         context: &ExecutionContext,
         item: &Value,
     ) -> Result<Option<String>, VmError> {
@@ -903,7 +996,7 @@ impl Interpreter {
                 object::number_data(obj, heap).is_some() || object::string_data(obj, heap).is_some()
             };
             if is_wrapper {
-                return Ok(Some(self.coerce_to_string(context, item)?));
+                return Ok(Some(self.coerce_to_string(stack, context, item)?));
             }
         }
         Ok(None)
@@ -912,16 +1005,19 @@ impl Interpreter {
     /// §25.5.2.1 steps 5–9 — translate `space` into the `gap` string.
     /// A Number / String wrapper coerces through ToNumber / ToString
     /// so a user `valueOf` / `toString` is observable.
-    fn json_gap(&mut self, context: &ExecutionContext, space: &Value) -> Result<String, VmError> {
+    fn json_gap(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        space: &Value,
+    ) -> Result<String, VmError> {
         let space = if let Some(obj) = space.as_object() {
             let heap = self.gc_heap();
             if object::number_data(obj, heap).is_some() {
-                Value::number(self.coerce_to_number(context, space)?)
+                Value::number(self.coerce_to_number(stack, context, space)?)
             } else if object::string_data(obj, heap).is_some() {
-                let s = self.coerce_to_string(context, space)?;
-                let js = JsString::from_str(&s, self.gc_heap_mut())
-                    .map_err(|_| self.err_type(("out of memory".to_string()).into()))?;
-                Value::string(js)
+                let text = self.coerce_to_string(stack, context, space)?;
+                return Ok(text.chars().take(10).collect());
             } else {
                 *space
             }
@@ -961,15 +1057,17 @@ impl Interpreter {
         // through a stale handle, and return the moved handle.
         let obj_root = self.json_root_push(Value::object(obj));
         let value_root = self.json_root_push(value);
-        let object_proto = self.object_prototype_object_opt();
-        let recv = self.json_root_get_object(obj_root);
-        object::set_prototype_value(recv, self.gc_heap_mut(), object_proto.map(Value::object));
-        let mut recv = self.json_root_get_object(obj_root);
-        let leaf = self.json_root_get(value_root);
-        object::set(&mut recv, self.gc_heap_mut(), "", leaf);
-        let result = self.json_root_get_object(obj_root);
+        let result = (|| {
+            let object_proto = self.object_prototype_object_opt();
+            let recv = self.json_root_get_object(obj_root);
+            object::set_prototype_value(recv, self.gc_heap_mut(), object_proto.map(Value::object));
+            let mut recv = self.json_root_get_object(obj_root);
+            let leaf = self.json_root_get(value_root);
+            object::set(&mut recv, self.gc_heap_mut(), "", leaf);
+            Ok(self.json_root_get_object(obj_root))
+        })();
         self.json_root_pop_to(obj_root);
-        Ok(result)
+        result
     }
 
     /// Read a rooted object handle, refreshed after any intervening GC. Panics

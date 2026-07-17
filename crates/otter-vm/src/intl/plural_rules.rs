@@ -156,15 +156,37 @@ pub(crate) fn plural_rules_select_range(
             name: "selectRange",
             reason: "missing execution context".to_string(),
         })?;
-    let to_num = |ctx: &mut NativeCtx<'_>, v: &Value| -> Result<f64, NativeError> {
-        crate::coerce::to_number_or_throw(ctx.cx.interp, &exec, v)
-            .map(|n| n.as_f64())
-            .map_err(|e| {
-                crate::native_function::vm_to_native_error(ctx.cx.interp, e, "selectRange")
-            })
-    };
-    let x = to_num(ctx, &start)?;
-    let y = to_num(ctx, &end)?;
+    let (x, y) = ctx.scope(|mut scope| {
+        let start = scope.value(start);
+        let end = scope.value(end);
+        let start_value = scope.raw(start);
+        let start_number = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, &exec, &start_value)
+        });
+        let x = start_number
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    error,
+                    "selectRange",
+                )
+            })?
+            .as_f64();
+        let end_value = scope.raw(end);
+        let end_number = scope.with_turn_parts(|interp, stack| {
+            crate::coerce::to_number_or_throw(interp, stack, &exec, &end_value)
+        });
+        let y = end_number
+            .map_err(|error| {
+                crate::native_function::vm_to_native_error(
+                    scope.context().interp_mut(),
+                    error,
+                    "selectRange",
+                )
+            })?
+            .as_f64();
+        Ok::<_, NativeError>((x, y))
+    })?;
     if x.is_nan() || y.is_nan() {
         return Err(NativeError::RangeError {
             name: "selectRange",

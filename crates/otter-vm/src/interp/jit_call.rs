@@ -45,32 +45,37 @@ impl Interpreter {
     /// normally; `Ok(Some(popped))` when the JIT ran and the callee returned,
     /// where `popped` mirrors [`Self::return_running_finally`] (`Some(v)` means
     /// the return unwound the dispatch entry and the loop should yield `v`).
-    pub(crate) fn trace_jit_bail(
+    pub(crate) fn record_jit_bail(
+        &mut self,
         context: &ExecutionContext,
         fid: u32,
-        kind: &str,
-        osr_pc: Option<u32>,
+        tier: jit_debug::JitDebugTier,
+        target: jit_debug::JitDebugTarget,
         pc: u32,
     ) {
-        if std::env::var_os("OTTER_JIT_TRACE").is_none() {
-            return;
-        }
-        let function_name = context
-            .function(fid)
-            .map(|function| function.name.as_str())
-            .unwrap_or("<unknown>");
-        let instruction = context.exec_function(fid).and_then(|function| {
-            function
-                .instr_at_index(pc as usize)
-                .map(|instr| (function, instr))
+        self.record_jit_debug_event(|| {
+            let function_name = context
+                .function(fid)
+                .map(|function| function.name.clone())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let instruction = context.exec_function(fid).and_then(|function| {
+                function
+                    .instr_at_index(pc as usize)
+                    .map(|instr| (function, instr))
+            });
+            let op_debug = instruction.map(|(function, instr)| format!("{:?}", function.op(instr)));
+            let operands_debug =
+                instruction.map(|(function, instr)| format!("{:?}", function.operand_view(instr)));
+            jit_debug::JitDebugEvent::Bail {
+                function_id: fid,
+                function_name,
+                tier,
+                target,
+                resume_pc: pc,
+                op_debug,
+                operands_debug,
+            }
         });
-        let op = instruction.map(|(function, instr)| function.op(instr));
-        let operands = instruction
-            .map(|(function, instr)| format!("{:?}", function.operand_view(instr)))
-            .unwrap_or_else(|| "[]".to_string());
-        eprintln!(
-            "[otter-jit] {kind} bail fid {fid} {function_name} osr={osr_pc:?} pc {pc} op {op:?} operands {operands}"
-        );
     }
 
     pub(crate) fn maybe_dispatch_jit(
@@ -95,9 +100,19 @@ impl Interpreter {
         match outcome {
             jit::JitExecOutcome::Bailed(pc) => {
                 stack[top_idx].pc = pc;
+                let fid = stack[top_idx].function_id;
+                self.record_jit_bail(
+                    context,
+                    fid,
+                    if optimized {
+                        jit_debug::JitDebugTier::Optimizing
+                    } else {
+                        jit_debug::JitDebugTier::Template
+                    },
+                    jit_debug::JitDebugTarget::Entry,
+                    pc,
+                );
                 if !optimized {
-                    let fid = stack[top_idx].function_id;
-                    Self::trace_jit_bail(context, fid, "entry", None, pc);
                     if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                         self.note_jit_entry_bail(fid);
                     }
@@ -294,8 +309,17 @@ impl Interpreter {
                 // loop, continue through cold epilogue/outer-loop code, and bail
                 // there; that should not permanently suppress the header on the
                 // next hot iteration.
-                let tier = if optimized { "optimized-osr" } else { "osr" };
-                Self::trace_jit_bail(context, fid, tier, Some(osr_pc), pc);
+                self.record_jit_bail(
+                    context,
+                    fid,
+                    if optimized {
+                        jit_debug::JitDebugTier::Optimizing
+                    } else {
+                        jit_debug::JitDebugTier::Template
+                    },
+                    jit_debug::JitDebugTarget::Osr { pc: osr_pc },
+                    pc,
+                );
                 stack[top_idx].pc = pc;
                 if self.reoptimize_arith_overflow_bail(context, fid, pc) {
                     return Ok(None);
@@ -464,9 +488,19 @@ impl Interpreter {
         match outcome {
             jit::JitExecOutcome::Bailed(pc) => {
                 stack[top_idx].pc = pc;
+                let fid = stack[top_idx].function_id;
+                self.record_jit_bail(
+                    context,
+                    fid,
+                    if optimized {
+                        jit_debug::JitDebugTier::Optimizing
+                    } else {
+                        jit_debug::JitDebugTier::Template
+                    },
+                    jit_debug::JitDebugTarget::SyncEntry,
+                    pc,
+                );
                 if !optimized {
-                    let fid = stack[top_idx].function_id;
-                    Self::trace_jit_bail(context, fid, "sync-entry", None, pc);
                     if !self.reoptimize_arith_overflow_bail(context, fid, pc) {
                         self.note_jit_entry_bail(fid);
                     }

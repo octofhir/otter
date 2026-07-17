@@ -90,14 +90,6 @@ impl Interpreter {
         let mut materialized: smallvec::SmallVec<[Frame; 4]> = smallvec::SmallVec::new();
 
         for (index, deopt) in frames.iter().enumerate() {
-            if std::env::var_os("OTTER_JIT_TRACE").is_some() {
-                eprintln!(
-                    "[jit-trace] materialize inline deopt frame {index}/{} fid={} pc={}",
-                    frames.len(),
-                    deopt.callee_fid,
-                    deopt.callee_pc
-                );
-            }
             let function = context
                 .exec_function(deopt.callee_fid)
                 .ok_or(VmError::InvalidOperand)?;
@@ -119,6 +111,12 @@ impl Interpreter {
             frame.self_value = deopt.closure;
             frame.pc = deopt.callee_pc;
             materialized.push(frame);
+            self.record_jit_debug_event(|| crate::JitDebugEvent::InlineDeoptFrame {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                total: u32::try_from(frames.len()).unwrap_or(u32::MAX),
+                function_id: deopt.callee_fid,
+                resume_pc: deopt.callee_pc,
+            });
         }
 
         self.enter_sync_reentry()?;

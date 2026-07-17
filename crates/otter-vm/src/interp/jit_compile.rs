@@ -63,6 +63,109 @@ impl Interpreter {
         }
     }
 
+    fn record_jit_compile_prepared(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+        target: jit_debug::JitDebugTarget,
+        view: &jit::JitCompileSnapshot,
+    ) {
+        if !self.reserve_jit_debug_event() {
+            return;
+        }
+        let function_name = context
+            .function(fid)
+            .map(|function| function.name.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let method_feedback_sites = view
+            .instructions
+            .iter()
+            .filter(|instr| {
+                instr
+                    .property_ic_site(&view.code_block)
+                    .is_some_and(|site| self.method_target_feedback(site).is_some())
+            })
+            .count();
+        let call_feedback_sites = view
+            .instructions
+            .iter()
+            .filter(|instr| {
+                view.code_block
+                    .feedback_at(instr.instruction_pc(&view.code_block) as usize)
+                    .is_some_and(|cell| cell.call_target().is_some())
+            })
+            .count();
+        let event = jit_debug::JitDebugEvent::CompilePrepared {
+            function_id: fid,
+            function_name,
+            tier,
+            target,
+            register_count: u32::try_from(view.code_block.register_count).unwrap_or(u32::MAX),
+            parameter_count: u32::try_from(view.code_block.param_count).unwrap_or(u32::MAX),
+            call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
+            method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
+            inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
+            inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
+        };
+        self.push_reserved_jit_debug_event(event);
+    }
+
+    fn record_jit_compile_finished(
+        &mut self,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+        target: jit_debug::JitDebugTarget,
+        code_object_id: u64,
+        status: &Result<jit::JitCompileStatus, jit::JitCompileError>,
+    ) {
+        if !self.reserve_jit_debug_event() {
+            return;
+        }
+        let outcome = match status {
+            Ok(jit::JitCompileStatus::Compiled { code }) => {
+                jit_debug::JitDebugCompileOutcome::Compiled {
+                    code_object_id,
+                    code_bytes: u64::try_from(code.code_len()).unwrap_or(u64::MAX),
+                }
+            }
+            Ok(jit::JitCompileStatus::Unavailable) => {
+                jit_debug::JitDebugCompileOutcome::Unavailable
+            }
+            Ok(jit::JitCompileStatus::Unsupported { reason }) => {
+                jit_debug::JitDebugCompileOutcome::Unsupported {
+                    reason: reason.clone(),
+                }
+            }
+            Err(error) => jit_debug::JitDebugCompileOutcome::Error {
+                message: error.message.clone(),
+            },
+        };
+        self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::CompileFinished {
+            function_id: fid,
+            tier,
+            target,
+            outcome,
+        });
+    }
+
+    fn record_jit_inline_candidate(
+        &mut self,
+        caller_function_id: u32,
+        instruction_pc: u32,
+        tier: jit_debug::JitDebugTier,
+        callee_function_id: Option<u32>,
+        bake_rejection: Option<jit_debug::JitInlineRejectionReason>,
+    ) {
+        self.record_jit_debug_event(|| jit_debug::JitDebugEvent::InlineCandidate {
+            caller_function_id,
+            instruction_pc,
+            tier,
+            callee_function_id,
+            bake_rejection,
+        });
+    }
+
     /// Compile and register one optimizing-tier leaf from the current feedback
     /// snapshot. Unsupported functions return `None` and keep using the
     /// template/interpreter path.
@@ -86,15 +189,35 @@ impl Interpreter {
         // there is nothing to inline.
         Self::bake_typed_array_layout(&mut snapshot);
         Self::bake_string_layout(&mut snapshot);
-        self.bake_inline_callees(&mut snapshot, context, fid);
+        self.bake_inline_callees(
+            &mut snapshot,
+            context,
+            fid,
+            jit_debug::JitDebugTier::Optimizing,
+        );
+        self.record_jit_compile_prepared(
+            context,
+            fid,
+            jit_debug::JitDebugTier::Optimizing,
+            jit_debug::JitDebugTarget::Entry,
+            &snapshot,
+        );
         let function = snapshot.code_block.clone();
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_optimized_function(jit::JitCompileRequest {
             snapshot,
+            debug: self.jit_debug.request(),
             osr_pc: None,
             code_object_id,
         });
+        self.record_jit_compile_finished(
+            fid,
+            jit_debug::JitDebugTier::Optimizing,
+            jit_debug::JitDebugTarget::Entry,
+            code_object_id,
+            &status,
+        );
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => {
                 self.jit_next_code_object_id += 1;
@@ -173,55 +296,37 @@ impl Interpreter {
         self.publish_property_feedback_for_view(&view);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
-        self.bake_inline_callees(&mut view, context, fid);
+        self.bake_inline_callees(&mut view, context, fid, jit_debug::JitDebugTier::Template);
         self.bake_collection_leaf_methods(&mut view);
         self.bake_collection_alloc_methods(&mut view);
         self.bake_array_methods(&mut view);
         self.bake_primitive_method_guards(&mut view);
-        let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
-        if trace {
-            let function_name = context
-                .function(fid)
-                .map(|function| function.name.as_str())
-                .unwrap_or("<unknown>");
-            let method_feedback = view
-                .instructions
-                .iter()
-                .filter(|instr| {
-                    instr
-                        .property_ic_site(&view.code_block)
-                        .is_some_and(|site| self.method_target_feedback(site).is_some())
-                })
-                .count();
-            let call_feedback = view
-                .instructions
-                .iter()
-                .filter(|instr| {
-                    view.code_block
-                        .feedback_at(instr.instruction_pc(&view.code_block) as usize)
-                        .is_some_and(|cell| cell.call_target().is_some())
-                })
-                .count();
-            eprintln!(
-                "[otter-jit] view fid {fid} {function_name}: call_feedback={} method_feedback={} inline_callees={} inline_methods={}",
-                call_feedback,
-                method_feedback,
-                view.inline_callees.len(),
-                view.inline_methods.len()
-            );
-        }
-        let (regs, params) = (view.code_block.register_count, view.code_block.param_count);
+        let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
+            jit_debug::JitDebugTarget::Osr { pc }
+        });
+        self.record_jit_compile_prepared(
+            context,
+            fid,
+            jit_debug::JitDebugTier::Template,
+            target,
+            &view,
+        );
         let function = view.code_block.clone();
         let hook = self.jit_hook.as_ref()?.clone();
         let code_object_id = self.jit_next_code_object_id;
         let status = hook.compile_function(jit::JitCompileRequest {
             snapshot: view,
+            debug: self.jit_debug.request(),
             osr_pc,
             code_object_id,
         });
-        if trace {
-            eprintln!("[jit] compile fid={fid} regs={regs} params={params} -> {status:?}");
-        }
+        self.record_jit_compile_finished(
+            fid,
+            jit_debug::JitDebugTier::Template,
+            target,
+            code_object_id,
+            &status,
+        );
         match status {
             Ok(jit::JitCompileStatus::Compiled { code }) => {
                 self.jit_next_code_object_id += 1;
@@ -387,8 +492,8 @@ impl Interpreter {
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
+        tier: jit_debug::JitDebugTier,
     ) {
-        let trace = std::env::var_os("OTTER_JIT_TRACE").is_some();
         let call_sites: Vec<_> = view
             .instructions
             .iter()
@@ -403,17 +508,23 @@ impl Interpreter {
             .collect();
         for (instruction_pc, call_byte_pc, state) in call_sites {
             let CallTargetFeedback::Mono(callee_fid) = state else {
-                if trace {
-                    eprintln!("[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: poly");
-                }
+                self.record_jit_inline_candidate(
+                    fid,
+                    instruction_pc,
+                    tier,
+                    None,
+                    Some(jit_debug::JitInlineRejectionReason::Polymorphic),
+                );
                 continue;
             };
             let Some(callee) = context.exec_function(callee_fid) else {
-                if trace {
-                    eprintln!(
-                        "[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: missing callee {callee_fid}"
-                    );
-                }
+                self.record_jit_inline_candidate(
+                    fid,
+                    instruction_pc,
+                    tier,
+                    Some(callee_fid),
+                    Some(jit_debug::JitInlineRejectionReason::MissingCallee),
+                );
                 continue;
             };
             if callee.is_generator
@@ -424,34 +535,35 @@ impl Interpreter {
                 || callee.contains_direct_eval
                 || callee.is_derived_constructor
             {
-                if trace {
-                    eprintln!(
-                        "[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: ineligible callee {callee_fid} flags gen={} async={} async_gen={} args={} rest={} eval={} derived={} makes_fn={}",
-                        callee.is_generator,
-                        callee.is_async,
-                        callee.is_async_generator,
-                        callee.needs_arguments,
-                        callee.has_rest,
-                        callee.contains_direct_eval,
-                        callee.is_derived_constructor,
-                        callee.makes_function,
-                    );
-                }
+                self.record_jit_inline_candidate(
+                    fid,
+                    instruction_pc,
+                    tier,
+                    Some(callee_fid),
+                    Some(jit_debug::JitInlineRejectionReason::Ineligible {
+                        generator: callee.is_generator,
+                        async_function: callee.is_async,
+                        async_generator: callee.is_async_generator,
+                        needs_arguments: callee.needs_arguments,
+                        has_rest: callee.has_rest,
+                        contains_direct_eval: callee.contains_direct_eval,
+                        derived_constructor: callee.is_derived_constructor,
+                        makes_function: callee.makes_function,
+                    }),
+                );
                 continue;
             }
             let Some(callee_view) = context.jit_compile_snapshot(callee_fid) else {
-                if trace {
-                    eprintln!(
-                        "[otter-jit] inline callee skip fid {fid} pc {instruction_pc}: missing view {callee_fid}"
-                    );
-                }
+                self.record_jit_inline_candidate(
+                    fid,
+                    instruction_pc,
+                    tier,
+                    Some(callee_fid),
+                    Some(jit_debug::JitInlineRejectionReason::MissingSnapshot),
+                );
                 continue;
             };
-            if trace {
-                eprintln!(
-                    "[otter-jit] inline callee bake fid {fid} pc {instruction_pc}: callee {callee_fid}"
-                );
-            }
+            self.record_jit_inline_candidate(fid, instruction_pc, tier, Some(callee_fid), None);
             view.inline_callees.insert(
                 call_byte_pc,
                 jit::JitInlineCallee {

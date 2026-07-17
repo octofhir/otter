@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! - [`CliJitTier`] — stable CLI spelling for execution-tier selection.
-//! - [`CliExecutionConfig`] — timeout, trace, and JIT settings captured once
-//!   after argument parsing and applied to either public runtime builder.
+//! - [`CliExecutionConfig`] — timeout, trace, JIT tier, and structured JIT
+//!   diagnostics captured once after argument parsing and applied to either
+//!   public runtime builder.
 //!
 //! # Invariants
 //! - Runtime-backed command paths receive this value explicitly. No timeout,
@@ -12,12 +13,16 @@
 //!   runtime, VM, and JIT crates consume only structured configuration.
 //! - `None` keeps the runtime timeout default while `Some(Duration::ZERO)`
 //!   explicitly disables it.
+//! - Engine crates only return owned JIT reports. This outer configuration
+//!   owns their optional filesystem/stderr serialization.
 
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
 use clap::ValueEnum;
-use otter_runtime::{JitSelection, OtterBuilder, RuntimeBuilder, TracerFactory};
+use otter_runtime::{
+    JitDebugReport, JitDebugRequest, JitSelection, OtterBuilder, RuntimeBuilder, TracerFactory,
+};
 
 /// User-facing execution-tier selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -45,6 +50,7 @@ impl From<CliJitTier> for JitSelection {
 pub(crate) struct CliExecutionConfig {
     timeout: Option<Duration>,
     trace_target: Option<String>,
+    jit_events_target: Option<String>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
 }
@@ -54,6 +60,7 @@ impl Default for CliExecutionConfig {
         Self {
             timeout: None,
             trace_target: None,
+            jit_events_target: None,
             jit_selection: JitSelection::ProductionTiered,
             jit_osr_threshold: None,
         }
@@ -66,6 +73,7 @@ impl CliExecutionConfig {
         timeout_secs: Option<u64>,
         trace_target: Option<String>,
         jit_tier: Option<CliJitTier>,
+        jit_events_target: Option<String>,
     ) -> Self {
         let jit_selection = jit_tier
             .map(JitSelection::from)
@@ -73,6 +81,7 @@ impl CliExecutionConfig {
         Self {
             timeout: timeout_secs.map(Duration::from_secs),
             trace_target,
+            jit_events_target,
             jit_selection,
             jit_osr_threshold: legacy_jit_osr_threshold(),
         }
@@ -80,7 +89,9 @@ impl CliExecutionConfig {
 
     /// Apply execution settings to the async-capable public runtime facade.
     pub(crate) fn apply_otter_builder(&self, builder: OtterBuilder) -> OtterBuilder {
-        let mut builder = builder.jit_selection(self.jit_selection);
+        let mut builder = builder
+            .jit_selection(self.jit_selection)
+            .jit_debug(self.jit_debug_request());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }
@@ -99,7 +110,9 @@ impl CliExecutionConfig {
     /// direct path; keeping the configured value here avoids another CLI-only
     /// source of truth when direct interruption support lands.
     pub(crate) fn apply_runtime_builder(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
-        let mut builder = builder.jit_selection(self.jit_selection);
+        let mut builder = builder
+            .jit_selection(self.jit_selection)
+            .jit_debug(self.jit_debug_request());
         if let Some(threshold) = self.jit_osr_threshold {
             builder = builder.jit_osr_threshold(threshold);
         }
@@ -123,6 +136,37 @@ impl CliExecutionConfig {
 
     pub(crate) const fn interpreter_only(&self) -> bool {
         matches!(self.jit_selection, JitSelection::InterpreterOnly)
+    }
+
+    /// Return whether the CLI must retain and serialize structured JIT events.
+    pub(crate) const fn jit_events_enabled(&self) -> bool {
+        self.jit_events_target.is_some()
+    }
+
+    /// Serialize one complete JIT report to the configured target.
+    ///
+    /// `-` writes to stderr; a path is created or truncated exactly once by the
+    /// outer CLI command after all top-level runs have completed.
+    pub(crate) fn write_jit_debug_report(&self, report: &JitDebugReport) -> io::Result<()> {
+        let Some(target) = &self.jit_events_target else {
+            return Ok(());
+        };
+        let mut writer: Box<dyn Write> = if target == "-" {
+            Box::new(BufWriter::new(io::stderr()))
+        } else {
+            Box::new(BufWriter::new(std::fs::File::create(target)?))
+        };
+        serde_json::to_writer_pretty(&mut writer, report).map_err(io::Error::other)?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+
+    const fn jit_debug_request(&self) -> JitDebugRequest {
+        if self.jit_events_target.is_some() {
+            JitDebugRequest::events()
+        } else {
+            JitDebugRequest::disabled()
+        }
     }
 }
 
@@ -188,6 +232,7 @@ mod tests {
         let inherited = CliExecutionConfig {
             timeout: None,
             trace_target: None,
+            jit_events_target: None,
             jit_selection: JitSelection::InterpreterOnly,
             jit_osr_threshold: None,
         };
@@ -204,10 +249,33 @@ mod tests {
         let config = CliExecutionConfig {
             timeout: None,
             trace_target: Some(target.clone()),
+            jit_events_target: None,
             jit_selection: JitSelection::InterpreterOnly,
             jit_osr_threshold: None,
         };
         target.clear();
         assert_eq!(config.trace_target.as_deref(), Some("trace.log"));
+    }
+
+    #[test]
+    fn jit_events_are_default_off_and_owned_when_enabled() {
+        assert!(!CliExecutionConfig::default().jit_events_enabled());
+        assert_eq!(
+            CliExecutionConfig::default().jit_debug_request(),
+            JitDebugRequest::disabled()
+        );
+
+        let mut target = String::from("jit-events.json");
+        let config = CliExecutionConfig {
+            timeout: None,
+            trace_target: None,
+            jit_events_target: Some(target.clone()),
+            jit_selection: JitSelection::Template,
+            jit_osr_threshold: Some(1),
+        };
+        target.clear();
+        assert!(config.jit_events_enabled());
+        assert_eq!(config.jit_events_target.as_deref(), Some("jit-events.json"));
+        assert_eq!(config.jit_debug_request(), JitDebugRequest::events());
     }
 }

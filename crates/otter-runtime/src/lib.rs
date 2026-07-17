@@ -18,6 +18,7 @@
 //! - [`Runtime`], [`RuntimeBuilder`] — Layer B.
 //! - [`SourceInput`] — JS / TS source bundles.
 //! - [`ExecutionResult`] — successful run output.
+//! - [`ExecutionAttempt`] — diagnostic-aware success/error envelope.
 //! - [`OtterError`], [`ConfigError`], [`IoErrorKind`] — error model.
 //! - [`InterruptHandle`] — cooperative cancellation.
 //!
@@ -47,6 +48,8 @@
 //! - Loader, module-graph, source-map, diagnostics, and package-manager DTO
 //!   state are owned by the `Runtime` session; no hidden global resolver state
 //!   is used by the active runtime path.
+//! - JIT diagnostics cross the async boundary as owned report data, including
+//!   partial reports from abrupt completion; they contain no VM/GC handles.
 //!
 //! # See also
 //! - [Engine architecture](../../../docs/book/src/engine/architecture.md)
@@ -111,9 +114,10 @@ pub use otter_compiler::{
 pub use otter_gc;
 pub use otter_vm::CpuProfile;
 pub use otter_vm::{
-    AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
-    MethodSpec, NativeCall, ObjectBuilder, Value, array, bootstrap, intrinsic_install, object,
-    rooting,
+    AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JIT_DEBUG_EVENT_LIMIT,
+    JitDebugCompileOutcome, JitDebugEvent, JitDebugReport, JitDebugRequest, JitDebugTarget,
+    JitDebugTier, JitInlineRejectionReason, JsObject, JsSurfaceError, MethodSpec, NativeCall,
+    ObjectBuilder, Value, array, bootstrap, intrinsic_install, object, rooting,
 };
 // Unrenamed re-exports consumed by `#[js_class]`- and `couch!`-generated
 // glue, which must resolve the same `::otter_vm::…` paths whether they
@@ -525,6 +529,8 @@ pub struct ExecutionResult {
     pub duration: Duration,
     /// Diagnostic counter snapshot sampled after the run completed.
     stats: Box<RuntimeExecutionStats>,
+    /// Owned, opt-in JIT diagnostics for this top-level run.
+    jit_debug_report: Option<Box<JitDebugReport>>,
 }
 
 impl ExecutionResult {
@@ -540,6 +546,7 @@ impl ExecutionResult {
             exit_code: 0,
             duration,
             stats: Box::default(),
+            jit_debug_report: None,
         }
     }
 
@@ -551,11 +558,22 @@ impl ExecutionResult {
             exit_code: code,
             duration,
             stats: Box::default(),
+            jit_debug_report: None,
         }
     }
 
     fn with_stats(mut self, stats: RuntimeExecutionStats) -> Self {
         self.stats = Box::new(stats);
+        self
+    }
+
+    fn with_jit_debug_report(mut self, report: JitDebugReport) -> Self {
+        let report = match self.jit_debug_report.take() {
+            Some(existing) if report.is_empty() => existing,
+            Some(existing) => Box::new((*existing).merged(report)),
+            None => Box::new(report),
+        };
+        self.jit_debug_report = Some(report);
         self
     }
 
@@ -581,6 +599,86 @@ impl ExecutionResult {
     #[must_use]
     pub fn stats(&self) -> RuntimeExecutionStats {
         *self.stats
+    }
+
+    /// Structured JIT diagnostics captured for this top-level run.
+    ///
+    /// Returns `None` when capture was not requested. The report is owned and
+    /// remains valid across later allocations and full collections.
+    #[must_use]
+    pub fn jit_debug_report(&self) -> Option<&JitDebugReport> {
+        self.jit_debug_report.as_deref()
+    }
+
+    /// Take the owned JIT report without cloning its event payloads.
+    #[must_use]
+    pub fn take_jit_debug_report(&mut self) -> Option<JitDebugReport> {
+        self.jit_debug_report.take().map(|report| *report)
+    }
+}
+
+/// One top-level execution plus diagnostics retained on abrupt failure.
+///
+/// Ordinary runtime APIs keep returning `Result<ExecutionResult, OtterError>`.
+/// Diagnostic-aware callers use this non-error envelope when they must persist
+/// partial JIT events even though execution did not produce a result.
+#[derive(Debug)]
+pub struct ExecutionAttempt {
+    result: Result<ExecutionResult, OtterError>,
+    failure_jit_debug_report: Option<Box<JitDebugReport>>,
+}
+
+impl ExecutionAttempt {
+    fn from_result(
+        result: Result<ExecutionResult, OtterError>,
+        report: Option<JitDebugReport>,
+    ) -> Self {
+        match result {
+            Ok(result) => Self {
+                result: Ok(match report {
+                    Some(report) => result.with_jit_debug_report(report),
+                    None => result,
+                }),
+                failure_jit_debug_report: None,
+            },
+            Err(error) => Self {
+                result: Err(error),
+                failure_jit_debug_report: report.map(Box::new),
+            },
+        }
+    }
+
+    /// Borrow the execution result or its original runtime error.
+    pub fn result(&self) -> Result<&ExecutionResult, &OtterError> {
+        self.result.as_ref()
+    }
+
+    /// Borrow the complete or partial JIT diagnostics report.
+    #[must_use]
+    pub fn jit_debug_report(&self) -> Option<&JitDebugReport> {
+        match &self.result {
+            Ok(result) => result.jit_debug_report(),
+            Err(_) => self.failure_jit_debug_report.as_deref(),
+        }
+    }
+
+    /// Discard failure-only diagnostics and recover the established API result.
+    pub fn into_result(self) -> Result<ExecutionResult, OtterError> {
+        self.result
+    }
+
+    /// Split execution from its owned complete or partial JIT report.
+    pub fn into_parts(self) -> (Result<ExecutionResult, OtterError>, Option<JitDebugReport>) {
+        match self.result {
+            Ok(mut result) => {
+                let report = result.take_jit_debug_report();
+                (Ok(result), report)
+            }
+            Err(error) => (
+                Err(error),
+                self.failure_jit_debug_report.map(|report| *report),
+            ),
+        }
     }
 }
 
@@ -1207,6 +1305,7 @@ pub(crate) struct RuntimeConfig {
     tracer_factory: Option<TracerFactory>,
     jit_selection: JitSelection,
     jit_osr_threshold: Option<u32>,
+    jit_debug: JitDebugRequest,
 }
 
 /// Which execution tiers a runtime installs at construction.
@@ -1435,6 +1534,7 @@ impl Default for RuntimeConfig {
             tracer_factory: None,
             jit_selection: JitSelection::default(),
             jit_osr_threshold: None,
+            jit_debug: JitDebugRequest::default(),
         }
     }
 }
@@ -1727,6 +1827,13 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Configure default-off structured JIT diagnostics.
+    #[must_use]
+    pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
+        self.config.jit_debug = request;
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -1964,6 +2071,7 @@ impl Runtime {
                     interp.set_eval_hook(Some(hook));
                     // Functions start in the interpreter and tier up through the
                     // explicitly configured compiler policy.
+                    interp.set_jit_debug_request(config.jit_debug);
                     if let Some(threshold) = config.jit_osr_threshold {
                         interp.set_jit_osr_threshold(threshold);
                     }
@@ -3117,6 +3225,29 @@ impl Runtime {
         result.with_stats(stats)
     }
 
+    pub(crate) fn attach_jit_debug_report(&mut self, result: ExecutionResult) -> ExecutionResult {
+        match self.interp.take_jit_debug_report() {
+            Some(report) => result.with_jit_debug_report(report),
+            None => result,
+        }
+    }
+
+    pub(crate) fn finish_jit_debug_attempt(
+        &mut self,
+        result: Result<ExecutionResult, OtterError>,
+    ) -> ExecutionAttempt {
+        ExecutionAttempt::from_result(result, self.interp.take_jit_debug_report())
+    }
+
+    /// Drain the current structured JIT diagnostics batch.
+    ///
+    /// This remains available after an abrupt run that cannot return an
+    /// [`ExecutionResult`].
+    #[must_use]
+    pub fn take_jit_debug_report(&mut self) -> Option<JitDebugReport> {
+        self.interp.take_jit_debug_report()
+    }
+
     /// Reset VM runtime budget/resource counters.
     pub fn reset_runtime_budget_stats(&mut self) {
         self.interp.reset_runtime_budget_stats();
@@ -3269,8 +3400,19 @@ impl Runtime {
         source: SourceInput,
         specifier: &str,
     ) -> Result<ExecutionResult, OtterError> {
+        self.interp.begin_jit_debug_capture();
         self.run_script_with_context(source, specifier)
-            .map(|(result, _)| result)
+            .map(|(result, _)| self.attach_jit_debug_report(result))
+    }
+
+    /// Run a script while retaining partial JIT diagnostics on abrupt failure.
+    pub fn run_script_with_diagnostics(
+        &mut self,
+        source: SourceInput,
+        specifier: &str,
+    ) -> ExecutionAttempt {
+        let result = self.run_script(source, specifier);
+        self.finish_jit_debug_attempt(result)
     }
 
     fn run_script_with_context(
@@ -3408,6 +3550,12 @@ impl Runtime {
         self.run_script(source, "<eval>")
     }
 
+    /// Evaluate a snippet while retaining partial JIT diagnostics on failure.
+    pub fn eval_with_diagnostics(&mut self, source: SourceInput) -> ExecutionAttempt {
+        let result = self.eval(source);
+        self.finish_jit_debug_attempt(result)
+    }
+
     /// Compile-only: parse + erase + lower without executing.
     ///
     /// # Errors
@@ -3480,8 +3628,18 @@ impl Runtime {
         &mut self,
         entry_path: impl AsRef<Path>,
     ) -> Result<ExecutionResult, OtterError> {
+        self.interp.begin_jit_debug_capture();
         self.run_module_with_context(entry_path)
-            .map(|(result, _)| result)
+            .map(|(result, _)| self.attach_jit_debug_report(result))
+    }
+
+    /// Run a module while retaining partial JIT diagnostics on abrupt failure.
+    pub fn run_module_with_diagnostics(
+        &mut self,
+        entry_path: impl AsRef<Path>,
+    ) -> ExecutionAttempt {
+        let result = self.run_module(entry_path);
+        self.finish_jit_debug_attempt(result)
     }
 
     /// Load, link, and execute a module graph with opt-in phase timings.
@@ -3496,10 +3654,11 @@ impl Runtime {
         &mut self,
         entry_path: impl AsRef<Path>,
     ) -> Result<(ExecutionResult, module_graph::ModulePhaseTimings), OtterError> {
+        self.interp.begin_jit_debug_capture();
         let mut timings = module_graph::ModulePhaseTimings::default();
         let (result, _) =
             self.run_module_with_context_inner(entry_path.as_ref(), Some(&mut timings))?;
-        Ok((result, timings))
+        Ok((self.attach_jit_debug_report(result), timings))
     }
 
     /// Register every linked module's §16.2.1.6 ResolveExport table with
@@ -3759,7 +3918,16 @@ impl Runtime {
     /// # Errors
     /// See [`OtterError`] variants.
     pub fn run_file(&mut self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
-        self.run_file_with_context(path).map(|(result, _)| result)
+        self.interp.begin_jit_debug_capture();
+        self.run_file_with_context(path)
+            .map(|(result, _)| result)
+            .map(|result| self.attach_jit_debug_report(result))
+    }
+
+    /// Run a file while retaining partial JIT diagnostics on abrupt failure.
+    pub fn run_file_with_diagnostics(&mut self, path: impl AsRef<Path>) -> ExecutionAttempt {
+        let result = self.run_file(path);
+        self.finish_jit_debug_attempt(result)
     }
 
     pub(crate) fn run_file_with_context(
@@ -3940,6 +4108,13 @@ impl Otter {
         self.handle.run_file(path.as_ref().to_path_buf()).await
     }
 
+    /// Run a file and retain partial JIT diagnostics on abrupt failure.
+    pub async fn run_file_with_diagnostics(&self, path: impl AsRef<Path>) -> ExecutionAttempt {
+        self.handle
+            .run_file_with_diagnostics(path.as_ref().to_path_buf())
+            .await
+    }
+
     /// Parse and compile a file without executing it.
     ///
     /// Module-shaped files use the same loader and package-graph resolution as
@@ -3958,6 +4133,13 @@ impl Otter {
     /// See [`OtterError`] variants.
     pub async fn run_module(&self, path: impl AsRef<Path>) -> Result<ExecutionResult, OtterError> {
         self.handle.run_module(path.as_ref().to_path_buf()).await
+    }
+
+    /// Run a module and retain partial JIT diagnostics on abrupt failure.
+    pub async fn run_module_with_diagnostics(&self, path: impl AsRef<Path>) -> ExecutionAttempt {
+        self.handle
+            .run_module_with_diagnostics(path.as_ref().to_path_buf())
+            .await
     }
 
     /// Run a string of JavaScript.
@@ -4002,6 +4184,17 @@ impl Otter {
         self.handle.run_script(source, specifier).await
     }
 
+    /// Run a source bundle and retain partial JIT diagnostics on failure.
+    pub async fn run_script_source_with_diagnostics(
+        &self,
+        source: SourceInput,
+        specifier: impl Into<String>,
+    ) -> ExecutionAttempt {
+        self.handle
+            .run_script_with_diagnostics(source, specifier)
+            .await
+    }
+
     /// Evaluate a snippet.
     ///
     /// # Errors
@@ -4009,6 +4202,13 @@ impl Otter {
     pub async fn eval(&self, source: &str) -> Result<ExecutionResult, OtterError> {
         self.handle
             .eval(SourceInput::from_javascript(source).with_top_level_await())
+            .await
+    }
+
+    /// Evaluate a snippet and retain partial JIT diagnostics on failure.
+    pub async fn eval_with_diagnostics(&self, source: &str) -> ExecutionAttempt {
+        self.handle
+            .eval_with_diagnostics(SourceInput::from_javascript(source).with_top_level_await())
             .await
     }
 
@@ -4248,6 +4448,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn jit_osr_threshold(mut self, threshold: u32) -> Self {
         self.runtime = self.runtime.jit_osr_threshold(threshold);
+        self
+    }
+
+    /// [`RuntimeBuilder::jit_debug`].
+    #[must_use]
+    pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
+        self.runtime = self.runtime.jit_debug(request);
         self
     }
 
@@ -5351,7 +5558,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "hangs intermittently after active runtime changes; keep targeted while Node compat work continues"]
     async fn runtime_handle_timer_cancellation_and_timeout_are_observable() {
         let otter = Otter::builder()
             .timeout(Duration::from_millis(20))
@@ -5377,7 +5583,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "hangs intermittently after active runtime changes; keep targeted while Node compat work continues"]
     async fn runtime_handle_bounded_queue_reports_backpressure() {
         let config = RuntimeConfig {
             timeout: Duration::from_millis(100),

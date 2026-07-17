@@ -43,39 +43,48 @@ needed to optimize the VM and JIT safely.
   summaries, and Chrome `.heapsnapshot` output.
 - [x] Explicit runtime tier selection (`ProductionTiered`, `Template`, or
   `InterpreterOnly`); template-only runs do not execute optimizer policy.
+- [x] Owned, schema-versioned JIT events through
+  `--jit-events[=<path>]`: compile preparation/results, inline candidates,
+  side exits, and inline-frame materialization. Capture is bounded, survives
+  abrupt completion, and includes JIT work performed by event-loop callbacks.
 
 The text step trace is not a Chrome/Perfetto trace. Async/op tracing, timeout
 ring-buffer dumps, Test262 failure traces, IR dumps, machine-code dumps, and
-annotated assembly are not shipped yet.
+annotated assembly are not shipped yet. Structured JIT events are an Otter
+diagnostic schema, not a replacement for the planned Chrome/Perfetto timeline.
 
 ## Known Debt
 
-- Internal JIT diagnostics use the ambient `OTTER_JIT_TRACE` variable and
-  unstructured `stderr` output.
 - Step tracing and CPU sampling happen at interpreter dispatch. JIT-heavy
   execution therefore has a diagnostic blind spot.
 - The direct synchronous runtime used by `--cpu-prof` does not enforce its
   informational timeout yet.
 - A single file trace target is truncated when a command creates multiple
   sequential runtimes (notably multiple `otter test` files).
+- A host-side command timeout may fire before the isolate can return its partial
+  JIT event report. In that case the CLI preserves the timeout error and does
+  not write a misleading empty artifact; bounded timeout snapshots remain a
+  later slice.
 - Compiled code retains executable bytes and runtime metadata but exposes no
   stable artifact bundle or code-offset map to tooling.
 - There is no standard way to correlate bytecode PC, tier plan/IR, native code
   offset, safepoint, deopt exit, and runtime entry/deopt counts.
+- JIT events identify functions, tiers, entry targets, and logical PCs but do
+  not yet carry the artifact/code-offset correlation needed for disassembly.
 
 ## Ordered Implementation Slices
 
 ### 1. Explicit diagnostics configuration
 
-- [ ] Add an owned, default-empty diagnostics request shared by runtime, VM,
+- [x] Add an owned, default-empty diagnostics request shared by runtime, VM,
   and JIT compile requests.
 - [x] Replace CLI timeout/trace globals with normal execution configuration.
 - [x] Add an explicit CLI tier selector for reproducible interpreter,
   template-only, and production-tiered runs; keep legacy environment parsing
   only at the CLI compatibility boundary.
-- [ ] Replace `OTTER_JIT_TRACE` reads with structured requested events or
+- [x] Replace `OTTER_JIT_TRACE` reads with structured requested events or
   artifacts.
-- [ ] Prove the disabled path produces no artifact payloads and performs no
+- [x] Prove the disabled path produces no artifact payloads and performs no
   filesystem work.
 
 ### 2. Versioned JIT artifact bundle
